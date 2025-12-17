@@ -13,6 +13,7 @@ def pytest_configure(config):
         "markers", "metal: mark test as requiring Metal/MPS backend"
     )
     config.addinivalue_line("markers", "slow: mark test as slow running")
+    config.addinivalue_line("markers", "server: mark test as requiring vLLM server")
 
 
 def pytest_collection_modifyitems(config, items):
