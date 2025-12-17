@@ -82,11 +82,30 @@ main() {
   local package_name="vllm-metal"
 
   # Source shared library functions
-  LIB_URL="https://raw.githubusercontent.com/$repo_owner/$repo_name/main/scripts/lib.sh"
-  # shellcheck source=/dev/null
-  if ! source <(curl -fsSL "$LIB_URL"); then
-    echo "Error: Failed to fetch lib.sh from $LIB_URL" >&2
-    exit 1
+  # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
+  local local_lib=""
+  if [[ -n "${BASH_SOURCE[0]}" ]]; then
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local_lib="$script_dir/scripts/lib.sh"
+  fi
+
+  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$local_lib"
+  else
+    # Fetch from remote (curl | bash case)
+    local lib_url="https://raw.githubusercontent.com/$repo_owner/$repo_name/main/scripts/lib.sh"
+    local lib_tmp
+    lib_tmp=$(mktemp)
+    if ! curl -fsSL "$lib_url" -o "$lib_tmp"; then
+      echo "Error: Failed to fetch lib.sh from $lib_url" >&2
+      rm -f "$lib_tmp"
+      exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$lib_tmp"
+    rm -f "$lib_tmp"
   fi
 
   is_apple_silicon
