@@ -9,7 +9,7 @@ This plugin enables vLLM to run on Apple Silicon Macs using Metal Performance Sh
 Install the latest release with a single command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ericcurtin/vllm-project/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/main/install.sh | bash
 ```
 
 ### From Source
