@@ -1,162 +1,111 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Layer normalization operations for Metal backend."""
+"""Metal normalization operations."""
+
+from typing import Optional, Tuple
 
 import torch
 
-# Try to import Metal kernels
-# NOTE: We only check importability here, not Metal availability.
-# Metal contexts cannot survive fork(), so we defer initialization to first use.
-try:
-    import vllm_metal_rust
-
-    _METAL_IMPORTABLE = hasattr(vllm_metal_rust, "metal_rms_norm")
-except ImportError:
-    _METAL_IMPORTABLE = False
-
-# Lazy initialization state
-_metal_initialized = False
-_metal_available = False
-
-
-def _ensure_metal_initialized():
-    """Initialize Metal lazily in the worker process."""
-    global _metal_initialized, _metal_available
-    if _metal_initialized:
-        return _metal_available
-    _metal_initialized = True
-    if _METAL_IMPORTABLE:
-        try:
-            # This will initialize the Metal context
-            _metal_available = vllm_metal_rust.is_metal_available()
-        except Exception:
-            _metal_available = False
-    return _metal_available
+from vllm_metal.mlx import (
+    mlx_fused_add_rms_norm,
+    mlx_rms_norm,
+    to_mlx,
+    to_torch,
+)
 
 
 def rms_norm(
-    out: torch.Tensor,
+    output: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
-    epsilon: float = 1e-6,
+    eps: float = 1e-6,
 ) -> None:
-    """Root Mean Square Layer Normalization.
-
-    Computes: out = (input / sqrt(mean(input^2) + epsilon)) * weight
-
-    This is the normalization used in LLaMA, Mistral, and other models.
-    Uses Metal kernel when available, falls back to PyTorch otherwise.
+    """RMS normalization using MLX.
 
     Args:
-        out: Output tensor
-        input: Input tensor
-        weight: Scale weight tensor
-        epsilon: Small constant for numerical stability
+        output: Output tensor to write results.
+        input: Input tensor [..., hidden_size].
+        weight: Scale parameter [hidden_size].
+        eps: Small constant for numerical stability.
     """
-    # Try Metal kernel first
-    if _ensure_metal_initialized() and input.device.type == "cpu":
-        try:
-            # Metal kernels work on CPU tensors (unified memory)
-            vllm_metal_rust.metal_rms_norm(out, input, weight, epsilon)
-            return
-        except Exception:
-            pass  # Fall back to PyTorch
+    import mlx.core as mx
 
-    # PyTorch fallback
-    variance = input.pow(2).mean(dim=-1, keepdim=True)
-    input_normalized = input * torch.rsqrt(variance + epsilon)
-    out.copy_(input_normalized * weight)
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+    w_mlx = to_mlx(weight)
+
+    # Compute RMS norm
+    result = mlx_rms_norm(x_mlx, w_mlx, eps)
+
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)
 
 
 def fused_add_rms_norm(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    epsilon: float = 1e-6,
-) -> None:
-    """Fused residual addition and RMS normalization.
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused residual addition and RMS normalization using MLX.
 
-    Computes:
-        input = input + residual
-        input = rms_norm(input, weight, epsilon)
-
-    This modifies input in-place for both the residual addition
-    and the normalization. Uses Metal kernel when available.
+    This combines residual addition and RMS normalization into a single
+    operation for better efficiency.
 
     Args:
-        input: Input tensor (modified in-place)
-        residual: Residual tensor to add
-        weight: Scale weight tensor
-        epsilon: Small constant for numerical stability
+        input: Input tensor [..., hidden_size].
+        residual: Residual tensor [..., hidden_size].
+        weight: Scale parameter [hidden_size].
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Tuple of (normalized_output, updated_residual).
     """
-    # Try Metal kernel first
-    if _ensure_metal_initialized() and input.device.type == "cpu":
-        try:
-            # Create output buffer (same as input for in-place)
-            output = input.clone()
-            vllm_metal_rust.metal_fused_add_rms_norm(
-                input, residual, weight, output, epsilon
-            )
-            input.copy_(output)
-            return
-        except Exception:
-            pass  # Fall back to PyTorch
+    import mlx.core as mx
 
-    # PyTorch fallback - add residual in-place
-    input.add_(residual)
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+    res_mlx = to_mlx(residual)
+    w_mlx = to_mlx(weight)
 
-    # Compute RMS norm in-place
-    variance = input.pow(2).mean(dim=-1, keepdim=True)
-    input.mul_(torch.rsqrt(variance + epsilon))
-    input.mul_(weight)
+    # Compute fused add + RMS norm
+    output_mlx, residual_mlx = mlx_fused_add_rms_norm(x_mlx, res_mlx, w_mlx, eps)
+
+    # Convert back to PyTorch
+    output = to_torch(output_mlx, device=input.device, dtype=input.dtype)
+    residual_out = to_torch(residual_mlx, device=residual.device, dtype=residual.dtype)
+
+    return output, residual_out
 
 
 def layer_norm(
-    out: torch.Tensor,
+    output: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
-    epsilon: float = 1e-5,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
 ) -> None:
-    """Standard Layer Normalization.
-
-    Computes: out = (input - mean) / sqrt(var + epsilon) * weight + bias
+    """Layer normalization using MLX.
 
     Args:
-        out: Output tensor
-        input: Input tensor
-        weight: Scale weight tensor
-        bias: Bias tensor
-        epsilon: Small constant for numerical stability
+        output: Output tensor to write results.
+        input: Input tensor [..., hidden_size].
+        weight: Scale parameter [hidden_size].
+        bias: Optional bias parameter [hidden_size].
+        eps: Small constant for numerical stability.
     """
-    normalized_shape = input.shape[-1:]
-    result = torch.nn.functional.layer_norm(
-        input, normalized_shape, weight, bias, epsilon
-    )
-    out.copy_(result)
+    from vllm_metal.mlx import mlx_layer_norm
 
+    import mlx.core as mx
 
-def fused_add_layer_norm(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    epsilon: float = 1e-5,
-) -> None:
-    """Fused residual addition and layer normalization.
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+    w_mlx = to_mlx(weight)
+    b_mlx = to_mlx(bias) if bias is not None else None
 
-    Args:
-        input: Input tensor (modified in-place)
-        residual: Residual tensor to add
-        weight: Scale weight tensor
-        bias: Bias tensor
-        epsilon: Small constant for numerical stability
-    """
-    # Add residual in-place
-    input.add_(residual)
+    # Compute layer norm
+    result = mlx_layer_norm(x_mlx, w_mlx, b_mlx, eps)
 
-    # Apply layer norm
-    normalized_shape = input.shape[-1:]
-    result = torch.nn.functional.layer_norm(
-        input, normalized_shape, weight, bias, epsilon
-    )
-    input.copy_(result)
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)

@@ -1,16 +1,31 @@
 #!/bin/bash
 
-main() {
-  set -eu -o pipefail
+smoke_test() {
+  ./install.sh
 
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # 1. Start vLLM in the background
+  vllm serve Qwen/Qwen3-0.6B
+    
+  # Store the process ID
+  local vllm_pid=$!
 
-  # shellcheck source=lib.sh disable=SC1091
-  source "${script_dir}/lib.sh"
+  # 2. Wait for the server to be ready
+  echo "Waiting for vLLM to start..."
+  local url="http://localhost:8000/health"
+  if ! curl --retry 8 --retry-all-errors -s "$url" > /dev/null; then
+    echo "vLLM failed to start."
 
-  setup_dev_env
+    kill $vllm_pid
 
+    exit 1
+  fi
+
+  echo "Model loaded successfully!"
+
+  kill $vllm_pid
+}
+
+installs() {
   # Install vllm with --no-deps to avoid CUDA dependencies and install its macOS-compatible deps
   section "Installing vllm"
   uv pip install --upgrade --no-deps vllm
@@ -23,7 +38,9 @@ main() {
   if is_apple_silicon; then
     brew install shellcheck
   fi
+}
 
+linters() {
   section "Running shellcheck"
   shellcheck -- *.sh scripts/*.sh
 
@@ -35,12 +52,30 @@ main() {
 
   section "Running mypy type checker"
   mypy vllm_metal
+}
+
+main() {
+  set -eu -o pipefail
+
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # shellcheck source=lib.sh disable=SC1091
+  source "${script_dir}/lib.sh"
+
+  setup_dev_env
+
+  installs
+
+  linters
 
   section "Running tests"
   pytest tests/ -v --tb=short
 
   section "Verifying package import"
   python -c "import vllm_metal; print('vllm_metal imported successfully')"
+
+  smoke_test
 }
 
 main "$@"

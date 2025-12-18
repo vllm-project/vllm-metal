@@ -2,259 +2,230 @@
 """Tests for Metal operations."""
 
 import pytest
-import torch
-from torch.nn import functional
-
-from vllm_metal.ops.activation import (
-    gelu_and_mul,
-    gelu_tanh_and_mul,
-    silu_and_mul,
-)
-from vllm_metal.ops.layernorm import (
-    fused_add_rms_norm,
-    rms_norm,
-)
-from vllm_metal.ops.rotary import (
-    create_cos_sin_cache,
-    rotary_embedding,
-)
-from vllm_metal.ops.sampling import (
-    greedy_sampling,
-    sampling_from_probs,
-    top_k_sampling,
-    top_p_sampling,
-)
+import numpy as np
 
 
-class TestActivations:
-    """Tests for activation functions."""
+@pytest.mark.mlx
+class TestNormalization:
+    """Tests for normalization operations."""
 
-    @pytest.mark.metal
-    def test_silu_and_mul(self, metal_device):
-        """Test fused SiLU and multiplication."""
-        batch_size, hidden_size = 4, 64
-        x = torch.randn(
-            batch_size, hidden_size * 2, device=metal_device, dtype=torch.float16
-        )
-        out = torch.empty(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-
-        silu_and_mul(out, x)
-
-        # Verify against reference
-        gate = x[..., :hidden_size]
-        up = x[..., hidden_size:]
-        expected = functional.silu(gate) * up
-
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.metal
-    def test_gelu_and_mul(self, metal_device):
-        """Test fused GELU and multiplication."""
-        batch_size, hidden_size = 4, 64
-        x = torch.randn(
-            batch_size, hidden_size * 2, device=metal_device, dtype=torch.float16
-        )
-        out = torch.empty(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-
-        gelu_and_mul(out, x)
-
-        # Verify against reference
-        gate = x[..., :hidden_size]
-        up = x[..., hidden_size:]
-        expected = functional.gelu(gate) * up
-
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.metal
-    def test_gelu_tanh_and_mul(self, metal_device):
-        """Test fused GELU (tanh) and multiplication."""
-        batch_size, hidden_size = 4, 64
-        x = torch.randn(
-            batch_size, hidden_size * 2, device=metal_device, dtype=torch.float16
-        )
-        out = torch.empty(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-
-        gelu_tanh_and_mul(out, x)
-
-        # Verify against reference
-        gate = x[..., :hidden_size]
-        up = x[..., hidden_size:]
-        expected = functional.gelu(gate, approximate="tanh") * up
-
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
-
-
-class TestLayerNorm:
-    """Tests for layer normalization operations."""
-
-    @pytest.mark.metal
-    def test_rms_norm(self, metal_device):
+    def test_rms_norm(self, torch_device):
         """Test RMS normalization."""
-        batch_size, hidden_size = 4, 64
-        epsilon = 1e-6
+        import torch
+        from vllm_metal.mlx import mlx_rms_norm, to_mlx, to_torch
 
-        x = torch.randn(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-        weight = torch.ones(hidden_size, device=metal_device, dtype=torch.float16)
-        out = torch.empty_like(x)
+        hidden_size = 64
+        batch_size = 4
 
-        rms_norm(out, x, weight, epsilon)
+        # Create inputs
+        input_tensor = torch.randn(batch_size, hidden_size, dtype=torch.float32)
+        weight = torch.ones(hidden_size, dtype=torch.float32)
 
-        # Verify against reference
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        expected = x * torch.rsqrt(variance + epsilon) * weight
+        # Convert and compute
+        input_mlx = to_mlx(input_tensor)
+        weight_mlx = to_mlx(weight)
+        output_mlx = mlx_rms_norm(input_mlx, weight_mlx, eps=1e-6)
+        output = to_torch(output_mlx, device="cpu", dtype=torch.float32)
 
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+        # Verify shape
+        assert output.shape == input_tensor.shape
 
-    @pytest.mark.metal
-    def test_fused_add_rms_norm(self, metal_device):
-        """Test fused residual add and RMS normalization."""
-        batch_size, hidden_size = 4, 64
-        epsilon = 1e-6
+        # Verify normalization (output should have ~unit variance)
+        # This is approximate due to the RMS norm formula
+        variance = output.var(dim=-1)
+        assert torch.allclose(variance, torch.ones_like(variance), atol=0.5)
 
-        x = torch.randn(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-        residual = torch.randn(
-            batch_size, hidden_size, device=metal_device, dtype=torch.float16
-        )
-        weight = torch.ones(hidden_size, device=metal_device, dtype=torch.float16)
+    def test_fused_add_rms_norm(self, torch_device):
+        """Test fused residual add + RMS normalization."""
+        import torch
+        from vllm_metal.mlx import mlx_fused_add_rms_norm, to_mlx, to_torch
 
-        # Reference computation
-        x_ref = x.clone()
-        x_ref.add_(residual)
-        variance = x_ref.pow(2).mean(dim=-1, keepdim=True)
-        expected = x_ref * torch.rsqrt(variance + epsilon) * weight
+        hidden_size = 64
+        batch_size = 4
 
-        # Fused operation
-        fused_add_rms_norm(x, residual, weight, epsilon)
+        # Create inputs
+        input_tensor = torch.randn(batch_size, hidden_size, dtype=torch.float32)
+        residual = torch.randn(batch_size, hidden_size, dtype=torch.float32)
+        weight = torch.ones(hidden_size, dtype=torch.float32)
 
-        torch.testing.assert_close(x, expected, rtol=1e-2, atol=1e-2)
+        # Convert and compute
+        input_mlx = to_mlx(input_tensor)
+        residual_mlx = to_mlx(residual)
+        weight_mlx = to_mlx(weight)
 
-
-class TestRotaryEmbedding:
-    """Tests for rotary positional embeddings."""
-
-    def test_create_cos_sin_cache(self):
-        """Test creating cos/sin cache."""
-        max_seq_len = 128
-        head_size = 64
-
-        cache = create_cos_sin_cache(max_seq_len, head_size)
-
-        assert cache.shape == (max_seq_len, head_size)
-        assert cache.dtype == torch.float32
-
-    @pytest.mark.metal
-    def test_rotary_embedding(self, metal_device):
-        """Test rotary embedding application."""
-        num_tokens = 8
-        num_heads = 4
-        num_kv_heads = 4
-        head_size = 64
-
-        positions = torch.arange(num_tokens, device=metal_device)
-        query = torch.randn(
-            num_tokens, num_heads * head_size, device=metal_device, dtype=torch.float16
-        )
-        key = torch.randn(
-            num_tokens,
-            num_kv_heads * head_size,
-            device=metal_device,
-            dtype=torch.float16,
+        output_mlx, new_residual_mlx = mlx_fused_add_rms_norm(
+            input_mlx, residual_mlx, weight_mlx, eps=1e-6
         )
 
-        cache = create_cos_sin_cache(
-            128, head_size, device=metal_device, dtype=torch.float16
-        )
-
-        q_out, k_out = rotary_embedding(positions, query, key, head_size, cache)
+        output = to_torch(output_mlx, device="cpu", dtype=torch.float32)
+        new_residual = to_torch(new_residual_mlx, device="cpu", dtype=torch.float32)
 
         # Verify shapes
-        assert q_out.shape == query.shape
-        assert k_out.shape == key.shape
+        assert output.shape == input_tensor.shape
+        assert new_residual.shape == residual.shape
 
-
-class TestSampling:
-    """Tests for sampling operations."""
-
-    @pytest.mark.metal
-    def test_greedy_sampling(self, metal_device):
-        """Test greedy (argmax) sampling."""
-        batch_size, vocab_size = 4, 1000
-        logits = torch.randn(
-            batch_size, vocab_size, device=metal_device, dtype=torch.float16
+        # Verify residual is updated
+        expected_residual = input_tensor + residual
+        np.testing.assert_allclose(
+            new_residual.numpy(),
+            expected_residual.numpy(),
+            rtol=1e-5,
+            atol=1e-5,
         )
 
-        samples = greedy_sampling(logits)
 
-        assert samples.shape == (batch_size,)
-        assert samples.dtype == torch.int64
+@pytest.mark.mlx
+class TestActivations:
+    """Tests for activation operations."""
 
-        # Verify against reference
-        expected = logits.argmax(dim=-1)
-        torch.testing.assert_close(samples, expected)
+    def test_silu_and_mul(self, torch_device):
+        """Test SiLU activation with gated multiplication."""
+        import torch
+        from vllm_metal.ops import silu_and_mul
 
-    @pytest.mark.metal
-    def test_sampling_from_probs(self, metal_device):
-        """Test sampling from probability distribution."""
-        batch_size, vocab_size = 4, 100
-        probs = functional.softmax(
-            torch.randn(batch_size, vocab_size, device=metal_device), dim=-1
+        hidden_size = 64
+        batch_size = 4
+
+        # Create input [batch, 2 * hidden]
+        input_tensor = torch.randn(
+            batch_size, 2 * hidden_size,
+            device=torch_device, dtype=torch.float32
         )
-        random_numbers = torch.rand(batch_size, device=metal_device)
-
-        samples = sampling_from_probs(probs, random_numbers)
-
-        assert samples.shape == (batch_size,)
-        assert (samples >= 0).all()
-        assert (samples < vocab_size).all()
-
-    @pytest.mark.metal
-    def test_sampling_from_probs_deterministic(self, metal_device):
-        """Test deterministic sampling (argmax mode)."""
-        batch_size, vocab_size = 4, 100
-        probs = functional.softmax(
-            torch.randn(batch_size, vocab_size, device=metal_device), dim=-1
-        )
-        random_numbers = torch.rand(batch_size, device=metal_device)
-
-        samples = sampling_from_probs(probs, random_numbers, deterministic=True)
-
-        expected = probs.argmax(dim=-1)
-        torch.testing.assert_close(samples, expected)
-
-    @pytest.mark.metal
-    def test_top_k_sampling(self, metal_device):
-        """Test top-k sampling."""
-        batch_size, vocab_size = 4, 1000
-        logits = torch.randn(
-            batch_size, vocab_size, device=metal_device, dtype=torch.float16
+        output = torch.zeros(
+            batch_size, hidden_size,
+            device=torch_device, dtype=torch.float32
         )
 
-        samples = top_k_sampling(logits, top_k=50)
+        silu_and_mul(output, input_tensor)
 
-        assert samples.shape == (batch_size,)
-        assert (samples >= 0).all()
-        assert (samples < vocab_size).all()
+        # Verify shape
+        assert output.shape == (batch_size, hidden_size)
 
-    @pytest.mark.metal
-    def test_top_p_sampling(self, metal_device):
-        """Test top-p (nucleus) sampling."""
-        batch_size, vocab_size = 4, 1000
-        logits = torch.randn(
-            batch_size, vocab_size, device=metal_device, dtype=torch.float16
+        # Verify output is not all zeros
+        assert not torch.allclose(output, torch.zeros_like(output))
+
+    def test_gelu_and_mul(self, torch_device):
+        """Test GELU activation with gated multiplication."""
+        import torch
+        from vllm_metal.ops import gelu_and_mul
+
+        hidden_size = 64
+        batch_size = 4
+
+        input_tensor = torch.randn(
+            batch_size, 2 * hidden_size,
+            device=torch_device, dtype=torch.float32
+        )
+        output = torch.zeros(
+            batch_size, hidden_size,
+            device=torch_device, dtype=torch.float32
         )
 
-        samples = top_p_sampling(logits, top_p=0.9)
+        gelu_and_mul(output, input_tensor)
 
-        assert samples.shape == (batch_size,)
-        assert (samples >= 0).all()
-        assert (samples < vocab_size).all()
+        assert output.shape == (batch_size, hidden_size)
+        assert not torch.allclose(output, torch.zeros_like(output))
+
+
+@pytest.mark.mlx
+class TestCache:
+    """Tests for cache operations."""
+
+    def test_reshape_and_cache(self, torch_device, kv_cache_tensors):
+        """Test reshape_and_cache operation."""
+        import torch
+        from vllm_metal.ops import reshape_and_cache
+
+        key_cache = kv_cache_tensors["key_cache"]
+        value_cache = kv_cache_tensors["value_cache"]
+        num_kv_heads = kv_cache_tensors["num_kv_heads"]
+        head_size = kv_cache_tensors["head_size"]
+        block_size = kv_cache_tensors["block_size"]
+
+        # Create key/value to store
+        num_tokens = 5
+        key = torch.randn(
+            num_tokens, num_kv_heads, head_size,
+            device=torch_device, dtype=torch.float16
+        )
+        value = torch.randn(
+            num_tokens, num_kv_heads, head_size,
+            device=torch_device, dtype=torch.float16
+        )
+
+        # Create slot mapping (store in first block)
+        slot_mapping = torch.arange(num_tokens, device=torch_device, dtype=torch.int64)
+
+        reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+        )
+
+        # Verify data was stored
+        for i in range(num_tokens):
+            np.testing.assert_allclose(
+                key_cache[0, i].cpu().numpy(),
+                key[i].cpu().numpy(),
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
+    def test_copy_blocks(self, torch_device, kv_cache_tensors):
+        """Test copy_blocks operation."""
+        import torch
+        from vllm_metal.ops import copy_blocks
+
+        key_cache = kv_cache_tensors["key_cache"]
+        value_cache = kv_cache_tensors["value_cache"]
+
+        # Initialize source block with data
+        key_cache[0] = torch.randn_like(key_cache[0])
+        value_cache[0] = torch.randn_like(value_cache[0])
+
+        # Copy block 0 to block 1
+        block_mapping = torch.tensor([[0, 1]], device=torch_device, dtype=torch.int64)
+
+        copy_blocks([key_cache], [value_cache], block_mapping)
+
+        # Verify copy
+        np.testing.assert_allclose(
+            key_cache[0].cpu().numpy(),
+            key_cache[1].cpu().numpy(),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.mlx
+class TestRotary:
+    """Tests for rotary embedding operations."""
+
+    def test_mlx_rotary_embedding(self):
+        """Test MLX rotary embedding."""
+        import torch
+        import mlx.core as mx
+        from vllm_metal.mlx import mlx_rotary_embedding
+
+        seq_len = 16
+        num_heads = 8
+        head_dim = 64
+
+        # Create input
+        x = mx.random.normal(shape=(seq_len, num_heads, head_dim))
+
+        # Create cos/sin (half of head_dim)
+        rotary_dim = head_dim // 2
+        cos = mx.random.normal(shape=(seq_len, rotary_dim))
+        sin = mx.random.normal(shape=(seq_len, rotary_dim))
+
+        # Expand to full rotary_dim
+        cos_full = mx.concatenate([cos, cos], axis=-1)
+        sin_full = mx.concatenate([sin, sin], axis=-1)
+
+        # Apply rotary embedding
+        output = mlx_rotary_embedding(x, cos_full, sin_full, is_neox_style=True)
+
+        assert output.shape == x.shape

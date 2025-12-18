@@ -1,26 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal attention implementation for vLLM Metal backend."""
+"""Metal attention implementation using MLX."""
 
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
-from torch.nn import functional
 
 from vllm_metal._compat import AttentionImpl, AttentionType, init_logger
 from vllm_metal.attention.backend import MetalAttentionMetadata
+from vllm_metal.mlx import (
+    TensorBridge,
+    mlx_paged_attention,
+    mlx_scaled_dot_product_attention,
+    to_mlx,
+    to_torch,
+)
 
 logger = init_logger(__name__)
 
 
 class MetalAttentionImpl(AttentionImpl):
-    """Metal-based attention implementation.
+    """Metal attention implementation using MLX.
 
-    This implementation uses PyTorch's scaled_dot_product_attention
-    which is optimized for Apple Silicon via MPS backend.
-
-    Note: Custom Metal kernels (rust_ext/shaders/sdpa_vector.metal) are
-    compiled but not yet integrated. The SDPA kernel dispatch in
-    rust_ext/src/metal/kernels/attention.rs is a stub.
+    This implementation provides efficient attention computation on
+    Apple Silicon by using MLX's optimized SDPA. It handles both
+    prefill (variable length) and decode (single token) phases.
     """
 
     def __init__(
@@ -28,378 +31,362 @@ class MetalAttentionImpl(AttentionImpl):
         num_heads: int,
         head_size: int,
         scale: float,
-        num_kv_heads: int | None = None,
-        alibi_slopes: list[float] | None = None,
-        sliding_window: int | None = None,
+        num_kv_heads: int,
+        alibi_slopes: Optional[List[float]] = None,
+        sliding_window: Optional[int] = None,
         kv_cache_dtype: str = "auto",
-        blocksparse_params: dict[str, Any] | None = None,
-        logits_soft_cap: float | None = None,
-        attn_type: AttentionType = AttentionType.DECODER,
-        **kwargs,
-    ) -> None:
+        blocksparse_params: Optional[Dict[str, Any]] = None,
+        logits_soft_cap: Optional[float] = None,
+        attn_type: str = "decoder",
+    ):
         """Initialize Metal attention.
 
         Args:
-            num_heads: Number of query attention heads.
-            head_size: Size of each attention head.
-            scale: Scaling factor for attention scores.
-            num_kv_heads: Number of key/value attention heads.
-            alibi_slopes: ALiBi slopes for position encoding.
-            sliding_window: Sliding window size for attention.
+            num_heads: Number of attention heads.
+            head_size: Size of each head.
+            scale: Attention scale factor.
+            num_kv_heads: Number of key-value heads (for GQA).
+            alibi_slopes: Optional ALiBi slopes.
+            sliding_window: Optional sliding window size.
             kv_cache_dtype: Data type for KV cache.
-            blocksparse_params: Block sparse attention parameters.
-            logits_soft_cap: Soft cap for attention logits.
-            attn_type: Type of attention (decoder, encoder, etc.).
+            blocksparse_params: Block sparse parameters (not supported).
+            logits_soft_cap: Logits soft cap (not supported).
+            attn_type: Attention type (decoder, encoder, etc.).
         """
         self.num_heads = num_heads
         self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        self.sliding_window = sliding_window
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
         self.alibi_slopes = alibi_slopes
+        self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
-        self.logits_soft_cap = logits_soft_cap
         self.attn_type = attn_type
 
-        # Calculate number of query groups for GQA
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        # GQA setup
+        self.num_queries_per_kv = num_heads // num_kv_heads
 
-        self.alibi_slopes_tensor: torch.Tensor | None
-        if alibi_slopes is not None:
-            self.alibi_slopes_tensor = torch.tensor(alibi_slopes, dtype=torch.float32)
-        else:
-            self.alibi_slopes_tensor = None
-
+        # Validate unsupported features
         if blocksparse_params is not None:
+            logger.warning("Block sparse attention not supported on Metal")
+        if logits_soft_cap is not None:
+            logger.warning("Logits soft cap not supported on Metal")
+        if sliding_window is not None:
             logger.warning(
-                "Block sparse attention is not supported on Metal, "
-                "falling back to dense attention"
+                "Sliding window attention has limited support on Metal"
             )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Process weights after model loading.
-
-        This is called after the model weights are loaded to perform
-        any necessary post-processing. For Metal attention, we just
-        ensure alibi slopes are on the correct device/dtype.
-        """
-        if self.alibi_slopes_tensor is not None:
-            self.alibi_slopes_tensor = self.alibi_slopes_tensor.to(dtype=act_dtype)
+        logger.debug(
+            f"MetalAttentionImpl initialized: "
+            f"num_heads={num_heads}, head_size={head_size}, "
+            f"num_kv_heads={num_kv_heads}, scale={scale}"
+        )
 
     def forward(
         self,
-        layer,
+        layer: Any,  # AttentionLayer, but we avoid import cycle
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor | None,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
         attn_metadata: MetalAttentionMetadata,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-        output: torch.Tensor | None = None,
-        **kwargs,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for attention.
 
         Args:
-            layer: The Attention layer calling this impl (vLLM interface requirement)
-            query: Query tensor of shape [num_tokens, num_heads * head_size]
-            key: Key tensor of shape [num_tokens, num_kv_heads * head_size]
-            value: Value tensor of shape [num_tokens, num_kv_heads * head_size]
-            kv_cache: KV cache tensor
-            attn_metadata: Attention metadata
-            k_scale: Key scaling factor
-            v_scale: Value scaling factor
-            output: Optional output tensor to write to
+            layer: The attention layer (unused on Metal).
+            query: Query tensor [num_tokens, num_heads, head_size].
+            key: Key tensor [num_tokens, num_kv_heads, head_size].
+            value: Value tensor [num_tokens, num_kv_heads, head_size].
+            kv_cache: Tuple of (key_cache, value_cache).
+            attn_metadata: Attention metadata.
+            output: Optional pre-allocated output tensor.
 
         Returns:
-            Output tensor of shape [num_tokens, num_heads * head_size]
+            Attention output [num_tokens, num_heads, head_size].
         """
-        num_tokens = query.shape[0]
+        key_cache, value_cache = kv_cache
 
-        # Reshape query, key, value for attention
-        # [num_tokens, num_heads, head_size]
-        query = query.view(num_tokens, self.num_heads, self.head_size)
-        key = key.view(num_tokens, self.num_kv_heads, self.head_size)
-        value = value.view(num_tokens, self.num_kv_heads, self.head_size)
+        # Store new K/V into cache
+        if attn_metadata.slot_mapping is not None:
+            self._store_kv_cache(
+                key, value, key_cache, value_cache, attn_metadata.slot_mapping
+            )
 
-        # Handle prefill and decode separately
-        if attn_metadata.is_prompt and attn_metadata.num_prefill_tokens > 0:
-            # Prefill phase
-            out = self._prefill_attention(query, key, value, kv_cache, attn_metadata)
+        # Route to appropriate attention implementation
+        if attn_metadata.is_all_prefill:
+            attn_output = self._prefill_attention(
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+        elif attn_metadata.is_all_decode:
+            attn_output = self._decode_attention(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+            )
         else:
-            # Decode phase
-            out = self._decode_attention(query, key, value, kv_cache, attn_metadata)
+            # Mixed batch - handle prefill and decode separately
+            attn_output = self._mixed_attention(
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata,
+            )
 
-        # Reshape output to [num_tokens, num_heads * head_size]
-        out = out.view(num_tokens, self.num_heads * self.head_size)
-
+        # Copy to output if provided
         if output is not None:
-            output.copy_(out)
+            output.copy_(attn_output)
             return output
 
-        return out
+        return attn_output
+
+    def _store_kv_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Store key and value tensors into the cache.
+
+        Args:
+            key: Key tensor [num_tokens, num_kv_heads, head_size].
+            value: Value tensor [num_tokens, num_kv_heads, head_size].
+            key_cache: Key cache [num_blocks, block_size, num_kv_heads, head_size].
+            value_cache: Value cache [num_blocks, block_size, num_kv_heads, head_size].
+            slot_mapping: Slot indices [num_tokens].
+        """
+        block_size = key_cache.shape[1]
+
+        # Compute block indices and offsets
+        block_indices = slot_mapping // block_size
+        block_offsets = slot_mapping % block_size
+
+        # Store using advanced indexing
+        # This works on MPS since PyTorch handles it
+        for i in range(key.shape[0]):
+            block_idx = int(block_indices[i])
+            offset = int(block_offsets[i])
+            key_cache[block_idx, offset] = key[i]
+            value_cache[block_idx, offset] = value[i]
 
     def _prefill_attention(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor | None,
         attn_metadata: MetalAttentionMetadata,
     ) -> torch.Tensor:
-        """Attention computation for prefill phase.
+        """Compute attention for prefill phase using MLX.
 
-        Uses PyTorch's scaled_dot_product_attention for efficiency.
+        Args:
+            query: Query tensor [total_tokens, num_heads, head_size].
+            key: Key tensor [total_tokens, num_kv_heads, head_size].
+            value: Value tensor [total_tokens, num_kv_heads, head_size].
+            attn_metadata: Attention metadata.
+
+        Returns:
+            Attention output [total_tokens, num_heads, head_size].
         """
-        # Store KV to cache if available
-        if kv_cache is not None and attn_metadata.slot_mapping is not None:
-            self._store_kv_cache(key, value, kv_cache, attn_metadata.slot_mapping)
+        import mlx.core as mx
 
-        # Process each sequence in the batch
-        if attn_metadata.seq_lens is None:
-            # Single sequence case
-            return self._compute_attention(query, key, value, is_causal=True)
+        # Convert to MLX
+        q_mlx = to_mlx(query)
+        k_mlx = to_mlx(key)
+        v_mlx = to_mlx(value)
 
-        # Multiple sequences with variable lengths
+        # Process each sequence
         outputs = []
-        start_idx = 0
+        seq_lens = attn_metadata.seq_lens
+        query_start_loc = attn_metadata.query_start_loc
 
-        for seq_len in attn_metadata.seq_lens:
-            q = query[start_idx : start_idx + seq_len]
-            k = key[start_idx : start_idx + seq_len]
-            v = value[start_idx : start_idx + seq_len]
+        for i in range(len(seq_lens)):
+            start = int(query_start_loc[i])
+            end = int(query_start_loc[i + 1])
+            seq_len = int(seq_lens[i])
 
-            out = self._compute_attention(q, k, v, is_causal=True)
+            if end <= start:
+                continue
+
+            # Get Q, K, V for this sequence
+            q = q_mlx[start:end]  # [seq_len, num_heads, head_size]
+            k = k_mlx[start:end]
+            v = v_mlx[start:end]
+
+            # Expand KV for GQA
+            if self.num_kv_heads != self.num_heads:
+                k = mx.repeat(k, self.num_queries_per_kv, axis=1)
+                v = mx.repeat(v, self.num_queries_per_kv, axis=1)
+
+            # Reshape for SDPA: [1, num_heads, seq_len, head_size]
+            q = q.transpose(1, 0, 2)[None, ...]
+            k = k.transpose(1, 0, 2)[None, ...]
+            v = v.transpose(1, 0, 2)[None, ...]
+
+            # Create causal mask
+            mask = mx.triu(
+                mx.full((seq_len, seq_len), float("-inf")),
+                k=1,
+            )
+
+            # Compute attention
+            out = mlx_scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
+
+            # Reshape back: [seq_len, num_heads, head_size]
+            out = out[0].transpose(1, 0, 2)
             outputs.append(out)
-            start_idx += seq_len
 
-        return torch.cat(outputs, dim=0)
+        # Concatenate and convert back to PyTorch
+        if outputs:
+            result = mx.concatenate(outputs, axis=0)
+            return to_torch(result, device=query.device, dtype=query.dtype)
+        else:
+            return query.new_zeros(query.shape)
 
     def _decode_attention(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor | None,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         attn_metadata: MetalAttentionMetadata,
     ) -> torch.Tensor:
-        """Attention computation for decode phase.
+        """Compute attention for decode phase using MLX paged attention.
 
-        Uses paged attention with KV cache.
+        Args:
+            query: Query tensor [batch, num_heads, head_size].
+            key_cache: Key cache [num_blocks, block_size, num_kv_heads, head_size].
+            value_cache: Value cache [num_blocks, block_size, num_kv_heads, head_size].
+            attn_metadata: Attention metadata.
+
+        Returns:
+            Attention output [batch, num_heads, head_size].
         """
-        if kv_cache is None:
-            raise ValueError("KV cache is required for decode attention")
+        import mlx.core as mx
 
-        # Store new KV to cache
-        if attn_metadata.slot_mapping is not None:
-            self._store_kv_cache(key, value, kv_cache, attn_metadata.slot_mapping)
+        # Convert to MLX
+        q_mlx = to_mlx(query)
+        k_cache_mlx = to_mlx(key_cache)
+        v_cache_mlx = to_mlx(value_cache)
+        block_table_mlx = to_mlx(attn_metadata.block_table)
+        seq_lens_mlx = to_mlx(attn_metadata.seq_lens)
 
-        # Read from paged KV cache
-        batch_size = query.shape[0]
-        outputs = []
+        # Add sequence dimension: [batch, num_heads, 1, head_size]
+        if q_mlx.ndim == 3:
+            q_mlx = q_mlx[:, :, None, :]
 
-        for i in range(batch_size):
-            # Get block table for this sequence
-            if attn_metadata.block_tables is not None:
-                block_table = attn_metadata.block_tables[i]
-            else:
-                continue
+        # ALiBi slopes if present
+        alibi_mlx = None
+        if self.alibi_slopes is not None:
+            alibi_mlx = mx.array(self.alibi_slopes)
 
-            assert attn_metadata.context_lens_tensor is not None
-            context_len = int(attn_metadata.context_lens_tensor[i].item()) + 1
+        # Compute paged attention
+        output = mlx_paged_attention(
+            q_mlx,
+            k_cache_mlx,
+            v_cache_mlx,
+            block_table_mlx,
+            seq_lens_mlx,
+            scale=self.scale,
+            alibi_slopes=alibi_mlx,
+        )
 
-            # Gather keys and values from cache
-            k_cache, v_cache = self._gather_from_cache(
-                kv_cache, block_table, context_len
-            )
+        # Remove sequence dimension: [batch, num_heads, head_size]
+        if output.shape[2] == 1:
+            output = output[:, :, 0, :]
 
-            # Single query token attention against cached KV
-            q = query[i : i + 1]  # [1, num_heads, head_size]
+        return to_torch(output, device=query.device, dtype=query.dtype)
 
-            # Expand KV for GQA if needed
-            if self.num_queries_per_kv > 1:
-                k_cache = k_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
-                v_cache = v_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-            out = self._compute_attention(q, k_cache, v_cache, is_causal=False)
-            outputs.append(out)
-
-        return torch.cat(outputs, dim=0)
-
-    def _compute_attention(
+    def _mixed_attention(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        is_causal: bool = True,
-        attn_mask: torch.Tensor | None = None,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
     ) -> torch.Tensor:
-        """Compute scaled dot-product attention.
+        """Handle mixed prefill/decode batch.
 
-        Uses PyTorch's optimized SDPA which works well on Metal.
-        """
-        # Input shapes: [seq_len, num_heads, head_size]
-        # SDPA expects: [batch, num_heads, seq_len, head_size]
-        query = query.transpose(0, 1).unsqueeze(0)
-        key = key.transpose(0, 1).unsqueeze(0)
-        value = value.transpose(0, 1).unsqueeze(0)
-
-        # Expand KV for GQA if needed
-        if self.num_queries_per_kv > 1 and key.shape[1] != query.shape[1]:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-        # Apply attention with optional sliding window
-        if self.sliding_window is not None and is_causal:
-            # Create sliding window mask
-            seq_len = query.shape[2]
-            attn_mask = self._create_sliding_window_mask(
-                seq_len, self.sliding_window, query.device, query.dtype
-            )
-            is_causal = False
-
-        # Apply alibi slopes if configured
-        if self.alibi_slopes_tensor is not None:
-            attn_mask = self._apply_alibi(
-                query.shape[2],
-                key.shape[2],
-                query.device,
-                query.dtype,
-                attn_mask,
-            )
-            is_causal = False
-
-        # Use PyTorch's SDPA
-        out = functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=is_causal,
-            scale=self.scale,
-        )
-
-        # Apply logits soft cap if needed
-        if self.logits_soft_cap is not None:
-            # Note: SDPA doesn't support soft cap directly
-            # This would need custom implementation
-            pass
-
-        # Reshape back: [batch, num_heads, seq_len, head_size] -> [seq_len, num_heads, head_size]
-        out = out.squeeze(0).transpose(0, 1)
-
-        return out
-
-    def _store_kv_cache(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Store key and value tensors into the KV cache.
-
-        KV cache shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
-        """
-        num_tokens = key.shape[0]
-
-        for i in range(num_tokens):
-            slot = int(slot_mapping[i].item())
-            block_idx = slot // kv_cache.shape[2]
-            block_offset = slot % kv_cache.shape[2]
-
-            # Store key
-            kv_cache[block_idx, 0, block_offset] = key[i]
-            # Store value
-            kv_cache[block_idx, 1, block_offset] = value[i]
-
-    def _gather_from_cache(
-        self,
-        kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        context_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather keys and values from the paged KV cache.
+        This is less common but can happen during continuous batching.
 
         Args:
-            kv_cache: KV cache tensor
-            block_table: Block indices for this sequence
-            context_len: Context length to gather
+            query: Query tensor.
+            key: Key tensor.
+            value: Value tensor.
+            key_cache: Key cache.
+            value_cache: Value cache.
+            attn_metadata: Attention metadata.
 
         Returns:
-            Tuple of (keys, values) tensors
+            Attention output.
         """
-        block_size = kv_cache.shape[2]
+        # For simplicity, fall back to PyTorch SDPA for mixed batches
+        # This is rare in practice
+        logger.debug("Mixed batch attention - using PyTorch SDPA fallback")
 
-        # Calculate number of blocks needed
-        num_blocks_needed = (context_len + block_size - 1) // block_size
+        return self._pytorch_attention(query, key, value, attn_metadata)
 
-        keys = []
-        values = []
-
-        tokens_gathered = 0
-        for block_idx in range(num_blocks_needed):
-            if block_idx >= len(block_table):
-                break
-
-            physical_block = int(block_table[block_idx].item())
-            tokens_in_block = min(block_size, context_len - tokens_gathered)
-
-            # Gather from this block
-            k_block = kv_cache[physical_block, 0, :tokens_in_block]
-            v_block = kv_cache[physical_block, 1, :tokens_in_block]
-
-            keys.append(k_block)
-            values.append(v_block)
-            tokens_gathered += tokens_in_block
-
-        # Concatenate all blocks
-        keys_tensor = torch.cat(keys, dim=0)  # [context_len, num_kv_heads, head_size]
-        values_tensor = torch.cat(values, dim=0)
-
-        return keys_tensor, values_tensor
-
-    def _create_sliding_window_mask(
+    def _pytorch_attention(
         self,
-        seq_len: int,
-        window_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
     ) -> torch.Tensor:
-        """Create a sliding window attention mask."""
-        mask = torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
-        for i in range(seq_len):
-            start = max(0, i - window_size + 1)
-            mask[i, start : i + 1] = 0
-        return mask
+        """Fallback to PyTorch SDPA.
 
-    def _apply_alibi(
-        self,
-        query_len: int,
-        key_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        existing_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Apply ALiBi position bias to attention mask."""
-        assert self.alibi_slopes_tensor is not None, "ALiBi slopes must be set"
-        alibi_slopes = self.alibi_slopes_tensor.to(device=device, dtype=dtype)
+        Args:
+            query: Query tensor.
+            key: Key tensor.
+            value: Value tensor.
+            attn_metadata: Attention metadata.
 
-        # Create position bias
-        # Shape: [num_heads, query_len, key_len]
-        positions = torch.arange(key_len, device=device, dtype=dtype)
-        query_positions = torch.arange(query_len, device=device, dtype=dtype)
+        Returns:
+            Attention output.
+        """
+        # Reshape for PyTorch SDPA
+        # [total_tokens, num_heads, head_size] -> [batch, num_heads, seq, head_size]
+        # This is a simplified implementation for edge cases
 
-        # Distance matrix
-        distances = query_positions.unsqueeze(1) - positions.unsqueeze(0)
-        distances = distances.clamp(max=0)  # Only attend to past positions
+        # Process per sequence
+        outputs = []
+        seq_lens = attn_metadata.seq_lens
+        query_start_loc = attn_metadata.query_start_loc
 
-        # Apply slopes
-        alibi_bias = alibi_slopes.unsqueeze(1).unsqueeze(2) * distances.unsqueeze(0)
+        if query_start_loc is not None:
+            for i in range(len(seq_lens)):
+                start = int(query_start_loc[i])
+                end = int(query_start_loc[i + 1])
 
-        if existing_mask is not None:
-            alibi_bias = alibi_bias + existing_mask
+                if end <= start:
+                    continue
 
-        return alibi_bias
+                q = query[start:end].transpose(0, 1).unsqueeze(0)
+                k = key[start:end].transpose(0, 1).unsqueeze(0)
+                v = value[start:end].transpose(0, 1).unsqueeze(0)
+
+                # Expand for GQA
+                if self.num_kv_heads != self.num_heads:
+                    k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                    v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, scale=self.scale, is_causal=True
+                )
+
+                out = out.squeeze(0).transpose(0, 1)
+                outputs.append(out)
+
+            if outputs:
+                return torch.cat(outputs, dim=0)
+
+        return query.new_zeros(query.shape)

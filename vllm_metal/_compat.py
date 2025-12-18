@@ -1,179 +1,103 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility layer for vLLM imports.
 
-This module provides compatibility when vLLM is not installed,
-allowing the core Metal operations to be tested standalone.
+This module provides version-compatible imports from vLLM to handle
+API changes across different vLLM versions (0.12+).
 """
 
-from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING
 
+# Core vLLM imports that are stable across versions
+try:
+    from vllm.config import VllmConfig
+except ImportError:
+    VllmConfig = None  # type: ignore[misc, assignment]
+
+# Platform imports
+try:
+    from vllm.platforms import Platform, PlatformEnum
+except ImportError:
+    # Fallback for older versions
+    try:
+        from vllm.platforms.interface import Platform, PlatformEnum
+    except ImportError:
+        Platform = object  # type: ignore[misc, assignment]
+        PlatformEnum = None  # type: ignore[misc, assignment]
+
+# Logger import
 try:
     from vllm.logger import init_logger
-    from vllm.platforms import Platform, PlatformEnum
-
-    VLLM_AVAILABLE = True
 except ImportError:
-    VLLM_AVAILABLE = False
+    import logging
 
-    class PlatformEnum(Enum):  # type: ignore[no-redef]
-        """Platform enumeration when vLLM is not available."""
-
-        CUDA = "cuda"
-        ROCM = "rocm"
-        TPU = "tpu"
-        XPU = "xpu"
-        CPU = "cpu"
-        OOT = "oot"
-        UNSPECIFIED = "unspecified"
-
-    class Platform:  # type: ignore[no-redef]
-        """Base Platform class when vLLM is not available."""
-
-        _enum = PlatformEnum.UNSPECIFIED
-        device_name: str = ""
-        device_type: str = ""
-
-        @classmethod
-        def get_device_name(cls, device_id: int = 0) -> str:
-            return cls.device_name
-
-        @classmethod
-        def get_device_uuid(cls, device_id: int = 0) -> str:
-            return ""
-
-        @classmethod
-        def get_device_total_memory(cls, device_id: int = 0) -> int:
-            return 0
-
-        @classmethod
-        def get_device_capability(cls, device_id: int = 0) -> Any | None:
-            return None
-
-    def init_logger(name: str):
-        """Simple logger when vLLM is not available."""
-        import logging
-
+    def init_logger(name: str) -> logging.Logger:
+        """Fallback logger initialization."""
         logger = logging.getLogger(name)
         if not logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                )
             )
-            handler.setFormatter(formatter)
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
         return logger
 
 
+# Attention backend imports
 try:
     from vllm.attention.backends.abstract import (
         AttentionBackend,
         AttentionImpl,
         AttentionMetadata,
-        AttentionMetadataBuilder,
         AttentionType,
     )
 except ImportError:
-    from dataclasses import dataclass
-    from enum import auto
+    AttentionBackend = object  # type: ignore[misc, assignment]
+    AttentionImpl = object  # type: ignore[misc, assignment]
+    AttentionMetadata = object  # type: ignore[misc, assignment]
+    AttentionType = None  # type: ignore[misc, assignment]
 
-    class AttentionType(Enum):  # type: ignore[no-redef]
-        """Attention type when vLLM is not available."""
-
-        DECODER = auto()
-        ENCODER = auto()
-        ENCODER_DECODER = auto()
-
-    @dataclass
-    class AttentionMetadata:  # type: ignore[no-redef]
-        """Base attention metadata when vLLM is not available."""
-
-        pass
-
-    class AttentionMetadataBuilder:  # type: ignore[no-redef]
-        """Base metadata builder when vLLM is not available."""
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __call__(self, *args, **kwargs):
-            pass
-
-        def build(self, *args, **kwargs):
-            pass
-
-    class AttentionImpl:  # type: ignore[no-redef]
-        """Base attention implementation when vLLM is not available."""
-
-        def forward(self, *args, **kwargs):
-            raise NotImplementedError
-
-    class AttentionBackend:  # type: ignore[no-redef]
-        """Base attention backend when vLLM is not available."""
-
-        @staticmethod
-        def get_name() -> str:
-            return "UNKNOWN"
-
-
+# Worker imports
 try:
-    from vllm.sequence import ExecuteModelRequest, SequenceGroupMetadata
+    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 except ImportError:
+    try:
+        from vllm.worker.worker import Worker as GPUWorker
+    except ImportError:
+        GPUWorker = object  # type: ignore[misc, assignment]
 
-    @dataclass
-    class SequenceGroupMetadata:  # type: ignore[no-redef]
-        """Sequence group metadata when vLLM is not available."""
-
-        is_prompt: bool = False
-        seq_data: dict[Any, Any] | None = None
-        block_tables: dict[Any, Any] | None = None
-
-    @dataclass
-    class ExecuteModelRequest:  # type: ignore[no-redef]
-        """Execute model request when vLLM is not available."""
-
-        seq_group_metadata_list: list[Any] | None = None
-
-
+# Model runner imports
 try:
-    from vllm.worker.worker_base import WorkerBase, WorkerInput
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 except ImportError:
+    try:
+        from vllm.worker.model_runner import ModelRunner as GPUModelRunner
+    except ImportError:
+        GPUModelRunner = object  # type: ignore[misc, assignment]
 
-    class WorkerInput:  # type: ignore[no-redef]
-        """Worker input when vLLM is not available."""
-
-        pass
-
-    class WorkerBase:  # type: ignore[no-redef]
-        """Worker base when vLLM is not available."""
-
-        pass
-
-
+# Compilation config imports (for disabling CUDA graphs)
 try:
-    from vllm.model_executor.model_loader.loader import BaseModelLoader
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
 except ImportError:
+    CompilationMode = None  # type: ignore[misc, assignment]
+    CUDAGraphMode = None  # type: ignore[misc, assignment]
 
-    class BaseModelLoader:  # type: ignore[no-redef]
-        """Base model loader when vLLM is not available."""
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig as VllmConfigType
 
-        def __init__(self, load_config):
-            self.load_config = load_config
-
-        def load_model(self, *args, **kwargs):
-            raise NotImplementedError
-
-
-try:
-    from vllm.config import VllmConfig
-except ImportError:
-
-    @dataclass
-    class VllmConfig:  # type: ignore[no-redef]
-        """vLLM config when vLLM is not available."""
-
-        model_config: Any = None
-        cache_config: Any = None
-        parallel_config: Any = None
-        scheduler_config: Any = None
+__all__ = [
+    "VllmConfig",
+    "Platform",
+    "PlatformEnum",
+    "init_logger",
+    "AttentionBackend",
+    "AttentionImpl",
+    "AttentionMetadata",
+    "AttentionType",
+    "GPUWorker",
+    "GPUModelRunner",
+    "CompilationMode",
+    "CUDAGraphMode",
+]

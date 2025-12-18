@@ -1,92 +1,179 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal-compatible penalties and temperature using PyTorch instead of Triton."""
+"""Metal-compatible penalty and temperature application.
+
+This module provides PyTorch/MLX implementations of penalty functions
+that replace Triton kernels on the Metal backend.
+"""
 
 import torch
-from vllm.v1.worker.gpu.sample.metadata import SamplingMetadata
 
 
 def apply_penalties_and_temperature(
     logits: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> None:
-    """PyTorch implementation of apply_penalties_and_temperature.
+    temperatures: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    bin_counts: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Apply penalties and temperature to logits.
 
-    Applies repetition, frequency, and presence penalties, as well as temperature
-    scaling to the logits tensor.
+    This function applies various sampling penalties and temperature
+    scaling to logits for controlled text generation.
+
+    Args:
+        logits: Raw model logits [batch_size, vocab_size].
+        temperatures: Temperature values [batch_size].
+        presence_penalties: Presence penalty values [batch_size].
+        frequency_penalties: Frequency penalty values [batch_size].
+        repetition_penalties: Repetition penalty values [batch_size].
+        output_token_ids: Previously generated tokens [batch_size, max_len].
+        bin_counts: Token frequency counts [batch_size, vocab_size].
+        vocab_size: Size of the vocabulary.
+
+    Returns:
+        Modified logits with penalties and temperature applied.
     """
-    num_reqs = logits.shape[0]
+    batch_size = logits.shape[0]
+    device = logits.device
 
-    for batch_idx in range(num_reqs):
-        rep_penalty = sampling_metadata.repetition_penalty[batch_idx].item()
-        freq_penalty = sampling_metadata.frequency_penalty[batch_idx].item()
-        pres_penalty = sampling_metadata.presence_penalty[batch_idx].item()
-        temperature = sampling_metadata.temperature[batch_idx].item()
+    # Apply temperature scaling
+    # Temperature of 0 means greedy (handled separately)
+    temp_mask = temperatures > 0
+    if temp_mask.any():
+        logits[temp_mask] = logits[temp_mask] / temperatures[temp_mask].unsqueeze(-1)
 
-        if temperature == 0.0:
-            temperature = 1.0
+    # Apply repetition penalty
+    # Repetition penalty multiplies logits of previously seen tokens
+    rep_mask = repetition_penalties != 1.0
+    if rep_mask.any():
+        for i in range(batch_size):
+            if repetition_penalties[i] != 1.0:
+                # Get unique tokens that have been generated
+                seen_tokens = output_token_ids[i][output_token_ids[i] >= 0].unique()
 
-        use_rep_penalty = rep_penalty != 1.0
-        use_freq_penalty = freq_penalty != 0.0
-        use_pres_penalty = pres_penalty != 0.0
-        use_penalty = use_rep_penalty or use_freq_penalty or use_pres_penalty
-        use_temperature = temperature != 1.0
+                if len(seen_tokens) > 0:
+                    penalty = repetition_penalties[i]
 
-        if not (use_penalty or use_temperature):
-            continue
+                    # Apply penalty: divide positive logits, multiply negative
+                    for token in seen_tokens:
+                        if token < vocab_size:
+                            if logits[i, token] > 0:
+                                logits[i, token] = logits[i, token] / penalty
+                            else:
+                                logits[i, token] = logits[i, token] * penalty
 
-        # Get logits for this request
-        req_logits = logits[batch_idx]
+    # Apply presence penalty
+    # Presence penalty subtracts from logits of tokens that appear
+    pres_mask = presence_penalties != 0.0
+    if pres_mask.any():
+        for i in range(batch_size):
+            if presence_penalties[i] != 0.0:
+                # Create presence mask from bin_counts
+                present = bin_counts[i] > 0
+                logits[i] = logits[i] - presence_penalties[i] * present.float()
 
-        if use_penalty:
-            req_state_idx = int(sampling_metadata.idx_mapping[batch_idx].item())
-            output_bin_counts = sampling_metadata.output_bin_counts[req_state_idx]
-            output_bin_mask = output_bin_counts > 0
+    # Apply frequency penalty
+    # Frequency penalty subtracts proportionally to occurrence count
+    freq_mask = frequency_penalties != 0.0
+    if freq_mask.any():
+        for i in range(batch_size):
+            if frequency_penalties[i] != 0.0:
+                logits[i] = logits[i] - frequency_penalties[i] * bin_counts[i].float()
 
-            # Apply repetition penalty
-            if use_rep_penalty:
-                prompt_bin_mask = sampling_metadata.prompt_bin_mask[req_state_idx]
-                # Unpack the bitmask
-                vocab_size = logits.shape[1]
-                unpacked_mask = torch.zeros(
-                    vocab_size, dtype=torch.bool, device=logits.device
-                )
+    return logits
 
-                # Unpack bits from the packed mask
-                num_packed = prompt_bin_mask.shape[0]
-                for i in range(num_packed):
-                    packed_val = int(prompt_bin_mask[i].item())
-                    for bit in range(32):
-                        token_idx = i * 32 + bit
-                        if token_idx < vocab_size:
-                            if (packed_val >> bit) & 1:
-                                unpacked_mask[token_idx] = True
 
-                # Combine prompt and output masks
-                combined_mask = unpacked_mask | output_bin_mask[:vocab_size].bool()
+def apply_temperature(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> torch.Tensor:
+    """Apply temperature scaling to logits.
 
-                # Apply repetition penalty
-                # If logits are positive, divide by penalty; otherwise multiply by penalty
-                positive_mask = req_logits > 0
-                penalty_scale = torch.where(
-                    positive_mask, 1.0 / rep_penalty, rep_penalty
-                )
-                penalty_scale = torch.where(
-                    combined_mask, penalty_scale, torch.ones_like(penalty_scale)
-                )
-                req_logits.mul_(penalty_scale)
+    Args:
+        logits: Raw logits [batch_size, vocab_size].
+        temperatures: Temperature values [batch_size].
 
-            # Apply frequency penalty
-            if use_freq_penalty:
-                req_logits.sub_(
-                    freq_penalty * output_bin_counts[: req_logits.shape[0]].float()
-                )
+    Returns:
+        Temperature-scaled logits.
+    """
+    # Handle temperature = 0 (greedy) separately
+    temp_mask = temperatures > 0
+    if temp_mask.any():
+        logits[temp_mask] = logits[temp_mask] / temperatures[temp_mask].unsqueeze(-1)
 
-            # Apply presence penalty
-            if use_pres_penalty:
-                req_logits.sub_(
-                    pres_penalty * output_bin_mask[: req_logits.shape[0]].float()
-                )
+    return logits
 
-        # Apply temperature
-        if use_temperature:
-            req_logits.div_(temperature)
+
+def apply_top_k(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+) -> torch.Tensor:
+    """Apply top-k filtering to logits.
+
+    Args:
+        logits: Logits tensor [batch_size, vocab_size].
+        top_k: Top-k values [batch_size].
+
+    Returns:
+        Filtered logits with non-top-k values set to -inf.
+    """
+    batch_size = logits.shape[0]
+    vocab_size = logits.shape[1]
+
+    for i in range(batch_size):
+        k = int(top_k[i])
+        if k > 0 and k < vocab_size:
+            # Get threshold value
+            top_k_values, _ = torch.topk(logits[i], k)
+            threshold = top_k_values[-1]
+
+            # Mask out values below threshold
+            logits[i] = torch.where(
+                logits[i] >= threshold,
+                logits[i],
+                torch.full_like(logits[i], float("-inf")),
+            )
+
+    return logits
+
+
+def apply_top_p(
+    logits: torch.Tensor,
+    top_p: torch.Tensor,
+) -> torch.Tensor:
+    """Apply top-p (nucleus) filtering to logits.
+
+    Args:
+        logits: Logits tensor [batch_size, vocab_size].
+        top_p: Top-p values [batch_size].
+
+    Returns:
+        Filtered logits with low-probability values set to -inf.
+    """
+    batch_size = logits.shape[0]
+
+    for i in range(batch_size):
+        p = float(top_p[i])
+        if p < 1.0:
+            # Sort logits and get cumulative probabilities
+            sorted_logits, sorted_indices = torch.sort(logits[i], descending=True)
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
+
+            # Find cutoff index
+            sorted_mask = cumulative_probs > p
+            # Shift mask to keep at least one token
+            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+            sorted_mask[..., 0] = False
+
+            # Apply mask
+            sorted_logits[sorted_mask] = float("-inf")
+
+            # Restore original order
+            logits[i] = sorted_logits.scatter(0, sorted_indices, sorted_logits)
+
+    return logits

@@ -1,102 +1,119 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# vLLM Metal Plugin Installation Script
+#
+# This script installs the vLLM Metal plugin for Apple Silicon Macs.
 
-fetch_latest_release() {
-  local repo_owner="$1"
-  local repo_name="$2"
+set -e
 
-  echo "Fetching latest release..." >&2
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-  local latest_release_url="https://api.github.com/repos/${repo_owner}/${repo_name}/releases/latest"
-  local release_data
-
-  if ! release_data=$(curl -fsSL "$latest_release_url" 2>&1); then
-    error "Failed to fetch release information."
-    echo "Please check your internet connection and try again." >&2
-    exit 1
-  fi
-
-  if [[ -z "$release_data" ]] || [[ "$release_data" == *"Not Found"* ]]; then
-    error "No releases found for this repository."
-    echo "Please visit https://github.com/${repo_owner}/${repo_name}/releases" >&2
-    exit 1
-  fi
-
-  echo "$release_data"
+info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-extract_wheel_url() {
-  local release_data="$1"
-
-  python3 -c "
-import sys
-import json
-try:
-    data = json.loads('''$release_data''')
-    assets = data.get('assets', [])
-    for asset in assets:
-        name = asset.get('name', '')
-        if name.endswith('.whl'):
-            print(asset.get('browser_download_url', ''))
-            break
-except Exception as e:
-    print('', file=sys.stderr)
-"
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-download_and_install_wheel() {
-  local wheel_url="$1"
-  local package_name="$2"
-
-  local wheel_name
-  wheel_name=$(basename "$wheel_url")
-  echo "Latest release: $wheel_name"
-  success "Found latest release"
-
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp_dir'" EXIT
-
-  echo ""
-  echo "Downloading wheel..."
-  local wheel_path="$tmp_dir/$wheel_name"
-
-  if ! curl -fsSL "$wheel_url" -o "$wheel_path"; then
-    error "Failed to download wheel."
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
     exit 1
-  fi
+}
 
-  success "Downloaded wheel"
+step() {
+    echo -e "${BLUE}[STEP]${NC} $1"
+}
 
-  # Install vllm-metal base package first
-  if ! uv pip install --upgrade "$wheel_path"; then
-    error "Failed to install ${package_name}."
-    exit 1
-  fi
+# Check if running on macOS
+if [[ "$(uname)" != "Darwin" ]]; then
+    error "This script is only for macOS"
+fi
 
-  # Install vllm separately with --no-deps to avoid pulling in CUDA dependencies
-  # that don't work on macOS/Apple Silicon
-  echo ""
-  echo "Installing vllm (without CUDA dependencies)..."
-  if ! uv pip install --upgrade --no-deps vllm; then
-    error "Failed to install vllm."
-    exit 1
-  fi
+# Check if running on Apple Silicon
+if [[ "$(uname -m)" != "arm64" ]]; then
+    error "This script requires Apple Silicon (M1/M2/M3/M4)"
+fi
 
-  # Install vllm's macOS-compatible dependencies
-  if ! uv pip install --upgrade \
+echo ""
+info "=========================================="
+info "   vLLM Metal Plugin Installer"
+info "=========================================="
+echo ""
+info "System: $(uname -m) macOS $(sw_vers -productVersion)"
+info "Chip: $(sysctl -n machdep.cpu.brand_string)"
+echo ""
+
+# Check Python version
+PYTHON_VERSION=$(python3 --version 2>&1 | cut -d' ' -f2)
+PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f1)
+PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d'.' -f2)
+
+info "Python version: $PYTHON_VERSION"
+
+# Warn about Python 3.14
+if [[ "$PYTHON_MINOR" -ge 14 ]]; then
+    warn "Python 3.14 is very new - some packages may not have wheels yet."
+    warn "If you encounter build issues, try Python 3.12 or 3.13."
+fi
+
+if [[ "$PYTHON_MAJOR" -lt 3 ]] || [[ "$PYTHON_MAJOR" -eq 3 && "$PYTHON_MINOR" -lt 11 ]]; then
+    error "Python 3.11+ is required. Current version: $PYTHON_VERSION"
+fi
+
+# Determine package manager
+if command -v uv &> /dev/null; then
+    PIP="uv pip"
+    info "Using uv for package management"
+else
+    PIP="pip3"
+    info "Using pip for package management"
+fi
+
+# Create virtual environment if not in one
+if [[ -z "$VIRTUAL_ENV" ]]; then
+    warn "Not in a virtual environment."
+
+    if [[ -d ".venv" ]]; then
+        info "Found existing .venv, activating..."
+        source .venv/bin/activate
+    else
+        info "Creating virtual environment..."
+        python3 -m venv .venv
+        source .venv/bin/activate
+        info "Virtual environment activated"
+    fi
+fi
+
+echo ""
+step "1/4 Installing MLX framework..."
+$PIP install mlx mlx-lm
+
+echo ""
+step "2/4 Installing vLLM dependencies..."
+# Install core dependencies that vLLM needs (pure Python or with macOS wheels)
+$PIP install \
+    torch \
+    transformers \
+    accelerate \
+    safetensors \
+    numpy \
+    psutil \
+    pydantic \
+    cbor2 \
     msgspec \
     cloudpickle \
     prometheus-client \
     fastapi \
     uvicorn \
     uvloop \
-    pydantic \
     pillow \
-    prometheus_fastapi_instrumentator \
     tiktoken \
-    lm-format-enforcer \
-    outlines \
     typing_extensions \
     filelock \
     py-cpuinfo \
@@ -109,101 +126,108 @@ download_and_install_wheel() {
     requests \
     tqdm \
     sentencepiece \
-    compressed-tensors \
     gguf \
-    partial-json-parser \
     blake3 \
-    cbor2 \
     pyzmq \
-    cachetools \
     regex \
     protobuf \
-    python-multipart \
-    "fastapi[standard]" \
-    "llguidance>=1.3.0,<1.4.0" \
-    "outlines_core==0.2.11" \
-    "lark==1.2.2" \
-    "xgrammar>=0.1.27" \
-    "opencv-python-headless>=4.11.0" \
-    six \
-    "setuptools>=77.0.3,<81.0.0" \
-    "depyf>=0.20.0" \
-    watchfiles \
-    python-json-logger \
-    scipy \
-    ninja \
-    pybase64 \
-    setproctitle \
-    "openai-harmony>=0.0.3" \
-    "anthropic>=0.71.0" \
-    "model-hosting-container-standards>=0.1.9,<1.0.0" \
-    "tokenizers>=0.21.1" \
-    "numba>=0.61.0"; then
-    error "Failed to install vllm dependencies."
-    exit 1
-  fi
-}
+    setuptools \
+    depyf \
+    tokenizers \
+    cachetools \
+    partial-json-parser \
+    compressed-tensors
 
-main() {
-  set -eu -o pipefail
+# Try to install optional constrained decoding packages (may fail on Python 3.14)
+set +e
+info "Installing optional constrained decoding packages..."
+if $PIP install outlines lm-format-enforcer xgrammar 2>/dev/null; then
+    info "Constrained decoding packages installed"
+else
+    warn "Some constrained decoding packages (outlines, xgrammar) failed to install"
+    warn "This is expected on Python 3.14 - these packages are optional"
+fi
+set -e
 
-  local repo_owner="vllm-project"
-  local repo_name="vllm-metal"
-  local package_name="vllm-metal"
+echo ""
+step "3/4 Installing vLLM..."
+# vLLM is tricky on macOS - it needs to be built from source
+# and requires cmake/ninja. We'll try multiple approaches.
 
-  # Source shared library functions
-  # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
-  local local_lib=""
-  if [[ -n "${BASH_SOURCE[0]}" ]]; then
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local_lib="$script_dir/scripts/lib.sh"
-  fi
+VLLM_INSTALLED=false
 
-  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    # shellcheck source=/dev/null
-    source "$local_lib"
-  else
-    # Fetch from remote (curl | bash case)
-    local lib_url="https://raw.githubusercontent.com/$repo_owner/$repo_name/main/scripts/lib.sh"
-    local lib_tmp
-    lib_tmp=$(mktemp)
-    if ! curl -fsSL "$lib_url" -o "$lib_tmp"; then
-      echo "Error: Failed to fetch lib.sh from $lib_url" >&2
-      rm -f "$lib_tmp"
-      exit 1
+# First, check if cmake is available (needed for source builds)
+if ! command -v cmake &> /dev/null; then
+    warn "cmake not found - needed to build vLLM"
+    if command -v brew &> /dev/null; then
+        info "Installing cmake and ninja via Homebrew..."
+        brew install cmake ninja || true
     fi
-    # shellcheck source=/dev/null
-    source "$lib_tmp"
-    rm -f "$lib_tmp"
-  fi
+fi
 
-  is_apple_silicon
-  if ! ensure_uv; then
-    exit 1
-  fi
+# Try to install vLLM
+set +e  # Don't exit on error for this section
+if $PIP install --only-binary=:all: vllm 2>/dev/null; then
+    VLLM_INSTALLED=true
+    info "vLLM installed from wheel"
+else
+    warn "No pre-built vLLM wheel for Python $PYTHON_VERSION on macOS arm64"
 
-  local release_data
-  release_data=$(fetch_latest_release "$repo_owner" "$repo_name")
+    if command -v cmake &> /dev/null; then
+        info "Building vLLM from source (this may take 5-10 minutes)..."
+        VLLM_TARGET_DEVICE=cpu MAX_JOBS=4 $PIP install vllm 2>&1 | tail -20
+        # Check if vLLM is actually installed
+        if python3 -c "import vllm" 2>/dev/null; then
+            VLLM_INSTALLED=true
+            info "vLLM built and installed successfully"
+        fi
+    fi
+fi
 
-  local wheel_url
-  wheel_url=$(extract_wheel_url "$release_data")
+if [ "$VLLM_INSTALLED" = false ]; then
+    warn "=========================================="
+    warn "vLLM installation failed."
+    warn ""
+    warn "Options:"
+    warn "  1. Use Python 3.12 which has vLLM wheels"
+    warn "  2. Install cmake: brew install cmake ninja"
+    warn "  3. Continue without vLLM (plugin development only)"
+    warn "=========================================="
+fi
+set -e  # Re-enable exit on error
 
-  if [[ -z "$wheel_url" ]]; then
-    error "No wheel file found in the latest release."
-    exit 1
-  fi
+echo ""
+step "4/4 Installing vLLM Metal plugin..."
+$PIP install -e .
 
-  download_and_install_wheel "$wheel_url" "$package_name"
+echo ""
+info "=========================================="
+info "   Verifying Installation"
+info "=========================================="
+echo ""
 
-  echo ""
-  success "Installation complete!"
-  echo ""
-  echo "To use vllm, activate the virtual environment:"
-  echo "  source .venv/bin/activate"
-  echo ""
-  echo "Or add the venv to your PATH:"
-  echo "  export PATH=\"\$PWD/.venv/bin:\$PATH\""
-}
+# Verify MLX
+python3 -c "import mlx.core as mx; print(f'  MLX device: {mx.default_device()}')" || warn "MLX import failed"
 
-main "$@"
+# Verify vllm_metal
+python3 -c "import vllm_metal; print(f'  vllm_metal version: {vllm_metal.__version__}')" || warn "vllm_metal import failed"
+
+# Verify chip detection
+python3 -c "from vllm_metal.utils import get_apple_chip_name; print(f'  Chip detected: {get_apple_chip_name()}')" || true
+
+# Try to verify vLLM
+python3 -c "import vllm; print(f'  vLLM version: {vllm.__version__}')" 2>/dev/null || warn "vLLM not fully installed"
+
+echo ""
+info "=========================================="
+info "   Installation Complete!"
+info "=========================================="
+echo ""
+info "Next steps:"
+info "  1. Activate the environment: source .venv/bin/activate"
+info "  2. Test with: python -c 'import vllm_metal; print(vllm_metal.register())'"
+info ""
+info "For development:"
+info "  pip install -e '.[dev]'"
+info "  pytest tests/ -v"
+echo ""

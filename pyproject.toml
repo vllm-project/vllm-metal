@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -5,14 +6,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-metal"
 version = "0.1.0"
-description = "Community maintained hardware plugin for vLLM on Apple Silicon"
+description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11,<3.14"
 authors = [
-    {name = "vLLM Team"}
+    {name = "vLLM Community"}
 ]
-keywords = ["vllm", "metal", "apple", "silicon", "mps", "llm", "inference"]
+keywords = ["vllm", "metal", "mlx", "apple", "silicon", "mps", "llm", "inference"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,9 +27,14 @@ classifiers = [
 ]
 
 dependencies = [
+    # MLX - Required for Apple Silicon GPU acceleration
+    "mlx>=0.20.0",
+    "mlx-lm>=0.20.0",
+    # Model loading and weights
     "transformers>=4.40.0",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
+    # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
 ]
@@ -41,11 +47,16 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
+all = [
+    "vllm-metal[vllm,dev]",
+]
+
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-metal"
 Repository = "https://github.com/vllm-project/vllm-metal"
 Issues = "https://github.com/vllm-project/vllm-metal/issues"
 
+# vLLM Plugin Entry Points
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 
@@ -81,4 +92,6 @@ asyncio_mode = "auto"
 dev = [
     "mypy>=1.19.1",
     "pytest>=9.0.2",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
 ]

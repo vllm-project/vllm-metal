@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal V1 Worker implementation for vLLM."""
+"""Metal V2 Worker implementation for vLLM."""
 
 import gc
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
@@ -27,17 +26,15 @@ from vllm_metal.utils import (
 )
 from vllm_metal.v2.model_runner import MetalModelRunner
 
-if TYPE_CHECKING:
-    pass
-
 logger = init_logger(__name__)
 
 
 class MetalWorker(Worker):
-    """V1 Worker implementation for Apple Metal/MPS backend.
+    """V2 Worker implementation for Apple Metal/MLX backend.
 
     This worker extends the base GPU Worker to provide Metal-specific
-    device initialization and model execution.
+    device initialization and model execution using MLX as the primary
+    compute backend.
     """
 
     def __init__(
@@ -73,16 +70,21 @@ class MetalWorker(Worker):
         )
 
     def init_device(self):
-        """Initialize the Metal/MPS device."""
-        # Set the device to MPS
+        """Initialize the Metal/MPS device and MLX."""
+        import mlx.core as mx
+
+        # Set the device to MPS for PyTorch compatibility
         self.device = torch.device("mps")
         current_platform.set_device(self.device)
+
+        # Set MLX to use GPU
+        mx.set_default_device(mx.gpu)
 
         # Log device info
         info = get_metal_device_info()
         logger.info(
             f"Metal device initialized: {info['name']}, "
-            f"Metal available: {info['metal_available']}, "
+            f"MLX available: {info.get('mlx_available', False)}, "
             f"Total memory: {info['total_memory'] / 1e9:.1f}GB"
         )
 
@@ -111,6 +113,7 @@ class MetalWorker(Worker):
 
         # Set random seed
         set_random_seed(self.model_config.seed)
+        mx.random.seed(self.model_config.seed)
 
         # Clear cache before measuring memory
         gc.collect()
@@ -139,11 +142,9 @@ class MetalWorker(Worker):
     def compile_or_warm_up_model(self) -> None:
         """Compile or warm up the model.
 
-        Metal uses custom Rust kernels, no graph compilation needed.
+        Metal uses MLX for compute, no graph compilation needed.
         """
-        # Skip LoRA handling - not supported on Metal
-        # Skip cuda graph capture - not supported on Metal
-        logger.info("Metal warmup: using Rust Metal kernels")
+        logger.info("Metal warmup: using MLX compute backend")
 
     def sleep(self, level: int = 1) -> None:
         """Sleep mode - clear Metal cache."""
@@ -180,10 +181,7 @@ class MetalWorker(Worker):
         return nullcontext()
 
     def load_model(self) -> None:
-        """Load the model onto the Metal device.
-
-        Overrides the parent to avoid CUDA-specific memory pool handling.
-        """
-        logger.info("Loading model on Metal device...")
+        """Load the model onto the Metal device."""
+        logger.info("Loading model on Metal device with MLX backend...")
         self.model_runner.load_model()
         logger.info("Model loaded successfully on Metal device")

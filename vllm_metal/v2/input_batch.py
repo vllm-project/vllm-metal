@@ -1,186 +1,192 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal-compatible input batch functions using PyTorch instead of Triton kernels."""
+"""Metal-compatible input batch preparation functions.
+
+These functions replace Triton kernels with PyTorch/MLX implementations
+for the Metal backend.
+"""
 
 import torch
 
 
 def prepare_prefill_inputs(
-    input_ids: torch.Tensor,
-    next_prefill_tokens: torch.Tensor,
-    idx_mapping: torch.Tensor,
+    num_scheduled_tokens_per_request: torch.Tensor,
+    token_indices: torch.Tensor,
+    position_ids: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    batch_indices: torch.Tensor,
+    prefill_positions_cpu: torch.Tensor,
+    input_token_ids: torch.Tensor,
+    input_positions: torch.Tensor,
+    input_slot_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
-    prefill_token_ids: torch.Tensor,
-    prefill_len: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-) -> None:
-    """PyTorch implementation of prepare_prefill_inputs.
+    seq_lens: torch.Tensor,
+) -> int:
+    """Prepare inputs for prefill phase using PyTorch operations.
 
-    Copies tokens from prefill_token_ids to input_ids based on query locations.
+    This replaces the Triton kernel version with pure PyTorch.
+
+    Args:
+        num_scheduled_tokens_per_request: Number of tokens per request.
+        token_indices: Token indices for each position.
+        position_ids: Position IDs for each token.
+        slot_mapping: Slot mapping for KV cache.
+        batch_indices: Batch index for each token.
+        prefill_positions_cpu: CPU tensor for position computation.
+        input_token_ids: Output tensor for token IDs.
+        input_positions: Output tensor for positions.
+        input_slot_mapping: Output tensor for slot mapping.
+        query_start_loc: Output tensor for query start locations.
+        seq_lens: Output tensor for sequence lengths.
+
+    Returns:
+        Total number of tokens prepared.
     """
-    num_reqs = idx_mapping.shape[0]
+    num_requests = num_scheduled_tokens_per_request.shape[0]
+    total_tokens = 0
 
-    for batch_idx in range(num_reqs):
-        req_state_idx = int(idx_mapping[batch_idx].item())
-        pf_len = int(prefill_len[req_state_idx].item())
-        num_computed = int(num_computed_tokens[req_state_idx].item())
+    # Compute cumulative positions for query_start_loc
+    query_start_loc[0] = 0
+    for i in range(num_requests):
+        num_tokens = int(num_scheduled_tokens_per_request[i])
+        query_start_loc[i + 1] = query_start_loc[i] + num_tokens
+        seq_lens[i] = num_tokens
 
-        if num_computed >= pf_len:
-            # Not prefill
-            continue
+        # Copy data for this request
+        if num_tokens > 0:
+            start = total_tokens
+            end = start + num_tokens
 
-        query_start = int(query_start_loc[batch_idx].item())
-        query_end = int(query_start_loc[batch_idx + 1].item())
-        query_len = query_end - query_start
+            # Get indices for this request
+            request_token_indices = token_indices[start:end]
+            request_positions = position_ids[start:end]
+            request_slots = slot_mapping[start:end]
 
-        # Copy tokens from prefill_token_ids to input_ids
-        tokens = prefill_token_ids[
-            req_state_idx, num_computed : num_computed + query_len
-        ]
-        input_ids[query_start:query_end] = tokens
+            # Copy to output tensors
+            input_token_ids[start:end] = request_token_indices
+            input_positions[start:end] = request_positions
+            input_slot_mapping[start:end] = request_slots
 
-        # Set next prefill token
-        next_pos = num_computed + query_len
-        if next_pos < pf_len:
-            next_prefill_tokens[req_state_idx] = prefill_token_ids[
-                req_state_idx, next_pos
-            ]
+            total_tokens += num_tokens
+
+    return total_tokens
 
 
 def prepare_pos_seq_lens(
-    idx_mapping: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-    pos: torch.Tensor,
+    num_scheduled_tokens_per_request: torch.Tensor,
+    seq_lens_tensor: torch.Tensor,
+    positions_cpu: torch.Tensor,
+    input_positions: torch.Tensor,
     seq_lens: torch.Tensor,
-) -> None:
-    """PyTorch implementation of prepare_pos_seq_lens.
+) -> int:
+    """Prepare position and sequence length tensors using PyTorch.
 
-    Sets position indices and sequence lengths for each request.
+    Args:
+        num_scheduled_tokens_per_request: Tokens per request.
+        seq_lens_tensor: Input sequence lengths.
+        positions_cpu: CPU positions tensor.
+        input_positions: Output positions tensor.
+        seq_lens: Output sequence lengths tensor.
+
+    Returns:
+        Total number of tokens.
     """
-    num_reqs = idx_mapping.shape[0]
-    max_num_reqs = seq_lens.shape[0]
+    num_requests = num_scheduled_tokens_per_request.shape[0]
+    total_tokens = 0
 
-    for batch_idx in range(num_reqs):
-        req_state_idx = int(idx_mapping[batch_idx].item())
-        num_computed = int(num_computed_tokens[req_state_idx].item())
+    for i in range(num_requests):
+        num_tokens = int(num_scheduled_tokens_per_request[i])
+        seq_len = int(seq_lens_tensor[i])
+        seq_lens[i] = seq_len
 
-        query_start = int(query_start_loc[batch_idx].item())
-        query_end = int(query_start_loc[batch_idx + 1].item())
-        query_len = query_end - query_start
+        if num_tokens > 0:
+            # Generate positions for this sequence
+            start_pos = seq_len - num_tokens
+            positions = torch.arange(
+                start_pos,
+                seq_len,
+                dtype=input_positions.dtype,
+                device=input_positions.device,
+            )
+            input_positions[total_tokens : total_tokens + num_tokens] = positions
+            total_tokens += num_tokens
 
-        # Set position indices
-        for i in range(query_len):
-            pos[query_start + i] = num_computed + i
-
-        # Set sequence length
-        seq_lens[batch_idx] = num_computed + query_len
-
-    # Pad unused seq_lens as 0 for full CUDA graphs (matches Triton kernel behavior)
-    seq_lens[num_reqs:max_num_reqs] = 0
+    return total_tokens
 
 
 def combine_sampled_and_draft_tokens(
-    input_ids: torch.Tensor,
-    idx_mapping: torch.Tensor,
-    last_sampled_tokens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    prefill_len: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    cu_num_logits: torch.Tensor,
-    num_logits: int,
-) -> torch.Tensor:
-    """PyTorch implementation of combine_sampled_and_draft_tokens.
+    sampled_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_accepted: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    output_num_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor | None = None,
+) -> int:
+    """Combine sampled and draft tokens using PyTorch.
 
-    Combines sampled and draft tokens based on accepted lengths.
-    Returns logits_indices tensor.
+    This is used for speculative decoding to combine the accepted
+    draft tokens with the newly sampled tokens.
+
+    Args:
+        sampled_token_ids: Newly sampled token IDs.
+        draft_token_ids: Draft token IDs to verify.
+        num_accepted: Number of accepted draft tokens per sequence.
+        output_token_ids: Output tensor for combined tokens.
+        output_num_tokens: Output tensor for token counts.
+        bonus_token_ids: Optional bonus tokens.
+
+    Returns:
+        Total number of output tokens.
     """
-    num_reqs = seq_lens.shape[0]
+    batch_size = sampled_token_ids.shape[0]
+    total_tokens = 0
 
-    logits_indices = torch.empty(
-        num_logits,
-        dtype=torch.int64,
-        device=input_ids.device,
-    )
+    for i in range(batch_size):
+        n_accepted = int(num_accepted[i])
 
-    for batch_idx in range(num_reqs):
-        req_state_idx = int(idx_mapping[batch_idx].item())
+        # Copy accepted draft tokens
+        if n_accepted > 0:
+            output_token_ids[i, :n_accepted] = draft_token_ids[i, :n_accepted]
 
-        # Get the number of logits and draft tokens
-        cu_num_logits_start = int(cu_num_logits[batch_idx].item())
-        cu_num_logits_end = int(cu_num_logits[batch_idx + 1].item())
-        num_logits_for_req = cu_num_logits_end - cu_num_logits_start
-        num_draft_tokens = num_logits_for_req - 1
+        # Add sampled token after accepted drafts
+        output_token_ids[i, n_accepted] = sampled_token_ids[i, 0]
 
-        # Compute the logits indices
-        query_end = int(query_start_loc[batch_idx + 1].item())
-        logits_start = query_end - num_logits_for_req
-        for i in range(num_logits_for_req):
-            logits_indices[cu_num_logits_start + i] = logits_start + i
+        # Count total tokens for this sequence
+        output_num_tokens[i] = n_accepted + 1
+        total_tokens += n_accepted + 1
 
-        seq_len = int(seq_lens[batch_idx].item())
-        pf_len = int(prefill_len[req_state_idx].item())
-        if seq_len <= pf_len:
-            # Handling prefill tokens. No sampled or draft tokens.
-            continue
+        # Add bonus token if provided
+        if bonus_token_ids is not None:
+            output_token_ids[i, n_accepted + 1] = bonus_token_ids[i]
+            output_num_tokens[i] += 1
+            total_tokens += 1
 
-        # Write the last sampled token ID to input_ids
-        last_token_id = int(last_sampled_tokens[req_state_idx].item())
-        input_ids[query_end - num_logits_for_req] = last_token_id
-
-        # Write the draft tokens (if any) to input_ids
-        if num_draft_tokens > 0:
-            for i in range(num_draft_tokens):
-                draft_token = int(draft_tokens[req_state_idx, i].item())
-                input_ids[query_end - num_draft_tokens + i] = draft_token
-
-    return logits_indices
+    return total_tokens
 
 
 def post_update(
-    # [num_reqs]
-    idx_mapping: torch.Tensor,
-    # [max_num_reqs]
-    num_computed_tokens: torch.Tensor,
-    # [max_num_reqs]
-    last_sampled_tokens: torch.Tensor,
-    # [max_num_reqs, vocab_size]
-    output_bin_counts: torch.Tensor,
-    # [num_reqs, num_speculative_steps + 1]
-    sampled_tokens: torch.Tensor,
-    # [num_reqs]
-    num_sampled: torch.Tensor,
-    # [num_reqs]
-    num_rejected: torch.Tensor,
-    # [num_reqs + 1]
-    query_start_loc: torch.Tensor,
-) -> None:
-    """PyTorch implementation of post_update.
+    req_ids: list,
+    num_tokens_per_request: torch.Tensor,
+    finished: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    output_num_tokens: torch.Tensor,
+) -> dict:
+    """Post-process batch update using PyTorch.
 
-    Updates internal state after model execution.
+    Args:
+        req_ids: Request IDs.
+        num_tokens_per_request: Tokens per request.
+        finished: Whether each request is finished.
+        output_token_ids: Generated token IDs.
+        output_num_tokens: Number of tokens per request.
+
+    Returns:
+        Dictionary mapping request ID to token list.
     """
-    num_reqs = idx_mapping.shape[0]
+    results = {}
 
-    for batch_idx in range(num_reqs):
-        req_state_idx = int(idx_mapping[batch_idx].item())
+    for i, req_id in enumerate(req_ids):
+        n_tokens = int(output_num_tokens[i])
+        tokens = output_token_ids[i, :n_tokens].tolist()
+        results[req_id] = tokens
 
-        num_sampled_for_req = int(num_sampled[batch_idx].item())
-        if num_sampled_for_req > 0:
-            # Store the last sampled token
-            token_id = int(sampled_tokens[batch_idx, num_sampled_for_req - 1].item())
-            last_sampled_tokens[req_state_idx] = token_id
-
-        # Update output_bin_counts for all sampled tokens
-        for i in range(num_sampled_for_req):
-            token_id = int(sampled_tokens[batch_idx, i].item())
-            output_bin_counts[req_state_idx, token_id] += 1
-
-        # Update num_computed_tokens
-        query_start = int(query_start_loc[batch_idx].item())
-        query_end = int(query_start_loc[batch_idx + 1].item())
-        query_len = query_end - query_start
-        num_rejected_for_req = int(num_rejected[batch_idx].item())
-
-        num_computed = int(num_computed_tokens[req_state_idx].item())
-        num_computed += query_len - num_rejected_for_req
-        num_computed_tokens[req_state_idx] = num_computed
+    return results

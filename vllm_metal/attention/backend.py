@@ -1,444 +1,195 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal attention backend for vLLM V1 architecture.
-
-This backend uses Rust/Metal kernels via unified memory, avoiding the MPS backend.
-PyTorch tensors are kept on CPU, but the underlying memory is directly accessible
-by Metal GPU kernels on Apple Silicon's unified memory architecture.
-"""
+"""Metal attention backend for vLLM."""
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, List, Optional, Tuple, Type
 
 import torch
-import torch.nn.functional as nnf  # noqa: N812
-from vllm.attention.backends.abstract import (
+
+from vllm_metal._compat import (
     AttentionBackend,
     AttentionImpl,
+    AttentionMetadata,
     AttentionType,
+    init_logger,
 )
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import (
-    AttentionCGSupport,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-)
-from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# Try to import Rust Metal extensions
-# NOTE: We don't initialize Metal at import time to avoid issues with multiprocessing.
-# Metal contexts cannot survive a fork, so we defer initialization to first use.
-try:
-    import vllm_metal_rust
-
-    METAL_RUST_IMPORTABLE = True
-except ImportError:
-    METAL_RUST_IMPORTABLE = False
-    logger.warning("Rust Metal extensions not available, using PyTorch SDPA fallback")
-
-# Lazy initialization flag - will be set on first use in worker process
-_metal_initialized = False
-_metal_available = False
-
-
-def _ensure_metal_initialized():
-    """Initialize Metal context lazily in the worker process."""
-    global _metal_initialized, _metal_available
-    if _metal_initialized:
-        return _metal_available
-
-    _metal_initialized = True
-    if not METAL_RUST_IMPORTABLE:
-        _metal_available = False
-        return False
-
-    try:
-        _metal_available = vllm_metal_rust.is_metal_available()
-        if _metal_available:
-            device_name, max_threads, max_mem = vllm_metal_rust.metal_device_info()
-            logger.info(f"Metal Rust backend initialized: {device_name}")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Metal: {e}")
-        _metal_available = False
-
-    return _metal_available
-
 
 @dataclass
-class MetalAttentionMetadata:
-    """V1 attention metadata for Metal backend.
+class MetalAttentionMetadata(AttentionMetadata):
+    """Metadata for Metal attention operations.
 
-    Follows the same pattern as TritonAttentionMetadata.
+    This class holds the attention metadata needed for both prefill
+    and decode phases on the Metal backend.
     """
 
-    num_actual_tokens: int
-    max_query_len: int
-    query_start_loc: torch.Tensor
-    max_seq_len: int
-    seq_lens: torch.Tensor
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
+    # Basic info
+    num_actual_tokens: int = 0
+    max_query_len: int = 0
+    max_seq_len: int = 0
 
-    # For cascade attention (prefix sharing)
+    # Prefill metadata
+    query_start_loc: Optional[torch.Tensor] = None  # [num_seqs + 1]
+    seq_lens: Optional[torch.Tensor] = None  # [num_seqs]
+    context_lens: Optional[torch.Tensor] = None  # [num_seqs]
+
+    # Decode metadata
+    block_table: Optional[torch.Tensor] = None  # [num_seqs, max_num_blocks]
+    slot_mapping: Optional[torch.Tensor] = None  # [num_tokens]
+
+    # For paged attention
+    max_num_blocks_per_seq: int = 0
+    use_cuda_graph: bool = False  # Always False for Metal
+
+    # Cascade attention (not supported on Metal)
     use_cascade: bool = False
-    common_prefix_len: int = 0
+
+    # Device
+    device: torch.device = torch.device("mps")
+
+    @property
+    def is_all_prefill(self) -> bool:
+        """Check if all requests are in prefill phase."""
+        return self.query_start_loc is not None and self.block_table is None
+
+    @property
+    def is_all_decode(self) -> bool:
+        """Check if all requests are in decode phase."""
+        return self.query_start_loc is None and self.block_table is not None
+
+    def get_seq_lens(self) -> torch.Tensor:
+        """Get sequence lengths."""
+        if self.seq_lens is not None:
+            return self.seq_lens
+        return torch.zeros(0, dtype=torch.int32, device=self.device)
 
 
-class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetadata]):
-    """V1 builder for Metal attention metadata."""
+class MetalAttentionMetadataBuilder:
+    """Builder for MetalAttentionMetadata.
 
-    # Metal does not support CUDA graphs
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
-
-    def __init__(
-        self,
-        kv_cache_spec: AttentionSpec,
-        layer_names: list[str],
-        vllm_config: VllmConfig,
-        device: torch.device,
-    ):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-
-        self.block_size = kv_cache_spec.block_size
-        model_config = vllm_config.model_config
-        self.num_heads_q = model_config.get_num_attention_heads(
-            vllm_config.parallel_config
-        )
-        self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        self.head_dim = model_config.get_head_size()
-
-    def build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> MetalAttentionMetadata:
-        """Build attention metadata from common metadata."""
-        return MetalAttentionMetadata(
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            max_query_len=common_attn_metadata.max_query_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            use_cascade=common_prefix_len > 0,
-            common_prefix_len=common_prefix_len,
-        )
-
-
-class MetalAttentionImpl(AttentionImpl):
-    """Metal attention implementation using PyTorch SDPA.
-
-    Uses PyTorch's scaled_dot_product_attention which is optimized
-    for Apple Silicon via MPS backend.
+    This class helps construct attention metadata from batch information.
     """
 
     def __init__(
         self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int | None = None,
-        alibi_slopes: list[float] | None = None,
-        sliding_window: int | None = None,
-        kv_cache_dtype: str = "auto",
-        blocksparse_params: dict | None = None,
-        logits_soft_cap: float | None = None,
-        attn_type: AttentionType = AttentionType.DECODER,
-        **kwargs,
-    ) -> None:
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        self.sliding_window = sliding_window
-        self.alibi_slopes = alibi_slopes
-        self.kv_cache_dtype = kv_cache_dtype
-        self.logits_soft_cap = logits_soft_cap
-        self.attn_type = attn_type
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-
-        if blocksparse_params is not None:
-            logger.warning("Block sparse attention not supported on Metal, ignoring")
-
-        if alibi_slopes is not None:
-            self.alibi_slopes_tensor = torch.tensor(alibi_slopes, dtype=torch.float32)
-        else:
-            self.alibi_slopes_tensor = None
-
-    def forward(
-        self,
-        layer: "torch.nn.Module",
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: MetalAttentionMetadata,
-        output: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Forward pass for Metal attention.
+        device: torch.device = torch.device("mps"),
+    ):
+        """Initialize the metadata builder.
 
         Args:
-            layer: The Attention layer (required by vLLM interface)
-            query: Query tensor [num_tokens, num_heads * head_size]
-            key: Key tensor [num_tokens, num_kv_heads * head_size]
-            value: Value tensor [num_tokens, num_kv_heads * head_size]
-            kv_cache: KV cache tensor
-            attn_metadata: Attention metadata
-            output: Optional output tensor
+            device: Target device for tensors.
+        """
+        self.device = device
+
+    def build_prefill_metadata(
+        self,
+        seq_lens: List[int],
+        query_lens: List[int],
+        slot_mapping: torch.Tensor,
+    ) -> MetalAttentionMetadata:
+        """Build metadata for prefill phase.
+
+        Args:
+            seq_lens: Length of each sequence.
+            query_lens: Query length for each sequence.
+            slot_mapping: Slot mapping for KV cache.
 
         Returns:
-            Output tensor [num_tokens, num_heads * head_size]
+            MetalAttentionMetadata for prefill.
         """
-        num_tokens = query.shape[0]
-        original_device = query.device
+        num_seqs = len(seq_lens)
+        total_tokens = sum(query_lens)
 
-        # Reshape Q, K, V: [num_tokens, num_heads, head_size]
-        query = query.view(num_tokens, self.num_heads, self.head_size)
-        key = key.view(num_tokens, self.num_kv_heads, self.head_size)
-        value = value.view(num_tokens, self.num_kv_heads, self.head_size)
+        # Compute query start locations
+        query_start_loc = torch.zeros(
+            num_seqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for i, qlen in enumerate(query_lens):
+            query_start_loc[i + 1] = query_start_loc[i] + qlen
 
-        # Store new KV to cache
-        if kv_cache is not None and attn_metadata.slot_mapping is not None:
-            self._store_kv_cache(key, value, kv_cache, attn_metadata.slot_mapping)
-
-        # Determine if this is prefill or decode based on query length
-        is_prefill = attn_metadata.max_query_len > 1
-
-        if is_prefill:
-            out = self._prefill_attention(query, key, value, attn_metadata)
-        else:
-            out = self._decode_attention(query, key, value, kv_cache, attn_metadata)
-
-        # Reshape output: [num_tokens, num_heads * head_size]
-        # Use reshape instead of view to handle non-contiguous tensors from SDPA
-        out = out.reshape(num_tokens, self.num_heads * self.head_size)
-
-        # Ensure output is on the same device as input
-        if out.device != original_device:
-            out = out.to(original_device)
-
-        if output is not None:
-            output.copy_(out)
-            return output
-        return out
-
-    def _prefill_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: MetalAttentionMetadata,
-    ) -> torch.Tensor:
-        """Compute attention for prefill phase.
-
-        For prefill, use the incoming K, V directly with causal masking.
-        Uses Rust/Metal kernel when available, falls back to PyTorch SDPA.
-        """
-        # Input: [num_tokens, num_heads, head_size]
-        # Metal SDPA expects: [num_queries, num_heads, head_dim] for Q
-        #                     [num_queries, seq_len, num_kv_heads, head_dim] for K, V
-
-        # Expand KV for GQA if needed
-        if self.num_queries_per_kv > 1:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-        # NOTE: Metal SDPA kernel works but has copy overhead - using PyTorch for now
-        # TODO: Implement zero-copy Metal buffers for better performance
-        # Use PyTorch SDPA (well-optimized for MPS)
-        # SDPA expects: [batch, num_heads, seq_len, head_size]
-        query = query.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq, head]
-        key = key.transpose(0, 1).unsqueeze(0)
-        value = value.transpose(0, 1).unsqueeze(0)
-
-        out = nnf.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            is_causal=True,
-            scale=self.scale,
+        seq_lens_tensor = torch.tensor(
+            seq_lens,
+            dtype=torch.int32,
+            device=self.device,
         )
 
-        # Reshape: [1, num_heads, seq, head] -> [seq, num_heads, head]
-        out = out.squeeze(0).transpose(0, 1)
-        return out
+        return MetalAttentionMetadata(
+            num_actual_tokens=total_tokens,
+            max_query_len=max(query_lens) if query_lens else 0,
+            max_seq_len=max(seq_lens) if seq_lens else 0,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens_tensor,
+            slot_mapping=slot_mapping.to(self.device),
+            device=self.device,
+        )
 
-    def _decode_attention(
+    def build_decode_metadata(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: MetalAttentionMetadata,
-    ) -> torch.Tensor:
-        """Compute attention for decode phase.
-
-        For decode, read K, V from cache using block tables.
-        Uses Rust/Metal paged attention kernel when available.
-        """
-        batch_size = query.shape[0]
-
-        # NOTE: Metal paged attention kernel works but has copy overhead
-        # TODO: Implement zero-copy Metal buffers for better performance
-
-        # Use PyTorch loop-based decode
-        outputs = []
-
-        for i in range(batch_size):
-            # Get block table for this sequence
-            block_table = attn_metadata.block_table[i]
-            seq_len = int(attn_metadata.seq_lens[i].item())
-
-            # Gather KV from cache
-            k_cache, v_cache = self._gather_from_cache(kv_cache, block_table, seq_len)
-
-            # Single query attention: [1, num_heads, head_size]
-            q = query[i : i + 1]
-
-            # Expand KV for GQA
-            if self.num_queries_per_kv > 1:
-                k_cache = k_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
-                v_cache = v_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-            # SDPA: [1, num_heads, 1, head] vs [1, num_heads, seq, head]
-            q = q.transpose(0, 1).unsqueeze(0)  # [1, heads, 1, head]
-            k = k_cache.transpose(0, 1).unsqueeze(0)  # [1, heads, seq, head]
-            v = v_cache.transpose(0, 1).unsqueeze(0)
-
-            out = nnf.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=False,  # No causal for decode
-                scale=self.scale,
-            )
-
-            # [1, heads, 1, head] -> [1, heads, head]
-            out = out.squeeze(0).transpose(0, 1)
-            outputs.append(out)
-
-        return torch.cat(outputs, dim=0)
-
-    def _store_kv_cache(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        seq_lens: List[int],
+        block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> None:
-        """Store key and value into KV cache using slot mapping.
+    ) -> MetalAttentionMetadata:
+        """Build metadata for decode phase.
 
-        KV cache layout: [num_blocks, 2, block_size, num_kv_heads, head_size]
-        Uses vectorized operations for better performance.
-        """
-        block_size = kv_cache.shape[2]
-
-        # Filter out padding slots (slot < 0)
-        valid_mask = slot_mapping >= 0
-        if not valid_mask.any():
-            return
-
-        valid_slots = slot_mapping[valid_mask]
-        valid_keys = key[valid_mask]
-        valid_values = value[valid_mask]
-
-        # Compute block indices and offsets vectorized
-        block_indices = valid_slots // block_size
-        block_offsets = valid_slots % block_size
-
-        # Use advanced indexing to scatter into cache
-        kv_cache[block_indices, 0, block_offsets] = valid_keys
-        kv_cache[block_indices, 1, block_offsets] = valid_values
-
-    def _gather_from_cache(
-        self,
-        kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        context_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather keys and values from paged KV cache.
-
-        Uses vectorized gather for better performance.
+        Args:
+            seq_lens: Length of each sequence.
+            block_table: Block table for paged attention.
+            slot_mapping: Slot mapping for KV cache.
 
         Returns:
-            (keys, values) both with shape [context_len, num_kv_heads, head_size]
+            MetalAttentionMetadata for decode.
         """
-        block_size = kv_cache.shape[2]
+        num_seqs = len(seq_lens)
 
-        # Vectorized approach: compute all slot positions and gather at once
-        # Create flat indices for all tokens we need
-        slot_positions = torch.arange(context_len, device=kv_cache.device)
-        block_indices = slot_positions // block_size
-        block_offsets = slot_positions % block_size
+        seq_lens_tensor = torch.tensor(
+            seq_lens,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
-        # Get physical block indices from block table
-        physical_blocks = block_table[block_indices]
-
-        # Gather all keys and values at once using advanced indexing
-        keys = kv_cache[physical_blocks, 0, block_offsets]
-        values = kv_cache[physical_blocks, 1, block_offsets]
-
-        return keys, values
-
-    def _gather_from_cache_loop(
-        self,
-        kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        context_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Legacy loop-based gather (kept for reference).
-
-        Returns:
-            (keys, values) both with shape [context_len, num_kv_heads, head_size]
-        """
-        block_size = kv_cache.shape[2]
-        num_blocks_needed = (context_len + block_size - 1) // block_size
-
-        keys = []
-        values = []
-        tokens_gathered = 0
-
-        for block_idx in range(num_blocks_needed):
-            if block_idx >= len(block_table):
-                break
-
-            physical_block = int(block_table[block_idx].item())
-            tokens_in_block = min(block_size, context_len - tokens_gathered)
-
-            k_block = kv_cache[physical_block, 0, :tokens_in_block]
-            v_block = kv_cache[physical_block, 1, :tokens_in_block]
-
-            keys.append(k_block)
-            values.append(v_block)
-            tokens_gathered += tokens_in_block
-
-        return torch.cat(keys, dim=0), torch.cat(values, dim=0)
+        return MetalAttentionMetadata(
+            num_actual_tokens=num_seqs,  # One token per sequence in decode
+            max_query_len=1,
+            max_seq_len=max(seq_lens) if seq_lens else 0,
+            seq_lens=seq_lens_tensor,
+            block_table=block_table.to(self.device),
+            slot_mapping=slot_mapping.to(self.device),
+            max_num_blocks_per_seq=block_table.shape[1] if block_table.dim() > 1 else 0,
+            device=self.device,
+        )
 
 
 class MetalAttentionBackend(AttentionBackend):
-    """V1 attention backend for Apple Metal."""
+    """Attention backend for Apple Metal using MLX.
 
-    accept_output_buffer: bool = False
+    This backend provides attention computation using MLX's optimized
+    scaled_dot_product_attention on Apple Silicon.
+    """
 
     @staticmethod
     def get_name() -> str:
-        return "METAL"
+        """Get the name of this backend."""
+        return "metal"
 
     @staticmethod
-    def get_impl_cls() -> type[AttentionImpl]:
+    def get_impl_cls() -> Type["MetalAttentionImpl"]:
+        """Get the implementation class."""
+        from vllm_metal.attention.metal_attention import MetalAttentionImpl
+
         return MetalAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type[MetalAttentionMetadata]:
+    def get_metadata_cls() -> Type[MetalAttentionMetadata]:
+        """Get the metadata class."""
         return MetalAttentionMetadata
 
     @staticmethod
-    def get_builder_cls() -> type[MetalAttentionMetadataBuilder]:
+    def get_builder_cls() -> Type[MetalAttentionMetadataBuilder]:
+        """Get the metadata builder class."""
         return MetalAttentionMetadataBuilder
 
     @staticmethod
@@ -447,9 +198,19 @@ class MetalAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-    ) -> tuple[int, ...]:
-        """KV cache shape: [num_blocks, 2, block_size, num_kv_heads, head_size]"""
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+    ) -> Tuple[int, ...]:
+        """Get the shape of the KV cache.
+
+        Args:
+            num_blocks: Number of cache blocks.
+            block_size: Tokens per block.
+            num_kv_heads: Number of key-value heads.
+            head_size: Size of each head.
+
+        Returns:
+            Shape tuple for the cache tensors.
+        """
+        return (num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(
@@ -457,20 +218,24 @@ class MetalAttentionBackend(AttentionBackend):
         dst_kv_cache: torch.Tensor,
         src_to_dst: torch.Tensor,
     ) -> None:
-        src_indices = src_to_dst[:, 0]
-        dst_indices = src_to_dst[:, 1]
-        dst_kv_cache[dst_indices] = src_kv_cache[src_indices]
+        """Swap KV cache blocks.
+
+        On Apple Silicon with unified memory, this is a simple copy.
+        """
+        for src, dst in src_to_dst.tolist():
+            dst_kv_cache[dst].copy_(src_kv_cache[src])
 
     @staticmethod
     def copy_blocks(
-        kv_caches: list[torch.Tensor],
-        src_to_dsts: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        src_to_dists: torch.Tensor,
     ) -> None:
-        for kv_cache in kv_caches:
-            src_indices = src_to_dsts[:, 0]
-            dst_indices = src_to_dsts[:, 1]
-            kv_cache[dst_indices] = kv_cache[src_indices]
+        """Copy KV cache blocks.
 
-    @staticmethod
-    def get_supported_head_sizes() -> list[int]:
-        return [64, 80, 96, 112, 128, 192, 256]
+        Args:
+            kv_caches: List of [key_cache, value_cache] pairs.
+            src_to_dists: Source to destination block mapping.
+        """
+        for src, dst in src_to_dists.tolist():
+            for kv_cache in kv_caches:
+                kv_cache[dst].copy_(kv_cache[src])

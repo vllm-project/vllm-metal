@@ -1,6 +1,6 @@
-"""vLLM Metal V2 - High-performance inference with custom Metal kernels."""
+# SPDX-License-Identifier: Apache-2.0
+"""V2 worker and model runner for vLLM Metal backend."""
 
-from .model_runner import MetalModelRunner
-from .worker import MetalWorker
+from vllm_metal.v2.worker import MetalWorker
 
-__all__ = ["MetalModelRunner", "MetalWorker"]
+__all__ = ["MetalWorker"]

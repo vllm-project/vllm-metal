@@ -2,37 +2,35 @@
 """Utility functions for vLLM Metal backend."""
 
 import platform
-import re
 import subprocess
 from functools import lru_cache
-
-import torch
+from typing import Any
 
 
 @lru_cache(maxsize=1)
 def is_apple_silicon() -> bool:
-    """Check if running on Apple Silicon."""
+    """Check if running on Apple Silicon.
+
+    Returns:
+        True if running on Apple Silicon (M1/M2/M3/M4/M5), False otherwise.
+    """
     if platform.system() != "Darwin":
         return False
 
-    try:
-        result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return "Apple" in result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # Fallback to architecture check
-        return platform.machine() == "arm64"
+    # Check for ARM64 architecture (Apple Silicon)
+    machine = platform.machine()
+    return machine in ("arm64", "aarch64")
 
 
 @lru_cache(maxsize=1)
 def get_apple_chip_name() -> str:
-    """Get the Apple chip name (e.g., 'M1', 'M2 Pro', 'M3 Max')."""
+    """Get the Apple chip name (e.g., 'Apple M1 Pro').
+
+    Returns:
+        The chip name string, or 'Unknown Apple Silicon' if not determinable.
+    """
     if not is_apple_silicon():
-        return "Unknown"
+        return "Not Apple Silicon"
 
     try:
         result = subprocess.run(
@@ -41,149 +39,189 @@ def get_apple_chip_name() -> str:
             text=True,
             check=True,
         )
-        brand = result.stdout.strip()
-        # Extract chip name from brand string
-        match = re.search(r"Apple\s+(M\d+(?:\s+(?:Pro|Max|Ultra))?)", brand)
-        if match:
-            return match.group(1)
-        return brand
+        return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return "Apple Silicon"
+        return "Unknown Apple Silicon"
 
 
 @lru_cache(maxsize=1)
-def get_metal_device_info() -> dict:
-    """Get Metal device information."""
-    info = {
-        "name": get_apple_chip_name(),
-        "is_apple_silicon": is_apple_silicon(),
-        "metal_available": is_apple_silicon() and platform.system() == "Darwin",
-    }
-
-    if info["metal_available"]:
-        # Get memory info
-        try:
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            info["total_memory"] = int(result.stdout.strip())
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-            info["total_memory"] = 0
-
-        # Get GPU cores
-        try:
-            result = subprocess.run(
-                ["system_profiler", "SPDisplaysDataType"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            match = re.search(r"Total Number of Cores:\s*(\d+)", result.stdout)
-            if match:
-                info["gpu_cores"] = int(match.group(1))
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-
-    return info
-
-
-def check_metal_availability() -> tuple[bool, str | None]:
-    """Check if Metal is available and return status with error message if not.
+def get_metal_device_info() -> dict[str, Any]:
+    """Get Metal device information.
 
     Returns:
-        Tuple of (is_available, error_message)
+        Dictionary containing:
+        - name: Device name (chip name)
+        - metal_available: Whether Metal is available
+        - total_memory: Total unified memory in bytes
+        - max_threads_per_threadgroup: Maximum threads per threadgroup
     """
-    if platform.system() != "Darwin":
-        return False, "Metal is only available on macOS"
+    import psutil
+
+    info: dict[str, Any] = {
+        "name": get_apple_chip_name(),
+        "metal_available": False,
+        "total_memory": 0,
+        "max_threads_per_threadgroup": 1024,  # Default for Apple Silicon
+    }
 
     if not is_apple_silicon():
-        return False, "Metal GPU acceleration requires Apple Silicon"
+        return info
 
-    return True, None
+    # Check if Metal is available via PyTorch
+    try:
+        import torch
+
+        info["metal_available"] = torch.backends.mps.is_available()
+    except ImportError:
+        pass
+
+    # Also check MLX availability
+    try:
+        import mlx.core as mx
+
+        info["metal_available"] = True
+        info["mlx_available"] = True
+        info["mlx_default_device"] = str(mx.default_device())
+    except ImportError:
+        info["mlx_available"] = False
+
+    # Get total system memory (unified memory on Apple Silicon)
+    info["total_memory"] = psutil.virtual_memory().total
+
+    return info
 
 
 def get_metal_memory_info() -> tuple[int, int]:
     """Get Metal memory usage information.
 
+    On Apple Silicon, GPU uses unified memory shared with CPU.
+    This returns approximate allocation based on MLX/PyTorch tracking.
+
     Returns:
-        Tuple of (allocated_bytes, total_bytes)
+        Tuple of (allocated_bytes, total_bytes).
     """
-    available, _ = check_metal_availability()
-    if not available:
-        return 0, 0
+    import psutil
 
+    from vllm_metal.envs import VLLM_METAL_MEMORY_FRACTION
+
+    total = psutil.virtual_memory().total
+    available_total = int(total * VLLM_METAL_MEMORY_FRACTION)
+
+    # Try to get MLX memory stats
     try:
-        # Metal uses unified memory, so we report system memory
-        result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True
-        )
-        total = int(result.stdout.strip())
+        import mlx.core as mx
 
-        # Get current allocated memory from PyTorch
-        # Note: This is an approximation based on PyTorch's tracking
-        try:
+        # MLX tracks peak memory usage
+        allocated = mx.get_peak_memory()
+        return allocated, available_total
+    except (ImportError, AttributeError):
+        pass
+
+    # Fall back to PyTorch MPS if available
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            # MPS doesn't have great memory tracking, estimate from system
             allocated = torch.mps.current_allocated_memory()
-        except Exception:
-            allocated = 0
+            return allocated, available_total
+    except (ImportError, AttributeError):
+        pass
 
-        return allocated, total
-    except Exception:
-        return 0, 0
+    # No tracking available, return 0 allocated
+    return 0, available_total
+
+
+def metal_empty_cache() -> None:
+    """Clear Metal memory caches."""
+    # Clear MLX cache
+    try:
+        import mlx.core as mx
+
+        mx.metal.clear_cache()
+    except (ImportError, AttributeError):
+        pass
+
+    # Clear PyTorch MPS cache
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except (ImportError, AttributeError):
+        pass
 
 
 def metal_synchronize() -> None:
     """Synchronize Metal operations."""
+    # Synchronize MLX
     try:
-        torch.mps.synchronize()
-    except Exception:
+        import mlx.core as mx
+
+        mx.eval([])  # Force evaluation of pending operations
+    except (ImportError, AttributeError):
+        pass
+
+    # Synchronize PyTorch MPS
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.synchronize()
+    except (ImportError, AttributeError):
         pass
 
 
-def metal_empty_cache() -> None:
-    """Empty Metal cache to free memory."""
-    try:
-        torch.mps.empty_cache()
-    except Exception:
-        pass
-
-
-def get_optimal_dtype() -> torch.dtype:
-    """Get the optimal dtype for Metal inference.
-
-    Metal works best with float16 or bfloat16 on newer chips.
-    """
-    # bfloat16 support was added in later Metal versions
-    # For now, default to float16 which is well-supported
-    return torch.float16
-
-
-def check_model_compatibility(model_config) -> tuple[bool, str | None]:
-    """Check if a model configuration is compatible with Metal backend.
-
-    Args:
-        model_config: vLLM model configuration
+def check_metal_availability() -> tuple[bool, str | None]:
+    """Check if Metal backend is available and functional.
 
     Returns:
-        Tuple of (is_compatible, error_message)
+        Tuple of (is_available, error_message).
+        If available, error_message is None.
     """
-    # Metal doesn't support all quantization methods
-    if hasattr(model_config, "quantization") and model_config.quantization:
-        quant = model_config.quantization
-        supported_quant = {"awq", "gptq", None}
-        if quant not in supported_quant:
-            return False, f"Quantization method '{quant}' not supported on Metal"
+    if not is_apple_silicon():
+        return False, "Not running on Apple Silicon"
+
+    # Check MLX availability (required)
+    try:
+        import mlx.core as mx
+
+        # Try a simple operation
+        x = mx.array([1.0, 2.0, 3.0])
+        _ = mx.sum(x)
+    except ImportError:
+        return False, "MLX is not installed. Install with: pip install mlx mlx-lm"
+    except Exception as e:
+        return False, f"MLX error: {e}"
+
+    # Check PyTorch MPS availability (optional but recommended)
+    try:
+        import torch
+
+        if not torch.backends.mps.is_available():
+            # Warning but not an error - MLX is primary backend
+            pass
+    except ImportError:
+        pass
 
     return True, None
 
 
-def format_memory_size(size_bytes: int | float) -> str:
-    """Format memory size in human-readable format."""
-    size: float = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} PB"
+@lru_cache(maxsize=1)
+def get_supported_dtypes() -> set[str]:
+    """Get supported data types for Metal backend.
+
+    Returns:
+        Set of supported dtype strings.
+    """
+    return {
+        "float32",
+        "float16",
+        "bfloat16",  # Supported on M1+ chips
+        "int32",
+        "int64",
+        "int16",
+        "int8",
+        "uint8",
+        "bool",
+    }

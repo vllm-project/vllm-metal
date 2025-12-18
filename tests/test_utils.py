@@ -1,122 +1,181 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for utility functions."""
 
-import platform
-
 import pytest
-import torch
-
-from vllm_metal.utils import (
-    check_metal_availability,
-    format_memory_size,
-    get_apple_chip_name,
-    get_metal_device_info,
-    get_metal_memory_info,
-    get_optimal_dtype,
-    is_apple_silicon,
-    metal_empty_cache,
-    metal_synchronize,
-)
 
 
-class TestPlatformDetection:
-    """Tests for platform detection utilities."""
+class TestUtilityFunctions:
+    """Tests for vllm_metal.utils functions."""
 
     def test_is_apple_silicon(self):
-        """Test Apple Silicon detection."""
+        """Test is_apple_silicon detection."""
+        import platform
+        from vllm_metal.utils import is_apple_silicon
+
         result = is_apple_silicon()
-        # Should return True on Apple Silicon, False elsewhere
         assert isinstance(result, bool)
 
-        if platform.system() == "Darwin" and platform.machine() == "arm64":
-            assert result is True
+        # Verify consistency with platform info
+        expected = (
+            platform.system() == "Darwin"
+            and platform.machine() in ("arm64", "aarch64")
+        )
+        assert result == expected
 
+    @pytest.mark.apple_silicon
     def test_get_apple_chip_name(self):
-        """Test getting Apple chip name."""
+        """Test chip name detection on Apple Silicon."""
+        from vllm_metal.utils import get_apple_chip_name
+
         name = get_apple_chip_name()
         assert isinstance(name, str)
+        assert len(name) > 0
+        # Should contain "Apple" for Apple Silicon
+        assert "Apple" in name or "M1" in name or "M2" in name or "M3" in name or "M4" in name
 
-        if is_apple_silicon():
-            # Should contain "M" for Apple Silicon chips
-            assert "M" in name or "Apple" in name
+    def test_get_apple_chip_name_non_apple(self):
+        """Test chip name on non-Apple platforms."""
+        from vllm_metal.utils import get_apple_chip_name, is_apple_silicon
 
+        if not is_apple_silicon():
+            name = get_apple_chip_name()
+            assert name == "Not Apple Silicon"
+
+    @pytest.mark.apple_silicon
     def test_get_metal_device_info(self):
-        """Test getting Metal device information."""
+        """Test Metal device info retrieval."""
+        from vllm_metal.utils import get_metal_device_info
+
         info = get_metal_device_info()
 
         assert isinstance(info, dict)
         assert "name" in info
-        assert "is_apple_silicon" in info
         assert "metal_available" in info
+        assert "total_memory" in info
 
+        assert info["metal_available"] is True
+        assert info["total_memory"] > 0
 
-class TestMetalAvailability:
-    """Tests for Metal availability checking."""
+    @pytest.mark.apple_silicon
+    def test_get_metal_memory_info(self):
+        """Test Metal memory info retrieval."""
+        from vllm_metal.utils import get_metal_memory_info
 
-    def test_check_metal_availability(self):
-        """Test Metal availability check."""
-        available, error = check_metal_availability()
-
-        assert isinstance(available, bool)
-        assert error is None or isinstance(error, str)
-
-        if platform.system() != "Darwin":
-            assert available is False
-            assert error is not None
-
-    @pytest.mark.metal
-    def test_metal_synchronize(self, metal_device):
-        """Test Metal synchronization."""
-        # Should not raise
-        metal_synchronize()
-
-    @pytest.mark.metal
-    def test_metal_empty_cache(self, metal_device):
-        """Test Metal cache clearing."""
-        # Create some tensors
-        _ = torch.randn(100, 100, device=metal_device)
-
-        # Should not raise
-        metal_empty_cache()
-
-    @pytest.mark.metal
-    def test_get_metal_memory_info(self, metal_device):
-        """Test getting Metal memory information."""
         allocated, total = get_metal_memory_info()
 
         assert isinstance(allocated, int)
         assert isinstance(total, int)
+        assert total > 0
         assert allocated >= 0
-        assert total >= 0
+        assert allocated <= total
+
+    @pytest.mark.apple_silicon
+    def test_check_metal_availability(self):
+        """Test Metal availability check."""
+        from vllm_metal.utils import check_metal_availability
+
+        available, error = check_metal_availability()
+
+        assert isinstance(available, bool)
+        if available:
+            assert error is None
+        else:
+            assert isinstance(error, str)
+
+    @pytest.mark.apple_silicon
+    @pytest.mark.mlx
+    def test_metal_operations(self):
+        """Test Metal cache clearing and synchronization."""
+        from vllm_metal.utils import metal_empty_cache, metal_synchronize
+
+        # These should not raise errors
+        metal_empty_cache()
+        metal_synchronize()
+
+    def test_get_supported_dtypes(self):
+        """Test supported dtypes retrieval."""
+        from vllm_metal.utils import get_supported_dtypes
+
+        dtypes = get_supported_dtypes()
+
+        assert isinstance(dtypes, set)
+        assert "float32" in dtypes
+        assert "float16" in dtypes
+        assert "bfloat16" in dtypes
+        assert "int32" in dtypes
 
 
-class TestDtypeUtils:
-    """Tests for dtype utilities."""
+class TestEnvironmentVariables:
+    """Tests for environment variable handling."""
 
-    def test_get_optimal_dtype(self):
-        """Test getting optimal dtype."""
-        dtype = get_optimal_dtype()
-        assert dtype in (torch.float16, torch.bfloat16)
+    def test_default_memory_fraction(self):
+        """Test default memory fraction."""
+        from vllm_metal.envs import VLLM_METAL_MEMORY_FRACTION
+
+        assert isinstance(VLLM_METAL_MEMORY_FRACTION, float)
+        assert 0.0 < VLLM_METAL_MEMORY_FRACTION <= 1.0
+
+    def test_default_use_mlx(self):
+        """Test default MLX usage flag."""
+        from vllm_metal.envs import VLLM_METAL_USE_MLX
+
+        assert isinstance(VLLM_METAL_USE_MLX, bool)
+        assert VLLM_METAL_USE_MLX is True  # Default should be True
+
+    def test_default_block_size(self):
+        """Test default block size."""
+        from vllm_metal.envs import VLLM_METAL_BLOCK_SIZE
+
+        assert isinstance(VLLM_METAL_BLOCK_SIZE, int)
+        assert VLLM_METAL_BLOCK_SIZE in (8, 16, 32)
 
 
-class TestFormatting:
-    """Tests for formatting utilities."""
+class TestConfig:
+    """Tests for Metal configuration."""
 
-    def test_format_memory_size_bytes(self):
-        """Test formatting bytes."""
-        assert format_memory_size(512) == "512.00 B"
+    def test_metal_config_defaults(self):
+        """Test MetalConfig default values."""
+        from vllm_metal.config import MetalConfig
 
-    def test_format_memory_size_kilobytes(self):
-        """Test formatting kilobytes."""
-        result = format_memory_size(2048)
-        assert "KB" in result
+        config = MetalConfig()
 
-    def test_format_memory_size_megabytes(self):
-        """Test formatting megabytes."""
-        result = format_memory_size(2 * 1024 * 1024)
-        assert "MB" in result
+        assert 0.0 < config.memory_fraction <= 1.0
+        assert config.block_size in (8, 16, 32)
+        assert config.max_batch_size > 0
+        assert config.use_mlx is True
+        assert config.mlx_device in ("gpu", "cpu")
 
-    def test_format_memory_size_gigabytes(self):
-        """Test formatting gigabytes."""
-        result = format_memory_size(8 * 1024 * 1024 * 1024)
-        assert "GB" in result
+    def test_metal_config_validation(self):
+        """Test MetalConfig validation."""
+        from vllm_metal.config import MetalConfig
+
+        # Invalid memory fraction
+        with pytest.raises(ValueError):
+            MetalConfig(memory_fraction=0.0)
+
+        with pytest.raises(ValueError):
+            MetalConfig(memory_fraction=1.5)
+
+        # Invalid block size
+        with pytest.raises(ValueError):
+            MetalConfig(block_size=64)
+
+        # Invalid batch size
+        with pytest.raises(ValueError):
+            MetalConfig(max_batch_size=0)
+
+    def test_global_config(self):
+        """Test global config getter/setter."""
+        from vllm_metal.config import get_metal_config, set_metal_config, MetalConfig
+
+        # Get default config
+        config = get_metal_config()
+        assert isinstance(config, MetalConfig)
+
+        # Set new config
+        new_config = MetalConfig(memory_fraction=0.8)
+        set_metal_config(new_config)
+
+        # Verify it was set
+        retrieved = get_metal_config()
+        assert retrieved.memory_fraction == 0.8

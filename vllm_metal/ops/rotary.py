@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rotary positional embedding operations for Metal backend."""
+"""Metal rotary embedding operations."""
+
+from typing import Optional, Tuple
 
 import torch
+
+from vllm_metal.mlx import mlx_rotary_embedding, to_mlx, to_torch
 
 
 def rotary_embedding(
@@ -11,167 +15,90 @@ def rotary_embedding(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary positional embeddings to query and key tensors.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings using MLX.
 
     Args:
-        positions: Position indices [num_tokens]
-        query: Query tensor [num_tokens, num_heads * head_size]
-        key: Key tensor [num_tokens, num_kv_heads * head_size]
-        head_size: Size of each attention head
-        cos_sin_cache: Precomputed cos/sin cache [max_seq_len, rotary_dim]
-        is_neox: Whether to use NeoX-style rotary (interleaved vs split)
+        positions: Position indices [batch_size, seq_len] or [seq_len].
+        query: Query tensor [batch, seq_len, num_heads, head_size].
+        key: Key tensor [batch, seq_len, num_kv_heads, head_size].
+        head_size: Size of each attention head.
+        cos_sin_cache: Precomputed cos/sin cache [max_seq_len, rotary_dim].
+        is_neox: Whether to use NeoX-style rotation.
 
     Returns:
-        Tuple of (rotated_query, rotated_key)
+        Tuple of (rotated_query, rotated_key).
     """
-    # Get rotary dimension (typically head_size or head_size // 2)
-    rotary_dim = cos_sin_cache.shape[1] // 2
+    import mlx.core as mx
 
-    # Reshape query and key
-    num_tokens = query.shape[0]
-    num_heads = query.shape[1] // head_size
-    num_kv_heads = key.shape[1] // head_size
+    # Extract cos and sin from cache
+    # cos_sin_cache shape: [max_seq_len, rotary_dim] where rotary_dim = 2 * head_size // 2
+    rotary_dim = cos_sin_cache.shape[-1] // 2
 
-    query = query.view(num_tokens, num_heads, head_size)
-    key = key.view(num_tokens, num_kv_heads, head_size)
-
-    # Get cos and sin for each position
-    cos = cos_sin_cache[positions, :rotary_dim]  # [num_tokens, rotary_dim]
-    sin = cos_sin_cache[positions, rotary_dim:]  # [num_tokens, rotary_dim]
-
-    # Expand for broadcasting
-    cos = cos.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-    sin = sin.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
-
-    # Apply rotary embedding
-    if is_neox:
-        # NeoX-style: split into two halves
-        query_rot = query[..., :rotary_dim]
-        query_pass = query[..., rotary_dim:]
-        key_rot = key[..., :rotary_dim]
-        key_pass = key[..., rotary_dim:]
-
-        query_rot = _apply_rotary_emb(query_rot, cos, sin)
-        key_rot = _apply_rotary_emb(key_rot, cos, sin)
-
-        query = torch.cat([query_rot, query_pass], dim=-1)
-        key = torch.cat([key_rot, key_pass], dim=-1)
+    # Get positions for indexing
+    if positions.dim() == 1:
+        pos_indices = positions
     else:
-        # GPT-J style: interleaved
-        query = _apply_rotary_emb_interleaved(query, cos, sin, rotary_dim)
-        key = _apply_rotary_emb_interleaved(key, cos, sin, rotary_dim)
+        pos_indices = positions.flatten()
 
-    # Reshape back
-    query = query.view(num_tokens, num_heads * head_size)
-    key = key.view(num_tokens, num_kv_heads * head_size)
+    # Get cos/sin values for these positions
+    cos_sin = cos_sin_cache[pos_indices.long()]
+    cos = cos_sin[:, :rotary_dim]
+    sin = cos_sin[:, rotary_dim:]
 
-    return query, key
+    # Convert to MLX
+    q_mlx = to_mlx(query)
+    k_mlx = to_mlx(key)
+    cos_mlx = to_mlx(cos)
+    sin_mlx = to_mlx(sin)
 
+    # Reshape cos/sin to match query shape
+    # Original shape: [num_tokens, rotary_dim]
+    # Need: [num_tokens, 1, rotary_dim] or broadcastable shape
+    if query.dim() == 4:
+        # [batch, seq_len, num_heads, head_size]
+        cos_mlx = cos_mlx.reshape(-1, 1, rotary_dim)
+        sin_mlx = sin_mlx.reshape(-1, 1, rotary_dim)
+    else:
+        # [total_tokens, num_heads, head_size]
+        cos_mlx = cos_mlx.reshape(-1, 1, rotary_dim)
+        sin_mlx = sin_mlx.reshape(-1, 1, rotary_dim)
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    """Apply rotary embedding to tensor x.
+    # Expand cos/sin to full rotary_dim for the rotation
+    cos_full = mx.concatenate([cos_mlx, cos_mlx], axis=-1)
+    sin_full = mx.concatenate([sin_mlx, sin_mlx], axis=-1)
 
-    Args:
-        x: Input tensor [..., rotary_dim]
-        cos: Cosine values [..., rotary_dim]
-        sin: Sine values [..., rotary_dim]
+    # Apply RoPE
+    rotated_q = mlx_rotary_embedding(q_mlx, cos_full, sin_full, is_neox)
+    rotated_k = mlx_rotary_embedding(k_mlx, cos_full, sin_full, is_neox)
 
-    Returns:
-        Rotated tensor
-    """
-    # Split into even and odd indices
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
+    # Convert back to PyTorch
+    rotated_query = to_torch(rotated_q, device=query.device, dtype=query.dtype)
+    rotated_key = to_torch(rotated_k, device=key.device, dtype=key.dtype)
 
-    cos = cos[..., ::2]
-    sin = sin[..., ::2]
-
-    # Apply rotation
-    # [x1, x2] @ [[cos, -sin], [sin, cos]] = [x1*cos - x2*sin, x1*sin + x2*cos]
-    out1 = x1 * cos - x2 * sin
-    out2 = x1 * sin + x2 * cos
-
-    # Interleave back
-    out = torch.stack([out1, out2], dim=-1).flatten(-2)
-    return out
+    return rotated_query, rotated_key
 
 
-def _apply_rotary_emb_interleaved(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    rotary_dim: int,
-) -> torch.Tensor:
-    """Apply rotary embedding with interleaved pattern (GPT-J style).
-
-    Args:
-        x: Input tensor [..., head_size]
-        cos: Cosine values
-        sin: Sine values
-        rotary_dim: Dimension for rotary embedding
-
-    Returns:
-        Rotated tensor
-    """
-    x_rot = x[..., :rotary_dim]
-    x_pass = x[..., rotary_dim:]
-
-    # Reshape for rotation
-    x_rot = x_rot.reshape(*x_rot.shape[:-1], -1, 2)
-
-    # Apply rotation
-    x_rot_out = torch.stack(
-        [
-            x_rot[..., 0] * cos.squeeze(-2) - x_rot[..., 1] * sin.squeeze(-2),
-            x_rot[..., 0] * sin.squeeze(-2) + x_rot[..., 1] * cos.squeeze(-2),
-        ],
-        dim=-1,
-    ).flatten(-2)
-
-    return torch.cat([x_rot_out, x_pass], dim=-1)
-
-
-def create_cos_sin_cache(
-    max_seq_len: int,
+def rotary_embedding_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
     head_size: int,
-    base: float = 10000.0,
-    dtype: torch.dtype = torch.float32,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Create cosine/sine cache for rotary embeddings.
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    """Apply rotary embeddings in-place.
 
     Args:
-        max_seq_len: Maximum sequence length
-        head_size: Size of attention head
-        base: Base for computing frequencies
-        dtype: Data type for the cache
-        device: Device to create cache on
-
-    Returns:
-        Cache tensor of shape [max_seq_len, head_size]
+        positions: Position indices.
+        query: Query tensor (modified in-place).
+        key: Key tensor (modified in-place).
+        head_size: Size of each head.
+        cos_sin_cache: Precomputed cos/sin cache.
+        is_neox: Whether to use NeoX-style rotation.
     """
-    # Compute inverse frequencies
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, head_size, 2, dtype=torch.float32) / head_size)
+    rotated_q, rotated_k = rotary_embedding(
+        positions, query, key, head_size, cos_sin_cache, is_neox
     )
-
-    # Create position indices
-    t = torch.arange(max_seq_len, dtype=torch.float32)
-
-    # Compute frequencies
-    freqs = torch.outer(t, inv_freq)
-
-    # Create cache: [max_seq_len, head_size]
-    cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
-
-    if device is not None:
-        cache = cache.to(device)
-    if dtype != torch.float32:
-        cache = cache.to(dtype)
-
-    return cache
+    query.copy_(rotated_q)
+    key.copy_(rotated_k)

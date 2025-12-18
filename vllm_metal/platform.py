@@ -6,10 +6,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_metal._compat import Platform, PlatformEnum, init_logger
-from vllm_metal.envs import (
-    VLLM_METAL_MEMORY_FRACTION,
+from vllm_metal._compat import (
+    CompilationMode,
+    CUDAGraphMode,
+    Platform,
+    PlatformEnum,
+    init_logger,
 )
+from vllm_metal.envs import VLLM_METAL_MEMORY_FRACTION
 from vllm_metal.utils import (
     check_metal_availability,
     get_apple_chip_name,
@@ -26,13 +30,26 @@ logger = init_logger(__name__)
 
 
 class MetalPlatform(Platform):
-    """Platform implementation for Apple Metal backend."""
+    """Platform implementation for Apple Metal backend using MLX.
 
-    _enum = PlatformEnum.OOT  # Out-of-tree platform
+    This platform provides high-performance LLM inference on Apple Silicon
+    by using MLX as the primary compute backend. It integrates with vLLM's
+    plugin system to provide a seamless experience.
+
+    Key features:
+    - MLX for GPU operations (attention, normalization, activations)
+    - PyTorch for model loading and tensor interface compatibility
+    - Unified memory architecture (no CPU/GPU copies needed)
+    - V2 model runner with Triton kernel replacements
+    """
+
+    # Out-of-tree platform enum (OOT is only available in vLLM 0.12+)
+    _enum = PlatformEnum.OOT if PlatformEnum is not None else None
     device_name: str = "mps"
     device_type: str = "mps"
     dispatch_key: str = "MPS"
 
+    # Supported quantization methods
     supported_quantization = ["awq", "gptq", "compressed-tensors"]
 
     @classmethod
@@ -43,8 +60,6 @@ class MetalPlatform(Platform):
     @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:
         """Get a unique identifier for the Metal device."""
-        # Metal doesn't have a PCI bus ID like CUDA
-        # Use chip name + device_id as identifier
         chip_name = get_apple_chip_name().replace(" ", "_")
         return f"metal:{chip_name}:{device_id}"
 
@@ -56,7 +71,6 @@ class MetalPlatform(Platform):
         """
         info = get_metal_device_info()
         total_mem = info.get("total_memory", 0)
-        # Apply memory fraction limit
         return int(total_mem * VLLM_METAL_MEMORY_FRACTION)
 
     @classmethod
@@ -70,7 +84,6 @@ class MetalPlatform(Platform):
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool) -> bool:
         """Check if async output is supported."""
-        # Metal supports async operations
         return not enforce_eager
 
     @classmethod
@@ -81,7 +94,11 @@ class MetalPlatform(Platform):
     @classmethod
     def seed_everything(cls, seed: int) -> None:
         """Seed all random number generators."""
+        import mlx.core as mx
+
         torch.manual_seed(seed)
+        mx.random.seed(seed)
+
         try:
             torch.mps.manual_seed(seed)
         except Exception:
@@ -92,20 +109,13 @@ class MetalPlatform(Platform):
         """Set the current device.
 
         Metal only has one device, so this is mostly a no-op.
+        MLX handles device placement automatically.
         """
-        # Ensure the proper device for new tensors
-        if isinstance(device, int):
-            device = torch.device("mps", device)
-        elif isinstance(device, str):
-            device = torch.device(device)
+        pass
 
     @classmethod
     def get_current_memory_usage(cls, device=None) -> int:
-        """Get current memory usage.
-
-        Returns:
-            used_bytes: The number of bytes currently allocated.
-        """
+        """Get current memory usage in bytes."""
         allocated, _ = get_metal_memory_info()
         return allocated
 
@@ -133,13 +143,10 @@ class MetalPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Check and update vLLM configuration for Metal backend.
 
-        Note: This method may be called multiple times during initialization,
-        and some configs may be None in early calls. We guard all accesses
-        appropriately.
+        This method validates the configuration and sets Metal-specific
+        defaults for optimal performance.
         """
-        from vllm.config.compilation import CompilationMode, CUDAGraphMode
-
-        # Validate platform availability (always safe to check)
+        # Validate platform availability
         available, error = check_metal_availability()
         if not available:
             raise RuntimeError(f"Metal backend not available: {error}")
@@ -150,19 +157,11 @@ class MetalPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         compilation_config = vllm_config.compilation_config
 
-        # Set the worker class for Metal platform - this is critical!
-        # Must be done early and guarded properly.
+        # Set the worker class for Metal platform
         if parallel_config is not None:
-            logger.info(
-                f"Metal backend: check_and_update_config called, worker_cls={parallel_config.worker_cls}"
-            )
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = "vllm_metal.v2.worker.MetalWorker"
                 logger.info("Metal backend: Using MetalWorker V2")
-            else:
-                logger.info(
-                    f"Metal backend: worker_cls already set to {parallel_config.worker_cls}, not overriding"
-                )
 
             # Metal doesn't support tensor parallelism
             if parallel_config.tensor_parallel_size > 1:
@@ -188,25 +187,19 @@ class MetalPlatform(Platform):
         if model_config is not None:
             model_config.enforce_eager = True
 
-        # Disable CUDA graphs and torch.compile - Metal doesn't support them
-        if compilation_config is not None:
+        # Disable CUDA graphs and torch.compile
+        if compilation_config is not None and CompilationMode is not None:
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             compilation_config.cudagraph_capture_sizes = []
             compilation_config.compile_sizes = []
-            # Disable compilation entirely - Metal doesn't support CUDA graphs or inductor
             compilation_config.level = 0
             compilation_config.mode = CompilationMode.NONE
             logger.info(
-                "Metal backend: Disabled CUDA graphs and compilation (not supported on Metal)"
+                "Metal backend: Disabled CUDA graphs and compilation "
+                "(not supported on Metal)"
             )
 
-        # Log configuration info only when cache_config is available
-        if cache_config is not None:
-            logger.info(
-                f"Metal backend: Using KV cache dtype={cache_config.cache_dtype}"
-            )
-
-        # Log overall initialization only once (when parallel_config is set)
+        # Log initialization info
         if parallel_config is not None:
             logger.info(
                 f"Metal backend initialized: device={cls.get_device_name()}, "
@@ -225,8 +218,6 @@ class MetalPlatform(Platform):
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         """Verify that the model architecture is supported."""
-        # Most transformer architectures are supported via PyTorch Metal
-        # Log a warning for potentially unsupported architectures
         unsupported = {"mamba", "rwkv", "xlnet"}
         if model_arch.lower() in unsupported:
             logger.warning(
@@ -249,15 +240,14 @@ class MetalPlatform(Platform):
     ) -> str:
         """Get the attention backend class path for Metal.
 
-        For Metal, we use a custom Metal attention backend that uses
-        PyTorch's scaled_dot_product_attention which is optimized.
+        Returns our custom Metal attention backend that uses MLX's
+        scaled_dot_product_attention.
         """
         if use_mla:
             raise NotImplementedError("MLA is not supported on Metal.")
         if use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal.")
 
-        # Use our custom Metal attention backend
         return "vllm_metal.attention.backend.MetalAttentionBackend"
 
     @classmethod
@@ -274,7 +264,7 @@ class MetalPlatform(Platform):
         supported = {
             torch.float32,
             torch.float16,
-            torch.bfloat16,  # Supported on newer chips
+            torch.bfloat16,
             torch.int32,
             torch.int64,
             torch.int16,
@@ -315,14 +305,12 @@ class MetalPlatform(Platform):
     @classmethod
     def support_static_graph_mode(cls) -> bool:
         """Check if static graph mode is supported."""
-        # Metal doesn't have graph capture like CUDA
         return False
 
     @classmethod
     @contextmanager
     def device_scope(cls, device_id: int = 0):
         """Context manager for device scope."""
-        # Metal only has one device
         yield
 
     @classmethod
@@ -349,9 +337,8 @@ class MetalPlatform(Platform):
 
     @classmethod
     def import_kernels(cls) -> None:
-        """Import Metal-specific kernels."""
+        """Import Metal-specific kernels (MLX operations)."""
         from vllm_metal import ops
 
-        # Trigger kernel registration
         ops.register_metal_ops()
-        logger.debug("Metal kernels imported")
+        logger.debug("Metal/MLX kernels imported")

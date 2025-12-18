@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention operations for Metal backend."""
+"""Metal paged attention operations."""
+
+from typing import Optional
 
 import torch
-from torch.nn import functional
+
+from vllm_metal.mlx import (
+    mlx_paged_attention,
+    to_mlx,
+    to_torch,
+)
 
 
 def paged_attention_v1(
-    out: torch.Tensor,
+    output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -16,103 +23,74 @@ def paged_attention_v1(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    alibi_slopes: torch.Tensor | None = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> None:
-    """Paged attention v1 for Metal.
+    """Paged attention v1 using MLX.
 
-    This is a Python implementation that works on Metal.
+    This is the standard paged attention used during decode phase.
 
     Args:
-        out: Output tensor [num_seqs, num_heads, head_size]
-        query: Query tensor [num_seqs, num_heads, head_size]
-        key_cache: Key cache [num_blocks, block_size, num_kv_heads, head_size]
-        value_cache: Value cache [num_blocks, block_size, num_kv_heads, head_size]
-        num_kv_heads: Number of KV heads
-        scale: Attention scale
-        block_tables: Block table [num_seqs, max_blocks]
-        seq_lens: Sequence lengths [num_seqs]
-        block_size: Block size
-        max_seq_len: Maximum sequence length
-        alibi_slopes: Optional ALiBi slopes
-        kv_cache_dtype: KV cache data type
-        k_scale: Key scaling factor
-        v_scale: Value scaling factor
+        output: Output tensor to write results [batch, num_heads, head_size].
+        query: Query tensor [batch, num_heads, head_size].
+        key_cache: Key cache [num_blocks, block_size, num_kv_heads, head_size].
+        value_cache: Value cache [num_blocks, block_size, num_kv_heads, head_size].
+        num_kv_heads: Number of key-value heads.
+        scale: Attention scale factor.
+        block_tables: Block table [batch, max_blocks].
+        seq_lens: Sequence lengths [batch].
+        block_size: Tokens per block.
+        max_seq_len: Maximum sequence length.
+        alibi_slopes: Optional ALiBi slopes.
+        kv_cache_dtype: Cache data type.
+        k_scale: Key scale factor (for FP8).
+        v_scale: Value scale factor (for FP8).
     """
-    num_seqs = query.shape[0]
-    num_heads = query.shape[1]
-    num_queries_per_kv = num_heads // num_kv_heads
+    import mlx.core as mx
 
-    for seq_idx in range(num_seqs):
-        seq_len = seq_lens[seq_idx].item()
-        if seq_len == 0:
-            continue
+    # Convert to MLX
+    q_mlx = to_mlx(query)
+    k_cache_mlx = to_mlx(key_cache)
+    v_cache_mlx = to_mlx(value_cache)
+    block_table_mlx = to_mlx(block_tables)
+    seq_lens_mlx = to_mlx(seq_lens)
 
-        # Get query for this sequence
-        q = query[seq_idx]  # [num_heads, head_size]
+    # Add sequence dimension for SDPA: [batch, num_heads, 1, head_size]
+    if q_mlx.ndim == 3:
+        q_mlx = q_mlx[:, :, None, :]
 
-        # Gather keys and values from cache
-        num_blocks_needed = int((seq_len + block_size - 1) // block_size)
-        block_table = block_tables[seq_idx]
+    # ALiBi slopes
+    alibi_mlx = None
+    if alibi_slopes is not None:
+        alibi_mlx = to_mlx(alibi_slopes)
 
-        keys: list[torch.Tensor] = []
-        values: list[torch.Tensor] = []
+    # Compute paged attention
+    result = mlx_paged_attention(
+        q_mlx,
+        k_cache_mlx,
+        v_cache_mlx,
+        block_table_mlx,
+        seq_lens_mlx,
+        scale=scale,
+        alibi_slopes=alibi_mlx,
+    )
 
-        tokens_gathered = 0
-        for block_idx in range(num_blocks_needed):
-            physical_block = int(block_table[block_idx].item())
-            tokens_in_block = int(min(block_size, seq_len - tokens_gathered))
+    # Remove sequence dimension
+    if result.shape[2] == 1:
+        result = result[:, :, 0, :]
 
-            k_block = key_cache[physical_block, :tokens_in_block]
-            v_block = value_cache[physical_block, :tokens_in_block]
-
-            keys.append(k_block)
-            values.append(v_block)
-            tokens_gathered += tokens_in_block
-
-        # Concatenate: [seq_len, num_kv_heads, head_size]
-        k = torch.cat(keys, dim=0)
-        v = torch.cat(values, dim=0)
-
-        # Apply scaling
-        k = k * k_scale
-        v = v * v_scale
-
-        # Expand KV for GQA
-        if num_queries_per_kv > 1:
-            k = k.repeat_interleave(num_queries_per_kv, dim=1)
-            v = v.repeat_interleave(num_queries_per_kv, dim=1)
-
-        # Compute attention
-        # q: [num_heads, head_size]
-        # k: [seq_len, num_heads, head_size]
-        # v: [seq_len, num_heads, head_size]
-
-        # Attention scores: [num_heads, seq_len]
-        attn_weights = torch.einsum("hd,shd->hs", q, k) * scale
-
-        # Apply ALiBi if provided
-        if alibi_slopes is not None:
-            positions = torch.arange(seq_len, device=query.device)
-            alibi_bias = alibi_slopes.unsqueeze(1) * (positions - seq_len + 1)
-            attn_weights = attn_weights + alibi_bias
-
-        # Softmax
-        attn_weights = functional.softmax(attn_weights, dim=-1)
-
-        # Weighted sum: [num_heads, head_size]
-        output = torch.einsum("hs,shd->hd", attn_weights, v)
-
-        out[seq_idx] = output
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)
 
 
 def paged_attention_v2(
-    out: torch.Tensor,
+    output: torch.Tensor,
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
-    tmp_out: torch.Tensor,
+    tmp_output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -122,40 +100,39 @@ def paged_attention_v2(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    alibi_slopes: torch.Tensor | None = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> None:
-    """Paged attention v2 for Metal.
+    """Paged attention v2 using MLX.
 
-    This version is designed for longer sequences with partition-based
-    softmax computation. On Metal, we use the same implementation as v1
-    since the Python overhead is similar.
+    This is the split-k version for very long sequences.
+    On Metal, we use the same implementation as v1 since MLX
+    handles the optimization internally.
 
     Args:
-        out: Output tensor [num_seqs, num_heads, head_size]
-        exp_sums: Exponential sums tensor (unused in this implementation)
-        max_logits: Max logits tensor (unused in this implementation)
-        tmp_out: Temporary output tensor (unused in this implementation)
-        query: Query tensor [num_seqs, num_heads, head_size]
-        key_cache: Key cache
-        value_cache: Value cache
-        num_kv_heads: Number of KV heads
-        scale: Attention scale
-        block_tables: Block table
-        seq_lens: Sequence lengths
-        block_size: Block size
-        max_seq_len: Maximum sequence length
-        alibi_slopes: Optional ALiBi slopes
-        kv_cache_dtype: KV cache data type
-        k_scale: Key scaling factor
-        v_scale: Value scaling factor
+        output: Output tensor [batch, num_heads, head_size].
+        exp_sums: Intermediate exp sums (unused on Metal).
+        max_logits: Intermediate max logits (unused on Metal).
+        tmp_output: Temporary output (unused on Metal).
+        query: Query tensor [batch, num_heads, head_size].
+        key_cache: Key cache.
+        value_cache: Value cache.
+        num_kv_heads: Number of KV heads.
+        scale: Attention scale.
+        block_tables: Block table.
+        seq_lens: Sequence lengths.
+        block_size: Block size.
+        max_seq_len: Max sequence length.
+        alibi_slopes: Optional ALiBi slopes.
+        kv_cache_dtype: Cache dtype.
+        k_scale: Key scale.
+        v_scale: Value scale.
     """
-    # For Metal, we use the same implementation as v1
-    # The partitioned approach of v2 is mainly beneficial for CUDA
+    # On Metal, v2 is the same as v1 - MLX handles optimization
     paged_attention_v1(
-        out=out,
+        output=output,
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,

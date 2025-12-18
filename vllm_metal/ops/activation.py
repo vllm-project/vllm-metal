@@ -1,123 +1,151 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Activation functions for Metal backend."""
+"""Metal activation operations."""
 
 import torch
-from torch.nn import functional
+
+from vllm_metal.mlx import to_mlx, to_torch
 
 
-def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    """Fused SiLU activation and element-wise multiplication.
+def silu_and_mul(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """SiLU activation with gated multiplication.
 
-    Computes: out = silu(x[..., :d]) * x[..., d:]
-    where d = x.shape[-1] // 2
+    Computes: silu(x[:, :d]) * x[:, d:]
+    where d = input.shape[-1] // 2
 
-    This is commonly used in LLaMA/Mistral FFN layers.
-
-    Args:
-        out: Output tensor [*, d]
-        x: Input tensor [*, 2*d]
-    """
-    d = x.shape[-1] // 2
-    gate = x[..., :d]
-    up = x[..., d:]
-
-    # SiLU = x * sigmoid(x)
-    out.copy_(functional.silu(gate) * up)
-
-
-def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    """Fused GELU activation and element-wise multiplication.
-
-    Computes: out = gelu(x[..., :d]) * x[..., d:]
-    where d = x.shape[-1] // 2
+    This is the GLU variant using SiLU (Swish) activation.
 
     Args:
-        out: Output tensor [*, d]
-        x: Input tensor [*, 2*d]
+        output: Output tensor [*, d].
+        input: Input tensor [*, 2*d].
     """
-    d = x.shape[-1] // 2
-    gate = x[..., :d]
-    up = x[..., d:]
+    import mlx.core as mx
 
-    out.copy_(functional.gelu(gate) * up)
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+
+    # Split input
+    d = x_mlx.shape[-1] // 2
+    gate = x_mlx[..., :d]
+    up = x_mlx[..., d:]
+
+    # SiLU (Swish) activation: x * sigmoid(x)
+    silu_gate = gate * mx.sigmoid(gate)
+
+    # Multiply with up projection
+    result = silu_gate * up
+
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)
 
 
-def gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    """Fused GELU (tanh approximation) activation and multiplication.
+def gelu_and_mul(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """GELU activation with gated multiplication.
 
-    Computes: out = gelu_tanh(x[..., :d]) * x[..., d:]
-    where d = x.shape[-1] // 2
+    Computes: gelu(x[:, :d]) * x[:, d:]
+    where d = input.shape[-1] // 2
 
-    Uses the tanh approximation of GELU:
-    gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    This is the GLU variant using GELU activation.
 
     Args:
-        out: Output tensor [*, d]
-        x: Input tensor [*, 2*d]
+        output: Output tensor [*, d].
+        input: Input tensor [*, 2*d].
     """
-    d = x.shape[-1] // 2
-    gate = x[..., :d]
-    up = x[..., d:]
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+
+    # Split input
+    d = x_mlx.shape[-1] // 2
+    gate = x_mlx[..., :d]
+    up = x_mlx[..., d:]
+
+    # GELU activation (using approximate formula for speed)
+    gelu_gate = nn.gelu(gate)
+
+    # Multiply with up projection
+    result = gelu_gate * up
+
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)
+
+
+def gelu_tanh_and_mul(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """GELU (tanh approximation) activation with gated multiplication.
+
+    Computes: gelu_tanh(x[:, :d]) * x[:, d:]
+    where d = input.shape[-1] // 2
+
+    Uses the tanh approximation of GELU for faster computation.
+
+    Args:
+        output: Output tensor [*, d].
+        input: Input tensor [*, 2*d].
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    # Convert to MLX
+    x_mlx = to_mlx(input)
+
+    # Split input
+    d = x_mlx.shape[-1] // 2
+    gate = x_mlx[..., :d]
+    up = x_mlx[..., d:]
 
     # GELU with tanh approximation
-    out.copy_(functional.gelu(gate, approximate="tanh") * up)
+    gelu_gate = nn.gelu_approx(gate)
+
+    # Multiply with up projection
+    result = gelu_gate * up
+
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)
 
 
-def gelu_new(x: torch.Tensor) -> torch.Tensor:
-    """GELU activation with the 'new' approximation.
+def relu_and_mul(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """ReLU activation with gated multiplication.
 
-    This is the approximation used in GPT-2 and some other models.
-
-    Args:
-        x: Input tensor
-
-    Returns:
-        GELU activated tensor
-    """
-    return functional.gelu(x, approximate="tanh")
-
-
-def gelu_fast(x: torch.Tensor) -> torch.Tensor:
-    """Fast GELU approximation.
-
-    Uses: 0.5 * x * (1 + tanh(x * 0.7978845608 * (1 + 0.044715 * x * x)))
+    Computes: relu(x[:, :d]) * x[:, d:]
+    where d = input.shape[-1] // 2
 
     Args:
-        x: Input tensor
-
-    Returns:
-        GELU activated tensor
+        output: Output tensor [*, d].
+        input: Input tensor [*, 2*d].
     """
-    return (
-        0.5 * x * (1.0 + torch.tanh(x * 0.7978845608028654 * (1.0 + 0.044715 * x * x)))
-    )
+    import mlx.core as mx
+    import mlx.nn as nn
 
+    # Convert to MLX
+    x_mlx = to_mlx(input)
 
-def quickgelu(x: torch.Tensor) -> torch.Tensor:
-    """Quick GELU approximation.
+    # Split input
+    d = x_mlx.shape[-1] // 2
+    gate = x_mlx[..., :d]
+    up = x_mlx[..., d:]
 
-    Uses: x * sigmoid(1.702 * x)
+    # ReLU activation
+    relu_gate = nn.relu(gate)
 
-    Args:
-        x: Input tensor
+    # Multiply with up projection
+    result = relu_gate * up
 
-    Returns:
-        GELU activated tensor
-    """
-    return x * torch.sigmoid(1.702 * x)
-
-
-def relu_squared(x: torch.Tensor) -> torch.Tensor:
-    """ReLU squared activation.
-
-    Computes: relu(x)^2
-
-    Used in some transformer variants.
-
-    Args:
-        x: Input tensor
-
-    Returns:
-        Activated tensor
-    """
-    return functional.relu(x).square()
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output.device, dtype=output.dtype)
+    output.copy_(result_torch)

@@ -1,211 +1,167 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sampling operations for Metal backend."""
+"""Metal sampling operations."""
+
+from typing import Optional
 
 import torch
-from torch.nn import functional
+
+from vllm_metal.mlx import to_mlx, to_torch
 
 
 def sampling_from_probs(
     probs: torch.Tensor,
     random_numbers: torch.Tensor,
-    deterministic: bool = False,
-) -> torch.Tensor:
-    """Sample token indices from probability distributions.
+    output_indices: torch.Tensor,
+) -> None:
+    """Sample token indices from probability distribution.
+
+    Uses the inverse CDF method for sampling.
 
     Args:
-        probs: Probability tensor [batch_size, vocab_size]
-        random_numbers: Random numbers for sampling [batch_size]
-        deterministic: If True, use argmax instead of sampling
-
-    Returns:
-        Sampled token indices [batch_size]
+        probs: Probability distribution [batch, vocab_size].
+        random_numbers: Uniform random numbers [batch].
+        output_indices: Output tensor for sampled indices [batch].
     """
-    if deterministic:
-        return probs.argmax(dim=-1)
+    import mlx.core as mx
 
-    # Use cumulative sum for sampling
-    cumsum = probs.cumsum(dim=-1)
-    random_numbers = random_numbers.unsqueeze(-1)
+    # Convert to MLX
+    probs_mlx = to_mlx(probs)
+    random_mlx = to_mlx(random_numbers)
 
-    # Find the first index where cumsum >= random_number
-    samples = (cumsum >= random_numbers).int().argmax(dim=-1)
+    # Compute cumulative probabilities
+    cum_probs = mx.cumsum(probs_mlx, axis=-1)
 
-    return samples
+    # Sample using inverse CDF
+    # Find first index where cum_prob > random
+    batch_size = probs.shape[0]
+    indices = []
+
+    for i in range(batch_size):
+        r = random_mlx[i]
+        # Find index where cumsum exceeds random number
+        mask = cum_probs[i] > r
+        # Get first True index
+        idx = mx.argmax(mask.astype(mx.int32))
+        indices.append(idx)
+
+    result = mx.stack(indices)
+
+    # Convert back and copy to output
+    result_torch = to_torch(result, device=output_indices.device, dtype=output_indices.dtype)
+    output_indices.copy_(result_torch)
 
 
-def top_p_sampling(
-    logits: torch.Tensor,
-    top_p: float,
-    temperature: float = 1.0,
+def multinomial_sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Apply top-p (nucleus) sampling to logits.
+    """Sample from multinomial distribution.
 
     Args:
-        logits: Logit tensor [batch_size, vocab_size]
-        top_p: Top-p threshold (0.0 to 1.0)
-        temperature: Sampling temperature
+        probs: Probability distribution [batch, vocab_size].
+        num_samples: Number of samples per batch element.
+        generator: Optional random number generator.
 
     Returns:
-        Sampled token indices [batch_size]
+        Sampled indices [batch, num_samples].
     """
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    # Sort logits in descending order
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-    sorted_probs = functional.softmax(sorted_logits, dim=-1)
-    cumsum_probs = sorted_probs.cumsum(dim=-1)
-
-    # Create mask for tokens to remove
-    sorted_mask = cumsum_probs - sorted_probs > top_p
-
-    # Set masked logits to -inf
-    sorted_logits[sorted_mask] = float("-inf")
-
-    # Sample from filtered distribution
-    probs = functional.softmax(sorted_logits, dim=-1)
-    sampled_sorted_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-    # Map back to original indices
-    sampled_idx = sorted_indices.gather(dim=-1, index=sampled_sorted_idx.unsqueeze(-1))
-    return sampled_idx.squeeze(-1)
+    # Use PyTorch's multinomial since it handles edge cases well
+    return torch.multinomial(probs, num_samples, generator=generator)
 
 
 def top_k_sampling(
     logits: torch.Tensor,
     top_k: int,
     temperature: float = 1.0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Apply top-k sampling to logits.
+    """Top-k sampling from logits.
 
     Args:
-        logits: Logit tensor [batch_size, vocab_size]
-        top_k: Number of top tokens to consider
-        temperature: Sampling temperature
+        logits: Unnormalized logits [batch, vocab_size].
+        top_k: Number of top tokens to sample from.
+        temperature: Sampling temperature.
+        generator: Optional random number generator.
 
     Returns:
-        Sampled token indices [batch_size]
+        Sampled token indices [batch].
     """
+    import mlx.core as mx
+
+    # Apply temperature
     if temperature != 1.0:
         logits = logits / temperature
 
-    # Get top-k logits and indices
-    top_k_logits, top_k_indices = torch.topk(logits, k=top_k, dim=-1)
+    # Convert to MLX for top-k
+    logits_mlx = to_mlx(logits)
 
-    # Sample from top-k
-    probs = functional.softmax(top_k_logits, dim=-1)
-    sampled_top_k_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    batch_size, vocab_size = logits.shape
+    sampled_indices = []
 
-    # Map back to original indices
-    sampled_idx = top_k_indices.gather(dim=-1, index=sampled_top_k_idx.unsqueeze(-1))
-    return sampled_idx.squeeze(-1)
+    for i in range(batch_size):
+        # Get top-k values and indices
+        if top_k < vocab_size:
+            top_k_values, top_k_indices = torch.topk(logits[i], top_k)
+
+            # Softmax over top-k
+            probs = torch.softmax(top_k_values, dim=-1)
+
+            # Sample from top-k
+            sample_idx = torch.multinomial(probs.unsqueeze(0), 1, generator=generator)
+            sampled_token = top_k_indices[sample_idx.squeeze()]
+        else:
+            # Sample from full distribution
+            probs = torch.softmax(logits[i], dim=-1)
+            sampled_token = torch.multinomial(probs.unsqueeze(0), 1, generator=generator).squeeze()
+
+        sampled_indices.append(sampled_token)
+
+    return torch.stack(sampled_indices)
 
 
-def top_k_top_p_sampling(
+def top_p_sampling(
     logits: torch.Tensor,
-    top_k: int,
     top_p: float,
     temperature: float = 1.0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Apply combined top-k and top-p sampling.
-
-    First applies top-k, then top-p filtering.
+    """Top-p (nucleus) sampling from logits.
 
     Args:
-        logits: Logit tensor [batch_size, vocab_size]
-        top_k: Number of top tokens to consider
-        top_p: Top-p threshold
-        temperature: Sampling temperature
+        logits: Unnormalized logits [batch, vocab_size].
+        top_p: Cumulative probability threshold.
+        temperature: Sampling temperature.
+        generator: Optional random number generator.
 
     Returns:
-        Sampled token indices [batch_size]
+        Sampled token indices [batch].
     """
+    # Apply temperature
     if temperature != 1.0:
         logits = logits / temperature
 
-    # Apply top-k first
-    vocab_size = logits.shape[-1]
-    if top_k > 0 and top_k < vocab_size:
-        top_k_logits, top_k_indices = torch.topk(logits, k=top_k, dim=-1)
-
-        # Create a mask for non-top-k tokens
-        mask = torch.full_like(logits, float("-inf"))
-        mask.scatter_(dim=-1, index=top_k_indices, src=top_k_logits)
-        logits = mask
-
-    # Apply top-p
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        sorted_probs = functional.softmax(sorted_logits, dim=-1)
-        cumsum_probs = sorted_probs.cumsum(dim=-1)
-
-        # Create mask for tokens to remove
-        sorted_mask = cumsum_probs - sorted_probs > top_p
-        sorted_logits[sorted_mask] = float("-inf")
-
-        # Unsort
-        logits = sorted_logits.gather(dim=-1, index=sorted_indices.argsort(dim=-1))
-
-    # Sample
-    probs = functional.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-
-def greedy_sampling(logits: torch.Tensor) -> torch.Tensor:
-    """Greedy (argmax) sampling.
-
-    Args:
-        logits: Logit tensor [batch_size, vocab_size]
-
-    Returns:
-        Selected token indices [batch_size]
-    """
-    return logits.argmax(dim=-1)
-
-
-def apply_temperature(
-    logits: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    """Apply temperature scaling to logits.
-
-    Args:
-        logits: Logit tensor
-        temperature: Temperature value (> 0)
-
-    Returns:
-        Scaled logits
-    """
-    if temperature == 1.0:
-        return logits
-    return logits / temperature
-
-
-def apply_repetition_penalty(
-    logits: torch.Tensor,
-    input_ids: torch.Tensor,
-    penalty: float,
-) -> torch.Tensor:
-    """Apply repetition penalty to logits.
-
-    Args:
-        logits: Logit tensor [batch_size, vocab_size]
-        input_ids: Input token IDs [batch_size, seq_len]
-        penalty: Repetition penalty (1.0 = no penalty)
-
-    Returns:
-        Penalized logits
-    """
-    if penalty == 1.0:
-        return logits
-
     batch_size = logits.shape[0]
-    for i in range(batch_size):
-        unique_tokens = input_ids[i].unique()
-        for token_id in unique_tokens:
-            if logits[i, token_id] < 0:
-                logits[i, token_id] *= penalty
-            else:
-                logits[i, token_id] /= penalty
+    sampled_indices = []
 
-    return logits
+    for i in range(batch_size):
+        # Sort by probability
+        sorted_logits, sorted_indices = torch.sort(logits[i], descending=True)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
+
+        # Find cutoff
+        cutoff_mask = cumulative_probs > top_p
+        cutoff_mask[1:] = cutoff_mask[:-1].clone()
+        cutoff_mask[0] = False
+
+        # Zero out tokens beyond cutoff
+        sorted_logits[cutoff_mask] = float("-inf")
+
+        # Sample from filtered distribution
+        filtered_probs = torch.softmax(sorted_logits, dim=-1)
+        sample_idx = torch.multinomial(filtered_probs.unsqueeze(0), 1, generator=generator)
+        sampled_token = sorted_indices[sample_idx.squeeze()]
+        sampled_indices.append(sampled_token)
+
+    return torch.stack(sampled_indices)
