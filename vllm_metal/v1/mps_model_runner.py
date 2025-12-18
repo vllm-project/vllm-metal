@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MPS Model Runner for vLLM v1 API on Apple Silicon."""
+"""MPS Model Runner for vLLM v1 API on Apple Silicon.
+
+Performance optimizations for high throughput streaming:
+- Deferred synchronization: Only sync when absolutely necessary
+- Rust-accelerated tensor conversion: Fast Python list building
+- Unified memory exploitation: Minimize copies in MPS unified memory model
+- Optimized decode path: Streamlined single-sequence decode
+"""
 
 import os
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -19,6 +27,15 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+# Try to import Rust extensions for accelerated tensor operations
+try:
+    from vllm_metal_rust import tensor_1d_to_nested_list, tensor_to_nested_list
+    RUST_AVAILABLE = True
+    logger.info("Rust extensions loaded for accelerated tensor operations")
+except ImportError:
+    RUST_AVAILABLE = False
+    logger.warning("Rust extensions not available, using Python fallback")
 
 # Profiling counters - enabled via VLLM_MPS_PROFILE=1
 _profile_enabled = os.environ.get("VLLM_MPS_PROFILE", "0") == "1"
@@ -221,25 +238,41 @@ class MPSModelRunner(GPUModelRunner):
 
         MPS requires explicit synchronization before reading GPU tensor values
         because our placeholder CUDA events don't actually synchronize.
+
+        Optimizations:
+        - Uses Rust extension for fast list building when available
+        - Minimizes Python object allocations
+        - Single sync point before tensor read
         """
         start = _profile_start("_to_list")
 
         # Sync MPS to ensure sampling is complete before reading tensor values
+        # This is the critical sync point - we've deferred it as long as possible
         sync_start = _profile_start("_to_list.sync")
         torch.mps.synchronize()
         _profile_end("_to_list.sync", sync_start)
 
-        # For efficiency, convert directly from MPS tensor to list
-        # Using numpy array access is faster than copy + tolist
         conv_start = _profile_start("_to_list.convert")
-        if sampled_token_ids.dim() == 1:
-            # 1D tensor: return as nested list [[id], [id], ...]
-            result = [[int(x)] for x in sampled_token_ids.cpu().numpy()]
-        else:
-            # 2D tensor: return as nested list [[id1, id2], ...]
-            result = sampled_token_ids.cpu().numpy().tolist()
-        _profile_end("_to_list.convert", conv_start)
 
+        # Move to CPU and get numpy array (unified memory makes this fast)
+        cpu_tensor = sampled_token_ids.cpu()
+        arr = cpu_tensor.numpy()
+
+        if RUST_AVAILABLE:
+            # Use Rust extension for fast conversion
+            # This avoids Python object allocation overhead
+            if sampled_token_ids.dim() == 1:
+                result = tensor_1d_to_nested_list(arr.astype(np.int64))
+            else:
+                result = tensor_to_nested_list(arr.astype(np.int64))
+        else:
+            # Python fallback
+            if sampled_token_ids.dim() == 1:
+                result = [[int(x)] for x in arr]
+            else:
+                result = arr.tolist()
+
+        _profile_end("_to_list.convert", conv_start)
         _profile_end("_to_list", start)
         return result
 
