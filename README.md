@@ -27,39 +27,39 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    vLLM Core (Unchanged)                   │
-│         Engine, Scheduler, API Server, Tokenizers          │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    vLLM Core (Unchanged)                 │
+│         Engine, Scheduler, API Server, Tokenizers        │
+└──────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌────────────────────────────────────────────────────────────┐
-│                 vllm_metal Plugin Layer                    │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │MetalPlatform│  │ MetalWorker │  │ MetalModelRunner    │ │
-│  │ (Platform)  │  │ (Worker)    │  │ (ModelRunner)       │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                 vllm_metal Plugin Layer                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌───────────────────┐ │
+│  │MetalPlatform│  │ MetalWorker │  │ MetalModelRunner  │ │
+│  │ (Platform)  │  │ (Worker)    │  │ (ModelRunner)     │ │
+│  └─────────────┘  └─────────────┘  └───────────────────┘ │
+└──────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌────────────────────────────────────────────────────────────┐
-│              Unified Compute Backend                       │
-│  ┌──────────────────────┐  ┌─────────────────────────────┐ │
-│  │   MLX Backend        │  │   PyTorch Backend           │ │
-│  │   (Primary)          │  │   (Model Loading/Interop)   │ │
-│  │                      │  │                             │ │
-│  │ • SDPA Attention     │  │ • HuggingFace Loading       │ │
-│  │ • RMSNorm            │  │ • Weight Conversion         │ │
-│  │ • RoPE               │  │ • Tensor Bridge             │ │
-│  │ • Cache Ops          │  │                             │ │
-│  └──────────────────────┘  └─────────────────────────────┘ │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│              Unified Compute Backend                     │
+│  ┌──────────────────────┐  ┌───────────────────────────┐ │
+│  │   MLX Backend        │  │   PyTorch Backend         │ │
+│  │   (Primary)          │  │   (Model Loading/Interop) │ │
+│  │                      │  │                           │ │
+│  │ • SDPA Attention     │  │ • HuggingFace Loading     │ │
+│  │ • RMSNorm            │  │ • Weight Conversion       │ │
+│  │ • RoPE               │  │ • Tensor Bridge           │ │
+│  │ • Cache Ops          │  │                           │ │
+│  └──────────────────────┘  └───────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌────────────────────────────────────────────────────────────┐
-│                    Metal GPU Layer                         │
-│         Apple Silicon Unified Memory Architecture          │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                    Metal GPU Layer                       │
+│         Apple Silicon Unified Memory Architecture        │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration
