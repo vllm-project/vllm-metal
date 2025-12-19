@@ -105,20 +105,20 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
-        num_layers = self.model_args.get(
-            "num_hidden_layers", self.model_args.get("n_layers", 32)
+        # Handle None values explicitly - model configs may have keys set to None
+        num_layers = (
+            self.model_args.get("num_hidden_layers")
+            or self.model_args.get("n_layers")
+            or 32
         )
-        num_kv_heads = self.model_args.get(
-            "num_key_value_heads",
-            self.model_args.get(
-                "n_kv_heads", self.model_args.get("num_attention_heads", 32)
-            ),
+        num_attention_heads = self.model_args.get("num_attention_heads") or 32
+        num_kv_heads = (
+            self.model_args.get("num_key_value_heads")
+            or self.model_args.get("n_kv_heads")
+            or num_attention_heads
         )
-        head_size = self.model_args.get(
-            "head_dim",
-            self.model_args.get("hidden_size", 4096)
-            // self.model_args.get("num_attention_heads", 32),
-        )
+        hidden_size = self.model_args.get("hidden_size") or 4096
+        head_size = self.model_args.get("head_dim") or (hidden_size // num_attention_heads)
         block_size = self.metal_config.block_size
 
         # Create a spec for each layer
@@ -150,20 +150,20 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
-        num_layers = self.model_args.get(
-            "num_hidden_layers", self.model_args.get("n_layers", 32)
+        # Handle None values explicitly - model configs may have keys set to None
+        num_layers = (
+            self.model_args.get("num_hidden_layers")
+            or self.model_args.get("n_layers")
+            or 32
         )
-        num_kv_heads = self.model_args.get(
-            "num_key_value_heads",
-            self.model_args.get(
-                "n_kv_heads", self.model_args.get("num_attention_heads", 32)
-            ),
+        num_attention_heads = self.model_args.get("num_attention_heads") or 32
+        num_kv_heads = (
+            self.model_args.get("num_key_value_heads")
+            or self.model_args.get("n_kv_heads")
+            or num_attention_heads
         )
-        head_dim = self.model_args.get(
-            "head_dim",
-            self.model_args.get("hidden_size", 4096)
-            // self.model_args.get("num_attention_heads", 32),
-        )
+        hidden_size = self.model_args.get("hidden_size") or 4096
+        head_dim = self.model_args.get("head_dim") or (hidden_size // num_attention_heads)
         block_size = self.metal_config.block_size
 
         # Each block stores key and value for all layers
