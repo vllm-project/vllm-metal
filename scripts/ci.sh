@@ -4,7 +4,7 @@ smoke_test() {
   ./install.sh
 
   # 1. Start vLLM in the background
-  vllm serve Qwen/Qwen3-0.6B
+  vllm serve Qwen/Qwen3-0.6B &
     
   # Store the process ID
   local vllm_pid=$!
