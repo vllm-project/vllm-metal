@@ -46,11 +46,6 @@ ensure_venv() {
   source "$1/bin/activate"
 }
 
-# Get repository root directory
-get_repo_root() {
-  git rev-parse --show-toplevel
-}
-
 # Install dev dependencies
 install_dev_deps() {
   section "Installing dependencies"
@@ -69,21 +64,3 @@ get_version() {
   uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
 }
 
-check_python_version() {
-  local min_major="${1:-3}"
-  local min_minor="${2:-12}"
-
-  if ! command -v python3 &> /dev/null; then
-    error "Python 3 is not installed"
-    return 1
-  fi
-
-  local major minor
-  major=$(python3 -c 'import sys; print(sys.version_info[0])')
-  minor=$(python3 -c 'import sys; print(sys.version_info[1])')
-
-  if [ "$major" -lt "$min_major" ] || { [ "$major" -eq "$min_major" ] && [ "$minor" -lt "$min_minor" ]; }; then
-    error "Python ${min_major}.${min_minor} or later is required (found ${major}.${minor})"
-    return 1
-  fi
-}
