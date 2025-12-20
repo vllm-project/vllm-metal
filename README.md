@@ -25,39 +25,39 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/instal
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                    vLLM Core (Unchanged)                  │
-│         Engine, Scheduler, API Server, Tokenizers         │
-└───────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────┐
-│                 vllm_metal Plugin Layer                   │
-│  ┌───────────────┐  ┌─────────────┐  ┌──────────────────┐ │
-│  │ MetalPlatform │  │ MetalWorker │  │ MetalModelRunner │ │
-│  │ (Platform)    │  │ (Worker)    │  │ (ModelRunner)    │ │
-│  └───────────────┘  └─────────────┘  └──────────────────┘ │
-└───────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────┐
-│              Unified Compute Backend                      │
-│  ┌───────────────────────┐  ┌───────────────────────────┐ │
-│  │   MLX Backend         │  │   PyTorch Backend         │ │
-│  │   (Primary)           │  │   (Model Loading/Interop) │ │
-│  │                       │  │                           │ │
-│  │ • SDPA Attention      │  │ • HuggingFace Loading     │ │
-│  │ • RMSNorm             │  │ • Weight Conversion       │ │
-│  │ • RoPE                │  │ • Tensor Bridge           │ │
-│  │ • Cache Ops           │  │                           │ │
-│  └───────────────────────┘  └───────────────────────────┘ │
-└───────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌───────────────────────────────────────────────────────────┐
-│                    Metal GPU Layer                        │
-│         Apple Silicon Unified Memory Architecture         │
-└───────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                          vLLM Core                          │
+│          Engine, Scheduler, API Server, Tokenizers          │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   vllm_metal Plugin Layer                   │
+│ ┌─────────────────┐ ┌────────────────┐ ┌──────────────────┐ │
+│ │ MetalPlatform   │ │ MetalWorker    │ │ MetalModelRunner │ │
+│ │ (Platform)      │ │ (Worker)       │ │ (ModelRunner)    │ │
+│ └─────────────────┘ └────────────────┘ └──────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Unified Compute Backend                   │
+│ ┌───────────────────────────┐ ┌───────────────────────────┐ │
+│ │   MLX Backend             │ │   PyTorch Backend         │ │
+│ │   (Primary)               │ │   (Model Loading/Interop) │ │
+│ │                           │ │                           │ │
+│ │ • SDPA Attention          │ │ • HuggingFace Loading     │ │
+│ │ • RMSNorm                 │ │ • Weight Conversion       │ │
+│ │ • RoPE                    │ │ • Tensor Bridge           │ │
+│ │ • Cache Ops               │ │                           │ │
+│ └───────────────────────────┘ └───────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       Metal GPU Layer                       │
+│          Apple Silicon Unified Memory Architecture          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration
