@@ -19,11 +19,16 @@ from mlx_lm import stream_generate
 from mlx_lm.models.cache import BatchKVCache, KVCache, make_prompt_cache
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
 logger = init_logger(__name__)
 
@@ -55,6 +60,7 @@ class RequestState:
 
     token_ids: list[int]
     cache: list[KVCache]  # Per-layer KV caches
+    sampling_params: SamplingParams  # Sampling parameters for this request
     generated_tokens: int = 0
 
 
@@ -137,6 +143,9 @@ class MetalModelRunner:
 
         # Pre-allocated buffer for decode input tokens
         self._max_batch_size = _MAX_BATCH_SIZE
+
+        # vLLM Sampler for token sampling with temperature, top_k, top_p support
+        self._sampler = Sampler()
 
     def load_model(self) -> None:
         """Load the model using MLX."""
@@ -270,14 +279,106 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
+    def _make_sampling_metadata(
+        self,
+        sampling_params_list: list[SamplingParams],
+        output_token_ids: list[list[int]],
+    ) -> SamplingMetadata:
+        """Create SamplingMetadata from per-request SamplingParams.
+
+        Args:
+            sampling_params_list: List of SamplingParams, one per request
+            output_token_ids: List of output token IDs per request (for penalties)
+
+        Returns:
+            SamplingMetadata for the batch
+        """
+        # Determine sampling mode
+        all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
+        all_random = not all_greedy and all(
+            sp.temperature >= 1e-5 for sp in sampling_params_list
+        )
+
+        # Check if any penalties are applied
+        no_penalties = all(
+            sp.frequency_penalty == 0
+            and sp.presence_penalty == 0
+            and sp.repetition_penalty == 1.0
+            for sp in sampling_params_list
+        )
+
+        # Create generators for random sampling
+        generators = {}
+        for i, sp in enumerate(sampling_params_list):
+            if sp.temperature >= 1e-5:
+                gen = torch.Generator()
+                if sp.seed is not None:
+                    gen.manual_seed(sp.seed)
+                generators[i] = gen
+
+        # top_k: pass None if all values indicate no filtering
+        # -1 = vLLM default (no filtering), 0 = OpenAI API convention (no filtering)
+        # vLLM's sampler expects None to skip top-k entirely
+        top_k_values = [sp.top_k for sp in sampling_params_list]
+        top_k = (
+            None
+            if all(k <= 0 for k in top_k_values)
+            else torch.tensor(top_k_values, dtype=torch.int32)
+        )
+
+        # top_p: pass None if all values are 1.0 (no filtering)
+        # vLLM's sampler expects None to skip top-p entirely
+        top_p_values = [sp.top_p for sp in sampling_params_list]
+        top_p = (
+            None
+            if all(p == 1.0 for p in top_p_values)
+            else torch.tensor(top_p_values, dtype=torch.float32)
+        )
+
+        return SamplingMetadata(
+            temperature=None
+            if all_greedy
+            else torch.tensor(
+                [sp.temperature for sp in sampling_params_list], dtype=torch.float32
+            ),
+            all_greedy=all_greedy,
+            all_random=all_random,
+            top_p=top_p,
+            top_k=top_k,
+            generators=generators,
+            max_num_logprobs=None,
+            prompt_token_ids=None,
+            output_token_ids=output_token_ids,
+            frequency_penalties=torch.tensor(
+                [sp.frequency_penalty for sp in sampling_params_list],
+                dtype=torch.float32,
+            ),
+            presence_penalties=torch.tensor(
+                [sp.presence_penalty for sp in sampling_params_list],
+                dtype=torch.float32,
+            ),
+            repetition_penalties=torch.tensor(
+                [sp.repetition_penalty for sp in sampling_params_list],
+                dtype=torch.float32,
+            ),
+            no_penalties=no_penalties,
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+            logitsprocs=LogitsProcessors(),
+        )
+
     def _prefill_single(
-        self, req_id: str, token_ids: list[int]
+        self,
+        req_id: str,
+        token_ids: list[int],
+        sampling_params: SamplingParams,
     ) -> tuple[int, list[KVCache]]:
         """Process a single prefill request.
 
         Args:
             req_id: Request ID
             token_ids: Prompt token IDs
+            sampling_params: Sampling parameters for this request
 
         Returns:
             Tuple of (next_token, cache)
@@ -289,12 +390,17 @@ class MetalModelRunner:
         input_ids = mx.array([token_ids], dtype=mx.int32)
         logits = self.model(input_ids, cache=cache)
 
-        # Get next token (greedy sampling)
-        next_token_logits = logits[:, -1, :]
-        next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
+        # Evaluate to materialize results before conversion
+        mx.eval(logits)
+
+        # Convert MLX logits to torch and sample using vLLM's Sampler
+        # Cast to float32 for numpy conversion (numpy doesn't support bfloat16)
+        logits_torch = mlx_to_torch(logits[:, -1, :].astype(mx.float32), device="cpu")
+        metadata = self._make_sampling_metadata([sampling_params], [[]])
+        output = self._sampler.forward(logits_torch, metadata)
+        next_token = int(output.sampled_token_ids[0, 0].item())
 
         # Evaluate to materialize cache state
-        mx.eval(logits)
         mx.eval([c.state for c in cache])
 
         return next_token, cache
@@ -336,14 +442,22 @@ class MetalModelRunner:
         # === SINGLE FORWARD PASS FOR ALL REQUESTS ===
         logits = self.model(batched_input, cache=batch_cache)
 
-        # Evaluate to materialize results
+        # Evaluate to materialize results before conversion
         mx.eval(logits)
 
-        # Extract next tokens (greedy sampling)
+        # Extract next tokens using vLLM's Sampler with per-request params
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
-        next_tokens_arr = mx.argmax(next_token_logits, axis=-1)
-        mx.eval(next_tokens_arr)
-        next_tokens = [int(next_tokens_arr[i].item()) for i in range(batch_size)]
+        sampling_params_list = [state.sampling_params for _, state in decode_reqs]
+        output_tokens_list = [state.token_ids for _, state in decode_reqs]
+
+        logits_torch = mlx_to_torch(next_token_logits, device="cpu")
+        metadata = self._make_sampling_metadata(
+            sampling_params_list, output_tokens_list
+        )
+        output = self._sampler.forward(logits_torch, metadata)
+        next_tokens = [
+            int(output.sampled_token_ids[i, 0].item()) for i in range(batch_size)
+        ]
 
         # Extract updated caches back to individual requests
         for i, (req_id, state) in enumerate(decode_reqs):
@@ -379,8 +493,16 @@ class MetalModelRunner:
             logits = self.model(input_ids, cache=state.cache)
             mx.eval(logits)
 
-            next_token_logits = logits[:, -1, :]
-            next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
+            # Sample using vLLM's Sampler with request's params
+            # Cast to float32 for numpy conversion (numpy doesn't support bfloat16)
+            logits_torch = mlx_to_torch(
+                logits[:, -1, :].astype(mx.float32), device="cpu"
+            )
+            metadata = self._make_sampling_metadata(
+                [state.sampling_params], [state.token_ids]
+            )
+            output = self._sampler.forward(logits_torch, metadata)
+            next_token = int(output.sampled_token_ids[0, 0].item())
             next_tokens.append(next_token)
 
             # Update state
@@ -421,18 +543,22 @@ class MetalModelRunner:
         for new_req in new_reqs:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
+            sampling_params = new_req.sampling_params or SamplingParams()
 
             req_ids.append(req_id)
             req_id_to_index[req_id] = len(req_ids) - 1
 
             if token_ids:
-                next_token, cache = self._prefill_single(req_id, token_ids)
+                next_token, cache = self._prefill_single(
+                    req_id, token_ids, sampling_params
+                )
                 sampled_tokens.append([next_token])
 
                 # Store request state with cache for future decoding
                 self._request_states[req_id] = RequestState(
                     token_ids=list(token_ids) + [next_token],
                     cache=cache,
+                    sampling_params=sampling_params,
                     generated_tokens=1,
                 )
 
