@@ -78,7 +78,7 @@ download_and_install_wheel() {
 }
 
 main() {
-  set -eu -o pipefail
+  set -e -o pipefail
 
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"
@@ -150,7 +150,19 @@ main() {
 
     download_and_install_wheel "$wheel_url" "$package_name"
   fi
+  # === Custom Patch for fixing to_int() error ===
+  echo "Applying custom patches..."
 
+  VENV_DIR="$HOME/.venv-vllm-metal" 
+
+  SITE_PACKAGES="$VENV_DIR/lib/python3.*/site-packages"
+
+  # 2. 把 patches/vllm 里的东西强行覆盖进去
+  if [ -d "patches/vllm" ]; then
+      cp -R patches/vllm/* $SITE_PACKAGES/vllm/
+      echo "Success: Patched vllm dependencies!"
+  fi
+  # ==============================
   echo ""
   success "Installation complete!"
   echo ""
