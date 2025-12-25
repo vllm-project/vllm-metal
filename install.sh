@@ -157,7 +157,6 @@ main() {
 
   SITE_PACKAGES="$VENV_DIR/lib/python3.*/site-packages"
 
-  # 2. 把 patches/vllm 里的东西强行覆盖进去
   if [ -d "patches/vllm" ]; then
       cp -R patches/vllm/* $SITE_PACKAGES/vllm/
       echo "Success: Patched vllm dependencies!"
