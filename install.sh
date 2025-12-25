@@ -78,7 +78,7 @@ download_and_install_wheel() {
 }
 
 main() {
-  set -eu -o pipefail
+  set -e -o pipefail
 
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"

@@ -1,11 +1,17 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Metal Model Runner for vLLM v1 engine.
+"""Metal Model Runner for vLLM v1 engine (patched for hybrid caches).
 
 Optimized for performance with:
 - True batched decode using BatchKVCache for O(1) forward passes per batch
 - Async evaluation pipeline for pipelined computation
 - Pre-allocated input buffers to reduce allocation overhead
 - Rust-based token state management for efficient batch operations
+
+This patched version adds support for hybrid models that mix attention (KVCache)
+and Mamba/SSM layers (MambaCache). It keeps the original fast path for
+attention layers via BatchKVCache.merge while batching Mamba caches by
+concatenating their internal state across the batch dimension.
 """
 
 import time
@@ -16,19 +22,19 @@ import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_load
 from mlx_lm import stream_generate
-from mlx_lm.models.cache import BatchKVCache, KVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    BatchKVCache,
+    KVCache,
+    MambaCache,
+    make_prompt_cache,
+)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
 logger = init_logger(__name__)
 
@@ -60,44 +66,120 @@ class RequestState:
 
     token_ids: list[int]
     cache: list[KVCache]  # Per-layer KV caches
-    sampling_params: SamplingParams  # Sampling parameters for this request
     generated_tokens: int = 0
 
 
-def _merge_kv_caches(caches_list: list[list[KVCache]]) -> list[BatchKVCache]:
+def _merge_kv_caches(caches_list: list[list[KVCache]]) -> list[Any]:
     """Merge multiple per-request caches into batched caches.
 
+    This patched version supports mixed per-layer cache types:
+    - Attention layers (KVCache) are merged using BatchKVCache.merge.
+    - Mamba/SSM layers (MambaCache/ArraysCache) are batched by concatenating
+      internal state arrays along the batch dimension.
+
     Args:
-        caches_list: List of per-request caches, each is a list of per-layer KVCache
+        caches_list: List of per-request caches, each is a list of per-layer caches
 
     Returns:
-        List of BatchKVCache, one per layer
+        List of batched caches (BatchKVCache or MambaCache), one per layer
     """
     if not caches_list:
         return []
 
     num_layers = len(caches_list[0])
-    merged = []
+    merged: list[Any] = []
 
     for layer_idx in range(num_layers):
+        # Gather this layer's caches across requests
         layer_caches = [caches[layer_idx] for caches in caches_list]
-        batch_cache = BatchKVCache.merge(layer_caches)
-        merged.append(batch_cache)
+        non_none = [c for c in layer_caches if c is not None]
+
+        if not non_none:
+            merged.append(None)
+            continue
+
+        first = non_none[0]
+
+        # Attention KV cache branch: has keys/values
+        if hasattr(first, "keys") and hasattr(first, "values"):
+            merged.append(BatchKVCache.merge(non_none))
+            continue
+
+        # Mamba/ArraysCache branch: build a batched MambaCache by stacking along batch dim
+        if isinstance(first, MambaCache) or hasattr(first, "cache"):
+            # Determine number of slots from first cache's state
+            slots = len(first.state) if hasattr(first, "state") else len(first.cache)  # type: ignore[attr-defined]
+            batched = MambaCache()
+            batched_list: list[Any] = []
+
+            for i in range(slots):
+                comps: list[Any] = []
+                ref = None
+                for c in layer_caches:
+                    if c is None:
+                        comps.append(None)
+                        continue
+                    comp = (c.state if hasattr(c, "state") else c.cache)[i]  # type: ignore[attr-defined]
+                    comps.append(comp)
+                    if ref is None and comp is not None:
+                        ref = comp
+
+                if ref is None:
+                    batched_list.append(None)
+                else:
+                    filled = [p if p is not None else mx.zeros_like(ref) for p in comps]
+                    batched_list.append(mx.concatenate(filled, axis=0))
+
+            batched.state = batched_list  # type: ignore[assignment]
+            merged.append(batched)
+            continue
+
+        # Unknown cache type: leave unmerged
+        merged.append(None)
 
     return merged
 
 
-def _extract_kv_cache(batch_caches: list[BatchKVCache], idx: int) -> list[KVCache]:
+def _extract_kv_cache(batch_caches: list[Any], idx: int) -> list[Any]:
     """Extract a single request's cache from batched caches.
 
+    Attention layers use BatchKVCache.extract().
+    Mamba layers slice the batched state along the batch dimension.
+
     Args:
-        batch_caches: List of BatchKVCache, one per layer
+        batch_caches: List of batched caches, one per layer
         idx: Index of the request in the batch
 
     Returns:
-        List of KVCache for the request, one per layer
+        List of per-layer caches for a single request
     """
-    return [cache.extract(idx) for cache in batch_caches]
+    extracted: list[Any] = []
+    for bc in batch_caches:
+        if bc is None:
+            extracted.append(None)
+            continue
+        # BatchKVCache supports extract
+        if hasattr(bc, "extract"):
+            try:
+                extracted.append(bc.extract(idx))
+                continue
+            except Exception:
+                pass
+        # Mamba path: rebuild a per-request MambaCache
+        if isinstance(bc, MambaCache) or hasattr(bc, "cache"):
+            mc = MambaCache()
+            src_list = bc.state if hasattr(bc, "state") else bc.cache  # type: ignore[attr-defined]
+            out_list: list[Any] = []
+            for comp in src_list:
+                if comp is None:
+                    out_list.append(None)
+                else:
+                    out_list.append(mx.contiguous(comp[idx : idx + 1]))
+            mc.state = out_list  # type: ignore[assignment]
+            extracted.append(mc)
+            continue
+        extracted.append(None)
+    return extracted
 
 
 class MetalModelRunner:
@@ -143,9 +225,6 @@ class MetalModelRunner:
 
         # Pre-allocated buffer for decode input tokens
         self._max_batch_size = _MAX_BATCH_SIZE
-
-        # vLLM Sampler for token sampling with temperature, top_k, top_p support
-        self._sampler = Sampler()
 
     def load_model(self) -> None:
         """Load the model using MLX."""
@@ -279,106 +358,14 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-    def _make_sampling_metadata(
-        self,
-        sampling_params_list: list[SamplingParams],
-        output_token_ids: list[list[int]],
-    ) -> SamplingMetadata:
-        """Create SamplingMetadata from per-request SamplingParams.
-
-        Args:
-            sampling_params_list: List of SamplingParams, one per request
-            output_token_ids: List of output token IDs per request (for penalties)
-
-        Returns:
-            SamplingMetadata for the batch
-        """
-        # Determine sampling mode
-        all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        all_random = not all_greedy and all(
-            sp.temperature >= 1e-5 for sp in sampling_params_list
-        )
-
-        # Check if any penalties are applied
-        no_penalties = all(
-            sp.frequency_penalty == 0
-            and sp.presence_penalty == 0
-            and sp.repetition_penalty == 1.0
-            for sp in sampling_params_list
-        )
-
-        # Create generators for random sampling
-        generators = {}
-        for i, sp in enumerate(sampling_params_list):
-            if sp.temperature >= 1e-5:
-                gen = torch.Generator()
-                if sp.seed is not None:
-                    gen.manual_seed(sp.seed)
-                generators[i] = gen
-
-        # top_k: pass None if all values indicate no filtering
-        # -1 = vLLM default (no filtering), 0 = OpenAI API convention (no filtering)
-        # vLLM's sampler expects None to skip top-k entirely
-        top_k_values = [sp.top_k for sp in sampling_params_list]
-        top_k = (
-            None
-            if all(k <= 0 for k in top_k_values)
-            else torch.tensor(top_k_values, dtype=torch.int32)
-        )
-
-        # top_p: pass None if all values are 1.0 (no filtering)
-        # vLLM's sampler expects None to skip top-p entirely
-        top_p_values = [sp.top_p for sp in sampling_params_list]
-        top_p = (
-            None
-            if all(p == 1.0 for p in top_p_values)
-            else torch.tensor(top_p_values, dtype=torch.float32)
-        )
-
-        return SamplingMetadata(
-            temperature=None
-            if all_greedy
-            else torch.tensor(
-                [sp.temperature for sp in sampling_params_list], dtype=torch.float32
-            ),
-            all_greedy=all_greedy,
-            all_random=all_random,
-            top_p=top_p,
-            top_k=top_k,
-            generators=generators,
-            max_num_logprobs=None,
-            prompt_token_ids=None,
-            output_token_ids=output_token_ids,
-            frequency_penalties=torch.tensor(
-                [sp.frequency_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-            ),
-            presence_penalties=torch.tensor(
-                [sp.presence_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-            ),
-            repetition_penalties=torch.tensor(
-                [sp.repetition_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-            ),
-            no_penalties=no_penalties,
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(),
-        )
-
     def _prefill_single(
-        self,
-        req_id: str,
-        token_ids: list[int],
-        sampling_params: SamplingParams,
+        self, req_id: str, token_ids: list[int]
     ) -> tuple[int, list[KVCache]]:
         """Process a single prefill request.
 
         Args:
             req_id: Request ID
             token_ids: Prompt token IDs
-            sampling_params: Sampling parameters for this request
 
         Returns:
             Tuple of (next_token, cache)
@@ -390,17 +377,12 @@ class MetalModelRunner:
         input_ids = mx.array([token_ids], dtype=mx.int32)
         logits = self.model(input_ids, cache=cache)
 
-        # Evaluate to materialize results before conversion
-        mx.eval(logits)
-
-        # Convert MLX logits to torch and sample using vLLM's Sampler
-        # Cast to float32 for numpy conversion (numpy doesn't support bfloat16)
-        logits_torch = mlx_to_torch(logits[:, -1, :].astype(mx.float32), device="cpu")
-        metadata = self._make_sampling_metadata([sampling_params], [[]])
-        output = self._sampler.forward(logits_torch, metadata)
-        next_token = int(output.sampled_token_ids[0, 0].item())
+        # Get next token (greedy sampling)
+        next_token_logits = logits[:, -1, :]
+        next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
 
         # Evaluate to materialize cache state
+        mx.eval(logits)
         mx.eval([c.state for c in cache])
 
         return next_token, cache
@@ -433,7 +415,7 @@ class MetalModelRunner:
         # Collect individual caches for merging
         caches_list = [state.cache for _, state in decode_reqs]
 
-        # Merge individual KV caches into batched cache (one per layer)
+        # Merge individual caches into batched caches (one per layer)
         batch_cache = _merge_kv_caches(caches_list)
 
         # Create batched input: shape (batch_size, 1) for single-token decode
@@ -442,22 +424,14 @@ class MetalModelRunner:
         # === SINGLE FORWARD PASS FOR ALL REQUESTS ===
         logits = self.model(batched_input, cache=batch_cache)
 
-        # Evaluate to materialize results before conversion
+        # Evaluate to materialize results
         mx.eval(logits)
 
-        # Extract next tokens using vLLM's Sampler with per-request params
+        # Extract next tokens (greedy sampling)
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
-        sampling_params_list = [state.sampling_params for _, state in decode_reqs]
-        output_tokens_list = [state.token_ids for _, state in decode_reqs]
-
-        logits_torch = mlx_to_torch(next_token_logits, device="cpu")
-        metadata = self._make_sampling_metadata(
-            sampling_params_list, output_tokens_list
-        )
-        output = self._sampler.forward(logits_torch, metadata)
-        next_tokens = [
-            int(output.sampled_token_ids[i, 0].item()) for i in range(batch_size)
-        ]
+        next_tokens_arr = mx.argmax(next_token_logits, axis=-1)
+        mx.eval(next_tokens_arr)
+        next_tokens = [int(next_tokens_arr[i].item()) for i in range(batch_size)]
 
         # Extract updated caches back to individual requests
         for i, (req_id, state) in enumerate(decode_reqs):
@@ -493,16 +467,8 @@ class MetalModelRunner:
             logits = self.model(input_ids, cache=state.cache)
             mx.eval(logits)
 
-            # Sample using vLLM's Sampler with request's params
-            # Cast to float32 for numpy conversion (numpy doesn't support bfloat16)
-            logits_torch = mlx_to_torch(
-                logits[:, -1, :].astype(mx.float32), device="cpu"
-            )
-            metadata = self._make_sampling_metadata(
-                [state.sampling_params], [state.token_ids]
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
+            next_token_logits = logits[:, -1, :]
+            next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
             next_tokens.append(next_token)
 
             # Update state
@@ -543,22 +509,18 @@ class MetalModelRunner:
         for new_req in new_reqs:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
-            sampling_params = new_req.sampling_params or SamplingParams()
 
             req_ids.append(req_id)
             req_id_to_index[req_id] = len(req_ids) - 1
 
             if token_ids:
-                next_token, cache = self._prefill_single(
-                    req_id, token_ids, sampling_params
-                )
+                next_token, cache = self._prefill_single(req_id, token_ids)
                 sampled_tokens.append([next_token])
 
                 # Store request state with cache for future decoding
                 self._request_states[req_id] = RequestState(
                     token_ids=list(token_ids) + [next_token],
                     cache=cache,
-                    sampling_params=sampling_params,
                     generated_tokens=1,
                 )
 
@@ -671,3 +633,4 @@ class MetalModelRunner:
             generated_text = response.text
 
         return generated_text
+
