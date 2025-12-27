@@ -24,6 +24,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import get_config
+from vllm_metal.platform import MetalPlatform
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
@@ -98,7 +99,9 @@ class MetalWorker(WorkerBase):
             logger.info(f"MLX device set to: {mx.default_device()}")
 
         # Set CPU as PyTorch device for interop
-        self.device = torch.device("cpu")
+        # self.device = torch.device("cpu")
+        self.device = MetalPlatform.get_torch_device(0)
+        logger.info(f"PyTorch device set to: {self.device}")
 
         # Initialize distributed environment
         init_worker_distributed_environment(
