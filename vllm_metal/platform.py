@@ -260,3 +260,20 @@ class MetalPlatform(Platform):
         if quant not in supported:
             msg = f"Metal does not support quantization: {quant}"
             raise ValueError(msg)
+
+    @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        """Check if pin_memory is available for Metal platform.
+
+        Returns:
+            False - pin_memory is not needed/supported on Metal/MLX
+
+        Note:
+            Although MLX uses unified memory (which theoretically could benefit
+            from pin_memory), we disable it because:
+            1. PyTorch's pin_memory is primarily designed for CUDA
+            2. In our architecture, PyTorch tensors are on CPU for MLX interop
+            3. pin_memory on CPU can cause issues or errors
+            4. Unified memory already provides fast CPU-GPU transfers without pinning
+        """
+        return False
