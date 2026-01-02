@@ -116,6 +116,8 @@ main() {
     exit 1
   fi
 
+  setup_macos_sdk
+
   local venv="$HOME/.venv-vllm-metal"
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     venv="$PWD/.venv-vllm-metal"

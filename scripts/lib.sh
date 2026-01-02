@@ -21,6 +21,18 @@ is_apple_silicon() {
   [ "$(uname -m)" = "arm64" ]
 }
 
+# This fixes "cstdlib file not found" errors when building with CMake
+setup_macos_sdk() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local sdk_path
+    sdk_path=$(xcrun --show-sdk-path 2>/dev/null)
+    if [[ -n "$sdk_path" ]]; then
+      export SDKROOT="$sdk_path"
+      export CPLUS_INCLUDE_PATH="${sdk_path}/usr/include/c++/v1:${CPLUS_INCLUDE_PATH:-}"
+    fi
+  fi
+}
+
 # Ensure uv is installed
 ensure_uv() {
   if ! command -v uv &> /dev/null; then
