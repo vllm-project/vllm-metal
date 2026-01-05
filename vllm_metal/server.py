@@ -46,11 +46,21 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[Message]
-    max_tokens: int = Field(default=256, ge=1, le=4096)
+    max_completion_tokens: int | None = None
+    max_tokens: int | None = None  # Deprecated, use max_completion_tokens
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     stream: bool = False
     stop: list[str] | str | None = None
+
+    @property
+    def effective_max_tokens(self) -> int:
+        """Get effective max_tokens, preferring max_completion_tokens."""
+        if self.max_completion_tokens is not None:
+            return self.max_completion_tokens
+        if self.max_tokens is not None:
+            return self.max_tokens
+        return 16  # Default per vLLM
 
 
 class Choice(BaseModel):
@@ -77,7 +87,7 @@ class ChatCompletionResponse(BaseModel):
 class CompletionRequest(BaseModel):
     model: str
     prompt: str | list[str]
-    max_tokens: int = Field(default=256, ge=1, le=4096)
+    max_tokens: int | None = 16  # Default per vLLM
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     stream: bool = False
@@ -149,7 +159,7 @@ async def chat_completions(request: ChatCompletionRequest) -> ChatCompletionResp
     try:
         output = _engine.generate(
             prompt=prompt,
-            max_tokens=request.max_tokens,
+            max_tokens=request.effective_max_tokens,
             temperature=request.temperature,
         )
     except Exception as e:
@@ -194,11 +204,13 @@ async def completions(request: CompletionRequest) -> CompletionResponse:
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
+    max_tokens = request.max_tokens if request.max_tokens is not None else 16
+
     for i, prompt in enumerate(prompts):
         try:
             output = _engine.generate(
                 prompt=prompt,
-                max_tokens=request.max_tokens,
+                max_tokens=max_tokens,
                 temperature=request.temperature,
             )
         except Exception as e:
