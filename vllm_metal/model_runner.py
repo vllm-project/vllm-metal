@@ -229,7 +229,7 @@ class MetalModelRunner:
             raise RuntimeError(msg)
 
         # Generate tokens using stream_generate
-        generated_text = ""
+        segments: list[str] = []
 
         # Create sampler with temperature
         sampler = make_sampler(temp=temperature)
@@ -242,9 +242,9 @@ class MetalModelRunner:
             sampler=sampler,
         ):
             # Accumulate incremental text from each token
-            generated_text += response.text
+            segments.append(response.text)
 
-        return generated_text
+        return "".join(segments)
 
     def __del__(self) -> None:
         """Cleanup model resources."""
