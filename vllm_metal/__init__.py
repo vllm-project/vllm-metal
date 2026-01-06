@@ -5,10 +5,13 @@ This plugin enables vLLM to run on Apple Silicon Macs using MLX as the
 primary compute backend, with PyTorch for model loading and interoperability.
 """
 
+import logging
 import os
 import sys
 
 __version__ = "0.1.0"
+
+logger = logging.getLogger(__name__)
 
 
 def _is_macos() -> bool:
@@ -27,7 +30,20 @@ def _apply_macos_defaults() -> None:
     """
     if not _is_macos():
         return
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is not None:
+        return
+
+    # macOS fork-safety:
+    # `fork()` with an initialized Objective-C runtime is unsafe and can crash in
+    # the child process (commonly observed via `objc_initializeAfterForkError`).
+    # Using `spawn` starts a fresh interpreter and avoids inheriting this state.
+    # See: https://www.sealiesoftware.com/blog/archive/2017/6/5/Objective-C_and_fork_in_macOS_1013.html
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    logger.debug(
+        "macOS detected + Metal plugin active: defaulting VLLM_WORKER_MULTIPROC_METHOD "
+        "to 'spawn' to avoid Objective-C runtime fork-safety crashes. "
+        "Set VLLM_WORKER_MULTIPROC_METHOD explicitly to override."
+    )
 
 
 # Lazy imports to avoid loading vLLM dependencies when just importing the Rust extension
