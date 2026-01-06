@@ -40,4 +40,3 @@ class TestMetalModelRunnerGenerate:
         assert captured["max_tokens"] == 3
         assert captured["temp"] == 0.7
         assert "sampler" in captured["kwargs"]
-
