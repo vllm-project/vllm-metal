@@ -72,3 +72,7 @@ Environment variables for customization:
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 
+## Distributed Inference
+
+vLLM-Metal is currently optimized for single-device inference. For distributed inference across multiple Apple Silicon Macs, see [docs/distributed-inference.md](docs/distributed-inference.md).
+
