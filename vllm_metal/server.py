@@ -38,9 +38,25 @@ _model_name: str = ""
 
 
 # Request/Response models
+class ImageUrl(BaseModel):
+    """Image URL for vision models."""
+
+    url: str
+
+
+class ContentPart(BaseModel):
+    """Content part for multimodal messages."""
+
+    type: str  # "text" or "image_url"
+    text: str | None = None
+    image_url: ImageUrl | None = None
+
+
 class Message(BaseModel):
+    """Chat message with optional multimodal content."""
+
     role: str
-    content: str
+    content: str | list[ContentPart]  # String or array of content parts
 
 
 class ChatCompletionRequest(BaseModel):
@@ -146,14 +162,14 @@ async def list_models() -> ModelsResponse:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest) -> ChatCompletionResponse:
-    """Handle chat completion requests."""
+    """Handle chat completion requests, including vision/multimodal."""
     global _engine
 
     if _engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Format messages into a prompt
-    prompt = format_chat_prompt(request.messages)
+    # Format messages into a prompt and extract images
+    prompt, images = format_chat_prompt(request.messages)
 
     # Generate response
     try:
@@ -161,6 +177,7 @@ async def chat_completions(request: ChatCompletionRequest) -> ChatCompletionResp
             prompt=prompt,
             max_tokens=request.effective_max_tokens,
             temperature=request.temperature,
+            images=images if images else None,
         )
     except Exception as e:
         logger.error(f"Generation failed: {e}")
@@ -243,24 +260,56 @@ async def completions(request: CompletionRequest) -> CompletionResponse:
     )
 
 
-def format_chat_prompt(messages: list[Message]) -> str:
-    """Format chat messages into a prompt string.
+def extract_message_content(content: str | list[ContentPart]) -> tuple[str, list[str]]:
+    """Extract text and images from message content.
+
+    Args:
+        content: String content or list of content parts
+
+    Returns:
+        Tuple of (text_content, list_of_image_urls)
+    """
+    if isinstance(content, str):
+        return content, []
+
+    text_parts = []
+    images = []
+
+    for part in content:
+        if part.type == "text" and part.text:
+            text_parts.append(part.text)
+        elif part.type == "image_url" and part.image_url:
+            images.append(part.image_url.url)
+
+    return " ".join(text_parts), images
+
+
+def format_chat_prompt(messages: list[Message]) -> tuple[str, list[str]]:
+    """Format chat messages into a prompt string and extract images.
 
     Uses a simple format that works with most chat models.
+
+    Returns:
+        Tuple of (formatted_prompt, list_of_image_urls)
     """
     formatted = []
+    all_images: list[str] = []
+
     for msg in messages:
+        text, images = extract_message_content(msg.content)
+        all_images.extend(images)
+
         if msg.role == "system":
-            formatted.append(f"System: {msg.content}")
+            formatted.append(f"System: {text}")
         elif msg.role == "user":
-            formatted.append(f"User: {msg.content}")
+            formatted.append(f"User: {text}")
         elif msg.role == "assistant":
-            formatted.append(f"Assistant: {msg.content}")
+            formatted.append(f"Assistant: {text}")
         else:
-            formatted.append(f"{msg.role}: {msg.content}")
+            formatted.append(f"{msg.role}: {text}")
 
     formatted.append("Assistant:")
-    return "\n".join(formatted)
+    return "\n".join(formatted), all_images
 
 
 def create_engine(model_name: str) -> Any:

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
+# Third-party imports
 import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
@@ -21,7 +22,12 @@ from mlx_lm import stream_generate
 from mlx_lm.models.cache import BatchKVCache, KVCache, make_prompt_cache
 
 # mlx_vlm for vision-language models
+from mlx_vlm import generate as mlx_vlm_generate
 from mlx_vlm import load as mlx_vlm_load
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config as mlx_vlm_load_config
+
+# vLLM imports
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -33,6 +39,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+# First-party imports
 from vllm_metal.config import get_config
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
@@ -171,6 +178,8 @@ class MetalModelRunner:
 
         self.model: Any = None
         self.tokenizer: Any = None
+        self.processor: Any = None  # VLM processor for image handling
+        self.vlm_config: Any = None  # VLM config for chat template
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
 
@@ -204,7 +213,17 @@ class MetalModelRunner:
         # Check vLLM's multimodal detection
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
-        return False
+        # Also check model name for common VLM patterns
+        model_name = self.model_config.model.lower()
+        vlm_patterns = [
+            "qwen2-vl",
+            "qwen-vl",
+            "qwen2.5-vl",
+            "llava",
+            "pixtral",
+            "idefics",
+        ]
+        return any(pattern in model_name for pattern in vlm_patterns)
 
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
@@ -220,7 +239,16 @@ class MetalModelRunner:
         # Check global cache first for fast repeated loads
         with _model_cache_lock:
             if model_name in _model_cache:
-                self.model, self.tokenizer = _model_cache[model_name]
+                cached_model, cached_tokenizer_or_processor = _model_cache[model_name]
+                self.model = cached_model
+                if is_vlm:
+                    self.processor = cached_tokenizer_or_processor
+                    self.tokenizer = self.processor
+                    self.vlm_config = mlx_vlm_load_config(model_name)
+                    self._is_vlm = True
+                else:
+                    self.tokenizer = cached_tokenizer_or_processor
+                    self._is_vlm = False
                 load_time = time.time() - start_time
                 logger.info(
                     f"Model loaded from cache in {load_time:.3f}s: {model_name}"
@@ -231,8 +259,13 @@ class MetalModelRunner:
         # Load model using appropriate backend
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
-            self.model, self.tokenizer = mlx_vlm_load(model_name)
+            # mlx_vlm_load returns (model, processor) - processor handles images
+            self.model, self.processor = mlx_vlm_load(model_name)
+            self.tokenizer = self.processor  # Processor also acts as tokenizer
+            # Load VLM config for chat template handling
+            self.vlm_config = mlx_vlm_load_config(model_name)
             self._is_vlm = True
+            logger.info(f"VLM loaded with processor: {type(self.processor).__name__}")
         else:
             # Load model and tokenizer using mlx_lm for text-only models
             self.model, self.tokenizer = mlx_lm_load(
@@ -245,7 +278,10 @@ class MetalModelRunner:
 
         # Cache for future loads
         with _model_cache_lock:
-            _model_cache[model_name] = (self.model, self.tokenizer)
+            if is_vlm:
+                _model_cache[model_name] = (self.model, self.processor)
+            else:
+                _model_cache[model_name] = (self.model, self.tokenizer)
 
         self._extract_model_args()
         load_time = time.time() - start_time
@@ -869,8 +905,9 @@ class MetalModelRunner:
         prompt: str,
         max_tokens: int = 100,
         temperature: float = 0.0,
+        images: list[str] | None = None,
     ) -> str:
-        """Generate text from a prompt.
+        """Generate text from a prompt, optionally with images.
 
         This is a simplified interface for direct text generation.
 
@@ -878,6 +915,7 @@ class MetalModelRunner:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0 = greedy)
+            images: List of image paths or URLs (for VLM models)
 
         Returns:
             Generated text
@@ -885,6 +923,34 @@ class MetalModelRunner:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model and tokenizer must be loaded")
 
+        # Handle VLM image generation
+        if self._is_vlm and images:
+            if self.processor is None or self.vlm_config is None:
+                raise RuntimeError(
+                    "VLM processor and config must be loaded for image generation"
+                )
+
+            # Format prompt with chat template for VLM
+            formatted_prompt = apply_chat_template(
+                self.processor,
+                self.vlm_config,
+                prompt,
+                num_images=len(images),
+            )
+
+            # Use mlx-vlm generate for image+text
+            output = mlx_vlm_generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                images,
+                max_tokens=max_tokens,
+                temp=temperature,
+                verbose=False,
+            )
+            return output
+
+        # Text-only generation
         segments: list[str] = []
 
         # Create sampler based on temperature (mlx_lm 0.29+ uses sampler param)

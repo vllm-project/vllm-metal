@@ -60,6 +60,69 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/instal
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Vision-Language Models (VLM)
+
+vLLM Metal supports vision-language models like Qwen2-VL using [mlx-vlm](https://github.com/Blaizzy/mlx-vlm).
+
+### Supported VLM Models
+
+- Qwen2-VL (e.g., `mlx-community/Qwen2-VL-2B-Instruct-4bit`)
+- Qwen2.5-VL
+- LLaVA
+- Pixtral
+- Idefics
+
+### Usage with Vision Models
+
+Start the server with a VLM:
+
+```bash
+vllm-metal --model mlx-community/Qwen2-VL-2B-Instruct-4bit
+```
+
+Send requests with images using the OpenAI-compatible API:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "What is in this image?"},
+          {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
+        ]
+      }
+    ],
+    "max_tokens": 100
+  }'
+```
+
+### Python API
+
+```python
+from vllm_metal.model_runner import MetalModelRunner
+
+# Create a minimal config for VLM
+class Config:
+    class ModelConfig:
+        model = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+    model_config = ModelConfig()
+
+runner = MetalModelRunner(Config())
+runner.load_model()
+
+# Generate with an image
+output = runner.generate(
+    prompt="Describe this image",
+    images=["https://example.com/image.jpg"],
+    max_tokens=100,
+)
+print(output)
+```
+
 ## Configuration
 
 Environment variables for customization:

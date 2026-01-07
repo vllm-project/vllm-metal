@@ -12,6 +12,7 @@ class TestV1MetalModelRunnerGenerate:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner.model = object()
         runner.tokenizer = object()
+        runner._is_vlm = False  # Initialize the missing attribute
         return runner
 
     def test_accumulates_streamed_segments(self, monkeypatch) -> None:

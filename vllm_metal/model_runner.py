@@ -4,11 +4,19 @@
 import logging
 from typing import TYPE_CHECKING, Any
 
+# Third-party imports
 import mlx.core as mx
 from mlx_lm import load as mlx_load
 from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler
 
+# mlx-vlm for vision-language models
+from mlx_vlm import generate as mlx_vlm_generate
+from mlx_vlm import load as mlx_vlm_load
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config as mlx_vlm_load_config
+
+# First-party imports
 from vllm_metal.config import get_config
 from vllm_metal.mlx_backend.cache import PagedKVCache
 
@@ -35,25 +43,71 @@ class MetalModelRunner:
 
         self.model: Any = None
         self.tokenizer: Any = None
+        self.processor: Any = None  # VLM processor for image handling
+        self.vlm_config: Any = None  # VLM config for chat template
+        self._is_vlm: bool = False  # Will be set during model loading
         self.model_config: dict[str, Any] | None = None
         self.kv_cache: PagedKVCache | None = None
 
+    def _is_vlm_model(self) -> bool:
+        """Check if the model is a vision-language model (VLM)."""
+        model_config = self.vllm_config.model_config
+        if hasattr(model_config, "is_multimodal_model"):
+            return model_config.is_multimodal_model
+        # Also check model name for common VLM patterns
+        model_name = model_config.model.lower()
+        vlm_patterns = [
+            "qwen2-vl",
+            "qwen-vl",
+            "qwen2.5-vl",
+            "llava",
+            "pixtral",
+            "idefics",
+        ]
+        return any(pattern in model_name for pattern in vlm_patterns)
+
     def load_model(self) -> None:
-        """Load the model using MLX."""
+        """Load the model using MLX or MLX-VLM for vision models."""
         model_config = self.vllm_config.model_config
         model_name = model_config.model
+        is_vlm = self._is_vlm_model()
 
-        logger.info(f"Loading model: {model_name}")
+        logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")
 
-        # Load model and tokenizer using mlx_lm
-        self.model, self.tokenizer = mlx_load(
-            model_name,
-            tokenizer_config={"trust_remote_code": True},
-        )
+        if is_vlm:
+            # Load VLM with mlx-vlm (returns model, processor)
+            self.model, self.processor = mlx_vlm_load(model_name)
+            self.tokenizer = self.processor  # Processor also acts as tokenizer
+            self.vlm_config = mlx_vlm_load_config(model_name)
+            self._is_vlm = True
+            logger.info(f"VLM loaded with processor: {type(self.processor).__name__}")
+        else:
+            # Load text-only model with mlx_lm
+            self.model, self.tokenizer = mlx_load(
+                model_name,
+                tokenizer_config={"trust_remote_code": True},
+            )
+            self._is_vlm = False
 
         # Extract model configuration
         if hasattr(self.model, "config"):
-            self.model_config = self.model.config
+            config = self.model.config
+            # VLMs often have text config nested inside main config
+            if self._is_vlm and hasattr(config, "text_config"):
+                text_config = config.text_config
+                if hasattr(text_config, "to_dict"):
+                    self.model_config = text_config.to_dict()
+                else:
+                    self.model_config = {
+                        k: getattr(text_config, k)
+                        for k in dir(text_config)
+                        if not k.startswith("_")
+                        and not callable(getattr(text_config, k))
+                    }
+            elif hasattr(config, "to_dict"):
+                self.model_config = config.to_dict()
+            else:
+                self.model_config = vars(config)
         elif hasattr(self.model, "args"):
             self.model_config = vars(self.model.args)
         else:
@@ -209,9 +263,10 @@ class MetalModelRunner:
         prompt: str,
         max_tokens: int = 100,
         temperature: float = 0.0,
+        images: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
-        """Generate text from a prompt.
+        """Generate text from a prompt, optionally with images.
 
         This is a simplified interface for direct text generation.
 
@@ -219,6 +274,7 @@ class MetalModelRunner:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0 = greedy)
+            images: List of image paths or URLs (for VLM models)
             **kwargs: Additional generation parameters
 
         Returns:
@@ -228,7 +284,34 @@ class MetalModelRunner:
             msg = "Model and tokenizer must be loaded"
             raise RuntimeError(msg)
 
-        # Generate tokens using stream_generate
+        # Handle VLM image generation
+        if self._is_vlm and images:
+            if self.processor is None or self.vlm_config is None:
+                raise RuntimeError(
+                    "VLM processor and config must be loaded for image generation"
+                )
+
+            # Format prompt with chat template for VLM
+            formatted_prompt = apply_chat_template(
+                self.processor,
+                self.vlm_config,
+                prompt,
+                num_images=len(images),
+            )
+
+            # Use mlx-vlm generate for image+text
+            output = mlx_vlm_generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                images,
+                max_tokens=max_tokens,
+                temp=temperature,
+                verbose=False,
+            )
+            return output
+
+        # Text-only generation using stream_generate
         segments: list[str] = []
 
         # Create sampler with temperature
