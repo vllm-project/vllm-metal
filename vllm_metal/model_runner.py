@@ -11,6 +11,7 @@ from mlx_lm.sample_utils import make_sampler
 
 from vllm_metal.config import get_config
 from vllm_metal.mlx_backend.cache import PagedKVCache
+from vllm_metal.platform import set_wired_limit
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -44,6 +45,7 @@ class MetalModelRunner:
         model_name = model_config.model
 
         logger.info(f"Loading model: {model_name}")
+        set_wired_limit()
 
         # Load model and tokenizer using mlx_lm
         self.model, self.tokenizer = mlx_load(

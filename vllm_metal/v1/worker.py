@@ -22,7 +22,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import get_config
-from vllm_metal.platform import MetalPlatform
+from vllm_metal.platform import MetalPlatform, set_wired_limit
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
@@ -95,6 +95,7 @@ class MetalWorker(WorkerBase):
             )
             mx.set_default_device(mx.Device(device_type))
             logger.info(f"MLX device set to: {mx.default_device()}")
+            set_wired_limit()
 
         # Use MetalPlatform.get_torch_device() to properly support MPS when available.
         # This ensures consistency with the platform's device selection logic and
