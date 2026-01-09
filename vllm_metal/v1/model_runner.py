@@ -751,6 +751,30 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
+        # === DEBUG: Log scheduler output for chunked prefill investigation ===
+        logger.info(
+            f"[SCHED] num_scheduled_tokens={scheduler_output.num_scheduled_tokens}, "
+            f"total={scheduler_output.total_num_scheduled_tokens}"
+        )
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            prompt_len = len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
+            logger.info(
+                f"[SCHED] NEW req_id={new_req.req_id}, "
+                f"prompt_len={prompt_len}, "
+                f"num_computed_tokens={new_req.num_computed_tokens}, "
+                f"prefill_token_ids={len(new_req.prefill_token_ids) if new_req.prefill_token_ids else None}"
+            )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached.req_ids:
+            logger.info(
+                f"[SCHED] CACHED req_ids={cached.req_ids}, "
+                f"num_computed_tokens={cached.num_computed_tokens}, "
+                f"resumed_req_ids={cached.resumed_req_ids}"
+            )
+        # === END DEBUG ===
+
         # Collect all requests to process
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
