@@ -207,8 +207,9 @@ class TestRustRequestStateManager:
         assert manager.num_requests == 0
 
 
+@pytest.mark.slow
 def test_performance_comparison():
-    """Benchmark Rust vs Python block allocation."""
+    """Ensure Rust allocator stays >5x faster than naive Python baseline."""
     num_blocks = 10000
     num_seqs = 200
     blocks_per_seq = 4

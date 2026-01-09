@@ -77,7 +77,9 @@ main() {
 
     smoke_test
     section "Running tests"
-    pytest tests/ -v --tb=short
+    # Exclude perf/long-running tests by default; run them explicitly via:
+    #   pytest -m slow tests/ -v --tb=short
+    pytest -m "not slow" tests/ -v --tb=short
   fi
 }
 

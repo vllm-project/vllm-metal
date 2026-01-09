@@ -102,6 +102,9 @@ disable_error_code = ["override", "misc", "assignment", "arg-type", "index", "ca
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "slow: opt-in performance or long-running tests",
+]
 
 [dependency-groups]
 dev = [
