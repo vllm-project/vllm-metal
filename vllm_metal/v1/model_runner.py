@@ -381,7 +381,8 @@ class MetalModelRunner:
         block_size = self.metal_config.block_size
 
         # Each block stores key and value for all layers
-        # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+        # Block memory = 2 * num_layers * block_size * num_kv_heads *
+        #               head_dim * dtype_size
         dtype_size = 2  # float16
         return 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
 
@@ -524,7 +525,8 @@ class MetalModelRunner:
             Tuple of (next_token, cache)
         """
         # Create a new prompt cache for this request
-        # For VLMs, use the language_model component; for text models, use model directly
+        # For VLMs, use the language_model component; for text models,
+        # use model directly
         cache_model = (
             self.model.language_model
             if self._is_vlm and hasattr(self.model, "language_model")

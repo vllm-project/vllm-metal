@@ -183,7 +183,8 @@ class MetalWorker(WorkerBase):
             mx.set_memory_limit(memory_limit)
             logger.info(
                 f"Auto mode: set MLX memory limit to {memory_limit / 1e9:.2f}GB "
-                f"(model={model_memory / 1e9:.2f}GB, kv_cache={kv_cache_memory / 1e9:.2f}GB)"
+                f"(model={model_memory / 1e9:.2f}GB, "
+                f"kv_cache={kv_cache_memory / 1e9:.2f}GB)"
             )
         else:
             logger.warning(

@@ -2,6 +2,7 @@
 """Metal Platform implementation for vLLM."""
 
 import logging
+import os
 import platform as py_platform
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,8 @@ def set_wired_limit() -> None:
 
         device_info = mx.metal.device_info()
         max_wired = device_info.get("max_recommended_working_set_size", 0)
+        # Ensure max_wired is an integer for comparison and division
+        max_wired = int(max_wired) if max_wired else 0
         if max_wired > 0:
             if hasattr(mx, "set_wired_limit"):
                 mx.set_wired_limit(max_wired)
@@ -53,6 +56,16 @@ class MetalPlatform(Platform):
     device_name: str = "cpu"  # PyTorch device name (use CPU for compatibility)
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
+    ray_device_key: str = "METAL"  # Ray resource key for scheduling
+    # NOTE: This requires upstream changes in vLLM Ray executor to properly
+    # handle non-GPU platforms. Currently, Ray executor assumes accelerator IDs
+    # for non-GPU platforms, but custom resources don't appear in
+    # get_accelerator_ids(). This causes issues when vLLM tries to access
+    # accelerator IDs for placement groups.
+    #
+    # The "METAL" resource key is used to avoid conflicts with Ray's special
+    # handling of "CPU" resource, but requires users to configure Ray with
+    # the custom resource and handle the accelerator IDs limitation.
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -235,13 +248,44 @@ class MetalPlatform(Platform):
         if config.debug:
             logger.info(f"Metal config: {config}")
 
+        # Force spawn multiprocessing method to avoid Metal/MLX state corruption
+        # when forking. MLX initializes Metal GPU state in the main process during
+        # platform availability check, and this state is not fork-safe.
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
-        # Set executor backend (use uniproc for single device)
-        if parallel_config.distributed_executor_backend in ("auto", None):
-            parallel_config.distributed_executor_backend = "uni"
+        # Set executor backend
+        # Allow Ray if explicitly requested or if Ray is initialized
+        if parallel_config.distributed_executor_backend == "ray":
+            logger.info("Using Ray executor backend (explicitly configured)")
+            # Log warning about experimental Ray + Metal support
+            logger.warning(
+                "Ray executor with Metal is highly experimental. "
+                "May require manual IP configuration and custom resource setup. "
+                "See docs/distributed-inference.md for troubleshooting."
+            )
+        elif parallel_config.distributed_executor_backend in ("auto", None):
+            # Check if Ray is initialized and should be used
+            try:
+                import ray
+
+                if ray.is_initialized():
+                    parallel_config.distributed_executor_backend = "ray"
+                    logger.info("Using Ray executor backend (Ray is initialized)")
+                    # Log warning about experimental Ray + Metal support
+                    logger.warning(
+                        "Ray executor with Metal is highly experimental. "
+                        "May require manual IP configuration and custom "
+                        "resource setup. "
+                        "See docs/distributed-inference.md for troubleshooting."
+                    )
+                else:
+                    parallel_config.distributed_executor_backend = "uni"
+            except ImportError:
+                parallel_config.distributed_executor_backend = "uni"
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True

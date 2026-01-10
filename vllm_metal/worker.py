@@ -135,7 +135,8 @@ class MetalWorker:
             )
 
             # Each block stores key and value for all layers
-            # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+            # Block memory = 2 * num_layers * block_size * num_kv_heads *
+            #               head_dim * dtype_size
             dtype_size = 2  # float16
             block_memory = (
                 2

@@ -1,8 +1,8 @@
-# vLLM Metal Plugin
+# vLLM-Metal Plugin
 
 > **High-performance LLM inference on Apple Silicon using MLX and vLLM**
 
-vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX as the primary compute backend. It unifies MLX and PyTorch under a single lowering path.
+vLLM-Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX as the primary compute backend. It unifies MLX and PyTorch under a single lowering path.
 
 ## Features
 
@@ -71,4 +71,8 @@ Environment variables for customization:
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
+
+## Distributed Inference with Ray
+
+vLLM-Metal is currently optimized for single-device inference. For distributed inference across multiple Apple Silicon Macs, see [docs/distributed-inference.md](docs/distributed-inference.md).
 
