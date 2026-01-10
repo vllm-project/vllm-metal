@@ -102,6 +102,10 @@ class RequestState:
     """State for an ongoing request with KV cache."""
 
     token_ids: list[int]
+    # Length of the original prompt (prefix) within `token_ids`.
+    # vLLM applies repetition penalties to both prompt+output tokens, but applies
+    # presence/frequency penalties only to generated (output) tokens.
+    prompt_len: int
     cache: list[KVCache]  # Per-layer KV caches
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
@@ -406,20 +410,38 @@ class MetalModelRunner:
     def _make_sampling_metadata(
         self,
         sampling_params_list: list[SamplingParams],
-        output_token_ids: list[list[int]],
+        prompt_token_id_lists: list[list[int]],
+        output_token_id_lists: list[list[int]],
         generators: dict[int, torch.Generator] | None = None,
     ) -> SamplingMetadata:
         """Create SamplingMetadata from per-request SamplingParams.
 
         Args:
             sampling_params_list: List of SamplingParams, one per request
-            output_token_ids: List of output token IDs per request (for penalties)
+            prompt_token_id_lists: Prompt token IDs per request (prefix used for
+                repetition penalty).
+            output_token_id_lists: Generated token IDs per request (used for
+                presence/frequency penalties, and also repetition penalty).
             generators: Optional per-request torch generators keyed by batch index.
                 If omitted, sampler falls back to the global RNG for those entries.
 
         Returns:
             SamplingMetadata for the batch
         """
+        batch_size = len(sampling_params_list)
+        if len(prompt_token_id_lists) != batch_size:
+            raise ValueError(
+                "Expected prompt token ids for each request in the batch "
+                f"(len(prompt_token_id_lists)={len(prompt_token_id_lists)} "
+                f"!= batch_size={batch_size})."
+            )
+        if len(output_token_id_lists) != batch_size:
+            raise ValueError(
+                "Expected output token ids for each request in the batch "
+                f"(len(output_token_id_lists)={len(output_token_id_lists)} "
+                f"!= batch_size={batch_size})."
+            )
+
         # Determine sampling mode
         all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
         all_random = not all_greedy and all(
@@ -455,19 +477,16 @@ class MetalModelRunner:
             else torch.tensor(top_p_values, dtype=torch.float32, device=self.device)
         )
 
-        # Create empty prompt_token_ids tensor to satisfy vLLM's assertion
-        # Use make_tensor_with_pad to match vLLM's expected format
-        # Pass empty lists and set pin_memory=False to avoid device mismatch
-        batch_size = len(sampling_params_list)
         vocab_size = self.model_args.get("vocab_size", 32000)
-        empty_prompt_lists: list[list[int]] = [[] for _ in range(batch_size)]
-        prompt_token_ids = make_tensor_with_pad(
-            empty_prompt_lists,
-            pad=vocab_size,
-            device=self.device,
-            dtype=torch.int64,
-            pin_memory=False,
-        )
+        prompt_token_ids_tensor = None
+        if not no_penalties:
+            prompt_token_ids_tensor = make_tensor_with_pad(
+                prompt_token_id_lists,
+                pad=vocab_size,
+                device=self.device,
+                dtype=torch.int64,
+                pin_memory=False,
+            )
 
         return SamplingMetadata(
             temperature=None
@@ -483,8 +502,8 @@ class MetalModelRunner:
             top_k=top_k,
             generators=generators,
             max_num_logprobs=None,
-            prompt_token_ids=prompt_token_ids,
-            output_token_ids=output_token_ids,
+            prompt_token_ids=prompt_token_ids_tensor,
+            output_token_ids=output_token_id_lists,
             frequency_penalties=torch.tensor(
                 [sp.frequency_penalty for sp in sampling_params_list],
                 dtype=torch.float32,
@@ -567,6 +586,7 @@ class MetalModelRunner:
             generators = {} if generator is None else {0: generator}
             metadata = self._make_sampling_metadata(
                 [sampling_params],
+                [token_ids],
                 [[]],
                 generators=generators,
             )
@@ -637,7 +657,12 @@ class MetalModelRunner:
         else:
             # Slow path: use vLLM sampler for advanced sampling
             mx.eval(next_token_logits)
-            output_tokens_list = [state.token_ids for _, state in decode_reqs]
+            prompt_token_ids_list = [
+                state.token_ids[: state.prompt_len] for _, state in decode_reqs
+            ]
+            output_tokens_list = [
+                state.token_ids[state.prompt_len :] for _, state in decode_reqs
+            ]
             generators = {
                 i: state.generator
                 for i, (_, state) in enumerate(decode_reqs)
@@ -648,6 +673,7 @@ class MetalModelRunner:
             )
             metadata = self._make_sampling_metadata(
                 sampling_params_list,
+                prompt_token_ids_list,
                 output_tokens_list,
                 generators=generators,
             )
@@ -716,7 +742,8 @@ class MetalModelRunner:
                 generators = {} if state.generator is None else {0: state.generator}
                 metadata = self._make_sampling_metadata(
                     [state.sampling_params],
-                    [state.token_ids],
+                    [state.token_ids[: state.prompt_len]],
+                    [state.token_ids[state.prompt_len :]],
                     generators=generators,
                 )
                 output = self._sampler.forward(logits_torch, metadata)
@@ -780,6 +807,7 @@ class MetalModelRunner:
                 # Store request state with cache for future decoding
                 self._request_states[req_id] = RequestState(
                     token_ids=list(token_ids) + [next_token],
+                    prompt_len=len(token_ids),
                     cache=cache,
                     sampling_params=sampling_params,
                     generator=generator,
