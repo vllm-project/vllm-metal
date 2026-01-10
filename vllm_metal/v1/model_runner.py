@@ -575,6 +575,114 @@ class MetalModelRunner:
 
         return next_token, cache
 
+    def _prefill_chunked(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        num_computed: int,
+        num_scheduled: int,
+        sampling_params: SamplingParams,
+        generator: torch.Generator | None = None,
+    ) -> tuple[int | None, list[KVCache]]:
+        """Process a prefill request with chunking support.
+
+        Supports chunked prefill where a long prompt is processed in multiple
+        chunks across scheduler iterations. The KV cache is accumulated across
+        chunks, and sampling only happens on the final chunk.
+
+        Args:
+            req_id: Request ID
+            token_ids: Full prompt token IDs (not just the chunk)
+            num_computed: Number of tokens already computed (offset into token_ids)
+            num_scheduled: Number of tokens to process in this chunk
+            sampling_params: Sampling parameters for this request
+            generator: Optional random generator for sampling
+
+        Returns:
+            Tuple of (next_token, cache) where next_token is None for non-final
+            chunks, or the sampled token for the final chunk.
+        """
+        # Calculate chunk boundaries
+        start = num_computed
+        end = start + num_scheduled
+        chunk_token_ids = token_ids[start:end]
+        is_final_chunk = end >= len(token_ids)
+
+        # Get or create cache
+        if num_computed == 0:
+            # First chunk: create new cache
+            cache_model = (
+                self.model.language_model
+                if self._is_vlm and hasattr(self.model, "language_model")
+                else self.model
+            )
+            cache = make_prompt_cache(cache_model)
+        else:
+            # Continuation: retrieve existing cache from partial state
+            cache = self._request_states[req_id].cache
+
+        # Process this chunk
+        input_ids = mx.array([chunk_token_ids], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
+
+        if is_final_chunk:
+            # Final chunk: sample the next token
+            logits = self._extract_logits(model_output)
+            last_logits = logits[:, -1, :]
+
+            # Use native MLX greedy sampling when possible
+            is_greedy = sampling_params.temperature < 1e-5
+            needs_advanced_sampling = (
+                sampling_params.top_k > 0
+                or sampling_params.top_p < 1.0
+                or sampling_params.frequency_penalty != 0
+                or sampling_params.presence_penalty != 0
+                or sampling_params.repetition_penalty != 1.0
+            )
+
+            if is_greedy and not needs_advanced_sampling:
+                # Fast path: native MLX greedy sampling
+                next_token_mlx = _mlx_greedy_sample(last_logits)
+                mx.eval(next_token_mlx, *[c.state for c in cache])
+                next_token = int(next_token_mlx.item())
+            else:
+                # Slow path: use vLLM sampler for advanced sampling
+                mx.eval(last_logits, *[c.state for c in cache])
+                logits_torch = mlx_to_torch(
+                    last_logits.astype(mx.float32), device=self.device
+                )
+                generators = {} if generator is None else {0: generator}
+                metadata = self._make_sampling_metadata(
+                    [sampling_params],
+                    [[]],
+                    generators=generators,
+                )
+                output = self._sampler.forward(logits_torch, metadata)
+                next_token = int(output.sampled_token_ids[0, 0].item())
+
+            # Store final state with generated token
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids) + [next_token],
+                cache=cache,
+                sampling_params=sampling_params,
+                generator=generator,
+                generated_tokens=1,
+            )
+            return next_token, cache
+        else:
+            # Non-final chunk: just update cache state, no sampling
+            mx.eval(*[c.state for c in cache])
+
+            # Store partial state for next chunk
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids[:end]),
+                cache=cache,
+                sampling_params=sampling_params,
+                generator=generator,
+                generated_tokens=0,
+            )
+            return None, cache
+
     def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
         """Process multiple decode requests in a single batched forward pass.
 
@@ -751,6 +859,32 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
+        # === DEBUG: Log scheduler output for chunked prefill investigation ===
+        logger.info(
+            f"[SCHED] num_scheduled_tokens={scheduler_output.num_scheduled_tokens}, "
+            f"total={scheduler_output.total_num_scheduled_tokens}"
+        )
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            prompt_len = (
+                len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
+            )
+            logger.info(
+                f"[SCHED] NEW req_id={new_req.req_id}, "
+                f"prompt_len={prompt_len}, "
+                f"num_computed_tokens={new_req.num_computed_tokens}, "
+                f"prefill_token_ids={len(new_req.prefill_token_ids) if new_req.prefill_token_ids else None}"
+            )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached.req_ids:
+            logger.info(
+                f"[SCHED] CACHED req_ids={cached.req_ids}, "
+                f"num_computed_tokens={cached.num_computed_tokens}, "
+                f"resumed_req_ids={cached.resumed_req_ids}"
+            )
+        # === END DEBUG ===
+
         # Collect all requests to process
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
@@ -763,35 +897,68 @@ class MetalModelRunner:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
+            num_computed = new_req.num_computed_tokens
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(
+                req_id, len(token_ids)
+            )
 
-            req_ids.append(req_id)
-            req_id_to_index[req_id] = len(req_ids) - 1
+            # === Original _prefill_single code (for reference) ===
+            # req_ids.append(req_id)
+            # req_id_to_index[req_id] = len(req_ids) - 1
+            #
+            # if token_ids:
+            #     generator = _create_request_generator(self.device, sampling_params)
+            #     next_token, cache = self._prefill_single(
+            #         req_id,
+            #         token_ids,
+            #         sampling_params,
+            #         generator=generator,
+            #     )
+            #     sampled_tokens.append([next_token])
+            #
+            #     # Store request state with cache for future decoding
+            #     self._request_states[req_id] = RequestState(
+            #         token_ids=list(token_ids) + [next_token],
+            #         cache=cache,
+            #         sampling_params=sampling_params,
+            #         generator=generator,
+            #         generated_tokens=1,
+            #     )
+            #
+            #     # Register with Rust state manager if available
+            #     if self._rust_state_manager is not None:
+            #         self._rust_state_manager.add_request(
+            #             req_id, list(token_ids) + [next_token]
+            #         )
+            # else:
+            #     sampled_tokens.append([0])  # Fallback
+            # === End original code ===
 
             if token_ids:
                 generator = _create_request_generator(self.device, sampling_params)
-                next_token, cache = self._prefill_single(
+                next_token, cache = self._prefill_chunked(
                     req_id,
                     token_ids,
+                    num_computed,
+                    num_scheduled,
                     sampling_params,
                     generator=generator,
                 )
-                sampled_tokens.append([next_token])
 
-                # Store request state with cache for future decoding
-                self._request_states[req_id] = RequestState(
-                    token_ids=list(token_ids) + [next_token],
-                    cache=cache,
-                    sampling_params=sampling_params,
-                    generator=generator,
-                    generated_tokens=1,
-                )
+                # Only add to output if this is the final chunk (token generated)
+                if next_token is not None:
+                    req_ids.append(req_id)
+                    req_id_to_index[req_id] = len(req_ids) - 1
+                    sampled_tokens.append([next_token])
 
-                # Register with Rust state manager if available
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.add_request(
-                        req_id, list(token_ids) + [next_token]
-                    )
+                    # Register with Rust state manager if available
+                    if self._rust_state_manager is not None:
+                        self._rust_state_manager.add_request(
+                            req_id, list(token_ids) + [next_token]
+                        )
             else:
+                req_ids.append(req_id)
+                req_id_to_index[req_id] = len(req_ids) - 1
                 sampled_tokens.append([0])  # Fallback
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
