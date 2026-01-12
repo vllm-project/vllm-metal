@@ -90,9 +90,13 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     if tensor.device.type == "mps":
         tensor = tensor.cpu()
 
-    # Convert via numpy for zero-copy on unified memory
-    np_array = tensor.detach().numpy()
-    return mx.array(np_array)
+    tensor = tensor.detach()
+
+    # Note: numpy does not support bfloat16.
+    if tensor.dtype == torch.bfloat16:
+        return mx.array(tensor.float().numpy(), dtype=mx.bfloat16)
+
+    return mx.array(tensor.numpy())
 
 
 def mlx_to_torch(
