@@ -73,6 +73,25 @@ class TestTensorConversion:
         assert mlx_array.shape == (2, 3)
         assert mlx_array.dtype == mx.float16
 
+    def test_torch_to_mlx_bfloat16(self) -> None:
+        """Test PyTorch to MLX conversion for bfloat16."""
+        torch_tensor = torch.randn(2, 3, dtype=torch.bfloat16)
+        mlx_array = torch_to_mlx(torch_tensor)
+        mx.eval(mlx_array)
+
+        assert mlx_array.shape == (2, 3)
+        assert mlx_array.dtype == mx.bfloat16
+
+        # Compare as float32 since numpy doesn't support bfloat16.
+        mlx_f32 = mlx_array.astype(mx.float32)
+        mx.eval(mlx_f32)
+        np.testing.assert_allclose(
+            np.array(mlx_f32),
+            torch_tensor.float().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
     def test_torch_to_mlx_int32(self) -> None:
         """Test PyTorch to MLX conversion for int32."""
         torch_tensor = torch.randint(0, 100, (2, 3), dtype=torch.int32)
