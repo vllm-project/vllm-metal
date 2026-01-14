@@ -156,7 +156,7 @@ class TestMetalPlatform:
 
         called = False
 
-        def fake_eval(value: mx.array) -> None:
+        def fake_eval(value) -> None:
             nonlocal called
             called = True
 
@@ -179,7 +179,7 @@ class TestMetalPlatform:
 
         called = False
 
-        def fake_eval(value: mx.array) -> None:
+        def fake_eval(value) -> None:
             nonlocal called
             called = True
 

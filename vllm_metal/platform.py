@@ -32,14 +32,69 @@ def set_wired_limit() -> None:
 
         device_info = mx.metal.device_info()
         max_wired = device_info.get("max_recommended_working_set_size", 0)
-        if max_wired > 0:
+
+        # Ensure max_wired is an integer
+        if isinstance(max_wired, str):
+            max_wired = int(max_wired) if max_wired.isdigit() else 0
+        elif isinstance(max_wired, float):
+            max_wired = int(max_wired)
+
+        # Also get the max buffer size to ensure we don't exceed it
+        max_buffer_size = device_info.get("max_buffer_size", 0)
+        if isinstance(max_buffer_size, str):
+            max_buffer_size = int(max_buffer_size) if max_buffer_size.isdigit() else 0
+        elif isinstance(max_buffer_size, float):
+            max_buffer_size = int(max_buffer_size)
+
+        # Use the smaller of the two limits to prevent allocation errors
+        effective_limit = max_wired
+        if max_buffer_size > 0:
+            effective_limit = min(
+                effective_limit, max_buffer_size * 0.5
+            )  # Use 50% of max buffer size to be more conservative
+
+        if effective_limit > 0:
             if hasattr(mx, "set_wired_limit"):
-                mx.set_wired_limit(max_wired)
+                mx.set_wired_limit(effective_limit)
             elif hasattr(mx.metal, "set_wired_limit"):
-                mx.metal.set_wired_limit(max_wired)
-            logger.info(f"Set Metal wired_limit to {max_wired / (1024**3):.1f} GB")
+                mx.metal.set_wired_limit(effective_limit)
+            logger.info(
+                f"Set Metal wired_limit to {effective_limit / (1024**3):.1f} GB"
+            )
+
+            # Also set memory limit to prevent unbounded growth
+            if hasattr(mx, "set_memory_limit"):
+                mx.set_memory_limit(
+                    int(effective_limit * 0.9)
+                )  # 90% of effective limit to be safe
+                logger.info(
+                    f"Set Metal memory_limit to {int(effective_limit * 0.9) / (1024**3):.1f} GB"
+                )
     except Exception as e:
         logger.warning(f"Failed to set wired_limit: {e}")
+
+
+def get_max_buffer_size() -> int:
+    """Get the maximum buffer size allowed by the Metal device.
+
+    Returns:
+        Maximum buffer size in bytes, or 0 if not available
+    """
+    try:
+        import mlx.core as mx
+
+        device_info = mx.metal.device_info()
+        max_buffer_size = device_info.get("max_buffer_size", 0)
+
+        # Ensure max_buffer_size is an integer
+        if isinstance(max_buffer_size, str):
+            max_buffer_size = int(max_buffer_size) if max_buffer_size.isdigit() else 0
+        elif isinstance(max_buffer_size, float):
+            max_buffer_size = int(max_buffer_size)
+
+        return max_buffer_size
+    except Exception:
+        return 0
 
 
 class MetalPlatform(Platform):
@@ -201,7 +256,17 @@ class MetalPlatform(Platform):
         try:
             mx.synchronize()
         except (AttributeError, TypeError):
-            mx.eval(mx.array(0, dtype=mx.int32))
+            try:
+                mx.eval(mx.array(0, dtype=mx.int32))
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Even tiny arrays can fail in extreme cases - clear cache and try again
+                    mx.metal.clear_cache()
+                    mx.eval(mx.array(0, dtype=mx.int32))
+                else:
+                    raise
 
         if torch.backends.mps.is_available():
             torch.mps.synchronize()

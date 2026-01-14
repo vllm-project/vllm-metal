@@ -6,7 +6,8 @@ smoke_test() {
   local model="HuggingFaceTB/SmolLM2-135M-Instruct"
 
   # 1. Start vLLM in the background
-  GLOO_SOCKET_IFNAME=lo0 vllm serve "$model" &
+  # Set memory fraction to 30% to prevent Metal GPU out-of-memory errors in CI
+  GLOO_SOCKET_IFNAME=lo0 VLLM_METAL_MEMORY_FRACTION=0.3 vllm serve "$model" &
 
   # Store the process ID
   local vllm_pid=$!

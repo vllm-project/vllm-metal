@@ -8,10 +8,13 @@ The Rust extension provides 355x faster block allocation compared to Python.
 from dataclasses import dataclass
 
 import mlx.core as mx
+from vllm.logger import init_logger
 
 # Import the Rust extension for high-performance block allocation
 # This is a mandatory dependency - the extension is bundled in the wheel
 from vllm_metal._rs import BlockAllocator
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -164,13 +167,59 @@ class PagedKVCache:
 
         # Block pool: (num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim)
         # where 2 = key + value
-        self.block_pool = mx.zeros(
-            (num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim),
-            dtype=dtype,
-        )
+        try:
+            self.block_pool = mx.zeros(
+                (num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim),
+                dtype=dtype,
+            )
+        except RuntimeError as e:
+            if "Attempting to allocate" in str(
+                e
+            ) and "greater than the maximum allowed buffer size" in str(e):
+                # Memory allocation error - try with fewer blocks
+                logger.warning(
+                    f"Initial block allocation failed: {e}. Reducing cache size..."
+                )
+
+                # Try to reduce the number of blocks by half iteratively until it works
+                reduced_num_blocks = num_blocks
+                while reduced_num_blocks > 1:
+                    try:
+                        reduced_num_blocks //= 2
+                        logger.info(
+                            f"Trying with {reduced_num_blocks} blocks instead of {num_blocks}"
+                        )
+                        self.block_pool = mx.zeros(
+                            (
+                                reduced_num_blocks,
+                                num_layers,
+                                2,
+                                block_size,
+                                num_kv_heads,
+                                head_dim,
+                            ),
+                            dtype=dtype,
+                        )
+                        self.num_blocks = reduced_num_blocks
+                        logger.warning(
+                            f"Successfully allocated with reduced cache: {reduced_num_blocks} blocks "
+                            f"(was {num_blocks}). Performance may be impacted."
+                        )
+                        break
+                    except RuntimeError:
+                        continue
+
+                if reduced_num_blocks <= 1:
+                    # If we can't even allocate 1 block, try with 1 block and smaller dimensions
+                    logger.error(
+                        "Could not allocate even a single block. This indicates a severe memory issue."
+                    )
+                    raise
+            else:
+                raise
 
         # Rust-based O(1) block allocator
-        self._allocator = BlockAllocator(num_blocks)
+        self._allocator = BlockAllocator(self.num_blocks)
 
     def allocate_blocks(self, seq_id: int, num_blocks: int) -> list[int]:
         """Allocate blocks for a sequence.
@@ -187,7 +236,18 @@ class PagedKVCache:
         Raises:
             RuntimeError: If not enough free blocks
         """
-        return self._allocator.allocate_blocks(seq_id, num_blocks)
+        free_before = self._allocator.num_free_blocks
+        if num_blocks > free_before:
+            logger.error(
+                f"Block allocation failed: seq_id={seq_id}, "
+                f"requested={num_blocks}, available={free_before}"
+            )
+        blocks = self._allocator.allocate_blocks(seq_id, num_blocks)
+        logger.debug(
+            f"Allocated blocks: seq_id={seq_id}, blocks={blocks}, "
+            f"free={self._allocator.num_free_blocks}/{self.num_blocks}"
+        )
+        return blocks
 
     def free_sequence(self, seq_id: int) -> None:
         """Free all blocks for a sequence.
@@ -195,7 +255,13 @@ class PagedKVCache:
         Args:
             seq_id: Sequence identifier
         """
+        blocks_before = self._allocator.get_sequence_blocks(seq_id)
         self._allocator.free_sequence(seq_id)
+        logger.debug(
+            f"Freed sequence: seq_id={seq_id}, "
+            f"freed_blocks={len(blocks_before)}, "
+            f"free={self._allocator.num_free_blocks}/{self.num_blocks}"
+        )
 
     def update_block(
         self,
@@ -224,7 +290,7 @@ class PagedKVCache:
     def get_sequence_kv(
         self, seq_id: int, layer_idx: int, seq_len: int
     ) -> tuple[mx.array, mx.array]:
-        """Get key-value pairs for a sequence.
+        """Get key-value pairs for a sequence using internal allocator.
 
         Args:
             seq_id: Sequence identifier
@@ -235,8 +301,22 @@ class PagedKVCache:
             Tuple of (keys, values) of shape (seq_len, num_kv_heads, head_dim)
         """
         blocks = self._allocator.get_sequence_blocks(seq_id)
+        return self.get_kv_from_blocks(blocks, layer_idx, seq_len)
 
-        if not blocks:
+    def get_kv_from_blocks(
+        self, block_ids: list[int], layer_idx: int, seq_len: int
+    ) -> tuple[mx.array, mx.array]:
+        """Get key-value pairs from specified blocks.
+
+        Args:
+            block_ids: List of block indices to read from
+            layer_idx: Index of the transformer layer
+            seq_len: Current sequence length
+
+        Returns:
+            Tuple of (keys, values) of shape (seq_len, num_kv_heads, head_dim)
+        """
+        if not block_ids:
             return (
                 mx.zeros((0, self.num_kv_heads, self.head_dim), dtype=self.dtype),
                 mx.zeros((0, self.num_kv_heads, self.head_dim), dtype=self.dtype),
@@ -246,7 +326,7 @@ class PagedKVCache:
         values = []
         remaining = seq_len
 
-        for block_idx in blocks:
+        for block_idx in block_ids:
             tokens_in_block = min(remaining, self.block_size)
             keys.append(self.block_pool[block_idx, layer_idx, 0, :tokens_in_block])
             values.append(self.block_pool[block_idx, layer_idx, 1, :tokens_in_block])
@@ -260,6 +340,22 @@ class PagedKVCache:
     def num_free_blocks(self) -> int:
         """Return number of free blocks."""
         return self._allocator.num_free_blocks
+
+    @property
+    def num_used_blocks(self) -> int:
+        """Return number of used blocks."""
+        return self.num_blocks - self._allocator.num_free_blocks
+
+    def get_cache_usage(self) -> tuple[int, int, float]:
+        """Get cache usage statistics.
+
+        Returns:
+            Tuple of (used_blocks, total_blocks, usage_ratio)
+        """
+        used = self.num_used_blocks
+        total = self.num_blocks
+        ratio = used / total if total > 0 else 0.0
+        return (used, total, ratio)
 
     def has_sequence(self, seq_id: int) -> bool:
         """Check if a sequence has blocks allocated.

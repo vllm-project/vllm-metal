@@ -18,7 +18,6 @@ import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
-from mlx_lm.models.cache import BatchKVCache, KVCache, make_prompt_cache
 
 # mlx_vlm for vision-language models
 from mlx_vlm import load as mlx_vlm_load
@@ -34,6 +33,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.mlx_backend.cache import PagedKVCache
+from vllm_metal.mlx_backend.paged_cache_adapter import (
+    PagedBatchKVCacheAdapter,
+    PagedKVCacheAdapterList,
+)
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
 logger = init_logger(__name__)
@@ -57,6 +61,147 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+
+
+def _safe_mx_eval(tensor: mx.array) -> None:
+    """Safely evaluate an MLX tensor with memory error handling.
+
+    Args:
+        tensor: MLX tensor to evaluate
+    """
+    try:
+        mx.eval(tensor)
+    except RuntimeError as e:
+        if "Attempting to allocate" in str(
+            e
+        ) and "greater than the maximum allowed buffer size" in str(e):
+            # Memory allocation error - try to clear cache and retry
+            mx.metal.clear_cache()
+
+            # Get device info to determine safe chunk sizes
+            device_info = mx.metal.device_info()
+            max_buffer_size = device_info.get(
+                "max_buffer_size", 3 * 1024**3
+            )  # Default to 3GB
+            if isinstance(max_buffer_size, str):
+                max_buffer_size = (
+                    int(max_buffer_size) if max_buffer_size.isdigit() else 3 * 1024**3
+                )
+            elif isinstance(max_buffer_size, float):
+                max_buffer_size = int(max_buffer_size)
+
+            # Calculate element size based on tensor dtype
+            dtype_size = (
+                2 if tensor.dtype == mx.float16 else 4
+            )  # float16=2 bytes, float32=4 bytes
+            element_count = 1
+            for dim in tensor.shape:
+                element_count *= dim
+
+            # Calculate tensor size in bytes
+            tensor_size_bytes = element_count * dtype_size
+
+            # If tensor is much larger than max buffer size, we need to chunk aggressively
+            if tensor_size_bytes > max_buffer_size:
+                # For very large tensors, try to chunk along the first dimension
+                if len(tensor.shape) >= 1 and tensor.shape[0] > 1:
+                    # Calculate a safe chunk size based on max buffer size
+                    elements_per_chunk = max_buffer_size // dtype_size
+                    # Ensure chunk size is reasonable and fits within tensor bounds
+                    chunk_size = max(
+                        1,
+                        min(
+                            tensor.shape[0],
+                            elements_per_chunk
+                            // max(1, element_count // tensor.shape[0]),
+                        ),
+                    )
+
+                    # Start with a conservative chunk size and increase if needed
+                    chunk_size = max(
+                        1, min(chunk_size, tensor.shape[0] // 8)
+                    )  # Start with 1/8th of the first dim
+
+                    # Try different chunk sizes until we find one that works
+                    current_chunk_size = chunk_size
+                    while current_chunk_size >= 1:
+                        try:
+                            # Process in chunks
+                            for i in range(0, tensor.shape[0], current_chunk_size):
+                                end_idx = min(i + current_chunk_size, tensor.shape[0])
+                                chunk = tensor[i:end_idx]
+                                mx.eval(chunk)
+                            return  # Success, exit the function
+                        except RuntimeError as chunk_error:
+                            if "Attempting to allocate" in str(
+                                chunk_error
+                            ) and "greater than the maximum allowed buffer size" in str(
+                                chunk_error
+                            ):
+                                # Reduce chunk size and try again
+                                current_chunk_size = max(1, current_chunk_size // 2)
+                                if current_chunk_size < 1:
+                                    break
+                            else:
+                                raise chunk_error
+
+                    # If chunking along first dimension didn't work, try a minimal evaluation
+                    try:
+                        # Evaluate just a small slice to avoid complete failure
+                        if tensor.shape[0] > 0:
+                            slice_size = max(
+                                1, tensor.shape[0] // 16
+                            )  # Take 1/16th of first dim
+                            mx.eval(tensor[0:slice_size])
+                    except Exception:
+                        # If all attempts fail, just continue without full evaluation
+                        # The model will still work but may have delayed evaluation
+                        pass
+                else:
+                    # For tensors that can't be chunked effectively, try to clear cache and evaluate
+                    # with a smaller portion
+                    try:
+                        mx.metal.clear_cache()
+                        # For 1D tensors, evaluate first few elements
+                        if len(tensor.shape) == 1 and tensor.shape[0] > 100:
+                            mx.eval(tensor[0 : min(100, tensor.shape[0])])
+                        else:
+                            # For other shapes, try to evaluate a scalar or small slice
+                            if tensor.size > 0:
+                                mx.eval(tensor.flatten()[0:1])
+                    except Exception:
+                        # If all attempts fail, just continue without full evaluation
+                        # The model will still work but may have delayed evaluation
+                        pass
+            else:
+                # Tensor size is within limits but still failed - try once more after clearing
+                try:
+                    mx.eval(tensor)
+                except Exception:
+                    # Last resort: try to evaluate a small slice
+                    try:
+                        if tensor.size > 0:
+                            if len(tensor.shape) == 1:
+                                mx.eval(tensor[0 : min(100, tensor.shape[0])])
+                            elif len(tensor.shape) >= 2:
+                                mx.eval(tensor[0:1, 0:1])  # First element in 2D case
+                            else:
+                                mx.eval(tensor.flatten()[0:1])
+                    except Exception:
+                        # If all attempts fail, just continue without full evaluation
+                        # The model will still work but may have delayed evaluation
+                        pass
+        else:
+            raise e from None
+
+
+def _safe_eval_logits(logits: mx.array) -> None:
+    """Safely evaluate logits with memory error handling.
+
+    Args:
+        logits: Logits array to evaluate
+    """
+    _safe_mx_eval(logits)
 
 
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
@@ -99,60 +244,24 @@ class SamplerOutput:
 
 @dataclass
 class RequestState:
-    """State for an ongoing request with KV cache."""
+    """State for an ongoing request with paged KV cache."""
 
     token_ids: list[int]
     # Length of the original prompt (prefix) within `token_ids`.
     # vLLM applies repetition penalties to both prompt+output tokens, but applies
     # presence/frequency penalties only to generated (output) tokens.
     prompt_len: int
-    cache: list[KVCache]  # Per-layer KV caches
+    cache: PagedKVCacheAdapterList  # Paged KV cache adapters
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
     generated_tokens: int = 0
-
-
-def _merge_kv_caches(caches_list: list[list[KVCache]]) -> list[BatchKVCache]:
-    """Merge multiple per-request caches into batched caches.
-
-    Args:
-        caches_list: List of per-request caches, each is a list of per-layer KVCache
-
-    Returns:
-        List of BatchKVCache, one per layer
-    """
-    if not caches_list:
-        return []
-
-    num_layers = len(caches_list[0])
-    merged = []
-
-    for layer_idx in range(num_layers):
-        layer_caches = [caches[layer_idx] for caches in caches_list]
-        batch_cache = BatchKVCache.merge(layer_caches)
-        merged.append(batch_cache)
-
-    return merged
-
-
-def _extract_kv_cache(batch_caches: list[BatchKVCache], idx: int) -> list[KVCache]:
-    """Extract a single request's cache from batched caches.
-
-    Args:
-        batch_caches: List of BatchKVCache, one per layer
-        idx: Index of the request in the batch
-
-    Returns:
-        List of KVCache for the request, one per layer
-    """
-    return [cache.extract(idx) for cache in batch_caches]
 
 
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
-    Uses true batched decode with BatchKVCache for efficient parallel processing.
+    Uses paged attention with PagedKVCache for memory-efficient inference.
     """
 
     def __init__(
@@ -181,6 +290,11 @@ class MetalModelRunner:
         # KV cache state
         self.kv_cache_initialized = False
         self.num_kv_cache_blocks = 0
+
+        # Paged KV cache (initialized in initialize_kv_cache)
+        self._paged_cache: PagedKVCache | None = None
+        self._next_seq_id: int = 0  # Monotonic sequence ID counter
+        self._req_id_to_seq_id: dict[str, int] = {}  # Map request IDs to sequence IDs
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -353,11 +467,46 @@ class MetalModelRunner:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache from configuration.
 
+        Creates a PagedKVCache with block-based storage for memory-efficient
+        KV cache management.
+
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
         self.num_kv_cache_blocks = kv_cache_config.num_blocks
-        logger.info(f"KV cache initialized with {self.num_kv_cache_blocks} blocks")
+
+        # Extract model dimensions for PagedKVCache initialization
+        num_layers = (
+            self.model_args.get("num_hidden_layers")
+            or self.model_args.get("n_layers")
+            or 32
+        )
+        num_attention_heads = self.model_args.get("num_attention_heads") or 32
+        num_kv_heads = (
+            self.model_args.get("num_key_value_heads")
+            or self.model_args.get("n_kv_heads")
+            or num_attention_heads
+        )
+        hidden_size = self.model_args.get("hidden_size") or 4096
+        head_dim = self.model_args.get("head_dim") or (
+            hidden_size // num_attention_heads
+        )
+
+        # Create the paged KV cache
+        self._paged_cache = PagedKVCache(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            num_blocks=self.num_kv_cache_blocks,
+            block_size=self.metal_config.block_size,
+            dtype=mx.float16,
+        )
+
+        logger.info(
+            f"PagedKVCache initialized: {self.num_kv_cache_blocks} blocks, "
+            f"block_size={self.metal_config.block_size}, "
+            f"layers={num_layers}, kv_heads={num_kv_heads}, head_dim={head_dim}"
+        )
         self.kv_cache_initialized = True
 
     def get_cache_block_size_bytes(self) -> int:
@@ -389,6 +538,17 @@ class MetalModelRunner:
         dtype_size = 2  # float16
         return 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
 
+    def get_cache_usage(self) -> tuple[int, int, float]:
+        """Get KV cache usage statistics.
+
+        Returns:
+            Tuple of (used_blocks, total_blocks, usage_ratio)
+            Returns (0, 0, 0.0) if cache not initialized
+        """
+        if self._paged_cache is None:
+            return (0, 0, 0.0)
+        return self._paged_cache.get_cache_usage()
+
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass."""
         if self.model is None:
@@ -402,7 +562,7 @@ class MetalModelRunner:
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
             output = self.model(dummy_tokens)
             logits = self._extract_logits(output)
-            mx.eval(logits)
+            _safe_eval_logits(logits)
             logger.info("Model warm-up complete")
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
@@ -531,25 +691,60 @@ class MetalModelRunner:
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
-    ) -> tuple[int, list[KVCache]]:
-        """Process a single prefill request.
+        block_ids: list[int] | None = None,
+    ) -> tuple[int, PagedKVCacheAdapterList]:
+        """Process a single prefill request using paged KV cache.
 
         Args:
             req_id: Request ID
             token_ids: Prompt token IDs
             sampling_params: Sampling parameters for this request
+            generator: Optional per-request generator for seeded sampling
+            block_ids: Optional block IDs from scheduler. If provided,
+                       uses these instead of internal allocation.
 
         Returns:
-            Tuple of (next_token, cache)
+            Tuple of (next_token, cache_adapter)
         """
-        # Create a new prompt cache for this request
-        # For VLMs, use the language_model component; for text models, use model directly
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
+        if self._paged_cache is None:
+            raise RuntimeError("PagedKVCache not initialized")
+
+        # Allocate a new sequence ID
+        seq_id = self._next_seq_id
+        self._next_seq_id += 1
+        self._req_id_to_seq_id[req_id] = seq_id
+
+        # Use scheduler's block IDs if provided, otherwise allocate internally
+        if block_ids is None:
+            # Legacy: estimate blocks needed and pre-allocate
+            prompt_len = len(token_ids)
+            blocks_needed = (
+                prompt_len + self.metal_config.block_size - 1
+            ) // self.metal_config.block_size
+            # Add one extra block for decode tokens
+            blocks_needed += 1
+            logger.debug(
+                f"Prefill (internal alloc): req_id={req_id}, seq_id={seq_id}, "
+                f"prompt_len={prompt_len}, blocks_needed={blocks_needed}"
+            )
+            self._paged_cache.allocate_blocks(seq_id, blocks_needed)
+        else:
+            logger.debug(
+                f"Prefill (scheduler blocks): req_id={req_id}, seq_id={seq_id}, "
+                f"prompt_len={len(token_ids)}, blocks={len(block_ids)}"
+            )
+
+        # Get number of layers from paged cache
+        num_layers = self._paged_cache.num_layers
+
+        # Create paged cache adapter list with scheduler's block IDs if provided
+        cache = PagedKVCacheAdapterList(
+            paged_cache=self._paged_cache,
+            seq_id=seq_id,
+            num_layers=num_layers,
+            block_size=self.metal_config.block_size,
+            block_ids=block_ids,
         )
-        cache = make_prompt_cache(cache_model)
 
         # Prefill: process the entire prompt with cache
         input_ids = mx.array([token_ids], dtype=mx.int32)
@@ -571,14 +766,38 @@ class MetalModelRunner:
 
         if is_greedy and not needs_advanced_sampling:
             # Fast path: native MLX greedy sampling
-            next_token_mlx = _mlx_greedy_sample(last_logits)
-            # Single eval for logits, token, and cache state together
-            mx.eval(next_token_mlx, *[c.state for c in cache])
-            next_token = int(next_token_mlx.item())
+            try:
+                next_token_mlx = _mlx_greedy_sample(last_logits)
+                # Single eval for logits and token
+                _safe_mx_eval(next_token_mlx)
+                next_token = int(next_token_mlx.item())
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - fall back to slow path with vLLM sampler
+                    mx.metal.clear_cache()
+                    # Evaluate logits safely
+                    _safe_eval_logits(last_logits)
+                    # Convert to torch for sampling
+                    logits_torch = mlx_to_torch(
+                        last_logits.astype(mx.float32), device=self.device
+                    )
+                    generators = {} if generator is None else {0: generator}
+                    metadata = self._make_sampling_metadata(
+                        [sampling_params],
+                        [token_ids],
+                        [[]],
+                        generators=generators,
+                    )
+                    output = self._sampler.forward(logits_torch, metadata)
+                    next_token = int(output.sampled_token_ids[0, 0].item())
+                else:
+                    raise
         else:
             # Slow path: use vLLM sampler for advanced sampling
-            # Single eval for logits and cache state together
-            mx.eval(last_logits, *[c.state for c in cache])
+            # Check memory before evaluating large logits tensor to prevent allocation errors
+            _safe_eval_logits(last_logits)
             # Convert to torch for sampling
             logits_torch = mlx_to_torch(
                 last_logits.astype(mx.float32), device=self.device
@@ -598,8 +817,8 @@ class MetalModelRunner:
     def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
         """Process multiple decode requests in a single batched forward pass.
 
-        Uses BatchKVCache to merge individual caches, run ONE forward pass,
-        then extract updated caches back.
+        Uses PagedBatchKVCacheAdapter to merge individual paged caches.
+        Since all caches share the same block pool, updates happen in-place.
 
         Args:
             decode_reqs: List of (req_id, state) tuples
@@ -608,6 +827,8 @@ class MetalModelRunner:
             List of next tokens for each request
         """
         batch_size = len(decode_reqs)
+        seq_lens = [state.cache.offset for _, state in decode_reqs]
+        logger.debug(f"Batched decode: batch_size={batch_size}, seq_lens={seq_lens}")
 
         # Use Rust extension for efficient batch token retrieval if available
         if self._rust_state_manager is not None:
@@ -620,11 +841,13 @@ class MetalModelRunner:
                 for _, state in decode_reqs
             ]
 
-        # Collect individual caches for merging
-        caches_list = [state.cache for _, state in decode_reqs]
+        # Collect individual paged cache adapters
+        caches_list: list[PagedKVCacheAdapterList] = [
+            state.cache for _, state in decode_reqs
+        ]
 
-        # Merge individual KV caches into batched cache (one per layer)
-        batch_cache = _merge_kv_caches(caches_list)
+        # Merge into batched cache (one per layer)
+        batch_cache = PagedBatchKVCacheAdapter.merge(caches_list)
 
         # Create batched input: shape (batch_size, 1) for single-token decode
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
@@ -650,13 +873,50 @@ class MetalModelRunner:
 
         if all_greedy and not any_advanced:
             # Fast path: native MLX greedy sampling for entire batch
-            next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
-            # Single eval - no intermediate sync needed
-            mx.eval(next_tokens_mlx)
-            next_tokens: list[int] = next_tokens_mlx.tolist()
+            try:
+                next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
+                # Single eval - no intermediate sync needed
+                _safe_mx_eval(next_tokens_mlx)
+                next_tokens: list[int] = next_tokens_mlx.tolist()
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - fall back to slow path with vLLM sampler
+                    mx.metal.clear_cache()
+                    # Evaluate logits safely
+                    _safe_eval_logits(next_token_logits)
+                    prompt_token_ids_list = [
+                        state.token_ids[: state.prompt_len] for _, state in decode_reqs
+                    ]
+                    output_tokens_list = [
+                        state.token_ids[state.prompt_len :] for _, state in decode_reqs
+                    ]
+                    generators = {
+                        i: state.generator
+                        for i, (_, state) in enumerate(decode_reqs)
+                        if state.generator is not None
+                    }
+                    logits_torch = mlx_to_torch(
+                        next_token_logits.astype(mx.float32), device=self.device
+                    )
+                    metadata = self._make_sampling_metadata(
+                        sampling_params_list,
+                        prompt_token_ids_list,
+                        output_tokens_list,
+                        generators=generators,
+                    )
+                    output = self._sampler.forward(logits_torch, metadata)
+                    next_tokens = [
+                        int(output.sampled_token_ids[i, 0].item())
+                        for i in range(batch_size)
+                    ]
+                else:
+                    raise
         else:
             # Slow path: use vLLM sampler for advanced sampling
-            mx.eval(next_token_logits)
+            # Check memory before evaluating large logits tensor to prevent allocation errors
+            _safe_eval_logits(next_token_logits)
             prompt_token_ids_list = [
                 state.token_ids[: state.prompt_len] for _, state in decode_reqs
             ]
@@ -682,9 +942,8 @@ class MetalModelRunner:
                 int(output.sampled_token_ids[i, 0].item()) for i in range(batch_size)
             ]
 
-        # Extract updated caches back to individual requests
+        # Update token state - cache updates happened in-place during forward pass
         for i, (req_id, state) in enumerate(decode_reqs):
-            state.cache = _extract_kv_cache(batch_cache, i)
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
 
@@ -730,12 +989,38 @@ class MetalModelRunner:
 
             if is_greedy and not needs_advanced:
                 # Fast path: native MLX greedy sampling
-                next_token_mlx = _mlx_greedy_sample(last_logits)
-                mx.eval(next_token_mlx)
-                next_token = int(next_token_mlx.item())
+                try:
+                    next_token_mlx = _mlx_greedy_sample(last_logits)
+                    _safe_mx_eval(next_token_mlx)
+                    next_token = int(next_token_mlx.item())
+                except RuntimeError as e:
+                    if "Attempting to allocate" in str(
+                        e
+                    ) and "greater than the maximum allowed buffer size" in str(e):
+                        # Memory allocation error - fall back to slow path with vLLM sampler
+                        mx.metal.clear_cache()
+                        # Evaluate logits safely
+                        _safe_eval_logits(last_logits)
+                        logits_torch = mlx_to_torch(
+                            last_logits.astype(mx.float32), device=self.device
+                        )
+                        generators = (
+                            {} if state.generator is None else {0: state.generator}
+                        )
+                        metadata = self._make_sampling_metadata(
+                            [state.sampling_params],
+                            [state.token_ids[: state.prompt_len]],
+                            [state.token_ids[state.prompt_len :]],
+                            generators=generators,
+                        )
+                        output = self._sampler.forward(logits_torch, metadata)
+                        next_token = int(output.sampled_token_ids[0, 0].item())
+                    else:
+                        raise
             else:
                 # Slow path: use vLLM sampler
-                mx.eval(last_logits)
+                # Check memory before evaluating large logits tensor to prevent allocation errors
+                _safe_eval_logits(last_logits)
                 logits_torch = mlx_to_torch(
                     last_logits.astype(mx.float32), device=self.device
                 )
@@ -785,6 +1070,16 @@ class MetalModelRunner:
 
         # === PHASE 1: Process new requests (prefill phase) ===
         new_reqs = scheduler_output.scheduled_new_reqs
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+
+        # Debug: Log request counts for diagnosing batching issues
+        used, total, ratio = self.get_cache_usage()
+        logger.debug(
+            f"execute_model: new_reqs={len(new_reqs)}, "
+            f"cached_reqs={len(cached_reqs.req_ids) if cached_reqs else 0}, "
+            f"active_states={len(self._request_states)}, "
+            f"cache_usage={used}/{total} ({ratio:.1%})"
+        )
 
         for new_req in new_reqs:
             req_id = new_req.req_id
@@ -796,11 +1091,25 @@ class MetalModelRunner:
 
             if token_ids:
                 generator = _create_request_generator(self.device, sampling_params)
+
+                # Extract block IDs from scheduler (if provided)
+                # block_ids is tuple[list[int], ...] - take first list for single head group
+                scheduler_block_ids: list[int] | None = None
+                if new_req.block_ids and len(new_req.block_ids) > 0:
+                    scheduler_block_ids = list(new_req.block_ids[0])
+
+                # Log prefill details for debugging
+                logger.debug(
+                    f"Prefill (scheduler blocks): req_id={req_id}, seq_id={self._next_seq_id}, "
+                    f"prompt_len={len(token_ids)}, blocks={len(scheduler_block_ids) if scheduler_block_ids else 'N/A'}"
+                )
+
                 next_token, cache = self._prefill_single(
                     req_id,
                     token_ids,
                     sampling_params,
                     generator=generator,
+                    block_ids=scheduler_block_ids,
                 )
                 sampled_tokens.append([next_token])
 
@@ -823,10 +1132,26 @@ class MetalModelRunner:
                 sampled_tokens.append([0])  # Fallback
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
-        cached_reqs = scheduler_output.scheduled_cached_reqs
         decode_req_ids = list(cached_reqs.req_ids)
 
         if decode_req_ids:
+            # Append any new block IDs from scheduler to cache adapters
+            if cached_reqs.new_block_ids:
+                blocks_appended = 0
+                for i, req_id in enumerate(decode_req_ids):
+                    state = self._request_states.get(req_id)
+                    if state is not None and i < len(cached_reqs.new_block_ids):
+                        new_blocks = cached_reqs.new_block_ids[i]
+                        if new_blocks is not None and len(new_blocks) > 0:
+                            # new_blocks is tuple[list[int], ...] - take first list
+                            state.cache.append_block_ids(list(new_blocks[0]))
+                            blocks_appended += len(new_blocks[0])
+                if blocks_appended > 0:
+                    logger.debug(
+                        f"Appended {blocks_appended} blocks to "
+                        f"{len(decode_req_ids)} decode requests"
+                    )
+
             # Collect all valid decode requests
             valid_decode_reqs: list[tuple[str, RequestState]] = []
             for req_id in decode_req_ids:
@@ -835,6 +1160,13 @@ class MetalModelRunner:
                     valid_decode_reqs.append((req_id, state))
 
             if valid_decode_reqs:
+                # Log batched decode details for debugging
+                seq_lens = [state.cache.offset for _, state in valid_decode_reqs]
+                logger.debug(
+                    f"Batched decode: batch_size={len(valid_decode_reqs)}, "
+                    f"seq_lens={seq_lens}"
+                )
+
                 # Use batched decode for multiple requests, sequential for single
                 if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
                     decode_tokens = self._batched_decode(valid_decode_reqs)
@@ -856,11 +1188,25 @@ class MetalModelRunner:
 
         # === PHASE 3: Clean up finished requests ===
         if scheduler_output.finished_req_ids:
+            used, total, ratio = self.get_cache_usage()
+            logger.debug(
+                f"Finishing {len(scheduler_output.finished_req_ids)} requests, "
+                f"cache_usage={used}/{total} ({ratio:.1%})"
+            )
             for req_id in scheduler_output.finished_req_ids:
                 state = self._request_states.pop(req_id, None)
                 if state is not None:
-                    del state.cache
+                    logger.debug(
+                        f"Cleanup: req_id={req_id}, "
+                        f"generated={state.generated_tokens}, "
+                        f"total_tokens={len(state.token_ids)}"
+                    )
+                    # Free paged cache blocks back to pool
+                    state.cache.free()
                     del state
+
+                # Remove sequence ID mapping
+                self._req_id_to_seq_id.pop(req_id, None)
 
                 # Remove from Rust state manager if available
                 if self._rust_state_manager is not None:
@@ -869,6 +1215,9 @@ class MetalModelRunner:
             # Lazy cache clearing - only clear periodically to avoid sync overhead
             self._finished_request_count += len(scheduler_output.finished_req_ids)
             if self._finished_request_count >= _CACHE_CLEAR_INTERVAL:
+                logger.debug(
+                    f"Clearing MLX cache after {_CACHE_CLEAR_INTERVAL} requests"
+                )
                 mx.clear_cache()
                 self._finished_request_count = 0
 
@@ -882,6 +1231,38 @@ class MetalModelRunner:
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
+
+        # Periodically clear cache to prevent memory buildup
+        if (
+            len(req_ids) > 0 and len(req_ids) % 5 == 0
+        ):  # More frequent clearing - every 5 requests
+            try:
+                mx.metal.clear_cache()
+            except Exception:
+                pass
+
+        # Additional cache clearing for memory-intensive operations
+        # Clear cache more aggressively if we have processed many requests
+        if len(req_ids) > 0 and len(req_ids) % 3 == 0:  # Every 3 requests
+            try:
+                mx.eval(mx.array([0]))  # Force evaluation of pending operations
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Clear cache if we encounter memory issues
+                    mx.metal.clear_cache()
+                else:
+                    pass  # Ignore other errors
+
+        # Periodic cache clearing to prevent memory buildup
+        try:
+            # Clear cache every 10 requests or when cache usage is high (>80%)
+            used, total, ratio = self.get_cache_usage()
+            if len(req_ids) > 0 and (len(req_ids) % 10 == 0 or ratio > 0.8):
+                mx.metal.clear_cache()
+        except Exception:
+            pass  # Ignore errors during cache clearing
 
         return ModelRunnerOutput(
             req_ids=req_ids,

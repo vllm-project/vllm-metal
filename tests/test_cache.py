@@ -175,6 +175,43 @@ class TestPagedKVCache:
         assert not cache.has_sequence(0)
         assert cache.has_sequence(1)
 
+    def test_cache_usage(self) -> None:
+        """Test cache usage statistics."""
+        cache = PagedKVCache(
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=32,
+            num_blocks=10,
+            block_size=16,
+        )
+
+        # Initially no blocks used
+        used, total, ratio = cache.get_cache_usage()
+        assert used == 0
+        assert total == 10
+        assert ratio == 0.0
+
+        # Allocate some blocks
+        cache.allocate_blocks(seq_id=0, num_blocks=3)
+        used, total, ratio = cache.get_cache_usage()
+        assert used == 3
+        assert total == 10
+        assert ratio == 0.3
+
+        # Allocate more
+        cache.allocate_blocks(seq_id=1, num_blocks=2)
+        used, total, ratio = cache.get_cache_usage()
+        assert used == 5
+        assert total == 10
+        assert ratio == 0.5
+
+        # Free and check
+        cache.free_sequence(seq_id=0)
+        used, total, ratio = cache.get_cache_usage()
+        assert used == 2
+        assert total == 10
+        assert ratio == 0.2
+
     def test_block_update(self) -> None:
         """Test updating block contents."""
         cache = PagedKVCache(

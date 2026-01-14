@@ -8,6 +8,7 @@ import logging
 from typing import Literal
 
 import mlx.core as mx
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -127,23 +128,157 @@ def mlx_to_torch(
     if torch_dtype is not None:
         if already_contiguous:
             # Fast path: skip contiguity check, single eval
-            mx.eval(array)
-            buffer = memoryview(array)
+            try:
+                mx.eval(array)
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - try to clear cache and process in chunks
+                    mx.metal.clear_cache()
+
+                    # For large arrays, try to process in chunks along the first dimension
+                    if len(array.shape) >= 1 and array.shape[0] > 1:
+                        # Calculate chunk size based on available buffer size
+                        device_info = mx.metal.device_info()
+                        max_buffer_size_raw = device_info.get(
+                            "max_buffer_size", 3 * 1024**3
+                        )
+
+                        # Ensure max_buffer_size is an integer
+                        if isinstance(max_buffer_size_raw, str):
+                            max_buffer_size = (
+                                int(max_buffer_size_raw)
+                                if max_buffer_size_raw.isdigit()
+                                else 3 * 1024**3
+                            )
+                        elif isinstance(max_buffer_size_raw, float):
+                            max_buffer_size = int(max_buffer_size_raw)
+                        else:
+                            max_buffer_size = max_buffer_size_raw
+
+                        # Calculate element size based on dtype
+                        dtype_size = array.dtype.size
+                        elements_per_dim = 1
+                        for dim in array.shape[
+                            1:
+                        ]:  # Exclude first dimension for chunking
+                            elements_per_dim *= dim
+
+                        # Calculate max elements we can process at once
+                        max_elements_per_chunk = (
+                            max_buffer_size // dtype_size // elements_per_dim
+                        )
+                        chunk_size = max(1, min(array.shape[0], max_elements_per_chunk))
+
+                        # Process in chunks
+                        chunk_tensors = []
+                        for i in range(0, array.shape[0], chunk_size):
+                            end_idx = min(i + chunk_size, array.shape[0])
+                            chunk = array[i:end_idx]
+                            mx.eval(chunk)
+                            chunk_buffer = memoryview(chunk)
+                            chunk_tensor = torch.frombuffer(
+                                chunk_buffer, dtype=torch_dtype
+                            ).reshape(chunk.shape)
+                            chunk_tensors.append(chunk_tensor)
+
+                        # Concatenate all chunks
+                        tensor = torch.cat(chunk_tensors, dim=0)
+                    else:
+                        # For arrays that can't be chunked effectively, try to evaluate and convert differently
+                        mx.metal.clear_cache()
+                        # Fallback to numpy path for very large arrays that can't be chunked
+                        array_np = np.array(array)
+                        tensor = torch.from_numpy(array_np)
+                else:
+                    raise
+            else:
+                buffer = memoryview(array)
+                tensor = torch.frombuffer(buffer, dtype=torch_dtype).reshape(
+                    array.shape
+                )
         else:
             # MLX views / non-contiguous arrays expose a non-contiguous buffer (or
             # sometimes no usable buffer), which `torch.frombuffer` can't consume.
             # Make contiguous first, then eval once
             array = mx.contiguous(array)
-            mx.eval(array)
-            buffer = memoryview(array)
+            try:
+                mx.eval(array)
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - try to clear cache and process in chunks
+                    mx.metal.clear_cache()
 
-        tensor = torch.frombuffer(buffer, dtype=torch_dtype).reshape(array.shape)
+                    # For large arrays, try to process in chunks along the first dimension
+                    if len(array.shape) >= 1 and array.shape[0] > 1:
+                        # Calculate chunk size based on available buffer size
+                        device_info = mx.metal.device_info()
+                        max_buffer_size_raw = device_info.get(
+                            "max_buffer_size", 3 * 1024**3
+                        )
+
+                        # Ensure max_buffer_size is an integer
+                        if isinstance(max_buffer_size_raw, str):
+                            max_buffer_size = (
+                                int(max_buffer_size_raw)
+                                if max_buffer_size_raw.isdigit()
+                                else 3 * 1024**3
+                            )
+                        elif isinstance(max_buffer_size_raw, float):
+                            max_buffer_size = int(max_buffer_size_raw)
+                        else:
+                            max_buffer_size = max_buffer_size_raw
+
+                        # Calculate element size based on dtype
+                        dtype_size = array.dtype.size
+                        elements_per_dim = 1
+                        for dim in array.shape[
+                            1:
+                        ]:  # Exclude first dimension for chunking
+                            elements_per_dim *= dim
+
+                        # Calculate max elements we can process at once
+                        max_elements_per_chunk = (
+                            max_buffer_size // dtype_size // elements_per_dim
+                        )
+                        chunk_size = max(1, min(array.shape[0], max_elements_per_chunk))
+
+                        # Process in chunks
+                        chunk_tensors = []
+                        for i in range(0, array.shape[0], chunk_size):
+                            end_idx = min(i + chunk_size, array.shape[0])
+                            chunk = mx.contiguous(array[i:end_idx])
+                            mx.eval(chunk)
+                            chunk_buffer = memoryview(chunk)
+                            chunk_tensor = torch.frombuffer(
+                                chunk_buffer, dtype=torch_dtype
+                            ).reshape(chunk.shape)
+                            chunk_tensors.append(chunk_tensor)
+
+                        # Concatenate all chunks
+                        tensor = torch.cat(chunk_tensors, dim=0)
+                    else:
+                        # For arrays that can't be chunked effectively, try to evaluate and convert differently
+                        mx.metal.clear_cache()
+                        # Fallback to numpy path for very large arrays that can't be chunked
+                        array_np = np.array(array)
+                        tensor = torch.from_numpy(array_np)
+                else:
+                    raise
+            else:
+                buffer = memoryview(array)
+                tensor = torch.frombuffer(buffer, dtype=torch_dtype).reshape(
+                    array.shape
+                )
     else:
         # Fallback to numpy path for unsupported dtypes
         raise ValueError(f"Unsupported MLX dtype: {array.dtype}")
 
     # Move to target device, but check for MPS size limits first
-    if device.type == "mps":
+    if isinstance(device, torch.device) and device.type == "mps":
         if _is_safe_for_mps(array):
             tensor = tensor.to(device)
         else:
@@ -154,7 +289,7 @@ def mlx_to_torch(
                 _get_tensor_size_bytes(array),
                 _MPS_SAFE_SIZE_BYTES,
             )
-    elif device.type != "cpu":
+    elif isinstance(device, torch.device) and device.type != "cpu":
         tensor = tensor.to(device)
 
     return tensor
@@ -170,7 +305,17 @@ def sync_mlx() -> None:
     try:
         mx.synchronize()
     except (AttributeError, TypeError):
-        mx.eval(mx.array(0, dtype=mx.int32))
+        try:
+            mx.eval(mx.array(0, dtype=mx.int32))
+        except RuntimeError as e:
+            if "Attempting to allocate" in str(
+                e
+            ) and "greater than the maximum allowed buffer size" in str(e):
+                # Even tiny arrays can fail in extreme cases - clear cache and try again
+                mx.metal.clear_cache()
+                mx.eval(mx.array(0, dtype=mx.int32))
+            else:
+                raise
 
 
 def sync_torch() -> None:
