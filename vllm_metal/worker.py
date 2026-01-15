@@ -5,7 +5,11 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm_metal.config import get_config
+from vllm_metal.config import (
+    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
+    AUTO_MEMORY_OVERHEAD_FACTOR,
+    get_config,
+)
 from vllm_metal.platform import MetalPlatform
 
 if TYPE_CHECKING:
@@ -149,6 +153,13 @@ class MetalWorker:
             # Default estimate: ~4KB per block
             block_memory = 4096
 
+        if block_memory <= 0:
+            msg = (
+                "Computed KV cache block size is invalid "
+                f"({block_memory} bytes). Check model config and VLLM_METAL_BLOCK_SIZE."
+            )
+            raise ValueError(msg)
+
         # Handle auto memory mode
         if self.config.is_auto_memory:
             # Get actual model memory usage
@@ -164,16 +175,34 @@ class MetalWorker:
                 max_model_len + self.config.block_size - 1
             ) // self.config.block_size
             # Add a small buffer for safety (e.g., 10% more blocks)
-            min_blocks = int(min_blocks * 1.1)
+            min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
 
             min_cache_memory = min_blocks * block_memory
 
             # Add 20% overhead buffer for MLX operations
-            overhead_factor = 1.2
-            minimal_needed = int((model_memory + min_cache_memory) * overhead_factor)
+            minimal_needed = int(
+                (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
+            )
 
             # Calculate effective memory fraction
             effective_fraction = minimal_needed / total_memory
+
+            if minimal_needed > total_memory:
+                msg = (
+                    "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
+                    "memory than is available. "
+                    f"total={total_memory / 1e9:.2f}GB, "
+                    f"model={model_memory / 1e9:.2f}GB, "
+                    f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
+                    f"overhead_factor={AUTO_MEMORY_OVERHEAD_FACTOR:.1f} "
+                    f"(max_model_len={max_model_len}, "
+                    f"block_size={self.config.block_size}, "
+                    f"min_blocks={min_blocks}, "
+                    f"needed_fraction={effective_fraction:.3f}). "
+                    "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
+                    "or use a smaller model."
+                )
+                raise ValueError(msg)
 
             logger.info(
                 f"Auto memory mode: model={model_memory / 1e9:.2f}GB, "
