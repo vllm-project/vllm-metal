@@ -11,7 +11,7 @@ from mlx_lm.sample_utils import make_sampler
 
 from vllm_metal.config import get_config
 from vllm_metal.mlx_backend.cache import PagedKVCache
-from vllm_metal.platform import set_wired_limit
+from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

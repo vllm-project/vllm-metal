@@ -22,7 +22,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import get_config
-from vllm_metal.platform import MetalPlatform, set_wired_limit
+from vllm_metal.platform import MetalPlatform
+from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
