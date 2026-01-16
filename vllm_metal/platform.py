@@ -19,8 +19,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
-
 class MetalPlatform(Platform):
     """Platform implementation for Apple Silicon Metal/MLX.
 
