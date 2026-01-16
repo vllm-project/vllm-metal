@@ -19,7 +19,7 @@ except ImportError:
     print('import_failed')
 """
         result = subprocess.run(
-            [sys.executable, '-c', code],
+            [sys.executable, "-c", code],
             capture_output=True,
             text=True,
             timeout=30,
@@ -27,11 +27,14 @@ except ImportError:
         if result.returncode != 0:
             # If import fails due to missing dependencies, skip the test
             import pytest
+
             pytest.skip(f"Import failed due to missing dependencies: {result.stderr}")
-        assert result.stdout.strip() in ['False', 'import_failed'], f"Unexpected result: {result.stdout.strip()}"
-        if result.stdout.strip() == 'False':
+        assert result.stdout.strip() in ["False", "import_failed"], (
+            f"Unexpected result: {result.stdout.strip()}"
+        )
+        if result.stdout.strip() == "False":
             # Only check if import succeeded
-            assert result.stdout.strip() == 'False', "vLLM was imported unexpectedly"
+            assert result.stdout.strip() == "False", "vLLM was imported unexpectedly"
 
     def test_model_runner_import_does_not_import_vllm(self) -> None:
         """Test that importing vllm_metal.model_runner does not import vllm."""
@@ -44,7 +47,7 @@ except ImportError:
     print('import_failed')
 """
         result = subprocess.run(
-            [sys.executable, '-c', code],
+            [sys.executable, "-c", code],
             capture_output=True,
             text=True,
             timeout=30,
@@ -52,8 +55,11 @@ except ImportError:
         if result.returncode != 0:
             # If import fails due to missing dependencies, skip the test
             import pytest
+
             pytest.skip(f"Import failed due to missing dependencies: {result.stderr}")
-        assert result.stdout.strip() in ['False', 'import_failed'], f"Unexpected result: {result.stdout.strip()}"
-        if result.stdout.strip() == 'False':
+        assert result.stdout.strip() in ["False", "import_failed"], (
+            f"Unexpected result: {result.stdout.strip()}"
+        )
+        if result.stdout.strip() == "False":
             # Only check if import succeeded
-            assert result.stdout.strip() == 'False', "vLLM was imported unexpectedly"
+            assert result.stdout.strip() == "False", "vLLM was imported unexpectedly"
