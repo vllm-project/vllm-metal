@@ -3,6 +3,8 @@
 
 import os
 
+import pytest
+
 from vllm_metal.config import (
     AUTO_MEMORY_FRACTION,
     MetalConfig,
@@ -111,3 +113,10 @@ class TestMetalConfig:
 
         assert config.memory_fraction == 0.5
         assert config.is_auto_memory is False
+
+    def test_block_size_must_be_positive(self) -> None:
+        for value in ["0", "-1"]:
+            reset_config()
+            os.environ["VLLM_METAL_BLOCK_SIZE"] = value
+            with pytest.raises(ValueError, match="Invalid VLLM_METAL_BLOCK_SIZE"):
+                MetalConfig.from_env()

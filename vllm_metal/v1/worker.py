@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -21,14 +22,32 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
+from vllm_metal.config import (
+    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
+    AUTO_MEMORY_OVERHEAD_FACTOR,
+    get_config,
+)
+
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _AutoMemoryEstimate:
+    total_memory: int
+    model_memory: int
+    kv_cache_memory: int
+    total_needed: int
+    needed_fraction: float
+    max_model_len: int
+    block_size_tokens: int
+    min_blocks: int
+    overhead_factor: float
 
 
 def init_worker_distributed_environment(
@@ -164,32 +183,73 @@ class MetalWorker(WorkerBase):
 
         This prevents MLX from using unbounded memory in auto mode.
         """
-        # Get model memory after loading
-        model_memory = self._get_model_memory_usage()
-
-        # Calculate KV cache memory needed for max_model_len
-        block_size_bytes = self.get_cache_block_size_bytes()
-        block_size_tokens = self.metal_config.block_size
-        max_model_len = self.model_config.max_model_len
-
-        min_blocks = (max_model_len + block_size_tokens - 1) // block_size_tokens
-        min_blocks = int(min_blocks * 1.1)  # 10% safety buffer
-        kv_cache_memory = min_blocks * block_size_bytes
-
-        # Total memory limit: model + KV cache + 20% overhead
-        memory_limit = int((model_memory + kv_cache_memory) * 1.2)
+        estimate = self._estimate_auto_memory()
+        if estimate.total_needed > estimate.total_memory:
+            raise ValueError(self._format_auto_memory_infeasible_error(estimate))
 
         # Set MLX memory limit
         if hasattr(mx, "set_memory_limit"):
-            mx.set_memory_limit(memory_limit)
+            mx.set_memory_limit(estimate.total_needed)
             logger.info(
-                f"Auto mode: set MLX memory limit to {memory_limit / 1e9:.2f}GB "
-                f"(model={model_memory / 1e9:.2f}GB, kv_cache={kv_cache_memory / 1e9:.2f}GB)"
+                f"Auto mode: set MLX memory limit to {estimate.total_needed / 1e9:.2f}GB "
+                f"(model={estimate.model_memory / 1e9:.2f}GB, kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB)"
             )
         else:
             logger.warning(
                 "mx.set_memory_limit not available, memory may grow unbounded"
             )
+
+    def _estimate_auto_memory(self) -> _AutoMemoryEstimate:
+        import psutil
+
+        total_memory = psutil.virtual_memory().total
+        model_memory = self._get_model_memory_usage()
+
+        block_size_bytes = self.get_cache_block_size_bytes()
+        if block_size_bytes <= 0:
+            msg = f"Computed KV cache block size is invalid ({block_size_bytes} bytes)."
+            raise ValueError(msg)
+
+        block_size_tokens = self.metal_config.block_size
+        max_model_len = self.model_config.max_model_len
+
+        min_blocks = (max_model_len + block_size_tokens - 1) // block_size_tokens
+        min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
+        kv_cache_memory = min_blocks * block_size_bytes
+
+        overhead_factor = AUTO_MEMORY_OVERHEAD_FACTOR
+        total_needed = int((model_memory + kv_cache_memory) * overhead_factor)
+        needed_fraction = total_needed / total_memory
+
+        return _AutoMemoryEstimate(
+            total_memory=total_memory,
+            model_memory=model_memory,
+            kv_cache_memory=kv_cache_memory,
+            total_needed=total_needed,
+            needed_fraction=needed_fraction,
+            max_model_len=max_model_len,
+            block_size_tokens=block_size_tokens,
+            min_blocks=min_blocks,
+            overhead_factor=overhead_factor,
+        )
+
+    def _format_auto_memory_infeasible_error(
+        self, estimate: _AutoMemoryEstimate
+    ) -> str:
+        return (
+            "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
+            "memory than is available. "
+            f"total={estimate.total_memory / 1e9:.2f}GB, "
+            f"model={estimate.model_memory / 1e9:.2f}GB, "
+            f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
+            f"overhead_factor={estimate.overhead_factor:.1f} "
+            f"(max_model_len={estimate.max_model_len}, "
+            f"block_size={estimate.block_size_tokens}, "
+            f"min_blocks={estimate.min_blocks}, "
+            f"needed_fraction={estimate.needed_fraction:.3f}). "
+            "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
+            "or use a smaller model."
+        )
 
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
@@ -199,44 +259,24 @@ class MetalWorker(WorkerBase):
         """
         import psutil
 
-        total_memory = psutil.virtual_memory().total
-
         # Handle auto memory mode
         if self.metal_config.is_auto_memory:
-            # Get actual model memory usage
-            model_memory = self._get_model_memory_usage()
-
-            # Get block size for minimal cache calculation
-            block_size_bytes = self.get_cache_block_size_bytes()
-            block_size_tokens = self.metal_config.block_size
-
-            # Calculate minimum blocks needed to handle at least one request
-            # at max_model_len (vLLM requires this minimum)
-            max_model_len = self.model_config.max_model_len
-            min_blocks = (max_model_len + block_size_tokens - 1) // block_size_tokens
-            # Add a small buffer for safety (e.g., 10% more blocks)
-            min_blocks = int(min_blocks * 1.1)
-
-            min_cache_memory = min_blocks * block_size_bytes
-
-            # Add 20% overhead buffer for MLX operations
-            overhead_factor = 1.2
-            minimal_needed = int((model_memory + min_cache_memory) * overhead_factor)
-
-            # Calculate effective memory fraction
-            effective_fraction = minimal_needed / total_memory
+            estimate = self._estimate_auto_memory()
+            if estimate.total_needed > estimate.total_memory:
+                raise ValueError(self._format_auto_memory_infeasible_error(estimate))
 
             logger.info(
-                f"Auto memory mode: model={model_memory / 1e9:.2f}GB, "
-                f"max_model_len={max_model_len}, min_blocks={min_blocks}, "
-                f"min_cache={min_cache_memory / 1e9:.2f}GB, "
-                f"total_needed={minimal_needed / 1e9:.2f}GB, "
-                f"effective_fraction={effective_fraction:.3f}"
+                f"Auto memory mode: model={estimate.model_memory / 1e9:.2f}GB, "
+                f"max_model_len={estimate.max_model_len}, min_blocks={estimate.min_blocks}, "
+                f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
+                f"total_needed={estimate.total_needed / 1e9:.2f}GB, "
+                f"needed_fraction={estimate.needed_fraction:.3f}"
             )
 
             # Return just the cache portion for KV cache allocation
-            available = min_cache_memory
+            available = estimate.kv_cache_memory
         else:
+            total_memory = psutil.virtual_memory().total
             # Use configured fraction of system memory
             available = int(total_memory * self.metal_config.memory_fraction * 0.5)
 
