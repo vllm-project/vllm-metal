@@ -89,7 +89,7 @@ exclude = ["extern", ".venv*", "test_vllm.py", "target"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
-ignore = ["E501"]
+ignore = ["E501", "UP040"]
 
 [tool.mypy]
 python_version = "3.12"
