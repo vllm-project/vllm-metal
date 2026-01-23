@@ -114,17 +114,39 @@ class TestMetalPlatform:
         device = MetalPlatform.get_torch_device()
         assert device.type in ("mps", "cpu")
 
-    def test_verify_quantization_supported(self) -> None:
-        """Test that verify_quantization allows all methods to pass through."""
-        # All quantization methods should pass through - actual support depends
-        # on model implementation, not the platform
-        MetalPlatform.verify_quantization("none")
+    def test_verify_quantization_allows_none(self) -> None:
+        """Quantization should allow explicit none values."""
         MetalPlatform.verify_quantization(None)
-        MetalPlatform.verify_quantization("fp16")
-        MetalPlatform.verify_quantization("bfloat16")
-        MetalPlatform.verify_quantization("int8")
-        MetalPlatform.verify_quantization("awq")
-        MetalPlatform.verify_quantization("compressed-tensors")
+        MetalPlatform.verify_quantization("none")
+        MetalPlatform.verify_quantization("null")
+        MetalPlatform.verify_quantization("")
+        MetalPlatform.verify_quantization("  NONE  ")
+
+    def test_verify_quantization_rejects_dtype_aliases(self) -> None:
+        """Quantization should reject dtype-like aliases with guidance."""
+        for quant in ("fp16", "bfloat16", "float32"):
+            with pytest.raises(ValueError, match="--dtype"):
+                MetalPlatform.verify_quantization(quant)
+
+    def test_verify_quantization_rejects_unsupported(self) -> None:
+        """Quantization should reject unsupported methods."""
+        for quant in (
+            "int8",
+            "awq",
+            "compressed-tensors",
+            "gptq",
+            "marlin",
+            "squeezellm",
+            "bitsandbytes",
+        ):
+            with pytest.raises(ValueError, match="not supported"):
+                MetalPlatform.verify_quantization(quant)
+
+    def test_verify_quantization_rejects_non_string(self) -> None:
+        """Quantization should reject non-string values."""
+        for quant in (0, 8, True, [], {"quant": "int8"}):
+            with pytest.raises(TypeError, match="string or None"):
+                MetalPlatform.verify_quantization(quant)
 
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch

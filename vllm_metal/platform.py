@@ -255,7 +255,7 @@ class MetalPlatform(Platform):
         return AttentionBackendEnum.CPU_ATTN.get_path()
 
     @classmethod
-    def verify_quantization(cls, quant: str) -> None:
+    def verify_quantization(cls, quant: str | None) -> None:
         """Verify that quantization method is supported.
 
         Args:
@@ -264,10 +264,40 @@ class MetalPlatform(Platform):
         Raises:
             ValueError: If quantization is not supported
         """
-        # Allow all quantization methods to pass through - actual support
-        # depends on the model implementation. This avoids blocking models
-        # that use quantization formats we may be able to handle.
-        pass
+        if quant is None:
+            return
+        if not isinstance(quant, str):
+            raise TypeError(
+                f"Quantization must be a string or None, got {type(quant).__name__}."
+            )
+
+        normalized = quant.strip().lower()
+        if normalized in ("", "none", "null"):
+            return
+
+        dtype_aliases = {
+            "fp16",
+            "float16",
+            "half",
+            "bf16",
+            "bfloat16",
+            "fp32",
+            "float32",
+        }
+        if normalized in dtype_aliases:
+            msg = (
+                f"Quantization '{quant}' is not supported on Metal/MLX. "
+                "If you intended precision control, use --dtype instead."
+            )
+            raise ValueError(msg)
+
+        msg = (
+            f"Quantization '{quant}' is not supported on Metal/MLX. "
+            "Use an MLX-compatible quantized model (for example, a 4-bit MLX "
+            "variant from Hugging Face) and omit --quantization, or set "
+            "precision with --dtype."
+        )
+        raise ValueError(msg)
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
