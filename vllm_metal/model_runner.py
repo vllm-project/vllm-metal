@@ -108,41 +108,68 @@ class MetalModelRunner:
 
     def _prepare_inputs(
         self, seq_group_metadata_list: list[Any]
-    ) -> tuple[mx.array, mx.array]:
-        """Prepare input tensors from sequence group metadata.
+    ) -> tuple[mx.array, mx.array, list[int]]:
+        """Prepare batched input tensors from sequence group metadata.
 
         Args:
             seq_group_metadata_list: List of sequence group metadata
 
         Returns:
-            Tuple of (input_ids, positions) as MLX arrays
+            Tuple of (input_ids, positions, seq_lens)
         """
-        input_ids_list: list[int] = []
-        positions_list: list[int] = []
+        input_ids_list: list[list[int]] = []
+        seq_lens: list[int] = []
 
         for seq_group in seq_group_metadata_list:
-            if hasattr(seq_group, "seq_data"):
-                for _seq_id, seq_data in seq_group.seq_data.items():
-                    if hasattr(seq_data, "get_token_ids"):
-                        tokens = seq_data.get_token_ids()
-                    else:
-                        tokens = seq_data.get("token_ids", [])
+            try:
+                seq_data_map = seq_group.seq_data
+            except AttributeError as exc:
+                raise ValueError("Sequence group missing seq_data") from exc
 
-                    # For prefill, use all tokens; for decode, use last token
-                    if seq_group.is_prompt:
-                        input_ids_list.extend(tokens)
-                        positions_list.extend(range(len(tokens)))
-                    else:
-                        input_ids_list.append(tokens[-1])
-                        positions_list.append(len(tokens) - 1)
+            if not seq_data_map:
+                raise ValueError("Sequence group has no sequence data")
+            if len(seq_data_map) > 1:
+                logger.warning(
+                    "Sequence group has multiple sequences; using the first one."
+                )
+
+            seq_data = next(iter(seq_data_map.values()))
+            try:
+                tokens = list(seq_data.get_token_ids())
+            except AttributeError as exc:
+                if isinstance(seq_data, dict):
+                    tokens = list(seq_data.get("token_ids", []))
+                else:
+                    raise ValueError("Sequence data lacks token ids") from exc
+
+            # For prefill, use all tokens; for decode, use last token
+            if seq_group.is_prompt:
+                input_ids = tokens
+            else:
+                if not tokens:
+                    raise ValueError("Decode sequence has no tokens")
+                input_ids = [tokens[-1]]
+
+            if not input_ids:
+                raise ValueError("Prompt sequence has no tokens")
+
+            input_ids_list.append(input_ids)
+            seq_lens.append(len(input_ids))
 
         if not input_ids_list:
-            return mx.array([[]], dtype=mx.int32), mx.array([[]], dtype=mx.int32)
+            empty = mx.array([[]], dtype=mx.int32)
+            return empty, empty, []
 
-        input_ids = mx.array([input_ids_list], dtype=mx.int32)
-        positions = mx.array([positions_list], dtype=mx.int32)
+        max_len = max(seq_lens)
+        pad_id = 0
+        padded_rows = [
+            row + [pad_id] * (max_len - len(row)) for row in input_ids_list
+        ]
 
-        return input_ids, positions
+        input_ids = mx.array(padded_rows, dtype=mx.int32)
+        positions = mx.array([list(range(max_len))] * len(padded_rows), dtype=mx.int32)
+
+        return input_ids, positions, seq_lens
 
     def execute_model(
         self,
@@ -166,7 +193,7 @@ class MetalModelRunner:
             return []
 
         # Prepare inputs
-        input_ids, positions = self._prepare_inputs(seq_group_metadata_list)
+        input_ids, positions, seq_lens = self._prepare_inputs(seq_group_metadata_list)
 
         if input_ids.size == 0:
             return []
@@ -176,9 +203,14 @@ class MetalModelRunner:
             logits = self.model(input_ids)
             mx.eval(logits)
 
-            # Get next token predictions
-            # Take the last position's logits for each sequence
-            next_token_logits = logits[:, -1, :]
+            # Get next token predictions per sequence using actual lengths
+            last_positions = mx.array(
+                [length - 1 for length in seq_lens], dtype=mx.int32
+            )
+            gathered = mx.take_along_axis(
+                logits, last_positions[:, None, None], axis=1
+            )
+            next_token_logits = gathered[:, 0, :]
 
             # Simple greedy sampling for now
             next_tokens = mx.argmax(next_token_logits, axis=-1)
@@ -186,16 +218,14 @@ class MetalModelRunner:
 
             # Convert to output format
             outputs = []
-            for i, seq_group in enumerate(seq_group_metadata_list):
-                token_id = (
-                    int(next_tokens[0].item())
-                    if i == 0
-                    else int(next_tokens[min(i, next_tokens.shape[0] - 1)].item())
-                )
+            next_token_list = next_tokens.tolist()
+            for seq_group, token_id in zip(
+                seq_group_metadata_list, next_token_list, strict=True
+            ):
                 outputs.append(
                     {
                         "seq_group": seq_group,
-                        "token_id": token_id,
+                        "token_id": int(token_id),
                         "logprobs": None,
                     }
                 )
