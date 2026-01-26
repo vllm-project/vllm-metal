@@ -162,9 +162,7 @@ class MetalModelRunner:
 
         max_len = max(seq_lens)
         pad_id = 0
-        padded_rows = [
-            row + [pad_id] * (max_len - len(row)) for row in input_ids_list
-        ]
+        padded_rows = [row + [pad_id] * (max_len - len(row)) for row in input_ids_list]
 
         input_ids = mx.array(padded_rows, dtype=mx.int32)
         positions = mx.array([list(range(max_len))] * len(padded_rows), dtype=mx.int32)
@@ -207,9 +205,7 @@ class MetalModelRunner:
             last_positions = mx.array(
                 [length - 1 for length in seq_lens], dtype=mx.int32
             )
-            gathered = mx.take_along_axis(
-                logits, last_positions[:, None, None], axis=1
-            )
+            gathered = mx.take_along_axis(logits, last_positions[:, None, None], axis=1)
             next_token_logits = gathered[:, 0, :]
 
             # Simple greedy sampling for now
