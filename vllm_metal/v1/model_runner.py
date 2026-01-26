@@ -7,8 +7,10 @@ Optimized for performance with:
 - Pre-allocated input buffers to reduce allocation overhead
 - Rust-based token state management for efficient batch operations
 - Global model cache for fast repeated loads
+- Content hash prefix caching for shared prompt reuse
 """
 
+import hashlib
 import time
 from dataclasses import dataclass
 from threading import Lock
@@ -64,6 +66,113 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+
+# Prefix cache configuration
+_PREFIX_CACHE_ENABLED = True
+_PREFIX_CACHE_MAX_ENTRIES = 100
+
+
+def _compute_prefix_hash(token_ids: list[int]) -> bytes:
+    """Compute content hash for a token sequence."""
+    h = hashlib.sha256()
+    h.update(str(token_ids).encode())
+    return h.digest()
+
+
+@dataclass
+class CachedPrefix:
+    """Cached KV state for a token prefix."""
+
+    token_ids: list[int]
+    cache_state: list[tuple[mx.array, mx.array]]
+    ref_count: int = 0
+
+
+class PrefixCacheManager:
+    """Manager for prefix KV cache reuse."""
+
+    def __init__(self, max_entries: int = _PREFIX_CACHE_MAX_ENTRIES):
+        self._cache: dict[bytes, CachedPrefix] = {}
+        self._max_entries = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def lookup(self, token_ids: list[int]) -> CachedPrefix | None:
+        """Look up cached prefix by token IDs."""
+        prefix_hash = _compute_prefix_hash(token_ids)
+        cached = self._cache.get(prefix_hash)
+        if cached is not None:
+            self._hits += 1
+            cached.ref_count += 1
+            logger.debug(
+                "Prefix cache HIT: %d hits, %d misses, rate=%.1f%%",
+                self._hits,
+                self._misses,
+                self.hit_rate * 100,
+            )
+            return cached
+        self._misses += 1
+        logger.debug(
+            "Prefix cache MISS: %d hits, %d misses, rate=%.1f%%",
+            self._hits,
+            self._misses,
+            self.hit_rate * 100,
+        )
+        return None
+
+    def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
+        """Insert a prefix cache entry."""
+        if len(self._cache) >= self._max_entries:
+            min_ref = min(self._cache.values(), key=lambda x: x.ref_count)
+            for h, c in list(self._cache.items()):
+                if c is min_ref:
+                    del self._cache[h]
+                    break
+
+        prefix_hash = _compute_prefix_hash(token_ids)
+        cache_state = []
+        for layer_cache in cache:
+            k = layer_cache.state[0]
+            v = layer_cache.state[1]
+            cache_state.append((mx.array(k), mx.array(v)))
+
+        self._cache[prefix_hash] = CachedPrefix(
+            token_ids=list(token_ids),
+            cache_state=cache_state,
+            ref_count=1,
+        )
+
+    def restore_cache(
+        self, cached: CachedPrefix, model: Any, is_vlm: bool
+    ) -> list[KVCache]:
+        """Restore a cached prefix to a fresh KVCache."""
+        cache_model = (
+            model.language_model
+            if is_vlm and hasattr(model, "language_model")
+            else model
+        )
+        cache = make_prompt_cache(cache_model)
+        for i, layer_cache in enumerate(cache):
+            if i < len(cached.cache_state):
+                k, v = cached.cache_state[i]
+                layer_cache.state = [mx.array(k), mx.array(v)]
+        return cache
+
+    @property
+    def hit_rate(self) -> float:
+        """Return prefix cache hit rate."""
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def get_stats(self) -> dict:
+        """Return prefix cache statistics."""
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self.hit_rate,
+            "cached_entries": len(self._cache),
+        }
+
 
 # Type alias for any cache type supported by the model
 AnyCache: TypeAlias = KVCache | MambaCache | ArraysCache
@@ -267,6 +376,11 @@ class MetalModelRunner:
 
         # Track finished requests for lazy cache clearing
         self._finished_request_count = 0
+
+        # Prefix cache for shared prompt reuse
+        self._prefix_cache: PrefixCacheManager | None = None
+        if _PREFIX_CACHE_ENABLED:
+            self._prefix_cache = PrefixCacheManager()
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -611,18 +725,43 @@ class MetalModelRunner:
         Returns:
             Tuple of (next_token, cache)
         """
-        # Create a new prompt cache for this request
-        # For VLMs, use the language_model component; for text models, use model directly
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        cache = make_prompt_cache(cache_model)
+        cache: list[KVCache]
+        cached_prefix_len = 0
 
-        # Prefill: process the entire prompt with cache
-        input_ids = mx.array([token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
+        # Try to reuse cached prefix
+        if self._prefix_cache is not None:
+            cached = self._prefix_cache.lookup(token_ids)
+            if cached is not None:
+                cache = self._prefix_cache.restore_cache(
+                    cached, self.model, self._is_vlm
+                )
+                cached_prefix_len = len(cached.token_ids)
+            else:
+                cache_model = (
+                    self.model.language_model
+                    if self._is_vlm and hasattr(self.model, "language_model")
+                    else self.model
+                )
+                cache = make_prompt_cache(cache_model)
+        else:
+            cache_model = (
+                self.model.language_model
+                if self._is_vlm and hasattr(self.model, "language_model")
+                else self.model
+            )
+            cache = make_prompt_cache(cache_model)
+
+        # Prefill: process tokens (or remaining tokens if prefix was cached)
+        if cached_prefix_len > 0 and cached_prefix_len == len(token_ids):
+            input_ids = mx.array([token_ids[-1:]], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+        else:
+            tokens_to_process = token_ids[cached_prefix_len:]
+            input_ids = mx.array([tokens_to_process], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            if self._prefix_cache is not None and len(token_ids) > 0:
+                self._prefix_cache.insert(token_ids, cache)
+
         logits = self._extract_logits(model_output)
 
         # Extract last token logits
@@ -940,6 +1079,17 @@ class MetalModelRunner:
             if self._finished_request_count >= _CACHE_CLEAR_INTERVAL:
                 mx.clear_cache()
                 self._finished_request_count = 0
+
+                # Log prefix cache stats periodically
+                if self._prefix_cache is not None:
+                    stats = self._prefix_cache.get_stats()
+                    logger.info(
+                        "Prefix cache hit rate: %.1f%% (hits=%d, misses=%d, cached=%d)",
+                        stats["hit_rate"] * 100,
+                        stats["hits"],
+                        stats["misses"],
+                        stats["cached_entries"],
+                    )
 
         # Handle empty case
         if not req_ids:
