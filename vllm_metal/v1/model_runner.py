@@ -12,6 +12,7 @@ Optimized for performance with:
 
 import hashlib
 import time
+from array import array
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, TypeAlias
@@ -75,16 +76,20 @@ _PREFIX_CACHE_MAX_ENTRIES = 100
 def _compute_prefix_hash(token_ids: list[int]) -> bytes:
     """Compute content hash for a token sequence."""
     h = hashlib.sha256()
-    h.update(str(token_ids).encode())
+    h.update(array("I", token_ids).tobytes())
     return h.digest()
 
 
 @dataclass
 class CachedPrefix:
-    """Cached KV state for a token prefix."""
+    """Cached KV state for a token prefix.
+
+    cache_state contains (k, v) tuples for KVCache layers, or None for
+    MambaCache/ArraysCache layers in hybrid models.
+    """
 
     token_ids: list[int]
-    cache_state: list[tuple[mx.array, mx.array]]
+    cache_state: list[tuple[mx.array, mx.array] | None]
     ref_count: int = 0
 
 
@@ -121,7 +126,11 @@ class PrefixCacheManager:
         return None
 
     def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
-        """Insert a prefix cache entry."""
+        """Insert a prefix cache entry.
+
+        Only KVCache layers are cached. MambaCache/ArraysCache layers are
+        skipped (stored as None) for hybrid model compatibility.
+        """
         if len(self._cache) >= self._max_entries:
             min_ref = min(self._cache.values(), key=lambda x: x.ref_count)
             for h, c in list(self._cache.items()):
@@ -132,9 +141,13 @@ class PrefixCacheManager:
         prefix_hash = _compute_prefix_hash(token_ids)
         cache_state = []
         for layer_cache in cache:
-            k = layer_cache.state[0]
-            v = layer_cache.state[1]
-            cache_state.append((mx.array(k), mx.array(v)))
+            if isinstance(layer_cache, KVCache):
+                k = layer_cache.state[0]
+                v = layer_cache.state[1]
+                cache_state.append((mx.array(k), mx.array(v)))
+            else:
+                # MambaCache/ArraysCache - skip (not supported)
+                cache_state.append(None)
 
         self._cache[prefix_hash] = CachedPrefix(
             token_ids=list(token_ids),
@@ -145,7 +158,11 @@ class PrefixCacheManager:
     def restore_cache(
         self, cached: CachedPrefix, model: Any, is_vlm: bool
     ) -> list[KVCache]:
-        """Restore a cached prefix to a fresh KVCache."""
+        """Restore a cached prefix to a fresh KVCache.
+
+        Only KVCache layers are restored. MambaCache/ArraysCache layers
+        remain in their fresh state for hybrid model compatibility.
+        """
         cache_model = (
             model.language_model
             if is_vlm and hasattr(model, "language_model")
@@ -153,9 +170,10 @@ class PrefixCacheManager:
         )
         cache = make_prompt_cache(cache_model)
         for i, layer_cache in enumerate(cache):
-            if i < len(cached.cache_state):
-                k, v = cached.cache_state[i]
-                layer_cache.state = [mx.array(k), mx.array(v)]
+            if i < len(cached.cache_state) and cached.cache_state[i] is not None:
+                if isinstance(layer_cache, KVCache):
+                    k, v = cached.cache_state[i]
+                    layer_cache.state = [mx.array(k), mx.array(v)]
         return cache
 
     @property
@@ -728,39 +746,37 @@ class MetalModelRunner:
         cache: list[KVCache]
         cached_prefix_len = 0
 
+        # Prefix caching: cache KV for tokens[:-1], always process last token
+        prefix = token_ids[:-1] if len(token_ids) > 1 else []
+        cache_model = (
+            self.model.language_model
+            if self._is_vlm and hasattr(self.model, "language_model")
+            else self.model
+        )
+
         # Try to reuse cached prefix
-        if self._prefix_cache is not None:
-            cached = self._prefix_cache.lookup(token_ids)
+        if self._prefix_cache is not None and len(prefix) > 0:
+            cached = self._prefix_cache.lookup(prefix)
             if cached is not None:
+                # Cache hit: restore KV for prefix, process only last token
                 cache = self._prefix_cache.restore_cache(
                     cached, self.model, self._is_vlm
                 )
                 cached_prefix_len = len(cached.token_ids)
             else:
-                cache_model = (
-                    self.model.language_model
-                    if self._is_vlm and hasattr(self.model, "language_model")
-                    else self.model
-                )
+                # Cache miss: process prefix first, cache it, then last token
                 cache = make_prompt_cache(cache_model)
+                prefix_ids = mx.array([prefix], dtype=mx.int32)
+                _ = self.model(prefix_ids, cache=cache)
+                self._prefix_cache.insert(prefix, cache)
+                cached_prefix_len = len(prefix)
         else:
-            cache_model = (
-                self.model.language_model
-                if self._is_vlm and hasattr(self.model, "language_model")
-                else self.model
-            )
             cache = make_prompt_cache(cache_model)
 
-        # Prefill: process tokens (or remaining tokens if prefix was cached)
-        if cached_prefix_len > 0 and cached_prefix_len == len(token_ids):
-            input_ids = mx.array([token_ids[-1:]], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-        else:
-            tokens_to_process = token_ids[cached_prefix_len:]
-            input_ids = mx.array([tokens_to_process], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-            if self._prefix_cache is not None and len(token_ids) > 0:
-                self._prefix_cache.insert(token_ids, cache)
+        # Prefill: process remaining tokens (always at least the last token)
+        tokens_to_process = token_ids[cached_prefix_len:]
+        input_ids = mx.array([tokens_to_process], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
 
         logits = self._extract_logits(model_output)
 
