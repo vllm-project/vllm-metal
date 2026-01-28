@@ -8,18 +8,28 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def get_model_download_path(model_name: str) -> str:
+def get_model_download_path(model_repo_name: str) -> str:
     """
-    Get the path to the model, downloading from ModelScope if configured.
+    Get the path to the model, downloading from ModelScope if configured, otherwise will pass the model_repo_name.
 
     Args:
-        model_name: HuggingFace or ModelScope model name/path
+        model_repo_name: Model repo name from HuggingFace or ModelScope
 
     Returns:
-        Path to the model (local path or original name)
+        Local folder path (string) of repo snapshot
+
+    Example:
+
+    model_repo_name example: mlx-community/Qwen2.5-0.5B-4bit
+
+    Spin up the server:
+
+    ```bash
+    export VLLM_USE_MODELSCOPE=True && export VLLM_METAL_MODELSCOPE_CACHE=/path/of/model/cache/to/be/downloaded &&  vllm-metal -m mlx-community/Qwen2.5-0.5B-4bit --host 0.0.0.0 --port 8000 --log-level debug
+    ```
     """
-    if Path(model_name).exists():
-        return model_name
+    if Path(model_repo_name).exists():
+        return model_repo_name
 
     if os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true":
         try:
@@ -27,10 +37,8 @@ def get_model_download_path(model_name: str) -> str:
 
             model_cache_dir = os.environ.get("VLLM_METAL_MODELSCOPE_CACHE")
 
-            logger.info(
-                f"Downloading model {model_name} from ModelScope, download path: {model_cache_dir}..."
-            )
-            model_path = snapshot_download(model_name, cache_dir=model_cache_dir)
+            logger.info(f"Downloading model {model_repo_name} from ModelScope...")
+            model_path = snapshot_download(model_repo_name, cache_dir=model_cache_dir)
             logger.info(f"Model downloaded to {model_path}")
             return str(model_path)
         except ImportError:
@@ -39,18 +47,9 @@ def get_model_download_path(model_name: str) -> str:
             )
         except Exception as e:
             logger.warning(f"Failed to download from ModelScope: {e}")
-    else:
-        try:
-            from huggingface_hub import snapshot_download
 
-            logger.info(f"Downloading model {model_name} from HuggingFace...")
-            model_path = snapshot_download(model_name)
-            logger.info(f"Model downloaded to {model_path}")
-            return str(model_path)
-        except Exception as e:
-            logger.warning(f"Failed to download from HuggingFace: {e}")
-
-    return model_name
+    # Fallback: Let mlx_lm or mlx_vlm handle the download natively from HuggingFace
+    return model_repo_name
 
 
 def set_wired_limit() -> None:
