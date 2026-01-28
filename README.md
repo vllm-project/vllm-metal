@@ -72,3 +72,4 @@ Environment variables for customization:
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
+| `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
