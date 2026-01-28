@@ -41,6 +41,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
 
@@ -283,7 +284,7 @@ class MetalModelRunner:
 
         Uses mlx_vlm for vision-language models and mlx_lm for text-only models.
         """
-        model_name = self.model_config.model
+        model_name = get_model_download_path(self.model_config.model)
         is_vlm = self._is_vlm_model()
 
         logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")

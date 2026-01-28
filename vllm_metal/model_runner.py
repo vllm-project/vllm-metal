@@ -11,7 +11,7 @@ from mlx_lm.sample_utils import make_sampler
 
 from vllm_metal.config import get_config
 from vllm_metal.mlx_backend.cache import PagedKVCache
-from vllm_metal.utils import set_wired_limit
+from vllm_metal.utils import get_model_download_path, set_wired_limit
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -42,7 +42,7 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the model using MLX."""
         model_config = self.vllm_config.model_config
-        model_name = model_config.model
+        model_name = get_model_download_path(model_config.model)
 
         logger.info(f"Loading model: {model_name}")
         set_wired_limit()
