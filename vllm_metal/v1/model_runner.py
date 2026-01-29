@@ -42,6 +42,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_metal.config import get_config
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.mlx_sampler import mlx_sample
 
 logger = init_logger(__name__)
 
@@ -629,24 +630,39 @@ class MetalModelRunner:
         last_logits = logits[:, -1, :]
 
         # Use native MLX greedy sampling when possible (avoids PyTorch round-trip)
-        is_greedy = sampling_params.temperature < 1e-5
-        needs_advanced_sampling = (
-            sampling_params.top_k > 0
-            or sampling_params.top_p < 1.0
-            or sampling_params.frequency_penalty != 0
-            or sampling_params.presence_penalty != 0
-            or sampling_params.repetition_penalty != 1.0
+        sp = sampling_params
+        is_greedy = sp.temperature < 1e-5
+        # Check for features not supported by fast MLX sampler
+        has_penalties = (
+            sp.frequency_penalty != 0.0
+            or sp.presence_penalty != 0.0
+            or sp.repetition_penalty != 1.0
         )
+        needs_logprobs = (sp.logprobs is not None and sp.logprobs > 0)
+        # Advanced sampling needed if not greedy, or if we have penalties/logprobs
+        # If greedy and no penalties -> fast path.
+        # If (greedy or simple sampling) and no penalties/logprobs -> fast path.
+        can_use_fast_path = not has_penalties and not needs_logprobs
 
-        if is_greedy and not needs_advanced_sampling:
+        if is_greedy and can_use_fast_path:
             # Fast path: native MLX greedy sampling
             next_token_mlx = _mlx_greedy_sample(last_logits)
             # Single eval for logits, token, and cache state together
             mx.eval(next_token_mlx, *[c.state for c in cache])
             next_token = int(next_token_mlx.item())
+        elif can_use_fast_path:
+            # Fast path: native MLX random sampling
+            mx.eval(last_logits, *[c.state for c in cache])
+            next_token_mlx = mlx_sample(
+                last_logits,
+                temp=sp.temperature,
+                top_p=sp.top_p,
+                top_k=sp.top_k,
+                min_p=sp.min_p,
+            )
+            next_token = int(next_token_mlx[0].item())
         else:
             # Slow path: use vLLM sampler for advanced sampling
-            # Single eval for logits and cache state together
             mx.eval(last_logits, *[c.state for c in cache])
             # Convert to torch for sampling
             logits_torch = mlx_to_torch(
@@ -706,23 +722,38 @@ class MetalModelRunner:
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
         sampling_params_list = [state.sampling_params for _, state in decode_reqs]
 
-        # Check if all requests can use fast greedy sampling
+        # Check if all requests can use fast sampling
         all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        any_advanced = any(
-            sp.top_k > 0
-            or sp.top_p < 1.0
-            or sp.frequency_penalty != 0
-            or sp.presence_penalty != 0
+        
+        # Check penalties/logprobs for ANY request in batch
+        # If any request needs slow path, fall back to slow path for the whole batch.
+        any_complex = any(
+            sp.frequency_penalty != 0.0
+            or sp.presence_penalty != 0.0
             or sp.repetition_penalty != 1.0
+            or (sp.logprobs is not None and sp.logprobs > 0)
             for sp in sampling_params_list
         )
 
-        if all_greedy and not any_advanced:
+        if all_greedy and not any_complex:
             # Fast path: native MLX greedy sampling for entire batch
             next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
-            # Single eval - no intermediate sync needed
             mx.eval(next_tokens_mlx)
             next_tokens: list[int] = next_tokens_mlx.tolist()
+        elif not any_complex:
+            # Fast path: native MLX random sampling
+            mx.eval(next_token_logits)
+            next_tokens = []
+            for i, sp in enumerate(sampling_params_list):
+                row_logits = next_token_logits[i:i+1] # Keep dim
+                token = mlx_sample(
+                    row_logits, 
+                    temp=sp.temperature, 
+                    top_p=sp.top_p, 
+                    top_k=sp.top_k,
+                    min_p=sp.min_p,
+                )
+                next_tokens.append(int(token[0].item()))
         else:
             # Slow path: use vLLM sampler for advanced sampling
             mx.eval(next_token_logits)
@@ -786,24 +817,35 @@ class MetalModelRunner:
             logits = self._extract_logits(model_output)
             last_logits = logits[:, -1, :]
 
-            # Use native MLX greedy sampling when possible
             sp = state.sampling_params
             is_greedy = sp.temperature < 1e-5
-            needs_advanced = (
-                sp.top_k > 0
-                or sp.top_p < 1.0
-                or sp.frequency_penalty != 0
-                or sp.presence_penalty != 0
+            
+            has_penalties = (
+                sp.frequency_penalty != 0.0
+                or sp.presence_penalty != 0.0
                 or sp.repetition_penalty != 1.0
             )
+            needs_logprobs = (sp.logprobs is not None and sp.logprobs > 0)
+            can_use_fast_path = not has_penalties and not needs_logprobs
 
-            if is_greedy and not needs_advanced:
+            if is_greedy and can_use_fast_path:
                 # Fast path: native MLX greedy sampling
                 next_token_mlx = _mlx_greedy_sample(last_logits)
                 mx.eval(next_token_mlx)
                 next_token = int(next_token_mlx.item())
+            elif can_use_fast_path:
+                # Fast path: native MLX random sampling
+                mx.eval(last_logits)
+                token_mlx = mlx_sample(
+                    last_logits,
+                    temp=sp.temperature,
+                    top_p=sp.top_p,
+                    top_k=sp.top_k,
+                    min_p=sp.min_p,
+                )
+                next_token = int(token_mlx[0].item())
             else:
-                # Slow path: use vLLM sampler
+                # Slow path: use vLLM sampler for advanced sampling
                 mx.eval(last_logits)
                 logits_torch = mlx_to_torch(
                     last_logits.astype(mx.float32), device=self.device
