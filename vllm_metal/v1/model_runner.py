@@ -754,8 +754,13 @@ class MetalModelRunner:
             else self.model
         )
 
+        # Create cache to check if model supports prefix caching
+        cache = make_prompt_cache(cache_model)
+        # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
+        supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
+
         # Try to reuse cached prefix
-        if self._prefix_cache is not None and len(prefix) > 0:
+        if supports_prefix_cache and self._prefix_cache is not None and len(prefix) > 0:
             cached = self._prefix_cache.lookup(prefix)
             if cached is not None:
                 # Cache hit: restore KV for prefix, process only last token
@@ -765,13 +770,10 @@ class MetalModelRunner:
                 cached_prefix_len = len(cached.token_ids)
             else:
                 # Cache miss: process prefix first, cache it, then last token
-                cache = make_prompt_cache(cache_model)
                 prefix_ids = mx.array([prefix], dtype=mx.int32)
                 _ = self.model(prefix_ids, cache=cache)
                 self._prefix_cache.insert(prefix, cache)
                 cached_prefix_len = len(prefix)
-        else:
-            cache = make_prompt_cache(cache_model)
 
         # Prefill: process remaining tokens (always at least the last token)
         tokens_to_process = token_ids[cached_prefix_len:]
