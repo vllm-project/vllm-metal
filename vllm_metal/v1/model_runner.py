@@ -11,7 +11,9 @@ Optimized for performance with:
 """
 
 import hashlib
+import os
 import time
+from array import array
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, TypeAlias
@@ -73,21 +75,40 @@ _PREFIX_CACHE_DEFAULT_FRACTION = 0.05  # 5% of total memory
 
 
 def _get_prefix_cache_max_bytes() -> int:
-    """Get prefix cache memory limit based on total memory."""
-    import os
-
-    import psutil
-
+    """Get prefix cache memory limit based on MLX recommended working set."""
     fraction_str = os.environ.get("VLLM_METAL_PREFIX_CACHE_FRACTION", "")
     if fraction_str:
-        fraction = float(fraction_str)
+        try:
+            fraction = float(fraction_str)
+            if fraction <= 0 or fraction > 1:
+                logger.warning(
+                    "VLLM_METAL_PREFIX_CACHE_FRACTION=%.2f out of range (0, 1], "
+                    "using default %.2f",
+                    fraction,
+                    _PREFIX_CACHE_DEFAULT_FRACTION,
+                )
+                fraction = _PREFIX_CACHE_DEFAULT_FRACTION
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_METAL_PREFIX_CACHE_FRACTION=%r, using default %.2f",
+                fraction_str,
+                _PREFIX_CACHE_DEFAULT_FRACTION,
+            )
+            fraction = _PREFIX_CACHE_DEFAULT_FRACTION
     else:
         fraction = _PREFIX_CACHE_DEFAULT_FRACTION
 
-    total = psutil.virtual_memory().total
+    # Use MLX recommended working set size instead of total system RAM
+    device_info = mx.metal.device_info()
+    total: int = int(device_info.get("max_recommended_working_set_size", 0))
+    if total == 0:
+        # Fallback to a conservative default (8GB)
+        total = 8 * 1024 * 1024 * 1024
+        logger.warning("Could not get MLX working set size, using 8GB fallback")
+
     max_bytes = int(total * fraction)
     logger.info(
-        "Prefix cache: %.1fGB limit (%.1f%% of %.1fGB total memory)",
+        "Prefix cache: %.1fGB limit (%.1f%% of %.1fGB MLX working set)",
         max_bytes / (1024 * 1024 * 1024),
         fraction * 100,
         total / (1024 * 1024 * 1024),
@@ -98,7 +119,7 @@ def _get_prefix_cache_max_bytes() -> int:
 def _compute_prefix_hash(token_ids: list[int]) -> bytes:
     """Compute content hash for a token sequence."""
     h = hashlib.sha256()
-    h.update(str(token_ids).encode())
+    h.update(array("I", token_ids).tobytes())
     return h.digest()
 
 
@@ -186,6 +207,15 @@ class PrefixCacheManager:
             cache_state.append((mx.array(k), mx.array(v)))
 
         entry_bytes = _compute_entry_bytes(cache_state)
+
+        # Skip if entry exceeds memory limit
+        if entry_bytes > self._max_bytes:
+            logger.debug(
+                "Prefix cache skip: entry %.1fMB exceeds limit %.1fGB",
+                entry_bytes / (1024 * 1024),
+                self._max_bytes / (1024 * 1024 * 1024),
+            )
+            return
 
         # Evict if needed
         self._evict_until_fits(entry_bytes)
