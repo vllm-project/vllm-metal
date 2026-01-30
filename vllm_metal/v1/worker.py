@@ -4,29 +4,25 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-from vllm.config import VllmConfig
+import torch
+from vllm.config import VllmConfig  # noqa: TC002
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
+from vllm.lora.request import LoRARequest  # noqa: TC002
 from vllm.model_executor import set_random_seed
-from vllm.tasks import SupportedTask
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.tasks import SupportedTask  # noqa: TC002
+from vllm.v1.core.sched.output import SchedulerOutput  # noqa: TC002
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec  # noqa: TC002
+from vllm.v1.outputs import ModelRunnerOutput  # noqa: TC002
 from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_metal.config import (
-    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
-    AUTO_MEMORY_OVERHEAD_FACTOR,
-    get_config,
-)
+from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
 
@@ -34,19 +30,6 @@ if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class _AutoMemoryEstimate:
-    total_memory: int
-    model_memory: int
-    kv_cache_memory: int
-    total_needed: int
-    needed_fraction: float
-    max_model_len: int
-    block_size_tokens: int
-    min_blocks: int
-    overhead_factor: float
 
 
 def init_worker_distributed_environment(
@@ -88,9 +71,9 @@ class MetalWorker(WorkerBase):
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        is_driver_worker: bool = False,
-        **kwargs: Any,
-    ):
+        is_driver_worker: bool = False,  # noqa: FBT001, FBT002
+        **kwargs: Any,  # noqa: ARG002, ANN401
+    ) -> None:
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -105,6 +88,8 @@ class MetalWorker(WorkerBase):
 
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
+        import psutil  # noqa: PLC0415
+
         # Set up MLX device
         if self.metal_config.use_mlx:
             device_type = (
@@ -113,29 +98,84 @@ class MetalWorker(WorkerBase):
                 else mx.DeviceType.cpu
             )
             mx.set_default_device(mx.Device(device_type))
-            logger.info(f"MLX device set to: {mx.default_device()}")
+            logger.info("MLX device set to: %s", mx.default_device())
             set_wired_limit()
+
+            # Log system memory info for debugging OOM issues
+            total_memory = psutil.virtual_memory().total
+            available_memory = psutil.virtual_memory().available
+            device_info = mx.metal.device_info()
+            max_buffer_size = device_info.get("max_buffer_length", 0)
+            if isinstance(max_buffer_size, str):
+                max_buffer_size = (
+                    int(max_buffer_size) if max_buffer_size.isdigit() else 0
+                )
+            elif isinstance(max_buffer_size, float):
+                max_buffer_size = int(max_buffer_size)
+
+            logger.info(
+                "[Memory] System: total=%.2fGB, available=%.2fGB, max_buffer=%.2fGB",
+                total_memory / (1024**3),
+                available_memory / (1024**3),
+                max_buffer_size / (1024**3) if max_buffer_size > 0 else 0,
+            )
+            # Note: MLX memory limit is set after model load in _set_auto_memory_limit()
 
         # Use MetalPlatform.get_torch_device() to properly support MPS when available.
         # This ensures consistency with the platform's device selection logic and
         # allows using MPS for PyTorch operations (like vLLM's sampler) when supported,
         # while falling back to CPU if MPS is not available.
         self.device = MetalPlatform.get_torch_device(0)
-        logger.info(f"PyTorch device set to: {self.device}")
+        logger.info("PyTorch device set to: %s", self.device)
 
-        # Initialize distributed environment
-        init_worker_distributed_environment(
-            self.vllm_config,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-        )
+        # Initialize distributed environment only if actually needed (multi-GPU setup)
+        # For single-device Metal usage, we can skip distributed initialization
+        # to avoid network timeout issues during benchmarking
+        if self.parallel_config.world_size > 1:
+            logger.info(
+                "Multi-device setup detected (world_size=%d), initializing distributed environment",
+                self.parallel_config.world_size,
+            )
+            init_worker_distributed_environment(
+                self.vllm_config,
+                self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+            )
+        else:
+            # For single-device Metal, just ensure model parallel is initialized appropriately
+            # but avoid network-based distributed setup which can cause timeouts
+            logger.info("Single-device Metal setup detected, skipping distributed init")
+
+            # Explicitly initialize model parallel for single device to avoid issues
+            # but avoid network-based initialization that can cause timeouts
+            from vllm.distributed.parallel_state import (  # noqa: PLC0415
+                ensure_model_parallel_initialized,
+                init_distributed_environment,
+            )
+
+            # Initialize with local world size of 1 to avoid network calls
+            try:
+                init_distributed_environment(
+                    world_size=1,
+                    rank=0,
+                    local_rank=self.local_rank,
+                    distributed_init_method=None,  # No network init method
+                    backend="nccl" if torch.cuda.is_available() else "gloo",
+                )
+                ensure_model_parallel_initialized(1, 1)
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize distributed environment for single device: %s. "
+                    "This may cause issues in some scenarios.",
+                    e,
+                )
 
         # Set random seed
         set_random_seed(self.model_config.seed)
 
         # Import here to avoid circular imports
-        from vllm_metal.v1.model_runner import MetalModelRunner
+        from vllm_metal.v1.model_runner import MetalModelRunner  # noqa: PLC0415
 
         # Create model runner
         self.model_runner = MetalModelRunner(
@@ -147,18 +187,36 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # In auto mode, set MLX memory limit to prevent unbounded growth
-        if self.metal_config.is_auto_memory:
-            self._set_auto_memory_limit()
+        # Always calculate memory budget after model loads
+        # This sets both MLX memory limit and _kv_cache_budget
+        self._set_auto_memory_limit()
+
+        # Clear cache after model loading to free up memory
+        try:
+            mx.metal.clear_cache()
+        except (RuntimeError, OSError):
+            # Log the exception instead of silently ignoring it
+            logger.debug("Failed to clear MLX cache", exc_info=True)
 
     def _get_model_memory_usage(self) -> int:
         """Get current model memory usage from MLX.
 
         Returns:
             Memory usage in bytes
+
         """
         # Force evaluation of any pending computations
-        mx.eval(mx.array([0]))
+        try:
+            mx.eval(mx.array([0]))
+        except RuntimeError as e:
+            if "Attempting to allocate" in str(
+                e,
+            ) and "greater than the maximum allowed buffer size" in str(e):
+                # Even tiny arrays can fail in extreme cases - clear cache and try again
+                mx.metal.clear_cache()
+                mx.eval(mx.array([0]))
+            else:
+                raise
 
         # Get active memory usage - try new API first, then deprecated
         if hasattr(mx, "get_active_memory"):
@@ -178,115 +236,96 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _set_auto_memory_limit(self) -> None:
-        """Set MLX memory limit based on auto calculation.
+        """Set MLX memory limit and calculate KV cache budget.
 
-        This prevents MLX from using unbounded memory in auto mode.
+        This is the unified memory calculation - called after model loads.
+        Sets both the MLX memory limit and stores _kv_cache_budget for
+        determine_available_memory() to return.
         """
-        estimate = self._estimate_auto_memory()
-        if estimate.total_needed > estimate.total_memory:
-            raise ValueError(self._format_auto_memory_infeasible_error(estimate))
+        import psutil  # noqa: PLC0415
+
+        # Get model memory after loading
+        model_memory = self._get_model_memory_usage()
+
+        # Get constraints
+        available_memory = psutil.virtual_memory().available
+        device_info = mx.metal.device_info()
+        max_buffer = device_info.get("max_buffer_length", 0)
+        if isinstance(max_buffer, str):
+            max_buffer = int(max_buffer) if max_buffer.isdigit() else 0
+        elif isinstance(max_buffer, float):
+            max_buffer = int(max_buffer)
+
+        # Calculate max allowed (respect both system RAM and Metal limits)
+        if max_buffer > 0:
+            max_allowed = min(available_memory, max_buffer)
+        else:
+            max_allowed = available_memory
+
+        # TODO: overhead should be profiled; using 0.2 * model_memory for now
+        overhead = int(model_memory * 0.2)
+
+        # KV cache budget = what's left after model and overhead
+        kv_cache_budget = max_allowed - overhead
+        kv_cache_budget = max(0, kv_cache_budget)  # safety floor
+        kv_cache_budget = int(0.6 * kv_cache_budget)  # for debugging
+
+        # Store for determine_available_memory() to use
+        self._kv_cache_budget = kv_cache_budget
+
+        # MLX limit = everything we plan to use
+        mlx_limit = model_memory + kv_cache_budget + overhead
+
+        logger.info(
+            "[Memory] Budget: available=%.2fGB, max_buffer=%.2fGB, "
+            "model=%.2fGB, overhead=%.2fGB, kv_cache=%.2fGB",
+            available_memory / (1024**3),
+            max_buffer / (1024**3) if max_buffer > 0 else 0,
+            model_memory / (1024**3),
+            overhead / (1024**3),
+            kv_cache_budget / (1024**3),
+        )
 
         # Set MLX memory limit
         if hasattr(mx, "set_memory_limit"):
-            mx.set_memory_limit(estimate.total_needed)
+            mx.set_memory_limit(mlx_limit)
             logger.info(
-                f"Auto mode: set MLX memory limit to {estimate.total_needed / 1e9:.2f}GB "
-                f"(model={estimate.model_memory / 1e9:.2f}GB, kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB)"
+                "[Memory] Set MLX limit: %.2fGB",
+                mlx_limit / (1024**3),
             )
         else:
             logger.warning(
-                "mx.set_memory_limit not available, memory may grow unbounded"
+                "mx.set_memory_limit not available, memory may grow unbounded",
             )
 
-    def _estimate_auto_memory(self) -> _AutoMemoryEstimate:
-        import psutil
-
-        total_memory = psutil.virtual_memory().total
-        model_memory = self._get_model_memory_usage()
-
-        block_size_bytes = self.get_cache_block_size_bytes()
-        if block_size_bytes <= 0:
-            msg = f"Computed KV cache block size is invalid ({block_size_bytes} bytes)."
-            raise ValueError(msg)
-
-        block_size_tokens = self.metal_config.block_size
-        max_model_len = self.model_config.max_model_len
-
-        min_blocks = (max_model_len + block_size_tokens - 1) // block_size_tokens
-        min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
-        kv_cache_memory = min_blocks * block_size_bytes
-
-        overhead_factor = AUTO_MEMORY_OVERHEAD_FACTOR
-        total_needed = int((model_memory + kv_cache_memory) * overhead_factor)
-        needed_fraction = total_needed / total_memory
-
-        return _AutoMemoryEstimate(
-            total_memory=total_memory,
-            model_memory=model_memory,
-            kv_cache_memory=kv_cache_memory,
-            total_needed=total_needed,
-            needed_fraction=needed_fraction,
-            max_model_len=max_model_len,
-            block_size_tokens=block_size_tokens,
-            min_blocks=min_blocks,
-            overhead_factor=overhead_factor,
-        )
-
-    def _format_auto_memory_infeasible_error(
-        self, estimate: _AutoMemoryEstimate
-    ) -> str:
-        return (
-            "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
-            "memory than is available. "
-            f"total={estimate.total_memory / 1e9:.2f}GB, "
-            f"model={estimate.model_memory / 1e9:.2f}GB, "
-            f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
-            f"overhead_factor={estimate.overhead_factor:.1f} "
-            f"(max_model_len={estimate.max_model_len}, "
-            f"block_size={estimate.block_size_tokens}, "
-            f"min_blocks={estimate.min_blocks}, "
-            f"needed_fraction={estimate.needed_fraction:.3f}). "
-            "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
-            "or use a smaller model."
-        )
-
     def determine_available_memory(self) -> int:
-        """Determine available memory for KV cache.
+        """Return available memory for KV cache.
+
+        Returns the budget calculated by _set_auto_memory_limit() after model load.
 
         Returns:
             Available memory in bytes
+
         """
-        import psutil
-
-        # Handle auto memory mode
-        if self.metal_config.is_auto_memory:
-            estimate = self._estimate_auto_memory()
-            if estimate.total_needed > estimate.total_memory:
-                raise ValueError(self._format_auto_memory_infeasible_error(estimate))
-
+        if hasattr(self, "_kv_cache_budget"):
             logger.info(
-                f"Auto memory mode: model={estimate.model_memory / 1e9:.2f}GB, "
-                f"max_model_len={estimate.max_model_len}, min_blocks={estimate.min_blocks}, "
-                f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
-                f"total_needed={estimate.total_needed / 1e9:.2f}GB, "
-                f"needed_fraction={estimate.needed_fraction:.3f}"
+                "[Memory] Returning KV cache budget: %.2fGB",
+                self._kv_cache_budget / (1024**3),
             )
+            return self._kv_cache_budget
 
-            # Return just the cache portion for KV cache allocation
-            available = estimate.kv_cache_memory
-        else:
-            total_memory = psutil.virtual_memory().total
-            # Use configured fraction of system memory
-            available = int(total_memory * self.metal_config.memory_fraction * 0.5)
+        # Fallback: if called before model load (shouldn't happen)
+        import psutil  # noqa: PLC0415
 
-        logger.info(f"Metal available memory for KV cache: {available / 1e9:.2f} GB")
-        return available
+        logger.warning("[Memory] determine_available_memory called before model load")
+        return int(psutil.virtual_memory().available * 0.5)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
         Returns:
             Dictionary mapping layer names to KV cache specs
+
         """
         return self.model_runner.get_kv_cache_spec()
 
@@ -296,6 +335,7 @@ class MetalWorker(WorkerBase):
         Args:
             num_gpu_blocks: Number of GPU cache blocks
             num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
+
         """
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -305,6 +345,7 @@ class MetalWorker(WorkerBase):
 
         Args:
             kv_cache_config: KV cache configuration for this worker
+
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -315,7 +356,8 @@ class MetalWorker(WorkerBase):
         self.model_runner.warm_up()
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
         """Execute model inference.
 
@@ -324,14 +366,16 @@ class MetalWorker(WorkerBase):
 
         Returns:
             Model runner output with generated tokens
+
         """
         return self.model_runner.execute_model(scheduler_output)
 
-    def get_model(self) -> Any:
+    def get_model(self) -> object:
         """Get the underlying model.
 
         Returns:
             The loaded model
+
         """
         return self.model_runner.model
 
@@ -340,10 +384,20 @@ class MetalWorker(WorkerBase):
 
         Returns:
             Block size in bytes
+
         """
         return self.model_runner.get_cache_block_size_bytes()
 
-    def add_lora(self, lora_request: LoRARequest) -> bool:
+    def get_cache_usage(self) -> tuple[int, int, float]:
+        """Get KV cache usage statistics.
+
+        Returns:
+            Tuple of (used_blocks, total_blocks, usage_ratio)
+
+        """
+        return self.model_runner.get_cache_usage()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:  # noqa: ARG002
         """Add a LoRA adapter.
 
         Args:
@@ -351,11 +405,12 @@ class MetalWorker(WorkerBase):
 
         Returns:
             False (LoRA not supported on Metal yet)
+
         """
         logger.warning("LoRA is not supported on Metal platform")
         return False
 
-    def remove_lora(self, lora_id: int) -> bool:
+    def remove_lora(self, lora_id: int) -> bool:  # noqa: ARG002
         """Remove a LoRA adapter.
 
         Args:
@@ -363,10 +418,11 @@ class MetalWorker(WorkerBase):
 
         Returns:
             False (LoRA not supported on Metal yet)
+
         """
         return False
 
-    def pin_lora(self, lora_id: int) -> bool:
+    def pin_lora(self, lora_id: int) -> bool:  # noqa: ARG002
         """Pin a LoRA adapter.
 
         Args:
@@ -374,6 +430,7 @@ class MetalWorker(WorkerBase):
 
         Returns:
             False (LoRA not supported on Metal yet)
+
         """
         return False
 
@@ -382,6 +439,7 @@ class MetalWorker(WorkerBase):
 
         Returns:
             Empty set (LoRA not supported)
+
         """
         return set()
 
@@ -390,22 +448,25 @@ class MetalWorker(WorkerBase):
 
         Returns:
             Tuple of supported task types
+
         """
         return ("generate",)
 
-    def sleep(self, level: int = 1) -> None:
+    def sleep(self, level: int = 1) -> None:  # noqa: ARG002
         """Enter sleep mode (not supported on Metal).
 
         Args:
             level: Sleep level
+
         """
         logger.warning("Sleep mode is not supported on Metal, ignoring")
 
-    def wake_up(self, tags: list[str] | None = None) -> None:
+    def wake_up(self, tags: list[str] | None = None) -> None:  # noqa: ARG002
         """Wake up from sleep mode (not supported on Metal).
 
         Args:
             tags: Wake up tags
+
         """
         logger.warning("Sleep mode is not supported on Metal, ignoring")
 
@@ -414,8 +475,19 @@ class MetalWorker(WorkerBase):
         # Metal worker is healthy if MLX is available
         try:
             mx.eval(mx.array([1.0]))
+        except RuntimeError as e:
+            if "Attempting to allocate" in str(
+                e,
+            ) and "greater than the maximum allowed buffer size" in str(e):
+                # Even tiny arrays can fail in extreme cases - clear cache and try again
+                mx.metal.clear_cache()
+                mx.eval(mx.array([1.0]))
+            else:
+                error_msg = f"Metal worker health check failed: {e}"
+                raise RuntimeError(error_msg) from e
         except Exception as e:
-            raise RuntimeError(f"Metal worker health check failed: {e}") from e
+            error_msg = f"Metal worker health check failed: {e}"
+            raise RuntimeError(error_msg) from e
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""

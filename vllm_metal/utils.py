@@ -52,6 +52,30 @@ def get_model_download_path(model_repo_name: str) -> str:
     return model_repo_name
 
 
+def get_max_buffer_size() -> int:
+    """Get the maximum buffer size allowed by the Metal device.
+
+    Returns:
+        Maximum buffer size in bytes, or 0 if not available
+    """
+    try:
+        import mlx.core as mx
+
+        device_info = mx.metal.device_info()
+        # Note: MLX uses "max_buffer_length" not "max_buffer_size"
+        max_buffer_size = device_info.get("max_buffer_length", 0)
+
+        # Ensure max_buffer_size is an integer
+        if isinstance(max_buffer_size, str):
+            max_buffer_size = int(max_buffer_size) if max_buffer_size.isdigit() else 0
+        elif isinstance(max_buffer_size, float):
+            max_buffer_size = int(max_buffer_size)
+
+        return max_buffer_size
+    except Exception:
+        return 0
+
+
 def set_wired_limit() -> None:
     """
     Set Metal wired memory limit for optimal GPU performance.

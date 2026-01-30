@@ -12,6 +12,9 @@ use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
+/// Type alias for the return type of numpy array preparation functions
+type NumpyArrayPair<'py> = PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>)>;
+
 /// High-performance block allocator with O(1) allocation and deallocation.
 ///
 /// Uses a VecDeque for O(1) pop_front operations instead of Python's list.pop(0)
@@ -73,7 +76,7 @@ impl BlockAllocator {
         // Update sequence blocks
         self.sequence_blocks
             .entry(seq_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .extend(allocated.iter().copied());
 
         Ok(allocated)
@@ -173,7 +176,7 @@ impl InputPreparer {
         &mut self,
         py: Python<'py>,
         sequences: Vec<(Vec<i32>, bool)>,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>)> {
+    ) -> NumpyArrayPair<'py> {
         // Clear and reuse buffers
         self.input_ids_buffer.clear();
         self.positions_buffer.clear();
@@ -213,7 +216,7 @@ impl InputPreparer {
         py: Python<'py>,
         token_ids_list: Vec<Bound<'py, PyArray1<i32>>>,
         is_prompt_list: Vec<bool>,
-    ) -> PyResult<(Bound<'py, PyArray1<i32>>, Bound<'py, PyArray1<i32>>)> {
+    ) -> NumpyArrayPair<'py> {
         // Clear and reuse buffers
         self.input_ids_buffer.clear();
         self.positions_buffer.clear();
@@ -244,7 +247,10 @@ impl InputPreparer {
 
     /// Get current buffer sizes (for debugging).
     pub fn buffer_sizes(&self) -> (usize, usize) {
-        (self.input_ids_buffer.capacity(), self.positions_buffer.capacity())
+        (
+            self.input_ids_buffer.capacity(),
+            self.positions_buffer.capacity(),
+        )
     }
 }
 
@@ -448,7 +454,10 @@ impl RequestStateManager {
     /// # Returns
     /// Token sequence, or empty list if not found
     pub fn get_tokens(&self, req_id: &str) -> Vec<i32> {
-        self.token_sequences.get(req_id).cloned().unwrap_or_default()
+        self.token_sequences
+            .get(req_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get the generated token count for a request.

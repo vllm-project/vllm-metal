@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal sampling with vLLM Sampler integration."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -11,6 +13,8 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_metal.mlx_backend.cache import PagedKVCache
+from vllm_metal.mlx_backend.paged_cache_adapter import PagedKVCacheAdapterList
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.model_runner import (
     MetalModelRunner,
@@ -274,14 +278,33 @@ class TestV1SeededSamplingGenerator:
         runner._rust_state_manager = None
         runner.model = uniform_logits_model(vocab_size)
 
+        # Initialize a minimal paged cache for testing
+        runner._paged_cache = PagedKVCache(
+            num_layers=4,  # Use a small number of layers for testing
+            num_kv_heads=8,
+            head_dim=64,
+            num_blocks=16,
+            block_size=16,
+            dtype=mx.float32,
+        )
+        runner.metal_config = SimpleNamespace(block_size=16)
+
         sp = SamplingParams(temperature=1.0, seed=123)
         generator = _create_request_generator(runner.device, sp)
         assert generator is not None
 
+        # Create proper cache adapter for the request
+        cache = PagedKVCacheAdapterList(
+            paged_cache=runner._paged_cache,
+            seq_id=0,  # Use sequence ID 0 for this test
+            num_layers=4,
+            block_size=16,
+        )
+
         state = RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
+            cache=cache,
             sampling_params=sp,
             generator=generator,
         )

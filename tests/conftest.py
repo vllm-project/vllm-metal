@@ -15,25 +15,24 @@ def _get_test_seed() -> int:
 
     Override via `VLLM_METAL_TEST_SEED` for debugging.
     """
-
     raw_seed = os.environ.get("VLLM_METAL_TEST_SEED", "0")
     try:
         return int(raw_seed)
     except ValueError as exc:  # pragma: no cover
-        raise ValueError("VLLM_METAL_TEST_SEED must be an integer") from exc
+        error_msg = "VLLM_METAL_TEST_SEED must be an integer"
+        raise ValueError(error_msg) from exc
 
 
 @pytest.fixture(autouse=True)
 def _seed_random_generators() -> None:
     """Seed common RNGs to keep tests deterministic."""
-
     seed = _get_test_seed()
     random.seed(seed)
-    np.random.seed(seed)
+    np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
 
     try:
-        import mlx.core as mx
+        import mlx.core as mx  # noqa: PLC0415
     except ImportError:
         return
 

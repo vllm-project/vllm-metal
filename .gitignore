@@ -1,3 +1,8 @@
+.gitignore
+ShareGPT_V3_unfiltered_cleaned_split.json
+uv.lock
+vllm-0.13.0.tar.gz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

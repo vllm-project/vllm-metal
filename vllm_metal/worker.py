@@ -160,36 +160,61 @@ class MetalWorker:
             )
             raise ValueError(msg)
 
+        # Get the maximum buffer size allowed by the device to prevent allocation errors
+        from vllm_metal.utils import get_max_buffer_size
+
+        max_buffer_size = get_max_buffer_size()
+
+        # Limit the total cache size to be less than the max buffer size
+        max_blocks_by_buffer_size = (
+            max_buffer_size // block_memory if max_buffer_size > 0 else float("inf")
+        )
+
         # Handle auto memory mode
         if self.config.is_auto_memory:
             # Get actual model memory usage
             model_memory = self._get_model_memory_usage()
 
-            # Calculate minimum blocks needed to handle at least one request
-            # at max_model_len (vLLM requires this minimum)
+            # Calculate blocks needed based on scheduler config for parallel requests
             max_model_len = 2048  # Default fallback
+            max_num_seqs = 256  # Default fallback
             if self.vllm_config is not None:
                 max_model_len = self.vllm_config.model_config.max_model_len
+                # Get max concurrent sequences from scheduler config
+                if hasattr(self.vllm_config.scheduler_config, "max_num_seqs"):
+                    max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
 
-            min_blocks = (
+            # Calculate blocks needed per sequence at max length
+            blocks_per_seq = (
                 max_model_len + self.config.block_size - 1
             ) // self.config.block_size
-            # Add a small buffer for safety (e.g., 10% more blocks)
-            min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
 
-            min_cache_memory = min_blocks * block_memory
+            # Calculate target cache memory for multiple concurrent sequences
+            # Use a reasonable estimate for average sequence length (25% of max initially)
+            avg_blocks_per_seq = max(1, blocks_per_seq // 4)
+            target_blocks = max_num_seqs * avg_blocks_per_seq
 
-            # Add 20% overhead buffer for MLX operations
+            # Add 10% safety buffer
+            target_blocks = int(target_blocks * 1.1)
+
+            target_cache_memory = target_blocks * block_memory
+
+            # Calculate available memory for cache (80% of remaining memory after model)
+            available_for_cache = int((total_memory - model_memory) * 0.8)
+            cache_memory = min(target_cache_memory, available_for_cache)
+
+            # Ensure minimum for at least one full sequence
+            min_cache_memory = int(blocks_per_seq * block_memory * 1.1)
+            cache_memory = max(cache_memory, min_cache_memory)
+
+            # Fail fast if minimum needed exceeds total memory
             minimal_needed = int(
                 (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
             )
-
-            # Calculate how much of total unified memory the minimum requirement
-            # consumes (useful for user diagnostics in logs/errors).
             needed_fraction = minimal_needed / total_memory
 
             if minimal_needed > total_memory:
-                msg = (
+                raise ValueError(
                     "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
                     "memory than is available. "
                     f"total={total_memory / 1e9:.2f}GB, "
@@ -198,31 +223,33 @@ class MetalWorker:
                     f"overhead_factor={AUTO_MEMORY_OVERHEAD_FACTOR:.1f} "
                     f"(max_model_len={max_model_len}, "
                     f"block_size={self.config.block_size}, "
-                    f"min_blocks={min_blocks}, "
                     f"needed_fraction={needed_fraction:.3f}). "
                     "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
                     "or use a smaller model."
                 )
-                raise ValueError(msg)
+
+            # Apply buffer size constraint
+            num_blocks = min(
+                int(cache_memory / block_memory), int(max_blocks_by_buffer_size)
+            )
 
             logger.info(
                 f"Auto memory mode: model={model_memory / 1e9:.2f}GB, "
-                f"max_model_len={max_model_len}, min_blocks={min_blocks}, "
-                f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
-                f"total_needed={minimal_needed / 1e9:.2f}GB, "
-                f"needed_fraction={needed_fraction:.3f}"
+                f"max_model_len={max_model_len}, max_num_seqs={max_num_seqs}, "
+                f"blocks_per_seq={blocks_per_seq}, target_blocks={target_blocks}, "
+                f"cache_memory={cache_memory / 1e9:.2f}GB, "
+                f"max_blocks_by_buffer={int(max_blocks_by_buffer_size) if max_blocks_by_buffer_size != float('inf') else 'unlimited'}, "
+                f"final_num_blocks={num_blocks}"
             )
-
-            available_memory = minimal_needed
-            # In auto mode, use most of the allocated memory for cache
-            # since we already calculated minimal needed
-            cache_memory = min_cache_memory
         else:
             available_memory = int(total_memory * self.config.memory_fraction)
-            # Reserve some memory for model weights and overhead
-            cache_memory = available_memory * 0.5  # Use 50% for cache
+            # Use 70% of available memory for cache (more aggressive than 50%)
+            cache_memory = available_memory * 0.7
 
-        num_blocks = int(cache_memory / block_memory)
+            # Apply buffer size constraint
+            num_blocks = min(
+                int(cache_memory / block_memory), int(max_blocks_by_buffer_size)
+            )
 
         # Ensure at least 1 block
         num_blocks = max(1, num_blocks)

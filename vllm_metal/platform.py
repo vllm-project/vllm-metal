@@ -178,7 +178,17 @@ class MetalPlatform(Platform):
         try:
             mx.synchronize()
         except (AttributeError, TypeError):
-            mx.eval(mx.array(0, dtype=mx.int32))
+            try:
+                mx.eval(mx.array(0, dtype=mx.int32))
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Even tiny arrays can fail in extreme cases - clear cache and try again
+                    mx.metal.clear_cache()
+                    mx.eval(mx.array(0, dtype=mx.int32))
+                else:
+                    raise
 
         if torch.backends.mps.is_available():
             torch.mps.synchronize()

@@ -199,7 +199,17 @@ class MetalModelRunner:
         # Run inference using MLX
         try:
             logits = self.model(input_ids)
-            mx.eval(logits)
+            try:
+                mx.eval(logits)
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - try to clear cache and retry
+                    mx.metal.clear_cache()
+                    mx.eval(logits)
+                else:
+                    raise
 
             # Get next token predictions per sequence using actual lengths
             last_positions = mx.array(
@@ -210,7 +220,17 @@ class MetalModelRunner:
 
             # Simple greedy sampling for now
             next_tokens = mx.argmax(next_token_logits, axis=-1)
-            mx.eval(next_tokens)
+            try:
+                mx.eval(next_tokens)
+            except RuntimeError as e:
+                if "Attempting to allocate" in str(
+                    e
+                ) and "greater than the maximum allowed buffer size" in str(e):
+                    # Memory allocation error - try to clear cache and retry
+                    mx.metal.clear_cache()
+                    mx.eval(next_tokens)
+                else:
+                    raise
 
             # Convert to output format
             outputs = []
