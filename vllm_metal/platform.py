@@ -204,6 +204,8 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        from vllm_metal.stt.config import is_stt_model
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
@@ -211,6 +213,19 @@ class MetalPlatform(Platform):
 
         if config.debug:
             logger.info(f"Metal config: {config}")
+
+        # STT (Whisper) models: MLX-converted model directories typically
+        # lack tokenizer / processor files that vLLM's scheduler and
+        # AsyncLLM init require (vocab.json, tokenizer.json,
+        # preprocessor_config.json, etc.).  Copy them from the canonical
+        # HuggingFace repo into the local directory so that every
+        # from_pretrained(model_path) call succeeds transparently.
+        if model_config is not None and is_stt_model(model_config.model):
+            cls._ensure_stt_hf_files(model_config.model)
+            model_config.tokenizer = "openai/whisper-small"
+            logger.info(
+                "STT model detected — HF files ensured, tokenizer overridden"
+            )
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
@@ -238,6 +253,59 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    # HF files that vLLM needs but MLX-converted Whisper directories lack.
+    _STT_HF_FILES = (
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "normalizer.json",
+        "added_tokens.json",
+        "preprocessor_config.json",
+        "generation_config.json",
+    )
+    # All Whisper sizes share the same tokenizer vocab.  preprocessor_config
+    # differs for large-v3 (128 mel bins vs 80) — callers loading large-v3
+    # should supply their own preprocessor_config.json in the model directory.
+    _STT_CANONICAL_REPO = "openai/whisper-small"
+
+    @classmethod
+    def _ensure_stt_hf_files(cls, model_path: str) -> None:
+        """Copy missing tokenizer / processor files into *model_path*.
+
+        Only touches files that do not already exist so user overrides
+        are preserved.
+        """
+        from pathlib import Path
+
+        dest = Path(model_path)
+        if not dest.is_dir():
+            return
+
+        missing = [f for f in cls._STT_HF_FILES if not (dest / f).exists()]
+        if not missing:
+            return
+
+        try:
+            import shutil
+
+            from huggingface_hub import hf_hub_download
+
+            for fname in missing:
+                try:
+                    src = hf_hub_download(
+                        repo_id=cls._STT_CANONICAL_REPO, filename=fname
+                    )
+                    shutil.copy2(src, str(dest / fname))
+                    logger.info(f"Copied {fname} into {model_path}")
+                except Exception:
+                    logger.debug(f"Could not fetch {fname} from HF, skipping")
+        except ImportError:
+            logger.warning(
+                "huggingface_hub not available — cannot auto-provision STT files"
+            )
 
     @classmethod
     def get_attn_backend_cls(

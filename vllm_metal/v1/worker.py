@@ -147,8 +147,9 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # In auto mode, set MLX memory limit to prevent unbounded growth
-        if self.metal_config.is_auto_memory:
+        # In auto mode, set MLX memory limit to prevent unbounded growth.
+        # STT models don't use the block-based KV cache so skip auto memory.
+        if self.metal_config.is_auto_memory and not self.model_runner._is_stt:
             self._set_auto_memory_limit()
 
     def _get_model_memory_usage(self) -> int:
@@ -388,9 +389,14 @@ class MetalWorker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks for this worker.
 
+        Delegates to the model runner so that STT models return
+        ``("transcription",)`` and LLM/VLM models return ``("generate",)``.
+
         Returns:
             Tuple of supported task types
         """
+        if hasattr(self, "model_runner") and self.model_runner is not None:
+            return self.model_runner.get_supported_tasks()
         return ("generate",)
 
     def sleep(self, level: int = 1) -> None:
