@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -252,7 +250,7 @@ class TestExtractSegments:
         """Build a token list: <|start_ts|> text_token <|end_ts|>."""
         start_tok = self._tid(f"<|{start_ts}|>")
         end_tok = self._tid(f"<|{end_ts}|>")
-        # Token 2425 = " Hello" in whisper-tiny vocab
+        # Token 2425 = " Hello" in Whisper vocab
         text_tok = 2425
         return [start_tok, text_tok, end_tok]
 
