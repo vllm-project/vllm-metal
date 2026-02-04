@@ -75,3 +75,11 @@ Environment variables for customization:
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_PREFIX_CACHE` | (unset) | Set to enable prefix caching for shared prompt reuse |
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
+
+## Speech-to-Text (STT)
+
+OpenAI-compatible Whisper transcription on Apple Silicon. See [docs/stt.md](docs/stt.md) for full documentation.
+
+```bash
+vllm serve --model openai/whisper-small
+```

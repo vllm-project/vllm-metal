@@ -35,6 +35,7 @@ app.add_middleware(
 # Global state
 _engine: Any = None
 _model_name: str = ""
+_stt_model_name: str = ""
 
 
 # Request/Response models
@@ -130,18 +131,14 @@ async def health() -> dict[str, str]:
 
 @app.get("/v1/models")
 async def list_models() -> ModelsResponse:
-    """List available models."""
-    if not _model_name:
-        return ModelsResponse(data=[])
-
-    return ModelsResponse(
-        data=[
-            ModelInfo(
-                id=_model_name,
-                created=int(time.time()),
-            )
-        ]
-    )
+    """List available models (LLM and STT)."""
+    models: list[ModelInfo] = []
+    now = int(time.time())
+    if _model_name:
+        models.append(ModelInfo(id=_model_name, created=now))
+    if _stt_model_name:
+        models.append(ModelInfo(id=_stt_model_name, created=now))
+    return ModelsResponse(data=models)
 
 
 @app.post("/v1/chat/completions")
@@ -292,7 +289,7 @@ def create_engine(model_name: str) -> Any:
 
 def main() -> None:
     """Main entry point for the server."""
-    global _engine, _model_name
+    global _engine, _model_name, _stt_model_name
 
     parser = argparse.ArgumentParser(description="vLLM Metal API Server")
     parser.add_argument(
@@ -300,7 +297,7 @@ def main() -> None:
         "-m",
         type=str,
         required=True,
-        help="HuggingFace model name or path",
+        help="HuggingFace model name or path (auto-detects LLM vs STT)",
     )
     parser.add_argument(
         "--host",
@@ -334,11 +331,22 @@ def main() -> None:
     if config.debug:
         logger.info(f"Metal config: {config}")
 
-    # Load model
-    logger.info(f"Loading model: {args.model}")
-    _model_name = args.model
-    _engine = create_engine(args.model)
-    logger.info("Model loaded successfully")
+    # Auto-detect model type from config.json
+    from vllm_metal.stt.config import is_stt_model
+
+    if is_stt_model(args.model):
+        from vllm_metal.stt import init_stt_model, stt_router
+
+        logger.info(f"Loading STT model: {args.model}")
+        _stt_model_name = args.model
+        init_stt_model(args.model)
+        app.include_router(stt_router)
+        logger.info("STT model loaded successfully")
+    else:
+        logger.info(f"Loading model: {args.model}")
+        _model_name = args.model
+        _engine = create_engine(args.model)
+        logger.info("Model loaded successfully")
 
     # Start server
     logger.info(f"Starting server on {args.host}:{args.port}")
