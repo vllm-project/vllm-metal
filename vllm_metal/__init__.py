@@ -88,6 +88,39 @@ __all__ = [
 ]
 
 
+def _patch_safetensors_for_local_paths() -> None:
+    """Prevent noisy ERROR logs when model is a local directory.
+
+    vLLM's ``try_get_safetensors_metadata`` unconditionally queries the
+    HuggingFace Hub, which logs ``Error retrieving safetensors`` for local
+    paths.  We wrap the function so that local paths short-circuit to
+    ``None`` without hitting the network.
+    """
+    from pathlib import Path
+
+    import vllm.transformers_utils.config as _tc
+
+    _original = _tc.try_get_safetensors_metadata
+
+    def _patched(model: str, *, revision: str | None = None):  # type: ignore[override]
+        if Path(model).exists():
+            return None
+        return _original(model, revision=revision)
+
+    _tc.try_get_safetensors_metadata = _patched
+
+    # Also patch the already-imported reference in vllm.config.model so that
+    # ``_find_dtype`` (which uses a ``from … import`` binding) picks up the
+    # patched version.
+    try:
+        import vllm.config.model as _model_mod
+
+        if hasattr(_model_mod, "try_get_safetensors_metadata"):
+            _model_mod.try_get_safetensors_metadata = _patched
+    except ImportError:
+        pass
+
+
 def _register() -> str | None:
     """Register the Metal platform plugin with vLLM.
 
@@ -97,6 +130,7 @@ def _register() -> str | None:
         Fully qualified class name if platform is available, None otherwise
     """
     _apply_macos_defaults()
+    _patch_safetensors_for_local_paths()
 
     from vllm_metal.platform import MetalPlatform
 

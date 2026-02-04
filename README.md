@@ -81,5 +81,6 @@ Environment variables for customization:
 OpenAI-compatible Whisper transcription on Apple Silicon. See [docs/stt.md](docs/stt.md) for full documentation.
 
 ```bash
-vllm serve --model openai/whisper-small
+vllm serve --model openai/whisper-small --port 8000
+curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.wav"
 ```

@@ -46,6 +46,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.stt.config import is_stt_model
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
@@ -464,6 +465,7 @@ class MetalModelRunner:
         self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
+        self._is_stt: bool = False  # Will be set during model loading
 
         # KV cache state
         self.kv_cache_initialized = False
@@ -505,9 +507,16 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
 
-        Uses mlx_vlm for vision-language models and mlx_lm for text-only models.
+        Uses stt/transcribe.py for Whisper models, mlx_vlm for vision-language
+        models, and mlx_lm for text-only models.
         """
         model_name = get_model_download_path(self.model_config.model)
+
+        # Detect STT (Whisper) models before VLM check
+        if is_stt_model(model_name):
+            self._load_stt_model(model_name)
+            return
+
         is_vlm = self._is_vlm_model()
 
         logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")
@@ -546,6 +555,39 @@ class MetalModelRunner:
         self._extract_model_args()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
+
+    def _load_stt_model(self, model_name: str) -> None:
+        """Load a Whisper STT model via stt/transcribe.py.
+
+        Args:
+            model_name: Model path or HuggingFace repo ID
+        """
+        from vllm_metal.stt.transcribe import load_model as stt_load_model
+
+        logger.info(f"Loading STT (Whisper) model: {model_name}")
+        start_time = time.time()
+
+        # Check global cache first
+        with _model_cache_lock:
+            if model_name in _model_cache:
+                self.model, self.tokenizer = _model_cache[model_name]
+                self._is_stt = True
+                load_time = time.time() - start_time
+                logger.info(
+                    f"STT model loaded from cache in {load_time:.3f}s: {model_name}"
+                )
+                return
+
+        self.model = stt_load_model(model_name)
+        self.tokenizer = None  # Whisper uses its own tokenizer internally
+        self._is_stt = True
+
+        # Cache for future loads
+        with _model_cache_lock:
+            _model_cache[model_name] = (self.model, self.tokenizer)
+
+        load_time = time.time() - start_time
+        logger.info(f"STT model loaded in {load_time:.2f}s: {model_name}")
 
     def _extract_model_args(self) -> None:
         """Extract model configuration from loaded model.
@@ -605,12 +647,38 @@ class MetalModelRunner:
         # mlx-lm returns logits directly
         return model_output
 
+    def get_supported_tasks(self) -> tuple[str, ...]:
+        """Get supported tasks for this model.
+
+        Returns:
+            Tuple of supported task names. STT models support
+            ``("transcription",)``; LLM/VLM models support ``("generate",)``.
+        """
+        if self._is_stt:
+            return ("transcription",)
+        return ("generate",)
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
         Returns:
-            Dictionary mapping attention layer names to KV cache specs
+            Dictionary mapping attention layer names to KV cache specs.
+            STT models return an empty dict (Whisper manages its own KV cache).
         """
+        # STT models manage their own encoder/decoder caches internally.
+        # Return a single dummy spec so vLLM's KVCacheCoordinator doesn't
+        # assert on an empty spec dict.
+        if self._is_stt:
+            block_size = self.metal_config.block_size
+            return {
+                "layers.0.self_attn": FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            }
+
         # Handle None values explicitly - model configs may have keys set to None
         num_layers = (
             self.model_args.get("num_hidden_layers")
@@ -688,6 +756,17 @@ class MetalModelRunner:
             return
 
         logger.info("Warming up model...")
+
+        if self._is_stt:
+            # STT warm-up: run a short silent mel through the encoder
+            try:
+                dummy_mel = mx.zeros((1, 80, 3000), dtype=mx.float16).transpose(0, 2, 1)
+                features = self.model.encode(dummy_mel)
+                mx.eval(features)
+                logger.info("STT model warm-up complete")
+            except Exception as e:
+                logger.warning(f"STT model warm-up failed: {e}")
+            return
 
         # Run a small dummy inference
         try:
@@ -1086,6 +1165,9 @@ class MetalModelRunner:
         Key optimization: Uses BatchKVCache.merge() to combine individual
         KV caches and run a SINGLE forward pass for all decode requests.
 
+        For STT models, delegates to ``_execute_stt()`` which runs the
+        Whisper encoder→decoder pipeline and returns transcription tokens.
+
         Args:
             scheduler_output: Scheduler output with batch information
 
@@ -1094,6 +1176,9 @@ class MetalModelRunner:
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
+
+        if self._is_stt:
+            return self._execute_stt(scheduler_output)
 
         # Collect all requests to process
         req_ids: list[str] = []
@@ -1205,6 +1290,113 @@ class MetalModelRunner:
                     )
 
         # Handle empty case
+        if not req_ids:
+            return ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            )
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=sampled_tokens,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[None] * len(req_ids),
+        )
+
+    def _execute_stt(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Execute STT inference: Whisper encoder → decoder loop.
+
+        Audio arrives pre-processed by vLLM's multi-modal pipeline
+        (WhisperFeatureExtractor) in ``mm_features``.  The runner
+        converts the mel features to MLX, runs the encoder, then
+        greedy-decodes the full transcription in a single scheduler
+        step so that the request is immediately finished.
+
+        Args:
+            scheduler_output: Scheduler output with batch information
+
+        Returns:
+            Model runner output with transcription tokens
+        """
+        import numpy as np
+
+        from vllm_metal.stt.transcribe import _get_token_id
+
+        _MAX_DECODE_TOKENS = 448  # Whisper's text context window
+
+        req_ids: list[str] = []
+        req_id_to_index: dict[str, int] = {}
+        sampled_tokens: list[list[int]] = []
+
+        eot_token = _get_token_id("<|endoftext|>")
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            req_ids.append(req_id)
+            req_id_to_index[req_id] = len(req_ids) - 1
+
+            prompt_token_ids = new_req.prompt_token_ids or []
+
+            # --- Extract audio features from mm_features ---
+            audio_features = None
+
+            if hasattr(new_req, "mm_features") and new_req.mm_features:
+                for feat in new_req.mm_features:
+                    if feat.modality == "audio" and feat.data is not None:
+                        if "input_features" in feat.data:
+                            input_feat = feat.data["input_features"].data
+                            # torch.Tensor or numpy – normalise to numpy
+                            if hasattr(input_feat, "cpu"):
+                                feat_np = input_feat.cpu().numpy()
+                            else:
+                                feat_np = np.asarray(input_feat)
+                            # HF produces (n_mels, time) e.g. (80, 3000).
+                            # Our encoder expects (batch, time, n_mels).
+                            if feat_np.ndim == 2:
+                                feat_np = feat_np[None, ...]  # (1, n_mels, T)
+                            feat_np = feat_np.transpose(0, 2, 1)  # (1, T, n_mels)
+                            mel = mx.array(feat_np)
+                            audio_features = self.model.encode(mel)
+                            mx.eval(audio_features)
+                        break
+
+            if audio_features is None:
+                sampled_tokens.append([eot_token])
+                continue
+
+            # Use decoder prompt tokens from vLLM's STT pipeline.
+            prefix = prompt_token_ids
+
+            # Greedy decoder loop
+            tokens = mx.array([prefix], dtype=mx.int32)
+            kv_cache = None
+            output_tokens: list[int] = []
+
+            for _ in range(_MAX_DECODE_TOKENS):
+                logits, kv_cache = self.model.decode(tokens, audio_features, kv_cache)
+                next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+                if next_token == eot_token:
+                    break
+                output_tokens.append(next_token)
+                tokens = mx.array([[next_token]], dtype=mx.int32)
+
+            # Append EOT so vLLM's output processor marks the request finished.
+            output_tokens.append(eot_token)
+            sampled_tokens.append(output_tokens)
+
+        # Clean up finished requests (STT requests finish in a single step)
+        if scheduler_output.finished_req_ids:
+            for req_id in scheduler_output.finished_req_ids:
+                self._request_states.pop(req_id, None)
+
         if not req_ids:
             return ModelRunnerOutput(
                 req_ids=[],

@@ -113,12 +113,6 @@ main() {
 
   is_apple_silicon
 
-  # ffmpeg is needed for STT audio decoding (non-blocking warning)
-  if ! command -v ffmpeg &>/dev/null; then
-    echo "Warning: ffmpeg not found. STT features require ffmpeg." >&2
-    echo "  Install with: brew install ffmpeg" >&2
-  fi
-
   if ! ensure_uv; then
     exit 1
   fi

@@ -1,11 +1,11 @@
 # Speech-to-Text (STT)
 
-vllm-metal includes an OpenAI-compatible Speech-to-Text module built on Whisper. It supports transcription, translation, timestamps, and subtitle output — all running natively on Apple Silicon via MLX.
+vllm-metal includes OpenAI-compatible Speech-to-Text support built on Whisper. It supports transcription, translation, timestamps, and subtitle output — all running natively on Apple Silicon via MLX.
 
 ## Quick Start
 
 ```bash
-vllm-metal --model openai/whisper-small
+vllm serve /path/to/whisper-small-mlx --port 8000
 ```
 
 The server auto-detects Whisper models from `config.json` and mounts the `/v1/audio/*` endpoints.
@@ -22,7 +22,7 @@ Any OpenAI Whisper checkpoint (HuggingFace or MLX format):
 | Whisper Medium | 769M | `openai/whisper-medium` |
 | Whisper Large V3 | 1.5B | `openai/whisper-large-v3` |
 
-MLX-format weights (e.g. from `mlx-community`) are also supported.
+MLX-format weights (e.g. from `mlx-community`) are also supported. Missing tokenizer/processor files are auto-downloaded from `openai/whisper-small` on first load.
 
 ## API Endpoints
 
@@ -53,12 +53,12 @@ Translate audio to English. Same parameters as transcriptions (except `language`
 **`verbose_json`** — includes segments with timestamps:
 ```json
 {
-  "task": "transcribe",
+  "duration": "5.0",
   "language": "en",
-  "duration": 5.0,
-  "text": "Hello, world.",
+  "text": " Hello, world.",
   "segments": [
-    {"id": 0, "start": 0.0, "end": 2.5, "text": " Hello, world.", ...}
+    {"id": 0, "start": 0.0, "end": 2.5, "text": " Hello, world.",
+     "tokens": [50364, 2425, 11, 1002, 13, 50489], "temperature": 0.0, "seek": 0}
   ]
 }
 ```
@@ -87,6 +87,10 @@ Hello, world.
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.wav"
 
+# Transcription with language specified
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@recording.wav" -F "language=en" -F "response_format=verbose_json"
+
 # Chinese transcription with SRT output
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.wav" -F "language=zh" -F "response_format=srt"
@@ -106,7 +110,3 @@ curl http://localhost:8000/v1/models
 ## Supported Languages
 
 100 languages including: English, Chinese, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Arabic, Hindi, and [many more](../vllm_metal/stt/config.py).
-
-## Requirements
-
-- **ffmpeg** is required for audio decoding. Install with `brew install ffmpeg`.

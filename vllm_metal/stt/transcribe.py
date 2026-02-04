@@ -33,7 +33,7 @@ def _get_tokenizer():
     """Get cached Whisper tokenizer."""
     from transformers import WhisperTokenizer
 
-    return WhisperTokenizer.from_pretrained("openai/whisper-tiny")
+    return WhisperTokenizer.from_pretrained("openai/whisper-small")
 
 
 def _get_token_id(token: str) -> int:
