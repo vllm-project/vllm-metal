@@ -1330,7 +1330,7 @@ class MetalModelRunner:
 
         from vllm_metal.stt.transcribe import _get_token_id
 
-        _MAX_DECODE_TOKENS = 448  # Whisper's text context window
+        max_decode_tokens = 448  # Whisper's text context window
 
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
@@ -1380,7 +1380,7 @@ class MetalModelRunner:
             kv_cache = None
             output_tokens: list[int] = []
 
-            for _ in range(_MAX_DECODE_TOKENS):
+            for _ in range(max_decode_tokens):
                 logits, kv_cache = self.model.decode(tokens, audio_features, kv_cache)
                 next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
                 if next_token == eot_token:
