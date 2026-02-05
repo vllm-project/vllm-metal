@@ -11,6 +11,8 @@ Optimized for performance with:
 """
 
 import hashlib
+import math
+import os
 import time
 from array import array
 from dataclasses import dataclass
@@ -68,9 +70,62 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
 
-# Prefix cache configuration
-_PREFIX_CACHE_ENABLED = True
-_PREFIX_CACHE_MAX_ENTRIES = 100
+# Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
+# in the environment (any value; unset to disable).
+
+
+def _prefix_cache_enabled() -> bool:
+    """Check whether prefix caching is enabled via environment variable."""
+    return "VLLM_METAL_PREFIX_CACHE" in os.environ
+
+
+_PREFIX_CACHE_ENABLED = _prefix_cache_enabled()
+_PREFIX_CACHE_DEFAULT_FRACTION = 0.05  # 5% of MLX working set
+
+
+def _get_prefix_cache_max_bytes() -> int:
+    """Get prefix cache memory limit based on MLX recommended working set."""
+    fraction_str = os.environ.get("VLLM_METAL_PREFIX_CACHE_FRACTION", "")
+    if fraction_str:
+        try:
+            fraction = float(fraction_str)
+            if not math.isfinite(fraction) or fraction <= 0 or fraction > 1:
+                logger.warning(
+                    "VLLM_METAL_PREFIX_CACHE_FRACTION=%r out of range (0, 1], "
+                    "using default %.2f",
+                    fraction_str,
+                    _PREFIX_CACHE_DEFAULT_FRACTION,
+                )
+                fraction = _PREFIX_CACHE_DEFAULT_FRACTION
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_METAL_PREFIX_CACHE_FRACTION=%r, using default %.2f",
+                fraction_str,
+                _PREFIX_CACHE_DEFAULT_FRACTION,
+            )
+            fraction = _PREFIX_CACHE_DEFAULT_FRACTION
+    else:
+        fraction = _PREFIX_CACHE_DEFAULT_FRACTION
+
+    fallback_bytes = 8 * 1024 * 1024 * 1024  # 8 GB
+    try:
+        device_info = mx.metal.device_info()
+        total = int(device_info.get("max_recommended_working_set_size", 0))
+    except (AttributeError, RuntimeError):
+        total = 0
+
+    if total == 0:
+        total = fallback_bytes
+        logger.warning("Could not get MLX working set size, using 8GB fallback")
+
+    max_bytes = int(total * fraction)
+    logger.info(
+        "Prefix cache: %.1fGB limit (%.1f%% of %.1fGB MLX working set)",
+        max_bytes / (1024 * 1024 * 1024),
+        fraction * 100,
+        total / (1024 * 1024 * 1024),
+    )
+    return max_bytes
 
 
 def _compute_prefix_hash(token_ids: list[int]) -> bytes:
@@ -78,6 +133,15 @@ def _compute_prefix_hash(token_ids: list[int]) -> bytes:
     h = hashlib.sha256()
     h.update(array("I", token_ids).tobytes())
     return h.digest()
+
+
+def _compute_entry_bytes(cache_state: list[tuple[mx.array, mx.array] | None]) -> int:
+    """Compute memory usage of a cache entry in bytes."""
+    total = 0
+    for pair in cache_state:
+        if pair is not None:
+            total += pair[0].nbytes + pair[1].nbytes
+    return total
 
 
 @dataclass
@@ -90,15 +154,19 @@ class CachedPrefix:
 
     token_ids: list[int]
     cache_state: list[tuple[mx.array, mx.array] | None]
+    size_bytes: int = 0
     ref_count: int = 0
 
 
 class PrefixCacheManager:
-    """Manager for prefix KV cache reuse."""
+    """Manager for prefix KV cache reuse with memory-based eviction."""
 
-    def __init__(self, max_entries: int = _PREFIX_CACHE_MAX_ENTRIES):
+    def __init__(self, max_bytes: int | None = None):
         self._cache: dict[bytes, CachedPrefix] = {}
-        self._max_entries = max_entries
+        self._max_bytes = (
+            max_bytes if max_bytes is not None else _get_prefix_cache_max_bytes()
+        )
+        self._current_bytes = 0
         self._hits = 0
         self._misses = 0
 
@@ -125,20 +193,27 @@ class PrefixCacheManager:
         )
         return None
 
+    def _evict_until_fits(self, needed_bytes: int) -> None:
+        """Evict entries until we have room for needed_bytes."""
+        while self._current_bytes + needed_bytes > self._max_bytes and self._cache:
+            min_hash, min_entry = min(self._cache.items(), key=lambda x: x[1].ref_count)
+            self._current_bytes -= min_entry.size_bytes
+            del self._cache[min_hash]
+            logger.debug(
+                "Prefix cache eviction: freed %.1fMB",
+                min_entry.size_bytes / (1024 * 1024),
+            )
+
     def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
-        """Insert a prefix cache entry.
+        """Insert a prefix cache entry with memory-based eviction.
 
         Only KVCache layers are cached. MambaCache/ArraysCache layers are
         skipped (stored as None) for hybrid model compatibility.
         """
-        if len(self._cache) >= self._max_entries:
-            min_ref = min(self._cache.values(), key=lambda x: x.ref_count)
-            for h, c in list(self._cache.items()):
-                if c is min_ref:
-                    del self._cache[h]
-                    break
-
         prefix_hash = _compute_prefix_hash(token_ids)
+        if prefix_hash in self._cache:
+            return
+
         cache_state = []
         for layer_cache in cache:
             if isinstance(layer_cache, KVCache):
@@ -146,14 +221,28 @@ class PrefixCacheManager:
                 v = layer_cache.state[1]
                 cache_state.append((mx.array(k), mx.array(v)))
             else:
-                # MambaCache/ArraysCache - skip (not supported)
                 cache_state.append(None)
+
+        entry_bytes = _compute_entry_bytes(cache_state)
+
+        # Skip if single entry exceeds memory limit
+        if entry_bytes > self._max_bytes:
+            logger.debug(
+                "Prefix cache skip: entry %.1fMB exceeds limit %.1fGB",
+                entry_bytes / (1024 * 1024),
+                self._max_bytes / (1024 * 1024 * 1024),
+            )
+            return
+
+        self._evict_until_fits(entry_bytes)
 
         self._cache[prefix_hash] = CachedPrefix(
             token_ids=list(token_ids),
             cache_state=cache_state,
+            size_bytes=entry_bytes,
             ref_count=1,
         )
+        self._current_bytes += entry_bytes
 
     def restore_cache(
         self, cached: CachedPrefix, model: Any, is_vlm: bool
@@ -189,6 +278,8 @@ class PrefixCacheManager:
             "misses": self._misses,
             "hit_rate": self.hit_rate,
             "cached_entries": len(self._cache),
+            "current_bytes": self._current_bytes,
+            "max_bytes": self._max_bytes,
         }
 
 
@@ -1102,11 +1193,15 @@ class MetalModelRunner:
                 if self._prefix_cache is not None:
                     stats = self._prefix_cache.get_stats()
                     logger.info(
-                        "Prefix cache hit rate: %.1f%% (hits=%d, misses=%d, cached=%d)",
+                        "Prefix cache: %.1f%% hit rate "
+                        "(hits=%d, misses=%d, cached=%d, "
+                        "%.1fMB/%.1fMB)",
                         stats["hit_rate"] * 100,
                         stats["hits"],
                         stats["misses"],
                         stats["cached_entries"],
+                        stats["current_bytes"] / (1024 * 1024),
+                        stats["max_bytes"] / (1024 * 1024),
                     )
 
         # Handle empty case
