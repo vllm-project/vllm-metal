@@ -210,7 +210,7 @@ def _extract_segments(
     seg_tokens: list[int] = []
     seg_id = segment_id_offset
 
-    for tid, text in zip(token_ids, raw_tokens):
+    for tid, text in zip(token_ids, raw_tokens, strict=True):
         m = _TIMESTAMP_RE.match(text)
         if m:
             ts = float(m.group(1))
