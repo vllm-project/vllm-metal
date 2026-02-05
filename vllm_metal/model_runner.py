@@ -118,50 +118,74 @@ class MetalModelRunner:
             Tuple of (input_ids, positions, seq_lens)
         """
         input_ids_list: list[list[int]] = []
-        seq_lens: list[int] = []
 
         for seq_group in seq_group_metadata_list:
-            try:
-                seq_data_map = seq_group.seq_data
-            except AttributeError as exc:
-                raise ValueError("Sequence group missing seq_data") from exc
-
-            if not seq_data_map:
-                raise ValueError("Sequence group has no sequence data")
-            if len(seq_data_map) > 1:
-                logger.warning(
-                    "Sequence group has multiple sequences; using the first one."
-                )
-
-            seq_data = next(iter(seq_data_map.values()))
-            try:
-                tokens = list(seq_data.get_token_ids())
-            except AttributeError as exc:
-                if isinstance(seq_data, dict):
-                    tokens = list(seq_data.get("token_ids", []))
-                else:
-                    raise ValueError("Sequence data lacks token ids") from exc
-
-            # For prefill, use all tokens; for decode, use last token
-            if seq_group.is_prompt:
-                input_ids = tokens
-            else:
-                if not tokens:
-                    raise ValueError("Decode sequence has no tokens")
-                input_ids = [tokens[-1]]
-
-            if not input_ids:
-                raise ValueError("Prompt sequence has no tokens")
-
+            seq_data = self._get_seq_data(seq_group)
+            tokens = self._extract_tokens(seq_data)
+            input_ids = self._select_input_ids(tokens, seq_group.is_prompt)
             input_ids_list.append(input_ids)
-            seq_lens.append(len(input_ids))
 
+        return self._pad_inputs(input_ids_list, pad_id=0)
+
+    @staticmethod
+    def _get_seq_data(seq_group: Any) -> Any:
+        try:
+            seq_data_map = seq_group.seq_data
+        except AttributeError as exc:
+            raise ValueError("Sequence group missing seq_data") from exc
+
+        if not seq_data_map:
+            raise ValueError("Sequence group has no sequence data")
+        if len(seq_data_map) > 1:
+            logger.warning(
+                "Sequence group has multiple sequences; using the first one."
+            )
+
+        return next(iter(seq_data_map.values()))
+
+    @staticmethod
+    def _extract_tokens(seq_data: Any) -> list[int]:
+        try:
+            token_ids = seq_data.get_token_ids()
+        except AttributeError as exc:
+            if isinstance(seq_data, dict):
+                token_ids = seq_data.get("token_ids", [])
+            else:
+                raise ValueError("Sequence data lacks token ids") from exc
+
+        if token_ids is None:
+            return []
+
+        try:
+            return list(token_ids)
+        except TypeError as exc:
+            raise ValueError("Sequence data lacks token ids") from exc
+
+    @staticmethod
+    def _select_input_ids(tokens: list[int], is_prompt: bool) -> list[int]:
+        # For prefill, use all tokens; for decode, use last token
+        if is_prompt:
+            input_ids = tokens
+        else:
+            if not tokens:
+                raise ValueError("Decode sequence has no tokens")
+            input_ids = [tokens[-1]]
+
+        if not input_ids:
+            raise ValueError("Prompt sequence has no tokens")
+
+        return input_ids
+
+    @staticmethod
+    def _pad_inputs(
+        input_ids_list: list[list[int]], pad_id: int = 0
+    ) -> tuple[mx.array, mx.array, list[int]]:
         if not input_ids_list:
             empty = mx.array([[]], dtype=mx.int32)
             return empty, empty, []
 
+        seq_lens = [len(row) for row in input_ids_list]
         max_len = max(seq_lens)
-        pad_id = 0
         padded_rows = [row + [pad_id] * (max_len - len(row)) for row in input_ids_list]
 
         input_ids_array = mx.array(padded_rows, dtype=mx.int32)

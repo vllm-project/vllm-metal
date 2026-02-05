@@ -7,9 +7,12 @@ Optimized for performance with:
 - Pre-allocated input buffers to reduce allocation overhead
 - Rust-based token state management for efficient batch operations
 - Global model cache for fast repeated loads
+- Content hash prefix caching for shared prompt reuse
 """
 
+import hashlib
 import time
+from array import array
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, TypeAlias
@@ -65,6 +68,130 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+
+# Prefix cache configuration
+_PREFIX_CACHE_ENABLED = True
+_PREFIX_CACHE_MAX_ENTRIES = 100
+
+
+def _compute_prefix_hash(token_ids: list[int]) -> bytes:
+    """Compute content hash for a token sequence."""
+    h = hashlib.sha256()
+    h.update(array("I", token_ids).tobytes())
+    return h.digest()
+
+
+@dataclass
+class CachedPrefix:
+    """Cached KV state for a token prefix.
+
+    cache_state contains (k, v) tuples for KVCache layers, or None for
+    MambaCache/ArraysCache layers in hybrid models.
+    """
+
+    token_ids: list[int]
+    cache_state: list[tuple[mx.array, mx.array] | None]
+    ref_count: int = 0
+
+
+class PrefixCacheManager:
+    """Manager for prefix KV cache reuse."""
+
+    def __init__(self, max_entries: int = _PREFIX_CACHE_MAX_ENTRIES):
+        self._cache: dict[bytes, CachedPrefix] = {}
+        self._max_entries = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def lookup(self, token_ids: list[int]) -> CachedPrefix | None:
+        """Look up cached prefix by token IDs."""
+        prefix_hash = _compute_prefix_hash(token_ids)
+        cached = self._cache.get(prefix_hash)
+        if cached is not None:
+            self._hits += 1
+            cached.ref_count += 1
+            logger.debug(
+                "Prefix cache HIT: %d hits, %d misses, rate=%.1f%%",
+                self._hits,
+                self._misses,
+                self.hit_rate * 100,
+            )
+            return cached
+        self._misses += 1
+        logger.debug(
+            "Prefix cache MISS: %d hits, %d misses, rate=%.1f%%",
+            self._hits,
+            self._misses,
+            self.hit_rate * 100,
+        )
+        return None
+
+    def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
+        """Insert a prefix cache entry.
+
+        Only KVCache layers are cached. MambaCache/ArraysCache layers are
+        skipped (stored as None) for hybrid model compatibility.
+        """
+        if len(self._cache) >= self._max_entries:
+            min_ref = min(self._cache.values(), key=lambda x: x.ref_count)
+            for h, c in list(self._cache.items()):
+                if c is min_ref:
+                    del self._cache[h]
+                    break
+
+        prefix_hash = _compute_prefix_hash(token_ids)
+        cache_state = []
+        for layer_cache in cache:
+            if isinstance(layer_cache, KVCache):
+                k = layer_cache.state[0]
+                v = layer_cache.state[1]
+                cache_state.append((mx.array(k), mx.array(v)))
+            else:
+                # MambaCache/ArraysCache - skip (not supported)
+                cache_state.append(None)
+
+        self._cache[prefix_hash] = CachedPrefix(
+            token_ids=list(token_ids),
+            cache_state=cache_state,
+            ref_count=1,
+        )
+
+    def restore_cache(
+        self, cached: CachedPrefix, model: Any, is_vlm: bool
+    ) -> list[KVCache]:
+        """Restore a cached prefix to a fresh KVCache.
+
+        Only KVCache layers are restored. MambaCache/ArraysCache layers
+        remain in their fresh state for hybrid model compatibility.
+        """
+        cache_model = (
+            model.language_model
+            if is_vlm and hasattr(model, "language_model")
+            else model
+        )
+        cache = make_prompt_cache(cache_model)
+        for i, layer_cache in enumerate(cache):
+            if i < len(cached.cache_state) and cached.cache_state[i] is not None:
+                if isinstance(layer_cache, KVCache):
+                    k, v = cached.cache_state[i]
+                    layer_cache.state = [mx.array(k), mx.array(v)]
+        return cache
+
+    @property
+    def hit_rate(self) -> float:
+        """Return prefix cache hit rate."""
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def get_stats(self) -> dict:
+        """Return prefix cache statistics."""
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self.hit_rate,
+            "cached_entries": len(self._cache),
+        }
+
 
 # Type alias for any cache type supported by the model
 AnyCache: TypeAlias = KVCache | MambaCache | ArraysCache
@@ -268,6 +395,11 @@ class MetalModelRunner:
 
         # Track finished requests for lazy cache clearing
         self._finished_request_count = 0
+
+        # Prefix cache for shared prompt reuse
+        self._prefix_cache: PrefixCacheManager | None = None
+        if _PREFIX_CACHE_ENABLED:
+            self._prefix_cache = PrefixCacheManager()
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -612,18 +744,43 @@ class MetalModelRunner:
         Returns:
             Tuple of (next_token, cache)
         """
-        # Create a new prompt cache for this request
-        # For VLMs, use the language_model component; for text models, use model directly
+        cache: list[KVCache]
+        cached_prefix_len = 0
+
+        # Prefix caching: cache KV for tokens[:-1], always process last token
+        prefix = token_ids[:-1] if len(token_ids) > 1 else []
         cache_model = (
             self.model.language_model
             if self._is_vlm and hasattr(self.model, "language_model")
             else self.model
         )
-        cache = make_prompt_cache(cache_model)
 
-        # Prefill: process the entire prompt with cache
-        input_ids = mx.array([token_ids], dtype=mx.int32)
+        # Create cache to check if model supports prefix caching
+        cache = make_prompt_cache(cache_model)
+        # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
+        supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
+
+        # Try to reuse cached prefix
+        if supports_prefix_cache and self._prefix_cache is not None and len(prefix) > 0:
+            cached = self._prefix_cache.lookup(prefix)
+            if cached is not None:
+                # Cache hit: restore KV for prefix, process only last token
+                cache = self._prefix_cache.restore_cache(
+                    cached, self.model, self._is_vlm
+                )
+                cached_prefix_len = len(cached.token_ids)
+            else:
+                # Cache miss: process prefix first, cache it, then last token
+                prefix_ids = mx.array([prefix], dtype=mx.int32)
+                _ = self.model(prefix_ids, cache=cache)
+                self._prefix_cache.insert(prefix, cache)
+                cached_prefix_len = len(prefix)
+
+        # Prefill: process remaining tokens (always at least the last token)
+        tokens_to_process = token_ids[cached_prefix_len:]
+        input_ids = mx.array([tokens_to_process], dtype=mx.int32)
         model_output = self.model(input_ids, cache=cache)
+
         logits = self._extract_logits(model_output)
 
         # Extract last token logits
@@ -642,7 +799,7 @@ class MetalModelRunner:
         # Advanced sampling needed if not greedy, or if we have penalties/logprobs
         # If greedy and no penalties -> fast path.
         # If (greedy or simple sampling) and no penalties/logprobs -> fast path.
-        can_use_fast_path = not has_penalties and not needs_logprobs
+        can_use_fast_path = not has_penalties and not needs_logprobs and sp.seed is None
 
         if is_greedy and can_use_fast_path:
             # Fast path: native MLX greedy sampling
@@ -827,7 +984,7 @@ class MetalModelRunner:
                 or sp.repetition_penalty != 1.0
             )
             needs_logprobs = sp.logprobs is not None and sp.logprobs > 0
-            can_use_fast_path = not has_penalties and not needs_logprobs
+            can_use_fast_path = not has_penalties and not needs_logprobs and sp.seed is None
 
             if is_greedy and can_use_fast_path:
                 # Fast path: native MLX greedy sampling
@@ -983,6 +1140,17 @@ class MetalModelRunner:
             if self._finished_request_count >= _CACHE_CLEAR_INTERVAL:
                 mx.clear_cache()
                 self._finished_request_count = 0
+
+                # Log prefix cache stats periodically
+                if self._prefix_cache is not None:
+                    stats = self._prefix_cache.get_stats()
+                    logger.info(
+                        "Prefix cache hit rate: %.1f%% (hits=%d, misses=%d, cached=%d)",
+                        stats["hit_rate"] * 100,
+                        stats["hits"],
+                        stats["misses"],
+                        stats["cached_entries"],
+                    )
 
         # Handle empty case
         if not req_ids:
