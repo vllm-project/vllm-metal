@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Whisper model implementation for MLX."""
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,7 +28,7 @@ class WhisperConfig:
     n_text_layer: int = 6
 
     @classmethod
-    def from_dict(cls, config: dict) -> "WhisperConfig":
+    def from_dict(cls, config: dict) -> WhisperConfig:
         """Create config from dictionary (supports HF and MLX formats)."""
         config = config.copy()
 
@@ -142,7 +145,7 @@ class ResidualAttentionBlock(nn.Module):
         xa: mx.array | None = None,
         mask: mx.array | None = None,
         kv_cache: tuple | None = None,
-    ) -> tuple[mx.array, tuple, mx.array]:
+    ) -> tuple[mx.array, tuple, mx.array | None]:
         kv, cross_kv = kv_cache if kv_cache else (None, None)
         y, kv, _ = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv)
         x = x + y
@@ -221,25 +224,26 @@ class TextDecoder(nn.Module):
         self,
         x: mx.array,
         xa: mx.array,
-        kv_cache: list | None = None,
-    ) -> tuple[mx.array, list, list]:
+        kv_cache: list[Any] | None = None,
+    ) -> tuple[mx.array, list[Any], list[Any]]:
         offset = kv_cache[0][0][0].shape[1] if kv_cache else 0
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
         )
 
-        if kv_cache is None:
-            kv_cache = [None] * len(self.blocks)
-        cross_qk = [None] * len(self.blocks)
+        kv_cache_out: list[Any] = (
+            kv_cache if kv_cache is not None else [None] * len(self.blocks)
+        )
+        cross_qk: list[Any] = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i], cross_qk[i] = block(
-                x, xa, mask=self._mask, kv_cache=kv_cache[i]
+            x, kv_cache_out[i], cross_qk[i] = block(
+                x, xa, mask=self._mask, kv_cache=kv_cache_out[i]
             )
 
         x = self.ln(x)
-        return self.token_embedding.as_linear(x), kv_cache, cross_qk
+        return self.token_embedding.as_linear(x), kv_cache_out, cross_qk
 
 
 class WhisperModel(nn.Module):

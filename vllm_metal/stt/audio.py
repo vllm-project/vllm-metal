@@ -164,7 +164,7 @@ def _find_split_point(
     region = audio[lo:hi]
 
     energies = _rms_energy(region, window_size)
-    best_window = mx.argmin(energies).item()
+    best_window = int(mx.argmin(energies).item())
     return lo + best_window * window_size
 
 

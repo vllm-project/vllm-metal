@@ -80,7 +80,7 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16) -> WhisperM
     if not weight_files:
         raise FileNotFoundError(f"No weight files in {model_path}")
 
-    weights = {}
+    weights: dict[str, mx.array] = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
 
@@ -141,7 +141,7 @@ def _greedy_decode(
 
     for _ in range(max_tokens):
         logits, kv_cache = model.decode(tokens, audio_features, kv_cache)
-        next_token = mx.argmax(logits[:, -1, :], axis=-1).item()
+        next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
         if next_token == eot_token:
             break
         output_tokens.append(next_token)
@@ -177,7 +177,7 @@ def _decode_with_timestamps(
 
     for _ in range(max_tokens):
         logits, kv_cache = model.decode(tokens, audio_features, kv_cache)
-        next_token = mx.argmax(logits[:, -1, :], axis=-1).item()
+        next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
         if next_token == eot_token:
             break
         output_tokens.append(next_token)
