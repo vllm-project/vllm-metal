@@ -40,9 +40,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.mlx_sampler import mlx_sample
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.mlx_sampler import mlx_sample
 
 logger = init_logger(__name__)
 
@@ -638,7 +638,7 @@ class MetalModelRunner:
             or sp.presence_penalty != 0.0
             or sp.repetition_penalty != 1.0
         )
-        needs_logprobs = (sp.logprobs is not None and sp.logprobs > 0)
+        needs_logprobs = sp.logprobs is not None and sp.logprobs > 0
         # Advanced sampling needed if not greedy, or if we have penalties/logprobs
         # If greedy and no penalties -> fast path.
         # If (greedy or simple sampling) and no penalties/logprobs -> fast path.
@@ -724,7 +724,7 @@ class MetalModelRunner:
 
         # Check if all requests can use fast sampling
         all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        
+
         # Check penalties/logprobs for ANY request in batch
         # If any request needs slow path, fall back to slow path for the whole batch.
         any_complex = any(
@@ -732,6 +732,7 @@ class MetalModelRunner:
             or sp.presence_penalty != 0.0
             or sp.repetition_penalty != 1.0
             or (sp.logprobs is not None and sp.logprobs > 0)
+            or sp.seed is not None
             for sp in sampling_params_list
         )
 
@@ -745,11 +746,11 @@ class MetalModelRunner:
             mx.eval(next_token_logits)
             next_tokens = []
             for i, sp in enumerate(sampling_params_list):
-                row_logits = next_token_logits[i:i+1] # Keep dim
+                row_logits = next_token_logits[i : i + 1]  # Keep dim
                 token = mlx_sample(
-                    row_logits, 
-                    temp=sp.temperature, 
-                    top_p=sp.top_p, 
+                    row_logits,
+                    temp=sp.temperature,
+                    top_p=sp.top_p,
                     top_k=sp.top_k,
                     min_p=sp.min_p,
                 )
@@ -819,13 +820,13 @@ class MetalModelRunner:
 
             sp = state.sampling_params
             is_greedy = sp.temperature < 1e-5
-            
+
             has_penalties = (
                 sp.frequency_penalty != 0.0
                 or sp.presence_penalty != 0.0
                 or sp.repetition_penalty != 1.0
             )
-            needs_logprobs = (sp.logprobs is not None and sp.logprobs > 0)
+            needs_logprobs = sp.logprobs is not None and sp.logprobs > 0
             can_use_fast_path = not has_penalties and not needs_logprobs
 
             if is_greedy and can_use_fast_path:
