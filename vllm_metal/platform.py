@@ -223,9 +223,7 @@ class MetalPlatform(Platform):
         if model_config is not None and is_stt_model(model_config.model):
             cls._ensure_stt_hf_files(model_config.model)
             model_config.tokenizer = "openai/whisper-small"
-            logger.info(
-                "STT model detected — HF files ensured, tokenizer overridden"
-            )
+            logger.info("STT model detected — HF files ensured, tokenizer overridden")
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":

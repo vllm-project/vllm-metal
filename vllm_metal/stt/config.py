@@ -95,7 +95,9 @@ def is_stt_model(model_path: str) -> bool:
         try:
             from huggingface_hub import hf_hub_download
 
-            config_file = Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+            config_file = Path(
+                hf_hub_download(repo_id=model_path, filename="config.json")
+            )
         except Exception:
             return False
 
