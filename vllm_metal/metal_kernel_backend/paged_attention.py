@@ -31,23 +31,6 @@ from vllm_metal.paged_attention_common import (
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
 
 # ---------------------------------------------------------------------------
-# Bridge helpers
-# ---------------------------------------------------------------------------
-
-
-def _mlx_to_mps(arr: mx.array, dtype: torch.dtype = torch.float16) -> torch.Tensor:
-    """Convert an MLX array to an MPS PyTorch tensor."""
-    mx.eval(arr)
-    t = mlx_to_torch(arr, device="cpu")
-    return t.to(dtype=dtype, device="mps")
-
-
-def _mps_to_mlx(t: torch.Tensor) -> mx.array:
-    """Convert an MPS PyTorch tensor back to an MLX array."""
-    return torch_to_mlx(t.cpu())
-
-
-# ---------------------------------------------------------------------------
 # Prefill attention (MLX SDPA + reshape_and_cache write)
 # ---------------------------------------------------------------------------
 
@@ -85,8 +68,8 @@ def _metal_kernel_prefill_attention(
     k_flat = keys[0].transpose(1, 0, 2)  # (L, kv_heads, head_dim)
     v_flat = values[0].transpose(1, 0, 2)
 
-    k_mps = _mlx_to_mps(k_flat, dtype=cache.dtype)
-    v_mps = _mlx_to_mps(v_flat, dtype=cache.dtype)
+    k_mps = mlx_to_torch(k_flat, device="mps").to(dtype=cache.dtype)
+    v_mps = mlx_to_torch(v_flat, device="mps").to(dtype=cache.dtype)
 
     slot_mapping_mps = torch.tensor(ctx.slot_mapping, dtype=torch.long, device="mps")
 
@@ -141,9 +124,9 @@ def _metal_kernel_decode_attention(
 
     # Bridge Q, new K/V to MPS
     # (B, heads, 1, hd) → squeeze seq dim → (B, heads, hd)
-    q_mps = _mlx_to_mps(queries[:, :, 0, :], dtype=cache.dtype)
-    k_mps = _mlx_to_mps(keys_new[:, :, 0, :], dtype=cache.dtype)
-    v_mps = _mlx_to_mps(values[:, :, 0, :], dtype=cache.dtype)
+    q_mps = mlx_to_torch(queries[:, :, 0, :], device="mps").to(dtype=cache.dtype)
+    k_mps = mlx_to_torch(keys_new[:, :, 0, :], device="mps").to(dtype=cache.dtype)
+    v_mps = mlx_to_torch(values[:, :, 0, :], device="mps").to(dtype=cache.dtype)
 
     slot_mapping_mps = torch.tensor(ctx.slot_mapping, dtype=torch.long, device="mps")
 
@@ -199,7 +182,7 @@ def _metal_kernel_decode_attention(
     )
 
     # Bridge output back to MLX: (B, heads, hd) → (B, 1, heads*hd)
-    out_mlx = _mps_to_mlx(out)  # (B, heads, head_dim)
+    out_mlx = torch_to_mlx(out)  # (B, heads, head_dim)
     out_mlx = out_mlx.reshape(B, 1, n_heads * head_dim)
     return attn_module.o_proj(out_mlx)
 
