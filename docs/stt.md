@@ -22,7 +22,7 @@ Any OpenAI Whisper checkpoint (HuggingFace or MLX format):
 | Whisper Medium | 769M | `openai/whisper-medium` |
 | Whisper Large V3 | 1.5B | `openai/whisper-large-v3` |
 
-MLX-format weights (e.g. from `mlx-community`) are also supported. Missing tokenizer/processor files are auto-downloaded from `openai/whisper-small` on first load.
+MLX-format weights (e.g. from `mlx-community`) are also supported. Missing tokenizer files are auto-downloaded from `openai/whisper-small` on first load; download failures are logged and may affect transcription if required files remain missing.
 
 ## API Endpoints
 

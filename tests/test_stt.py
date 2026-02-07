@@ -27,19 +27,17 @@ class TestSpeechToTextConfig:
 
     def test_default_values(self) -> None:
         cfg = SpeechToTextConfig()
-        assert cfg.sample_rate == 16000
         assert cfg.max_audio_clip_s == 30.0
         assert cfg.overlap_chunk_second == 1.0
         assert cfg.min_energy_split_window_size == 1600
+        assert cfg.sample_rate == 16000  # deprecated but still accepted
 
     def test_custom_values(self) -> None:
         cfg = SpeechToTextConfig(
-            sample_rate=8000,
             max_audio_clip_s=15.0,
             overlap_chunk_second=0.5,
             min_energy_split_window_size=800,
         )
-        assert cfg.sample_rate == 8000
         assert cfg.max_audio_clip_s == 15.0
         assert cfg.overlap_chunk_second == 0.5
         assert cfg.min_energy_split_window_size == 800
@@ -327,6 +325,64 @@ class TestEncodePrompt:
 # ---------------------------------------------------------------------------
 # Integration tests (require model download)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Model runner STT path (deterministic, no model required)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteSTT:
+    """Deterministic tests for _execute_stt and helpers in model_runner."""
+
+    def test_greedy_decode_empty_prompt_returns_eot(self) -> None:
+        """Empty prompt should return EOT immediately without decoding."""
+        from unittest.mock import MagicMock
+
+        from vllm_metal.v1 import model_runner as mr
+
+        runner = MagicMock()
+        runner.model = MagicMock()
+
+        eot_token = 50257
+        audio_features = mx.zeros((1, 1500, 512))
+
+        # Call the helper directly
+        result = mr.MetalModelRunner._greedy_decode_stt(
+            runner, audio_features, [], eot_token
+        )
+
+        assert result == [eot_token]
+        # Model.decode should NOT be called for empty prompt
+        runner.model.decode.assert_not_called()
+
+    def test_extract_audio_features_missing_mm_features(self) -> None:
+        """Request without mm_features should return None."""
+        from unittest.mock import MagicMock
+
+        from vllm_metal.v1 import model_runner as mr
+
+        runner = MagicMock()
+        runner.model = MagicMock()
+
+        new_req = MagicMock()
+        del new_req.mm_features  # Simulate missing attribute
+
+        result = mr.MetalModelRunner._extract_audio_features(runner, new_req)
+        assert result is None
+
+    def test_extract_audio_features_empty_list(self) -> None:
+        """Request with empty mm_features list should return None."""
+        from unittest.mock import MagicMock
+
+        from vllm_metal.v1 import model_runner as mr
+
+        runner = MagicMock()
+        new_req = MagicMock()
+        new_req.mm_features = []
+
+        result = mr.MetalModelRunner._extract_audio_features(runner, new_req)
+        assert result is None
 
 
 @pytest.mark.slow

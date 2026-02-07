@@ -214,16 +214,12 @@ class MetalPlatform(Platform):
         if config.debug:
             logger.info(f"Metal config: {config}")
 
-        # STT (Whisper) models: MLX-converted model directories typically
-        # lack tokenizer / processor files that vLLM's scheduler and
-        # AsyncLLM init require (vocab.json, tokenizer.json,
-        # preprocessor_config.json, etc.).  Copy them from the canonical
-        # HuggingFace repo into the local directory so that every
-        # from_pretrained(model_path) call succeeds transparently.
+        # STT models: copy missing tokenizer files from canonical repo.
+        # preprocessor_config.json excluded (differs by model size).
         if model_config is not None and is_stt_model(model_config.model):
             cls._ensure_stt_hf_files(model_config.model)
-            model_config.tokenizer = "openai/whisper-small"
-            logger.info("STT model detected — HF files ensured, tokenizer overridden")
+            model_config.tokenizer = model_config.model
+            logger.info("STT model detected — using model path as tokenizer")
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
@@ -252,7 +248,10 @@ class MetalPlatform(Platform):
             f"{available_mem / 1e9:.1f}GB available"
         )
 
-    # HF files that vLLM needs but MLX-converted Whisper directories lack.
+    # HF tokenizer files that vLLM needs but MLX-converted Whisper directories lack.
+    # NOTE: preprocessor_config.json is intentionally excluded — it differs
+    # between model sizes (e.g. large-v3 uses 128 mel bins vs 80 for smaller
+    # models). Models should ship their own or vLLM will use HF defaults.
     _STT_HF_FILES = (
         "vocab.json",
         "merges.txt",
@@ -261,17 +260,14 @@ class MetalPlatform(Platform):
         "special_tokens_map.json",
         "normalizer.json",
         "added_tokens.json",
-        "preprocessor_config.json",
         "generation_config.json",
     )
-    # All Whisper sizes share the same tokenizer vocab.  preprocessor_config
-    # differs for large-v3 (128 mel bins vs 80) — callers loading large-v3
-    # should supply their own preprocessor_config.json in the model directory.
+    # All Whisper sizes share the same tokenizer vocab.
     _STT_CANONICAL_REPO = "openai/whisper-small"
 
     @classmethod
     def _ensure_stt_hf_files(cls, model_path: str) -> None:
-        """Copy missing tokenizer / processor files into *model_path*.
+        """Copy missing tokenizer files into *model_path*.
 
         Only touches files that do not already exist so user overrides
         are preserved.

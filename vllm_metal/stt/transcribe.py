@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -27,18 +28,38 @@ from vllm_metal.stt.config import SpeechToTextConfig
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
 
+logger = logging.getLogger(__name__)
 
-@lru_cache(maxsize=1)
-def _get_tokenizer():
-    """Get cached Whisper tokenizer."""
+
+@lru_cache(maxsize=4)
+def _get_tokenizer(model_path: str | None = None):
+    """Get cached Whisper tokenizer.
+
+    Args:
+        model_path: Local model path to load tokenizer from. Falls back to
+            openai/whisper-small if not provided or loading fails.
+    """
     from transformers import WhisperTokenizer
 
-    return WhisperTokenizer.from_pretrained("openai/whisper-small")
+    # Try local model path first (works offline if tokenizer files present)
+    if model_path:
+        try:
+            return WhisperTokenizer.from_pretrained(model_path)
+        except Exception as e:
+            logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
+
+    # Fall back to openai/whisper-small (online or cached)
+    try:
+        return WhisperTokenizer.from_pretrained("openai/whisper-small")
+    except OSError:
+        return WhisperTokenizer.from_pretrained(
+            "openai/whisper-small", local_files_only=True
+        )
 
 
-def _get_token_id(token: str) -> int:
+def _get_token_id(token: str, model_path: str | None = None) -> int:
     """Get token ID from tokenizer."""
-    return _get_tokenizer().convert_tokens_to_ids(token)
+    return _get_tokenizer(model_path).convert_tokens_to_ids(token)
 
 
 @dataclass
@@ -279,20 +300,18 @@ def transcribe(
 ) -> TranscriptionResult:
     """Transcribe audio to text.
 
-    *prompt* supplies prior context (e.g. proper-noun spelling) injected
-    via ``<|startofprev|>`` tokens.  When *with_timestamps* is ``True``
-    the result includes per-segment timing information.  Long audio is
-    automatically split into chunks using the parameters in *stt_config*.
+    File paths are resampled to 16kHz; array inputs must already be 16kHz.
     """
+    if stt_config is None:
+        stt_config = SpeechToTextConfig()
+
+    # Whisper requires 16kHz audio
     if isinstance(audio, str):
-        audio = load_audio(audio)
+        audio = load_audio(audio, sample_rate=SAMPLE_RATE)
     elif isinstance(audio, np.ndarray):
         audio = mx.array(audio, mx.float32)
 
     total_duration = audio_duration(audio, SAMPLE_RATE)
-
-    if stt_config is None:
-        stt_config = SpeechToTextConfig()
 
     if not with_timestamps:
         # Fast path: single chunk, no timestamp tokens
@@ -311,7 +330,7 @@ def transcribe(
         max_clip_s=stt_config.max_audio_clip_s,
         overlap_s=stt_config.overlap_chunk_second,
         window_size=stt_config.min_energy_split_window_size,
-        sample_rate=stt_config.sample_rate,
+        sample_rate=SAMPLE_RATE,
     )
 
     all_segments: list[TranscriptionSegment] = []
