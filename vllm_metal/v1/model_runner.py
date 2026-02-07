@@ -1018,7 +1018,7 @@ class MetalModelRunner:
         self._paged_request_blocks[req_id] = all_blocks
         return all_blocks
 
-    def _prefill_single_paged(
+    def _prefill_single_request_paged(
         self,
         req_id: str,
         token_ids: list[int],
@@ -1232,7 +1232,7 @@ class MetalModelRunner:
 
                 if self._paged_kv_cache is not None:
                     # Paged attention path (Metal kernel)
-                    next_token = self._prefill_single_paged(
+                    next_token = self._prefill_single_request_paged(
                         req_id,
                         token_ids,
                         sampling_params,

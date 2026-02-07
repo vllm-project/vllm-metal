@@ -39,7 +39,13 @@ class MPSPagedKVCache:
 
         self._allocator = BlockAllocator(num_blocks)
 
-        # x factor for key cache layout
+        # The key cache uses a 5D layout for vectorized memory access:
+        #   [num_blocks, num_kv_heads, head_dim // x, block_size, x]
+        # where x = 16 // element_size ensures each innermost vector is
+        # exactly 16 bytes, matching the Metal kernel's load granularity.
+        # This layout is required by the HF paged-attention Metal kernel
+        # (ported from vLLM CUDA / mistral.rs):
+        #   https://github.com/huggingface/kernels-community/blob/main/paged-attention/paged-attention-metal/paged_attention.mm
         element_size = torch.tensor([], dtype=dtype).element_size()
         self.x = 16 // element_size  # 8 for float16, 4 for float32
 
