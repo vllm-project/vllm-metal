@@ -30,7 +30,6 @@ from vllm_metal.mlx_backend.paged_attention import (
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
 
-
 # ---------------------------------------------------------------------------
 # Bridge helpers
 # ---------------------------------------------------------------------------
@@ -68,7 +67,7 @@ def _metal_kernel_prefill_attention(
     Inline causal SDPA in MLX, then write K/V to MPS paged cache via
     ``reshape_and_cache``.
     """
-    B, _, L, _ = queries.shape
+    B, _, L, _ = queries.shape  # noqa: N806
 
     # RoPE
     offset = offset_cache.offset if offset_cache is not None else 0
@@ -127,7 +126,7 @@ def _metal_kernel_decode_attention(
     Per-request RoPE, write new token via ``reshape_and_cache``,
     then zero-copy attention via ``paged_attention_v1``.
     """
-    B = queries.shape[0]
+    B = queries.shape[0]  # noqa: N806
     n_heads = queries.shape[1]
     head_dim = queries.shape[3]
 
@@ -241,7 +240,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         kv_cache = self._mk_kv_cache
         layer_idx = self._mk_layer_idx
 
-        B, L, D = x.shape
+        B, L, D = x.shape  # noqa: N806
 
         # Projections + reshape
         queries = inner.q_proj(x)

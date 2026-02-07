@@ -234,7 +234,7 @@ class TestMetalKernelPagedVsStandard:
             all_seq_lens.append(len(tids))
 
         # Batched decode steps
-        for step in range(max_new - 1):
+        for _step in range(max_new - 1):
             requests_info = []
             for i in range(len(prompts)):
                 requests_info.append((all_block_ids[i], all_seq_lens[i]))

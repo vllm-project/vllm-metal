@@ -17,7 +17,6 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
 # ---------------------------------------------------------------------------
@@ -71,7 +70,7 @@ class OffsetCache:
 
     def make_mask(
         self,
-        N: int,
+        N: int,  # noqa: N803
         return_array: bool = False,
         window_size: int | None = None,
     ) -> Any:
