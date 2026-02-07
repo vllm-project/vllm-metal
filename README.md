@@ -73,3 +73,12 @@ Environment variables for customization:
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
+
+## Speech-to-Text (STT)
+
+OpenAI-compatible Whisper transcription on Apple Silicon. See [docs/stt.md](docs/stt.md) for full documentation.
+
+```bash
+vllm serve /path/to/whisper-small-mlx --port 8000
+curl -X POST http://localhost:8000/v1/audio/transcriptions -F "file=@audio.wav"
+```

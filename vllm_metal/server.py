@@ -133,7 +133,6 @@ async def list_models() -> ModelsResponse:
     """List available models."""
     if not _model_name:
         return ModelsResponse(data=[])
-
     return ModelsResponse(
         data=[
             ModelInfo(
