@@ -1346,7 +1346,9 @@ class MetalModelRunner:
             tokenizer_path = getattr(self.model_config, "tokenizer", None)
             eot_token = _get_token_id("<|endoftext|>", tokenizer_path)
         except Exception:
-            logger.warning("Failed to load tokenizer, using fallback EOT", exc_info=True)
+            logger.warning(
+                "Failed to load tokenizer, using fallback EOT", exc_info=True
+            )
             eot_token = 50257  # Whisper EOT token ID
 
         req_ids: list[str] = []
