@@ -71,14 +71,14 @@ ISO639_1_SUPPORTED_LANGS: dict[str, str] = {
 class SpeechToTextConfig:
     """Runtime configuration for STT processing.
 
-    Controls audio chunking, energy-based splitting, and general
-    processing parameters.
+    Controls audio chunking and energy-based splitting parameters.
     """
 
-    sample_rate: int = 16000
     max_audio_clip_s: float = 30.0
     overlap_chunk_second: float = 1.0
     min_energy_split_window_size: int = 1600
+    # Deprecated: Whisper requires 16kHz; this field is ignored.
+    sample_rate: int = 16000
 
 
 def is_stt_model(model_path: str) -> bool:

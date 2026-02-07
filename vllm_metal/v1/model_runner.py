@@ -1340,13 +1340,18 @@ class MetalModelRunner:
             No exceptions are raised; encoding/decoding failures result
             in an empty transcription (EOT token only) for that request.
         """
-        from vllm_metal.stt.transcribe import _get_token_id
+        try:
+            from vllm_metal.stt.transcribe import _get_token_id
+
+            tokenizer_path = getattr(self.model_config, "tokenizer", None)
+            eot_token = _get_token_id("<|endoftext|>", tokenizer_path)
+        except Exception:
+            logger.warning("Failed to load tokenizer, using fallback EOT", exc_info=True)
+            eot_token = 50257  # Whisper EOT token ID
 
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
-
-        eot_token = _get_token_id("<|endoftext|>")
 
         for new_req in scheduler_output.scheduled_new_reqs:
             req_id = new_req.req_id
@@ -1355,20 +1360,24 @@ class MetalModelRunner:
 
             prompt_token_ids = new_req.prompt_token_ids or []
 
-            # Extract audio features from mm_features (set by vLLM's
-            # WhisperMultiModalProcessor via WhisperFeatureExtractor).
-            audio_features = self._extract_audio_features(new_req)
+            try:
+                # Extract audio features from mm_features (set by vLLM's
+                # WhisperMultiModalProcessor via WhisperFeatureExtractor).
+                audio_features = self._extract_audio_features(new_req)
 
-            if audio_features is None:
-                # No audio found — return empty transcription
+                if audio_features is None:
+                    # No audio found — return empty transcription
+                    sampled_tokens.append([eot_token])
+                    continue
+
+                # Greedy decode using prompt tokens from vLLM's STT pipeline
+                output_tokens = self._greedy_decode_stt(
+                    audio_features, prompt_token_ids, eot_token
+                )
+                sampled_tokens.append(output_tokens)
+            except Exception:
+                logger.warning("STT decode failed for %s", req_id, exc_info=True)
                 sampled_tokens.append([eot_token])
-                continue
-
-            # Greedy decode using prompt tokens from vLLM's STT pipeline
-            output_tokens = self._greedy_decode_stt(
-                audio_features, prompt_token_ids, eot_token
-            )
-            sampled_tokens.append(output_tokens)
 
         # Clean up finished requests (STT requests finish in a single step)
         for req_id in scheduler_output.finished_req_ids:
@@ -1449,6 +1458,10 @@ class MetalModelRunner:
         Returns:
             List of decoded token IDs, ending with EOT
         """
+        # Guard against empty prompt — return EOT immediately
+        if not prompt_token_ids:
+            return [eot_token]
+
         tokens = mx.array([prompt_token_ids], dtype=mx.int32)
         kv_cache = None
         output_tokens: list[int] = []
