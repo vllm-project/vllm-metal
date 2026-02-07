@@ -8,8 +8,6 @@ vllm-metal includes OpenAI-compatible Speech-to-Text support built on Whisper. I
 vllm serve /path/to/whisper-small-mlx --port 8000
 ```
 
-The server auto-detects Whisper models from `config.json` and mounts the `/v1/audio/*` endpoints.
-
 ## Supported Models
 
 Any OpenAI Whisper checkpoint (HuggingFace or MLX format):
@@ -22,7 +20,7 @@ Any OpenAI Whisper checkpoint (HuggingFace or MLX format):
 | Whisper Medium | 769M | `openai/whisper-medium` |
 | Whisper Large V3 | 1.5B | `openai/whisper-large-v3` |
 
-MLX-format weights (e.g. from `mlx-community`) are also supported. Missing tokenizer files are auto-downloaded from `openai/whisper-small` on first load; download failures are logged and may affect transcription if required files remain missing.
+MLX-format weights (e.g. from `mlx-community`) are also supported.
 
 ## API Endpoints
 
@@ -57,8 +55,7 @@ Translate audio to English. Same parameters as transcriptions (except `language`
   "language": "en",
   "text": " Hello, world.",
   "segments": [
-    {"id": 0, "start": 0.0, "end": 2.5, "text": " Hello, world.",
-     "tokens": [50364, 2425, 11, 1002, 13, 50489], "temperature": 0.0, "seek": 0}
+    {"id": 0, "start": 0.0, "end": 2.5, "text": " Hello, world."}
   ]
 }
 ```
@@ -102,11 +99,8 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 # Translate to English
 curl -X POST http://localhost:8000/v1/audio/translations \
   -F "file=@japanese_audio.wav"
-
-# List models
-curl http://localhost:8000/v1/models
 ```
 
 ## Supported Languages
 
-100 languages including: English, Chinese, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Arabic, Hindi, and [many more](../vllm_metal/stt/config.py).
+100 languages including: English, Chinese, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Arabic, Hindi, and more.
