@@ -147,9 +147,131 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
+        # Patch model for paged attention if enabled
+        if self.metal_config.use_metal_kernel:
+            self._setup_metal_kernel_attention()
+        elif self.metal_config.use_paged_attention:
+            self._setup_paged_attention()
+
         # In auto mode, set MLX memory limit to prevent unbounded growth
         if self.metal_config.is_auto_memory:
             self._set_auto_memory_limit()
+
+    def _setup_paged_attention(self) -> None:
+        """Create PagedKVCache and patch model attention for paged KV."""
+        from vllm_metal.mlx_backend.cache import PagedKVCache
+        from vllm_metal.mlx_backend.paged_attention import patch_model_attention
+
+        runner = self.model_runner
+        block_size = self.metal_config.block_size
+
+        # Extract model dimensions
+        num_layers = (
+            runner.model_args.get("num_hidden_layers")
+            or runner.model_args.get("n_layers")
+            or 32
+        )
+        num_attention_heads = runner.model_args.get("num_attention_heads") or 32
+        num_kv_heads = (
+            runner.model_args.get("num_key_value_heads")
+            or runner.model_args.get("n_kv_heads")
+            or num_attention_heads
+        )
+        hidden_size = runner.model_args.get("hidden_size") or 4096
+        head_dim = runner.model_args.get("head_dim") or (
+            hidden_size // num_attention_heads
+        )
+
+        # Allocate blocks — use a reasonable default; the actual count is
+        # refined later by initialize_from_config, but we need the pool now.
+        max_model_len = self.model_config.max_model_len
+        num_blocks = (max_model_len + block_size - 1) // block_size
+        # Add buffer for batched decode (multiple sequences)
+        num_blocks = int(num_blocks * 4)
+
+        paged_kv_cache = PagedKVCache(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            dtype=mx.float16,
+        )
+
+        n_patched = patch_model_attention(runner.model, paged_kv_cache, block_size)
+        logger.info(
+            "Paged attention enabled: %d layers patched, %d blocks allocated "
+            "(block_size=%d, kv_heads=%d, head_dim=%d)",
+            n_patched,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )
+
+        # Store on model runner for use by paged prefill/decode
+        runner._paged_kv_cache = paged_kv_cache
+        runner._paged_block_size = block_size
+
+    def _setup_metal_kernel_attention(self) -> None:
+        """Create MPSPagedKVCache and patch model attention for HF Metal kernel."""
+        import torch
+
+        from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
+        from vllm_metal.metal_kernel_backend.paged_attention import (
+            patch_model_attention_metal_kernel,
+        )
+
+        runner = self.model_runner
+        block_size = self.metal_config.block_size
+
+        # Extract model dimensions
+        num_layers = (
+            runner.model_args.get("num_hidden_layers")
+            or runner.model_args.get("n_layers")
+            or 32
+        )
+        num_attention_heads = runner.model_args.get("num_attention_heads") or 32
+        num_kv_heads = (
+            runner.model_args.get("num_key_value_heads")
+            or runner.model_args.get("n_kv_heads")
+            or num_attention_heads
+        )
+        hidden_size = runner.model_args.get("hidden_size") or 4096
+        head_dim = runner.model_args.get("head_dim") or (
+            hidden_size // num_attention_heads
+        )
+
+        # Allocate blocks
+        max_model_len = self.model_config.max_model_len
+        num_blocks = (max_model_len + block_size - 1) // block_size
+        num_blocks = int(num_blocks * 4)  # buffer for batched decode
+
+        mps_kv_cache = MPSPagedKVCache(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            dtype=torch.float16,
+        )
+
+        n_patched = patch_model_attention_metal_kernel(
+            runner.model, mps_kv_cache, block_size
+        )
+        logger.info(
+            "Metal kernel paged attention enabled: %d layers patched, "
+            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
+            n_patched,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )
+
+        # Store on model runner for use by paged prefill/decode
+        runner._metal_kernel_kv_cache = mps_kv_cache
+        runner._paged_block_size = block_size
 
     def _get_model_memory_usage(self) -> int:
         """Get current model memory usage from MLX.

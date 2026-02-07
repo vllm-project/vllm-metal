@@ -29,6 +29,8 @@ class MetalConfig:
     mlx_device: Literal["gpu", "cpu"]
     block_size: int
     debug: bool
+    use_paged_attention: bool = False
+    use_metal_kernel: bool = False
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -59,6 +61,9 @@ class MetalConfig:
             mlx_device=os.environ.get("VLLM_MLX_DEVICE", "gpu"),  # type: ignore[arg-type]
             block_size=int(os.environ.get("VLLM_METAL_BLOCK_SIZE", "16")),
             debug=os.environ.get("VLLM_METAL_DEBUG", "0") == "1",
+            use_paged_attention=os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+            == "1",
+            use_metal_kernel=os.environ.get("VLLM_METAL_USE_METAL_KERNEL", "0") == "1",
         )
 
 
