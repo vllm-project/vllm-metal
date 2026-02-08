@@ -68,7 +68,6 @@ except ImportError:
     logger.debug("Rust extension not available, using Python fallback")
 
 # Configuration for batched operations
-_MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
 _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
@@ -931,73 +930,6 @@ class MetalModelRunner:
 
         return next_tokens
 
-    def _sequential_decode(
-        self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> list[int]:
-        """Fallback: process decode requests sequentially.
-
-        Used when batch size is 1 (no benefit from batching).
-
-        Args:
-            decode_reqs: List of (req_id, state) tuples
-
-        Returns:
-            List of next tokens for each request
-        """
-        next_tokens = []
-
-        for req_id, state in decode_reqs:
-            last_token = state.token_ids[-1] if state.token_ids else 0
-            input_ids = mx.array([[last_token]], dtype=mx.int32)
-
-            model_output = self.model(input_ids, cache=state.cache)
-            logits = self._extract_logits(model_output)
-            last_logits = logits[:, -1, :]
-
-            # Use native MLX greedy sampling when possible
-            sp = state.sampling_params
-            is_greedy = sp.temperature < 1e-5
-            needs_advanced = (
-                sp.top_k > 0
-                or sp.top_p < 1.0
-                or sp.frequency_penalty != 0
-                or sp.presence_penalty != 0
-                or sp.repetition_penalty != 1.0
-            )
-
-            if is_greedy and not needs_advanced:
-                # Fast path: native MLX greedy sampling
-                next_token_mlx = _mlx_greedy_sample(last_logits)
-                mx.eval(next_token_mlx)
-                next_token = int(next_token_mlx.item())
-            else:
-                # Slow path: use vLLM sampler
-                mx.eval(last_logits)
-                logits_torch = mlx_to_torch(
-                    last_logits.astype(mx.float32), device=self.device
-                )
-                generators = {} if state.generator is None else {0: state.generator}
-                metadata = self._make_sampling_metadata(
-                    [state.sampling_params],
-                    [state.token_ids[: state.prompt_len]],
-                    [state.token_ids[state.prompt_len :]],
-                    generators=generators,
-                )
-                output = self._sampler.forward(logits_torch, metadata)
-                next_token = int(output.sampled_token_ids[0, 0].item())
-
-            next_tokens.append(next_token)
-
-            # Update state
-            state.token_ids.append(next_token)
-            state.generated_tokens += 1
-
-            # Update Rust state manager if available
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_token)
-
-        return next_tokens
-
     # ------------------------------------------------------------------
     # Paged attention paths
     # ------------------------------------------------------------------
@@ -1297,12 +1229,9 @@ class MetalModelRunner:
 
             if valid_decode_reqs:
                 if self._paged_kv_cache is not None:
-                    # Paged attention path (always batched)
                     decode_tokens = self._batched_decode_paged(valid_decode_reqs)
-                elif len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
-                    decode_tokens = self._batched_decode(valid_decode_reqs)
                 else:
-                    decode_tokens = self._sequential_decode(valid_decode_reqs)
+                    decode_tokens = self._batched_decode(valid_decode_reqs)
 
                 # Add decode results to output
                 for i, (req_id, _) in enumerate(valid_decode_reqs):

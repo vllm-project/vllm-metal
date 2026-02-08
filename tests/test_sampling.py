@@ -351,7 +351,7 @@ class TestV1PenaltyTokenAccounting:
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)])
+        next_tokens = runner._batched_decode([("r1", state)])
 
         assert next_tokens == [prompt_token]
 
@@ -381,7 +381,7 @@ class TestV1PenaltyTokenAccounting:
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)])
+        next_tokens = runner._batched_decode([("r1", state)])
 
         assert next_tokens == [prompt_token]
 
