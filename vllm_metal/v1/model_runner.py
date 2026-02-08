@@ -409,7 +409,6 @@ class MetalModelRunner:
         # Paged attention state (set by worker when enabled)
         self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
-        self._paged_request_blocks: dict[str, list[int]] = {}  # req_id → block_ids
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
 
     def _is_vlm_model(self) -> bool:
@@ -1004,19 +1003,16 @@ class MetalModelRunner:
     # ------------------------------------------------------------------
 
     def _allocate_blocks_for_seq(self, req_id: str, num_tokens: int) -> list[int]:
-        """Allocate blocks for a sequence and track them."""
+        """Allocate blocks for a sequence, using the Rust allocator as source of truth."""
         bs = self._paged_block_size
         num_blocks = (num_tokens + bs - 1) // bs
-        # Check if we need more blocks than already allocated
-        existing = self._paged_request_blocks.get(req_id, [])
+        cache = self._paged_kv_cache
+        existing = cache.get_sequence_blocks(req_id)
         if len(existing) >= num_blocks:
             return existing
         needed = num_blocks - len(existing)
-        cache = self._paged_kv_cache
-        new_blocks = cache.allocate_blocks(hash(req_id), needed)
-        all_blocks = existing + new_blocks
-        self._paged_request_blocks[req_id] = all_blocks
-        return all_blocks
+        new_blocks = cache.allocate_blocks(req_id, needed)
+        return existing + new_blocks
 
     def _prefill_single_request_paged(
         self,
@@ -1333,10 +1329,8 @@ class MetalModelRunner:
                 # Free paged KV blocks
                 if self._paged_kv_cache is not None:
                     paged_cache = self._paged_kv_cache
-                    req_hash = hash(req_id)
-                    if paged_cache.has_sequence(req_hash):
-                        paged_cache.free_sequence(req_hash)
-                    self._paged_request_blocks.pop(req_id, None)
+                    if paged_cache.has_sequence(req_id):
+                        paged_cache.free_sequence(req_id)
                     self._paged_request_seq_lens.pop(req_id, None)
 
                 # Remove from Rust state manager if available

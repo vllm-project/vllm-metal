@@ -79,20 +79,24 @@ class MPSPagedKVCache:
         self.k_scale_tensor = torch.tensor(1.0, dtype=torch.float32, device="mps")
         self.v_scale_tensor = torch.tensor(1.0, dtype=torch.float32, device="mps")
 
-    def allocate_blocks(self, seq_id: int, num_blocks: int) -> list[int]:
+    def allocate_blocks(self, seq_id: str, num_blocks: int) -> list[int]:
         """Allocate *num_blocks* blocks for *seq_id*.
 
         Returns list of block indices.
         """
         return self._allocator.allocate_blocks(seq_id, num_blocks)
 
-    def free_sequence(self, seq_id: int) -> None:
+    def free_sequence(self, seq_id: str) -> None:
         """Free all blocks belonging to *seq_id*."""
         self._allocator.free_sequence(seq_id)
 
-    def has_sequence(self, seq_id: int) -> bool:
+    def has_sequence(self, seq_id: str) -> bool:
         """Check whether *seq_id* has allocated blocks."""
         return self._allocator.has_sequence(seq_id)
+
+    def get_sequence_blocks(self, seq_id: str) -> list[int]:
+        """Return the block indices allocated to *seq_id*."""
+        return self._allocator.get_sequence_blocks(seq_id)
 
     @property
     def num_free_blocks(self) -> int:

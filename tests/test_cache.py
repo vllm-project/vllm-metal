@@ -132,11 +132,11 @@ class TestPagedKVCache:
         )
 
         # Allocate blocks for sequence 0
-        blocks = cache.allocate_blocks(seq_id=0, num_blocks=3)
+        blocks = cache.allocate_blocks(seq_id="seq-0", num_blocks=3)
 
         assert len(blocks) == 3
         assert cache.num_free_blocks == 7
-        assert cache.has_sequence(0)
+        assert cache.has_sequence("seq-0")
 
     def test_block_allocation_insufficient(self) -> None:
         """Test block allocation with insufficient blocks."""
@@ -150,7 +150,7 @@ class TestPagedKVCache:
 
         # Try to allocate more blocks than available
         with pytest.raises(RuntimeError, match="Not enough free blocks"):
-            cache.allocate_blocks(seq_id=0, num_blocks=10)
+            cache.allocate_blocks(seq_id="seq-0", num_blocks=10)
 
     def test_sequence_free(self) -> None:
         """Test freeing sequence blocks."""
@@ -163,17 +163,17 @@ class TestPagedKVCache:
         )
 
         # Allocate blocks
-        cache.allocate_blocks(seq_id=0, num_blocks=3)
-        cache.allocate_blocks(seq_id=1, num_blocks=2)
+        cache.allocate_blocks(seq_id="seq-0", num_blocks=3)
+        cache.allocate_blocks(seq_id="seq-1", num_blocks=2)
 
         assert cache.num_free_blocks == 5
 
         # Free sequence 0
-        cache.free_sequence(seq_id=0)
+        cache.free_sequence(seq_id="seq-0")
 
         assert cache.num_free_blocks == 8
-        assert not cache.has_sequence(0)
-        assert cache.has_sequence(1)
+        assert not cache.has_sequence("seq-0")
+        assert cache.has_sequence("seq-1")
 
     def test_block_update(self) -> None:
         """Test updating block contents."""
@@ -185,7 +185,7 @@ class TestPagedKVCache:
             block_size=16,
         )
 
-        blocks = cache.allocate_blocks(seq_id=0, num_blocks=1)
+        blocks = cache.allocate_blocks(seq_id="seq-0", num_blocks=1)
         block_idx = blocks[0]
 
         # Update block
@@ -201,7 +201,9 @@ class TestPagedKVCache:
         )
 
         # Verify update
-        cached_k, cached_v = cache.get_sequence_kv(seq_id=0, layer_idx=0, seq_len=8)
+        cached_k, cached_v = cache.get_sequence_kv(
+            seq_id="seq-0", layer_idx=0, seq_len=8
+        )
         mx.eval(cached_k, cached_v)
 
         assert cached_k.shape == (8, 4, 32)
