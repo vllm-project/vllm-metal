@@ -132,7 +132,11 @@ class WhisperTranscriber:
         for chunk_audio, chunk_start in chunks:
             features = _encode_chunk(self.model, chunk_audio)
             output_tokens = _greedy_decode(
-                self.model, features, language, task, prompt,
+                self.model,
+                features,
+                language,
+                task,
+                prompt,
                 with_timestamps=with_timestamps,
             )
 
@@ -144,7 +148,9 @@ class WhisperTranscriber:
                 seg_id_offset += len(segments)
                 # Fallback if no segments extracted
                 if not segments:
-                    text = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
+                    text = self.tokenizer.decode(
+                        output_tokens, skip_special_tokens=True
+                    )
                     if text.strip():
                         all_text_parts.append(text.strip())
             else:
