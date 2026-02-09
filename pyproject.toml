@@ -38,14 +38,7 @@ dependencies = [
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
-    # Server dependencies
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
-    "pydantic>=2.0.0",
 ]
-
-[project.scripts]
-vllm-metal = "vllm_metal.server:main"
 
 [project.optional-dependencies]
 vllm = ["vllm>=0.13.0"]
