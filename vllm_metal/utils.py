@@ -25,7 +25,7 @@ def get_model_download_path(model_repo_name: str) -> str:
     Spin up the server:
 
     ```bash
-    export VLLM_USE_MODELSCOPE=True && export VLLM_METAL_MODELSCOPE_CACHE=/path/of/model/cache/to/be/downloaded &&  vllm-metal -m mlx-community/Qwen2.5-0.5B-4bit --host 0.0.0.0 --port 8000 --log-level debug
+    export VLLM_USE_MODELSCOPE=True && export VLLM_METAL_MODELSCOPE_CACHE=/path/of/model/cache/to/be/downloaded && vllm serve mlx-community/Qwen2.5-0.5B-4bit --host 0.0.0.0 --port 8000 --log-level debug
     ```
     """
     if Path(model_repo_name).exists():
