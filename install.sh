@@ -112,6 +112,7 @@ main() {
   fi
 
   is_apple_silicon
+
   if ! ensure_uv; then
     exit 1
   fi

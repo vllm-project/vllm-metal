@@ -204,6 +204,8 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        from vllm_metal.stt.config import is_stt_model
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
@@ -211,6 +213,11 @@ class MetalPlatform(Platform):
 
         if config.debug:
             logger.info(f"Metal config: {config}")
+
+        # STT models: set tokenizer path for runtime loading
+        if model_config is not None and is_stt_model(model_config.model):
+            model_config.tokenizer = model_config.model
+            logger.info("STT model detected")
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
