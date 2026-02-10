@@ -12,6 +12,9 @@ def get_model_download_path(model_repo_name: str) -> str:
     """
     Get the path to the model, downloading from ModelScope if configured, otherwise will pass the model_repo_name.
 
+    When VLLM_USE_MODELSCOPE=True, downloads the model from ModelScope (modelscope.cn)
+    instead of HuggingFace. Useful in regions where HuggingFace is slow or blocked.
+
     Args:
         model_repo_name: Model repo name from HuggingFace or ModelScope
 
@@ -20,12 +23,8 @@ def get_model_download_path(model_repo_name: str) -> str:
 
     Example:
 
-    model_repo_name example: mlx-community/Qwen2.5-0.5B-4bit
-
-    Spin up the server:
-
     ```bash
-    export VLLM_USE_MODELSCOPE=True && export VLLM_METAL_MODELSCOPE_CACHE=/path/of/model/cache/to/be/downloaded &&  vllm-metal -m mlx-community/Qwen2.5-0.5B-4bit --host 0.0.0.0 --port 8000 --log-level debug
+    VLLM_USE_MODELSCOPE=True VLLM_METAL_MODELSCOPE_CACHE=/path/to/cache vllm serve Qwen/Qwen2.5-0.5B
     ```
     """
     if Path(model_repo_name).exists():

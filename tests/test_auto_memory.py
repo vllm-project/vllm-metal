@@ -15,53 +15,9 @@ from vllm_metal.config import (
 )
 from vllm_metal.v1 import worker as v1_worker_module
 from vllm_metal.v1.worker import MetalWorker as V1MetalWorker
-from vllm_metal.worker import MetalWorker as LegacyMetalWorker
 
 
 class TestAutoMemoryGuardrails:
-    def test_legacy_worker_returns_blocks_when_feasible(self, monkeypatch) -> None:
-        worker = LegacyMetalWorker.__new__(LegacyMetalWorker)
-        worker.config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=False,
-            mlx_device="gpu",
-            block_size=16,
-            debug=False,
-        )
-        worker.vllm_config = None
-        worker.model_runner = None
-        worker._get_model_memory_usage = lambda: 500_000_000
-
-        monkeypatch.setattr(
-            psutil, "virtual_memory", lambda: SimpleNamespace(total=8_000_000_000)
-        )
-
-        num_gpu_blocks, num_cpu_blocks = worker.determine_num_available_blocks()
-        assert num_cpu_blocks == 0
-        assert num_gpu_blocks > 0
-
-    def test_legacy_worker_raises_when_minimal_needed_exceeds_total(
-        self, monkeypatch
-    ) -> None:
-        worker = LegacyMetalWorker.__new__(LegacyMetalWorker)
-        worker.config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=False,
-            mlx_device="gpu",
-            block_size=16,
-            debug=False,
-        )
-        worker.vllm_config = None
-        worker.model_runner = None
-        worker._get_model_memory_usage = lambda: 2_000_000_000
-
-        monkeypatch.setattr(
-            psutil, "virtual_memory", lambda: SimpleNamespace(total=1_000_000_000)
-        )
-
-        with pytest.raises(ValueError, match="Auto memory mode"):
-            worker.determine_num_available_blocks()
-
     def test_v1_worker_sets_mx_memory_limit_in_auto_mode_when_feasible(
         self, monkeypatch
     ) -> None:
