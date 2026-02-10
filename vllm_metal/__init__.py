@@ -57,18 +57,10 @@ def __getattr__(name):
         from vllm_metal.config import reset_config
 
         return reset_config
-    elif name == "MetalModelRunner":
-        from vllm_metal.model_runner import MetalModelRunner
-
-        return MetalModelRunner
     elif name == "MetalPlatform":
         from vllm_metal.platform import MetalPlatform
 
         return MetalPlatform
-    elif name == "MetalWorker":
-        from vllm_metal.worker import MetalWorker
-
-        return MetalWorker
     elif name == "register":
         return _register
     elif name == "register_ops":
@@ -79,8 +71,6 @@ def __getattr__(name):
 __all__ = [
     "MetalConfig",
     "MetalPlatform",
-    "MetalWorker",
-    "MetalModelRunner",
     "get_config",
     "reset_config",
     "register",
