@@ -41,7 +41,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vllm = ["vllm>=0.13.0"]
+vllm = ["vllm>=0.14.0"]
 stt = [
     # Speech-to-text audio processing (Whisper models)
     "librosa>=0.10.2",

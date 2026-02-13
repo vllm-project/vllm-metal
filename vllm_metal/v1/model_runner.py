@@ -37,7 +37,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -485,6 +485,10 @@ class MetalModelRunner:
 
         # Track finished requests for lazy cache clearing
         self._finished_request_count = 0
+
+        # vLLM v1 async scheduling calls sample_tokens after execute_model.
+        # Keep the latest execution output so sample_tokens can return it.
+        self._pending_output: ModelRunnerOutput | None = None
 
         # Prefix cache for shared prompt reuse
         self._prefix_cache: PrefixCacheManager | None = None
@@ -1206,7 +1210,7 @@ class MetalModelRunner:
 
         # Handle empty case
         if not req_ids:
-            return ModelRunnerOutput(
+            self._pending_output = ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
                 sampled_token_ids=[],
@@ -1214,8 +1218,9 @@ class MetalModelRunner:
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
+            return None
 
-        return ModelRunnerOutput(
+        self._pending_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_tokens,
@@ -1223,6 +1228,18 @@ class MetalModelRunner:
             prompt_logprobs_dict={},
             pooler_output=[None] * len(req_ids),
         )
+        return None
+
+    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
+        """Return sampled tokens produced by the last execute_model call."""
+        del grammar_output
+        if self._pending_output is None:
+            raise RuntimeError(
+                "sample_tokens called without pending output from execute_model"
+            )
+        output = self._pending_output
+        self._pending_output = None
+        return output
 
     def generate(
         self,

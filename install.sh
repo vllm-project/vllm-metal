@@ -123,7 +123,7 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.13.0"
+  local vllm_v="0.14.1"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
   curl -OL $url_base/v$vllm_v/$filename

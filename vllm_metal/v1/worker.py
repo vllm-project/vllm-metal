@@ -15,9 +15,9 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor import set_random_seed
 from vllm.tasks import SupportedTask
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
@@ -326,6 +326,10 @@ class MetalWorker(WorkerBase):
             Model runner output with generated tokens
         """
         return self.model_runner.execute_model(scheduler_output)
+
+    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
+        """Return sampled tokens for the previously executed batch."""
+        return self.model_runner.sample_tokens(grammar_output)
 
     def get_model(self) -> Any:
         """Get the underlying model.
