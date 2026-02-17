@@ -5,8 +5,8 @@ import platform
 
 import pytest
 import torch
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.selector import AttentionSelectorConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import AttentionSelectorConfig
 
 from vllm_metal.platform import MetalPlatform
 
