@@ -1367,6 +1367,7 @@ class MetalModelRunner:
 
         # === PHASE 1: Process new requests (prefill phase) ===
         new_reqs = scheduler_output.scheduled_new_reqs
+        new_reqs_by_id = {r.req_id: r for r in new_reqs}
 
         for new_req in new_reqs:
             req_id = new_req.req_id
@@ -1482,6 +1483,7 @@ class MetalModelRunner:
 
                 # Context phase: prefill only, emit no tokens.
                 for req_id in context_req_ids:
+                    emitted_token: int | None = None
                     state = self._request_states.get(req_id)
                     if state is not None:
                         idx = req_id_to_cached_idx.get(req_id)
@@ -1492,7 +1494,9 @@ class MetalModelRunner:
                         else:
                             computed = self._paged_request_seq_lens.get(req_id, 0)
                         scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                        target_len = computed + scheduled
+                        # cached_reqs.num_computed_tokens is post-schedule; it
+                        # already includes the tokens scheduled for this step.
+                        target_len = computed
                         full_token_ids = state.token_ids
                         if target_len > len(full_token_ids):
                             logger.warning(
@@ -1509,8 +1513,37 @@ class MetalModelRunner:
                             scheduled,
                             target_len,
                         )
-                        prev_len = self._paged_request_seq_lens.get(req_id, computed)
-                        if target_len > prev_len:
+                        prev_len = self._paged_request_seq_lens.get(
+                            req_id, max(0, target_len - scheduled)
+                        )
+                        # When a chunked prefill request reaches end-of-prompt,
+                        # emit the first token to enter generation phase.
+                        # Do this regardless of prev_len/target_len equality to
+                        # avoid missing the transition due local length skew.
+                        if target_len >= state.prompt_len and state.generated_tokens == 0:
+                            prompt_tokens = full_token_ids[: state.prompt_len]
+                            emitted_token = self._prefill_single_request_paged(
+                                req_id,
+                                prompt_tokens,
+                                state.sampling_params,
+                                generator=state.generator,
+                            )
+                            state.token_ids = prompt_tokens + [emitted_token]
+                            state.generated_tokens += 1
+                            logger.info(
+                                "Paged ctx->gen transition req=%s prompt_len=%d",
+                                req_id,
+                                state.prompt_len,
+                            )
+                            if self._rust_state_manager is not None:
+                                for token_id in full_token_ids[prev_len: state.prompt_len]:
+                                    self._rust_state_manager.append_token(
+                                        req_id, token_id
+                                    )
+                                self._rust_state_manager.append_token(
+                                    req_id, emitted_token
+                                )
+                        elif target_len > prev_len:
                             self._prefill_only_request_paged(
                                 req_id, full_token_ids[:target_len]
                             )
@@ -1522,7 +1555,10 @@ class MetalModelRunner:
                     # Emit no outputs for context phase.
                     req_ids.append(req_id)
                     req_id_to_index[req_id] = len(req_ids) - 1
-                    sampled_tokens.append([])
+                    if emitted_token is None:
+                        sampled_tokens.append([])
+                    else:
+                        sampled_tokens.append([emitted_token])
 
                 # Generation phase: decode as usual.
                 valid_decode_reqs: list[tuple[str, RequestState]] = []
@@ -1579,6 +1615,55 @@ class MetalModelRunner:
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([0])
 
+        # Consistency check: every scheduled request must be represented in
+        # req_ids, and decode-phase scheduled requests should not emit empty
+        # token lists. Missing/empty outputs here can leave placeholders stale.
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            missing_req_ids: list[str] = []
+            unexpected_empty_req_ids: list[str] = []
+            cached_req_id_set = set(cached_reqs.req_ids)
+            for req_id in scheduler_output.num_scheduled_tokens:
+                idx = req_id_to_index.get(req_id)
+                if idx is None:
+                    missing_req_ids.append(req_id)
+                    continue
+                if sampled_tokens[idx]:
+                    continue
+
+                is_cached_ctx = (
+                    req_id in cached_req_id_set
+                    and cached_reqs.is_context_phase(req_id)
+                )
+                is_new_ctx = False
+                new_req = new_reqs_by_id.get(req_id)
+                if new_req is not None:
+                    prompt_len = len(new_req.prompt_token_ids or [])
+                    computed = new_req.num_computed_tokens
+                    scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                    is_new_ctx = computed + scheduled < prompt_len
+
+                if not is_cached_ctx and not is_new_ctx:
+                    unexpected_empty_req_ids.append(req_id)
+
+            if missing_req_ids or unexpected_empty_req_ids:
+                logger.error(
+                    "ModelRunner scheduled/output mismatch: scheduled=%d emitted=%d "
+                    "missing=%d unexpected_empty=%d",
+                    len(scheduler_output.num_scheduled_tokens),
+                    len(req_ids),
+                    len(missing_req_ids),
+                    len(unexpected_empty_req_ids),
+                )
+                if missing_req_ids:
+                    logger.error(
+                        "Missing scheduled req ids: %s", missing_req_ids[:16]
+                    )
+                if unexpected_empty_req_ids:
+                    logger.error(
+                        "Unexpected empty outputs for req ids: %s",
+                        unexpected_empty_req_ids[:16],
+                    )
+
         # === PHASE 3: Clean up finished requests ===
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
@@ -1622,7 +1707,7 @@ class MetalModelRunner:
 
         # Handle empty case
         if not req_ids:
-            self._pending_output = ModelRunnerOutput(
+            empty_output = ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
                 sampled_token_ids=[],
@@ -1630,6 +1715,18 @@ class MetalModelRunner:
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                # No model execution in this step (e.g., finished_req_ids-only step).
+                # EngineCore expects execute_model() to return a concrete output
+                # directly because sample_tokens() is not invoked.
+                if not scheduler_output.finished_req_ids and self._request_states:
+                    raise RuntimeError(
+                        "No scheduled tokens and no finished requests while "
+                        f"{len(self._request_states)} requests remain active."
+                    )
+                self._pending_output = None
+                return empty_output
+            self._pending_output = empty_output
             return None
 
         logger.info(
