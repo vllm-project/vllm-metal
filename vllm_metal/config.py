@@ -19,6 +19,17 @@ AUTO_MEMORY_OVERHEAD_FACTOR = 1.2
 # avoid under-allocation due to rounding and other small overheads.
 AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR = 1.1
 
+# Paged attention: placeholder overhead for activations, framework, OS, etc.
+# Will be replaced by a profiling pass in a future PR.
+PAGED_ATTENTION_OVERHEAD_BYTES = 800 * 1024 * 1024  # 800 MB
+
+# Default memory fraction when user leaves VLLM_METAL_MEMORY_FRACTION as "auto"
+# but enables paged attention (auto is for the MLX path).
+PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
+
+# Minimum blocks required for paged attention to be usable.
+PAGED_ATTENTION_MIN_BLOCKS = 16
+
 
 @dataclass
 class MetalConfig:
