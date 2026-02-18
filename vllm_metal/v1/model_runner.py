@@ -342,7 +342,7 @@ class BatchMambaCache:
 
 def _is_mamba_cache(cache: AnyCache) -> bool:
     """Check if a cache is a Mamba-style cache (ArraysCache or MambaCache)."""
-    return isinstance(cache, (MambaCache, ArraysCache))
+    return isinstance(cache, MambaCache | ArraysCache)
 
 
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
@@ -1396,7 +1396,7 @@ class MetalModelRunner:
                             prompt_len,
                         )
                         self._prefill_only_request_paged(req_id, token_ids[:cur_len])
-                        cache = []  # No per-request KV cache needed
+                        cache: list = []  # No per-request KV cache needed
                         sampled_tokens.append([])
                         self._request_states[req_id] = RequestState(
                             token_ids=list(token_ids),
@@ -1554,7 +1554,7 @@ class MetalModelRunner:
                             sampled_tokens.append([0])
             else:
                 # Collect all valid decode requests
-                valid_decode_reqs: list[tuple[str, RequestState]] = []
+                valid_decode_reqs = []
                 for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
                     if state is not None:
