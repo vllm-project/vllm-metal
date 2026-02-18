@@ -1130,9 +1130,13 @@ class MetalModelRunner:
             if self._is_vlm and hasattr(self.model, "language_model")
             else self.model
         )
-        num_layers = len(
-            getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
-        )
+        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
+        if layers is None:
+            raise RuntimeError(
+                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
+                "Expected model.model.layers or model.layers."
+            )
+        num_layers = len(layers)
 
         # Stash per-request metadata (slot_mapping) in thread-local so the
         # patched attention wrappers can read it during the forward pass.
@@ -1214,9 +1218,13 @@ class MetalModelRunner:
             if self._is_vlm and hasattr(self.model, "language_model")
             else self.model
         )
-        num_layers = len(
-            getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
-        )
+        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
+        if layers is None:
+            raise RuntimeError(
+                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
+                "Expected model.model.layers or model.layers."
+            )
+        num_layers = len(layers)
 
         # OffsetCache is a fake cache — no KV stored.  The offset value
         # only matters for make_mask(); for single-token decode make_mask(1)
@@ -1330,7 +1338,6 @@ class MetalModelRunner:
 
         # === PHASE 1: Process new requests (prefill phase) ===
         new_reqs = scheduler_output.scheduled_new_reqs
-        new_reqs_by_id = {r.req_id: r for r in new_reqs}
 
         for new_req in new_reqs:
             req_id = new_req.req_id
@@ -1525,6 +1532,7 @@ class MetalModelRunner:
         # req_ids, and decode-phase scheduled requests should not emit empty
         # token lists. Missing/empty outputs here can leave placeholders stale.
         if scheduler_output.total_num_scheduled_tokens > 0:
+            new_reqs_by_id = {r.req_id: r for r in new_reqs}
             missing_req_ids: list[str] = []
             unexpected_empty_req_ids: list[str] = []
             for req_id in scheduler_output.num_scheduled_tokens:
