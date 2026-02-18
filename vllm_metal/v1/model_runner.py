@@ -1187,43 +1187,6 @@ class MetalModelRunner:
 
         return next_token
 
-    def _prefill_only_request_paged(
-        self,
-        req_id: str,
-        token_ids: list[int],
-    ) -> None:
-        """Paged-attention prefill without emitting output tokens.
-
-        Used for context-phase (chunked prefill) cached requests to
-        update KV cache while returning no outputs.
-        """
-        if not token_ids:
-            return
-
-        num_tokens = len(token_ids)
-        block_ids = self._allocate_blocks_for_seq(req_id, num_tokens)
-
-        # Determine number of layers for OffsetCache list
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        num_layers = len(
-            getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
-        )
-
-        prepare_prefill(block_ids, num_tokens, self._paged_block_size)
-
-        offset_caches = [OffsetCache(0) for _ in range(num_layers)]
-        input_ids = mx.array([token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=offset_caches)
-        logits = self._extract_logits(model_output)
-        mx.eval(logits)
-        clear_context()
-
-        self._paged_request_seq_lens[req_id] = num_tokens
-
     def _batched_decode_paged(
         self, decode_reqs: list[tuple[str, RequestState]]
     ) -> list[int]:
@@ -1388,16 +1351,16 @@ class MetalModelRunner:
                     computed_tokens = new_req.num_computed_tokens
                     prompt_len = len(token_ids)
                     if computed_tokens + scheduled_tokens < prompt_len:
-                        # Context-phase chunk: prefill only, emit no output tokens.
+                        # Intermediate chunk: sample then drop (async scheduler
+                        # allocates no placeholder for intermediate chunks).
                         cur_len = computed_tokens + scheduled_tokens
-                        logger.info(
-                            "Paged new req=%s ctx-chunk cur_len=%d prompt_len=%d",
+                        _discarded = self._prefill_single_request_paged(
                             req_id,
-                            cur_len,
-                            prompt_len,
+                            token_ids[:cur_len],
+                            sampling_params,
+                            generator=generator,
                         )
-                        self._prefill_only_request_paged(req_id, token_ids[:cur_len])
-                        cache: list = []  # No per-request KV cache needed
+                        cache: list = []
                         sampled_tokens.append([])
                         self._request_states[req_id] = RequestState(
                             token_ids=list(token_ids),
@@ -1453,39 +1416,24 @@ class MetalModelRunner:
 
         if decode_req_ids:
             if self._paged_kv_cache is not None:
-                # Paged attention path: respect context vs generation phase.
+                # Paged attention path: unified flow using model-runner-local
+                # state (state.generated_tokens) instead of is_context_phase().
                 req_id_to_cached_idx = {
                     rid: i for i, rid in enumerate(cached_reqs.req_ids)
                 }
-                for req_id in decode_req_ids:
-                    idx = req_id_to_cached_idx.get(req_id)
-                    if idx is None:
-                        continue
-                    logger.info(
-                        "Paged cached req=%s ctx=%s new_tokens=%d num_out_tokens=%d scheduled_tokens=%d",
-                        req_id,
-                        cached_reqs.is_context_phase(req_id),
-                        len(cached_reqs.new_token_ids[idx])
-                        if idx < len(cached_reqs.new_token_ids)
-                        else -1,
-                        cached_reqs.num_output_tokens[idx]
-                        if idx < len(cached_reqs.num_output_tokens)
-                        else -1,
-                        scheduler_output.num_scheduled_tokens.get(req_id, 0),
-                    )
-                context_req_ids: list[str] = []
-                decode_only_req_ids: list[str] = []
-                for req_id in decode_req_ids:
-                    if cached_reqs.is_context_phase(req_id):
-                        context_req_ids.append(req_id)
-                    else:
-                        decode_only_req_ids.append(req_id)
+                paged_decode_reqs: list[tuple[str, RequestState]] = []
 
-                # Context phase: prefill only, emit no tokens.
-                for req_id in context_req_ids:
-                    emitted_token: int | None = None
+                for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
-                    if state is not None:
+                    if state is None:
+                        # Edge case: no state — emit dummy token
+                        req_ids.append(req_id)
+                        req_id_to_index[req_id] = len(req_ids) - 1
+                        sampled_tokens.append([0])
+                        continue
+
+                    if state.generated_tokens == 0:
+                        # Still prefilling prompt
                         idx = req_id_to_cached_idx.get(req_id)
                         if idx is not None and idx < len(
                             cached_reqs.num_computed_tokens
@@ -1494,100 +1442,58 @@ class MetalModelRunner:
                         else:
                             computed = self._paged_request_seq_lens.get(req_id, 0)
                         scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                        # cached_reqs.num_computed_tokens is post-schedule; it
-                        # already includes the tokens scheduled for this step.
-                        target_len = computed
-                        full_token_ids = state.token_ids
-                        if target_len > len(full_token_ids):
-                            logger.warning(
-                                "Paged ctx-phase req=%s target_len=%d exceeds stored_len=%d",
+                        target_len = computed + scheduled  # FIX: was just `computed`
+
+                        if target_len < state.prompt_len:
+                            # Intermediate chunk: sample then drop
+                            prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
+                            _discarded = self._prefill_single_request_paged(
                                 req_id,
-                                target_len,
-                                len(full_token_ids),
-                            )
-                            target_len = len(full_token_ids)
-                        logger.info(
-                            "Paged ctx-phase req=%s computed=%d scheduled=%d target_len=%d",
-                            req_id,
-                            computed,
-                            scheduled,
-                            target_len,
-                        )
-                        prev_len = self._paged_request_seq_lens.get(
-                            req_id, max(0, target_len - scheduled)
-                        )
-                        # When a chunked prefill request reaches end-of-prompt,
-                        # emit the first token to enter generation phase.
-                        # Do this regardless of prev_len/target_len equality to
-                        # avoid missing the transition due local length skew.
-                        if target_len >= state.prompt_len and state.generated_tokens == 0:
-                            prompt_tokens = full_token_ids[: state.prompt_len]
-                            emitted_token = self._prefill_single_request_paged(
-                                req_id,
-                                prompt_tokens,
+                                state.token_ids[:target_len],
                                 state.sampling_params,
                                 generator=state.generator,
                             )
-                            state.token_ids = prompt_tokens + [emitted_token]
-                            state.generated_tokens += 1
-                            logger.info(
-                                "Paged ctx->gen transition req=%s prompt_len=%d",
+                            if self._rust_state_manager is not None:
+                                for tid in state.token_ids[prev_seq_len:target_len]:
+                                    self._rust_state_manager.append_token(req_id, tid)
+                            req_ids.append(req_id)
+                            req_id_to_index[req_id] = len(req_ids) - 1
+                            sampled_tokens.append([])
+                        else:
+                            # Last chunk: sample and keep (drains async placeholder)
+                            prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
+                            next_token = self._prefill_single_request_paged(
                                 req_id,
-                                state.prompt_len,
+                                state.token_ids[: state.prompt_len],
+                                state.sampling_params,
+                                generator=state.generator,
                             )
+                            state.token_ids = list(
+                                state.token_ids[: state.prompt_len]
+                            ) + [next_token]
+                            state.generated_tokens = 1
                             if self._rust_state_manager is not None:
-                                for token_id in full_token_ids[prev_len: state.prompt_len]:
-                                    self._rust_state_manager.append_token(
-                                        req_id, token_id
-                                    )
+                                for tid in state.token_ids[
+                                    prev_seq_len : state.prompt_len
+                                ]:
+                                    self._rust_state_manager.append_token(req_id, tid)
                                 self._rust_state_manager.append_token(
-                                    req_id, emitted_token
+                                    req_id, next_token
                                 )
-                        elif target_len > prev_len:
-                            self._prefill_only_request_paged(
-                                req_id, full_token_ids[:target_len]
-                            )
-                            if self._rust_state_manager is not None:
-                                for token_id in full_token_ids[prev_len:target_len]:
-                                    self._rust_state_manager.append_token(
-                                        req_id, token_id
-                                    )
-                    # Emit no outputs for context phase.
-                    req_ids.append(req_id)
-                    req_id_to_index[req_id] = len(req_ids) - 1
-                    if emitted_token is None:
-                        sampled_tokens.append([])
+                            req_ids.append(req_id)
+                            req_id_to_index[req_id] = len(req_ids) - 1
+                            sampled_tokens.append([next_token])
                     else:
-                        sampled_tokens.append([emitted_token])
+                        # Decode phase: collect for batched decode
+                        paged_decode_reqs.append((req_id, state))
 
-                # Generation phase: decode as usual.
-                valid_decode_reqs: list[tuple[str, RequestState]] = []
-                for req_id in decode_only_req_ids:
-                    state = self._request_states.get(req_id)
-                    if state is not None:
-                        valid_decode_reqs.append((req_id, state))
-
-                if valid_decode_reqs:
-                    decode_tokens = self._batched_decode_paged(valid_decode_reqs)
-                    for i, (req_id, _) in enumerate(valid_decode_reqs):
-                        logger.info(
-                            "Paged gen-phase req=%s emit_tokens=%d",
-                            req_id,
-                            1,
-                        )
+                # Batch decode all generation-phase requests
+                if paged_decode_reqs:
+                    decode_tokens = self._batched_decode_paged(paged_decode_reqs)
+                    for i, (req_id, _) in enumerate(paged_decode_reqs):
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([decode_tokens[i]])
-
-                # Handle requests with no cached state (edge case)
-                for req_id in decode_req_ids:
-                    if req_id not in req_id_to_index:
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        if cached_reqs.is_context_phase(req_id):
-                            sampled_tokens.append([])
-                        else:
-                            sampled_tokens.append([0])
             else:
                 # Collect all valid decode requests
                 valid_decode_reqs = []
@@ -1621,7 +1527,6 @@ class MetalModelRunner:
         if scheduler_output.total_num_scheduled_tokens > 0:
             missing_req_ids: list[str] = []
             unexpected_empty_req_ids: list[str] = []
-            cached_req_id_set = set(cached_reqs.req_ids)
             for req_id in scheduler_output.num_scheduled_tokens:
                 idx = req_id_to_index.get(req_id)
                 if idx is None:
@@ -1630,19 +1535,21 @@ class MetalModelRunner:
                 if sampled_tokens[idx]:
                     continue
 
-                is_cached_ctx = (
-                    req_id in cached_req_id_set
-                    and cached_reqs.is_context_phase(req_id)
-                )
-                is_new_ctx = False
-                new_req = new_reqs_by_id.get(req_id)
-                if new_req is not None:
-                    prompt_len = len(new_req.prompt_token_ids or [])
-                    computed = new_req.num_computed_tokens
-                    scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                    is_new_ctx = computed + scheduled < prompt_len
+                # The only valid empty-output case is an intermediate
+                # prefill chunk (generated_tokens == 0 means still
+                # prefilling).
+                state = self._request_states.get(req_id)
+                is_intermediate_ctx = state is not None and state.generated_tokens == 0
+                # Also check PHASE 1 intermediate chunks
+                if not is_intermediate_ctx:
+                    new_req = new_reqs_by_id.get(req_id)
+                    if new_req is not None:
+                        prompt_len = len(new_req.prompt_token_ids or [])
+                        computed = new_req.num_computed_tokens
+                        scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                        is_intermediate_ctx = computed + scheduled < prompt_len
 
-                if not is_cached_ctx and not is_new_ctx:
+                if not is_intermediate_ctx:
                     unexpected_empty_req_ids.append(req_id)
 
             if missing_req_ids or unexpected_empty_req_ids:
@@ -1655,9 +1562,7 @@ class MetalModelRunner:
                     len(unexpected_empty_req_ids),
                 )
                 if missing_req_ids:
-                    logger.error(
-                        "Missing scheduled req ids: %s", missing_req_ids[:16]
-                    )
+                    logger.error("Missing scheduled req ids: %s", missing_req_ids[:16])
                 if unexpected_empty_req_ids:
                     logger.error(
                         "Unexpected empty outputs for req ids: %s",
@@ -1729,12 +1634,6 @@ class MetalModelRunner:
             self._pending_output = empty_output
             return None
 
-        logger.info(
-            "ModelRunnerOutput ready: reqs=%d sampled_lists=%d empty_samples=%d",
-            len(req_ids),
-            len(sampled_tokens),
-            sum(1 for t in sampled_tokens if len(t) == 0),
-        )
         self._pending_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
