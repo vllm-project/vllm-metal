@@ -1206,7 +1206,7 @@ class MetalModelRunner:
         Uses MLX for projections + per-request RoPE, then the HF kernel for
         reshape_and_cache + paged_attention_v1 (zero-copy from block tables).
         """
-        
+
         """
         UNTESTED optimization to avoid unnecessary python rust FFI roundtrips.
         # Store block_ids when they're first computed (prefill) or when they grow (decode)
