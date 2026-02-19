@@ -1208,9 +1208,12 @@ class MetalModelRunner:
                         stats["max_bytes"] / (1024 * 1024),
                     )
 
-        # Handle empty case
+        # Handle empty case — return directly so the batch-queue path in
+        # step_with_batch_queue receives a non-None result from the
+        # execute_model future (when model_executed=False, sample_tokens is
+        # never called, so _pending_output would go unconsumed).
         if not req_ids:
-            self._pending_output = ModelRunnerOutput(
+            return ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
                 sampled_token_ids=[],
@@ -1218,7 +1221,6 @@ class MetalModelRunner:
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
-            return None
 
         self._pending_output = ModelRunnerOutput(
             req_ids=req_ids,
