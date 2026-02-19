@@ -103,7 +103,7 @@ def _greedy_generate_metal_kernel(
 
     # Allocate blocks for this sequence
     seq_blocks_needed = (len(token_ids) + max_new + BLOCK_SIZE - 1) // BLOCK_SIZE
-    block_ids = mps_cache.allocate_blocks(0, seq_blocks_needed)
+    block_ids = mps_cache.allocate_blocks("seq-0", seq_blocks_needed)
 
     # --- Prefill ---
     prepare_prefill(block_ids, len(token_ids), BLOCK_SIZE)
@@ -219,7 +219,7 @@ class TestMetalKernelPagedVsStandard:
             tids = tokenizer.encode(prompt)
             all_token_ids.append(tids)
             needed = (len(tids) + max_new + BLOCK_SIZE - 1) // BLOCK_SIZE
-            bids = mps_cache.allocate_blocks(i, needed)
+            bids = mps_cache.allocate_blocks(f"seq-{i}", needed)
             all_block_ids.append(bids)
 
             prepare_prefill(bids, len(tids), BLOCK_SIZE)

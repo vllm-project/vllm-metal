@@ -505,6 +505,7 @@ class MetalModelRunner:
         self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
+        self._num_layers: int = 0  # set by load_model → _discover_num_layers
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -516,6 +517,25 @@ class MetalModelRunner:
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
         return False
+
+    def _discover_num_layers(self) -> int:
+        """Return the number of transformer layers in the loaded model.
+
+        Handles both VLMs (model.language_model.model.layers) and text-only
+        models (model.model.layers or model.layers).
+        """
+        cache_model = (
+            self.model.language_model
+            if self._is_vlm and hasattr(self.model, "language_model")
+            else self.model
+        )
+        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
+        if layers is None:
+            raise RuntimeError(
+                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
+                "Expected model.model.layers or model.layers."
+            )
+        return len(layers)
 
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
@@ -559,6 +579,7 @@ class MetalModelRunner:
             _model_cache[model_name] = (self.model, self.tokenizer)
 
         self._extract_model_args()
+        self._num_layers = self._discover_num_layers()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -1124,20 +1145,6 @@ class MetalModelRunner:
         num_tokens = len(token_ids)
         block_ids = self._allocate_blocks_for_seq(req_id, num_tokens)
 
-        # Determine number of layers for OffsetCache list
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
-        if layers is None:
-            raise RuntimeError(
-                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
-                "Expected model.model.layers or model.layers."
-            )
-        num_layers = len(layers)
-
         # Stash per-request metadata (slot_mapping) in thread-local so the
         # patched attention wrappers can read it during the forward pass.
         prepare_prefill(block_ids, num_tokens, self._paged_block_size)
@@ -1145,7 +1152,7 @@ class MetalModelRunner:
         # OffsetCache is a fake cache — it stores no KV data.  It only
         # satisfies mlx_lm's RoPE offset and mask protocol.  Real KV is
         # written to the MPS paged cache by the attention wrapper.
-        offset_caches = [OffsetCache(0) for _ in range(num_layers)]
+        offset_caches = [OffsetCache(0) for _ in range(self._num_layers)]
 
         # The model forward calls each layer's self_attn, which has been
         # replaced by MetalKernelPagedAttentionWrapper.  The wrapper:
@@ -1199,6 +1206,22 @@ class MetalModelRunner:
         Uses MLX for projections + per-request RoPE, then the HF kernel for
         reshape_and_cache + paged_attention_v1 (zero-copy from block tables).
         """
+        
+        """
+        UNTESTED optimization to avoid unnecessary python rust FFI roundtrips.
+        # Store block_ids when they're first computed (prefill) or when they grow (decode)
+        # In _batched_decode_paged:
+        new_seq_len = seq_len + 1
+        prev_blocks = (seq_len + bs - 1) // bs
+        curr_blocks = (new_seq_len + bs - 1) // bs
+
+        if curr_blocks > prev_blocks:
+            # Crossing a block boundary — need one more block
+            new_block = cache.allocate_blocks(req_id, 1)
+            self._paged_request_block_ids[req_id].extend(new_block)
+
+        block_ids = self._paged_request_block_ids[req_id]
+        """
         batch_size = len(decode_reqs)
 
         # Build request info for prepare_decode
@@ -1212,26 +1235,12 @@ class MetalModelRunner:
         # offsets) in thread-local for the attention wrappers.
         prepare_decode(requests_info, self._paged_block_size)
 
-        # Determine number of layers
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
-        if layers is None:
-            raise RuntimeError(
-                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
-                "Expected model.model.layers or model.layers."
-            )
-        num_layers = len(layers)
-
         # OffsetCache is a fake cache — no KV stored.  The offset value
         # only matters for make_mask(); for single-token decode make_mask(1)
         # returns None regardless, so a shared max_offset is fine.  Actual
         # per-request RoPE offsets come from ctx.offsets in the wrapper.
         max_offset = max(info[1] for info in requests_info)
-        offset_caches = [OffsetCache(max_offset) for _ in range(num_layers)]
+        offset_caches = [OffsetCache(max_offset) for _ in range(self._num_layers)]
 
         # Build batched input
         if self._rust_state_manager is not None:

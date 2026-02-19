@@ -100,6 +100,11 @@ def _metal_kernel_prefill_attention(
     B, _, L, _ = queries.shape  # noqa: N806
 
     # RoPE
+    if not hasattr(attn_module, "rope"):
+        raise NotImplementedError(
+            f"Attention module {type(attn_module).__name__} does not have a 'rope' "
+            "attribute. Only RoPE-based models are supported by paged attention."
+        )
     offset = offset_cache.offset if offset_cache is not None else 0
     queries = attn_module.rope(queries, offset=offset)
     keys = attn_module.rope(keys, offset=offset)
@@ -161,6 +166,11 @@ def _metal_kernel_decode_attention(
     head_dim = queries.shape[3]
 
     # Per-request RoPE
+    if not hasattr(attn_module, "rope"):
+        raise NotImplementedError(
+            f"Attention module {type(attn_module).__name__} does not have a 'rope' "
+            "attribute. Only RoPE-based models are supported by paged attention."
+        )
     q_parts = []
     k_parts = []
     for i in range(B):
