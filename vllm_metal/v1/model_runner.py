@@ -718,14 +718,20 @@ class MetalModelRunner:
         return 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
 
     def warm_up(self) -> None:
-        """Warm up the model with a dummy forward pass."""
+        """Warm up the model with a dummy forward pass.
+
+        When paged attention is enabled, also loads the HF Metal kernel and
+        runs a tiny ``reshape_and_cache`` to force Metal library creation.
+        This catches Metal language-version incompatibilities at startup
+        rather than during the first real inference request.
+        """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
             return
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference
+        # Run a small dummy inference (standard MLX path)
         try:
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
             output = self.model(dummy_tokens)
@@ -734,6 +740,69 @@ class MetalModelRunner:
             logger.info("Model warm-up complete")
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
+
+        # Paged attention kernel warm-up: load kernel + smoke-test Metal ops
+        if hasattr(self, "_paged_kv_cache") and self._paged_kv_cache is not None:
+            self._warm_up_paged_attention_kernel()
+
+    def _warm_up_paged_attention_kernel(self) -> None:
+        """Load the HF paged-attention kernel and verify Metal ops work.
+
+        Forces ``newLibraryWithData`` inside the .so by running a single-token
+        ``reshape_and_cache`` against layer 0 of the already-allocated cache.
+        If the embedded metallib targets a Metal language version unsupported
+        by this OS, the error surfaces here instead of mid-inference.
+        """
+        import platform
+
+        from vllm_metal.metal_kernel_backend.kernel_loader import (
+            get_paged_attention_ops,
+        )
+
+        cache = self._paged_kv_cache
+
+        logger.info("Warming up paged attention Metal kernel...")
+
+        try:
+            ops = get_paged_attention_ops()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load paged-attention Metal kernel: {e}. "
+                f"macOS version: {platform.mac_ver()[0]}"
+            ) from e
+
+        # Smoke-test: single-token reshape_and_cache on layer 0
+        try:
+            dummy_k = torch.zeros(
+                1,
+                cache.num_kv_heads,
+                cache.head_dim,
+                dtype=cache.dtype,
+                device="mps",
+            )
+            dummy_v = torch.zeros_like(dummy_k)
+            dummy_slot = torch.zeros(1, dtype=torch.long, device="mps")
+
+            ops.reshape_and_cache(
+                dummy_k,
+                dummy_v,
+                cache.key_caches[0],
+                cache.value_caches[0],
+                dummy_slot,
+                "auto",
+                cache.k_scale_tensor,
+                cache.v_scale_tensor,
+            )
+            logger.info("Paged attention Metal kernel warm-up complete")
+        except RuntimeError as e:
+            mac_ver = platform.mac_ver()[0]
+            if "language version" in str(e):
+                raise RuntimeError(
+                    f"Metal kernel incompatible with this OS (macOS {mac_ver}). "
+                    f"The kernel requires a newer Metal language version than "
+                    f"this OS supports. Original error: {e}"
+                ) from e
+            raise
 
     def _make_sampling_metadata(
         self,
