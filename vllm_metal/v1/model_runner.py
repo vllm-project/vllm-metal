@@ -1696,9 +1696,12 @@ class MetalModelRunner:
                         stats["max_bytes"] / (1024 * 1024),
                     )
 
-        # Handle empty case
+        # Handle empty case — return directly so the batch-queue path in
+        # step_with_batch_queue receives a non-None result from the
+        # execute_model future (when model_executed=False, sample_tokens is
+        # never called, so _pending_output would go unconsumed).
         if not req_ids:
-            empty_output = ModelRunnerOutput(
+            return ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
                 sampled_token_ids=[],
@@ -1706,19 +1709,6 @@ class MetalModelRunner:
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
-            if scheduler_output.total_num_scheduled_tokens == 0:
-                # No model execution in this step (e.g., finished_req_ids-only step).
-                # EngineCore expects execute_model() to return a concrete output
-                # directly because sample_tokens() is not invoked.
-                if not scheduler_output.finished_req_ids and self._request_states:
-                    raise RuntimeError(
-                        "No scheduled tokens and no finished requests while "
-                        f"{len(self._request_states)} requests remain active."
-                    )
-                self._pending_output = None
-                return empty_output
-            self._pending_output = empty_output
-            return None
 
         self._pending_output = ModelRunnerOutput(
             req_ids=req_ids,
