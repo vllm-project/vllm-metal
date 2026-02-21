@@ -28,8 +28,8 @@ classifiers = [
 
 dependencies = [
     # MLX - Required for Apple Silicon GPU acceleration
-    "mlx>=0.20.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "mlx-lm>=0.20.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx>=0.29.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.28.4; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.3.0; platform_system == 'Darwin' and platform_machine == 'arm64'",  # Vision-language model support
     # Model loading and weights
     "transformers>=4.40.0",
