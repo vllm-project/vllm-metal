@@ -69,7 +69,7 @@ download_and_install_wheel() {
   success "Downloaded wheel"
 
   # Install vllm-metal package
-  if ! uv pip install --upgrade "$wheel_path"; then
+  if ! uv pip install "$wheel_path"; then
     error "Failed to install ${package_name}."
     exit 1
   fi
@@ -162,4 +162,3 @@ main() {
 }
 
 main "$@"
-
