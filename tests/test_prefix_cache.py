@@ -111,9 +111,7 @@ class TestHybridCacheMergeExtract:
     _KV_NUM_HEADS = 1
     _KV_HEAD_DIM = 2
 
-    def _make_arrays_cache(
-        self, v0: float | None, v1: float | None
-    ) -> mr.ArraysCache:
+    def _make_arrays_cache(self, v0: float | None, v1: float | None) -> mr.ArraysCache:
         cache = mr.ArraysCache(self._ARRAYS_CACHE_ENTRIES)
         if v0 is not None:
             cache[0] = mx.full((1, self._ARRAYS_CACHE_FEATURES), v0, dtype=mx.float32)
