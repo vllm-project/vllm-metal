@@ -4,9 +4,16 @@ vllm-metal supports OpenAI-compatible Speech-to-Text using Whisper models, runni
 
 ## Installation
 
-STT requires optional audio processing dependencies:
+First, install vllm-metal using the install script (see [README](../README.md)):
 
 ```bash
+./install.sh
+```
+
+Then install the optional STT dependencies inside the virtual environment:
+
+```bash
+source .venv/bin/activate
 pip install vllm-metal[stt]
 ```
 

@@ -29,7 +29,9 @@ classifiers = [
 dependencies = [
     # MLX - Required for Apple Silicon GPU acceleration
     "mlx>=0.20.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "mlx-lm>=0.20.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # mlx-lm 0.30.6 removed MambaCache; pin until we support ArraysCache-only versions.
+    # See: https://github.com/vllm-project/vllm-metal/issues/100
+    "mlx-lm>=0.20.0,<0.30.6; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.3.0; platform_system == 'Darwin' and platform_machine == 'arm64'",  # Vision-language model support
     # Model loading and weights
     "transformers>=4.40.0",
@@ -58,7 +60,7 @@ dev = [
     "mypy>=1.19.1",
 ]
 all = [
-    "vllm-metal[vllm,paged,dev]",
+    "vllm-metal[vllm,paged,stt,dev]",
 ]
 
 [project.urls]

@@ -39,7 +39,7 @@ ensure_uv() {
 ensure_venv() {
   if [ ! -d "$1" ]; then
     section "Creating virtual environment"
-    uv venv "$1" --clear --python 3.12
+    uv venv "$1" --clear --python 3.12 --seed
   fi
 
   # shellcheck source=/dev/null
@@ -63,4 +63,3 @@ setup_dev_env() {
 get_version() {
   uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
 }
-
