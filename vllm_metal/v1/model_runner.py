@@ -708,7 +708,14 @@ class MetalModelRunner:
         # Each block stores key and value for all layers
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
         dtype_size = 2  # float16
-        return 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+        return (
+            2
+            * int(num_layers)
+            * block_size
+            * int(num_kv_heads)
+            * int(head_dim)
+            * dtype_size
+        )
 
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
