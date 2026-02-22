@@ -45,7 +45,13 @@ def get_paged_attention_ops() -> Any:
     """
     global _kernel
     if _kernel is None:
-        from kernels import get_kernel
+        try:
+            from kernels import get_kernel
+        except ImportError:
+            raise ImportError(
+                "Paged attention requires the 'kernels' package. "
+                "Install it with:  pip install 'vllm-metal[paged]'"
+            ) from None
 
         revision = _MACOS15_COMPAT_REVISION if _needs_compat_revision() else None
         _kernel = get_kernel("kernels-community/paged-attention", revision=revision)
