@@ -589,11 +589,12 @@ class MetalModelRunner:
         Handles both text-only models and VLMs (which have nested text_config).
         """
         if hasattr(self.model, "args"):
+            # mlx-lm models (Qwen, Llama, etc.)
             self.model_args = vars(self.model.args)
         elif hasattr(self.model, "config"):
             config = self.model.config
-            # VLMs often have text config nested inside main config
             if self._is_vlm and hasattr(config, "text_config"):
+                # VLMs with nested text config (LLaVA, Pixtral via mlx-vlm)
                 text_config = config.text_config
                 if hasattr(text_config, "to_dict"):
                     self.model_args = text_config.to_dict()
@@ -605,21 +606,15 @@ class MetalModelRunner:
                         and not callable(getattr(text_config, k))
                     }
             elif hasattr(config, "to_dict"):
+                # Standard HuggingFace config objects
                 self.model_args = config.to_dict()
             else:
                 self.model_args = vars(config)
         else:
-            # Fallback: try to get from model attributes
-            self.model_args = {
-                "num_hidden_layers": getattr(self.model, "n_layers", 32),
-                "num_attention_heads": getattr(self.model, "n_heads", 32),
-                "num_key_value_heads": getattr(
-                    self.model, "n_kv_heads", getattr(self.model, "n_heads", 32)
-                ),
-                "hidden_size": getattr(self.model, "dim", 4096),
-                "head_dim": getattr(self.model, "head_dim", 128),
-                "vocab_size": getattr(self.model, "vocab_size", 32000),
-            }
+            raise ValueError(
+                "Cannot extract model config: model has neither .args nor "
+                ".config attribute."
+            )
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
 
@@ -647,21 +642,21 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
-        # Handle None values explicitly - model configs may have keys set to None
         num_layers = (
             self.model_args.get("num_hidden_layers")
             or self.model_args.get("n_layers")
-            or 32
         )
-        num_attention_heads = self.model_args.get("num_attention_heads") or 32
+        num_attention_heads = self.model_args.get("num_attention_heads")
         num_kv_heads = (
             self.model_args.get("num_key_value_heads")
             or self.model_args.get("n_kv_heads")
             or num_attention_heads
         )
-        hidden_size = self.model_args.get("hidden_size") or 4096
+        hidden_size = self.model_args.get("hidden_size")
         head_size = self.model_args.get("head_dim") or (
             hidden_size // num_attention_heads
+            if hidden_size and num_attention_heads
+            else None
         )
         block_size = self.metal_config.block_size
 
@@ -694,21 +689,21 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
-        # Handle None values explicitly - model configs may have keys set to None
         num_layers = (
             self.model_args.get("num_hidden_layers")
             or self.model_args.get("n_layers")
-            or 32
         )
-        num_attention_heads = self.model_args.get("num_attention_heads") or 32
+        num_attention_heads = self.model_args.get("num_attention_heads")
         num_kv_heads = (
             self.model_args.get("num_key_value_heads")
             or self.model_args.get("n_kv_heads")
             or num_attention_heads
         )
-        hidden_size = self.model_args.get("hidden_size") or 4096
+        hidden_size = self.model_args.get("hidden_size")
         head_dim = self.model_args.get("head_dim") or (
             hidden_size // num_attention_heads
+            if hidden_size and num_attention_heads
+            else None
         )
         block_size = self.metal_config.block_size
 

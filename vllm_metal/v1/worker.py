@@ -265,17 +265,18 @@ class MetalWorker(WorkerBase):
         num_layers = (
             runner.model_args.get("num_hidden_layers")
             or runner.model_args.get("n_layers")
-            or 32
         )
-        num_attention_heads = runner.model_args.get("num_attention_heads") or 32
+        num_attention_heads = runner.model_args.get("num_attention_heads")
         num_kv_heads = (
             runner.model_args.get("num_key_value_heads")
             or runner.model_args.get("n_kv_heads")
             or num_attention_heads
         )
-        hidden_size = runner.model_args.get("hidden_size") or 4096
+        hidden_size = runner.model_args.get("hidden_size")
         head_dim = runner.model_args.get("head_dim") or (
             hidden_size // num_attention_heads
+            if hidden_size and num_attention_heads
+            else None
         )
 
         # --- Create cache and patch model ---
