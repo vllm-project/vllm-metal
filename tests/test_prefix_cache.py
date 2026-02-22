@@ -5,11 +5,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
 
 import vllm_metal.v1.model_runner as mr
 
 
-class StubMambaCache:
+class StubArraysCache:
     @property
     def state(self):
         return []
@@ -32,7 +33,7 @@ class TestPrefixCacheHybridGuard:
             kv.keys = mx.zeros((1, 8, 0, 64))
             kv.values = mx.zeros((1, 8, 0, 64))
             kv.offset = 0
-            return [kv, StubMambaCache(), kv]
+            return [kv, StubArraysCache(), kv]
 
         monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
 
@@ -90,6 +91,134 @@ class TestPrefixCacheHybridGuard:
 
         lookup_spy.assert_called_once_with([1, 2, 3, 4])
         insert_spy.assert_called_once()
+
+
+class TestHybridCacheMergeExtract:
+    """Regression tests for hybrid (KV + ArraysCache) batching.
+
+    Background:
+    - `mlx-lm==0.30.6` removed `MambaCache` and hybrid models now use `ArraysCache`.
+    - Older mlx-lm versions don't provide `ArraysCache.merge()` / `extract()`.
+
+    These tests validate that vllm-metal can merge per-request caches into a batched
+    cache, run a batched forward pass, and then extract per-request caches back,
+    without depending on `MambaCache` or new mlx-lm APIs.
+    """
+
+    _ARRAYS_CACHE_ENTRIES = 2
+    _ARRAYS_CACHE_FEATURES = 4
+
+    _KV_NUM_HEADS = 1
+    _KV_HEAD_DIM = 2
+
+    def _make_arrays_cache(self, v0: float | None, v1: float | None) -> mr.ArraysCache:
+        cache = mr.ArraysCache(self._ARRAYS_CACHE_ENTRIES)
+        if v0 is not None:
+            cache[0] = mx.full((1, self._ARRAYS_CACHE_FEATURES), v0, dtype=mx.float32)
+        if v1 is not None:
+            cache[1] = mx.full((1, self._ARRAYS_CACHE_FEATURES), v1, dtype=mx.float32)
+        return cache
+
+    def _make_kv_cache(self, seq_len: int, value: float) -> mr.KVCache:
+        kv = mr.KVCache()
+        kv.keys = mx.full(
+            (1, self._KV_NUM_HEADS, seq_len, self._KV_HEAD_DIM),
+            value,
+            dtype=mx.float32,
+        )
+        kv.values = mx.full(
+            (1, self._KV_NUM_HEADS, seq_len, self._KV_HEAD_DIM),
+            value + 0.5,
+            dtype=mx.float32,
+        )
+        kv.offset = seq_len
+        return kv
+
+    def test_arrays_cache_merge_extract_roundtrip(self) -> None:
+        """Merging then extracting ArraysCache round-trips per request."""
+        arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
+        arrays_cache_req1 = self._make_arrays_cache(2.0, 22.0)
+
+        merged = mr._merge_kv_caches([[arrays_cache_req0], [arrays_cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.ArraysCache)
+        assert isinstance(extracted_req0, mr.ArraysCache)
+        assert isinstance(extracted_req1, mr.ArraysCache)
+        assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
+        assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
+        assert bool(mx.allclose(extracted_req1.state[0], arrays_cache_req1.state[0]))
+        assert bool(mx.allclose(extracted_req1.state[1], arrays_cache_req1.state[1]))
+
+    def test_arrays_cache_merge_extract_handles_missing_entries(self) -> None:
+        """Missing per-request entries become zeros after merging.
+
+        ArraysCache merging densifies per-entry state into a batch array when at
+        least one request has that entry populated. Requests that had `None`
+        for the entry are represented as zeros in the merged state.
+        """
+        arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
+        arrays_cache_req1 = self._make_arrays_cache(2.0, None)
+
+        merged = mr._merge_kv_caches([[arrays_cache_req0], [arrays_cache_req1]])
+
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(extracted_req0, mr.ArraysCache)
+        assert isinstance(extracted_req1, mr.ArraysCache)
+
+        assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
+        assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
+        assert bool(mx.allclose(extracted_req1.state[0], arrays_cache_req1.state[0]))
+
+        missing = extracted_req1.state[1]
+        assert missing is not None
+        assert missing.shape == (1, self._ARRAYS_CACHE_FEATURES)
+        assert bool(mx.allclose(missing, mx.zeros_like(missing)))
+
+    def test_mixed_kv_and_arrays_cache_merge_extract_roundtrip(self) -> None:
+        """Merging/extracting preserves both KVCache and ArraysCache layers."""
+        kv_cache_req0 = self._make_kv_cache(seq_len=2, value=1.0)
+        kv_cache_req1 = self._make_kv_cache(seq_len=4, value=2.0)
+        arrays_cache_req0 = self._make_arrays_cache(3.0, 33.0)
+        arrays_cache_req1 = self._make_arrays_cache(4.0, 44.0)
+
+        merged = mr._merge_kv_caches(
+            [[kv_cache_req0, arrays_cache_req0], [kv_cache_req1, arrays_cache_req1]]
+        )
+        extracted_req0 = mr._extract_kv_cache(merged, 0)
+        extracted_req1 = mr._extract_kv_cache(merged, 1)
+
+        assert isinstance(merged[0], mr.BatchKVCache)
+        assert isinstance(merged[1], mr.ArraysCache)
+
+        kv_req0_out, arrays_req0_out = extracted_req0
+        kv_req1_out, arrays_req1_out = extracted_req1
+
+        assert isinstance(kv_req0_out, mr.KVCache)
+        assert isinstance(kv_req1_out, mr.KVCache)
+        assert isinstance(arrays_req0_out, mr.ArraysCache)
+        assert isinstance(arrays_req1_out, mr.ArraysCache)
+
+        assert kv_req0_out.offset == kv_cache_req0.offset
+        assert kv_req1_out.offset == kv_cache_req1.offset
+        assert bool(mx.allclose(kv_req0_out.keys, kv_cache_req0.keys))
+        assert bool(mx.allclose(kv_req0_out.values, kv_cache_req0.values))
+        assert bool(mx.allclose(kv_req1_out.keys, kv_cache_req1.keys))
+        assert bool(mx.allclose(kv_req1_out.values, kv_cache_req1.values))
+
+        assert bool(mx.allclose(arrays_req0_out.state[0], arrays_cache_req0.state[0]))
+        assert bool(mx.allclose(arrays_req0_out.state[1], arrays_cache_req0.state[1]))
+        assert bool(mx.allclose(arrays_req1_out.state[0], arrays_cache_req1.state[0]))
+        assert bool(mx.allclose(arrays_req1_out.state[1], arrays_cache_req1.state[1]))
+
+    def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
+        arrays_cache = self._make_arrays_cache(1.0, 2.0)
+        kv_cache = mr.KVCache()
+        with pytest.raises(TypeError, match="Mixed cache types in a single layer"):
+            mr._merge_kv_caches([[arrays_cache], [kv_cache]])
 
 
 class TestPrefixCacheEviction:
