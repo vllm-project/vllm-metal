@@ -49,7 +49,7 @@ ensure_venv() {
 # Install dev dependencies
 install_dev_deps() {
   section "Installing dependencies"
-  uv pip install -e ".[dev]"
+  uv pip install -e ".[dev,paged]"
 }
 
 # Full development environment setup
