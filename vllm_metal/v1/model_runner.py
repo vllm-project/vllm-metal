@@ -642,9 +642,8 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
-        num_layers = (
-            self.model_args.get("num_hidden_layers")
-            or self.model_args.get("n_layers")
+        num_layers = self.model_args.get("num_hidden_layers") or self.model_args.get(
+            "n_layers"
         )
         num_attention_heads = self.model_args.get("num_attention_heads")
         num_kv_heads = (
@@ -689,9 +688,8 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
-        num_layers = (
-            self.model_args.get("num_hidden_layers")
-            or self.model_args.get("n_layers")
+        num_layers = self.model_args.get("num_hidden_layers") or self.model_args.get(
+            "n_layers"
         )
         num_attention_heads = self.model_args.get("num_attention_heads")
         num_kv_heads = (
@@ -1225,11 +1223,12 @@ class MetalModelRunner:
         # - computes attention via MLX SDPA
         # - writes K/V to MPS paged cache via reshape_and_cache
         input_ids = mx.array([token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=offset_caches)
-        logits = self._extract_logits(model_output)
-        last_logits = logits[:, -1, :]
-
-        clear_context()
+        try:
+            model_output = self.model(input_ids, cache=offset_caches)
+            logits = self._extract_logits(model_output)
+            last_logits = logits[:, -1, :]
+        finally:
+            clear_context()
 
         # Sample
         is_greedy = sampling_params.temperature < 1e-5
@@ -1326,11 +1325,12 @@ class MetalModelRunner:
         # - applies per-request RoPE using ctx.offsets
         # - writes new K/V to MPS paged cache via reshape_and_cache
         # - reads all cached K/V via paged_attention_v1 (zero-copy)
-        model_output = self.model(batched_input, cache=offset_caches)
-        logits = self._extract_logits(model_output)
-        next_token_logits = logits[:, -1, :]
-
-        clear_context()
+        try:
+            model_output = self.model(batched_input, cache=offset_caches)
+            logits = self._extract_logits(model_output)
+            next_token_logits = logits[:, -1, :]
+        finally:
+            clear_context()
 
         # Sample
         sampling_params_list = [state.sampling_params for _, state in decode_reqs]

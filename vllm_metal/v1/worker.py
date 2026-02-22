@@ -262,10 +262,9 @@ class MetalWorker(WorkerBase):
         )
 
         # --- Extract model dimensions ---
-        num_layers = (
-            runner.model_args.get("num_hidden_layers")
-            or runner.model_args.get("n_layers")
-        )
+        num_layers = runner.model_args.get(
+            "num_hidden_layers"
+        ) or runner.model_args.get("n_layers")
         num_attention_heads = runner.model_args.get("num_attention_heads")
         num_kv_heads = (
             runner.model_args.get("num_key_value_heads")
