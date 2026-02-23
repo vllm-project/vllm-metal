@@ -27,7 +27,6 @@ from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
     KVCache,
-    MambaCache,
     make_prompt_cache,
 )
 
@@ -155,7 +154,7 @@ class CachedPrefix:
     """Cached KV state for a token prefix.
 
     cache_state contains (k, v) tuples for KVCache layers, or None for
-    MambaCache/ArraysCache layers in hybrid models.
+    ArraysCache layers in hybrid models.
     """
 
     token_ids: list[int]
@@ -213,8 +212,8 @@ class PrefixCacheManager:
     def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
         """Insert a prefix cache entry with memory-based eviction.
 
-        Only KVCache layers are cached. MambaCache/ArraysCache layers are
-        skipped (stored as None) for hybrid model compatibility.
+        Only KVCache layers are cached. ArraysCache layers are skipped (stored as
+        None) for hybrid model compatibility.
         """
         prefix_hash = _compute_prefix_hash(token_ids)
         if prefix_hash in self._cache:
@@ -255,8 +254,8 @@ class PrefixCacheManager:
     ) -> list[KVCache]:
         """Restore a cached prefix to a fresh KVCache.
 
-        Only KVCache layers are restored. MambaCache/ArraysCache layers
-        remain in their fresh state for hybrid model compatibility.
+        Only KVCache layers are restored. ArraysCache layers remain in their
+        fresh state for hybrid model compatibility.
         """
         cache_model = (
             model.language_model
@@ -290,59 +289,50 @@ class PrefixCacheManager:
 
 
 # Type alias for any cache type supported by the model
-AnyCache: TypeAlias = KVCache | MambaCache | ArraysCache
+AnyCache: TypeAlias = KVCache | ArraysCache
 
 
-class BatchMambaCache:
-    """Batched cache for Mamba/SSM layers.
+def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
+    """Merge per-request ArraysCache objects into a single batched ArraysCache.
 
-    Wraps multiple MambaCache instances into a single batched cache
-    for efficient batched forward passes on hybrid models.
+    This mirrors the behavior of `mlx_lm.models.cache.ArraysCache.merge` but is
+    implemented here for compatibility with older mlx-lm versions that do not
+    provide `merge()` / `extract()`.
     """
+    if not caches:
+        raise ValueError("caches must be non-empty")
 
-    def __init__(self, caches: list[MambaCache | ArraysCache]):
-        """Create a batched Mamba cache from individual caches.
+    num_entries = len(caches[0].state)
+    batch_size = len(caches)
 
-        Args:
-            caches: List of MambaCache instances to batch
-        """
-        self._batch_size = len(caches)
-        self._cache_size = len(caches[0].cache) if caches else 0
+    merged = ArraysCache(num_entries)
+    for entry_idx in range(num_entries):
+        values = [cache.state[entry_idx] for cache in caches]
+        template = next((value for value in values if value is not None), None)
+        if template is None:
+            continue
 
-        # Stack each state array across the batch dimension
-        self.cache: list[mx.array | None] = []
-        for i in range(self._cache_size):
-            states = [c.cache[i] for c in caches]
-            if all(s is not None for s in states):
-                self.cache.append(mx.concatenate(states, axis=0))
-            else:
-                self.cache.append(None)
+        shape = list(template.shape)
+        shape[0] = batch_size
+        merged_state = mx.zeros(tuple(shape), template.dtype)
+        for batch_idx, value in enumerate(values):
+            if value is None:
+                continue
+            merged_state[batch_idx : batch_idx + 1] = value
 
-    def __getitem__(self, idx: int) -> mx.array | None:
-        return self.cache[idx]
+        merged[entry_idx] = merged_state
 
-    def __setitem__(self, idx: int, value: mx.array | None) -> None:
-        self.cache[idx] = value
-
-    def extract(self, idx: int) -> MambaCache:
-        """Extract a single request's cache from the batch.
-
-        Args:
-            idx: Index of the request in the batch
-
-        Returns:
-            MambaCache for the individual request
-        """
-        cache = MambaCache()
-        for i in range(self._cache_size):
-            if self.cache[i] is not None:
-                cache.cache[i] = self.cache[i][idx : idx + 1]
-        return cache
+    return merged
 
 
-def _is_mamba_cache(cache: AnyCache) -> bool:
-    """Check if a cache is a Mamba-style cache (ArraysCache or MambaCache)."""
-    return isinstance(cache, MambaCache | ArraysCache)
+def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
+    """Extract a single request's ArraysCache from a batched ArraysCache."""
+    state = batch_cache.state
+    extracted = ArraysCache(len(state))
+    extracted.state = [
+        None if value is None else value[idx : idx + 1] for value in state
+    ]
+    return extracted
 
 
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
@@ -392,7 +382,7 @@ class RequestState:
     # vLLM applies repetition penalties to both prompt+output tokens, but applies
     # presence/frequency penalties only to generated (output) tokens.
     prompt_len: int
-    cache: list[AnyCache]  # Per-layer caches (KVCache or MambaCache for hybrid models)
+    cache: list[AnyCache]  # Per-layer caches (KVCache or ArraysCache for hybrid models)
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
     generated_tokens: int = 0
@@ -400,7 +390,7 @@ class RequestState:
 
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
-) -> list[BatchKVCache | BatchMambaCache]:
+) -> list[BatchKVCache | ArraysCache]:
     """Merge multiple per-request caches into batched caches.
 
     Args:
@@ -413,13 +403,20 @@ def _merge_kv_caches(
         return []
 
     num_layers = len(caches_list[0])
-    merged: list[BatchKVCache | BatchMambaCache] = []
+    merged: list[BatchKVCache | ArraysCache] = []
 
     for layer_idx in range(num_layers):
         layer_caches = [caches[layer_idx] for caches in caches_list]
-        if _is_mamba_cache(layer_caches[0]):
-            batch_cache = BatchMambaCache(layer_caches)
-        else:
+        if isinstance(layer_caches[0], ArraysCache):
+            arrays_caches: list[ArraysCache] = []
+            for cache in layer_caches:
+                if not isinstance(cache, ArraysCache):
+                    raise TypeError(
+                        "Mixed cache types in a single layer: expected ArraysCache"
+                    )
+                arrays_caches.append(cache)
+            batch_cache = _merge_arrays_caches(arrays_caches)
+        else:  # KV-like caches
             batch_cache = BatchKVCache.merge(layer_caches)
         merged.append(batch_cache)
 
@@ -427,7 +424,7 @@ def _merge_kv_caches(
 
 
 def _extract_kv_cache(
-    batch_caches: list[BatchKVCache | BatchMambaCache], idx: int
+    batch_caches: list[BatchKVCache | ArraysCache], idx: int
 ) -> list[AnyCache]:
     """Extract a single request's cache from batched caches.
 
@@ -438,7 +435,13 @@ def _extract_kv_cache(
     Returns:
         List of caches for the request, one per layer
     """
-    return [cache.extract(idx) for cache in batch_caches]
+    extracted: list[AnyCache] = []
+    for cache in batch_caches:
+        if isinstance(cache, ArraysCache):
+            extracted.append(_extract_arrays_cache(cache, idx))
+        else:
+            extracted.append(cache.extract(idx))
+    return extracted
 
 
 class MetalModelRunner:
