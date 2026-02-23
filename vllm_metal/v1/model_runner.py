@@ -614,33 +614,39 @@ class MetalModelRunner:
         """
         args = self.model_args
 
-        self.num_layers = args.get("num_hidden_layers") or args.get("n_layers")
-        self.num_attention_heads = args.get("num_attention_heads")
-        self.num_kv_heads = (
+        num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        num_attention_heads = args.get("num_attention_heads")
+        num_kv_heads = (
             args.get("num_key_value_heads")
             or args.get("n_kv_heads")
-            or self.num_attention_heads
+            or num_attention_heads
         )
-        self.hidden_size = args.get("hidden_size")
-        self.head_dim = args.get("head_dim") or (
-            self.hidden_size // self.num_attention_heads
-            if self.hidden_size and self.num_attention_heads
+        hidden_size = args.get("hidden_size")
+        head_dim = args.get("head_dim") or (
+            hidden_size // num_attention_heads
+            if hidden_size and num_attention_heads
             else None
         )
 
         # Fail fast if critical dims are missing
         missing = []
-        if not self.num_layers:
+        if not num_layers:
             missing.append("num_layers (num_hidden_layers / n_layers)")
-        if not self.num_kv_heads:
+        if not num_kv_heads:
             missing.append("num_kv_heads (num_key_value_heads / n_kv_heads)")
-        if not self.head_dim:
+        if not head_dim:
             missing.append("head_dim")
         if missing:
             raise ValueError(
                 f"Cannot resolve model dimensions: {', '.join(missing)}. "
                 f"Available keys: {sorted(args.keys())}"
             )
+
+        self.num_layers: int = int(num_layers)
+        self.num_attention_heads = num_attention_heads
+        self.num_kv_heads: int = int(num_kv_heads)
+        self.hidden_size = hidden_size
+        self.head_dim: int = int(head_dim)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
