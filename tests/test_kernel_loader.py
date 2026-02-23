@@ -24,29 +24,20 @@ import pytest
 class TestNeedsCompatRevision:
     """Test _needs_compat_revision() with mocked macOS versions."""
 
-    def test_macos_15_needs_compat(self):
+    @pytest.mark.parametrize(
+        "ver, expected",
+        [
+            ("15.7.4", True),  # macOS 15 — needs compat
+            ("14.5", True),  # macOS 14 — needs compat
+            ("26.3", False),  # macOS 26 — modern
+            ("", False),  # empty — safe default
+        ],
+    )
+    def test_version_check(self, ver, expected):
         from vllm_metal.metal_kernel_backend.kernel_loader import _needs_compat_revision
 
-        with mock.patch("platform.mac_ver", return_value=("15.7.4", ("", "", ""), "")):
-            assert _needs_compat_revision() is True
-
-    def test_macos_14_needs_compat(self):
-        from vllm_metal.metal_kernel_backend.kernel_loader import _needs_compat_revision
-
-        with mock.patch("platform.mac_ver", return_value=("14.5", ("", "", ""), "")):
-            assert _needs_compat_revision() is True
-
-    def test_macos_26_no_compat(self):
-        from vllm_metal.metal_kernel_backend.kernel_loader import _needs_compat_revision
-
-        with mock.patch("platform.mac_ver", return_value=("26.3", ("", "", ""), "")):
-            assert _needs_compat_revision() is False
-
-    def test_empty_version_no_compat(self):
-        from vllm_metal.metal_kernel_backend.kernel_loader import _needs_compat_revision
-
-        with mock.patch("platform.mac_ver", return_value=("", ("", "", ""), "")):
-            assert _needs_compat_revision() is False
+        with mock.patch("platform.mac_ver", return_value=(ver, ("", "", ""), "")):
+            assert _needs_compat_revision() is expected
 
 
 class TestGetKernelRevisionSelection:
