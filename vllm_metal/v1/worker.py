@@ -261,28 +261,11 @@ class MetalWorker(WorkerBase):
             max_tokens_cached,
         )
 
-        # --- Extract model dimensions ---
-        num_layers = runner.model_args.get(
-            "num_hidden_layers"
-        ) or runner.model_args.get("n_layers")
-        num_attention_heads = runner.model_args.get("num_attention_heads")
-        num_kv_heads = (
-            runner.model_args.get("num_key_value_heads")
-            or runner.model_args.get("n_kv_heads")
-            or num_attention_heads
-        )
-        hidden_size = runner.model_args.get("hidden_size")
-        head_dim = runner.model_args.get("head_dim") or (
-            hidden_size // num_attention_heads
-            if hidden_size and num_attention_heads
-            else None
-        )
-
         # --- Create cache and patch model ---
         mps_kv_cache = MPSPagedKVCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
+            num_layers=runner.num_layers,
+            num_kv_heads=runner.num_kv_heads,
+            head_dim=runner.head_dim,
             num_blocks=num_blocks,
             block_size=block_size,
             dtype=torch.float16,
@@ -297,8 +280,8 @@ class MetalWorker(WorkerBase):
             n_patched,
             num_blocks,
             block_size,
-            num_kv_heads,
-            head_dim,
+            runner.num_kv_heads,
+            runner.head_dim,
         )
 
         # Store on model runner for use by paged prefill/decode

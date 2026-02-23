@@ -49,6 +49,13 @@ class MPSPagedKVCache:
         element_size = torch.tensor([], dtype=dtype).element_size()
         self.x = 16 // element_size  # 8 for float16, 4 for float32
 
+        if head_dim % self.x != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by x ({self.x}) "
+                f"for the 5-D key cache layout [num_blocks, num_kv_heads, "
+                f"head_dim // x, block_size, x]"
+            )
+
         # Per-layer caches
         self.key_caches: list[torch.Tensor] = []
         self.value_caches: list[torch.Tensor] = []

@@ -110,15 +110,18 @@ def _find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
     getattr(layer, attn_attr_name) pointing to the attention module.
 
     Supports mlx_lm model structures like:
+        model.language_model.model.layers[i].self_attn   (VLMs)
         model.model.layers[i].self_attn
         model.layers[i].self_attn
     """
-    # Try model.model.layers (Qwen3 Model wrapper)
-    layers_container = getattr(model, "model", model)
+    # Unwrap VLM wrapper (e.g. LLaVA, Pixtral via mlx-vlm)
+    root = getattr(model, "language_model", model)
+    # Try root.model.layers (Qwen3 Model wrapper)
+    layers_container = getattr(root, "model", root)
     if hasattr(layers_container, "layers"):
         layer_list = layers_container.layers
-    elif hasattr(model, "layers"):
-        layer_list = model.layers
+    elif hasattr(root, "layers"):
+        layer_list = root.layers
     else:
         raise ValueError(
             f"Cannot find transformer layers in model of type {type(model)}"

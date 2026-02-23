@@ -508,7 +508,6 @@ class MetalModelRunner:
         self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
-        self._num_layers: int = 0  # set by load_model → _discover_num_layers
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -520,25 +519,6 @@ class MetalModelRunner:
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
         return False
-
-    def _discover_num_layers(self) -> int:
-        """Return the number of transformer layers in the loaded model.
-
-        Handles both VLMs (model.language_model.model.layers) and text-only
-        models (model.model.layers or model.layers).
-        """
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        layers = getattr(getattr(cache_model, "model", cache_model), "layers", None)
-        if layers is None:
-            raise RuntimeError(
-                f"Cannot find transformer layers on model {type(cache_model).__name__}. "
-                "Expected model.model.layers or model.layers."
-            )
-        return len(layers)
 
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
@@ -560,6 +540,7 @@ class MetalModelRunner:
                     f"Model loaded from cache in {load_time:.3f}s: {model_name}"
                 )
                 self._extract_model_args()
+                self._resolve_model_dims()
                 return
 
         # Load model using appropriate backend
@@ -582,7 +563,7 @@ class MetalModelRunner:
             _model_cache[model_name] = (self.model, self.tokenizer)
 
         self._extract_model_args()
-        self._num_layers = self._discover_num_layers()
+        self._resolve_model_dims()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -621,6 +602,46 @@ class MetalModelRunner:
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
 
+    def _resolve_model_dims(self) -> None:
+        """Extract and validate model dimensions from ``self.model_args``.
+
+        Must be called after ``_extract_model_args()``.  Stores validated
+        dimensions as instance attributes so that every consumer reads from
+        one canonical source instead of repeating fallback chains.
+
+        Raises:
+            ValueError: If any critical dimension cannot be determined.
+        """
+        args = self.model_args
+
+        self.num_layers = args.get("num_hidden_layers") or args.get("n_layers")
+        self.num_attention_heads = args.get("num_attention_heads")
+        self.num_kv_heads = (
+            args.get("num_key_value_heads")
+            or args.get("n_kv_heads")
+            or self.num_attention_heads
+        )
+        self.hidden_size = args.get("hidden_size")
+        self.head_dim = args.get("head_dim") or (
+            self.hidden_size // self.num_attention_heads
+            if self.hidden_size and self.num_attention_heads
+            else None
+        )
+
+        # Fail fast if critical dims are missing
+        missing = []
+        if not self.num_layers:
+            missing.append("num_layers (num_hidden_layers / n_layers)")
+        if not self.num_kv_heads:
+            missing.append("num_kv_heads (num_key_value_heads / n_kv_heads)")
+        if not self.head_dim:
+            missing.append("head_dim")
+        if missing:
+            raise ValueError(
+                f"Cannot resolve model dimensions: {', '.join(missing)}. "
+                f"Available keys: {sorted(args.keys())}"
+            )
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -645,31 +666,16 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
-        num_layers = self.model_args.get("num_hidden_layers") or self.model_args.get(
-            "n_layers"
-        )
-        num_attention_heads = self.model_args.get("num_attention_heads")
-        num_kv_heads = (
-            self.model_args.get("num_key_value_heads")
-            or self.model_args.get("n_kv_heads")
-            or num_attention_heads
-        )
-        hidden_size = self.model_args.get("hidden_size")
-        head_size = self.model_args.get("head_dim") or (
-            hidden_size // num_attention_heads
-            if hidden_size and num_attention_heads
-            else None
-        )
         block_size = self.metal_config.block_size
 
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
-        for layer_idx in range(num_layers):
+        for layer_idx in range(self.num_layers):
             layer_name = f"layers.{layer_idx}.self_attn"
             specs[layer_name] = FullAttentionSpec(
                 block_size=block_size,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
                 dtype=torch.float16,
             )
 
@@ -691,21 +697,6 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
-        num_layers = self.model_args.get("num_hidden_layers") or self.model_args.get(
-            "n_layers"
-        )
-        num_attention_heads = self.model_args.get("num_attention_heads")
-        num_kv_heads = (
-            self.model_args.get("num_key_value_heads")
-            or self.model_args.get("n_kv_heads")
-            or num_attention_heads
-        )
-        hidden_size = self.model_args.get("hidden_size")
-        head_dim = self.model_args.get("head_dim") or (
-            hidden_size // num_attention_heads
-            if hidden_size and num_attention_heads
-            else None
-        )
         block_size = self.metal_config.block_size
 
         # Each block stores key and value for all layers
@@ -713,10 +704,10 @@ class MetalModelRunner:
         dtype_size = 2  # float16
         return (
             2
-            * int(num_layers)
+            * self.num_layers
             * block_size
-            * int(num_kv_heads)
-            * int(head_dim)
+            * self.num_kv_heads
+            * self.head_dim
             * dtype_size
         )
 
@@ -1224,7 +1215,7 @@ class MetalModelRunner:
         # OffsetCache is a fake cache — it stores no KV data.  It only
         # satisfies mlx_lm's RoPE offset and mask protocol.  Real KV is
         # written to the MPS paged cache by the attention wrapper.
-        offset_caches = [OffsetCache(0) for _ in range(self._num_layers)]
+        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
 
         # The model forward calls each layer's self_attn, which has been
         # replaced by MetalKernelPagedAttentionWrapper.  The wrapper:
@@ -1313,7 +1304,7 @@ class MetalModelRunner:
         # returns None regardless, so a shared max_offset is fine.  Actual
         # per-request RoPE offsets come from ctx.offsets in the wrapper.
         max_offset = max(info[1] for info in requests_info)
-        offset_caches = [OffsetCache(max_offset) for _ in range(self._num_layers)]
+        offset_caches = [OffsetCache(max_offset) for _ in range(self.num_layers)]
 
         # Build batched input
         if self._rust_state_manager is not None:
