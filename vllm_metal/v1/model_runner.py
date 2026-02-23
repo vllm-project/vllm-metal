@@ -460,6 +460,7 @@ class MetalModelRunner:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.device = device
         self.metal_config = get_config()
 
@@ -1240,10 +1241,11 @@ class MetalModelRunner:
     ) -> ModelRunnerOutput | None:
         """Return sampled tokens produced by the last execute_model call.
 
-        vLLM's v1 engine will call ``sample_tokens`` after ``execute_model`` when
-        scheduling tokens. If ``execute_model`` fails before producing output,
-        returning ``None`` here allows vLLM to surface the original exception
-        from ``execute_model``.
+        vLLM's v1 engine calls ``sample_tokens`` after a successful
+        ``execute_model`` call that returned ``None``. When async scheduling is
+        enabled, vLLM may still call ``sample_tokens`` even if ``execute_model``
+        failed; returning ``None`` in that case allows vLLM to surface the
+        original exception from ``execute_model``.
         """
         del grammar_output
         if self._pending_output is None:
@@ -1251,13 +1253,20 @@ class MetalModelRunner:
             model_config = getattr(self, "model_config", None)
             if model_config is not None:
                 model_id = getattr(model_config, "model", None)
-            logger.error(
-                "sample_tokens called without pending output from execute_model "
-                "(model=%r). Returning None so vLLM can surface the original "
-                "execute_model error.",
-                model_id,
+
+            if getattr(self, "use_async_scheduling", False):
+                logger.error(
+                    "sample_tokens called without pending output from "
+                    "execute_model (model=%r). Returning None so vLLM can "
+                    "surface the original execute_model error.",
+                    model_id,
+                )
+                return None
+
+            raise RuntimeError(
+                "State error: sample_tokens called without pending output from "
+                f"execute_model (model={model_id!r})."
             )
-            return None
         output = self._pending_output
         self._pending_output = None
         return output

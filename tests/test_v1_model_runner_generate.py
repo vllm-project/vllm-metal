@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -70,6 +71,7 @@ class TestV1MetalModelRunnerSampleTokens:
     def _make_runner(self) -> mr.MetalModelRunner:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner._pending_output = None
+        runner.use_async_scheduling = True
         return runner
 
     def test_returns_pending_output_and_clears_state(self) -> None:
@@ -77,7 +79,7 @@ class TestV1MetalModelRunnerSampleTokens:
         pending = ModelRunnerOutput(
             req_ids=["req-0"],
             req_id_to_index={"req-0": 0},
-            sampled_token_ids=[123],
+            sampled_token_ids=[[123]],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[None],
@@ -94,3 +96,12 @@ class TestV1MetalModelRunnerSampleTokens:
         out = runner.sample_tokens(grammar_output=None)
 
         assert out is None
+
+    def test_raises_when_no_pending_output_and_not_async(self) -> None:
+        runner = self._make_runner()
+        runner.use_async_scheduling = False
+
+        with pytest.raises(
+            RuntimeError, match="sample_tokens called without pending output"
+        ):
+            runner.sample_tokens(grammar_output=None)
