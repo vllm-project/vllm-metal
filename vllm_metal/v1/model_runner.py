@@ -1235,13 +1235,29 @@ class MetalModelRunner:
         )
         return None
 
-    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
-        """Return sampled tokens produced by the last execute_model call."""
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | None:
+        """Return sampled tokens produced by the last execute_model call.
+
+        vLLM's v1 engine will call ``sample_tokens`` after ``execute_model`` when
+        scheduling tokens. If ``execute_model`` fails before producing output,
+        returning ``None`` here allows vLLM to surface the original exception
+        from ``execute_model``.
+        """
         del grammar_output
         if self._pending_output is None:
-            raise RuntimeError(
-                "sample_tokens called without pending output from execute_model"
+            model_id = None
+            model_config = getattr(self, "model_config", None)
+            if model_config is not None:
+                model_id = getattr(model_config, "model", None)
+            logger.error(
+                "sample_tokens called without pending output from execute_model "
+                "(model=%r). Returning None so vLLM can surface the original "
+                "execute_model error.",
+                model_id,
             )
+            return None
         output = self._pending_output
         self._pending_output = None
         return output
