@@ -9,29 +9,52 @@ import pytest
 
 from vllm_metal.config import (
     AUTO_MEMORY_FRACTION,
-    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
-    AUTO_MEMORY_OVERHEAD_FACTOR,
     MetalConfig,
 )
 from vllm_metal.v1 import worker as v1_worker_module
 from vllm_metal.v1.worker import MetalWorker as V1MetalWorker
 
 
+def _make_worker(
+    *,
+    memory_fraction: float = AUTO_MEMORY_FRACTION,
+    max_model_len: int = 2048,
+    num_layers: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    model_memory: int = 500_000_000,
+) -> V1MetalWorker:
+    """Create a minimal V1MetalWorker for unit testing."""
+    worker = V1MetalWorker.__new__(V1MetalWorker)
+    worker.metal_config = MetalConfig(
+        memory_fraction=memory_fraction,
+        use_mlx=False,
+        mlx_device="gpu",
+        block_size=16,
+        debug=False,
+    )
+    worker.model_config = SimpleNamespace(max_model_len=max_model_len)
+    worker.model_runner = SimpleNamespace(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+    worker._get_model_memory_usage = lambda: model_memory
+    return worker
+
+
+def _one_seq_kv_bytes(
+    num_layers: int, max_model_len: int, num_kv_heads: int, head_dim: int
+) -> int:
+    """Expected KV bytes for one max-length sequence (K+V, float16)."""
+    return 2 * num_layers * max_model_len * num_kv_heads * head_dim * 2
+
+
 class TestAutoMemoryGuardrails:
     def test_v1_worker_sets_mx_memory_limit_in_auto_mode_when_feasible(
         self, monkeypatch
     ) -> None:
-        worker = V1MetalWorker.__new__(V1MetalWorker)
-        worker.metal_config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=False,
-            mlx_device="gpu",
-            block_size=16,
-            debug=False,
-        )
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.get_cache_block_size_bytes = lambda: 4096
-        worker._get_model_memory_usage = lambda: 500_000_000
+        worker = _make_worker()
 
         monkeypatch.setattr(
             psutil, "virtual_memory", lambda: SimpleNamespace(total=8_000_000_000)
@@ -49,35 +72,40 @@ class TestAutoMemoryGuardrails:
         worker._set_auto_memory_limit()
         assert captured.limit is not None
 
-        min_blocks = (
-            worker.model_config.max_model_len + worker.metal_config.block_size - 1
-        ) // worker.metal_config.block_size
-        min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
-        kv_cache_memory = min_blocks * worker.get_cache_block_size_bytes()
-        expected = int(
-            (worker._get_model_memory_usage() + kv_cache_memory)
-            * AUTO_MEMORY_OVERHEAD_FACTOR
-        )
+        kv_bytes = _one_seq_kv_bytes(32, 2048, 8, 128)
+        expected = int((500_000_000 + kv_bytes) * 1.2)
         assert captured.limit == expected
 
     def test_v1_worker_raises_when_minimal_needed_exceeds_total(
         self, monkeypatch
     ) -> None:
-        worker = V1MetalWorker.__new__(V1MetalWorker)
-        worker.metal_config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=False,
-            mlx_device="gpu",
-            block_size=16,
-            debug=False,
-        )
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.get_cache_block_size_bytes = lambda: 4096
-        worker._get_model_memory_usage = lambda: 2_000_000_000
+        worker = _make_worker(model_memory=2_000_000_000)
 
         monkeypatch.setattr(
             psutil, "virtual_memory", lambda: SimpleNamespace(total=1_000_000_000)
         )
 
         with pytest.raises(ValueError, match="Auto memory mode"):
-            worker.determine_available_memory()
+            worker._set_auto_memory_limit()
+
+    def test_determine_available_memory_returns_one_sequence_budget(self) -> None:
+        worker = _make_worker()
+
+        available = worker.determine_available_memory()
+        expected = _one_seq_kv_bytes(32, 2048, 8, 128)
+        assert available == expected
+
+    def test_explicit_fraction_warns_without_paged_attention(
+        self, monkeypatch, caplog
+    ) -> None:
+        worker = _make_worker(memory_fraction=0.7)
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            available = worker.determine_available_memory()
+
+        # Should still return one-sequence budget, not fraction-based
+        expected = _one_seq_kv_bytes(32, 2048, 8, 128)
+        assert available == expected
+        assert "ignored without paged attention" in caplog.text

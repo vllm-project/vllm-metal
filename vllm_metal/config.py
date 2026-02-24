@@ -8,17 +8,6 @@ from typing import Literal
 # Sentinel value indicating auto memory calculation
 AUTO_MEMORY_FRACTION = -1.0
 
-# Auto memory estimation heuristics.
-#
-# These heuristics intentionally over-estimate the minimum unified memory needed
-# to run the model + a minimal KV cache, to account for transient allocations and
-# fragmentation.
-AUTO_MEMORY_OVERHEAD_FACTOR = 1.2
-
-# Extra slack on the minimum number of KV blocks derived from `max_model_len` to
-# avoid under-allocation due to rounding and other small overheads.
-AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR = 1.1
-
 # Paged attention: placeholder overhead for activations, framework, OS, etc.
 # Will be replaced by a profiling pass in a future PR.
 PAGED_ATTENTION_OVERHEAD_BYTES = 800 * 1024 * 1024  # 800 MB
