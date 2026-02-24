@@ -335,8 +335,7 @@ class MetalWorker(WorkerBase):
         if hasattr(mx, "set_memory_limit"):
             mx.set_memory_limit(total_needed)
             logger.info(
-                "Auto mode: MLX memory limit set to %.2fGB "
-                "(model=%.2fGB, kv=%.2fGB)",
+                "Auto mode: MLX memory limit set to %.2fGB (model=%.2fGB, kv=%.2fGB)",
                 total_needed / 1e9,
                 model_memory / 1e9,
                 kv_memory / 1e9,

@@ -88,9 +88,7 @@ class TestAutoMemoryGuardrails:
         available = worker.determine_available_memory()
         assert available == worker._one_sequence_kv_bytes()
 
-    def test_explicit_fraction_warns_without_paged_attention(
-        self, caplog
-    ) -> None:
+    def test_explicit_fraction_warns_without_paged_attention(self, caplog) -> None:
         worker = _make_worker(memory_fraction=0.7)
 
         with caplog.at_level(logging.WARNING):
