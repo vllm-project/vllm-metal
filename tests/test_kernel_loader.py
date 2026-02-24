@@ -16,8 +16,10 @@ from unittest import mock
 
 import pytest
 
+pytest.importorskip("kernels")
+
 # ---------------------------------------------------------------------------
-# Unit tests (no network, no GPU — run everywhere)
+# Unit tests (no network, no GPU)
 # ---------------------------------------------------------------------------
 
 
