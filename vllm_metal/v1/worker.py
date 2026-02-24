@@ -375,13 +375,6 @@ class MetalWorker(WorkerBase):
                 return available
 
         # --- MLX path: one max-length sequence for admission control ---
-        if not self.metal_config.is_auto_memory:
-            logger.warning(
-                "VLLM_METAL_MEMORY_FRACTION=%.2f ignored without paged "
-                "attention; using one-sequence budget for admission control.",
-                self.metal_config.memory_fraction,
-            )
-
         available = self._one_sequence_kv_bytes()
         logger.info(
             "MLX path: reporting %.2fGB for scheduler admission control "

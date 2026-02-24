@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from types import SimpleNamespace
 
 import psutil
@@ -18,13 +17,12 @@ from vllm_metal.v1.worker import MetalWorker as V1MetalWorker
 
 def _make_worker(
     *,
-    memory_fraction: float = AUTO_MEMORY_FRACTION,
     model_memory: int = 1000,
 ) -> V1MetalWorker:
     """Create a minimal V1MetalWorker for unit testing."""
     worker = V1MetalWorker.__new__(V1MetalWorker)
     worker.metal_config = MetalConfig(
-        memory_fraction=memory_fraction,
+        memory_fraction=AUTO_MEMORY_FRACTION,
         use_mlx=False,
         mlx_device="gpu",
         block_size=16,
@@ -87,12 +85,3 @@ class TestAutoMemoryGuardrails:
 
         available = worker.determine_available_memory()
         assert available == worker._one_sequence_kv_bytes()
-
-    def test_explicit_fraction_warns_without_paged_attention(self, caplog) -> None:
-        worker = _make_worker(memory_fraction=0.7)
-
-        with caplog.at_level(logging.WARNING):
-            available = worker.determine_available_memory()
-
-        assert available == worker._one_sequence_kv_bytes()
-        assert "ignored without paged attention" in caplog.text
