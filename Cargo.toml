@@ -10,8 +10,8 @@ name = "_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
-numpy = "0.24"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+numpy = "0.28"
 
 [profile.release]
 lto = true
