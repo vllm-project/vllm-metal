@@ -134,6 +134,24 @@ class TestHybridCacheMergeExtract:
         kv.offset = seq_len
         return kv
 
+    def _make_rotating_kv_cache(
+        self, *, max_size: int, total_tokens: int, value: float
+    ) -> mr.RotatingKVCache:
+        cache = mr.RotatingKVCache(max_size=max_size)
+        keys = mx.full(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM),
+            value,
+            dtype=mx.float32,
+        )
+        values = mx.full(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM),
+            value + 0.5,
+            dtype=mx.float32,
+        )
+        for _ in range(total_tokens):
+            cache.update_and_fetch(keys, values)
+        return cache
+
     def test_arrays_cache_merge_extract_roundtrip(self) -> None:
         """Merging then extracting ArraysCache round-trips per request."""
         arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
@@ -213,6 +231,20 @@ class TestHybridCacheMergeExtract:
         assert bool(mx.allclose(arrays_req0_out.state[1], arrays_cache_req0.state[1]))
         assert bool(mx.allclose(arrays_req1_out.state[0], arrays_cache_req1.state[0]))
         assert bool(mx.allclose(arrays_req1_out.state[1], arrays_cache_req1.state[1]))
+
+    def test_rotating_kvcache_merge_extract_preserves_offsets(self) -> None:
+        cache_req0 = self._make_rotating_kv_cache(max_size=8, total_tokens=20, value=1.0)
+        cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset
+        assert extracted_req1.offset == cache_req1.offset
 
     def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
         arrays_cache = self._make_arrays_cache(1.0, 2.0)
