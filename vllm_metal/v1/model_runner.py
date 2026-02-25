@@ -388,7 +388,7 @@ class RequestState:
     # vLLM applies repetition penalties to both prompt+output tokens, but applies
     # presence/frequency penalties only to generated (output) tokens.
     prompt_len: int
-    cache: list[AnyCache]  # Per-layer caches (KVCache or ArraysCache for hybrid models)
+    cache: list[AnyCache]  # Per-layer caches (KVCache, RotatingKVCache, or ArraysCache)
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
     generated_tokens: int = 0
@@ -409,7 +409,7 @@ def _merge_kv_caches(
         return []
 
     num_layers = len(caches_list[0])
-    merged: list[BatchKVCache | ArraysCache] = []
+    merged: list[BatchKVCache | BatchRotatingKVCache | ArraysCache] = []
 
     for layer_idx in range(num_layers):
         layer_caches = [caches[layer_idx] for caches in caches_list]
