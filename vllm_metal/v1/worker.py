@@ -138,10 +138,6 @@ class MetalWorker(WorkerBase):
         if self.metal_config.use_paged_attention:
             self._setup_paged_attention()
 
-        # In auto mode, set MLX memory limit to prevent unbounded growth
-        if self.metal_config.is_auto_memory:
-            self._set_auto_memory_limit()
-
     def _setup_paged_attention(self) -> None:
         """Create MPSPagedKVCache and patch model attention for HF Metal kernel.
 
@@ -309,41 +305,6 @@ class MetalWorker(WorkerBase):
             * runner.head_dim
             * 2  # float16
         )
-
-    def _set_auto_memory_limit(self) -> None:
-        """Cap MLX memory to (model + one-sequence KV) * 1.2 safety margin.
-
-        Prevents MLX from growing unbounded in auto mode.
-        """
-        import psutil
-
-        total_memory = psutil.virtual_memory().total
-        model_memory = self._get_model_memory_usage()
-        kv_memory = self._one_sequence_kv_bytes()
-        total_needed = int((model_memory + kv_memory) * 1.2)
-
-        if total_needed > total_memory:
-            raise ValueError(
-                "Auto memory mode requires more memory than available. "
-                f"total={total_memory / 1e9:.2f}GB, "
-                f"model={model_memory / 1e9:.2f}GB, "
-                f"kv={kv_memory / 1e9:.2f}GB "
-                f"(max_model_len={self.model_config.max_model_len}). "
-                "Mitigations: reduce max_model_len or use a smaller model."
-            )
-
-        if hasattr(mx, "set_memory_limit"):
-            mx.set_memory_limit(total_needed)
-            logger.info(
-                "Auto mode: MLX memory limit set to %.2fGB (model=%.2fGB, kv=%.2fGB)",
-                total_needed / 1e9,
-                model_memory / 1e9,
-                kv_memory / 1e9,
-            )
-        else:
-            logger.warning(
-                "mx.set_memory_limit not available, memory may grow unbounded"
-            )
 
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
