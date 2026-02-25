@@ -26,7 +26,9 @@ from mlx_lm import stream_generate
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchRotatingKVCache,
     KVCache,
+    RotatingKVCache,
     make_prompt_cache,
 )
 
@@ -251,11 +253,11 @@ class PrefixCacheManager:
 
     def restore_cache(
         self, cached: CachedPrefix, model: Any, is_vlm: bool
-    ) -> list[KVCache]:
+    ) -> list["AnyCache"]:
         """Restore a cached prefix to a fresh KVCache.
 
-        Only KVCache layers are restored. ArraysCache layers remain in their
-        fresh state for hybrid model compatibility.
+        Only KVCache layers are restored. RotatingKVCache / ArraysCache layers
+        remain in their fresh state.
         """
         cache_model = (
             model.language_model
@@ -288,8 +290,12 @@ class PrefixCacheManager:
         }
 
 
-# Type alias for any cache type supported by the model
-AnyCache: TypeAlias = KVCache | ArraysCache
+# Type alias for any per-layer cache type supported by the model.
+#
+# Notes:
+# - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
+# - Hybrid models use `ArraysCache` for non-attention state.
+AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -390,7 +396,7 @@ class RequestState:
 
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
-) -> list[BatchKVCache | ArraysCache]:
+) -> list[BatchKVCache | BatchRotatingKVCache | ArraysCache]:
     """Merge multiple per-request caches into batched caches.
 
     Args:
@@ -416,15 +422,34 @@ def _merge_kv_caches(
                     )
                 arrays_caches.append(cache)
             batch_cache = _merge_arrays_caches(arrays_caches)
-        else:  # KV-like caches
-            batch_cache = BatchKVCache.merge(layer_caches)
+        elif isinstance(layer_caches[0], RotatingKVCache):
+            rotating_caches: list[RotatingKVCache] = []
+            for cache in layer_caches:
+                if not isinstance(cache, RotatingKVCache):
+                    raise TypeError(
+                        "Mixed cache types in a single layer: expected RotatingKVCache"
+                    )
+                rotating_caches.append(cache)
+            batch_cache = BatchRotatingKVCache.merge(rotating_caches)
+        elif isinstance(layer_caches[0], KVCache):
+            kv_caches: list[KVCache] = []
+            for cache in layer_caches:
+                if not isinstance(cache, KVCache):
+                    raise TypeError(
+                        "Mixed cache types in a single layer: expected KVCache"
+                    )
+                kv_caches.append(cache)
+            batch_cache = BatchKVCache.merge(kv_caches)
+        else:
+            cache_type = type(layer_caches[0]).__name__
+            raise TypeError(f"Unsupported cache type for batching: {cache_type}")
         merged.append(batch_cache)
 
     return merged
 
 
 def _extract_kv_cache(
-    batch_caches: list[BatchKVCache | ArraysCache], idx: int
+    batch_caches: list[BatchKVCache | BatchRotatingKVCache | ArraysCache], idx: int
 ) -> list[AnyCache]:
     """Extract a single request's cache from batched caches.
 
