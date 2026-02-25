@@ -9,7 +9,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 - **MLX-accelerated inference**: faster than PyTorch MPS on Apple Silicon
 - **Unified memory**: True zero-copy operations leveraging Apple Silicon's unified memory architecture
 - **vLLM compatibility**: Full integration with vLLM's engine, scheduler, and OpenAI-compatible API
-- **Paged attention**: Efficient KV cache management for long sequences
+- **Paged attention** *(experimental)*: Efficient KV cache management for long sequences — opt-in via `VLLM_METAL_USE_PAGED_ATTENTION=1` (requires `pip install 'vllm-metal[paged]'`); default path uses MLX-managed KV cache
 - **GQA support**: Grouped-Query Attention for efficient inference
 
 ## Requirements
@@ -20,6 +20,14 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+```
+
+## Reinstallation and Update
+If any issues occur, please use the following command to switch to the latest release version and check if the problem is resolved.
+If the issue continues to occur in the latest release, please report the details of the issue.
+
+```bash
+rm -rf ~/.venv-vllm-metal && curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
 ## Architecture
@@ -70,6 +78,7 @@ Environment variables for customization:
 | `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute (1=yes, 0=no) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
+| `VLLM_METAL_USE_PAGED_ATTENTION` | `0` | Enable experimental paged KV cache (requires `pip install 'vllm-metal[paged]'`) |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |

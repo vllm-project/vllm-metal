@@ -25,6 +25,9 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_metal.config import (
     AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
     AUTO_MEMORY_OVERHEAD_FACTOR,
+    PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
+    PAGED_ATTENTION_MIN_BLOCKS,
+    PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
 from vllm_metal.platform import MetalPlatform
@@ -147,9 +150,143 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
+        # Patch model for paged attention if enabled
+        if self.metal_config.use_paged_attention:
+            self._setup_paged_attention()
+
         # In auto mode, set MLX memory limit to prevent unbounded growth
         if self.metal_config.is_auto_memory:
             self._set_auto_memory_limit()
+
+    def _setup_paged_attention(self) -> None:
+        """Create MPSPagedKVCache and patch model attention for HF Metal kernel.
+
+        Computes num_blocks from available system RAM, model weight size, and
+        a configurable memory fraction, rather than blindly scaling from
+        max_model_len.
+        """
+        import psutil
+        import torch
+
+        from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
+        from vllm_metal.metal_kernel_backend.paged_attention import (
+            patch_model_attention_metal_kernel,
+        )
+
+        runner = self.model_runner
+        block_size = self.metal_config.block_size
+
+        # --- Determine memory fraction ---
+        if self.metal_config.is_auto_memory:
+            fraction = PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
+            logger.info(
+                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
+                "defaulting to %.2f for paged path",
+                fraction,
+            )
+        else:
+            fraction = self.metal_config.memory_fraction
+
+        # --- Gather memory numbers ---
+        total_ram = psutil.virtual_memory().total
+        model_memory = self._get_model_memory_usage()
+        per_block_bytes = self.get_cache_block_size_bytes()
+
+        # --- Compute KV budget ---
+        usable_ram = int(total_ram * fraction)
+        available_ram = psutil.virtual_memory().available
+
+        if usable_ram > available_ram:
+            raise ValueError(
+                "Paged attention: requested memory exceeds available RAM. "
+                f"total_ram={total_ram / 1e9:.2f}GB, "
+                f"fraction={fraction}, "
+                f"usable_ram={usable_ram / 1e9:.2f}GB, "
+                f"available_ram={available_ram / 1e9:.2f}GB. "
+                "The OS and other processes are using "
+                f"{(total_ram - available_ram) / 1e9:.2f}GB. "
+                "Mitigations: lower VLLM_METAL_MEMORY_FRACTION "
+                f"(try {available_ram / total_ram:.2f} or less), "
+                "close other applications, or add more RAM."
+            )
+
+        kv_budget = usable_ram - model_memory - PAGED_ATTENTION_OVERHEAD_BYTES
+
+        if kv_budget <= 0:
+            raise ValueError(
+                "Paged attention: not enough memory for KV cache. "
+                f"total_ram={total_ram / 1e9:.2f}GB, "
+                f"fraction={fraction}, "
+                f"usable_ram={usable_ram / 1e9:.2f}GB, "
+                f"model_memory={model_memory / 1e9:.2f}GB, "
+                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"kv_budget={kv_budget / 1e9:.2f}GB. "
+                "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
+                "use a smaller model, or add more RAM."
+            )
+
+        num_blocks = kv_budget // per_block_bytes
+
+        if num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
+            raise ValueError(
+                "Paged attention: computed num_blocks too low "
+                f"({num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
+                f"total_ram={total_ram / 1e9:.2f}GB, "
+                f"fraction={fraction}, "
+                f"usable_ram={usable_ram / 1e9:.2f}GB, "
+                f"model_memory={model_memory / 1e9:.2f}GB, "
+                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"kv_budget={kv_budget / 1e9:.2f}GB, "
+                f"per_block_bytes={per_block_bytes}. "
+                "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
+                "use a smaller model, or add more RAM."
+            )
+
+        max_tokens_cached = num_blocks * block_size
+
+        logger.info(
+            "Paged attention memory breakdown: "
+            "total_ram=%.2fGB, fraction=%.2f, usable_ram=%.2fGB, "
+            "model_memory=%.2fGB, overhead=%.2fGB, "
+            "kv_budget=%.2fGB, per_block_bytes=%d, "
+            "num_blocks=%d, max_tokens_cached=%d",
+            total_ram / 1e9,
+            fraction,
+            usable_ram / 1e9,
+            model_memory / 1e9,
+            PAGED_ATTENTION_OVERHEAD_BYTES / 1e9,
+            kv_budget / 1e9,
+            per_block_bytes,
+            num_blocks,
+            max_tokens_cached,
+        )
+
+        # --- Create cache and patch model ---
+        mps_kv_cache = MPSPagedKVCache(
+            num_layers=runner.num_layers,
+            num_kv_heads=runner.num_kv_heads,
+            head_dim=runner.head_dim,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            dtype=torch.float16,
+        )
+
+        n_patched = patch_model_attention_metal_kernel(
+            runner.model, mps_kv_cache, block_size
+        )
+        logger.info(
+            "Metal kernel paged attention enabled: %d layers patched, "
+            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
+            n_patched,
+            num_blocks,
+            block_size,
+            runner.num_kv_heads,
+            runner.head_dim,
+        )
+
+        # Store on model runner for use by paged prefill/decode
+        runner._paged_kv_cache = mps_kv_cache
+        runner._paged_block_size = block_size
 
     def _get_model_memory_usage(self) -> int:
         """Get current model memory usage from MLX.
@@ -253,10 +390,34 @@ class MetalWorker(WorkerBase):
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
 
+        When paged attention is enabled, reports the actual MPS paged cache
+        capacity so the vLLM scheduler allocates the right number of blocks.
+
         Returns:
             Available memory in bytes
         """
         import psutil
+
+        # When paged attention is on, the real KV storage is the MPS paged
+        # cache (already allocated).  Report its capacity so the scheduler
+        # can make use of all the blocks we actually have.
+        if self.metal_config.use_paged_attention:
+            runner = self.model_runner
+            if (
+                hasattr(runner, "_paged_kv_cache")
+                and runner._paged_kv_cache is not None
+            ):
+                paged_cache = runner._paged_kv_cache
+                block_size_bytes = self.get_cache_block_size_bytes()
+                available = paged_cache.num_blocks * block_size_bytes
+                logger.info(
+                    "Paged attention: reporting MPS cache capacity "
+                    "(%d blocks × %d bytes = %.2f GB)",
+                    paged_cache.num_blocks,
+                    block_size_bytes,
+                    available / 1e9,
+                )
+                return available
 
         # Handle auto memory mode
         if self.metal_config.is_auto_memory:

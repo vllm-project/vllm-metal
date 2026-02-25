@@ -19,6 +19,17 @@ AUTO_MEMORY_OVERHEAD_FACTOR = 1.2
 # avoid under-allocation due to rounding and other small overheads.
 AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR = 1.1
 
+# Paged attention: placeholder overhead for activations, framework, OS, etc.
+# Will be replaced by a profiling pass in a future PR.
+PAGED_ATTENTION_OVERHEAD_BYTES = 800 * 1024 * 1024  # 800 MB
+
+# Default memory fraction when user leaves VLLM_METAL_MEMORY_FRACTION as "auto"
+# but enables paged attention (auto is for the MLX path).
+PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
+
+# Minimum blocks required for paged attention to be usable.
+PAGED_ATTENTION_MIN_BLOCKS = 16
+
 
 @dataclass
 class MetalConfig:
@@ -29,6 +40,7 @@ class MetalConfig:
     mlx_device: Literal["gpu", "cpu"]
     block_size: int
     debug: bool
+    use_paged_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -59,6 +71,8 @@ class MetalConfig:
             mlx_device=os.environ.get("VLLM_MLX_DEVICE", "gpu"),  # type: ignore[arg-type]
             block_size=int(os.environ.get("VLLM_METAL_BLOCK_SIZE", "16")),
             debug=os.environ.get("VLLM_METAL_DEBUG", "0") == "1",
+            use_paged_attention=os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+            == "1",
         )
 
 

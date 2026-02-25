@@ -132,6 +132,10 @@ class KVCache:
 class PagedKVCache:
     """Paged KV cache for batched inference with variable sequence lengths.
 
+    NOTE: This class is not used in production. The active paged attention
+    implementation uses MPSPagedKVCache from metal_kernel_backend.cache.
+    Kept as a reference for future development.
+
     Uses Rust-based O(1) block allocation via VecDeque, providing 355x faster
     allocation compared to Python's list.pop(0) at scale.
     """
@@ -172,7 +176,7 @@ class PagedKVCache:
         # Rust-based O(1) block allocator
         self._allocator = BlockAllocator(num_blocks)
 
-    def allocate_blocks(self, seq_id: int, num_blocks: int) -> list[int]:
+    def allocate_blocks(self, seq_id: str, num_blocks: int) -> list[int]:
         """Allocate blocks for a sequence.
 
         Uses Rust VecDeque for O(1) allocation (355x faster than Python list.pop(0)).
@@ -189,7 +193,7 @@ class PagedKVCache:
         """
         return self._allocator.allocate_blocks(seq_id, num_blocks)
 
-    def free_sequence(self, seq_id: int) -> None:
+    def free_sequence(self, seq_id: str) -> None:
         """Free all blocks for a sequence.
 
         Args:
@@ -222,7 +226,7 @@ class PagedKVCache:
         self.block_pool[block_idx, layer_idx, 1, slot_offset:end_slot] = value
 
     def get_sequence_kv(
-        self, seq_id: int, layer_idx: int, seq_len: int
+        self, seq_id: str, layer_idx: int, seq_len: int
     ) -> tuple[mx.array, mx.array]:
         """Get key-value pairs for a sequence.
 
@@ -261,7 +265,7 @@ class PagedKVCache:
         """Return number of free blocks."""
         return self._allocator.num_free_blocks
 
-    def has_sequence(self, seq_id: int) -> bool:
+    def has_sequence(self, seq_id: str) -> bool:
         """Check if a sequence has blocks allocated.
 
         Args:
@@ -271,3 +275,7 @@ class PagedKVCache:
             True if the sequence has allocated blocks
         """
         return self._allocator.has_sequence(seq_id)
+
+    def get_sequence_blocks(self, seq_id: str) -> list[int]:
+        """Return the block indices allocated to *seq_id*."""
+        return self._allocator.get_sequence_blocks(seq_id)

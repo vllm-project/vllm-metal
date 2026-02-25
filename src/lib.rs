@@ -21,7 +21,7 @@ pub struct BlockAllocator {
     /// Free blocks stored in a deque for O(1) operations
     free_blocks: VecDeque<usize>,
     /// Mapping from sequence ID to allocated blocks
-    sequence_blocks: HashMap<i64, Vec<usize>>,
+    sequence_blocks: HashMap<String, Vec<usize>>,
     /// Total number of blocks
     num_blocks: usize,
 }
@@ -53,7 +53,7 @@ impl BlockAllocator {
     ///
     /// # Raises
     /// RuntimeError if not enough free blocks
-    pub fn allocate_blocks(&mut self, seq_id: i64, num_blocks: usize) -> PyResult<Vec<usize>> {
+    pub fn allocate_blocks(&mut self, seq_id: String, num_blocks: usize) -> PyResult<Vec<usize>> {
         if self.free_blocks.len() < num_blocks {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Not enough free blocks: need {}, have {}",
@@ -83,7 +83,7 @@ impl BlockAllocator {
     ///
     /// # Arguments
     /// * `seq_id` - Sequence identifier
-    pub fn free_sequence(&mut self, seq_id: i64) {
+    pub fn free_sequence(&mut self, seq_id: String) {
         if let Some(blocks) = self.sequence_blocks.remove(&seq_id) {
             // Return blocks to the free pool
             for block_idx in blocks {
@@ -99,7 +99,7 @@ impl BlockAllocator {
     ///
     /// # Returns
     /// List of block indices for the sequence
-    pub fn get_sequence_blocks(&self, seq_id: i64) -> Vec<usize> {
+    pub fn get_sequence_blocks(&self, seq_id: String) -> Vec<usize> {
         self.sequence_blocks
             .get(&seq_id)
             .cloned()
@@ -119,7 +119,7 @@ impl BlockAllocator {
     }
 
     /// Check if sequence has blocks allocated.
-    pub fn has_sequence(&self, seq_id: i64) -> bool {
+    pub fn has_sequence(&self, seq_id: String) -> bool {
         self.sequence_blocks.contains_key(&seq_id)
     }
 
@@ -130,7 +130,7 @@ impl BlockAllocator {
     }
 
     /// Get all sequence blocks as a dictionary.
-    pub fn get_all_sequence_blocks(&self) -> HashMap<i64, Vec<usize>> {
+    pub fn get_all_sequence_blocks(&self) -> HashMap<String, Vec<usize>> {
         self.sequence_blocks.clone()
     }
 }
@@ -280,10 +280,10 @@ pub fn compute_kv_block_indices(
 /// Batch compute block indices for multiple sequences.
 #[pyfunction]
 pub fn batch_compute_kv_indices(
-    sequence_blocks: HashMap<i64, Vec<usize>>,
-    seq_lens: HashMap<i64, usize>,
+    sequence_blocks: HashMap<String, Vec<usize>>,
+    seq_lens: HashMap<String, usize>,
     block_size: usize,
-) -> HashMap<i64, Vec<(usize, usize, usize)>> {
+) -> HashMap<String, Vec<(usize, usize, usize)>> {
     let mut result = HashMap::with_capacity(sequence_blocks.len());
 
     for (seq_id, blocks) in sequence_blocks {

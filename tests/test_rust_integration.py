@@ -17,7 +17,7 @@ class TestRustBlockAllocator:
         allocator = BlockAllocator(100)
         assert allocator.num_free_blocks == 100
 
-        blocks = allocator.allocate_blocks(0, 10)
+        blocks = allocator.allocate_blocks("seq-0", 10)
         assert len(blocks) == 10
         assert allocator.num_free_blocks == 90
         assert blocks == list(range(10))
@@ -26,9 +26,9 @@ class TestRustBlockAllocator:
         """Test allocation for multiple sequences."""
         allocator = BlockAllocator(100)
 
-        blocks0 = allocator.allocate_blocks(0, 5)
-        blocks1 = allocator.allocate_blocks(1, 5)
-        blocks2 = allocator.allocate_blocks(2, 5)
+        blocks0 = allocator.allocate_blocks("seq-0", 5)
+        blocks1 = allocator.allocate_blocks("seq-1", 5)
+        blocks2 = allocator.allocate_blocks("seq-2", 5)
 
         assert len(blocks0) == 5
         assert len(blocks1) == 5
@@ -43,22 +43,22 @@ class TestRustBlockAllocator:
         """Test freeing blocks for a sequence."""
         allocator = BlockAllocator(100)
 
-        allocator.allocate_blocks(0, 10)
-        allocator.allocate_blocks(1, 10)
+        allocator.allocate_blocks("seq-0", 10)
+        allocator.allocate_blocks("seq-1", 10)
         assert allocator.num_free_blocks == 80
 
-        allocator.free_sequence(0)
+        allocator.free_sequence("seq-0")
         assert allocator.num_free_blocks == 90
 
-        allocator.free_sequence(1)
+        allocator.free_sequence("seq-1")
         assert allocator.num_free_blocks == 100
 
     def test_get_sequence_blocks(self):
         """Test getting blocks for a sequence."""
         allocator = BlockAllocator(100)
 
-        expected = allocator.allocate_blocks(42, 7)
-        actual = allocator.get_sequence_blocks(42)
+        expected = allocator.allocate_blocks("seq-42", 7)
+        actual = allocator.get_sequence_blocks("seq-42")
 
         assert actual == expected
 
@@ -67,14 +67,14 @@ class TestRustBlockAllocator:
         allocator = BlockAllocator(10)
 
         with pytest.raises(RuntimeError, match="Not enough free blocks"):
-            allocator.allocate_blocks(0, 20)
+            allocator.allocate_blocks("seq-0", 20)
 
     def test_reset(self):
         """Test resetting the allocator."""
         allocator = BlockAllocator(100)
 
-        allocator.allocate_blocks(0, 50)
-        allocator.allocate_blocks(1, 30)
+        allocator.allocate_blocks("seq-0", 50)
+        allocator.allocate_blocks("seq-1", 30)
         assert allocator.num_free_blocks == 20
 
         allocator.reset()
@@ -219,7 +219,7 @@ def test_performance_comparison():
     for _ in range(100):
         allocator = BlockAllocator(num_blocks)
         for seq_id in range(num_seqs):
-            allocator.allocate_blocks(seq_id, blocks_per_seq)
+            allocator.allocate_blocks(f"seq-{seq_id}", blocks_per_seq)
     rust_time = time.perf_counter() - start
 
     # Python list.pop(0) allocation
