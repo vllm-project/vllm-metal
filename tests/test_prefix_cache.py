@@ -248,6 +248,34 @@ class TestHybridCacheMergeExtract:
         assert extracted_req0.offset == cache_req0.offset
         assert extracted_req1.offset == cache_req1.offset
 
+    def test_rotating_kvcache_merge_handles_offset_exceeding_max_size(self) -> None:
+        """Merging works when offset > max_size (cache has rotated).
+
+        This is a regression test for a bug in ``BatchRotatingKVCache.merge``
+        (mlx-lm <= 0.29.1) where using ``c.offset`` instead of ``len(c)`` caused
+        a broadcast shape error after the cache rotated past its maximum size.
+        """
+        # offset=300 >> max_size=8 — the cache has rotated many times
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=300, value=1.0
+        )
+        cache_req1 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=150, value=2.0
+        )
+
+        assert cache_req0.offset > cache_req0.max_size
+        assert cache_req1.offset > cache_req1.max_size
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset
+        assert extracted_req1.offset == cache_req1.offset
+
     def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
         arrays_cache = self._make_arrays_cache(1.0, 2.0)
         kv_cache = mr.KVCache()

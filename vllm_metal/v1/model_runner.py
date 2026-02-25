@@ -341,6 +341,52 @@ def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
     return extracted
 
 
+def _merge_rotating_kv_caches(
+    caches: list[RotatingKVCache],
+) -> BatchRotatingKVCache:
+    """Merge per-request RotatingKVCache objects into a single BatchRotatingKVCache.
+
+    This mirrors ``BatchRotatingKVCache.merge`` but pre-computes the temporal-ordered
+    keys/values and uses their actual shape for the copy width.  The upstream
+    implementation uses ``c.offset`` which can exceed the underlying array size
+    after the cache has rotated, causing a broadcast shape error.
+    """
+    if not caches:
+        raise ValueError("caches must be non-empty")
+
+    if not all(c.max_size == caches[0].max_size for c in caches):
+        raise ValueError(
+            "BatchRotatingKVCache can only merge caches with the same maximum size"
+        )
+
+    # Pre-compute temporal-ordered keys/values so we know the real size of each.
+    ordered = [(c._temporal_order(c.keys), c._temporal_order(c.values)) for c in caches]
+    lengths = [k.shape[2] for k, _ in ordered]
+    max_length = max(lengths)
+    padding = [max_length - length for length in lengths]
+    batch_size = len(caches)
+    n_heads = max(k.shape[1] for k, _ in ordered)
+    k_dim = max(k.shape[3] for k, _ in ordered)
+    v_dim = max(v.shape[3] for _, v in ordered)
+    dtype = next(iter(k.dtype for k, _ in ordered))
+
+    keys = mx.zeros((batch_size, n_heads, max_length, k_dim), dtype=dtype)
+    values = mx.zeros((batch_size, n_heads, max_length, v_dim), dtype=dtype)
+    for i, (pad, (k, v)) in enumerate(zip(padding, ordered, strict=True)):
+        n = k.shape[2]
+        keys[i : i + 1, :, pad : pad + n] = k
+        values[i : i + 1, :, pad : pad + n] = v
+
+    cache = BatchRotatingKVCache(caches[0].max_size, padding)
+    cache.keys = keys
+    cache.values = values
+    cache.offset = mx.array([c.offset for c in caches])
+    cache._idx = keys.shape[2]
+    cache._offset = keys.shape[2]
+
+    return cache
+
+
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
     """Native MLX greedy sampling - avoids PyTorch round-trip.
 
@@ -430,7 +476,7 @@ def _merge_kv_caches(
                         "Mixed cache types in a single layer: expected RotatingKVCache"
                     )
                 rotating_caches.append(cache)
-            batch_cache = BatchRotatingKVCache.merge(rotating_caches)
+            batch_cache = _merge_rotating_kv_caches(rotating_caches)
         elif isinstance(layer_caches[0], KVCache):
             kv_caches: list[KVCache] = []
             for cache in layer_caches:
