@@ -233,7 +233,9 @@ class TestHybridCacheMergeExtract:
         assert bool(mx.allclose(arrays_req1_out.state[1], arrays_cache_req1.state[1]))
 
     def test_rotating_kvcache_merge_extract_preserves_offsets(self) -> None:
-        cache_req0 = self._make_rotating_kv_cache(max_size=8, total_tokens=20, value=1.0)
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=20, value=1.0
+        )
         cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
 
         merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
