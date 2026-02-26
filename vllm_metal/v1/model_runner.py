@@ -347,20 +347,41 @@ def _merge_rotating_kv_caches(
     """Merge per-request RotatingKVCache objects into a single BatchRotatingKVCache.
 
     This mirrors ``BatchRotatingKVCache.merge`` but pre-computes the temporal-ordered
-    keys/values and uses their actual shape for the copy width.  The upstream
-    implementation uses ``c.offset`` which can exceed the underlying array size
+    keys/values, trims them to ``len(cache)`` (the effective sliding-window length),
+    and uses that length for the copy width.  The upstream implementation in
+    mlx-lm <= 0.29.1 uses ``c.offset`` which can exceed the underlying array size
     after the cache has rotated, causing a broadcast shape error.
+
+    This workaround can be removed once vllm-metal can depend on an mlx-lm version
+    that includes the upstream fix (ml-explore/mlx-lm#738) and has been verified
+    to work with gpt-oss models end-to-end.
     """
     if not caches:
         raise ValueError("caches must be non-empty")
+
+    for c in caches:
+        if c.keys is None or c.values is None:
+            raise ValueError(
+                "Cannot merge unpopulated RotatingKVCache (keys/values is None)"
+            )
 
     if not all(c.max_size == caches[0].max_size for c in caches):
         raise ValueError(
             "BatchRotatingKVCache can only merge caches with the same maximum size"
         )
 
-    # Pre-compute temporal-ordered keys/values so we know the real size of each.
-    ordered = [(c._temporal_order(c.keys), c._temporal_order(c.values)) for c in caches]
+    # Pre-compute temporal-ordered keys/values and trim to the effective
+    # sliding-window length.  ``_temporal_order`` may return an array larger
+    # than ``len(cache)`` when the internal buffer has not been trimmed yet
+    # (e.g. after a large prefill), so we slice to ``len(cache)`` which is
+    # ``min(offset, max_size)``.
+    ordered: list[tuple[mx.array, mx.array]] = []
+    for c in caches:
+        n = len(c)  # effective length: min(offset, max_size)
+        k = c._temporal_order(c.keys)[..., :n, :]
+        v = c._temporal_order(c.values)[..., :n, :]
+        ordered.append((k, v))
+
     lengths = [k.shape[2] for k, _ in ordered]
     max_length = max(lengths)
     padding = [max_length - length for length in lengths]
