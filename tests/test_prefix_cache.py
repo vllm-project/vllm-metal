@@ -134,6 +134,24 @@ class TestHybridCacheMergeExtract:
         kv.offset = seq_len
         return kv
 
+    def _make_rotating_kv_cache(
+        self, *, max_size: int, total_tokens: int, value: float
+    ) -> mr.RotatingKVCache:
+        cache = mr.RotatingKVCache(max_size=max_size)
+        keys = mx.full(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM),
+            value,
+            dtype=mx.float32,
+        )
+        values = mx.full(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM),
+            value + 0.5,
+            dtype=mx.float32,
+        )
+        for _ in range(total_tokens):
+            cache.update_and_fetch(keys, values)
+        return cache
+
     def test_arrays_cache_merge_extract_roundtrip(self) -> None:
         """Merging then extracting ArraysCache round-trips per request."""
         arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
@@ -213,6 +231,109 @@ class TestHybridCacheMergeExtract:
         assert bool(mx.allclose(arrays_req0_out.state[1], arrays_cache_req0.state[1]))
         assert bool(mx.allclose(arrays_req1_out.state[0], arrays_cache_req1.state[0]))
         assert bool(mx.allclose(arrays_req1_out.state[1], arrays_cache_req1.state[1]))
+
+    def test_rotating_kvcache_merge_extract_preserves_offsets(self) -> None:
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=20, value=1.0
+        )
+        cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset
+        assert extracted_req1.offset == cache_req1.offset
+
+    def test_rotating_kvcache_merge_handles_offset_exceeding_max_size(self) -> None:
+        """Merging works when offset > max_size (cache has rotated).
+
+        This is a regression test for a bug in ``BatchRotatingKVCache.merge``
+        (mlx-lm <= 0.29.1) where using ``c.offset`` instead of ``len(c)`` caused
+        a broadcast shape error after the cache rotated past its maximum size.
+        """
+        # offset=300 >> max_size=8 — the cache has rotated many times
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=300, value=1.0
+        )
+        cache_req1 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=150, value=2.0
+        )
+
+        assert cache_req0.offset > cache_req0.max_size
+        assert cache_req1.offset > cache_req1.max_size
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset
+        assert extracted_req1.offset == cache_req1.offset
+
+    def test_rotating_kvcache_merge_handles_prefill_exceeding_max_size(self) -> None:
+        """Merging works when prefill length exceeds max_size.
+
+        After a large prefill the internal buffer may temporarily be larger than
+        ``max_size``.  The merge must trim to the effective sliding-window length.
+        """
+        # Prefill 128 tokens into a cache with max_size=70
+        cache_req0 = mr.RotatingKVCache(max_size=70)
+        big_k = mx.full(
+            (1, self._KV_NUM_HEADS, 128, self._KV_HEAD_DIM), 1.0, dtype=mx.float32
+        )
+        big_v = mx.full(
+            (1, self._KV_NUM_HEADS, 128, self._KV_HEAD_DIM), 1.5, dtype=mx.float32
+        )
+        cache_req0.update_and_fetch(big_k, big_v)
+
+        cache_req1 = self._make_rotating_kv_cache(
+            max_size=70, total_tokens=30, value=2.0
+        )
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+
+        assert isinstance(merged[0], mr.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset
+        assert extracted_req1.offset == cache_req1.offset
+
+    def test_rotating_kvcache_merge_decode_extract_roundtrip(self) -> None:
+        """Merged cache can be used for a batched decode step and extracted back.
+
+        This verifies that the internal state (_idx, _offset) set by
+        ``_merge_rotating_kv_caches`` is compatible with
+        ``BatchRotatingKVCache.update_and_fetch`` and ``extract``.
+        """
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=20, value=1.0
+        )
+        cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        batch_cache = merged[0]
+        assert isinstance(batch_cache, mr.BatchRotatingKVCache)
+
+        # Simulate one batched decode step (S=1)
+        decode_k = mx.ones((2, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM))
+        decode_v = mx.ones((2, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM))
+        batch_cache.update_and_fetch(decode_k, decode_v)
+
+        # Extract back to per-request caches
+        extracted_req0 = batch_cache.extract(0)
+        extracted_req1 = batch_cache.extract(1)
+
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert extracted_req0.offset == cache_req0.offset + 1
+        assert extracted_req1.offset == cache_req1.offset + 1
 
     def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
         arrays_cache = self._make_arrays_cache(1.0, 2.0)

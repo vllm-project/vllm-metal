@@ -26,7 +26,9 @@ from mlx_lm import stream_generate
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchRotatingKVCache,
     KVCache,
+    RotatingKVCache,
     make_prompt_cache,
 )
 
@@ -251,11 +253,11 @@ class PrefixCacheManager:
 
     def restore_cache(
         self, cached: CachedPrefix, model: Any, is_vlm: bool
-    ) -> list[KVCache]:
+    ) -> list["AnyCache"]:
         """Restore a cached prefix to a fresh KVCache.
 
-        Only KVCache layers are restored. ArraysCache layers remain in their
-        fresh state for hybrid model compatibility.
+        Only KVCache layers are restored. RotatingKVCache / ArraysCache layers
+        remain in their fresh state.
         """
         cache_model = (
             model.language_model
@@ -288,8 +290,12 @@ class PrefixCacheManager:
         }
 
 
-# Type alias for any cache type supported by the model
-AnyCache: TypeAlias = KVCache | ArraysCache
+# Type alias for any per-layer cache type supported by the model.
+#
+# Notes:
+# - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
+# - Hybrid models use `ArraysCache` for non-attention state.
+AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -333,6 +339,79 @@ def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
         None if value is None else value[idx : idx + 1] for value in state
     ]
     return extracted
+
+
+def _merge_rotating_kv_caches(
+    caches: list[RotatingKVCache],
+) -> BatchRotatingKVCache:
+    """Merge per-request RotatingKVCache objects into a single BatchRotatingKVCache.
+
+    This mirrors ``BatchRotatingKVCache.merge`` but pre-computes the temporal-ordered
+    keys/values, trims them to ``len(cache)`` (the effective sliding-window length),
+    and uses that length for the copy width.  The upstream implementation in
+    mlx-lm <= 0.29.1 uses ``c.offset`` which can exceed the underlying array size
+    after the cache has rotated, causing a broadcast shape error.
+
+    This workaround can be removed once vllm-metal can depend on an mlx-lm version
+    that includes the upstream fix (ml-explore/mlx-lm#738) and has been verified
+    to work with gpt-oss models end-to-end.
+    """
+    if not caches:
+        raise ValueError("caches must be non-empty")
+
+    if any(c.keys is None or c.values is None for c in caches):
+        raise ValueError(
+            "Cannot merge unpopulated RotatingKVCache (keys/values is None)"
+        )
+
+    if not all(c.max_size == caches[0].max_size for c in caches):
+        raise ValueError(
+            "BatchRotatingKVCache can only merge caches with the same maximum size"
+        )
+
+    # Pre-compute temporal-ordered keys/values and trim to the effective
+    # sliding-window length.  ``_temporal_order`` may return an array larger
+    # than ``len(cache)`` when the internal buffer has not been trimmed yet
+    # (e.g. after a large prefill), so we trim via ``_trim`` to preserve
+    # the ``keep`` prefix semantics used by RotatingKVCache internally.
+    ordered: list[tuple[mx.array, mx.array]] = []
+    for c in caches:
+        effective_len = len(c)  # min(offset, max_size)
+        ordered_keys = c._temporal_order(c.keys)
+        ordered_values = c._temporal_order(c.values)
+        if ordered_keys.shape[2] > effective_len:
+            trim_size = ordered_keys.shape[2] - effective_len
+            ordered_keys = c._trim(trim_size, ordered_keys)
+            ordered_values = c._trim(trim_size, ordered_values)
+        else:
+            ordered_keys = ordered_keys[..., :effective_len, :]
+            ordered_values = ordered_values[..., :effective_len, :]
+        ordered.append((ordered_keys, ordered_values))
+
+    lengths = [k.shape[2] for k, _ in ordered]
+    max_length = max(lengths)
+    padding = [max_length - length for length in lengths]
+    batch_size = len(caches)
+    n_heads = max(k.shape[1] for k, _ in ordered)
+    k_dim = max(k.shape[3] for k, _ in ordered)
+    v_dim = max(v.shape[3] for _, v in ordered)
+    dtype = next(iter(k.dtype for k, _ in ordered))
+
+    keys = mx.zeros((batch_size, n_heads, max_length, k_dim), dtype=dtype)
+    values = mx.zeros((batch_size, n_heads, max_length, v_dim), dtype=dtype)
+    for i, (pad, (k, v)) in enumerate(zip(padding, ordered, strict=True)):
+        n = k.shape[2]
+        keys[i : i + 1, :, pad : pad + n] = k
+        values[i : i + 1, :, pad : pad + n] = v
+
+    cache = BatchRotatingKVCache(caches[0].max_size, padding)
+    cache.keys = keys
+    cache.values = values
+    cache.offset = mx.array([c.offset for c in caches])
+    cache._idx = keys.shape[2]
+    cache._offset = keys.shape[2]
+
+    return cache
 
 
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
@@ -382,7 +461,7 @@ class RequestState:
     # vLLM applies repetition penalties to both prompt+output tokens, but applies
     # presence/frequency penalties only to generated (output) tokens.
     prompt_len: int
-    cache: list[AnyCache]  # Per-layer caches (KVCache or ArraysCache for hybrid models)
+    cache: list[AnyCache]  # Per-layer caches (KVCache, RotatingKVCache, or ArraysCache)
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
     generated_tokens: int = 0
@@ -390,7 +469,7 @@ class RequestState:
 
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
-) -> list[BatchKVCache | ArraysCache]:
+) -> list[BatchKVCache | BatchRotatingKVCache | ArraysCache]:
     """Merge multiple per-request caches into batched caches.
 
     Args:
@@ -403,7 +482,7 @@ def _merge_kv_caches(
         return []
 
     num_layers = len(caches_list[0])
-    merged: list[BatchKVCache | ArraysCache] = []
+    merged: list[BatchKVCache | BatchRotatingKVCache | ArraysCache] = []
 
     for layer_idx in range(num_layers):
         layer_caches = [caches[layer_idx] for caches in caches_list]
@@ -416,15 +495,34 @@ def _merge_kv_caches(
                     )
                 arrays_caches.append(cache)
             batch_cache = _merge_arrays_caches(arrays_caches)
-        else:  # KV-like caches
-            batch_cache = BatchKVCache.merge(layer_caches)
+        elif isinstance(layer_caches[0], RotatingKVCache):
+            rotating_caches: list[RotatingKVCache] = []
+            for cache in layer_caches:
+                if not isinstance(cache, RotatingKVCache):
+                    raise TypeError(
+                        "Mixed cache types in a single layer: expected RotatingKVCache"
+                    )
+                rotating_caches.append(cache)
+            batch_cache = _merge_rotating_kv_caches(rotating_caches)
+        elif isinstance(layer_caches[0], KVCache):
+            kv_caches: list[KVCache] = []
+            for cache in layer_caches:
+                if not isinstance(cache, KVCache):
+                    raise TypeError(
+                        "Mixed cache types in a single layer: expected KVCache"
+                    )
+                kv_caches.append(cache)
+            batch_cache = BatchKVCache.merge(kv_caches)
+        else:
+            cache_type = type(layer_caches[0]).__name__
+            raise TypeError(f"Unsupported cache type for batching: {cache_type}")
         merged.append(batch_cache)
 
     return merged
 
 
 def _extract_kv_cache(
-    batch_caches: list[BatchKVCache | ArraysCache], idx: int
+    batch_caches: list[BatchKVCache | BatchRotatingKVCache | ArraysCache], idx: int
 ) -> list[AnyCache]:
     """Extract a single request's cache from batched caches.
 
@@ -466,6 +564,7 @@ class MetalModelRunner:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.device = device
         self.metal_config = get_config()
 
@@ -1722,12 +1821,36 @@ class MetalModelRunner:
         )
         return None
 
-    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
-        """Return sampled tokens produced by the last execute_model call."""
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | None:
+        """Return sampled tokens produced by the last execute_model call.
+
+        vLLM's v1 engine calls ``sample_tokens`` after a successful
+        ``execute_model`` call that returned ``None``. When async scheduling is
+        enabled, vLLM may still call ``sample_tokens`` even if ``execute_model``
+        failed; returning ``None`` in that case allows vLLM to surface the
+        original exception from ``execute_model``.
+        """
         del grammar_output
         if self._pending_output is None:
+            model_id = None
+            model_config = getattr(self, "model_config", None)
+            if model_config is not None:
+                model_id = getattr(model_config, "model", None)
+
+            if getattr(self, "use_async_scheduling", False):
+                logger.error(
+                    "sample_tokens called without pending output from "
+                    "execute_model (model=%r). Returning None so vLLM can "
+                    "surface the original execute_model error.",
+                    model_id,
+                )
+                return None
+
             raise RuntimeError(
-                "sample_tokens called without pending output from execute_model"
+                "State error: sample_tokens called without pending output from "
+                f"execute_model (model={model_id!r})."
             )
         output = self._pending_output
         self._pending_output = None

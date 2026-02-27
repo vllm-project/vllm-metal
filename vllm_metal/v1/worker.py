@@ -488,7 +488,9 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.execute_model(scheduler_output)
 
-    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | None:
         """Return sampled tokens for the previously executed batch."""
         return self.model_runner.sample_tokens(grammar_output)
 
