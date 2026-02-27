@@ -608,6 +608,13 @@ class MetalModelRunner:
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
 
+        # Whether the model supports batched decode via BatchKVCache.
+        # Hybrid models (e.g. Qwen3.5 with mixed attention/linear layers)
+        # use ArraysCache for some layers, and their attention code assumes
+        # scalar cache.offset which is incompatible with BatchKVCache's
+        # per-element mx.array offset.  Determined in load_model().
+        self._supports_batched_decode: bool = True
+
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
 
@@ -640,6 +647,7 @@ class MetalModelRunner:
                 )
                 self._extract_model_args()
                 self._resolve_model_dims()
+                self._detect_batched_decode_support()
                 return
 
         # Load model using appropriate backend
@@ -663,6 +671,7 @@ class MetalModelRunner:
 
         self._extract_model_args()
         self._resolve_model_dims()
+        self._detect_batched_decode_support()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -746,6 +755,35 @@ class MetalModelRunner:
         self.num_kv_heads: int = int(num_kv_heads)
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
+
+    def _detect_batched_decode_support(self) -> None:
+        """Check if the model's cache is compatible with BatchKVCache.
+
+        Hybrid models (e.g. Qwen3.5 with mixed attention + linear/SSM layers)
+        produce caches containing ArraysCache entries.  Their attention code
+        uses ``cache.offset`` as a Python int for mask slicing, which is
+        incompatible with BatchKVCache's per-element ``mx.array`` offset.
+
+        Must be called after ``load_model()`` has set ``self.model``.
+        """
+        cache_model = (
+            self.model.language_model
+            if self._is_vlm and hasattr(self.model, "language_model")
+            else self.model
+        )
+        try:
+            cache = make_prompt_cache(cache_model)
+            all_kv = all(isinstance(c, (KVCache, RotatingKVCache)) for c in cache)
+            self._supports_batched_decode = all_kv
+        except Exception:
+            # If we can't determine, default to sequential (safe)
+            self._supports_batched_decode = False
+
+        if not self._supports_batched_decode:
+            logger.info(
+                "Model uses hybrid cache (e.g. ArraysCache + KVCache); "
+                "batched decode disabled, using sequential decode."
+            )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1689,7 +1727,10 @@ class MetalModelRunner:
                         valid_decode_reqs.append((req_id, state))
 
                 if valid_decode_reqs:
-                    if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
+                    if (
+                        self._supports_batched_decode
+                        and len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING
+                    ):
                         decode_tokens = self._batched_decode(valid_decode_reqs)
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
