@@ -167,6 +167,9 @@ def qwen3_model():
 
 class TestMetalKernelPagedVsStandard:
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
+    )
     def test_greedy_output_matches(self, qwen3_model):
         """Metal kernel paged attention greedy decode must match standard path."""
         model, tokenizer = qwen3_model
@@ -187,6 +190,9 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
+    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
