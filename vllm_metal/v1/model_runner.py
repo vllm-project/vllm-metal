@@ -359,11 +359,10 @@ def _merge_rotating_kv_caches(
     if not caches:
         raise ValueError("caches must be non-empty")
 
-    for c in caches:
-        if c.keys is None or c.values is None:
-            raise ValueError(
-                "Cannot merge unpopulated RotatingKVCache (keys/values is None)"
-            )
+    if any(c.keys is None or c.values is None for c in caches):
+        raise ValueError(
+            "Cannot merge unpopulated RotatingKVCache (keys/values is None)"
+        )
 
     if not all(c.max_size == caches[0].max_size for c in caches):
         raise ValueError(
@@ -373,14 +372,21 @@ def _merge_rotating_kv_caches(
     # Pre-compute temporal-ordered keys/values and trim to the effective
     # sliding-window length.  ``_temporal_order`` may return an array larger
     # than ``len(cache)`` when the internal buffer has not been trimmed yet
-    # (e.g. after a large prefill), so we slice to ``len(cache)`` which is
-    # ``min(offset, max_size)``.
+    # (e.g. after a large prefill), so we trim via ``_trim`` to preserve
+    # the ``keep`` prefix semantics used by RotatingKVCache internally.
     ordered: list[tuple[mx.array, mx.array]] = []
     for c in caches:
-        n = len(c)  # effective length: min(offset, max_size)
-        k = c._temporal_order(c.keys)[..., :n, :]
-        v = c._temporal_order(c.values)[..., :n, :]
-        ordered.append((k, v))
+        effective_len = len(c)  # min(offset, max_size)
+        ordered_keys = c._temporal_order(c.keys)
+        ordered_values = c._temporal_order(c.values)
+        if ordered_keys.shape[2] > effective_len:
+            trim_size = ordered_keys.shape[2] - effective_len
+            ordered_keys = c._trim(trim_size, ordered_keys)
+            ordered_values = c._trim(trim_size, ordered_values)
+        else:
+            ordered_keys = ordered_keys[..., :effective_len, :]
+            ordered_values = ordered_values[..., :effective_len, :]
+        ordered.append((ordered_keys, ordered_values))
 
     lengths = [k.shape[2] for k, _ in ordered]
     max_length = max(lengths)
