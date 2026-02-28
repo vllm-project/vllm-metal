@@ -41,7 +41,7 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -587,6 +587,13 @@ class MetalModelRunner:
         # vLLM Sampler for token sampling with temperature, top_k, top_p support
         self._sampler = Sampler()
 
+        # Build logits processors (includes custom plugins from entry-points)
+        custom_lp = vllm_config.model_config.logits_processors
+        custom_logitsprocs = tuple(custom_lp) if custom_lp is not None else ()
+        self._logitsprocs = build_logitsprocs(
+            vllm_config, device, False, False, custom_logitsprocs,
+        )
+
         # Track finished requests for lazy cache clearing
         self._finished_request_count = 0
 
@@ -1015,7 +1022,7 @@ class MetalModelRunner:
             no_penalties=no_penalties,
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(),
+            logitsprocs=getattr(self, '_logitsprocs', LogitsProcessors()),
         )
 
     def _prefill_single(
