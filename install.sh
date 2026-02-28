@@ -123,16 +123,22 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.14.1"
-  local url_base="https://github.com/vllm-project/vllm/releases/download"
-  local filename="vllm-$vllm_v.tar.gz"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
-  cd vllm-$vllm_v
+  local vllm_repo="https://github.com/vllm-project/vllm"
+  local vllm_ref="main"
+  local vllm_dir="vllm-${vllm_ref}"
+  if ! curl -fsSL "$vllm_repo/archive/refs/heads/${vllm_ref}.tar.gz" -o "${vllm_dir}.tar.gz"; then
+    error "Failed to download vLLM source."
+    exit 1
+  fi
+  tar xf "${vllm_dir}.tar.gz"
+  cd "$vllm_dir"
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  uv pip install .
-  cd -
-  rm -rf vllm-$vllm_v*
+  SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 uv pip install .
+  cd - > /dev/null
+  rm -rf "${vllm_dir}" "${vllm_dir}.tar.gz"
+
+  # Upgrade dependencies for newer model support (e.g., Qwen3.5)
+  uv pip install 'mlx-lm>=0.30.7' 'mlx-vlm>=0.3.12' 'transformers>=5.2.0'
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
