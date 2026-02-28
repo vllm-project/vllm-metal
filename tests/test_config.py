@@ -26,6 +26,7 @@ class TestMetalConfig:
             "VLLM_MLX_DEVICE",
             "VLLM_METAL_BLOCK_SIZE",
             "VLLM_METAL_DEBUG",
+            "VLLM_METAL_USE_PAGED_ATTENTION",
         ]:
             os.environ.pop(var, None)
 
@@ -38,6 +39,7 @@ class TestMetalConfig:
             "VLLM_MLX_DEVICE",
             "VLLM_METAL_BLOCK_SIZE",
             "VLLM_METAL_DEBUG",
+            "VLLM_METAL_USE_PAGED_ATTENTION",
         ]:
             os.environ.pop(var, None)
 
@@ -59,6 +61,7 @@ class TestMetalConfig:
         os.environ["VLLM_MLX_DEVICE"] = "cpu"
         os.environ["VLLM_METAL_BLOCK_SIZE"] = "32"
         os.environ["VLLM_METAL_DEBUG"] = "1"
+        os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
 
         config = MetalConfig.from_env()
 
@@ -108,11 +111,24 @@ class TestMetalConfig:
     def test_is_auto_memory_false_for_numeric(self) -> None:
         """Test that is_auto_memory is False for numeric values."""
         os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5"
+        os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
 
         config = MetalConfig.from_env()
 
         assert config.memory_fraction == 0.5
         assert config.is_auto_memory is False
+
+    def test_explicit_fraction_requires_paged_attention(self) -> None:
+        """Test that explicit memory fraction without paged attention is rejected."""
+        with pytest.raises(ValueError, match="requires VLLM_METAL_USE_PAGED_ATTENTION"):
+            MetalConfig(
+                memory_fraction=0.7,
+                use_mlx=False,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=False,
+            )
 
     def test_block_size_must_be_positive(self) -> None:
         for value in ["0", "-1"]:

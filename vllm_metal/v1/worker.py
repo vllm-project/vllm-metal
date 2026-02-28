@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -23,8 +22,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import (
-    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
-    AUTO_MEMORY_OVERHEAD_FACTOR,
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     PAGED_ATTENTION_OVERHEAD_BYTES,
@@ -37,19 +34,6 @@ if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class _AutoMemoryEstimate:
-    total_memory: int
-    model_memory: int
-    kv_cache_memory: int
-    total_needed: int
-    needed_fraction: float
-    max_model_len: int
-    block_size_tokens: int
-    min_blocks: int
-    overhead_factor: float
 
 
 def init_worker_distributed_environment(
@@ -153,10 +137,6 @@ class MetalWorker(WorkerBase):
         # Patch model for paged attention if enabled
         if self.metal_config.use_paged_attention:
             self._setup_paged_attention()
-
-        # In auto mode, set MLX memory limit to prevent unbounded growth
-        if self.metal_config.is_auto_memory:
-            self._set_auto_memory_limit()
 
     def _setup_paged_attention(self) -> None:
         """Create MPSPagedKVCache and patch model attention for HF Metal kernel.
@@ -314,93 +294,29 @@ class MetalWorker(WorkerBase):
 
         return 0
 
-    def _set_auto_memory_limit(self) -> None:
-        """Set MLX memory limit based on auto calculation.
-
-        This prevents MLX from using unbounded memory in auto mode.
-        """
-        estimate = self._estimate_auto_memory()
-        if estimate.total_needed > estimate.total_memory:
-            raise ValueError(self._format_auto_memory_infeasible_error(estimate))
-
-        # Set MLX memory limit
-        if hasattr(mx, "set_memory_limit"):
-            mx.set_memory_limit(estimate.total_needed)
-            logger.info(
-                f"Auto mode: set MLX memory limit to {estimate.total_needed / 1e9:.2f}GB "
-                f"(model={estimate.model_memory / 1e9:.2f}GB, kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB)"
-            )
-        else:
-            logger.warning(
-                "mx.set_memory_limit not available, memory may grow unbounded"
-            )
-
-    def _estimate_auto_memory(self) -> _AutoMemoryEstimate:
-        import psutil
-
-        total_memory = psutil.virtual_memory().total
-        model_memory = self._get_model_memory_usage()
-
-        block_size_bytes = self.get_cache_block_size_bytes()
-        if block_size_bytes <= 0:
-            msg = f"Computed KV cache block size is invalid ({block_size_bytes} bytes)."
-            raise ValueError(msg)
-
-        block_size_tokens = self.metal_config.block_size
-        max_model_len = self.model_config.max_model_len
-
-        min_blocks = (max_model_len + block_size_tokens - 1) // block_size_tokens
-        min_blocks = int(min_blocks * AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR)
-        kv_cache_memory = min_blocks * block_size_bytes
-
-        overhead_factor = AUTO_MEMORY_OVERHEAD_FACTOR
-        total_needed = int((model_memory + kv_cache_memory) * overhead_factor)
-        needed_fraction = total_needed / total_memory
-
-        return _AutoMemoryEstimate(
-            total_memory=total_memory,
-            model_memory=model_memory,
-            kv_cache_memory=kv_cache_memory,
-            total_needed=total_needed,
-            needed_fraction=needed_fraction,
-            max_model_len=max_model_len,
-            block_size_tokens=block_size_tokens,
-            min_blocks=min_blocks,
-            overhead_factor=overhead_factor,
-        )
-
-    def _format_auto_memory_infeasible_error(
-        self, estimate: _AutoMemoryEstimate
-    ) -> str:
+    def _one_sequence_kv_bytes(self) -> int:
+        """Bytes for one max-length sequence of KV cache (K + V, float16)."""
+        runner = self.model_runner
         return (
-            "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
-            "memory than is available. "
-            f"total={estimate.total_memory / 1e9:.2f}GB, "
-            f"model={estimate.model_memory / 1e9:.2f}GB, "
-            f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
-            f"overhead_factor={estimate.overhead_factor:.1f} "
-            f"(max_model_len={estimate.max_model_len}, "
-            f"block_size={estimate.block_size_tokens}, "
-            f"min_blocks={estimate.min_blocks}, "
-            f"needed_fraction={estimate.needed_fraction:.3f}). "
-            "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
-            "or use a smaller model."
+            2  # K and V
+            * runner.num_layers
+            * self.model_config.max_model_len
+            * runner.num_kv_heads
+            * runner.head_dim
+            * 2  # float16
         )
 
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
 
-        When paged attention is enabled, reports the actual MPS paged cache
-        capacity so the vLLM scheduler allocates the right number of blocks.
+        Paged attention: reports the actual MPS paged cache capacity.
+        MLX path (default): reports one max-length sequence of KV cache
+        so the scheduler budgets for one concurrent sequence.
 
         Returns:
             Available memory in bytes
         """
-        import psutil
-
-        # When paged attention is on, the real KV storage is the MPS paged
-        # cache (already allocated).  Report its capacity so the scheduler
-        # can make use of all the blocks we actually have.
+        # --- Paged attention: report real MPS cache capacity ---
         if self.metal_config.use_paged_attention:
             runner = self.model_runner
             if (
@@ -419,28 +335,14 @@ class MetalWorker(WorkerBase):
                 )
                 return available
 
-        # Handle auto memory mode
-        if self.metal_config.is_auto_memory:
-            estimate = self._estimate_auto_memory()
-            if estimate.total_needed > estimate.total_memory:
-                raise ValueError(self._format_auto_memory_infeasible_error(estimate))
-
-            logger.info(
-                f"Auto memory mode: model={estimate.model_memory / 1e9:.2f}GB, "
-                f"max_model_len={estimate.max_model_len}, min_blocks={estimate.min_blocks}, "
-                f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
-                f"total_needed={estimate.total_needed / 1e9:.2f}GB, "
-                f"needed_fraction={estimate.needed_fraction:.3f}"
-            )
-
-            # Return just the cache portion for KV cache allocation
-            available = estimate.kv_cache_memory
-        else:
-            total_memory = psutil.virtual_memory().total
-            # Use configured fraction of system memory
-            available = int(total_memory * self.metal_config.memory_fraction * 0.5)
-
-        logger.info(f"Metal available memory for KV cache: {available / 1e9:.2f} GB")
+        # --- MLX path: one max-length sequence for admission control ---
+        available = self._one_sequence_kv_bytes()
+        logger.info(
+            "MLX path: reporting %.2fGB for scheduler admission control "
+            "(one max-length sequence, max_model_len=%d)",
+            available / 1e9,
+            self.model_config.max_model_len,
+        )
         return available
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
