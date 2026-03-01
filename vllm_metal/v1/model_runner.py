@@ -46,6 +46,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
@@ -603,6 +604,7 @@ class MetalModelRunner:
         self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
+        self.kv_cache_dtype: torch.dtype | None = None
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -636,6 +638,7 @@ class MetalModelRunner:
                 )
                 self._extract_model_args()
                 self._resolve_model_dims()
+                self._initialize_kv_cache_dtype()
                 return
 
         # Load model using appropriate backend
@@ -659,8 +662,19 @@ class MetalModelRunner:
 
         self._extract_model_args()
         self._resolve_model_dims()
+        self._initialize_kv_cache_dtype()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
+
+    def _initialize_kv_cache_dtype(self) -> None:
+        """Infer and store the KV cache dtype for this runner."""
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        paged_kv_dtype = infer_kv_cache_dtype_from_model(self.model)
+        if paged_kv_dtype.warning:
+            logger.warning("%s", paged_kv_dtype.warning)
+        self.kv_cache_dtype = paged_kv_dtype.dtype
 
     def _extract_model_args(self) -> None:
         """Extract model configuration from loaded model.
@@ -768,6 +782,8 @@ class MetalModelRunner:
             Dictionary mapping attention layer names to KV cache specs
         """
         block_size = self.metal_config.block_size
+        if self.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
@@ -777,7 +793,7 @@ class MetalModelRunner:
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=torch.float16,
+                dtype=self.kv_cache_dtype,
             )
 
         return specs
@@ -803,7 +819,9 @@ class MetalModelRunner:
 
         # Each block stores key and value for all layers
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
-        dtype_size = 2  # float16
+        if self.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
+        dtype_size = self.kv_cache_dtype.itemsize
         return (
             2
             * self.num_layers

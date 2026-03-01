@@ -103,7 +103,7 @@ class OffsetCache:
 # ---------------------------------------------------------------------------
 
 
-def _find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
+def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
     """Find transformer layers and the attention attribute name.
 
     Returns (layer_list, attn_attr_name) where each layer has

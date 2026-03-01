@@ -21,6 +21,8 @@ try:
     import torch
     from mlx_lm import load as mlx_lm_load
     from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 except ImportError as exc:
     pytest.skip(
         f"Metal kernel paged attention tests require mlx/torch/mlx_lm: {exc}",
@@ -68,6 +70,21 @@ def _paged_attention_ops_available() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _test_infer_paged_kv_dtype(model) -> torch.dtype:
+    """Test-only helper: choose a float dtype for MPSPagedKVCache.
+
+    This is deliberately local to this test module. Production code uses
+    `vllm_metal.kv_cache_dtype.infer_kv_cache_dtype_from_model()`.
+    """
+    result = infer_kv_cache_dtype_from_model(model)
+    if result.warning is not None:
+        raise AssertionError(
+            "KV cache dtype inference unexpectedly fell back during tests: "
+            f"{result.warning}"
+        )
+    return result.dtype
+
+
 def _greedy_generate_standard(model, token_ids: list[int], max_new: int) -> list[int]:
     """Generate tokens using the standard mlx_lm KVCache path."""
     cache = make_prompt_cache(model)
@@ -109,7 +126,7 @@ def _greedy_generate_metal_kernel(
         head_dim=head_dim,
         num_blocks=num_blocks,
         block_size=BLOCK_SIZE,
-        dtype=torch.float16,
+        dtype=_test_infer_paged_kv_dtype(model),
     )
 
     n_patched = patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
@@ -190,9 +207,6 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
-    @pytest.mark.xfail(
-        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
-    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
@@ -225,7 +239,7 @@ class TestMetalKernelPagedVsStandard:
             head_dim=head_dim,
             num_blocks=num_blocks,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_test_infer_paged_kv_dtype(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
@@ -300,7 +314,7 @@ class TestMetalKernelPatchRouting:
             head_dim=args.head_dim,
             num_blocks=32,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_test_infer_paged_kv_dtype(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
@@ -323,7 +337,7 @@ class TestMetalKernelPatchRouting:
             head_dim=args.head_dim,
             num_blocks=32,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_test_infer_paged_kv_dtype(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
