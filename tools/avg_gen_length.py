@@ -62,7 +62,7 @@ def run_offline(
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
     )
-    sampling_params = SamplingParams(temperature=0.8, max_tokens=max_tokens)
+    sampling_params = SamplingParams(temperature=0, seed=42, max_tokens=max_tokens)
 
     conversations = [[{"role": "user", "content": p}] for p in prompts]
 
