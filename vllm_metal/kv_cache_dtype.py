@@ -17,7 +17,7 @@ import torch
 from vllm_metal.paged_attention_common import find_layers_and_attr
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 
-DEFAULT_KV_CACHE_DTYPE = torch.bfloat16
+DEFAULT_KV_CACHE_DTYPE = torch.float16
 ALLOWED_KV_CACHE_DTYPES: frozenset[torch.dtype] = frozenset(
     {
         torch.float16,
