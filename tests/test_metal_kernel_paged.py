@@ -76,7 +76,13 @@ def _test_infer_paged_kv_dtype(model) -> torch.dtype:
     This is deliberately local to this test module. Production code uses
     `vllm_metal.kv_cache_dtype.infer_kv_cache_dtype_from_model()`.
     """
-    return infer_kv_cache_dtype_from_model(model).dtype
+    result = infer_kv_cache_dtype_from_model(model)
+    if result.warning is not None:
+        raise AssertionError(
+            "KV cache dtype inference unexpectedly fell back during tests: "
+            f"{result.warning}"
+        )
+    return result.dtype
 
 
 def _greedy_generate_standard(model, token_ids: list[int], max_new: int) -> list[int]:
