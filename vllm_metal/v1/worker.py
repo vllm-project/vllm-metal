@@ -7,7 +7,6 @@ import gc
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -300,9 +299,7 @@ class MetalWorker(WorkerBase):
         """Bytes for one max-length sequence of KV cache (K + V)."""
         runner = self.model_runner
         dtype_size = (
-            torch.tensor([], dtype=runner.kv_cache_dtype).element_size()
-            if runner.kv_cache_dtype is not None
-            else 2
+            runner.kv_cache_dtype.itemsize if runner.kv_cache_dtype is not None else 2
         )
         return (
             2  # K and V

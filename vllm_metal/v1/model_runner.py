@@ -821,7 +821,7 @@ class MetalModelRunner:
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = torch.tensor([], dtype=self.kv_cache_dtype).element_size()
+        dtype_size = self.kv_cache_dtype.itemsize
         return (
             2
             * self.num_layers
