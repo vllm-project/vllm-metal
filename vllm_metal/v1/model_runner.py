@@ -49,13 +49,24 @@ from vllm_metal.config import get_config
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
+    find_layers_and_attr,
     prepare_decode,
     prepare_prefill,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE, mlx_to_torch
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
+
+# KV cache policy for the MPS paged-attention backend. K/V activations are
+# floating-point tensors; for quantized weights (int/uint) we must not pick an
+# integer dtype for the cache.
+_DEFAULT_KV_CACHE_DTYPE = torch.bfloat16
+_ALLOWED_KV_CACHE_DTYPES: set[torch.dtype] = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+}
 
 # Global model cache for fast repeated loads
 _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
@@ -603,6 +614,7 @@ class MetalModelRunner:
         self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
+        self.kv_cache_dtype: torch.dtype | None = None
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -636,6 +648,7 @@ class MetalModelRunner:
                 )
                 self._extract_model_args()
                 self._resolve_model_dims()
+                self.kv_cache_dtype = self._infer_kv_cache_dtype()
                 return
 
         # Load model using appropriate backend
@@ -659,8 +672,53 @@ class MetalModelRunner:
 
         self._extract_model_args()
         self._resolve_model_dims()
+        self.kv_cache_dtype = self._infer_kv_cache_dtype()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
+
+    def _infer_kv_cache_dtype(self) -> torch.dtype:
+        """Infer a torch dtype for KV cache allocation from model weights.
+
+        Paged attention stores K/V in an MPS-backed cache. To avoid precision
+        drift (and token divergence) we align the paged-cache dtype with the
+        model's parameter dtype whenever possible.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        try:
+            layers, attn_attr = find_layers_and_attr(self.model)
+            attn = getattr(layers[0], attn_attr)
+            mlx_dtype = attn.q_proj.weight.dtype
+        except (ValueError, AttributeError, IndexError, TypeError) as exc:
+            logger.warning(
+                "Cannot infer KV cache dtype from model; defaulting to %s: %s",
+                _DEFAULT_KV_CACHE_DTYPE,
+                exc,
+            )
+            return _DEFAULT_KV_CACHE_DTYPE
+
+        torch_dtype = MLX_TO_TORCH_DTYPE.get(mlx_dtype)
+        if torch_dtype is None:
+            logger.warning(
+                "Unsupported MLX dtype for KV cache (%r); defaulting to %s",
+                mlx_dtype,
+                _DEFAULT_KV_CACHE_DTYPE,
+            )
+            return _DEFAULT_KV_CACHE_DTYPE
+
+        if torch_dtype not in _ALLOWED_KV_CACHE_DTYPES:
+            # Quantized weights can be int/uint; KV cache must be float.
+            logger.warning(
+                "Model weight dtype %r maps to non-float torch dtype %s; "
+                "using %s for KV cache instead",
+                mlx_dtype,
+                torch_dtype,
+                _DEFAULT_KV_CACHE_DTYPE,
+            )
+            return _DEFAULT_KV_CACHE_DTYPE
+
+        return torch_dtype
 
     def _extract_model_args(self) -> None:
         """Extract model configuration from loaded model.
@@ -768,6 +826,8 @@ class MetalModelRunner:
             Dictionary mapping attention layer names to KV cache specs
         """
         block_size = self.metal_config.block_size
+        if self.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
@@ -777,7 +837,7 @@ class MetalModelRunner:
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=torch.float16,
+                dtype=self.kv_cache_dtype,
             )
 
         return specs
@@ -803,7 +863,9 @@ class MetalModelRunner:
 
         # Each block stores key and value for all layers
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
-        dtype_size = 2  # float16
+        if self.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
+        dtype_size = torch.tensor([], dtype=self.kv_cache_dtype).element_size()
         return (
             2
             * self.num_layers

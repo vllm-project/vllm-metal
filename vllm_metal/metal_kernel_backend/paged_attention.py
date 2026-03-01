@@ -72,7 +72,7 @@ from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
 from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
-    _find_layers_and_attr,
+    find_layers_and_attr,
     get_context,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
@@ -327,7 +327,7 @@ def patch_model_attention_metal_kernel(
 
     Returns the number of patched layers.
     """
-    layer_list, attn_attr = _find_layers_and_attr(model)
+    layer_list, attn_attr = find_layers_and_attr(model)
     patched = 0
 
     for layer_idx, layer in enumerate(layer_list):
