@@ -7,6 +7,7 @@ import gc
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -146,7 +147,6 @@ class MetalWorker(WorkerBase):
         max_model_len.
         """
         import psutil
-        import torch
 
         from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
         from vllm_metal.metal_kernel_backend.paged_attention import (
@@ -242,13 +242,15 @@ class MetalWorker(WorkerBase):
         )
 
         # --- Create cache and patch model ---
+        if runner.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
         mps_kv_cache = MPSPagedKVCache(
             num_layers=runner.num_layers,
             num_kv_heads=runner.num_kv_heads,
             head_dim=runner.head_dim,
             num_blocks=num_blocks,
             block_size=block_size,
-            dtype=torch.float16,
+            dtype=runner.kv_cache_dtype,
         )
 
         n_patched = patch_model_attention_metal_kernel(
@@ -295,15 +297,20 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of KV cache (K + V, float16)."""
+        """Bytes for one max-length sequence of KV cache (K + V)."""
         runner = self.model_runner
+        dtype_size = (
+            torch.tensor([], dtype=runner.kv_cache_dtype).element_size()
+            if runner.kv_cache_dtype is not None
+            else 2
+        )
         return (
             2  # K and V
             * runner.num_layers
             * self.model_config.max_model_len
             * runner.num_kv_heads
             * runner.head_dim
-            * 2  # float16
+            * dtype_size
         )
 
     def determine_available_memory(self) -> int:
