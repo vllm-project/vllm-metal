@@ -302,6 +302,7 @@ class TestHybridCacheMergeExtract:
 
         assert isinstance(merged[0], mr.BatchRotatingKVCache)
         assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req1, mr.RotatingKVCache)
         assert extracted_req0.offset == cache_req0.offset
         assert extracted_req1.offset == cache_req1.offset
 
