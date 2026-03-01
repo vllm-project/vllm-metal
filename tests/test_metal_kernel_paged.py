@@ -21,6 +21,8 @@ try:
     import torch
     from mlx_lm import load as mlx_lm_load
     from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 except ImportError as exc:
     pytest.skip(
         f"Metal kernel paged attention tests require mlx/torch/mlx_lm: {exc}",
@@ -68,6 +70,20 @@ def _paged_attention_ops_available() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _infer_kv_dtype_from_model(model) -> torch.dtype:
+    """Infer a float dtype for the MPS paged KV cache from model weights."""
+    attn = model.model.layers[0].self_attn
+    # If the model is already patched, unwrap the wrapper to reach the real
+    # attention module (which owns q_proj/k_proj weights).
+    attn = getattr(attn, "_inner", attn)
+    mlx_dtype = attn.q_proj.weight.dtype
+    torch_dtype = MLX_TO_TORCH_DTYPE.get(mlx_dtype, torch.bfloat16)
+    if torch_dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return torch_dtype
+    # Quantized weights: KV activations are still float; use a safe default.
+    return torch.bfloat16
+
+
 def _greedy_generate_standard(model, token_ids: list[int], max_new: int) -> list[int]:
     """Generate tokens using the standard mlx_lm KVCache path."""
     cache = make_prompt_cache(model)
@@ -109,7 +125,7 @@ def _greedy_generate_metal_kernel(
         head_dim=head_dim,
         num_blocks=num_blocks,
         block_size=BLOCK_SIZE,
-        dtype=torch.float16,
+        dtype=_infer_kv_dtype_from_model(model),
     )
 
     n_patched = patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
@@ -190,9 +206,6 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
-    @pytest.mark.xfail(
-        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
-    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
@@ -225,7 +238,7 @@ class TestMetalKernelPagedVsStandard:
             head_dim=head_dim,
             num_blocks=num_blocks,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_infer_kv_dtype_from_model(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
@@ -300,7 +313,7 @@ class TestMetalKernelPatchRouting:
             head_dim=args.head_dim,
             num_blocks=32,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_infer_kv_dtype_from_model(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
@@ -323,7 +336,7 @@ class TestMetalKernelPatchRouting:
             head_dim=args.head_dim,
             num_blocks=32,
             block_size=BLOCK_SIZE,
-            dtype=torch.float16,
+            dtype=_infer_kv_dtype_from_model(model),
         )
         patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
 
