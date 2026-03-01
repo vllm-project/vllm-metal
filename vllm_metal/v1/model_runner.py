@@ -573,10 +573,6 @@ class MetalModelRunner:
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
 
-        # KV cache state
-        self.kv_cache_initialized = False
-        self.num_kv_cache_blocks = 0
-
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
 
@@ -787,14 +783,15 @@ class MetalModelRunner:
         return specs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        """Initialize KV cache from configuration.
+        """Accept KV cache config from engine (no-op for MLX path).
 
-        Args:
-            kv_cache_config: KV cache configuration for this worker
+        MLX manages its own KV cache via make_prompt_cache().
+        This method exists to satisfy the engine's initialization protocol.
         """
-        self.num_kv_cache_blocks = kv_cache_config.num_blocks
-        logger.info(f"KV cache initialized with {self.num_kv_cache_blocks} blocks")
-        self.kv_cache_initialized = True
+        logger.info(
+            "KV cache config received: %d blocks (MLX manages cache internally)",
+            kv_cache_config.num_blocks,
+        )
 
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.

@@ -36,9 +36,11 @@ class TestV1MetalModelRunnerGenerate:
         assert out == "hello world"
         assert captured["prompt"] == "p"
         assert captured["max_tokens"] == 3
+        kwargs = captured.get("kwargs")
+        assert isinstance(kwargs, dict)
         # mlx_lm 0.29+ uses sampler parameter instead of temp
-        assert "sampler" in captured["kwargs"]
-        assert callable(captured["kwargs"]["sampler"])
+        assert "sampler" in kwargs
+        assert callable(kwargs["sampler"])
 
     def test_passes_sampler_for_temperature_sampling(self, monkeypatch) -> None:
         captured: dict[str, object] = {}
@@ -56,7 +58,9 @@ class TestV1MetalModelRunnerGenerate:
         out = runner.generate("p", max_tokens=2, temperature=0.5)
 
         assert out == "ab"
-        assert "sampler" in captured["kwargs"]
+        kwargs = captured.get("kwargs")
+        assert isinstance(kwargs, dict)
+        assert "sampler" in kwargs
 
 
 class TestV1MetalModelRunnerSampleTokens:
