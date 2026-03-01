@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for STT data types, config, and formatting."""
+"""Tests for STT data types, config, formatting, and audio pipeline."""
 
 from __future__ import annotations
 
+import mlx.core as mx
+import numpy as np
 import pytest
 
+from vllm_metal.stt.audio import SAMPLE_RATE, audio_duration, split_audio
 from vllm_metal.stt.config import (
     SpeechToTextConfig,
     get_supported_languages,
@@ -177,3 +180,111 @@ class TestFormatting:
         srt = format_as_srt([seg])
         assert "01:01:01,123" in srt
         assert "01:01:05,456" in srt
+
+
+# ===========================================================================
+# Audio pipeline (log_mel_spectrogram, _stft)
+# ===========================================================================
+
+
+class TestAudioPipeline:
+    """Tests for core audio processing functions."""
+
+    def test_log_mel_spectrogram_shape(self) -> None:
+        """Log-mel spectrogram should have expected shape."""
+        from vllm_metal.stt.audio import N_MELS_DEFAULT, log_mel_spectrogram
+
+        audio = mx.zeros(SAMPLE_RATE)  # 1 second
+        mel = log_mel_spectrogram(audio)
+        assert mel.ndim == 2
+        assert mel.shape[0] == N_MELS_DEFAULT
+
+    def test_log_mel_spectrogram_values_bounded(self) -> None:
+        """Output should be normalised (roughly in [-1, 1] range)."""
+        from vllm_metal.stt.audio import log_mel_spectrogram
+
+        audio = mx.array(np.random.randn(SAMPLE_RATE).astype(np.float32))
+        mel = log_mel_spectrogram(audio)
+        assert mel.min().item() >= -2.0
+        assert mel.max().item() <= 2.0
+
+    def test_log_mel_spectrogram_accepts_numpy(self) -> None:
+        """Should accept numpy arrays."""
+        from vllm_metal.stt.audio import log_mel_spectrogram
+
+        audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        mel = log_mel_spectrogram(audio)
+        assert mel.ndim == 2
+
+    def test_stft_output_shape(self) -> None:
+        """STFT should produce expected frequency bins."""
+        from vllm_metal.stt.audio import HOP_LENGTH, N_FFT, _hanning, _stft
+
+        audio = mx.zeros(SAMPLE_RATE)
+        window = _hanning(N_FFT)
+        freqs = _stft(audio, window, N_FFT, HOP_LENGTH)
+        assert freqs.shape[0] == N_FFT // 2 + 1
+
+    def test_hanning_window_properties(self) -> None:
+        """Hanning window should be symmetric and peak in centre."""
+        from vllm_metal.stt.audio import _hanning
+
+        window = _hanning(400)
+        assert window.shape[0] == 400
+        assert abs(window[0].item()) < 1e-6
+        assert window[200].item() > window[0].item()
+
+
+# ===========================================================================
+# Audio chunking
+# ===========================================================================
+
+
+class TestAudioChunking:
+    """Tests for audio_duration() and split_audio()."""
+
+    def test_audio_duration(self) -> None:
+        audio = mx.zeros(SAMPLE_RATE)
+        assert audio_duration(audio) == pytest.approx(1.0)
+
+    def test_audio_duration_half_second(self) -> None:
+        audio = mx.zeros(SAMPLE_RATE // 2)
+        assert audio_duration(audio) == pytest.approx(0.5)
+
+    def test_split_short_audio_is_noop(self) -> None:
+        """Audio shorter than max_clip_s is returned as-is."""
+        audio = mx.zeros(5 * SAMPLE_RATE)
+        chunks = split_audio(audio)
+        assert len(chunks) == 1
+        assert chunks[0][1] == 0.0
+        assert chunks[0][0].shape[0] == 5 * SAMPLE_RATE
+
+    def test_split_long_audio(self) -> None:
+        """90 seconds should produce multiple chunks."""
+        audio = mx.zeros(90 * SAMPLE_RATE)
+        chunks = split_audio(audio, max_clip_s=30.0)
+        assert len(chunks) >= 3
+        for _, start in chunks:
+            assert start >= 0.0
+
+    def test_split_covers_all_audio(self) -> None:
+        """All samples should be covered (no gaps at the end)."""
+        duration_s = 65
+        audio = mx.zeros(duration_s * SAMPLE_RATE)
+        chunks = split_audio(audio, max_clip_s=30.0, overlap_s=0.0)
+        last_chunk, last_start = chunks[-1]
+        last_end_sample = int(last_start * SAMPLE_RATE) + last_chunk.shape[0]
+        assert last_end_sample == duration_s * SAMPLE_RATE
+
+    def test_split_with_energy_based_split_point(self) -> None:
+        """Splitter should find quiet regions near chunk boundaries."""
+        sr = SAMPLE_RATE
+        loud = mx.array(np.random.randn(28 * sr).astype(np.float32))
+        silent = mx.zeros(2 * sr)
+        loud2 = mx.array(np.random.randn(20 * sr).astype(np.float32))
+        audio = mx.concatenate([loud, silent, loud2])
+
+        chunks = split_audio(audio, max_clip_s=30.0, overlap_s=0.5)
+        assert len(chunks) >= 2
+        _, second_start = chunks[1]
+        assert 26.0 <= second_start <= 31.0
