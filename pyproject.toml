@@ -104,6 +104,8 @@ disable_error_code = ["override", "misc", "assignment", "arg-type", "index", "ca
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# By default, run all tests (including "slow"). Use `pytest -m "not slow"` for a
+# fast loop (CI already does this).
 markers = [
     "slow: opt-in performance or long-running tests",
 ]

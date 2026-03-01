@@ -5,8 +5,18 @@ import time
 
 import pytest
 
-# Import from the bundled Rust extension
-from vllm_metal._rs import BlockAllocator, InputPreparer, RequestStateManager
+from tests._rust_ext import require_rust_block_allocator_string_seq_id
+
+try:
+    from vllm_metal._rs import BlockAllocator, InputPreparer, RequestStateManager
+except ImportError:
+    pytest.skip(
+        "Rust extension not installed. Build/rebuild it with: "
+        "uv pip install -e . --reinstall --no-deps",
+        allow_module_level=True,
+    )
+
+require_rust_block_allocator_string_seq_id()
 
 
 class TestRustBlockAllocator:

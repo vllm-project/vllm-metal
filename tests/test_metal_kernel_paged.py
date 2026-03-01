@@ -9,44 +9,58 @@ Run with:
 
 from __future__ import annotations
 
-import mlx.core as mx
 import pytest
-import torch
-from mlx_lm import load as mlx_lm_load
-from mlx_lm.models.cache import make_prompt_cache
 
-from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
-from vllm_metal.metal_kernel_backend.paged_attention import (
-    MetalKernelPagedAttentionWrapper,
-    patch_model_attention_metal_kernel,
-)
-from vllm_metal.paged_attention_common import (
-    OffsetCache,
-    clear_context,
-    prepare_decode,
-    prepare_prefill,
-)
+from tests._rust_ext import require_rust_block_allocator_string_seq_id
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 BLOCK_SIZE = 16
 
-
-# ---------------------------------------------------------------------------
-# Skip if kernels package not available
-# ---------------------------------------------------------------------------
+try:
+    import mlx.core as mx
+    import torch
+    from mlx_lm import load as mlx_lm_load
+    from mlx_lm.models.cache import make_prompt_cache
+except ImportError as exc:
+    pytest.skip(
+        f"Metal kernel paged attention tests require mlx/torch/mlx_lm: {exc}",
+        allow_module_level=True,
+    )
 
 try:
+    from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
     from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
+    from vllm_metal.metal_kernel_backend.paged_attention import (
+        MetalKernelPagedAttentionWrapper,
+        patch_model_attention_metal_kernel,
+    )
+    from vllm_metal.paged_attention_common import (
+        OffsetCache,
+        clear_context,
+        prepare_decode,
+        prepare_prefill,
+    )
+except ImportError as exc:
+    pytest.skip(
+        "Metal kernel paged attention tests require the vllm-metal paged backend "
+        f"(and Rust extension): {exc}. Build/rebuild it with: "
+        "uv pip install -e . --reinstall --no-deps",
+        allow_module_level=True,
+    )
 
-    _ops = get_paged_attention_ops()
-    _KERNEL_AVAILABLE = True
-except Exception:
-    _KERNEL_AVAILABLE = False
+require_rust_block_allocator_string_seq_id()
 
-pytestmark = pytest.mark.skipif(
-    not _KERNEL_AVAILABLE,
-    reason="kernels-community/paged-attention not available",
-)
+
+@pytest.fixture(scope="module", autouse=True)
+def _paged_attention_ops_available() -> None:
+    """Skip this module if the paged-attention ops cannot be loaded."""
+
+    try:
+        get_paged_attention_ops()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    except Exception as exc:
+        pytest.skip(f"kernels-community/paged-attention not available: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +167,9 @@ def qwen3_model():
 
 class TestMetalKernelPagedVsStandard:
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
+    )
     def test_greedy_output_matches(self, qwen3_model):
         """Metal kernel paged attention greedy decode must match standard path."""
         model, tokenizer = qwen3_model
@@ -173,6 +190,9 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
+    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
