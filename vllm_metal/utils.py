@@ -68,8 +68,11 @@ def set_wired_limit() -> None:
         if max_wired > 0:
             if hasattr(mx, "set_wired_limit"):
                 mx.set_wired_limit(max_wired)
+                logger.info(f"Set Metal wired_limit to {max_wired / (1024**3):.1f} GB")
             elif hasattr(mx.metal, "set_wired_limit"):
                 mx.metal.set_wired_limit(max_wired)
-            logger.info(f"Set Metal wired_limit to {max_wired / (1024**3):.1f} GB")
+                logger.info(f"Set Metal wired_limit to {max_wired / (1024**3):.1f} GB")
+            else:
+                logger.debug("No set_wired_limit API available, skipping")
     except Exception as e:
         logger.warning(f"Failed to set wired_limit: {e}")
