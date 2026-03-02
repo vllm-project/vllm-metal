@@ -4,7 +4,7 @@
 
 Usage:
     # Download ShareGPT dataset (~642 MB):
-    huggingface-cli download anon8231489123/ShareGPT_Vicuna_unfiltered \
+    hf download anon8231489123/ShareGPT_Vicuna_unfiltered \
         --repo-type dataset --local-dir . ShareGPT_V3_unfiltered_cleaned_split.json
 
     # Batch size 1 (sequential):
@@ -55,6 +55,7 @@ def run_offline(
     max_tokens: int,
     max_model_len: int,
     max_num_seqs: int,
+    seed: int,
 ) -> list[int]:
     """Run offline inference, return list of completion token counts."""
     llm = LLM(
@@ -62,7 +63,7 @@ def run_offline(
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
     )
-    sampling_params = SamplingParams(temperature=0, seed=42, max_tokens=max_tokens)
+    sampling_params = SamplingParams(temperature=0, seed=seed, max_tokens=max_tokens)
 
     conversations = [[{"role": "user", "content": p}] for p in prompts]
 
@@ -119,7 +120,7 @@ def main() -> None:
     for mns in args.max_num_seqs:
         print(f"\nRunning with max_num_seqs={mns} ...")
         counts = run_offline(
-            args.model, prompts, args.max_tokens, args.max_model_len, mns
+            args.model, prompts, args.max_tokens, args.max_model_len, mns, args.seed
         )
         results[mns] = counts
 
