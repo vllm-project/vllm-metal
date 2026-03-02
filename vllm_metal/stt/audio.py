@@ -173,7 +173,8 @@ def _hanning(size: int) -> mx.array:
     Returns:
         1-D ``mx.array`` of float32 window values.
     """
-    return mx.array([0.5 - 0.5 * math.cos(2 * math.pi * n / size) for n in range(size)])
+    n = mx.arange(size, dtype=mx.float32)
+    return 0.5 - 0.5 * mx.cos(2 * math.pi * n / size)
 
 
 def _stft(
