@@ -10,8 +10,11 @@ Usage:
 
 import os
 
-os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.1")
+os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.2")
 os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+os.environ.setdefault("VLLM_METAL_DEBUG", "1")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
 
 from vllm import LLM, SamplingParams
 
@@ -23,7 +26,7 @@ if __name__ == "__main__":
         "Write a quicksort implementation in Python.",
         "List all countries in Europe and their capitals.",
         "Describe photosynthesis step by step.",
-    ] * 100
+    ] * 10
 
     out = llm.generate(prompts, SamplingParams(max_tokens=200))
     for o in out:
