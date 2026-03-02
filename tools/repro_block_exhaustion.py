@@ -5,7 +5,7 @@
 Usage:
     VLLM_METAL_MEMORY_FRACTION=0.1 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
-    python scripts/repro_block_exhaustion.py
+    python tools/repro_block_exhaustion.py
 """
 
 import os
