@@ -8,14 +8,12 @@ expected by ``reshape_and_cache`` and ``paged_attention_v1``:
                where x = 16 // element_size (8 for float16)
 - value_cache: [num_blocks, num_kv_heads, head_dim, block_size]
 
-Block allocation is handled by the Rust ``BlockAllocator``.
+Block allocation is managed externally by the scheduler's KV cache manager.
 """
 
 from __future__ import annotations
 
 import torch
-
-from vllm_metal._rs import BlockAllocator
 
 
 class MPSPagedKVCache:
@@ -36,8 +34,6 @@ class MPSPagedKVCache:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.dtype = dtype
-
-        self._allocator = BlockAllocator(num_blocks)
 
         # The key cache uses a 5D layout for vectorized memory access:
         #   [num_blocks, num_kv_heads, head_dim // x, block_size, x]
@@ -85,26 +81,3 @@ class MPSPagedKVCache:
         # Scale tensors (identity scaling)
         self.k_scale_tensor = torch.tensor(1.0, dtype=torch.float32, device="mps")
         self.v_scale_tensor = torch.tensor(1.0, dtype=torch.float32, device="mps")
-
-    def allocate_blocks(self, seq_id: str, num_blocks: int) -> list[int]:
-        """Allocate *num_blocks* blocks for *seq_id*.
-
-        Returns list of block indices.
-        """
-        return self._allocator.allocate_blocks(seq_id, num_blocks)
-
-    def free_sequence(self, seq_id: str) -> None:
-        """Free all blocks belonging to *seq_id*."""
-        self._allocator.free_sequence(seq_id)
-
-    def has_sequence(self, seq_id: str) -> bool:
-        """Check whether *seq_id* has allocated blocks."""
-        return self._allocator.has_sequence(seq_id)
-
-    def get_sequence_blocks(self, seq_id: str) -> list[int]:
-        """Return the block indices allocated to *seq_id*."""
-        return self._allocator.get_sequence_blocks(seq_id)
-
-    @property
-    def num_free_blocks(self) -> int:
-        return self._allocator.num_free_blocks

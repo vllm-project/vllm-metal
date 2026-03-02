@@ -19,9 +19,8 @@ Silicon.  The HF Metal kernel is no longer actively maintained, so it may
 be replaced in the future.  To swap in a new attention backend:
 
 1. **Cache**: Create a new cache class that allocates per-layer KV storage
-   addressable by block index.  The model runner calls
-   ``allocate_blocks(seq_id, n)`` and ``free_sequence(seq_id)`` — keep
-   this interface.
+   addressable by block index.  Block allocation is managed externally
+   by the scheduler's KV cache manager; the cache only stores tensors.
 
 2. **Prefill**: Receives ``(queries, keys, values)`` after projection and
    RoPE, all as MLX arrays shaped ``(1, heads, seq_len, head_dim)``.

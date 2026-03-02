@@ -15,7 +15,7 @@ import math
 import os
 import time
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, TypeAlias
 
@@ -465,6 +465,9 @@ class RequestState:
     sampling_params: SamplingParams  # Sampling parameters for this request
     generator: torch.Generator | None = None
     generated_tokens: int = 0
+    block_ids: list[int] = field(
+        default_factory=list
+    )  # Scheduler-assigned paged KV blocks
 
 
 def _merge_kv_caches(
@@ -1283,23 +1286,12 @@ class MetalModelRunner:
     # Paged attention paths
     # ------------------------------------------------------------------
 
-    def _allocate_blocks_for_seq(self, req_id: str, num_tokens: int) -> list[int]:
-        """Allocate blocks for a sequence, using the Rust allocator as source of truth."""
-        bs = self._paged_block_size
-        num_blocks = (num_tokens + bs - 1) // bs
-        cache = self._paged_kv_cache
-        existing = cache.get_sequence_blocks(req_id)
-        if len(existing) >= num_blocks:
-            return existing
-        needed = num_blocks - len(existing)
-        new_blocks = cache.allocate_blocks(req_id, needed)
-        return existing + new_blocks
-
     def _prefill_single_request_paged(
         self,
         req_id: str,
         token_ids: list[int],
         sampling_params: SamplingParams,
+        block_ids: list[int],
         generator: torch.Generator | None = None,
     ) -> int:
         """Paged-attention prefill for a single request.
@@ -1308,7 +1300,6 @@ class MetalModelRunner:
         the HF reshape_and_cache kernel. Returns the next token.
         """
         num_tokens = len(token_ids)
-        block_ids = self._allocate_blocks_for_seq(req_id, num_tokens)
 
         # Stash per-request metadata (slot_mapping) in thread-local so the
         # patched attention wrappers can read it during the forward pass.
@@ -1373,29 +1364,13 @@ class MetalModelRunner:
         reshape_and_cache + paged_attention_v1 (zero-copy from block tables).
         """
 
-        """
-        UNTESTED optimization to avoid unnecessary python rust FFI roundtrips.
-        # Store block_ids when they're first computed (prefill) or when they grow (decode)
-        # In _batched_decode_paged:
-        new_seq_len = seq_len + 1
-        prev_blocks = (seq_len + bs - 1) // bs
-        curr_blocks = (new_seq_len + bs - 1) // bs
-
-        if curr_blocks > prev_blocks:
-            # Crossing a block boundary — need one more block
-            new_block = cache.allocate_blocks(req_id, 1)
-            self._paged_request_block_ids[req_id].extend(new_block)
-
-        block_ids = self._paged_request_block_ids[req_id]
-        """
         batch_size = len(decode_reqs)
 
         # Build request info for prepare_decode
         requests_info: list[tuple[list[int], int]] = []
         for req_id, state in decode_reqs:
             seq_len = self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 1)
-            block_ids = self._allocate_blocks_for_seq(req_id, seq_len + 1)
-            requests_info.append((block_ids, seq_len))
+            requests_info.append((state.block_ids, seq_len))
 
         # Stash per-request metadata (slot_mapping, block_tables, context_lens,
         # offsets) in thread-local for the attention wrappers.
@@ -1528,6 +1503,7 @@ class MetalModelRunner:
 
                 if self._paged_kv_cache is not None:
                     # Paged attention path (Metal kernel)
+                    sched_block_ids = list(new_req.block_ids[0])
                     scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
                         req_id, 0
                     )
@@ -1541,6 +1517,7 @@ class MetalModelRunner:
                             req_id,
                             token_ids[:cur_len],
                             sampling_params,
+                            block_ids=sched_block_ids,
                             generator=generator,
                         )
                         cache: list = []
@@ -1552,6 +1529,7 @@ class MetalModelRunner:
                             sampling_params=sampling_params,
                             generator=generator,
                             generated_tokens=0,
+                            block_ids=sched_block_ids,
                         )
                         if self._rust_state_manager is not None:
                             self._rust_state_manager.add_request(
@@ -1563,6 +1541,7 @@ class MetalModelRunner:
                         req_id,
                         token_ids,
                         sampling_params,
+                        block_ids=sched_block_ids,
                         generator=generator,
                     )
                     cache = []  # No per-request KV cache needed
@@ -1583,6 +1562,9 @@ class MetalModelRunner:
                     sampling_params=sampling_params,
                     generator=generator,
                     generated_tokens=1,
+                    block_ids=sched_block_ids
+                    if self._paged_kv_cache is not None
+                    else [],
                 )
 
                 # Register with Rust state manager if available
@@ -1606,6 +1588,30 @@ class MetalModelRunner:
                 }
                 paged_decode_reqs: list[tuple[str, RequestState]] = []
 
+                # Update block_ids from scheduler (append or replace on resume)
+                for i, req_id in enumerate(cached_reqs.req_ids):
+                    state = self._request_states.get(req_id)
+                    if state is None:
+                        continue
+                    new_block_ids = cached_reqs.new_block_ids[i]
+                    resumed = req_id in cached_reqs.resumed_req_ids
+
+                    if not resumed:
+                        if new_block_ids is not None:
+                            state.block_ids.extend(new_block_ids[0])
+                    else:
+                        # Preempted → full recompute with fresh blocks
+                        assert new_block_ids is not None
+                        state.block_ids = list(new_block_ids[0])
+                        state.generated_tokens = 0
+                        state.prompt_len = len(state.token_ids)
+                        self._paged_request_seq_lens.pop(req_id, None)
+                        if self._rust_state_manager is not None:
+                            self._rust_state_manager.remove_request(req_id)
+                            self._rust_state_manager.add_request(
+                                req_id, list(state.token_ids[: state.prompt_len])
+                            )
+
                 for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
                     if state is None:
@@ -1616,7 +1622,7 @@ class MetalModelRunner:
                         continue
 
                     if state.generated_tokens == 0:
-                        # Still prefilling prompt
+                        # Still prefilling prompt (or re-prefilling after preemption)
                         idx = req_id_to_cached_idx.get(req_id)
                         if idx is not None and idx < len(
                             cached_reqs.num_computed_tokens
@@ -1634,6 +1640,7 @@ class MetalModelRunner:
                                 req_id,
                                 state.token_ids[:target_len],
                                 state.sampling_params,
+                                block_ids=state.block_ids,
                                 generator=state.generator,
                             )
                             if self._rust_state_manager is not None:
@@ -1649,6 +1656,7 @@ class MetalModelRunner:
                                 req_id,
                                 state.token_ids[: state.prompt_len],
                                 state.sampling_params,
+                                block_ids=state.block_ids,
                                 generator=state.generator,
                             )
                             state.token_ids = list(
@@ -1762,12 +1770,9 @@ class MetalModelRunner:
                         del state.cache
                     del state
 
-                # Free paged KV blocks
-                if self._paged_kv_cache is not None:
-                    paged_cache = self._paged_kv_cache
-                    if paged_cache.has_sequence(req_id):
-                        paged_cache.free_sequence(req_id)
-                    self._paged_request_seq_lens.pop(req_id, None)
+                # Clean up paged attention tracking state.
+                # Block freeing is handled by the scheduler's kv_cache_manager.
+                self._paged_request_seq_lens.pop(req_id, None)
 
                 # Remove from Rust state manager if available
                 if self._rust_state_manager is not None:

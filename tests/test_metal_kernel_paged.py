@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import pytest
 
-from tests._rust_ext import require_rust_block_allocator_string_seq_id
-
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 BLOCK_SIZE = 16
 
@@ -47,8 +45,6 @@ except ImportError as exc:
         "uv pip install -e . --reinstall --no-deps",
         allow_module_level=True,
     )
-
-require_rust_block_allocator_string_seq_id()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -115,9 +111,9 @@ def _greedy_generate_metal_kernel(
     n_patched = patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
     assert n_patched == num_layers
 
-    # Allocate blocks for this sequence
+    # Assign block IDs for this sequence (manual allocation, no Rust allocator)
     seq_blocks_needed = (len(token_ids) + max_new + BLOCK_SIZE - 1) // BLOCK_SIZE
-    block_ids = mps_cache.allocate_blocks("seq-0", seq_blocks_needed)
+    block_ids = list(range(seq_blocks_needed))
 
     # --- Prefill ---
     prepare_prefill(block_ids, len(token_ids), BLOCK_SIZE)
@@ -235,11 +231,13 @@ class TestMetalKernelPagedVsStandard:
         all_seq_lens = []
         all_generated: list[list[int]] = []
 
-        for i, prompt in enumerate(prompts):
+        block_offset = 0
+        for _i, prompt in enumerate(prompts):
             tids = tokenizer.encode(prompt)
             all_token_ids.append(tids)
             needed = (len(tids) + max_new + BLOCK_SIZE - 1) // BLOCK_SIZE
-            bids = mps_cache.allocate_blocks(f"seq-{i}", needed)
+            bids = list(range(block_offset, block_offset + needed))
+            block_offset += needed
             all_block_ids.append(bids)
 
             prepare_prefill(bids, len(tids), BLOCK_SIZE)
