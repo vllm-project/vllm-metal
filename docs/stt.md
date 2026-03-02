@@ -13,7 +13,7 @@ First, install vllm-metal using the install script (see [README](../README.md)):
 Then install the optional STT dependencies inside the virtual environment:
 
 ```bash
-source .venv/bin/activate
+source .venv-vllm-metal/bin/activate
 pip install vllm-metal[stt]
 ```
 
