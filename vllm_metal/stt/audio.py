@@ -125,7 +125,9 @@ def _load_audio_ffmpeg(
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ffmpeg timed out after {timeout_s}s decoding {file_path}") from exc
+        raise RuntimeError(
+            f"ffmpeg timed out after {timeout_s}s decoding {file_path}"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg error: {result.stderr.decode()}")
     return mx.array(np.frombuffer(result.stdout, np.float32), mx.float32)

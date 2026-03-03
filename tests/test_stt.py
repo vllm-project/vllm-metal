@@ -261,7 +261,9 @@ class TestAudioLoading:
             called["timeout_s"] = timeout_s
             return mx.array(np.zeros(4, dtype=np.float32))
 
-        monkeypatch.setitem(sys.modules, "librosa", SimpleNamespace(load=fake_librosa_load))
+        monkeypatch.setitem(
+            sys.modules, "librosa", SimpleNamespace(load=fake_librosa_load)
+        )
         monkeypatch.setattr(audio_mod, "_load_audio_ffmpeg", fake_load_audio_ffmpeg)
 
         audio = audio_mod.load_audio("dummy.wav")
