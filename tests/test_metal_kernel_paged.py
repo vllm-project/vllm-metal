@@ -40,9 +40,8 @@ try:
     )
 except ImportError as exc:
     pytest.skip(
-        "Metal kernel paged attention tests require the vllm-metal paged backend "
-        f"(and Rust extension): {exc}. Build/rebuild it with: "
-        "uv pip install -e . --reinstall --no-deps",
+        "Metal kernel paged attention tests require the vllm-metal paged backend: "
+        f"{exc}. Install with: pip install 'vllm-metal[paged]'",
         allow_module_level=True,
     )
 
@@ -111,7 +110,7 @@ def _greedy_generate_metal_kernel(
     n_patched = patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
     assert n_patched == num_layers
 
-    # Assign block IDs for this sequence (manual allocation, no Rust allocator)
+    # Assign block IDs for this sequence (manual allocation)
     seq_blocks_needed = (len(token_ids) + max_new + BLOCK_SIZE - 1) // BLOCK_SIZE
     block_ids = list(range(seq_blocks_needed))
 
