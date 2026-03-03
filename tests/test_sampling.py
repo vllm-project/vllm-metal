@@ -296,6 +296,41 @@ class TestV1SeededSamplingGenerator:
         assert not torch.equal(after_second, after_first)
 
 
+class TestV1SamplingMetadataLogitsProcessors:
+    @staticmethod
+    def _make_runner(vocab_size: int = 32) -> MetalModelRunner:
+        runner = MetalModelRunner.__new__(MetalModelRunner)
+        runner.device = torch.device("cpu")
+        runner.model_args = {"vocab_size": vocab_size}
+        return runner
+
+    def test_make_sampling_metadata_uses_runner_logitsprocs(self) -> None:
+        runner = self._make_runner()
+        expected_logitsprocs = LogitsProcessors()
+        runner._logitsprocs = expected_logitsprocs
+
+        metadata = runner._make_sampling_metadata(
+            sampling_params_list=[SamplingParams(temperature=0.0)],
+            prompt_token_id_lists=[[]],
+            output_token_id_lists=[[]],
+        )
+
+        assert metadata.logitsprocs is expected_logitsprocs
+
+    def test_make_sampling_metadata_falls_back_without_init(self) -> None:
+        runner = self._make_runner()
+        assert not hasattr(runner, "_logitsprocs")
+
+        metadata = runner._make_sampling_metadata(
+            sampling_params_list=[SamplingParams(temperature=0.0)],
+            prompt_token_id_lists=[[]],
+            output_token_id_lists=[[]],
+        )
+
+        assert isinstance(metadata.logitsprocs, LogitsProcessors)
+        assert list(metadata.logitsprocs.all) == []
+
+
 class TestV1PenaltyTokenAccounting:
     """Regression tests for prompt vs output token accounting in penalties."""
 

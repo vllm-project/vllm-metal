@@ -37,6 +37,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
@@ -588,10 +589,16 @@ class MetalModelRunner:
         self._sampler = Sampler()
 
         # Build logits processors (includes custom plugins from entry-points)
+        is_pooling_model = getattr(self.model_config, "runner_type", None) == "pooling"
+        pin_memory = is_pin_memory_available()
         custom_lp = vllm_config.model_config.logits_processors
         custom_logitsprocs = tuple(custom_lp) if custom_lp is not None else ()
         self._logitsprocs = build_logitsprocs(
-            vllm_config, device, False, False, custom_logitsprocs,
+            vllm_config,
+            device,
+            pin_memory,
+            is_pooling_model,
+            custom_logitsprocs,
         )
 
         # Track finished requests for lazy cache clearing
