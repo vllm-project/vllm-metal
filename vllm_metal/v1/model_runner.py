@@ -1600,16 +1600,21 @@ class MetalModelRunner:
                         if new_block_ids is not None:
                             state.block_ids.extend(new_block_ids[0])
                     else:
-                        # Preempted → full recompute with fresh blocks
+                        # Preempted → full recompute with fresh blocks.
+                        # Keep prompt_len at the original prompt boundary
+                        # (used for sampling penalty split). The prefill
+                        # loop uses len(state.token_ids) — which already
+                        # includes previously generated output tokens —
+                        # to determine the recompute scope, matching
+                        # upstream vLLM's use of request.num_tokens.
                         assert new_block_ids is not None
                         state.block_ids = list(new_block_ids[0])
                         state.generated_tokens = 0
-                        state.prompt_len = len(state.token_ids)
                         self._paged_request_seq_lens.pop(req_id, None)
                         if self._rust_state_manager is not None:
                             self._rust_state_manager.remove_request(req_id)
                             self._rust_state_manager.add_request(
-                                req_id, list(state.token_ids[: state.prompt_len])
+                                req_id, list(state.token_ids)
                             )
 
                 for req_id in decode_req_ids:
@@ -1633,7 +1638,7 @@ class MetalModelRunner:
                         scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
                         target_len = computed + scheduled  # FIX: was just `computed`
 
-                        if target_len < state.prompt_len:
+                        if target_len < len(state.token_ids):
                             # Intermediate chunk: sample then drop
                             prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
                             _discarded = self._prefill_single_request_paged(
@@ -1652,21 +1657,20 @@ class MetalModelRunner:
                         else:
                             # Last chunk: sample and keep (drains async placeholder)
                             prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
+                            seq_len_before = len(state.token_ids)
                             next_token = self._prefill_single_request_paged(
                                 req_id,
-                                state.token_ids[: state.prompt_len],
+                                state.token_ids,
                                 state.sampling_params,
                                 block_ids=state.block_ids,
                                 generator=state.generator,
                             )
-                            state.token_ids = list(
-                                state.token_ids[: state.prompt_len]
-                            ) + [next_token]
-                            state.generated_tokens = 1
+                            state.token_ids.append(next_token)
+                            state.generated_tokens = (
+                                len(state.token_ids) - state.prompt_len
+                            )
                             if self._rust_state_manager is not None:
-                                for tid in state.token_ids[
-                                    prev_seq_len : state.prompt_len
-                                ]:
+                                for tid in state.token_ids[prev_seq_len:seq_len_before]:
                                     self._rust_state_manager.append_token(req_id, tid)
                                 self._rust_state_manager.append_token(
                                     req_id, next_token
