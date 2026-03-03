@@ -347,3 +347,25 @@ class TestAudioChunking:
         assert len(chunks) >= 2
         _, second_start = chunks[1]
         assert 26.0 <= second_start <= 31.0
+
+    def test_split_chunks_never_exceed_max_clip(self) -> None:
+        """No chunk should be longer than max_clip_s samples."""
+        max_clip_s = 10.0
+        max_samples = int(max_clip_s * SAMPLE_RATE)
+        audio = mx.array(np.random.randn(50 * SAMPLE_RATE).astype(np.float32))
+        chunks = split_audio(audio, max_clip_s=max_clip_s, overlap_s=0.0)
+
+        for chunk, _ in chunks:
+            assert chunk.shape[0] <= max_samples
+
+    def test_split_small_clip_silent_audio_avoids_tiny_chunks(self) -> None:
+        """Small max_clip_s should not degrade into 1-sample chunks."""
+        max_clip_s = 0.4
+        max_samples = int(max_clip_s * SAMPLE_RATE)
+        audio = mx.zeros(2 * SAMPLE_RATE)
+
+        chunks = split_audio(audio, max_clip_s=max_clip_s, overlap_s=0.0)
+
+        assert len(chunks) == 5
+        for chunk, _ in chunks:
+            assert chunk.shape[0] == max_samples
