@@ -1646,7 +1646,6 @@ class MetalModelRunner:
 
                         if target_len < len(state.token_ids):
                             # Intermediate chunk: sample then drop
-                            prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
                             _discarded = self._prefill_single_request_paged(
                                 req_id,
                                 state.token_ids[:target_len],
@@ -1654,16 +1653,11 @@ class MetalModelRunner:
                                 block_ids=state.block_ids,
                                 generator=state.generator,
                             )
-                            if self._rust_state_manager is not None:
-                                for tid in state.token_ids[prev_seq_len:target_len]:
-                                    self._rust_state_manager.append_token(req_id, tid)
                             req_ids.append(req_id)
                             req_id_to_index[req_id] = len(req_ids) - 1
                             sampled_tokens.append([])
                         else:
                             # Last chunk: sample and keep (drains async placeholder)
-                            prev_seq_len = self._paged_request_seq_lens.get(req_id, 0)
-                            seq_len_before = len(state.token_ids)
                             next_token = self._prefill_single_request_paged(
                                 req_id,
                                 state.token_ids,
@@ -1677,8 +1671,6 @@ class MetalModelRunner:
                                 len(state.token_ids) - state.prompt_len
                             )
                             if self._rust_state_manager is not None:
-                                for tid in state.token_ids[prev_seq_len:seq_len_before]:
-                                    self._rust_state_manager.append_token(req_id, tid)
                                 self._rust_state_manager.append_token(
                                     req_id, next_token
                                 )
