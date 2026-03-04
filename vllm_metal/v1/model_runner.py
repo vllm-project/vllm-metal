@@ -1029,7 +1029,7 @@ class MetalModelRunner:
             no_penalties=no_penalties,
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
-            logitsprocs=getattr(self, '_logitsprocs', LogitsProcessors()),
+            logitsprocs=getattr(self, "_logitsprocs", None) or LogitsProcessors(),
         )
 
     def _prefill_single(
