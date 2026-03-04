@@ -1293,6 +1293,7 @@ class MetalModelRunner:
         sampling_params: SamplingParams,
         block_ids: list[int],
         generator: torch.Generator | None = None,
+        prompt_len: int | None = None,
     ) -> int:
         """Paged-attention prefill for a single request.
 
@@ -1300,6 +1301,8 @@ class MetalModelRunner:
         the HF reshape_and_cache kernel. Returns the next token.
         """
         num_tokens = len(token_ids)
+        if prompt_len is None:
+            prompt_len = num_tokens
 
         # Stash per-request metadata (slot_mapping) in thread-local so the
         # patched attention wrappers can read it during the forward pass.
@@ -1345,7 +1348,10 @@ class MetalModelRunner:
             )
             generators = {} if generator is None else {0: generator}
             metadata = self._make_sampling_metadata(
-                [sampling_params], [token_ids], [[]], generators=generators
+                [sampling_params],
+                [token_ids[:prompt_len]],
+                [token_ids[prompt_len:]],
+                generators=generators,
             )
             output = self._sampler.forward(logits_torch, metadata)
             next_token = int(output.sampled_token_ids[0, 0].item())
@@ -1664,6 +1670,7 @@ class MetalModelRunner:
                                 state.sampling_params,
                                 block_ids=state.block_ids,
                                 generator=state.generator,
+                                prompt_len=state.prompt_len,
                             )
                             state.token_ids.append(next_token)
                             state.generated_tokens = (
