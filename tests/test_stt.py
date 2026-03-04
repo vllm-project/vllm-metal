@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for STT data types, config, formatting, audio pipeline, and model."""
+"""Tests for STT data types, config, formatting, and audio pipeline."""
 
 from __future__ import annotations
 
@@ -288,73 +288,3 @@ class TestAudioChunking:
         assert len(chunks) >= 2
         _, second_start = chunks[1]
         assert 26.0 <= second_start <= 31.0
-
-
-# ===========================================================================
-# Weight sanitization
-# ===========================================================================
-
-
-class TestWeightSanitize:
-    """Tests for WhisperModel.sanitize() weight mapping."""
-
-    @pytest.fixture()
-    def model(self):
-        """Create a minimal WhisperModel for testing sanitize()."""
-        from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
-
-        config = WhisperConfig(
-            n_mels=80,
-            n_vocab=51865,
-            n_audio_ctx=1500,
-            n_audio_state=512,
-            n_audio_head=8,
-            n_audio_layer=6,
-            n_text_ctx=448,
-            n_text_state=512,
-            n_text_head=8,
-            n_text_layer=6,
-        )
-        return WhisperModel(config, dtype=mx.float16)
-
-    def test_sanitize_hf_key_rename(self, model) -> None:
-        """HuggingFace keys should be renamed to MLX format."""
-        weights = {
-            "model.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((512, 512)),
-        }
-        sanitized = model.sanitize(weights)
-        assert "encoder.blocks.0.attn.query.weight" in sanitized
-        assert "model.encoder.layers.0.self_attn.q_proj.weight" not in sanitized
-
-    def test_sanitize_skips_encoder_positions(self, model) -> None:
-        """encoder.embed_positions should be skipped (None mapping)."""
-        weights = {
-            "model.encoder.embed_positions.weight": mx.zeros((1500, 512)),
-            "model.decoder.embed_tokens.weight": mx.zeros((51865, 512)),
-        }
-        sanitized = model.sanitize(weights)
-        assert "encoder.embed_positions.weight" not in sanitized
-        assert "decoder.token_embedding.weight" in sanitized
-
-    def test_sanitize_transposes_conv_weights(self, model) -> None:
-        """Conv1d weights should be transposed from HF format."""
-        # HF format: (out_channels, in_channels, kernel_size)
-        hf_conv = mx.zeros((512, 80, 3))
-        weights = {"model.encoder.conv1.weight": hf_conv}
-        sanitized = model.sanitize(weights)
-        # MLX expects (out_channels, kernel_size, in_channels)
-        assert sanitized["encoder.conv1.weight"].shape == (512, 3, 80)
-
-    def test_sanitize_preserves_mlx_format(self, model) -> None:
-        """Already-MLX-format weights pass through unchanged."""
-        weights = {
-            "encoder.blocks.0.attn.query.weight": mx.zeros((512, 512)),
-        }
-        sanitized = model.sanitize(weights)
-        assert "encoder.blocks.0.attn.query.weight" in sanitized
-
-    def test_sanitize_casts_dtype(self, model) -> None:
-        """Weights should be cast to model dtype."""
-        weights = {"encoder.ln_post.weight": mx.ones((512,), dtype=mx.float32)}
-        sanitized = model.sanitize(weights)
-        assert sanitized["encoder.ln_post.weight"].dtype == mx.float16

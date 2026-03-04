@@ -154,7 +154,9 @@ class MultiHeadAttention(nn.Module):
 
         qk = q @ k
         if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
+            k_len = k.shape[3]
+            offset = k_len - n_ctx
+            qk = qk + mask[offset : offset + n_ctx, :k_len]
 
         w = mx.softmax(qk, axis=-1, precise=True)
         out = (w @ v).transpose(0, 2, 1, 3)
