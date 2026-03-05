@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention using the HF ``kernels-community/paged-attention`` Metal
-kernel for zero-copy decode.
+"""Paged attention using vendored Metal kernels dispatched through MLX.
 
-Prefill: MLX inline SDPA (causal), then bridge K/V to MPS and call
-``reshape_and_cache`` to write into the paged cache.
+Prefill: MLX inline SDPA (causal), then ``reshape_and_cache`` to write
+projected K/V into the paged cache.
 
-Decode: MLX projections + per-request RoPE, bridge Q/K/V to MPS, call
-``reshape_and_cache`` then ``paged_attention_v1`` (zero-copy read from
-block tables), bridge output back to MLX.
+Decode: MLX projections + per-request RoPE, ``reshape_and_cache`` to write
+the new token, then ``paged_attention_v1`` for zero-copy attention over
+all cached K/V blocks.
+
+All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill``,
 ``prepare_decode``, ``clear_context`` from ``paged_attention_common``.
@@ -15,8 +16,7 @@ Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill``,
 Backend replacement guide
 -------------------------
 This module exists because there is no flash attention library for Apple
-Silicon.  The HF Metal kernel is no longer actively maintained, so it may
-be replaced in the future.  To swap in a new attention backend:
+Silicon.  To swap in a new attention backend:
 
 1. **Cache**: Create a new cache class that allocates per-layer KV storage
    addressable by block index.  Block allocation is managed externally
@@ -65,16 +65,14 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import torch
 
+from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
-from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
     find_layers_and_attr,
     get_context,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
 
 # ---------------------------------------------------------------------------
 # Prefill attention (MLX SDPA + reshape_and_cache write)
@@ -93,7 +91,7 @@ def _metal_kernel_prefill_attention(
 ) -> mx.array:
     """Prefill: B=1, L=prompt_len.
 
-    Inline causal SDPA in MLX, then write K/V to MPS paged cache via
+    Inline causal SDPA in MLX, then write K/V to paged cache via
     ``reshape_and_cache``.
     """
     B, _, L, _ = queries.shape  # noqa: N806
@@ -114,26 +112,25 @@ def _metal_kernel_prefill_attention(
         queries, keys, values, scale=attn_module.scale, mask=attn_mask
     )
 
-    # Write K/V into paged MPS cache via reshape_and_cache
+    # Write K/V into paged cache via reshape_and_cache
     # keys/values: (1, kv_heads, L, head_dim) → (L, kv_heads, head_dim)
     k_flat = keys[0].transpose(1, 0, 2)  # (L, kv_heads, head_dim)
     v_flat = values[0].transpose(1, 0, 2)
 
-    k_mps = mlx_to_torch(k_flat, device="mps").to(dtype=cache.dtype)
-    v_mps = mlx_to_torch(v_flat, device="mps").to(dtype=cache.dtype)
+    # Ensure contiguous + correct dtype
+    k_flat = mx.contiguous(k_flat.astype(cache.dtype))
+    v_flat = mx.contiguous(v_flat.astype(cache.dtype))
 
-    slot_mapping_mps = torch.tensor(ctx.slot_mapping, dtype=torch.long, device="mps")
+    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
+    mx.eval(k_flat, v_flat, slot_mapping)
 
-    ops = get_paged_attention_ops()
+    ops = get_ops()
     ops.reshape_and_cache(
-        k_mps,
-        v_mps,
+        k_flat,
+        v_flat,
         cache.key_caches[layer_idx],
         cache.value_caches[layer_idx],
-        slot_mapping_mps,
-        "auto",
-        cache.k_scale_tensor,
-        cache.v_scale_tensor,
+        slot_mapping,
     )
 
     # output: (B, heads, L, head_dim) → (B, L, heads, head_dim) → (B, L, D)
@@ -178,38 +175,38 @@ def _metal_kernel_decode_attention(
     queries = mx.concatenate(q_parts, axis=0)  # (B, heads, 1, head_dim)
     keys_new = mx.concatenate(k_parts, axis=0)  # (B, kv_heads, 1, head_dim)
 
-    # Bridge Q, new K/V to MPS
-    # (B, heads, 1, hd) → squeeze seq dim → (B, heads, hd)
-    q_mps = mlx_to_torch(queries[:, :, 0, :], device="mps").to(dtype=cache.dtype)
-    k_mps = mlx_to_torch(keys_new[:, :, 0, :], device="mps").to(dtype=cache.dtype)
-    v_mps = mlx_to_torch(values[:, :, 0, :], device="mps").to(dtype=cache.dtype)
+    # Squeeze seq dim: (B, heads, 1, hd) → (B, heads, hd)
+    q_3d = mx.contiguous(queries[:, :, 0, :].astype(cache.dtype))
+    k_3d = mx.contiguous(keys_new[:, :, 0, :].astype(cache.dtype))
+    v_3d = mx.contiguous(values[:, :, 0, :].astype(cache.dtype))
 
-    slot_mapping_mps = torch.tensor(ctx.slot_mapping, dtype=torch.long, device="mps")
+    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
 
-    ops = get_paged_attention_ops()
-
-    # Write new K/V tokens into paged cache
-    ops.reshape_and_cache(
-        k_mps,
-        v_mps,
-        cache.key_caches[layer_idx],
-        cache.value_caches[layer_idx],
-        slot_mapping_mps,
-        "auto",
-        cache.k_scale_tensor,
-        cache.v_scale_tensor,
-    )
-
-    # Build block_tables and seq_lens tensors
+    # Build block_tables and seq_lens
     max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
     block_tables_list = [
         bt + [0] * (max_blocks_per_seq - len(bt)) for bt in ctx.block_tables
     ]
-    block_tables_mps = torch.tensor(block_tables_list, dtype=torch.int32, device="mps")
-    seq_lens_mps = torch.tensor(ctx.context_lens, dtype=torch.int32, device="mps")
+    block_tables = mx.array(block_tables_list, dtype=mx.int32)
+    seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
 
-    # Allocate output tensor
-    out = torch.zeros(B, n_heads, head_dim, dtype=cache.dtype, device="mps")
+    # Eval all inputs before kernel dispatch
+    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens)
+
+    ops = get_ops()
+
+    # Write new K/V tokens into paged cache
+    ops.reshape_and_cache(
+        k_3d,
+        v_3d,
+        cache.key_caches[layer_idx],
+        cache.value_caches[layer_idx],
+        slot_mapping,
+    )
+
+    # Allocate output
+    out = mx.zeros((B, n_heads, head_dim), dtype=cache.dtype)
+    mx.eval(out)
 
     max_seq_len = max(ctx.context_lens)
     scale = attn_module.scale
@@ -217,30 +214,21 @@ def _metal_kernel_decode_attention(
     # Zero-copy paged attention
     ops.paged_attention_v1(
         out,
-        q_mps,
+        q_3d,
         cache.key_caches[layer_idx],
         cache.value_caches[layer_idx],
         cache.num_kv_heads,
         scale,
-        block_tables_mps,
-        seq_lens_mps,
+        block_tables,
+        seq_lens,
         cache.block_size,
         max_seq_len,
-        None,  # alibi_slopes
-        "auto",  # kv_cache_dtype
-        cache.k_scale_tensor,
-        cache.v_scale_tensor,
-        0,  # tp_rank
-        0,  # blocksparse_local_blocks
-        0,  # blocksparse_vert_stride
-        64,  # blocksparse_block_size
-        0,  # blocksparse_head_sliding_step
     )
 
-    # Bridge output back to MLX: (B, heads, hd) → (B, 1, heads*hd)
-    out_mlx = torch_to_mlx(out)  # (B, heads, head_dim)
-    out_mlx = out_mlx.reshape(B, 1, n_heads * head_dim)
-    return attn_module.o_proj(out_mlx)
+    # out: (B, heads, hd) → (B, 1, heads*hd)
+    mx.eval(out)
+    out = out.reshape(B, 1, n_heads * head_dim)
+    return attn_module.o_proj(out)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +237,7 @@ def _metal_kernel_decode_attention(
 
 
 class MetalKernelPagedAttentionWrapper(nn.Module):
-    """Wraps an mlx_lm Attention module to use the HF Metal kernel for paged KV.
+    """Wraps an mlx_lm Attention module to use native Metal paged KV.
 
     Uses ``object.__setattr__`` to bypass MLX nn.Module's ``__setattr__``.
 

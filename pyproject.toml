@@ -42,8 +42,8 @@ dependencies = [
 
 [project.optional-dependencies]
 paged = [
-    # Paged attention Metal kernel (opt-in, experimental)
-    "kernels>=0.4.5; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Paged attention now uses vendored Metal shaders + native MLX dispatch.
+    # No external dependencies required — kernels are JIT-compiled at startup.
 ]
 vllm = ["vllm>=0.14.0"]
 stt = [

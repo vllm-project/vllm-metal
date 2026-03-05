@@ -243,13 +243,28 @@ class MetalWorker(WorkerBase):
         # --- Create cache and patch model ---
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
+
+        # Convert torch.dtype → mx.Dtype for the MLX-native cache
+        import torch
+
+        _TORCH_TO_MX_DTYPE = {
+            torch.float16: mx.float16,
+            torch.bfloat16: mx.bfloat16,
+            torch.float32: mx.float32,
+        }
+        mx_dtype = _TORCH_TO_MX_DTYPE.get(runner.kv_cache_dtype)
+        if mx_dtype is None:
+            raise ValueError(
+                f"Unsupported KV cache dtype for MLX: {runner.kv_cache_dtype}"
+            )
+
         mps_kv_cache = MPSPagedKVCache(
             num_layers=runner.num_layers,
             num_kv_heads=runner.num_kv_heads,
             head_dim=runner.head_dim,
             num_blocks=num_blocks,
             block_size=block_size,
-            dtype=runner.kv_cache_dtype,
+            dtype=mx_dtype,
         )
 
         n_patched = patch_model_attention_metal_kernel(
