@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 # Default: test the paged KV cache path through vLLM offline inference.
 # Change to "0" to test the MLX inline cache path.
 os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
 os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.2")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+import pytest
+from vllm import LLM, SamplingParams
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
@@ -68,9 +69,6 @@ GOLDEN_PAGED = {
 # fmt: on
 
 
-from vllm import LLM, SamplingParams
-
-
 @pytest.fixture(scope="module")
 def vllm_outputs():
     """Run vLLM offline inference once for all prompts."""
@@ -102,7 +100,7 @@ class TestPagedDeterministic:
         elif paged_match:
             print("  result: MATCHED paged-cache golden")
         else:
-            print(f"  result: NO MATCH")
+            print("  result: NO MATCH")
             print(f"  expected (mlx):   {mlx_expected}")
             print(f"  expected (paged): {paged_expected}")
 
