@@ -67,26 +67,18 @@ GOLDEN_PAGED = {
 # fmt: on
 
 
-@pytest.fixture(scope="session")
-def _monkeypatch_session():
-    """Session-scoped monkeypatch (pytest only provides function-scoped)."""
-    from _pytest.monkeypatch import MonkeyPatch
-
-    mp = MonkeyPatch()
-    yield mp
-    mp.undo()
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _set_env(_monkeypatch_session):
+@pytest.fixture(autouse=True, scope="module")
+def _set_env():
     """Set env vars for the paged KV cache path.
 
-    Uses monkeypatch so env changes are automatically reverted after the
-    session, avoiding side effects on other tests.
+    Uses MonkeyPatch.context() so env changes are automatically reverted
+    after the module, avoiding side effects on other tests.
     """
-    _monkeypatch_session.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-    _monkeypatch_session.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
-    _monkeypatch_session.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
+        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        yield
 
 
 @pytest.fixture(scope="module")
