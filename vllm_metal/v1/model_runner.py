@@ -378,7 +378,7 @@ def _merge_rotating_kv_caches(
     # the ``keep`` prefix semantics used by RotatingKVCache internally.
     ordered: list[tuple[mx.array, mx.array]] = []
     for c in caches:
-        effective_len = len(c)  # min(offset, max_size)
+        effective_len = c.size() if hasattr(c, "size") else len(c)
         ordered_keys = c._temporal_order(c.keys)
         ordered_values = c._temporal_order(c.values)
         if ordered_keys.shape[2] > effective_len:
@@ -543,7 +543,30 @@ def _extract_kv_cache(
         if isinstance(cache, ArraysCache):
             extracted.append(_extract_arrays_cache(cache, idx))
         else:
-            extracted.append(cache.extract(idx))
+            c = cache.extract(idx)
+            # After extract, RotatingKVCache may have offset > max_size but
+            # keys.shape[2] < max_size (buffer was sliced).  Pad the buffer
+            # back to max_size so _update_in_place won't try to grow it
+            # (which would compute a negative new_size).  The padded region
+            # is dead space that will be overwritten on the next rotation.
+            if (
+                isinstance(c, RotatingKVCache)
+                and c.keys is not None
+                and c.offset > c.max_size
+                and c.keys.shape[2] < c.max_size
+            ):
+                pad = c.max_size - c.keys.shape[2]
+                z_k = mx.zeros(
+                    (1, c.keys.shape[1], pad, c.keys.shape[3]),
+                    dtype=c.keys.dtype,
+                )
+                z_v = mx.zeros(
+                    (1, c.values.shape[1], pad, c.values.shape[3]),
+                    dtype=c.values.dtype,
+                )
+                c.keys = mx.concatenate([c.keys, z_k], axis=2)
+                c.values = mx.concatenate([c.values, z_v], axis=2)
+            extracted.append(c)
     return extracted
 
 
