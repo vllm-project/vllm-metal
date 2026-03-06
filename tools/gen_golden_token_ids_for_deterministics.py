@@ -7,11 +7,11 @@ token-ID dicts to paste into test_paged_deterministic.py.
 
 Usage:
     # MLX inline cache (default):
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
 
     # Paged KV cache:
     VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.3 \
-        VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
+        VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
 
 Note: MLX path requires VLLM_METAL_MEMORY_FRACTION=auto (the default).
       Numeric fractions are only valid for the paged attention path.

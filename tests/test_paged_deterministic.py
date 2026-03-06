@@ -29,6 +29,8 @@ only valid for the paged attention path).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from vllm import LLM, SamplingParams
 
@@ -45,7 +47,7 @@ PROMPTS = [
 
 # fmt: off
 # Golden token IDs from MLX inline cache (default path), greedy decoding.
-# Generated on main branch via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
+# Generated on main branch via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
 GOLDEN_MLX = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
@@ -56,7 +58,7 @@ GOLDEN_MLX = {
 
 # Golden token IDs from paged KV cache (HF kernel on main branch), greedy decoding.
 # Generated on main branch via: VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.3 \
-#                                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
+#                                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
 GOLDEN_PAGED = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
@@ -69,15 +71,31 @@ GOLDEN_PAGED = {
 
 @pytest.fixture(autouse=True, scope="module")
 def _set_env():
-    """Set env vars for the paged KV cache path.
+    """Set default env vars for this test.
 
     Uses MonkeyPatch.context() so env changes are automatically reverted
     after the module, avoiding side effects on other tests.
+
+    Defaults to the paged KV cache path to ensure the test actually exercises
+    the paged attention kernel, but respects any env vars already set by the
+    user (e.g. to run the MLX path).
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+        # Default to paged attention, but allow the caller to override.
+        use_paged = os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION")
+        if use_paged is None:
+            mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+            use_paged = "1"
+
+        # Set a sensible default memory setting for the selected path, unless
+        # the caller has already specified one.
+        if os.environ.get("VLLM_METAL_MEMORY_FRACTION") is None:
+            if use_paged == "1":
+                mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
+            else:
+                mp.setenv("VLLM_METAL_MEMORY_FRACTION", "auto")
         yield
 
 
