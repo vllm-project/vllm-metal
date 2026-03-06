@@ -225,8 +225,11 @@ def _metal_kernel_decode_attention(
         max_seq_len,
     )
 
-    # out: (B, heads, hd) → (B, 1, heads*hd)
-    mx.eval(out)
+    # Synchronize GPU: paged_attention_v1 wrote to out's buffer via a raw
+    # Metal dispatch that MLX's lazy graph doesn't track.  mx.eval(out) would
+    # be a no-op here (out was already evaluated as zeros), so we must use
+    # mx.synchronize() to flush the command encoder and wait for the kernel.
+    mx.synchronize()
     out = out.reshape(B, 1, n_heads * head_dim)
     return attn_module.o_proj(out)
 
