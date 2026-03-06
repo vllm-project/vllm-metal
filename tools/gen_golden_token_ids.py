@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Generate golden token IDs for the e2e smoke test via vLLM offline inference.
+"""Generate golden token IDs for the deterministic smoke test.
+
+Runs vLLM offline inference (greedy, max_num_seqs=1) and prints golden
+token-ID dicts to paste into test_paged_deterministic.py.
 
 Usage:
     # MLX inline cache (default):
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden.py
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
 
     # Paged KV cache:
-    VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-        python tools/gen_golden.py
+    VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.3 \
+        VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
+
+Note: MLX path requires VLLM_METAL_MEMORY_FRACTION=auto (the default).
+      Numeric fractions are only valid for the paged attention path.
 """
 
 import os
@@ -33,7 +39,7 @@ if __name__ == "__main__":
     label = "PAGED" if paged else "MLX"
     print(f"\n--- Generating golden values for {label} path ---\n")
 
-    llm = LLM(model=MODEL, max_model_len=512)
+    llm = LLM(model=MODEL, max_model_len=512, max_num_seqs=1)
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
     outputs = llm.generate(PROMPTS, sp)
 

@@ -2,7 +2,8 @@
 """Deterministic smoke test: vLLM offline inference with golden token comparison.
 
 Golden token IDs were generated on the main branch using vLLM offline inference
-with temperature=0 (greedy decoding) on Qwen/Qwen3-0.6B.
+with temperature=0 (greedy decoding) on Qwen/Qwen3-0.6B, running one sequence
+at a time (max_num_seqs=1) to avoid batch-invariance issues on Metal.
 
 Findings from golden generation (main branch, HF paged-attention kernel):
 - The HF kernel paged KV path produces correct, coherent output.
@@ -18,18 +19,15 @@ which path matched.
 Run (paged KV path, the default):
     python -m pytest tests/test_paged_deterministic.py -v -s
 
-To test the MLX inline cache path instead, change the env vars below.
+To test the MLX inline cache path instead, pass env vars explicitly:
+    VLLM_METAL_USE_PAGED_ATTENTION=0 VLLM_METAL_MEMORY_FRACTION=auto \
+        python -m pytest tests/test_paged_deterministic.py -v -s
+
+Note: MLX requires VLLM_METAL_MEMORY_FRACTION=auto (numeric fractions are
+only valid for the paged attention path).
 """
 
 from __future__ import annotations
-
-import os
-
-# Default: test the paged KV cache path through vLLM offline inference.
-# Change to "0" to test the MLX inline cache path.
-os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.2")
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import pytest
 from vllm import LLM, SamplingParams
@@ -47,7 +45,7 @@ PROMPTS = [
 
 # fmt: off
 # Golden token IDs from MLX inline cache (default path), greedy decoding.
-# Generated on main branch via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden.py
+# Generated on main branch via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
 GOLDEN_MLX = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
@@ -58,7 +56,7 @@ GOLDEN_MLX = {
 
 # Golden token IDs from paged KV cache (HF kernel on main branch), greedy decoding.
 # Generated on main branch via: VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.3 \
-#                                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden.py
+#                                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids.py
 GOLDEN_PAGED = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
@@ -69,10 +67,35 @@ GOLDEN_PAGED = {
 # fmt: on
 
 
+@pytest.fixture(scope="session")
+def _monkeypatch_session():
+    """Session-scoped monkeypatch (pytest only provides function-scoped)."""
+    from _pytest.monkeypatch import MonkeyPatch
+
+    mp = MonkeyPatch()
+    yield mp
+    mp.undo()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _set_env(_monkeypatch_session):
+    """Set env vars for the paged KV cache path.
+
+    Uses monkeypatch so env changes are automatically reverted after the
+    session, avoiding side effects on other tests.
+    """
+    _monkeypatch_session.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+    _monkeypatch_session.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
+    _monkeypatch_session.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+
 @pytest.fixture(scope="module")
 def vllm_outputs():
-    """Run vLLM offline inference once for all prompts."""
-    llm = LLM(model=MODEL_NAME, max_model_len=512)
+    """Run vLLM offline inference once for all prompts.
+
+    Uses max_num_seqs=1 to avoid batch-invariance non-determinism on Metal.
+    """
+    llm = LLM(model=MODEL_NAME, max_model_len=512, max_num_seqs=1)
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
     outputs = llm.generate(PROMPTS, sp)
     return {o.prompt: o for o in outputs}
