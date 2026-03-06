@@ -103,14 +103,15 @@ Environment variables for customization:
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
 
 
-## Paged_KV vs MLX_KV Memory Env Var
+## Paged KV vs MLX KV memory settings
 
-* **mlx_lm** use auto to only use just enough memory
-* **paged kv cache** use VLLM_METAL_MEMORY_FRACTION, allocate as much memory as possible.
-* 
-MEMORY_FRACTION | USE_PAGED_ATTENTION | Valid? | Why
+- MLX path (`VLLM_METAL_USE_PAGED_ATTENTION=0`): `VLLM_METAL_MEMORY_FRACTION` must be `auto`.
+- Paged KV path (`VLLM_METAL_USE_PAGED_ATTENTION=1`): `VLLM_METAL_MEMORY_FRACTION` can be `auto` or a numeric fraction in `(0, 1]`.
+- For paged KV with `VLLM_METAL_MEMORY_FRACTION=auto`, vllm-metal uses a default fraction of `0.9`.
+
+`VLLM_METAL_MEMORY_FRACTION` | `VLLM_METAL_USE_PAGED_ATTENTION` | Valid? | Notes
 -- | -- | -- | --
-auto | 0 | Yes | MLX path — the default
-auto | 1 | Yes | Paged path, defaults to 0.9 fraction
-0.7 | 1 | Yes | Paged path, explicit fraction
-0.7 | 0 | No | Explicit fraction with no paged cache — meaningless
+`auto` | `0` | Yes | MLX path (default)
+`auto` | `1` | Yes | Paged KV path; defaults to 0.9 internally
+`0.7` | `1` | Yes | Paged KV path with explicit memory budget
+`0.7` | `0` | No | Explicit fraction without paged KV is invalid
