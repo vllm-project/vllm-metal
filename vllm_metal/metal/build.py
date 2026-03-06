@@ -8,7 +8,6 @@ Metal shaders through MLX's own command encoder.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sysconfig
 from pathlib import Path

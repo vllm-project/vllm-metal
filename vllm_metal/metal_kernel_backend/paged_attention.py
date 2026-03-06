@@ -67,7 +67,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
+from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
     find_layers_and_attr,
@@ -84,7 +84,7 @@ def _metal_kernel_prefill_attention(
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
-    cache: MPSPagedKVCache,
+    cache: MetalPagedKVCache,
     layer_idx: int,
     ctx: PagedAttentionContext,
     offset_cache: Any,
@@ -148,7 +148,7 @@ def _metal_kernel_decode_attention(
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
-    cache: MPSPagedKVCache,
+    cache: MetalPagedKVCache,
     layer_idx: int,
     ctx: PagedAttentionContext,
 ) -> mx.array:
@@ -251,7 +251,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         self,
         inner: nn.Module,
         layer_idx: int,
-        kv_cache: MPSPagedKVCache,
+        kv_cache: MetalPagedKVCache,
         block_size: int,
     ) -> None:
         super().__init__()
@@ -309,7 +309,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
 
 def patch_model_attention_metal_kernel(
     model: Any,
-    kv_cache: MPSPagedKVCache,
+    kv_cache: MetalPagedKVCache,
     block_size: int,
 ) -> int:
     """Walk model layers and replace each attention module with a

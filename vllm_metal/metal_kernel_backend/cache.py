@@ -23,7 +23,7 @@ _DTYPE_SIZE = {
 }
 
 
-class MPSPagedKVCache:
+class MetalPagedKVCache:
     """Per-layer MLX arrays for native Metal paged attention."""
 
     def __init__(

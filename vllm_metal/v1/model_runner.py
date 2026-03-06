@@ -618,10 +618,10 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
+        self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
-        self.kv_cache_dtype: torch.dtype | None = None
+        self.kv_cache_dtype: mx.Dtype | None = None
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -802,6 +802,11 @@ class MetalModelRunner:
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
+        # FullAttentionSpec (upstream vLLM) expects torch.dtype
+        from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+
+        torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
+
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
@@ -810,7 +815,7 @@ class MetalModelRunner:
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=self.kv_cache_dtype,
+                dtype=torch_dtype,
             )
 
         return specs
@@ -838,7 +843,7 @@ class MetalModelRunner:
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = self.kv_cache_dtype.itemsize
+        dtype_size = self.kv_cache_dtype.size
         return (
             2
             * self.num_layers
