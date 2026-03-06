@@ -11,8 +11,10 @@ Optimized for performance with:
 """
 
 import hashlib
+import importlib
 import math
 import os
+import sys
 import time
 from array import array
 from dataclasses import dataclass, field
@@ -62,6 +64,47 @@ logger = init_logger(__name__)
 # Global model cache for fast repeated loads
 _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
 _model_cache_lock = Lock()
+
+
+def _ensure_mlx_lm_model_aliases() -> None:
+    """Register temporary model-type aliases for mlx_lm compatibility.
+
+    Some newer model snapshots report a ``model_type`` that is not yet
+    available as a module in the currently bundled ``mlx_lm`` release.
+    In that case we register a best-effort import alias so ``mlx_lm`` can
+    still resolve the architecture.
+    """
+    alias_map = {
+        # Qwen3.5 MoE currently reuses the same implementation shape as qwen3_moe.
+        "qwen3_5_moe": "qwen3_moe",
+    }
+
+    for alias, target in alias_map.items():
+        alias_module = f"mlx_lm.models.{alias}"
+        target_module = f"mlx_lm.models.{target}"
+
+        if alias_module in sys.modules:
+            continue
+
+        # If mlx_lm already ships this architecture, do not override it.
+        try:
+            importlib.import_module(alias_module)
+            continue
+        except ModuleNotFoundError:
+            pass
+
+        try:
+            resolved = importlib.import_module(target_module)
+        except ModuleNotFoundError:
+            logger.debug(
+                "Skipping mlx_lm alias registration for %s (target %s missing)",
+                alias,
+                target,
+            )
+            continue
+
+        sys.modules[alias_module] = resolved
+        logger.info("Registered mlx_lm model alias: %s -> %s", alias, target)
 
 # Try to import Rust extension for high-performance token state management
 try:
@@ -688,6 +731,7 @@ class MetalModelRunner:
             self._is_vlm = True
         else:
             # Load model and tokenizer using mlx_lm for text-only models
+            _ensure_mlx_lm_model_aliases()
             self.model, self.tokenizer = mlx_lm_load(
                 model_name,
                 tokenizer_config={
