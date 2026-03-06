@@ -101,3 +101,16 @@ Environment variables for customization:
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_PREFIX_CACHE` | (unset) | Set to enable prefix caching for shared prompt reuse |
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
+
+
+## Paged_KV vs MLX_KV Memory Env Var
+
+* **mlx_lm** use auto to only use just enough memory
+* **paged kv cache** use VLLM_METAL_MEMORY_FRACTION, allocate as much memory as possible.
+* 
+MEMORY_FRACTION | USE_PAGED_ATTENTION | Valid? | Why
+-- | -- | -- | --
+auto | 0 | Yes | MLX path — the default
+auto | 1 | Yes | Paged path, defaults to 0.9 fraction
+0.7 | 1 | Yes | Paged path, explicit fraction
+0.7 | 0 | No | Explicit fraction with no paged cache — meaningless
