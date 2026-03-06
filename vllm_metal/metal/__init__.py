@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_DIR = _THIS_DIR / "kernels"
 
+# Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
+# and held in MLX's library cache for the lifetime of the process.  Editing
+# .metal source files requires restarting the Python interpreter to pick up
+# changes (the .cpp extension itself is rebuilt automatically by build.py when
+# paged_ops.cpp is newer than the .so).
 _ops_module: ModuleType | None = None
 
 

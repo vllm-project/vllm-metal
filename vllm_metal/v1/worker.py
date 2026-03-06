@@ -139,7 +139,7 @@ class MetalWorker(WorkerBase):
             self._setup_paged_attention()
 
     def _setup_paged_attention(self) -> None:
-        """Create MetalPagedKVCache and patch model attention for HF Metal kernel.
+        """Create MetalPagedKVCache and patch model attention for native Metal kernel.
 
         Computes num_blocks from available system RAM, model weight size, and
         a configurable memory fraction, rather than blindly scaling from

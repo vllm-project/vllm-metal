@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal kernel paged attention — verifies output matches non-paged path.
 
-Requires ``kernels`` package with ``kernels-community/paged-attention`` support.
-
 Run with:
     python -m pytest tests/test_metal_kernel_paged.py -v -s
 """
@@ -27,8 +25,8 @@ except ImportError as exc:
     )
 
 try:
+    from vllm_metal.metal import get_ops
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-    from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
     from vllm_metal.metal_kernel_backend.paged_attention import (
         MetalKernelPagedAttentionWrapper,
         patch_model_attention_metal_kernel,
@@ -41,22 +39,19 @@ try:
     )
 except ImportError as exc:
     pytest.skip(
-        "Metal kernel paged attention tests require the vllm-metal paged backend: "
-        f"{exc}. Install with: pip install 'vllm-metal[paged]'",
+        f"Metal kernel paged attention tests require vllm-metal paged backend: {exc}",
         allow_module_level=True,
     )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _paged_attention_ops_available() -> None:
-    """Skip this module if the paged-attention ops cannot be loaded."""
+    """Skip this module if the native paged-attention ops cannot be loaded."""
 
     try:
-        get_paged_attention_ops()
-    except ImportError as exc:
-        pytest.skip(str(exc))
+        get_ops()
     except Exception as exc:
-        pytest.skip(f"kernels-community/paged-attention not available: {exc}")
+        pytest.skip(f"Native paged-attention Metal ops not available: {exc}")
 
 
 # ---------------------------------------------------------------------------

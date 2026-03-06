@@ -41,10 +41,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-paged = [
-    # Paged attention now uses vendored Metal shaders + native MLX dispatch.
-    # No external dependencies required — kernels are JIT-compiled at startup.
-]
 vllm = ["vllm>=0.14.0"]
 stt = [
     # Speech-to-text audio processing (Whisper models)
