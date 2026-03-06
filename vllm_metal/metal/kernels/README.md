@@ -1,6 +1,6 @@
 # Metal Kernel Sources
 
-Vendored from `kernels-community/paged-attention` (HuggingFace).
+Vendored from [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (MIT license), via [HuggingFace kernels-community](https://github.com/huggingface/kernels-community).
 
 ## Active (used by `paged_ops.cpp` via MLX dispatch)
 
