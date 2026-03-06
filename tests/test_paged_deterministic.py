@@ -36,6 +36,9 @@ from vllm import LLM, SamplingParams
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
+DEFAULT_USE_PAGED_ATTENTION = "1"
+DEFAULT_PAGED_MEMORY_FRACTION = "0.2"
+DEFAULT_MLX_MEMORY_FRACTION = "auto"
 
 PROMPTS = [
     "The capital of France is",
@@ -69,6 +72,15 @@ GOLDEN_PAGED = {
 # fmt: on
 
 
+def _setenv_default(mp: pytest.MonkeyPatch, key: str, default: str) -> str:
+    """Set an env var only when absent and return the effective value."""
+    value = os.environ.get(key)
+    if value is None:
+        mp.setenv(key, default)
+        return default
+    return value
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _set_env():
     """Set default env vars for this test.
@@ -83,19 +95,20 @@ def _set_env():
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-        # Default to paged attention, but allow the caller to override.
-        use_paged = os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION")
-        if use_paged is None:
-            mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-            use_paged = "1"
+        # Default to paged attention, but allow explicit caller override.
+        use_paged = _setenv_default(
+            mp,
+            "VLLM_METAL_USE_PAGED_ATTENTION",
+            DEFAULT_USE_PAGED_ATTENTION,
+        )
 
-        # Set a sensible default memory setting for the selected path, unless
-        # the caller has already specified one.
-        if os.environ.get("VLLM_METAL_MEMORY_FRACTION") is None:
-            if use_paged == "1":
-                mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
-            else:
-                mp.setenv("VLLM_METAL_MEMORY_FRACTION", "auto")
+        # Choose a path-specific memory default, while preserving caller override.
+        memory_default = (
+            DEFAULT_PAGED_MEMORY_FRACTION
+            if use_paged == "1"
+            else DEFAULT_MLX_MEMORY_FRACTION
+        )
+        _setenv_default(mp, "VLLM_METAL_MEMORY_FRACTION", memory_default)
         yield
 
 
