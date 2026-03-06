@@ -123,16 +123,28 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.14.1"
-  local url_base="https://github.com/vllm-project/vllm/releases/download"
-  local filename="vllm-$vllm_v.tar.gz"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
-  cd vllm-$vllm_v
-  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  uv pip install .
-  cd -
-  rm -rf vllm-$vllm_v*
+  echo ""
+  echo "Installing vllm from source..."
+  uv pip install "git+https://github.com/vllm-project/vllm.git"
+  success "Installed vllm"
+
+  # Patch vllm's bundled Qwen3.5 configs for transformers 5.x compatibility.
+  # vllm sets ignore_keys_at_rope_validation as a list [], but transformers 5.x
+  # uses set union (|) on it, which requires a set {}.
+  echo "Patching vllm configs for transformers 5.x compatibility..."
+  "$venv/bin/python3" -c "
+import pathlib, re, site
+configs = pathlib.Path(site.getsitepackages()[0]) / 'vllm/transformers_utils/configs'
+for name in ('qwen3_5_moe.py', 'qwen3_5.py'):
+    p = configs / name
+    if p.exists():
+        txt = p.read_text()
+        txt = re.sub(
+            r'(\[\"ignore_keys_at_rope_validation\"\]\s*=\s*)\[(.*?)\]',
+            r'\1{\2}', txt, flags=re.DOTALL)
+        p.write_text(txt)
+"
+  success "Patched vllm configs"
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
