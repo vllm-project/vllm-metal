@@ -272,6 +272,9 @@ class PrefixCacheManager:
                 if isinstance(layer_cache, KVCache):
                     k, v = cached.cache_state[i]
                     layer_cache.state = [mx.array(k), mx.array(v)]
+                    # Keep RoPE position correct even if KVCache.state setter
+                    # behavior changes in future mlx-lm versions.
+                    layer_cache.offset = int(k.shape[2])
         return cache
 
     @property
