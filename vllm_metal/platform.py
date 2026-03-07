@@ -231,6 +231,21 @@ class MetalPlatform(Platform):
         if model_config is not None:
             model_config.disable_cascade_attn = True
 
+        # STT model detection — set tokenizer fallback if not already configured
+        from vllm_metal.stt.config import is_stt_model
+
+        if model_config is not None and is_stt_model(model_config.model):
+            if not getattr(model_config, "tokenizer", None):
+                model_config.tokenizer = model_config.model
+            # STT processes entire audio in one execute_model call;
+            # async scheduling's batch queue expects incremental decode
+            # and would schedule cached requests that STT cannot handle.
+            scheduler_config = vllm_config.scheduler_config
+            if getattr(scheduler_config, "async_scheduling", False):
+                scheduler_config.async_scheduling = False
+                logger.info("STT: disabled async_scheduling")
+            logger.info("STT model detected")
+
         # Log memory configuration
         total_mem = cls.get_device_total_memory()
         available_mem = cls.get_device_available_memory()
