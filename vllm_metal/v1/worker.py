@@ -139,7 +139,7 @@ class MetalWorker(WorkerBase):
             self._setup_paged_attention()
 
     def _setup_paged_attention(self) -> None:
-        """Create MPSPagedKVCache and patch model attention for HF Metal kernel.
+        """Create MetalPagedKVCache and patch model attention for native Metal kernel.
 
         Computes num_blocks from available system RAM, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
@@ -147,7 +147,7 @@ class MetalWorker(WorkerBase):
         """
         import psutil
 
-        from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
+        from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
         from vllm_metal.metal_kernel_backend.paged_attention import (
             patch_model_attention_metal_kernel,
         )
@@ -243,7 +243,8 @@ class MetalWorker(WorkerBase):
         # --- Create cache and patch model ---
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
-        mps_kv_cache = MPSPagedKVCache(
+
+        metal_kv_cache = MetalPagedKVCache(
             num_layers=runner.num_layers,
             num_kv_heads=runner.num_kv_heads,
             head_dim=runner.head_dim,
@@ -253,7 +254,7 @@ class MetalWorker(WorkerBase):
         )
 
         n_patched = patch_model_attention_metal_kernel(
-            runner.model, mps_kv_cache, block_size
+            runner.model, metal_kv_cache, block_size
         )
         logger.info(
             "Metal kernel paged attention enabled: %d layers patched, "
@@ -266,7 +267,7 @@ class MetalWorker(WorkerBase):
         )
 
         # Store on model runner for use by paged prefill/decode
-        runner._paged_kv_cache = mps_kv_cache
+        runner._paged_kv_cache = metal_kv_cache
         runner._paged_block_size = block_size
 
     def _get_model_memory_usage(self) -> int:
@@ -299,7 +300,7 @@ class MetalWorker(WorkerBase):
         """Bytes for one max-length sequence of KV cache (K + V)."""
         runner = self.model_runner
         dtype_size = (
-            runner.kv_cache_dtype.itemsize if runner.kv_cache_dtype is not None else 2
+            runner.kv_cache_dtype.size if runner.kv_cache_dtype is not None else 2
         )
         return (
             2  # K and V

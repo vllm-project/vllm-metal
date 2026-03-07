@@ -641,10 +641,10 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
+        self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
-        self.kv_cache_dtype: torch.dtype | None = None
+        self.kv_cache_dtype: mx.Dtype | None = None
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -825,6 +825,11 @@ class MetalModelRunner:
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
+        # FullAttentionSpec (upstream vLLM) expects torch.dtype
+        from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+
+        torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
+
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
@@ -833,7 +838,7 @@ class MetalModelRunner:
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=self.kv_cache_dtype,
+                dtype=torch_dtype,
             )
 
         return specs
@@ -861,7 +866,7 @@ class MetalModelRunner:
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = self.kv_cache_dtype.itemsize
+        dtype_size = self.kv_cache_dtype.size
         return (
             2
             * self.num_layers
@@ -900,42 +905,39 @@ class MetalModelRunner:
             self._warm_up_paged_attention_kernel()
 
     def _warm_up_paged_attention_kernel(self) -> None:
-        """Load the HF paged-attention kernel and verify Metal ops work.
+        """JIT-compile vendored Metal shaders and verify ops work.
 
-        Forces ``newLibraryWithData`` inside the .so by running a single-token
-        ``reshape_and_cache`` against layer 0 of the already-allocated cache.
-        If the embedded metallib targets a Metal language version unsupported
-        by this OS, the error surfaces here instead of mid-inference.
+        Calls ``get_ops()`` which triggers JIT build of the C++ nanobind
+        extension + Metal shader compilation via MLX's device.get_library().
+        Then runs a single-token ``reshape_and_cache`` smoke test against
+        layer 0 of the already-allocated cache.
         """
         import platform
 
-        from vllm_metal.metal_kernel_backend.kernel_loader import (
-            get_paged_attention_ops,
-        )
+        from vllm_metal.metal import get_ops
 
         cache = self._paged_kv_cache
 
         logger.info("Warming up paged attention Metal kernel...")
 
         try:
-            ops = get_paged_attention_ops()
+            ops = get_ops()
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load paged-attention Metal kernel: {e}. "
+                f"Failed to build/load native paged-attention Metal kernel: {e}. "
                 f"macOS version: {platform.mac_ver()[0]}"
             ) from e
 
         # Smoke-test: single-token reshape_and_cache on layer 0
         try:
-            dummy_k = torch.zeros(
-                1,
-                cache.num_kv_heads,
-                cache.head_dim,
-                dtype=cache.dtype,
-                device="mps",
+            dummy_k = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
             )
-            dummy_v = torch.zeros_like(dummy_k)
-            dummy_slot = torch.zeros(1, dtype=torch.long, device="mps")
+            dummy_v = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
+            )
+            dummy_slot = mx.zeros((1,), dtype=mx.int64)
+            mx.eval(dummy_k, dummy_v, dummy_slot)
 
             ops.reshape_and_cache(
                 dummy_k,
@@ -943,10 +945,8 @@ class MetalModelRunner:
                 cache.key_caches[0],
                 cache.value_caches[0],
                 dummy_slot,
-                "auto",
-                cache.k_scale_tensor,
-                cache.v_scale_tensor,
             )
+            mx.eval(cache.key_caches[0])
             logger.info("Paged attention Metal kernel warm-up complete")
         except RuntimeError as e:
             mac_ver = platform.mac_ver()[0]
