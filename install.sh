@@ -123,16 +123,8 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.14.1"
-  local url_base="https://github.com/vllm-project/vllm/releases/download"
-  local filename="vllm-$vllm_v.tar.gz"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
-  cd vllm-$vllm_v
-  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  uv pip install .
-  cd -
-  rm -rf vllm-$vllm_v*
+  local vllm_v="0.16.0"
+  uv pip install "vllm==$vllm_v"
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
