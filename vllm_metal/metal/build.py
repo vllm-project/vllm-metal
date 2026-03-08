@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-_OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
+_CACHE_DIR = Path.home() / ".cache" / "vllm-metal"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_OUT = _CACHE_DIR / f"_paged_ops{_EXT_SUFFIX}"
 
 
 def _find_package_path(name: str) -> Path:
@@ -49,7 +51,7 @@ def build() -> Path:
 
     logger.info("Building native paged-attention extension ...")
 
-    py_include = sysconfig.get_config_var("INCLUDEPY")
+    py_include = sysconfig.get_paths()["include"]
     nb_path = _find_package_path("nanobind")
     mlx_path = _find_package_path("mlx")
     mlx_include = mlx_path / "include"
