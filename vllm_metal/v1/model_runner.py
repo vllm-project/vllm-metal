@@ -647,12 +647,12 @@ class STTExecutor:
         if input_features is None:
             return None
 
-        # Convert to MLX array — handle numpy, torch tensors, and lists
+        # Convert to MLX array — handle numpy, torch, and lists
         if isinstance(input_features, np.ndarray):
             mel = mx.array(input_features, dtype=mx.float16)
-        elif hasattr(input_features, "numpy"):
-            # torch tensor — .cpu() for device safety, .float() because
-            # bfloat16 has no numpy dtype support.
+        elif isinstance(input_features, torch.Tensor):
+            # .cpu() for device safety, .float() because bfloat16 has
+            # no numpy dtype support.
             mel = mx.array(input_features.cpu().float().numpy(), dtype=mx.float16)
         else:
             mel = mx.array(np.array(input_features), dtype=mx.float16)
@@ -666,6 +666,10 @@ class STTExecutor:
             mel = mel.transpose(
                 0, 2, 1
             )  # (batch, n_mels, time) → (batch, time, n_mels)
+        else:
+            raise ValueError(
+                f"Unexpected mel spectrogram rank {mel.ndim}; expected 2D or 3D"
+            )
 
         features = self.model.encode(mel)
         mx.eval(features)
@@ -2125,17 +2129,11 @@ class MetalModelRunner:
     def _execute_stt(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
-        """Execute STT inference for all new requests in the batch."""
-        try:
-            return self._execute_stt_inner(scheduler_output)
-        except Exception:
-            logger.exception("_execute_stt failed")
-            raise
+        """Execute STT inference for all new requests in the batch.
 
-    def _execute_stt_inner(
-        self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | None:
-        """Inner STT execution — separated for clean error logging."""
+        Raises:
+            ValueError: If a request uses non-greedy sampling params.
+        """
         assert self._stt_executor is not None
 
         req_ids: list[str] = []

@@ -39,24 +39,35 @@ def _make_executor() -> STTExecutor:
     return executor
 
 
-def _make_runner():
-    """Create a minimal mock MetalModelRunner with STT enabled."""
-    runner = MagicMock()
-    runner._is_stt = True
-    runner.model = MagicMock()
-    runner._request_states = {}
-    runner._pending_output = None
+class _StubRunner:
+    """Lightweight concrete test double for MetalModelRunner (STT path only).
 
-    # Create a real STTExecutor with pre-cached transcriber
-    runner._stt_executor = _make_executor()
-    runner._stt_executor.model = runner.model
+    Inherits ``_execute_stt`` from the real class so class invariants
+    (assert, attribute access) are exercised without MagicMock rebinding.
+    Only the fields consumed by ``_execute_stt`` are initialised.
+    """
 
-    # Import the real methods and bind them
     from vllm_metal.v1.model_runner import MetalModelRunner
 
-    runner._execute_stt = MetalModelRunner._execute_stt.__get__(runner)
-    runner._execute_stt_inner = MetalModelRunner._execute_stt_inner.__get__(runner)
-    return runner
+    # Inherit the real method — no __get__ rebinding needed.
+    _execute_stt = MetalModelRunner._execute_stt
+
+    def __init__(self) -> None:
+        self._is_stt = True
+        self.model = MagicMock()
+        self._request_states: dict = {}
+        self._pending_output = None
+        self._stt_executor = _make_executor()
+        self._stt_executor.model = self.model
+
+    @property
+    def is_stt(self) -> bool:
+        return self._is_stt
+
+
+def _make_runner() -> _StubRunner:
+    """Create a lightweight runner stub with STT enabled."""
+    return _StubRunner()
 
 
 def _make_scheduler_output(new_reqs=None, finished_req_ids=None, cached_req_ids=None):
@@ -206,6 +217,22 @@ class TestMalformedMMFeatures:
         req = _make_new_req(mm_features=[None])
         result = executor.extract_audio_features(req)
         assert result is None
+
+    def test_1d_mel_raises_valueerror(self) -> None:
+        """1D mel input should raise ValueError (expected 2D or 3D)."""
+        executor = _make_executor()
+        mel = np.zeros((3000,), dtype=np.float32)
+        req = _make_new_req(mm_features=[{"input_features": mel}])
+        with pytest.raises(ValueError, match="rank"):
+            executor.extract_audio_features(req)
+
+    def test_4d_mel_raises_valueerror(self) -> None:
+        """4D mel input should raise ValueError (expected 2D or 3D)."""
+        executor = _make_executor()
+        mel = np.zeros((1, 1, 80, 3000), dtype=np.float32)
+        req = _make_new_req(mm_features=[{"input_features": mel}])
+        with pytest.raises(ValueError, match="rank"):
+            executor.extract_audio_features(req)
 
 
 # ===========================================================================

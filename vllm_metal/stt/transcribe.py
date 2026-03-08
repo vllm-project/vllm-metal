@@ -213,7 +213,15 @@ class WhisperTranscriber:
         # Cap by context window to prevent overflow
         n_text_ctx = getattr(self.model.config, "n_text_ctx", None)
         if n_text_ctx is not None:
-            max_tokens = min(max_tokens, n_text_ctx - len(prompt_token_ids))
+            remaining = n_text_ctx - len(prompt_token_ids)
+            if remaining <= 0:
+                logger.warning(
+                    "Prompt (%d tokens) already fills context window (%d)",
+                    len(prompt_token_ids),
+                    n_text_ctx,
+                )
+                return []
+            max_tokens = min(max_tokens, remaining)
 
         eot_token = self._get_token_id("<|endoftext|>")
         tokens = mx.array([prompt_token_ids], dtype=mx.int32)
