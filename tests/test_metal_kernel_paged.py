@@ -46,12 +46,8 @@ except ImportError as exc:
 
 @pytest.fixture(scope="module", autouse=True)
 def _paged_attention_ops_available() -> None:
-    """Skip this module if the native paged-attention ops cannot be loaded."""
-
-    try:
-        get_ops()
-    except Exception as exc:
-        pytest.skip(f"Native paged-attention Metal ops not available: {exc}")
+    """Fail early if the native paged-attention ops cannot be loaded."""
+    get_ops()
 
 
 # ---------------------------------------------------------------------------
