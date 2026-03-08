@@ -81,8 +81,8 @@ void reshape_and_cache_impl(
   int num_tokens  = static_cast<int>(key.shape(0));
   int num_heads   = static_cast<int>(key.shape(1));
   int head_size   = static_cast<int>(key.shape(2));
-  int block_size  = static_cast<int>(key_cache.shape(3));
-  int x_val       = static_cast<int>(key_cache.shape(4));
+  // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
+  int block_size  = static_cast<int>(key_cache.shape(1));
 
   // Contiguous strides (arrays must be row-major after mx.eval)
   int32_t key_stride   = static_cast<int32_t>(num_heads * head_size);
@@ -90,7 +90,6 @@ void reshape_and_cache_impl(
   int32_t num_heads_i  = static_cast<int32_t>(num_heads);
   int32_t head_size_i  = static_cast<int32_t>(head_size);
   int32_t block_size_i = static_cast<int32_t>(block_size);
-  int32_t x_i          = static_cast<int32_t>(x_val);
 
   // Kernel name: same kv and cache dtype (no FP8)
   auto dt = dtype_to_metal(key.dtype());
@@ -120,7 +119,6 @@ void reshape_and_cache_impl(
   enc.set_bytes(num_heads_i,  9);
   enc.set_bytes(head_size_i,  10);
   enc.set_bytes(block_size_i, 11);
-  enc.set_bytes(x_i,          12);
 
   int tpg = std::min(512, num_heads * head_size);
   enc.dispatch_threadgroups(
@@ -226,9 +224,10 @@ void paged_attention_v1_impl(
   // 14: alibi_slopes — skipped
 
   // Strides (contiguous row-major)
+  // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
   int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
   int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[1]);
+  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
   enc.set_bytes(q_stride,        15);
   enc.set_bytes(kv_block_stride, 16);
   enc.set_bytes(kv_head_stride,  17);

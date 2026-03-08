@@ -774,9 +774,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     [[buffer(2)]], // [num_seqs, num_heads, max_num_partitions, head_size]
     device const T *q [[buffer(3)]], // [num_seqs, num_heads, head_size]
     device const CACHE_T *k_cache
-    [[buffer(4)]], // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    [[buffer(4)]], // [num_blocks, block_size, num_kv_heads, head_size]
     device const CACHE_T *v_cache
-    [[buffer(5)]], // [num_blocks, num_kv_heads, head_size, block_size]
+    [[buffer(5)]], // [num_blocks, block_size, num_kv_heads, head_size]
     const device float *__restrict__ k_scale
     [[buffer(6), function_constant(use_fp8_scales)]], // [1]
     const device float *__restrict__ v_scale
@@ -883,9 +883,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // Workspace for reduction
   threadgroup float red_smem[2 * NUM_WARPS];
 
-  // x == THREAD_GROUP_SIZE * VEC_SIZE
-  // Each thread group fetches x elements from the key at a time.
-  constexpr int x = 16 / sizeof(CACHE_T);
+  // Token stride within a block: num_kv_heads * HEAD_SIZE
+  const int kv_token_stride = num_kv_heads * HEAD_SIZE;
   float qk_max = -FLT_MAX;
 
   // Iterate over the key blocks.
@@ -915,22 +914,23 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+        // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
+        // head_size is contiguous — direct vector load
         const device CACHE_T *k_ptr =
             k_cache + physical_block_number * kv_block_stride +
-            kv_head_idx * kv_head_stride + physical_block_offset * x;
+            physical_block_offset * kv_token_stride +
+            kv_head_idx * kv_head_stride;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-        const int offset1 = (vec_idx * VEC_SIZE) / x;
-        const int offset2 = (vec_idx * VEC_SIZE) % x;
 
         if constexpr (is_uchar<CACHE_T>()) {
           // FP8 support
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+              k_ptr + vec_idx * VEC_SIZE);
           k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
         } else {
           // Non-FP8 default
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+              k_ptr + vec_idx * VEC_SIZE);
         }
       }
 
@@ -1020,86 +1020,55 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     *exp_sums_ptr = exp_sum;
   }
 
-  // Each thread will fetch 16 bytes from the value cache at a time.
-  constexpr int V_VEC_SIZE = MIN(16 / sizeof(T), BLOCK_SIZE);
-  using V_vec = typename Vec<T, V_VEC_SIZE>::Type;
-  using L_vec = typename Vec<T, V_VEC_SIZE>::Type;
-  using Float_L_vec = typename FloatVec<L_vec>::Type;
-  using V_quant_vec = typename Vec<CACHE_T, V_VEC_SIZE>::Type;
-
-  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
-  constexpr int NUM_ROWS_PER_ITER = NUM_SIMD_LANES / NUM_V_VECS_PER_ROW;
-  constexpr int NUM_ROWS_PER_THREAD =
-      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER);
+  // ========== V accumulation ==========
+  // Token-outer, head_dim-inner loop (matches the new cache layout where
+  // head_size is contiguous per token).
+  //
+  // Each SIMD lane owns a fixed set of head_dim elements:
+  //   lane l owns elements at indices: l, l+NUM_SIMD_LANES, l+2*NUM_SIMD_LANES, ...
+  // No intra-warp reduction is needed — each lane independently accumulates
+  // its own output elements.
+  constexpr int V_ELEMS_PER_THREAD =
+      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_SIMD_LANES);
 
   // NOTE: We use FP32 for the accumulator for better accuracy.
-  float accs[NUM_ROWS_PER_THREAD];
+  float v_accs[V_ELEMS_PER_THREAD];
 #pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-    accs[i] = 0.f;
+  for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+    v_accs[i] = 0.f;
   }
 
-  T zero_value = 0;
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
-    // NOTE: The block number is stored in int32. However, we cast it to int64
-    // because int32 can lead to overflow when this variable is multiplied by
-    // large numbers (e.g., kv_block_stride).
     const int64_t physical_block_number =
         static_cast<int64_t>(block_table[block_idx]);
-    const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
-    const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-    L_vec logits_vec;
-    Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec *>(
-        logits + token_idx - start_token_idx);
-    from_float(logits_vec, logits_float_vec);
 
-    const device CACHE_T *v_ptr = v_cache +
-                                  physical_block_number * kv_block_stride +
-                                  kv_head_idx * kv_head_stride;
+    for (int tok = 0; tok < BLOCK_SIZE; tok++) {
+      const int token_idx = block_idx * BLOCK_SIZE + tok;
+      if (token_idx >= context_len) break;
+
+      const float logit_val = logits[token_idx - start_token_idx];
+
+      // V cache layout: [num_blocks, block_size, num_kv_heads, head_size]
+      const device CACHE_T *v_ptr =
+          v_cache + physical_block_number * kv_block_stride +
+          tok * kv_token_stride +
+          kv_head_idx * kv_head_stride;
+
 #pragma unroll
-    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-      if (row_idx < HEAD_SIZE) {
-        const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
-        // NOTE: When v_vec contains the tokens that are out of the context,
-        // we should explicitly zero out the values since they may contain NaNs.
-        // See
-        // https://github.com/vllm-project/vllm/issues/641#issuecomment-1682544472
-        V_vec v_vec;
-
-        if constexpr (is_uchar<CACHE_T>()) {
-          // FP8 support
-          V_quant_vec v_quant_vec =
-              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
-          v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
-        } else {
-          // Non-FP8 default
-          v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
-        }
-
-        if (block_idx == num_context_blocks - 1) {
-          thread T *v_vec_ptr = reinterpret_cast<thread T *>(&v_vec);
-#pragma unroll
-          for (int j = 0; j < V_VEC_SIZE; j++) {
-            v_vec_ptr[j] =
-                token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
+      for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+        const int d = lane + i * NUM_SIMD_LANES;
+        if (d < HEAD_SIZE) {
+          float v_val;
+          if constexpr (is_uchar<CACHE_T>()) {
+            v_val = fp8_e4m3_to_float(v_ptr[d]) * (*v_scale);
+          } else {
+            v_val = float(v_ptr[d]);
           }
+          v_accs[i] += logit_val * v_val;
         }
-        accs[i] += dot(logits_vec, v_vec);
       }
     }
-  }
-
-  // Perform reduction within each warp.
-#pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-    float acc = accs[i];
-#pragma unroll
-    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
-      acc += simd_shuffle_xor(acc, mask);
-    }
-    accs[i] = acc;
   }
 
   // NOTE: A barrier is required because the shared memory space for logits
@@ -1116,10 +1085,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     if (warp_idx >= mid && warp_idx < i) {
       threadgroup float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
 #pragma unroll
-      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-          dst[row_idx] = accs[i];
+      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+        const int d = lane + j * NUM_SIMD_LANES;
+        if (d < HEAD_SIZE) {
+          dst[d] = v_accs[j];
         }
       }
     }
@@ -1129,10 +1098,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     if (warp_idx < mid) {
       const threadgroup float *src = &out_smem[warp_idx * HEAD_SIZE];
 #pragma unroll
-      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-          accs[i] += src[row_idx];
+      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+        const int d = lane + j * NUM_SIMD_LANES;
+        if (d < HEAD_SIZE) {
+          v_accs[j] += src[d];
         }
       }
     }
@@ -1145,10 +1114,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
         out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
-    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-      if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-        *(out_ptr + row_idx) = T(accs[i]);
+    for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+      const int d = lane + j * NUM_SIMD_LANES;
+      if (d < HEAD_SIZE) {
+        *(out_ptr + d) = T(v_accs[j]);
       }
     }
   }

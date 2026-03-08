@@ -28,6 +28,8 @@ template <> inline half to_cache<half, half>(half v) { return v; }
 
 constant bool use_fp8_scales [[function_constant(10)]];
 
+// Cache layout: [num_blocks, block_size, num_heads, head_size]
+// Both key and value caches use the same token-contiguous layout.
 template <typename KV_T, typename CACHE_T>
 [[kernel]] void reshape_and_cache(
     const device KV_T *__restrict__ key
@@ -35,9 +37,9 @@ template <typename KV_T, typename CACHE_T>
     const device KV_T *__restrict__ value
     [[buffer(1)]], // [num_tokens, num_heads, head_size]
     device CACHE_T *__restrict__ key_cache
-    [[buffer(2)]], // [num_blocks, num_heads, head_size/x, block_size, x]
+    [[buffer(2)]], // [num_blocks, block_size, num_heads, head_size]
     device CACHE_T *__restrict__ value_cache
-    [[buffer(3)]], // [num_blocks, num_heads, head_size, block_size]
+    [[buffer(3)]], // [num_blocks, block_size, num_heads, head_size]
     const device int64_t *__restrict__ slot_mapping
     [[buffer(4)]], // [num_tokens]
     const device float *__restrict__ k_scale
@@ -49,7 +51,6 @@ template <typename KV_T, typename CACHE_T>
     device const int &num_heads [[buffer(9)]],
     device const int &head_size [[buffer(10)]],
     device const int &block_size [[buffer(11)]],
-    device const int &x [[buffer(12)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
@@ -70,26 +71,22 @@ template <typename KV_T, typename CACHE_T>
 
     const int head_idx = i / head_size;
     const int head_offset = i % head_size;
-    const int x_idx = head_offset / x;
-    const int x_offset = head_offset % x;
 
-    const int64_t tgt_key_idx =
-        block_idx * num_heads * (head_size / x) * block_size * x +
-        head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
-        block_offset * x + x_offset;
-    const int64_t tgt_value_idx =
-        block_idx * num_heads * head_size * block_size +
-        head_idx * head_size * block_size + head_offset * block_size +
-        block_offset;
+    // Target index: [block_idx, block_offset, head_idx, head_offset]
+    const int64_t tgt_idx =
+        block_idx * block_size * num_heads * head_size +
+        block_offset * num_heads * head_size +
+        head_idx * head_size +
+        head_offset;
 
     if (use_fp8_scales) {
-      key_cache[tgt_key_idx] =
+      key_cache[tgt_idx] =
           to_cache<KV_T, CACHE_T>(KV_T((float)key[src_key_idx] / *k_scale));
-      value_cache[tgt_value_idx] =
+      value_cache[tgt_idx] =
           to_cache<KV_T, CACHE_T>(KV_T((float)value[src_value_idx] / *v_scale));
     } else {
-      key_cache[tgt_key_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
-      value_cache[tgt_value_idx] =
+      key_cache[tgt_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
+      value_cache[tgt_idx] =
           to_cache<KV_T, CACHE_T>(value[src_value_idx]);
     }
   }
@@ -113,7 +110,6 @@ template <typename KV_T, typename CACHE_T>
       device const int &num_heads [[buffer(9)]],                               \
       device const int &head_size [[buffer(10)]],                              \
       device const int &block_size [[buffer(11)]],                             \
-      device const int &x [[buffer(12)]],                                      \
       uint gid [[threadgroup_position_in_grid]],                               \
       uint tid [[thread_position_in_threadgroup]],                             \
       uint threads_per_threadgroup [[threads_per_threadgroup]]);

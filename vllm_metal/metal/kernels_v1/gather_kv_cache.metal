@@ -34,15 +34,14 @@ constant bool use_fp8_scales [[function_constant(10)]];
 ///
 /// Uses binary search on cu_seq_lens to find batch_id.
 ///
-/// K cache layout: [num_blocks, kv_heads, head_size/x, block_size, x]
-/// V cache layout: [num_blocks, kv_heads, head_size, block_size]
-/// K/V output:     [num_tokens, kv_heads, head_size]
+/// K/V cache layout: [num_blocks, block_size, kv_heads, head_size]
+/// K/V output:       [num_tokens, kv_heads, head_size]
 template <typename CACHE_T, typename OUT_T>
 [[kernel]] void gather_kv_cache(
     const device CACHE_T *__restrict__ key_cache
-    [[buffer(0)]], // [num_blocks, kv_heads, head_size/x, block_size, x]
+    [[buffer(0)]], // [num_blocks, block_size, kv_heads, head_size]
     const device CACHE_T *__restrict__ value_cache
-    [[buffer(1)]], // [num_blocks, kv_heads, head_size, block_size]
+    [[buffer(1)]], // [num_blocks, block_size, kv_heads, head_size]
     device OUT_T *__restrict__ k_out
     [[buffer(2)]], // [num_tokens, kv_heads, head_size]
     device OUT_T *__restrict__ v_out
@@ -60,7 +59,6 @@ template <typename CACHE_T, typename OUT_T>
     device const int &block_table_stride [[buffer(11)]],
     device const int &num_kv_heads [[buffer(12)]],
     device const int &head_size [[buffer(13)]],
-    device const int &x [[buffer(14)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
@@ -90,37 +88,28 @@ template <typename CACHE_T, typename OUT_T>
   const int n = num_kv_heads * head_size;
   const long out_base = (long)token_id * num_kv_heads * head_size;
 
-  // Precompute strides
-  const long k_block_stride =
-      (long)num_kv_heads * (head_size / x) * block_size * x;
-  const long k_head_stride = (long)(head_size / x) * block_size * x;
-  const long v_block_stride = (long)num_kv_heads * head_size * block_size;
-  const long v_head_stride = (long)head_size * block_size;
+  // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
+  // Both K and V use the same layout — index is identical.
+  const long cache_block_stride = (long)block_size * num_kv_heads * head_size;
+  const long cache_token_stride = (long)num_kv_heads * head_size;
 
   for (int i = tid; i < n; i += threads_per_threadgroup) {
     const int head_idx = i / head_size;
     const int d = i % head_size;
 
-    // K: [block_id, head_idx, d/x, slot, d%x]
-    const int x_idx = d / x;
-    const int x_offset = d % x;
-    const long k_src_idx = (long)block_id * k_block_stride +
-                           head_idx * k_head_stride + x_idx * block_size * x +
-                           slot * x + x_offset;
-
-    // V: [block_id, head_idx, d, slot]
-    const long v_src_idx = (long)block_id * v_block_stride +
-                           head_idx * v_head_stride + d * block_size + slot;
+    const long src_idx = (long)block_id * cache_block_stride +
+                         slot * cache_token_stride +
+                         head_idx * head_size + d;
 
     if (use_fp8_scales) {
       k_out[out_base + i] = OUT_T(
-          (float)from_cache<CACHE_T, OUT_T>(key_cache[k_src_idx]) * (*k_scale));
+          (float)from_cache<CACHE_T, OUT_T>(key_cache[src_idx]) * (*k_scale));
       v_out[out_base + i] =
-          OUT_T((float)from_cache<CACHE_T, OUT_T>(value_cache[v_src_idx]) *
+          OUT_T((float)from_cache<CACHE_T, OUT_T>(value_cache[src_idx]) *
                 (*v_scale));
     } else {
-      k_out[out_base + i] = from_cache<CACHE_T, OUT_T>(key_cache[k_src_idx]);
-      v_out[out_base + i] = from_cache<CACHE_T, OUT_T>(value_cache[v_src_idx]);
+      k_out[out_base + i] = from_cache<CACHE_T, OUT_T>(key_cache[src_idx]);
+      v_out[out_base + i] = from_cache<CACHE_T, OUT_T>(value_cache[src_idx]);
     }
   }
 }
@@ -145,7 +134,6 @@ template <typename CACHE_T, typename OUT_T>
       device const int &block_table_stride [[buffer(11)]],                     \
       device const int &num_kv_heads [[buffer(12)]],                           \
       device const int &head_size [[buffer(13)]],                              \
-      device const int &x [[buffer(14)]],                                      \
       uint gid [[threadgroup_position_in_grid]],                               \
       uint tid [[thread_position_in_threadgroup]],                             \
       uint threads_per_threadgroup [[threads_per_threadgroup]]);

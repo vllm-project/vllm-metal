@@ -4,9 +4,12 @@
 Stores per-layer key/value caches as MLX arrays in the layout expected by
 ``reshape_and_cache`` and ``paged_attention_v1``:
 
-- key_cache:   [num_blocks, num_kv_heads, head_dim // x, block_size, x]
-               where x = 16 // element_size (8 for float16)
-- value_cache: [num_blocks, num_kv_heads, head_dim, block_size]
+- key_cache:   [num_blocks, block_size, num_kv_heads, head_dim]
+- value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+
+Both caches use the same token-contiguous layout where each token's
+KV vector is stored contiguously.  This simplifies indexing and is
+compatible with variable-length / FlashInfer-style paged attention.
 
 Block allocation is managed externally by the scheduler's KV cache manager.
 """
@@ -14,13 +17,6 @@ Block allocation is managed externally by the scheduler's KV cache manager.
 from __future__ import annotations
 
 import mlx.core as mx
-
-# mx.Dtype → element size in bytes
-_DTYPE_SIZE = {
-    mx.float16: 2,
-    mx.bfloat16: 2,
-    mx.float32: 4,
-}
 
 
 class MetalPagedKVCache:
@@ -42,31 +38,22 @@ class MetalPagedKVCache:
         self.block_size = block_size
         self.dtype = dtype
 
-        element_size = _DTYPE_SIZE.get(dtype)
-        if element_size is None:
+        if dtype not in (mx.float16, mx.bfloat16, mx.float32):
             raise ValueError(f"Unsupported dtype for paged KV cache: {dtype}")
-        self.x = 16 // element_size  # 8 for float16, 4 for float32
 
-        if head_dim % self.x != 0:
-            raise ValueError(
-                f"head_dim ({head_dim}) must be divisible by x ({self.x}) "
-                f"for the 5-D key cache layout [num_blocks, num_kv_heads, "
-                f"head_dim // x, block_size, x]"
-            )
-
-        # Per-layer caches
+        # Per-layer caches — unified layout for both K and V
         self.key_caches: list[mx.array] = []
         self.value_caches: list[mx.array] = []
         for _ in range(num_layers):
             self.key_caches.append(
                 mx.zeros(
-                    (num_blocks, num_kv_heads, head_dim // self.x, block_size, self.x),
+                    (num_blocks, block_size, num_kv_heads, head_dim),
                     dtype=dtype,
                 )
             )
             self.value_caches.append(
                 mx.zeros(
-                    (num_blocks, num_kv_heads, head_dim, block_size),
+                    (num_blocks, block_size, num_kv_heads, head_dim),
                     dtype=dtype,
                 )
             )
