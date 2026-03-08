@@ -273,7 +273,7 @@ class TestSamplingParamsValidation:
 
 
 class TestExecuteSTTProtocol:
-    """Tests for _execute_stt_inner output protocol and request lifecycle."""
+    """Tests for _execute_stt output protocol and request lifecycle."""
 
     def _run_stt(self, runner, sched):
         """Run _execute_stt (STTExecutor is pre-cached in _make_runner)."""
