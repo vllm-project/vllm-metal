@@ -233,8 +233,14 @@ class MetalPlatform(Platform):
 
         # STT model detection — set tokenizer fallback if not already configured
         from vllm_metal.stt.config import is_stt_model
+        from vllm_metal.utils import get_model_download_path
 
-        if model_config is not None and is_stt_model(model_config.model):
+        resolved_model = (
+            get_model_download_path(model_config.model)
+            if model_config is not None
+            else None
+        )
+        if resolved_model is not None and is_stt_model(resolved_model):
             if not getattr(model_config, "tokenizer", None):
                 model_config.tokenizer = model_config.model
             # STT processes entire audio in one execute_model call;

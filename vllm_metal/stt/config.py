@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 # STT model types that can be auto-detected from config.json
 _STT_MODEL_TYPES = {"whisper"}
 
+# Maximum decode tokens for Whisper models (matches Whisper's context window).
+WHISPER_MAX_DECODE_TOKENS = 448
+
+# Nominal memory reported to vLLM scheduler for STT models.
+# No KV cache is actually allocated; this just passes minimum-memory checks.
+STT_SCHED_AVAILABLE_BYTES = 1 << 30  # 1 GiB
+
+# Block size reported to vLLM for STT models (minimal, no real KV cache).
+STT_SCHED_BLOCK_BYTES = 1
+
 # Officially supported languages (OpenAI docs subset).
 # fmt: off
 _OFFICIALLY_SUPPORTED = {

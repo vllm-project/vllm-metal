@@ -27,7 +27,7 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
-from vllm_metal.stt.config import SpeechToTextConfig
+from vllm_metal.stt.config import WHISPER_MAX_DECODE_TOKENS, SpeechToTextConfig
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
 
@@ -180,6 +180,56 @@ class WhisperTranscriber:
             duration=total_duration,
         )
 
+    # ---- public decode API -------------------------------------------------
+
+    def greedy_decode_tokens(
+        self,
+        audio_features: mx.array,
+        prompt_token_ids: list[int],
+        max_tokens: int | None = None,
+    ) -> list[int]:
+        """Greedy autoregressive decode with pre-built prompt tokens.
+
+        This is the single owner of the core decode loop.  Both the
+        high-level :meth:`_greedy_decode` and the v1 model runner
+        delegate here to avoid duplication.
+
+        Args:
+            audio_features: Encoded audio from the Whisper encoder.
+            prompt_token_ids: Prefix token IDs (language, task, etc.).
+            max_tokens: Maximum decode steps
+                (default: :data:`WHISPER_MAX_DECODE_TOKENS`).
+
+        Returns:
+            Decoded token IDs (excluding prompt prefix, excluding EOT).
+        """
+        if max_tokens is None:
+            max_tokens = WHISPER_MAX_DECODE_TOKENS
+
+        if not prompt_token_ids:
+            logger.warning("Empty prompt_token_ids; returning no tokens")
+            return []
+
+        # Cap by context window to prevent overflow
+        n_text_ctx = getattr(self.model.config, "n_text_ctx", None)
+        if n_text_ctx is not None:
+            max_tokens = min(max_tokens, n_text_ctx - len(prompt_token_ids))
+
+        eot_token = self._get_token_id("<|endoftext|>")
+        tokens = mx.array([prompt_token_ids], dtype=mx.int32)
+        kv_cache = None
+        output_tokens: list[int] = []
+
+        for _ in range(max_tokens):
+            logits, kv_cache = self.model.decode(tokens, audio_features, kv_cache)
+            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            if next_token == eot_token:
+                break
+            output_tokens.append(next_token)
+            tokens = mx.array([[next_token]], dtype=mx.int32)
+
+        return output_tokens
+
     # ---- private helpers ---------------------------------------------------
 
     def _get_token_id(self, token: str) -> int:
@@ -218,6 +268,7 @@ class WhisperTranscriber:
 
         A single method handles both timestamp and non-timestamp modes.
         The only difference is whether ``<|notimestamps|>`` is prepended.
+        Delegates to :meth:`greedy_decode_tokens` for the core loop.
 
         Args:
             audio_features: Encoded audio from the encoder.
@@ -231,7 +282,9 @@ class WhisperTranscriber:
             List of decoded token IDs (excluding special prefix).
         """
         if max_tokens is None:
-            max_tokens = 448 if with_timestamps else _MAX_PROMPT_TOKENS
+            max_tokens = (
+                WHISPER_MAX_DECODE_TOKENS if with_timestamps else _MAX_PROMPT_TOKENS
+            )
 
         prefix = self._encode_prompt(prompt)
         prefix.append(self._get_token_id("<|startoftranscript|>"))
@@ -241,20 +294,7 @@ class WhisperTranscriber:
         if not with_timestamps:
             prefix.append(self._get_token_id("<|notimestamps|>"))
 
-        eot_token = self._get_token_id("<|endoftext|>")
-        tokens = mx.array([prefix], dtype=mx.int32)
-        kv_cache = None
-        output_tokens: list[int] = []
-
-        for _ in range(max_tokens):
-            logits, kv_cache = self.model.decode(tokens, audio_features, kv_cache)
-            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-            if next_token == eot_token:
-                break
-            output_tokens.append(next_token)
-            tokens = mx.array([[next_token]], dtype=mx.int32)
-
-        return output_tokens
+        return self.greedy_decode_tokens(audio_features, prefix, max_tokens)
 
     def _extract_segments(
         self,
