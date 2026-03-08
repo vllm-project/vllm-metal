@@ -21,7 +21,7 @@ from types import ModuleType
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
-_KERNELS_DIR = _THIS_DIR / "kernels"
+_KERNELS_DIR = _THIS_DIR / "kernels_v1"
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
@@ -40,21 +40,21 @@ def _read_metal_source(path: Path) -> str:
 
 
 def _build_reshape_cache_source() -> str:
-    """Concatenate utils + float8 + reshape_and_cache into a single source."""
+    """Concatenate float8 + utils + reshape_and_cache into a single source."""
     parts = [
-        _read_metal_source(_KERNELS_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_DIR / "float8.metal"),
-        _read_metal_source(_KERNELS_DIR / "cache" / "reshape_and_cache.metal"),
+        _read_metal_source(_KERNELS_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_DIR / "reshape_and_cache.metal"),
     ]
     return "\n".join(parts)
 
 
 def _build_paged_attention_source() -> str:
-    """Concatenate utils + float8 + paged_attention into a single source."""
+    """Concatenate float8 + utils + paged_attention into a single source."""
     parts = [
-        _read_metal_source(_KERNELS_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_DIR / "float8.metal"),
-        _read_metal_source(_KERNELS_DIR / "attention" / "paged_attention.metal"),
+        _read_metal_source(_KERNELS_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_DIR / "pagedattention.metal"),
     ]
     return "\n".join(parts)
 

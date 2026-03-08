@@ -178,13 +178,15 @@ void paged_attention_v1_impl(
   bool use_partitioning = false;
   bool use_alibi        = false;
   bool use_fp8          = false;
+  bool use_sinks        = false;
 
   auto* lib = d.get_library("paged_attention_kern");
   auto* kernel = d.get_kernel(
       kname, lib, kname,
       {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
        {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
-       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)}});
+       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
 
   // Threadgroup shared memory
   constexpr int NUM_THREADS    = 256;
