@@ -106,7 +106,7 @@ def ref_paged_attn(
         q = q * scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
+        block_indices = mx.array(block_tables[i, :num_kv_blocks])
 
         k = key_cache[block_indices].reshape(-1, num_kv_heads, head_size)
         k = k[:kv_len]
@@ -144,6 +144,93 @@ def ref_paged_attn(
         start_idx += query_len
 
     return mx.concatenate(outputs, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Triangle test: v1 kernel vs reference (decode-only)
+#
+# Validates that the v1 kernel and the pure-MLX reference produce the same
+# results for decode-only inputs.  This test runs TODAY (no v2 needed) and
+# also validates ref_paged_attn itself, so we can trust it as ground truth.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1), (1, 128), (1, 2048)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_blocks", [2048])
+def test_v1_kernel_vs_reference(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    dtype: mx.Dtype,
+    block_size: int,
+    num_blocks: int,
+) -> None:
+    """v1 kernel == reference for decode-only inputs.
+
+    Completes the triangle: if v1 == ref and v2 == v1, then v2 == ref.
+    Also serves as a smoke test for ref_paged_attn correctness.
+    """
+    mx.random.seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    assert all(q == 1 for q in query_lens)
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(num_seqs, num_query_heads, head_size)).astype(dtype)
+    key_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    value_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = mx.random.randint(
+        0, num_blocks, shape=(num_seqs, max_num_blocks_per_seq)
+    ).astype(mx.int32)
+
+    v1_output = _run_v1_paged_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+        block_tables=block_tables,
+        seq_lens=kv_lens_arr,
+        block_size=block_size,
+        max_seq_len=max_kv_len,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=np.array(block_tables),
+        scale=scale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    np.testing.assert_allclose(
+        np.array(v1_output), np.array(ref_output), atol=atol, rtol=rtol
+    )
 
 
 # ---------------------------------------------------------------------------
