@@ -1,0 +1,238 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Adapted from vLLM's test_triton_unified_attention.py for Metal/MLX.
+#
+# Compares metal_unified_attention (the Metal kernel under development)
+# against ref_paged_attn (a naive pure-MLX loop implementation that is
+# trivially correct).  Both receive the same paged KV cache and query
+# inputs; the test asserts their outputs match within FP tolerance.
+
+import numpy as np
+import pytest
+
+import mlx.core as mx
+
+# TODO: import from vllm_metal.metal once the kernel is implemented
+# from vllm_metal.metal import metal_unified_attention
+
+NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
+HEAD_SIZES = [128, 256]
+BLOCK_SIZES = [16]
+DTYPES = [mx.float16]
+
+# One value large enough to test overflow in index calculation.
+# One value small enough to test the schema op check.
+NUM_BLOCKS = [32768, 2048]
+
+
+# ---------------------------------------------------------------------------
+# Kernel stub — replace with real Metal kernel dispatch
+# ---------------------------------------------------------------------------
+
+
+def metal_unified_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    out: mx.array,
+    cu_seqlens_q: mx.array,
+    seqused_k: mx.array,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    block_table: mx.array,
+    softcap: float,
+) -> None:
+    """Unified varlen paged attention for Metal.
+
+    Handles both prefill (q_len > 1) and decode (q_len = 1) sequences
+    packed into a single batch via cu_seqlens_q.
+
+    Args:
+        q: Query tensor       [total_q_tokens, num_q_heads, head_size]
+        k: Key cache           [num_blocks, block_size, num_kv_heads, head_size]
+        v: Value cache         [num_blocks, block_size, num_kv_heads, head_size]
+        out: Output tensor     [total_q_tokens, num_q_heads, head_size]
+        cu_seqlens_q: Cumulative query lengths [num_seqs + 1], int32
+        seqused_k: KV lengths  [num_seqs], int32
+        max_seqlen_q: Maximum query length in batch
+        max_seqlen_k: Maximum KV length in batch
+        softmax_scale: Scale factor (typically head_size ** -0.5)
+        causal: Whether to apply causal masking
+        window_size: (left, right) sliding window; (-1, -1) = no window
+        block_table: Block indices [num_seqs, max_blocks_per_seq], int32
+        softcap: Soft capping value; 0 = disabled
+    """
+    raise NotImplementedError(
+        "metal_unified_attention not yet implemented. "
+        "Build the Metal kernel to make this test pass."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure-MLX reference implementation
+# ---------------------------------------------------------------------------
+
+
+def ref_paged_attn(
+    query: mx.array,
+    key_cache: mx.array,
+    value_cache: mx.array,
+    query_lens: list[int],
+    kv_lens: list[int],
+    block_tables: np.ndarray,
+    scale: float,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+) -> mx.array:
+    """Pure-MLX reference: gather K/V from paged cache, compute attention.
+
+    Processes each sequence independently with naive quadratic attention.
+    Supports GQA (num_q_heads != num_kv_heads), sliding window, and soft cap.
+    """
+    num_seqs = len(query_lens)
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+
+    outputs: list[mx.array] = []
+    start_idx = 0
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx : start_idx + query_len]
+        q = q * scale
+
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_tables[i, :num_kv_blocks]
+
+        k = key_cache[block_indices].reshape(-1, num_kv_heads, head_size)
+        k = k[:kv_len]
+        v = value_cache[block_indices].reshape(-1, num_kv_heads, head_size)
+        v = v[:kv_len]
+
+        # GQA: expand kv heads to match query heads
+        if q.shape[1] != k.shape[1]:
+            n_rep = q.shape[1] // k.shape[1]
+            k = mx.repeat(k, n_rep, axis=1)
+            v = mx.repeat(v, n_rep, axis=1)
+
+        attn = mx.einsum("qhd,khd->hqk", q, k).astype(mx.float32)
+
+        # Causal mask: True where attention should be masked out
+        empty_mask = mx.ones((query_len, kv_len))
+        mask = mx.triu(empty_mask, k=kv_len - query_len + 1).astype(mx.bool_)
+
+        if sliding_window is not None:
+            sliding_window_mask = mx.logical_not(
+                mx.triu(empty_mask, k=kv_len - (query_len + sliding_window) + 1).astype(
+                    mx.bool_
+                )
+            )
+            mask = mx.logical_or(mask, sliding_window_mask)
+
+        if soft_cap is not None and soft_cap > 0:
+            attn = soft_cap * mx.tanh(attn / soft_cap)
+
+        attn = mx.where(mask, float("-inf"), attn)
+        attn = mx.softmax(attn, axis=-1).astype(v.dtype)
+        out = mx.einsum("hqk,khd->qhd", attn, v)
+
+        outputs.append(out)
+        start_idx += query_len
+
+    return mx.concatenate(outputs, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    raises=NotImplementedError, reason="Metal kernel not yet implemented"
+)
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 64, 128, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+def test_metal_unified_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    dtype: mx.Dtype,
+    block_size: int,
+    soft_cap: float | None,
+    num_blocks: int,
+) -> None:
+    mx.random.seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = mx.random.normal(
+        shape=(sum(query_lens), num_query_heads, head_size)
+    ).astype(dtype)
+    key_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    value_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    cu_query_lens = mx.cumsum(mx.array([0] + query_lens, dtype=mx.int32))
+    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = mx.random.randint(
+        0, num_blocks, shape=(num_seqs, max_num_blocks_per_seq)
+    ).astype(mx.int32)
+
+    output = mx.zeros_like(query)
+
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=np.array(block_tables),
+        scale=scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    np.testing.assert_allclose(
+        np.array(output), np.array(ref_output), atol=atol, rtol=rtol
+    )
