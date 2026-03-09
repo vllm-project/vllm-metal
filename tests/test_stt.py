@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from vllm_metal.stt import audio as audio_mod
-from vllm_metal.stt.audio import SAMPLE_RATE, audio_duration, split_audio
+from vllm_metal.stt.audio import SAMPLE_RATE, _rms_energy, audio_duration, split_audio
 from vllm_metal.stt.config import (
     SpeechToTextConfig,
     get_supported_languages,
@@ -238,6 +238,17 @@ class TestAudioPipeline:
         assert window.shape[0] == 400
         assert abs(window[0].item()) < 1e-6
         assert window[200].item() > window[0].item()
+
+    def test_rms_energy_partial_last_window_matches_unpadded_mean(self) -> None:
+        """Partial trailing windows should use their real sample count."""
+        audio = mx.array([1.0, 1.0, 2.0], mx.float32)
+        energies = _rms_energy(audio, window_size=2)
+
+        # Window 1: sqrt((1^2 + 1^2) / 2) = 1.0
+        # Window 2: sqrt((2^2) / 1) = 2.0 (real sample count, not padded count)
+        assert energies.shape[0] == 2
+        assert energies[0].item() == pytest.approx(1.0)
+        assert energies[1].item() == pytest.approx(2.0)
 
 
 class TestAudioLoading:

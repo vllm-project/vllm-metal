@@ -336,6 +336,40 @@ class TestHybridCacheMergeExtract:
         assert extracted_req0.offset == cache_req0.offset + 1
         assert extracted_req1.offset == cache_req1.offset + 1
 
+    def test_extracted_rotating_cache_can_decode_after_rotation(self) -> None:
+        """Extracted RotatingKVCache can continue decoding after offset > max_size.
+
+        After merge -> extract, the extracted cache may have offset > max_size
+        but keys.shape[2] < max_size (buffer sliced by extract).  Without the
+        buffer padding fix in ``_extract_kv_cache``, the next
+        ``_update_in_place`` call would compute a negative ``new_size`` and
+        crash with ``ValueError: [full] Negative dimensions not allowed``.
+        """
+        cache_req0 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=300, value=1.0
+        )
+        cache_req1 = self._make_rotating_kv_cache(
+            max_size=8, total_tokens=150, value=2.0
+        )
+
+        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+
+        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert extracted_req0.offset > extracted_req0.max_size
+        assert extracted_req0.keys.shape[2] == extracted_req0.max_size
+
+        # This would crash without the buffer padding fix
+        decode_k = mx.ones(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM), dtype=mx.float32
+        )
+        decode_v = mx.ones(
+            (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM), dtype=mx.float32
+        )
+        extracted_req0.update_and_fetch(decode_k, decode_v)
+
+        assert extracted_req0.offset == cache_req0.offset + 1
+
     def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
         arrays_cache = self._make_arrays_cache(1.0, 2.0)
         kv_cache = mr.KVCache()

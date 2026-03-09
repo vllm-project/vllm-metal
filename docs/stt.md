@@ -50,6 +50,7 @@ Any OpenAI Whisper checkpoint (HuggingFace or MLX format):
 | Whisper Small | 244M | `openai/whisper-small` |
 | Whisper Medium | 769M | `openai/whisper-medium` |
 | Whisper Large V3 | 1.5B | `openai/whisper-large-v3` |
+| Whisper Large V3 Turbo | 809M | `openai/whisper-large-v3-turbo` |
 
 MLX-format weights (e.g. from `mlx-community`) are also supported.
 

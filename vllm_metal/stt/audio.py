@@ -173,7 +173,8 @@ def _hanning(size: int) -> mx.array:
     Returns:
         1-D ``mx.array`` of float32 window values.
     """
-    return mx.array([0.5 - 0.5 * math.cos(2 * math.pi * n / size) for n in range(size)])
+    n = mx.arange(size, dtype=mx.float32)
+    return 0.5 - 0.5 * mx.cos(2 * math.pi * n / size)
 
 
 def _stft(
@@ -270,7 +271,7 @@ def log_mel_spectrogram(
 
     window = _hanning(N_FFT)
     freqs = _stft(audio, window, N_FFT, HOP_LENGTH)
-    magnitudes = mx.abs(freqs).square()
+    magnitudes = (freqs * mx.conj(freqs)).real
 
     filters = _mel_filters(SAMPLE_RATE, N_FFT, n_mels)
     mel_spec = filters @ magnitudes
@@ -310,15 +311,28 @@ def _rms_energy(audio: mx.array, window_size: int) -> mx.array:
         RMS energy of each window.
     """
     n = audio.shape[0]
+    if n == 0:
+        return mx.array([])
+
     n_windows = math.ceil(n / window_size)
-    energies = []
-    for i in range(n_windows):
-        start = i * window_size
-        end = min(start + window_size, n)
-        chunk = audio[start:end]
-        rms = mx.sqrt(mx.mean(chunk * chunk))
-        energies.append(rms.item())
-    return mx.array(energies)
+    pad = n_windows * window_size - n
+    if pad > 0:
+        audio = mx.pad(audio, [(0, pad)])
+
+    windows = audio.reshape(n_windows, window_size)
+    sum_squares = mx.sum(windows * windows, axis=1)
+
+    if pad == 0:
+        return mx.sqrt(sum_squares / window_size)
+
+    remainder = n % window_size
+    if n_windows == 1:
+        counts = mx.array([float(remainder)], dtype=mx.float32)
+    else:
+        full_counts = mx.full((n_windows - 1,), float(window_size), dtype=mx.float32)
+        last_count = mx.array([float(remainder)], dtype=mx.float32)
+        counts = mx.concatenate([full_counts, last_count])
+    return mx.sqrt(sum_squares / counts)
 
 
 def _find_split_point(

@@ -35,16 +35,14 @@ dependencies = [
     "transformers>=4.40.0",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
+    # Native Metal extension JIT build
+    "nanobind>=2.0.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]
-paged = [
-    # Paged attention Metal kernel (opt-in, experimental)
-    "kernels>=0.4.5; platform_system == 'Darwin' and platform_machine == 'arm64'",
-]
 vllm = ["vllm>=0.14.0"]
 stt = [
     # Speech-to-text audio processing (Whisper models)
@@ -58,7 +56,7 @@ dev = [
     "mypy>=1.19.1",
 ]
 all = [
-    "vllm-metal[vllm,paged,stt,dev]",
+    "vllm-metal[vllm,stt,dev]",
 ]
 
 [project.urls]

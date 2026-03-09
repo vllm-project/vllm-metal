@@ -20,6 +20,7 @@ from threading import Lock
 from typing import Any, TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
@@ -55,6 +56,10 @@ from vllm_metal.paged_attention_common import (
     prepare_prefill,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.stt.config import (
+    STT_SCHED_BLOCK_BYTES,
+    is_stt_model,
+)
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
@@ -62,6 +67,7 @@ logger = init_logger(__name__)
 # Global model cache for fast repeated loads
 _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
 _model_cache_lock = Lock()
+
 
 # Try to import Rust extension for high-performance token state management
 try:
@@ -378,7 +384,7 @@ def _merge_rotating_kv_caches(
     # the ``keep`` prefix semantics used by RotatingKVCache internally.
     ordered: list[tuple[mx.array, mx.array]] = []
     for c in caches:
-        effective_len = len(c)  # min(offset, max_size)
+        effective_len = c.size() if hasattr(c, "size") else len(c)
         ordered_keys = c._temporal_order(c.keys)
         ordered_values = c._temporal_order(c.values)
         if ordered_keys.shape[2] > effective_len:
@@ -543,8 +549,158 @@ def _extract_kv_cache(
         if isinstance(cache, ArraysCache):
             extracted.append(_extract_arrays_cache(cache, idx))
         else:
-            extracted.append(cache.extract(idx))
+            c = cache.extract(idx)
+            # After extract, RotatingKVCache may have offset > max_size but
+            # keys.shape[2] < max_size (buffer was sliced).  Pad the buffer
+            # back to max_size so _update_in_place won't try to grow it
+            # (which would compute a negative new_size).  The padded region
+            # is dead space that will be overwritten on the next rotation.
+            if (
+                isinstance(c, RotatingKVCache)
+                and c.keys is not None
+                and c.offset > c.max_size
+                and c.keys.shape[2] < c.max_size
+            ):
+                pad = c.max_size - c.keys.shape[2]
+                z_k = mx.zeros(
+                    (1, c.keys.shape[1], pad, c.keys.shape[3]),
+                    dtype=c.keys.dtype,
+                )
+                z_v = mx.zeros(
+                    (1, c.values.shape[1], pad, c.values.shape[3]),
+                    dtype=c.values.dtype,
+                )
+                c.keys = mx.concatenate([c.keys, z_k], axis=2)
+                c.values = mx.concatenate([c.values, z_v], axis=2)
+            extracted.append(c)
     return extracted
+
+
+# ------------------------------------------------------------------
+# STTExecutor — owns audio feature extraction and decode delegation
+# ------------------------------------------------------------------
+
+
+class STTExecutor:
+    """Encapsulates STT-specific audio extraction and decoding.
+
+    Holds a lazily-created :class:`WhisperTranscriber` and provides
+    :meth:`extract_audio_features` and :meth:`decode` so that
+    :class:`MetalModelRunner` can delegate without STT-specific logic.
+    """
+
+    def __init__(self, model: Any, model_path: str) -> None:
+        self.model = model
+        self._model_path = model_path
+        self._transcriber: Any = None
+
+    @property
+    def transcriber(self):
+        """Lazily-created :class:`WhisperTranscriber`."""
+        if self._transcriber is None:
+            from vllm_metal.stt.transcribe import WhisperTranscriber
+
+            self._transcriber = WhisperTranscriber(
+                self.model, model_path=self._model_path
+            )
+        return self._transcriber
+
+    @property
+    def eot_token(self) -> int:
+        """End-of-text token ID resolved from the tokenizer."""
+        return self.transcriber.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+
+    def extract_audio_features(self, new_req: Any) -> "mx.array | None":
+        """Extract and encode audio features from a request.
+
+        Handles two formats:
+        - vLLM MultiModalFeatureSpec: ``mm_features[0].data['input_features'].data``
+        - Plain dict: ``mm_features[0]['input_features']``
+
+        Expects HF WhisperFeatureExtractor output with shape ``(n_mels, time)``
+        and transposes to ``(batch, time, n_mels)`` for the encoder.
+
+        Returns:
+            Encoded audio features, or None if input is missing/malformed.
+        """
+        mm_features = getattr(new_req, "mm_features", None)
+        if mm_features is None:
+            return None
+        if not isinstance(mm_features, list) or len(mm_features) == 0:
+            return None
+
+        first = mm_features[0]
+
+        # Extract input_features from the multimodal data.
+        # vLLM's MultiModalFeatureSpec.data is a MultiModalKwargsItem
+        # (UserDict subclass), not a plain dict.
+        input_features = None
+        if hasattr(first, "data") and hasattr(first.data, "get"):
+            # MultiModalFeatureSpec → .data is MultiModalKwargsItem (UserDict)
+            elem = first.data.get("input_features")
+            if elem is not None:
+                # MultiModalFieldElem has .data with the actual tensor
+                input_features = getattr(elem, "data", elem)
+        elif isinstance(first, dict):
+            input_features = first.get("input_features")
+
+        if input_features is None:
+            return None
+
+        # Convert to MLX array — handle numpy, torch, and lists
+        if isinstance(input_features, np.ndarray):
+            mel = mx.array(input_features, dtype=mx.float16)
+        elif isinstance(input_features, torch.Tensor):
+            # .cpu() for device safety, .float() because bfloat16 has
+            # no numpy dtype support.
+            mel = mx.array(input_features.cpu().float().numpy(), dtype=mx.float16)
+        else:
+            mel = mx.array(np.array(input_features), dtype=mx.float16)
+
+        # HF WhisperFeatureExtractor output shape: (n_mels, time)
+        # Whisper encoder expects: (batch, time, n_mels)
+        if mel.ndim == 2:
+            mel = mel[None, ...]  # add batch dim → (1, n_mels, time)
+            mel = mel.transpose(0, 2, 1)  # → (1, time, n_mels)
+        elif mel.ndim == 3:
+            mel = mel.transpose(
+                0, 2, 1
+            )  # (batch, n_mels, time) → (batch, time, n_mels)
+        else:
+            raise ValueError(
+                f"Unexpected mel spectrogram rank {mel.ndim}; expected 2D or 3D"
+            )
+
+        features = self.model.encode(mel)
+        mx.eval(features)
+        return features
+
+    def decode(
+        self,
+        audio_features: "mx.array",
+        prompt_token_ids: list[int],
+    ) -> list[int]:
+        """Decode audio features into token IDs (ending with EOT).
+
+        Delegates the core decode loop to
+        :meth:`WhisperTranscriber.greedy_decode_tokens` (single owner).
+
+        Args:
+            audio_features: Encoded audio from the Whisper encoder.
+            prompt_token_ids: Prefix tokens (language, task, etc.).
+
+        Returns:
+            List of decoded token IDs ending with EOT.
+        """
+        eot = self.eot_token
+        if not prompt_token_ids:
+            logger.warning("STT: empty prompt_token_ids, returning EOT")
+            return [eot]
+
+        tokens = self.transcriber.greedy_decode_tokens(audio_features, prompt_token_ids)
+        # Always end with EOT so vLLM marks the request as finished
+        tokens.append(eot)
+        return tokens
 
 
 class MetalModelRunner:
@@ -577,6 +733,8 @@ class MetalModelRunner:
         self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
+        self._is_stt: bool = False  # Will be set during model loading
+        self._stt_executor: STTExecutor | None = None  # Set during STT loading
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -618,10 +776,15 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
+        self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
-        self.kv_cache_dtype: torch.dtype | None = None
+        self.kv_cache_dtype: mx.Dtype | None = None
+
+    @property
+    def is_stt(self) -> bool:
+        """Whether the loaded model is a Speech-to-Text model."""
+        return self._is_stt
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -640,6 +803,12 @@ class MetalModelRunner:
         Uses mlx_vlm for vision-language models and mlx_lm for text-only models.
         """
         model_name = get_model_download_path(self.model_config.model)
+
+        # STT models use their own loading path — skip VLM/LM logic entirely.
+        if is_stt_model(model_name):
+            self._load_stt_model(model_name)
+            return
+
         is_vlm = self._is_vlm_model()
 
         logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")
@@ -682,6 +851,36 @@ class MetalModelRunner:
         self._initialize_kv_cache_dtype()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
+
+    def _load_stt_model(self, model_name: str) -> None:
+        """Load a Speech-to-Text model (e.g. Whisper) with caching."""
+        start_time = time.time()
+
+        with _model_cache_lock:
+            if model_name in _model_cache:
+                self.model, _ = _model_cache[model_name]
+                load_time = time.time() - start_time
+                logger.info(
+                    f"STT model loaded from cache in {load_time:.3f}s: {model_name}"
+                )
+                self.tokenizer = None  # Whisper manages its own tokenizer
+                self._is_stt = True
+                self._stt_executor = STTExecutor(self.model, model_name)
+                return
+
+        from vllm_metal.stt.transcribe import load_model as stt_load_model
+
+        logger.info(f"Loading STT model: {model_name}")
+        self.model = stt_load_model(model_name)
+        self.tokenizer = None  # Whisper manages its own tokenizer
+        self._is_stt = True
+        self._stt_executor = STTExecutor(self.model, model_name)
+
+        with _model_cache_lock:
+            _model_cache[model_name] = (self.model, None)
+
+        load_time = time.time() - start_time
+        logger.info(f"STT model loaded in {load_time:.2f}s: {model_name}")
 
     def _initialize_kv_cache_dtype(self) -> None:
         """Infer and store the KV cache dtype for this runner."""
@@ -798,9 +997,27 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
+        if self._is_stt:
+            # Whisper manages its own KV cache internally.
+            # vLLM requires a non-empty spec for scheduler initialization,
+            # so we return a single minimal entry.
+            return {
+                "layers.0.self_attn": FullAttentionSpec(
+                    block_size=self.metal_config.block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            }
+
         block_size = self.metal_config.block_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
+
+        # FullAttentionSpec (upstream vLLM) expects torch.dtype
+        from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+
+        torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
 
         # Create a spec for each layer
         specs: dict[str, KVCacheSpec] = {}
@@ -810,7 +1027,7 @@ class MetalModelRunner:
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
-                dtype=self.kv_cache_dtype,
+                dtype=torch_dtype,
             )
 
         return specs
@@ -832,13 +1049,16 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
+        if self._is_stt:
+            return STT_SCHED_BLOCK_BYTES
+
         block_size = self.metal_config.block_size
 
         # Each block stores key and value for all layers
         # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = self.kv_cache_dtype.itemsize
+        dtype_size = self.kv_cache_dtype.size
         return (
             2
             * self.num_layers
@@ -860,6 +1080,17 @@ class MetalModelRunner:
             logger.warning("Model not loaded, skipping warm-up")
             return
 
+        if self._is_stt:
+            logger.info("Warming up STT model...")
+            n_mels = self.model.config.n_mels
+            n_audio_ctx = self.model.config.n_audio_ctx
+            # n_audio_ctx * 2 because conv2 has stride=2
+            dummy_mel = mx.zeros((1, n_audio_ctx * 2, n_mels), dtype=mx.float16)
+            features = self.model.encode(dummy_mel)
+            mx.eval(features)
+            logger.info("STT model warm-up complete")
+            return
+
         logger.info("Warming up model...")
 
         # Run a small dummy inference (standard MLX path)
@@ -877,42 +1108,39 @@ class MetalModelRunner:
             self._warm_up_paged_attention_kernel()
 
     def _warm_up_paged_attention_kernel(self) -> None:
-        """Load the HF paged-attention kernel and verify Metal ops work.
+        """JIT-compile vendored Metal shaders and verify ops work.
 
-        Forces ``newLibraryWithData`` inside the .so by running a single-token
-        ``reshape_and_cache`` against layer 0 of the already-allocated cache.
-        If the embedded metallib targets a Metal language version unsupported
-        by this OS, the error surfaces here instead of mid-inference.
+        Calls ``get_ops()`` which triggers JIT build of the C++ nanobind
+        extension + Metal shader compilation via MLX's device.get_library().
+        Then runs a single-token ``reshape_and_cache`` smoke test against
+        layer 0 of the already-allocated cache.
         """
         import platform
 
-        from vllm_metal.metal_kernel_backend.kernel_loader import (
-            get_paged_attention_ops,
-        )
+        from vllm_metal.metal import get_ops
 
         cache = self._paged_kv_cache
 
         logger.info("Warming up paged attention Metal kernel...")
 
         try:
-            ops = get_paged_attention_ops()
+            ops = get_ops()
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load paged-attention Metal kernel: {e}. "
+                f"Failed to build/load native paged-attention Metal kernel: {e}. "
                 f"macOS version: {platform.mac_ver()[0]}"
             ) from e
 
         # Smoke-test: single-token reshape_and_cache on layer 0
         try:
-            dummy_k = torch.zeros(
-                1,
-                cache.num_kv_heads,
-                cache.head_dim,
-                dtype=cache.dtype,
-                device="mps",
+            dummy_k = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
             )
-            dummy_v = torch.zeros_like(dummy_k)
-            dummy_slot = torch.zeros(1, dtype=torch.long, device="mps")
+            dummy_v = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
+            )
+            dummy_slot = mx.zeros((1,), dtype=mx.int64)
+            mx.eval(dummy_k, dummy_v, dummy_slot)
 
             ops.reshape_and_cache(
                 dummy_k,
@@ -920,10 +1148,8 @@ class MetalModelRunner:
                 cache.key_caches[0],
                 cache.value_caches[0],
                 dummy_slot,
-                "auto",
-                cache.k_scale_tensor,
-                cache.v_scale_tensor,
             )
+            mx.eval(cache.key_caches[0])
             logger.info("Paged attention Metal kernel warm-up complete")
         except RuntimeError as e:
             mac_ver = platform.mac_ver()[0]
@@ -1520,6 +1746,9 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
+        if self._is_stt:
+            return self._execute_stt(scheduler_output)
+
         # Collect all requests to process
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
@@ -1892,6 +2121,86 @@ class MetalModelRunner:
         output = self._pending_output
         self._pending_output = None
         return output
+
+    # ------------------------------------------------------------------
+    # STT (Speech-to-Text) helpers
+    # ------------------------------------------------------------------
+
+    def _execute_stt(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Execute STT inference for all new requests in the batch.
+
+        Raises:
+            ValueError: If a request uses non-greedy sampling params.
+        """
+        assert self._stt_executor is not None
+
+        req_ids: list[str] = []
+        req_id_to_index: dict[str, int] = {}
+        sampled_tokens: list[list[int]] = []
+
+        eot_token = self._stt_executor.eot_token
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            sampling_params = new_req.sampling_params or SamplingParams()
+
+            # Only greedy decoding is supported for STT
+            if sampling_params.temperature > 0:
+                raise ValueError(
+                    "STT models only support greedy decoding (temperature=0). "
+                    f"Got temperature={sampling_params.temperature}"
+                )
+
+            audio_features = self._stt_executor.extract_audio_features(new_req)
+            if audio_features is None:
+                # No audio — return EOT immediately
+                logger.warning("STT: no audio features for req %s", req_id)
+                req_ids.append(req_id)
+                req_id_to_index[req_id] = len(req_ids) - 1
+                sampled_tokens.append([eot_token])
+                continue
+
+            prompt_token_ids = list(new_req.prompt_token_ids or [])
+            tokens = self._stt_executor.decode(audio_features, prompt_token_ids)
+
+            req_ids.append(req_id)
+            req_id_to_index[req_id] = len(req_ids) - 1
+            sampled_tokens.append(tokens)
+
+        # Handle cached requests: STT processes everything in one shot,
+        # so any "cached" (decode-phase) request just gets an EOT to finish.
+        cached_req_ids = list(scheduler_output.scheduled_cached_reqs.req_ids)
+        for req_id in cached_req_ids:
+            req_ids.append(req_id)
+            req_id_to_index[req_id] = len(req_ids) - 1
+            sampled_tokens.append([eot_token])
+
+        # Clean up finished requests
+        if scheduler_output.finished_req_ids:
+            for req_id in scheduler_output.finished_req_ids:
+                self._request_states.pop(req_id, None)
+
+        if not req_ids:
+            return ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            )
+
+        self._pending_output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=sampled_tokens,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[None] * len(req_ids),
+        )
+        return None
 
     def generate(
         self,

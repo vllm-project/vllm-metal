@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal kernel paged attention — verifies output matches non-paged path.
 
-Requires ``kernels`` package with ``kernels-community/paged-attention`` support.
-
 Run with:
     python -m pytest tests/test_metal_kernel_paged.py -v -s
 """
@@ -16,20 +14,19 @@ BLOCK_SIZE = 16
 
 try:
     import mlx.core as mx
-    import torch
     from mlx_lm import load as mlx_lm_load
     from mlx_lm.models.cache import make_prompt_cache
 
     from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 except ImportError as exc:
     pytest.skip(
-        f"Metal kernel paged attention tests require mlx/torch/mlx_lm: {exc}",
+        f"Metal kernel paged attention tests require mlx/mlx_lm: {exc}",
         allow_module_level=True,
     )
 
 try:
-    from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
-    from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
+    from vllm_metal.metal import get_ops
+    from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
     from vllm_metal.metal_kernel_backend.paged_attention import (
         MetalKernelPagedAttentionWrapper,
         patch_model_attention_metal_kernel,
@@ -42,22 +39,15 @@ try:
     )
 except ImportError as exc:
     pytest.skip(
-        "Metal kernel paged attention tests require the vllm-metal paged backend: "
-        f"{exc}. Install with: pip install 'vllm-metal[paged]'",
+        f"Metal kernel paged attention tests require vllm-metal paged backend: {exc}",
         allow_module_level=True,
     )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _paged_attention_ops_available() -> None:
-    """Skip this module if the paged-attention ops cannot be loaded."""
-
-    try:
-        get_paged_attention_ops()
-    except ImportError as exc:
-        pytest.skip(str(exc))
-    except Exception as exc:
-        pytest.skip(f"kernels-community/paged-attention not available: {exc}")
+    """Fail early if the native paged-attention ops cannot be loaded."""
+    get_ops()
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +55,8 @@ def _paged_attention_ops_available() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _test_infer_paged_kv_dtype(model) -> torch.dtype:
-    """Test-only helper: choose a float dtype for MPSPagedKVCache.
+def _test_infer_paged_kv_dtype(model) -> mx.Dtype:
+    """Test-only helper: choose a float dtype for MetalPagedKVCache.
 
     This is deliberately local to this test module. Production code uses
     `vllm_metal.kv_cache_dtype.infer_kv_cache_dtype_from_model()`.
@@ -115,7 +105,7 @@ def _greedy_generate_metal_kernel(
     total_tokens = len(token_ids) + max_new + BLOCK_SIZE
     num_blocks = (total_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 4
 
-    mps_cache = MPSPagedKVCache(
+    metal_cache = MetalPagedKVCache(
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -124,7 +114,7 @@ def _greedy_generate_metal_kernel(
         dtype=_test_infer_paged_kv_dtype(model),
     )
 
-    n_patched = patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
+    n_patched = patch_model_attention_metal_kernel(model, metal_cache, BLOCK_SIZE)
     assert n_patched == num_layers
 
     # Assign block IDs for this sequence (manual allocation)
@@ -179,9 +169,6 @@ def qwen3_model():
 
 class TestMetalKernelPagedVsStandard:
     @pytest.mark.slow
-    @pytest.mark.xfail(
-        reason="Metal paged-attention parity mismatch vs standard path (see #119)"
-    )
     def test_greedy_output_matches(self, qwen3_model):
         """Metal kernel paged attention greedy decode must match standard path."""
         model, tokenizer = qwen3_model
@@ -202,6 +189,11 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        reason="B=2 batched GEMM produces different floats than B=1, "
+        "causing token divergence after ~5 decode steps (not a kernel bug). "
+        "See https://github.com/vllm-project/vllm-metal/issues/119"
+    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
@@ -228,7 +220,7 @@ class TestMetalKernelPagedVsStandard:
         )
         num_blocks = ((total_max + BLOCK_SIZE - 1) // BLOCK_SIZE) * len(prompts) + 8
 
-        mps_cache = MPSPagedKVCache(
+        metal_cache = MetalPagedKVCache(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -236,7 +228,7 @@ class TestMetalKernelPagedVsStandard:
             block_size=BLOCK_SIZE,
             dtype=_test_infer_paged_kv_dtype(model),
         )
-        patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
+        patch_model_attention_metal_kernel(model, metal_cache, BLOCK_SIZE)
 
         # Prefill each prompt
         all_token_ids = []
@@ -305,7 +297,7 @@ class TestMetalKernelPatchRouting:
         model, _ = qwen3_model
         args = model.args
 
-        mps_cache = MPSPagedKVCache(
+        metal_cache = MetalPagedKVCache(
             num_layers=args.num_hidden_layers,
             num_kv_heads=args.num_key_value_heads,
             head_dim=args.head_dim,
@@ -313,7 +305,7 @@ class TestMetalKernelPatchRouting:
             block_size=BLOCK_SIZE,
             dtype=_test_infer_paged_kv_dtype(model),
         )
-        patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
+        patch_model_attention_metal_kernel(model, metal_cache, BLOCK_SIZE)
 
         layers = model.model.layers
         for i, layer in enumerate(layers):
@@ -328,7 +320,7 @@ class TestMetalKernelPatchRouting:
         model, _ = qwen3_model
         args = model.args
 
-        mps_cache = MPSPagedKVCache(
+        metal_cache = MetalPagedKVCache(
             num_layers=args.num_hidden_layers,
             num_kv_heads=args.num_key_value_heads,
             head_dim=args.head_dim,
@@ -336,7 +328,7 @@ class TestMetalKernelPatchRouting:
             block_size=BLOCK_SIZE,
             dtype=_test_infer_paged_kv_dtype(model),
         )
-        patch_model_attention_metal_kernel(model, mps_cache, BLOCK_SIZE)
+        patch_model_attention_metal_kernel(model, metal_cache, BLOCK_SIZE)
 
         # Run forward without setting context → should use fallback
         cache = make_prompt_cache(model)
