@@ -8,10 +8,9 @@
 # trivially correct).  Both receive the same paged KV cache and query
 # inputs; the test asserts their outputs match within FP tolerance.
 
+import mlx.core as mx
 import numpy as np
 import pytest
-
-import mlx.core as mx
 
 # TODO: import from vllm_metal.metal once the kernel is implemented
 # from vllm_metal.metal import metal_unified_attention
@@ -146,12 +145,112 @@ def ref_paged_attn(
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Scaffolding: decode-only (q_len=1) — bridges v1 kernel to v2 unified API
+#
+# Freezes parameters to the subset that the existing paged_attention_v1
+# already handles: every sequence has q_len=1, no sliding window, no
+# soft_cap.  Get this green first when building the v2 kernel, then
+# graduate to the full varlen test below.
+#
+# DELETE this test once test_metal_unified_attn passes.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.xfail(
-    raises=NotImplementedError, reason="Metal kernel not yet implemented"
+    raises=NotImplementedError, reason="v2 Metal kernel not yet implemented"
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1), (1, 128), (1, 2048)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+def test_metal_unified_attn_decode_only(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    dtype: mx.Dtype,
+    block_size: int,
+    num_blocks: int,
+) -> None:
+    """Decode-only: all q_len=1, no sliding window, no soft cap.
+
+    When the v2 kernel is built, this should produce identical results to
+    the existing paged_attention_v1 kernel (same algorithmic path).
+    """
+    mx.random.seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    assert all(q == 1 for q in query_lens), "Scaffolding test requires q_len=1"
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(num_seqs, num_query_heads, head_size)).astype(dtype)
+    key_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    value_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(dtype)
+    cu_query_lens = mx.cumsum(mx.array([0] + query_lens, dtype=mx.int32))
+    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = mx.random.randint(
+        0, num_blocks, shape=(num_seqs, max_num_blocks_per_seq)
+    ).astype(mx.int32)
+
+    output = mx.zeros_like(query)
+
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=1,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=np.array(block_tables),
+        scale=scale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    np.testing.assert_allclose(
+        np.array(output), np.array(ref_output), atol=atol, rtol=rtol
+    )
+
+
+# ---------------------------------------------------------------------------
+# Target: full varlen unified attention (v2 kernel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    raises=NotImplementedError, reason="v2 Metal kernel not yet implemented"
 )
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
