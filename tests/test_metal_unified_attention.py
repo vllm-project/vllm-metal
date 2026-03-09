@@ -151,11 +151,47 @@ def ref_paged_attn(
 #
 # Freezes parameters to the subset that the existing paged_attention_v1
 # already handles: every sequence has q_len=1, no sliding window, no
-# soft_cap.  Get this green first when building the v2 kernel, then
-# graduate to the full varlen test below.
+# soft_cap.  Compares the v2 kernel output against the v1 kernel output
+# to prove v2 is a drop-in replacement for decode.  Get this green first
+# when building the v2 kernel, then graduate to the full varlen test below.
 #
 # DELETE this test once test_metal_unified_attn passes.
 # ---------------------------------------------------------------------------
+
+
+def _run_v1_paged_attention(
+    query: mx.array,
+    key_cache: mx.array,
+    value_cache: mx.array,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: mx.array,
+    seq_lens: mx.array,
+    block_size: int,
+    max_seq_len: int,
+) -> mx.array:
+    """Run the existing v1 paged_attention kernel and return the output."""
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+
+    out = mx.zeros_like(query)
+    mx.eval(out, query, key_cache, value_cache, block_tables, seq_lens)
+
+    ops.paged_attention_v1(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+    )
+    mx.synchronize()
+    return out
 
 
 @pytest.mark.xfail(
@@ -183,8 +219,8 @@ def test_metal_unified_attn_decode_only(
 ) -> None:
     """Decode-only: all q_len=1, no sliding window, no soft cap.
 
-    When the v2 kernel is built, this should produce identical results to
-    the existing paged_attention_v1 kernel (same algorithmic path).
+    Compares the v2 unified kernel against the existing v1 paged_attention
+    kernel to prove v2 is a drop-in replacement for the decode path.
     """
     mx.random.seed(0)
     num_seqs = len(seq_lens)
@@ -212,13 +248,27 @@ def test_metal_unified_attn_decode_only(
         0, num_blocks, shape=(num_seqs, max_num_blocks_per_seq)
     ).astype(mx.int32)
 
-    output = mx.zeros_like(query)
+    # --- v1 kernel output (known-correct, production code) ---
+    v1_output = _run_v1_paged_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+        block_tables=block_tables,
+        seq_lens=kv_lens_arr,
+        block_size=block_size,
+        max_seq_len=max_kv_len,
+    )
+
+    # --- v2 kernel output (under development) ---
+    v2_output = mx.zeros_like(query)
 
     metal_unified_attention(
         q=query,
         k=key_cache,
         v=value_cache,
-        out=output,
+        out=v2_output,
         cu_seqlens_q=cu_query_lens,
         seqused_k=kv_lens_arr,
         max_seqlen_q=1,
@@ -230,19 +280,9 @@ def test_metal_unified_attn_decode_only(
         softcap=0,
     )
 
-    ref_output = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
-        block_tables=np.array(block_tables),
-        scale=scale,
-    )
-
-    atol, rtol = 1.5e-2, 1e-2
+    # v2 must match v1 exactly (same algorithm, same precision)
     np.testing.assert_allclose(
-        np.array(output), np.array(ref_output), atol=atol, rtol=rtol
+        np.array(v2_output), np.array(v1_output), atol=1e-4, rtol=1e-4
     )
 
 
