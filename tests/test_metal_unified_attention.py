@@ -22,6 +22,8 @@ DTYPES = [mx.float16]
 
 # One value large enough to test overflow in index calculation.
 # One value small enough to test the schema op check.
+# NOTE: 32768 blocks with large head_size/num_heads can allocate multiple GB.
+# Consider marking 32768 cases as @pytest.mark.slow once the kernel is implemented.
 NUM_BLOCKS = [32768, 2048]
 
 
@@ -246,6 +248,10 @@ def test_metal_unified_attn_decode_only(
 
 # ---------------------------------------------------------------------------
 # Target: full varlen unified attention (v2 kernel)
+#
+# NOTE: fully expanded parametrization yields ~192 cases. Once the kernel is
+# implemented and tests actually compute, consider pruning or marking some
+# combinations (e.g. num_blocks=32768) as @pytest.mark.slow to keep CI fast.
 # ---------------------------------------------------------------------------
 
 
