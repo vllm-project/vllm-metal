@@ -204,9 +204,9 @@ def _get_feat_extract_output_lengths(input_lengths: int) -> int:
     remainder = input_lengths % chunk_size
     full_chunks = input_lengths // chunk_size
     if remainder == 0:
-        return full_chunks * frames_per_full_chunk
+        return int(full_chunks * frames_per_full_chunk)
     remainder_out = _get_cnn_output_lengths(remainder)
-    return full_chunks * frames_per_full_chunk + remainder_out
+    return int(full_chunks * frames_per_full_chunk + remainder_out)
 
 
 class AudioEncoder(nn.Module):
