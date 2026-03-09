@@ -533,9 +533,7 @@ class TestBuildPromptTokens:
             "\n": [40],
         }
         mock_tok.encode = MagicMock(
-            side_effect=lambda s, add_special_tokens=False: _encode_map.get(
-                s, [0]
-            )
+            side_effect=lambda s, add_special_tokens=False: _encode_map.get(s, [0])
         )
         t._tokenizer = mock_tok
         return t
