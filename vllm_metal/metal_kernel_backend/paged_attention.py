@@ -79,6 +79,29 @@ from vllm_metal.paged_attention_common import (
 # ---------------------------------------------------------------------------
 
 
+def _build_packed_causal_mask(
+    cu_seq_lens: list[int],
+    total_len: int,
+) -> mx.array:
+    """Build a block-diagonal causal mask for packed prefill.
+
+    Each request only attends to its own tokens (causally).  Returns an
+    additive mask of shape ``(1, 1, total_len, total_len)`` with 0 for
+    allowed positions and ``-inf`` for blocked positions, suitable for
+    ``mx.fast.scaled_dot_product_attention``.
+    """
+    # Start with all-blocked, then open causal windows per request
+    mask = mx.full((total_len, total_len), -mx.inf)
+    for i in range(len(cu_seq_lens) - 1):
+        start = cu_seq_lens[i]
+        end = cu_seq_lens[i + 1]
+        seq_len = end - start
+        # Causal mask for this request's tokens
+        causal = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1)
+        mask[start:end, start:end] = causal
+    return mask.reshape(1, 1, total_len, total_len)
+
+
 def _metal_kernel_prefill_attention(
     attn_module: Any,
     queries: mx.array,
@@ -89,25 +112,44 @@ def _metal_kernel_prefill_attention(
     ctx: PagedAttentionContext,
     offset_cache: Any,
 ) -> mx.array:
-    """Prefill: B=1, L=prompt_len.
+    """Prefill: B=1, L=prompt_len (single) or L=total_tokens (packed).
 
     Inline causal SDPA in MLX, then write K/V to paged cache via
-    ``reshape_and_cache``.
+    ``reshape_and_cache``.  When ``ctx.cu_seq_lens`` is set, builds a
+    block-diagonal causal mask so packed requests don't cross-attend.
     """
     B, _, L, _ = queries.shape  # noqa: N806
 
-    # RoPE
+    # RoPE — per-request position reset for packed prefill
     if not hasattr(attn_module, "rope"):
         raise NotImplementedError(
             f"Attention module {type(attn_module).__name__} does not have a 'rope' "
             "attribute. Only RoPE-based models are supported by paged attention."
         )
-    offset = offset_cache.offset if offset_cache is not None else 0
-    queries = attn_module.rope(queries, offset=offset)
-    keys = attn_module.rope(keys, offset=offset)
 
-    # Causal SDPA (inline — K/V already in hand)
-    attn_mask = "causal" if L > 1 else None
+    if ctx.cu_seq_lens is not None:
+        # Packed prefill: apply RoPE per request with position reset
+        q_parts = []
+        k_parts = []
+        for i in range(len(ctx.cu_seq_lens) - 1):
+            start = ctx.cu_seq_lens[i]
+            end = ctx.cu_seq_lens[i + 1]
+            q_parts.append(attn_module.rope(queries[:, :, start:end, :], offset=0))
+            k_parts.append(attn_module.rope(keys[:, :, start:end, :], offset=0))
+        queries = mx.concatenate(q_parts, axis=2)
+        keys = mx.concatenate(k_parts, axis=2)
+    else:
+        offset = offset_cache.offset if offset_cache is not None else 0
+        queries = attn_module.rope(queries, offset=offset)
+        keys = attn_module.rope(keys, offset=offset)
+
+    # Causal SDPA
+    if ctx.cu_seq_lens is not None and len(ctx.cu_seq_lens) > 2:
+        # Packed: block-diagonal causal mask
+        attn_mask = _build_packed_causal_mask(ctx.cu_seq_lens, L)
+    else:
+        attn_mask = "causal" if L > 1 else None
+
     output = mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=attn_module.scale, mask=attn_mask
     )

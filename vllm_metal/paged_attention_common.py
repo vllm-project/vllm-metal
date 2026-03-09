@@ -42,6 +42,10 @@ class PagedAttentionContext:
     block_tables: list[list[int]] = field(default_factory=list)
     context_lens: list[int] = field(default_factory=list)
     offsets: list[int] = field(default_factory=list)
+    # packed prefill fields — set when multiple requests are packed into
+    # a single forward pass.  cu_seq_lens is a cumulative sequence length
+    # array: [0, len0, len0+len1, ...] (length = num_requests + 1).
+    cu_seq_lens: list[int] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -160,6 +164,39 @@ def prepare_prefill(
         PagedAttentionContext(
             is_prefill=True,
             slot_mapping=slot_mapping,
+        )
+    )
+
+
+def prepare_prefill_packed(
+    requests: list[tuple[list[int], int]],
+    block_size: int,
+) -> None:
+    """Compute slot_mapping and cu_seq_lens for packed prefill.
+
+    Packs multiple prefill requests into a single forward pass.  The
+    attention wrapper uses ``cu_seq_lens`` to build a block-diagonal
+    causal mask so that each request only attends to its own tokens.
+
+    Args:
+        requests: list of (block_ids, num_tokens) per request.
+        block_size: tokens per block.
+    """
+    slot_mapping: list[int] = []
+    cu_seq_lens: list[int] = [0]
+
+    for block_ids, num_tokens in requests:
+        for pos in range(num_tokens):
+            block_idx = block_ids[pos // block_size]
+            slot = block_idx * block_size + (pos % block_size)
+            slot_mapping.append(slot)
+        cu_seq_lens.append(cu_seq_lens[-1] + num_tokens)
+
+    set_context(
+        PagedAttentionContext(
+            is_prefill=True,
+            slot_mapping=slot_mapping,
+            cu_seq_lens=cu_seq_lens,
         )
     )
 
