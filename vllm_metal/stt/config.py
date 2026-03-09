@@ -12,7 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # STT model types that can be auto-detected from config.json
-_STT_MODEL_TYPES = {"whisper"}
+_STT_MODEL_TYPES = {"whisper", "qwen3_asr"}
 
 # Maximum decode tokens for Whisper models (matches Whisper's context window).
 WHISPER_MAX_DECODE_TOKENS = 448
