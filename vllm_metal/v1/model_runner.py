@@ -1636,7 +1636,7 @@ class MetalModelRunner:
         """Packed paged-attention prefill for multiple requests.
 
         Concatenates token_ids from all requests into a single forward
-        pass using ``cu_seq_lens`` to build a block-diagonal causal mask.
+        pass using ``cu_seqlens`` to build a block-diagonal causal mask.
         This avoids the overhead of N separate forward passes.
 
         Args:
@@ -1654,7 +1654,7 @@ class MetalModelRunner:
             all_token_ids.extend(token_ids)
             block_requests.append((block_ids, len(token_ids)))
 
-        # Stash packed context (slot_mapping + cu_seq_lens)
+        # Stash packed context (slot_mapping + cu_seqlens)
         prepare_prefill_packed(block_requests, self._paged_block_size)
 
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
@@ -1666,9 +1666,9 @@ class MetalModelRunner:
             clear_context()
 
         # Extract per-request last-token logits and sample
-        cu_seq_lens = [0]
+        cu_seqlens = [0]
         for _, token_ids, _, _, _, _ in pack_reqs:
-            cu_seq_lens.append(cu_seq_lens[-1] + len(token_ids))
+            cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
 
         next_tokens: list[int] = []
         for i, (
@@ -1679,7 +1679,7 @@ class MetalModelRunner:
             generator,
             prompt_len,
         ) in enumerate(pack_reqs):
-            last_idx = cu_seq_lens[i + 1] - 1
+            last_idx = cu_seqlens[i + 1] - 1
             last_logits = logits[:, last_idx : last_idx + 1, :]
 
             if prompt_len is None:
@@ -1948,8 +1948,9 @@ class MetalModelRunner:
                         req_id, list(token_ids) + [next_token]
                     )
 
-        # Process collected complete paged prefill requests — pack if ≥ 2
-        if len(paged_complete) >= 2:
+        # Process collected complete paged prefill requests via unified
+        # packed path (handles 1 or more requests).
+        if paged_complete:
             pack_input = [
                 (rid, tids, sp, bids, gen, None)
                 for _, rid, tids, sp, bids, gen in paged_complete
@@ -1969,28 +1970,6 @@ class MetalModelRunner:
                 )
                 if self._rust_state_manager is not None:
                     self._rust_state_manager.add_request(rid, list(tids) + [nt])
-        elif len(paged_complete) == 1:
-            # Single request: no packing overhead
-            idx, rid, tids, sp, bids, gen = paged_complete[0]
-            nt = self._prefill_single_request_paged(
-                rid,
-                tids,
-                sp,
-                block_ids=bids,
-                generator=gen,
-            )
-            sampled_tokens[idx] = [nt]
-            self._request_states[rid] = RequestState(
-                token_ids=list(tids) + [nt],
-                prompt_len=len(tids),
-                cache=[],
-                sampling_params=sp,
-                generator=gen,
-                generated_tokens=1,
-                block_ids=bids,
-            )
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.add_request(rid, list(tids) + [nt])
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
         cached_reqs = scheduler_output.scheduled_cached_reqs

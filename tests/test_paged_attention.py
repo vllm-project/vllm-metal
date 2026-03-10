@@ -59,16 +59,16 @@ class TestPrepare:
         # Request 0: block 10, slots 40,41,42
         # Request 1: block 20, slots 80,81
         assert ctx.slot_mapping == [40, 41, 42, 80, 81]
-        assert ctx.cu_seq_lens == [0, 3, 5]
+        assert ctx.cu_seqlens == [0, 3, 5]
 
     def test_prepare_prefill_packed_single_request(self):
-        # Single request should still produce valid cu_seq_lens
+        # Single request should still produce valid cu_seqlens
         requests = [([5, 6], 5)]
         prepare_prefill_packed(requests, block_size=4)
         ctx = get_context()
 
         assert ctx is not None
-        assert ctx.cu_seq_lens == [0, 5]
+        assert ctx.cu_seqlens == [0, 5]
         # block 5: slots 20,21,22,23; block 6: slot 24
         assert ctx.slot_mapping == [20, 21, 22, 23, 24]
 
@@ -92,11 +92,11 @@ class TestPackedCausalMask:
     """Tests for the block-diagonal causal mask used in packed prefill."""
 
     def test_single_sequence(self):
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            _build_packed_causal_mask,
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            build_packed_causal_mask,
         )
 
-        mask = _build_packed_causal_mask([0, 3], total_len=3)
+        mask = build_packed_causal_mask([0, 3], total_len=3)
         # Standard causal: lower-triangular (0) with upper-triangular (-inf)
         assert mask.shape == (1, 1, 3, 3)
         m = mask[0, 0]
@@ -109,12 +109,12 @@ class TestPackedCausalMask:
         assert m[0, 2].item() == float("-inf")
 
     def test_two_sequences_isolation(self):
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            _build_packed_causal_mask,
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            build_packed_causal_mask,
         )
 
         # Two sequences: [0,2) and [2,5)
-        mask = _build_packed_causal_mask([0, 2, 5], total_len=5)
+        mask = build_packed_causal_mask([0, 2, 5], total_len=5)
         m = mask[0, 0]
         # Seq 0 tokens should not attend to seq 1 tokens
         assert m[0, 2].item() == float("-inf")
