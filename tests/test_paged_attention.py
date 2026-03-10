@@ -170,3 +170,53 @@ class TestPackedRoPE:
         assert q_out.shape == (1, 1, 5, 2)
         assert mx.allclose(q_out, mx.zeros_like(q_out)).item()
         assert mx.allclose(k_out, mx.zeros_like(k_out)).item()
+
+
+class TestBatchSplitting:
+    """Tests for the packed-prefill batch splitting logic."""
+
+    @staticmethod
+    def _split_batches(
+        entries: list[tuple[int, int]],
+        max_tokens: int,
+    ) -> list[list[tuple[int, int]]]:
+        """Reproduce the batch splitting algorithm from _run_packed_prefill.
+
+        entries: list of (index, num_tokens) for simplicity.
+        """
+        batches: list[list[tuple[int, int]]] = [[]]
+        batch_tokens = 0
+        for entry in entries:
+            entry_tokens = entry[1]
+            if batch_tokens + entry_tokens > max_tokens and batches[-1]:
+                batches.append([])
+                batch_tokens = 0
+            batches[-1].append(entry)
+            batch_tokens += entry_tokens
+        return batches
+
+    def test_all_fit_single_batch(self):
+        entries = [(0, 100), (1, 200), (2, 300)]
+        batches = self._split_batches(entries, max_tokens=4096)
+        assert len(batches) == 1
+        assert batches[0] == entries
+
+    def test_split_into_two_batches(self):
+        entries = [(0, 3000), (1, 2000)]
+        batches = self._split_batches(entries, max_tokens=4096)
+        assert len(batches) == 2
+        assert batches[0] == [(0, 3000)]
+        assert batches[1] == [(1, 2000)]
+
+    def test_single_large_request_not_dropped(self):
+        # A request exceeding the cap should still go into its own batch
+        entries = [(0, 5000)]
+        batches = self._split_batches(entries, max_tokens=4096)
+        assert len(batches) == 1
+        assert batches[0] == [(0, 5000)]
+
+    def test_preserves_all_entries(self):
+        entries = [(i, 1000) for i in range(10)]
+        batches = self._split_batches(entries, max_tokens=4096)
+        flat = [e for batch in batches for e in batch]
+        assert flat == entries
