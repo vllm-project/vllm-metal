@@ -119,7 +119,7 @@ def _metal_kernel_prefill_attention(
     # Causal SDPA
     # SCAFFOLDING: dense mask — remove when varlen kernel is ready.
     if ctx.cu_seqlens is not None and len(ctx.cu_seqlens) > 2:
-        attn_mask = build_packed_causal_mask(ctx.cu_seqlens, L).astype(queries.dtype)
+        attn_mask = build_packed_causal_mask(ctx.cu_seqlens, L, dtype=queries.dtype)
     else:
         attn_mask = "causal" if L > 1 else None
 

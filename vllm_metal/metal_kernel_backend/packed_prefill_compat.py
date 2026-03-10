@@ -13,6 +13,7 @@ import mlx.core as mx
 def build_packed_causal_mask(
     cu_seqlens: list[int],
     total_len: int,
+    dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
     """Build a block-diagonal causal mask for packed prefill.
 
@@ -21,16 +22,21 @@ def build_packed_causal_mask(
     allowed positions and ``-inf`` for blocked positions, suitable for
     ``mx.fast.scaled_dot_product_attention``.
 
+    Args:
+        dtype: Construct the mask directly in this dtype to avoid a
+            transient float32 allocation followed by a cast.
+
     SCAFFOLDING: remove when varlen kernel is ready.
     """
+    neg_inf = mx.array(-mx.inf, dtype=dtype)
     # Start with all-blocked, then open causal windows per request
-    mask = mx.full((total_len, total_len), -mx.inf)
+    mask = mx.full((total_len, total_len), neg_inf)
     for i in range(len(cu_seqlens) - 1):
         start = cu_seqlens[i]
         end = cu_seqlens[i + 1]
         seq_len = end - start
         # Causal mask for this request's tokens
-        causal = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1)
+        causal = mx.triu(mx.full((seq_len, seq_len), neg_inf), k=1)
         mask[start:end, start:end] = causal
     return mask.reshape(1, 1, total_len, total_len)
 

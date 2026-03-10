@@ -129,3 +129,44 @@ class TestPackedCausalMask:
         assert m[3, 2].item() == 0.0
         assert m[3, 3].item() == 0.0
         assert m[2, 3].item() == float("-inf")
+
+    def test_mask_dtype_matches_request(self):
+        import mlx.core as mx
+
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            build_packed_causal_mask,
+        )
+
+        mask = build_packed_causal_mask([0, 3], total_len=3, dtype=mx.bfloat16)
+        assert mask.dtype == mx.bfloat16
+
+
+class TestPackedRoPE:
+    """Tests for per-request RoPE position reset in packed prefill."""
+
+    def test_positions_reset_per_request(self):
+        """Each packed request's RoPE should start from position 0."""
+        import mlx.core as mx
+
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            apply_packed_rope,
+        )
+
+        # Minimal RoPE stub: returns input + offset so we can verify offsets
+        class FakeRoPE:
+            def rope(self, x, offset=0):
+                return x + offset
+
+        module = FakeRoPE()
+        # Two requests packed: 3 tokens + 2 tokens
+        # Shape: (1, heads=1, total_len=5, head_dim=2)
+        q = mx.zeros((1, 1, 5, 2))
+        k = mx.zeros((1, 1, 5, 2))
+        cu_seqlens = [0, 3, 5]
+
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens)
+
+        # All values should be 0 (offset=0 for every request)
+        assert q_out.shape == (1, 1, 5, 2)
+        assert mx.allclose(q_out, mx.zeros_like(q_out)).item()
+        assert mx.allclose(k_out, mx.zeros_like(k_out)).item()
