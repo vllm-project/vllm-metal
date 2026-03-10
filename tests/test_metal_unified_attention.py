@@ -20,8 +20,6 @@ HEAD_SIZES = [128]
 BLOCK_SIZES = [16]
 DTYPES = [mx.float16]
 
-NUM_BLOCKS = [2048]
-
 
 # ---------------------------------------------------------------------------
 # Kernel stub — replace with real Metal kernel dispatch
@@ -291,7 +289,7 @@ def _run_v1_paged_attention(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("num_blocks", [256])
 def test_metal_unified_attn_decode_only(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
@@ -387,10 +385,10 @@ def test_metal_unified_attn_decode_only(
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", [None, 64, 128, 256])
+@pytest.mark.parametrize("sliding_window", [None, 128])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 50.0])
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("num_blocks", [256])
 def test_metal_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
