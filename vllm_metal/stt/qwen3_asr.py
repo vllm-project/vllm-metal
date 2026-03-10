@@ -194,13 +194,20 @@ def _get_cnn_output_lengths(input_lengths: int | mx.array) -> int | mx.array:
     return lengths
 
 
-def _get_feat_extract_output_lengths(input_lengths: int) -> int:
+def _get_feat_extract_output_lengths(
+    input_lengths: int, n_window: int = 50
+) -> int:
     """Total audio token count for a mel with given number of time frames.
 
-    Accounts for chunking into windows of 100 and 3x Conv2d stride-2.
+    Accounts for chunking into windows of ``n_window * 2`` and 3x Conv2d
+    stride-2.
+
+    Args:
+        input_lengths: Number of mel time frames.
+        n_window: Window size from audio config (default: 50).
     """
-    chunk_size = 100  # n_window * 2
-    frames_per_full_chunk = _get_cnn_output_lengths(chunk_size)  # 13
+    chunk_size = n_window * 2
+    frames_per_full_chunk = _get_cnn_output_lengths(chunk_size)
     remainder = input_lengths % chunk_size
     full_chunks = input_lengths // chunk_size
     if remainder == 0:
@@ -532,7 +539,10 @@ class Qwen3LM(nn.Module):
             Qwen3DecoderLayer(config, dtype) for _ in range(config.num_hidden_layers)
         ]
         self.norm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def embed(self, token_ids: mx.array) -> mx.array:
         """Convert token IDs to embeddings."""
@@ -569,7 +579,10 @@ class Qwen3LM(nn.Module):
             new_cache.append(layer_cache)
 
         h = self.norm(h)
-        logits = self.lm_head(h)
+        if self.lm_head is not None:
+            logits = self.lm_head(h)
+        else:
+            logits = self.embed_tokens.as_linear(h)
         return logits, new_cache
 
 
@@ -690,6 +703,9 @@ class Qwen3ASRModel(nn.Module):
 
             # Map lm_head.* → language_model.lm_head.*
             if new_k.startswith("lm_head."):
+                # Skip lm_head when weights are tied to embed_tokens
+                if self.config.text_config.tie_word_embeddings:
+                    continue
                 new_k = "language_model." + new_k
 
             # Conv2d weight transpose: PyTorch NCHW (O,I,H,W) → MLX NHWC (O,H,W,I)

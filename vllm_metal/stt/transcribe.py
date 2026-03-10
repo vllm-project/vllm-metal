@@ -27,7 +27,11 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
-from vllm_metal.stt.config import WHISPER_MAX_DECODE_TOKENS, SpeechToTextConfig
+from vllm_metal.stt.config import (
+    QWEN3_ASR_MAX_DECODE_TOKENS,
+    WHISPER_MAX_DECODE_TOKENS,
+    SpeechToTextConfig,
+)
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
 
@@ -439,13 +443,14 @@ class Qwen3ASRTranscriber:
         Args:
             audio_features: Audio embeddings from the encoder.
             prompt_token_ids: Full prompt with audio_pad placeholders.
-            max_tokens: Maximum decode steps (default: 448).
+            max_tokens: Maximum decode steps
+                (default: :data:`QWEN3_ASR_MAX_DECODE_TOKENS`).
 
         Returns:
             Decoded token IDs (excluding prompt prefix, excluding EOS).
         """
         if max_tokens is None:
-            max_tokens = WHISPER_MAX_DECODE_TOKENS
+            max_tokens = QWEN3_ASR_MAX_DECODE_TOKENS
 
         if not prompt_token_ids:
             logger.warning("Empty prompt_token_ids; returning no tokens")
@@ -602,12 +607,17 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
     return _load_whisper_model(model_path, config_dict, dtype)
 
 
-def _load_whisper_model(
-    model_path: Path, config_dict: dict, dtype: mx.Dtype
-) -> WhisperModel:
-    """Load a Whisper model from config and weights."""
-    config = WhisperConfig.from_dict(config_dict)
-    model = WhisperModel(config, dtype)
+def _load_and_init_model(model, model_path: Path, config_dict: dict):
+    """Shared loader: quantize, sanitize, load weights, and eval.
+
+    Args:
+        model: Instantiated model with a ``sanitize`` method.
+        model_path: Path to weight files.
+        config_dict: Raw config.json dict (checked for ``quantization``).
+
+    Returns:
+        The model with weights loaded and evaluated.
+    """
     weights = _load_weights(model_path)
 
     quantization = config_dict.get("quantization")
@@ -622,6 +632,15 @@ def _load_whisper_model(
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model
+
+
+def _load_whisper_model(
+    model_path: Path, config_dict: dict, dtype: mx.Dtype
+) -> WhisperModel:
+    """Load a Whisper model from config and weights."""
+    config = WhisperConfig.from_dict(config_dict)
+    model = WhisperModel(config, dtype)
+    return _load_and_init_model(model, model_path, config_dict)
 
 
 def _load_qwen3_asr_model(model_path: Path, config_dict: dict, dtype: mx.Dtype):
@@ -630,20 +649,7 @@ def _load_qwen3_asr_model(model_path: Path, config_dict: dict, dtype: mx.Dtype):
 
     config = Qwen3ASRConfig.from_dict(config_dict)
     model = Qwen3ASRModel(config, dtype)
-    weights = _load_weights(model_path)
-
-    quantization = config_dict.get("quantization")
-    if quantization is not None:
-
-        def class_predicate(p, m):
-            return isinstance(m, (nn.Linear, nn.Embedding)) and f"{p}.scales" in weights
-
-        nn.quantize(model, **quantization, class_predicate=class_predicate)
-
-    weights = model.sanitize(weights)
-    model.load_weights(list(weights.items()), strict=False)
-    mx.eval(model.parameters())
-    return model
+    return _load_and_init_model(model, model_path, config_dict)
 
 
 # ===========================================================================

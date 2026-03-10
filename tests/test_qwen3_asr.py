@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import mlx.core as mx
 import pytest
 
+from vllm_metal.stt.config import is_stt_model
 from vllm_metal.stt.qwen3_asr import (
     AudioEncoder,
     Qwen3ASRAudioConfig,
@@ -17,6 +23,7 @@ from vllm_metal.stt.qwen3_asr import (
     _get_cnn_output_lengths,
     _get_feat_extract_output_lengths,
 )
+from vllm_metal.stt.transcribe import Qwen3ASRTranscriber, load_model
 
 # ===========================================================================
 # Configuration
@@ -283,12 +290,33 @@ class TestWeightSanitize:
         sanitized = model.sanitize(weights)
         assert "language_model.embed_tokens.weight" in sanitized
 
-    def test_maps_lm_head(self, model) -> None:
-        """'thinker.lm_head.*' should map to 'language_model.lm_head.*'."""
+    def test_skips_lm_head_when_tied(self, model) -> None:
+        """lm_head weights should be skipped when tie_word_embeddings=True."""
         weights = {
             "thinker.lm_head.weight": mx.zeros((100, 48)),
         }
         sanitized = model.sanitize(weights)
+        assert "language_model.lm_head.weight" not in sanitized
+
+    def test_maps_lm_head_when_untied(self) -> None:
+        """'thinker.lm_head.*' should map to 'language_model.lm_head.*' when untied."""
+        config = Qwen3ASRConfig(
+            text_config=Qwen3ASRTextConfig(
+                hidden_size=48,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=24,
+                intermediate_size=96,
+                vocab_size=100,
+                tie_word_embeddings=False,
+            ),
+        )
+        untied_model = Qwen3ASRModel(config, dtype=mx.float32)
+        weights = {
+            "thinker.lm_head.weight": mx.zeros((100, 48)),
+        }
+        sanitized = untied_model.sanitize(weights)
         assert "language_model.lm_head.weight" in sanitized
 
     def test_transposes_conv2d_weights(self, model) -> None:
@@ -442,20 +470,14 @@ class TestPostProcessOutput:
     """Tests for Qwen3ASRTranscriber.post_process_output."""
 
     def test_strips_asr_text_tag(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>Hello world"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_no_tag_passthrough(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "Hello world"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_empty_string(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         assert Qwen3ASRTranscriber.post_process_output("") == ""
 
 
@@ -468,32 +490,22 @@ class TestPostProcessOutputTruncation:
     """Tests for special token truncation in post_process_output."""
 
     def test_truncates_at_im_end(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>Hello world<|im_end|>"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_truncates_at_endoftext(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>Hello world<|endoftext|>"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_truncates_at_im_start(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>Hello world<|im_start|>system"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_multiple_asr_text_uses_last(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>wrong<asr_text>Hello world<|im_end|>"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
     def test_strips_whitespace(self) -> None:
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         text = "language english<asr_text>  Hello world  <|im_end|>"
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
@@ -509,10 +521,6 @@ class TestBuildPromptTokens:
     @pytest.fixture()
     def transcriber(self, tmp_path):
         """Create a transcriber with a mock tokenizer for prompt tests."""
-        from unittest.mock import MagicMock
-
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber
-
         config = Qwen3ASRConfig(
             audio_token_id=99,
             audio_start_token_id=97,
@@ -540,18 +548,27 @@ class TestBuildPromptTokens:
 
     def test_audio_pad_count_matches_frames(self, transcriber) -> None:
         """Number of audio_pad tokens should equal n_audio_frames."""
+        # Act
         prompt = transcriber.build_prompt_tokens(50)
+
+        # Assert
         audio_pad_count = prompt.count(99)  # audio_token_id
         assert audio_pad_count == 50
 
     def test_audio_pad_count_zero(self, transcriber) -> None:
         """Zero audio frames should produce no audio_pad tokens."""
+        # Act
         prompt = transcriber.build_prompt_tokens(0)
+
+        # Assert
         assert prompt.count(99) == 0
 
     def test_prompt_contains_structural_tokens(self, transcriber) -> None:
         """Prompt should contain audio_start, audio_end, im_start, user, assistant."""
+        # Act
         prompt = transcriber.build_prompt_tokens(5)
+
+        # Assert
         assert 97 in prompt  # audio_start
         assert 98 in prompt  # audio_end
         assert 10 in prompt  # im_start
@@ -560,10 +577,12 @@ class TestBuildPromptTokens:
 
     def test_prompt_structure_order(self, transcriber) -> None:
         """Audio tokens should be between audio_start and audio_end."""
+        # Act
         prompt = transcriber.build_prompt_tokens(3)
+
+        # Assert
         start_idx = prompt.index(97)  # audio_start
         end_idx = prompt.index(98)  # audio_end
-        # All audio_pad tokens should be between start and end
         for i, tok in enumerate(prompt):
             if tok == 99:
                 assert start_idx < i < end_idx
@@ -579,10 +598,6 @@ class TestConfigDetection:
 
     def test_qwen3_asr_detected(self, tmp_path) -> None:
         """qwen3_asr model_type should be detected as STT."""
-        import json
-
-        from vllm_metal.stt.config import is_stt_model
-
         config = {"model_type": "qwen3_asr"}
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert is_stt_model(str(tmp_path)) is True
@@ -595,31 +610,27 @@ class TestConfigDetection:
 
 @pytest.mark.slow
 class TestModelLoad:
-    """Tests that load the real Qwen3-ASR-0.6B model."""
+    """Tests that load the real Qwen3-ASR-0.6B model.
 
-    _MODEL_PATH = "/Volumes/MacPro/llm-dev/models/Qwen3-ASR-0.6B"
+    Set QWEN3_ASR_MODEL_PATH and QWEN3_ASR_AUDIO_PATH env vars to run.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _model_path(self):
+        path = os.environ.get("QWEN3_ASR_MODEL_PATH")
+        if not path:
+            pytest.skip("QWEN3_ASR_MODEL_PATH not set")
+        if not Path(path).exists():
+            pytest.skip(f"Model path does not exist: {path}")
+        self._MODEL_PATH = path
 
     def test_load_model(self) -> None:
         """Should load model without errors."""
-        from pathlib import Path
-
-        from vllm_metal.stt.transcribe import load_model
-
-        if not Path(self._MODEL_PATH).exists():
-            pytest.skip("Qwen3-ASR-0.6B model not available")
-
         model = load_model(self._MODEL_PATH)
         assert model.model_type == "qwen3_asr"
 
     def test_encode_dummy_mel(self) -> None:
         """Should encode a dummy mel spectrogram."""
-        from pathlib import Path
-
-        from vllm_metal.stt.transcribe import load_model
-
-        if not Path(self._MODEL_PATH).exists():
-            pytest.skip("Qwen3-ASR-0.6B model not available")
-
         model = load_model(self._MODEL_PATH)
         mel = mx.random.normal((128, 300))
         embeddings = model.encode(mel)
@@ -629,20 +640,14 @@ class TestModelLoad:
 
     def test_greedy_decode(self) -> None:
         """Should encode + decode a real audio file using WhisperFeatureExtractor."""
-        from pathlib import Path
-
         import numpy as np
         from transformers import WhisperFeatureExtractor
 
         from vllm_metal.stt.audio import load_audio
-        from vllm_metal.stt.transcribe import Qwen3ASRTranscriber, load_model
 
-        if not Path(self._MODEL_PATH).exists():
-            pytest.skip("Qwen3-ASR-0.6B model not available")
-
-        audio_path = "/Volumes/MacPro/llm-dev/stt-test.mp3"
-        if not Path(audio_path).exists():
-            pytest.skip("Test audio file not available")
+        audio_path = os.environ.get("QWEN3_ASR_AUDIO_PATH")
+        if not audio_path or not Path(audio_path).exists():
+            pytest.skip("QWEN3_ASR_AUDIO_PATH not set or file not found")
 
         model = load_model(self._MODEL_PATH)
         transcriber = Qwen3ASRTranscriber(model, model_path=self._MODEL_PATH)
