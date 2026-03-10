@@ -15,6 +15,15 @@ import pytest
 # TODO: import from vllm_metal.metal once the kernel is implemented
 # from vllm_metal.metal import metal_unified_attention
 
+# Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
+#   HEAD_SIZES = [128, 256]
+#   NUM_BLOCKS = [32768, 2048]
+#   sliding_window = [None, 64, 128, 256]
+#   DTYPES = [torch.bfloat16]
+#   Also tested: FP8 output quantization (QDTYPES), 3D decode kernel
+#     (SEQ_THRESHOLD_3D) — both CUDA-specific, omitted here.
+# Current sizes are reduced for Apple Silicon unified memory.
+# TODO: try head_size=256 and larger num_blocks as @pytest.mark.slow variants.
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128]
 BLOCK_SIZES = [16]
