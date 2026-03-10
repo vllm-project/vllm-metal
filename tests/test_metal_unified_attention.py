@@ -141,7 +141,7 @@ def ref_paged_attn(
 
 
 # ---------------------------------------------------------------------------
-# Triangle test: v1 kernel vs reference (decode-only)
+# Triangle edge: v1 == ref (decode-only)
 #
 # Validates that the v1 kernel and the pure-MLX reference produce the same
 # results for decode-only inputs.  This test runs TODAY (no v2 needed) and
@@ -228,7 +228,8 @@ def test_v1_kernel_vs_reference(
 
 
 # ---------------------------------------------------------------------------
-# Scaffolding: decode-only (q_len=1) — bridges v1 kernel to v2 unified API
+# Scaffolding
+# Triangle edge: v2 == v1 (decode-only scaffolding)
 #
 # Freezes parameters to the subset that the existing paged_attention_v1
 # already handles: every sequence has q_len=1, no sliding window, no
@@ -368,11 +369,7 @@ def test_metal_unified_attn_decode_only(
 
 
 # ---------------------------------------------------------------------------
-# Target: full varlen unified attention (v2 kernel)
-#
-# NOTE: fully expanded parametrization yields ~192 cases. Once the kernel is
-# implemented and tests actually compute, consider pruning or marking some
-# combinations (e.g. num_blocks=32768) as @pytest.mark.slow to keep CI fast.
+# Triangle edge: v2 == ref (full varlen unified attention)
 # ---------------------------------------------------------------------------
 
 
