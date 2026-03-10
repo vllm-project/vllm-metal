@@ -194,9 +194,7 @@ def _get_cnn_output_lengths(input_lengths: int | mx.array) -> int | mx.array:
     return lengths
 
 
-def _get_feat_extract_output_lengths(
-    input_lengths: int, n_window: int = 50
-) -> int:
+def _get_feat_extract_output_lengths(input_lengths: int, n_window: int = 50) -> int:
     """Total audio token count for a mel with given number of time frames.
 
     Accounts for chunking into windows of ``n_window * 2`` and 3x Conv2d
