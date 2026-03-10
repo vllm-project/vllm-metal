@@ -1950,26 +1950,52 @@ class MetalModelRunner:
 
         # Process collected complete paged prefill requests via unified
         # packed path (handles 1 or more requests).
+        # SCAFFOLDING: cap packed length to avoid O(N²) mask blowup.
+        # Remove when varlen kernel is ready.
+        max_packed_tokens = 4096
         if paged_complete:
-            pack_input = [
-                (rid, tids, sp, bids, gen, None)
-                for _, rid, tids, sp, bids, gen in paged_complete
-            ]
-            next_tokens = self._prefill_packed_paged(pack_input)
-            for i, (idx, rid, tids, sp, bids, gen) in enumerate(paged_complete):
-                nt = next_tokens[i]
-                sampled_tokens[idx] = [nt]
-                self._request_states[rid] = RequestState(
-                    token_ids=list(tids) + [nt],
-                    prompt_len=len(tids),
-                    cache=[],
-                    sampling_params=sp,
-                    generator=gen,
-                    generated_tokens=1,
-                    block_ids=bids,
-                )
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.add_request(rid, list(tids) + [nt])
+            # Split into batches that fit within the packed-length cap.
+            batches: list[
+                list[
+                    tuple[
+                        int,
+                        str,
+                        list[int],
+                        SamplingParams,
+                        list[int],
+                        torch.Generator | None,
+                    ]
+                ]
+            ] = [[]]
+            batch_tokens = 0
+            for entry in paged_complete:
+                entry_tokens = len(entry[2])  # token_ids
+                if batch_tokens + entry_tokens > max_packed_tokens and batches[-1]:
+                    batches.append([])
+                    batch_tokens = 0
+                batches[-1].append(entry)
+                batch_tokens += entry_tokens
+
+            for batch in batches:
+                pack_input = [
+                    (rid, tids, sp, bids, gen, None)
+                    for _, rid, tids, sp, bids, gen in batch
+                ]
+                next_tokens = self._prefill_packed_paged(pack_input)
+                for i, (idx, rid, tids, sp, bids, gen) in enumerate(batch):
+                    nt = next_tokens[i]
+                    sampled_tokens[idx] = [nt]
+                    self._request_states[rid] = RequestState(
+                        token_ids=list(tids) + [nt],
+                        prompt_len=len(tids),
+                        cache=[],
+                        sampling_params=sp,
+                        generator=gen,
+                        generated_tokens=1,
+                        block_ids=bids,
+                    )
+                    if self._rust_state_manager is not None:
+                        self._rust_state_manager.add_request(rid, list(tids) + [nt])
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
         cached_reqs = scheduler_output.scheduled_cached_reqs
