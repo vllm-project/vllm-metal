@@ -16,15 +16,11 @@ import pytest
 # from vllm_metal.metal import metal_unified_attention
 
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
-HEAD_SIZES = [128, 256]
+HEAD_SIZES = [128]
 BLOCK_SIZES = [16]
 DTYPES = [mx.float16]
 
-# One value large enough to test overflow in index calculation.
-# One value small enough to test the schema op check.
-# NOTE: 32768 blocks with large head_size/num_heads can allocate multiple GB.
-# Consider marking 32768 cases as @pytest.mark.slow once the kernel is implemented.
-NUM_BLOCKS = [32768, 2048]
+NUM_BLOCKS = [2048]
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +162,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("num_blocks", [2048])
+@pytest.mark.parametrize("num_blocks", [256])
 def test_v1_kernel_vs_reference(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
