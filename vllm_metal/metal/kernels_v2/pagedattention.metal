@@ -756,6 +756,34 @@ inline float block_sum(threadgroup float *red_smem, float sum, uint simd_tid,
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
+// Binary search to find which sequence a global query token belongs to.
+//
+// In varlen (ragged-batch) attention, queries from multiple sequences are
+// packed contiguously into a flat array:
+//   q[0..q_len_0-1]  → seq 0,  q[q_len_0..q_len_0+q_len_1-1]  → seq 1, ...
+// The kernel launches one threadgroup per (head, query_token) in a flat grid.
+// Each threadgroup needs to discover which sequence it belongs to so it can
+// look up the correct block_table row, kv_len, and causal mask boundary.
+//
+// This is the same approach used by the upstream vLLM unified Triton kernel
+// (triton_unified_attention.py:find_seq_idx) and FlashAttention's varlen API.
+//
+// cu_seqlens_q is sorted ascending: [0, q_len_0, q_len_0+q_len_1, ...].
+// Returns seq_idx such that cu_seqlens_q[seq_idx] <= q_token_idx < cu_seqlens_q[seq_idx+1].
+inline int find_seq_idx(const device int32_t *cu_seqlens_q,
+                        int q_token_idx, int num_seqs) {
+  int lo = 0, hi = num_seqs;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) / 2;
+    if (cu_seqlens_q[mid] <= q_token_idx) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
 constant bool use_partitioning [[function_constant(10)]];
 constant bool use_alibi [[function_constant(20)]];
 constant bool use_fp8_scales [[function_constant(30)]];
@@ -795,24 +823,41 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     const constant int &kv_head_stride [[buffer(17)]],
     const device float *sinks
     [[buffer(18), function_constant(use_sinks)]], // [num_heads]
+    device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
+    const constant int &num_seqs [[buffer(20)]],
+    const constant int &sliding_window [[buffer(21)]],  // -1 = disabled
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint simd_tid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  const int seq_idx = threadgroup_position_in_grid.y;
+  // Varlen: each threadgroup handles one query token.
+  // Use binary search on cu_seqlens_q to find which sequence it belongs to.
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int seq_idx = find_seq_idx(cu_seqlens_q, q_token_idx, num_seqs);
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int q_pos_in_seq = q_token_idx - q_seq_start;
   const int partition_idx = threadgroup_position_in_grid.z;
   const int max_num_partitions = threadgroups_per_grid.z;
   const int thread_idx = thread_position_in_threadgroup.x;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const uint32_t context_len = context_lens[seq_idx];
-  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= context_len) {
+  const uint32_t context_len = context_lens[seq_idx];  // total KV length for this seq
+
+  // Causal: this query token can attend to KV positions [0, effective_context_len).
+  const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
+  if (effective_context_len <= 0) {
+    // No KV tokens to attend to — output zeros (handled naturally by loop not executing).
+    return;
+  }
+
+  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= effective_context_len) {
     // No work to do. Terminate the thread block.
     return;
   }
 
-  const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
+  const int num_context_blocks = DIVIDE_ROUND_UP(effective_context_len, BLOCK_SIZE);
   const int num_blocks_per_partition =
       USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
@@ -867,7 +912,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // For example, if the thread group size is 4, then the first thread in the
   // group has 0, 4, 8, ... th vectors of the query, and the second thread has
   // 1, 5, 9, ... th vectors of the query, and so on.
-  const device T *q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
+  const device T *q_ptr = q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
   threadgroup Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
 #pragma unroll
   for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
@@ -960,10 +1005,15 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       }
 
       qk +=
-          (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;
+          (alibi_slope != 0) ? alibi_slope * (token_idx - effective_context_len + 1) : 0;
 
       if (thread_group_offset == 0) {
-        const bool mask = token_idx >= context_len;
+        // Causal mask: only attend to KV positions < effective_context_len.
+        bool mask = token_idx >= effective_context_len;
+        // Sliding window mask: skip positions too far in the past.
+        if (sliding_window >= 0) {
+          mask = mask || (token_idx < effective_context_len - sliding_window);
+        }
         warp_scores[physical_block_offset] = mask ? -FLT_MAX : qk;
       }
     }
@@ -981,7 +1031,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     // Valid tokens in this block:
     const int block_start_token = block_idx * BLOCK_SIZE;
     const int block_valid_tokens =
-        MIN(BLOCK_SIZE, (int)context_len - block_start_token);
+        MIN(BLOCK_SIZE, effective_context_len - block_start_token);
 
     // Find max score in this block (all lanes participate for speed).
     float block_max = -FLT_MAX;
@@ -1143,7 +1193,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     const float inv_l = 1.f / (warp_l + 1e-6f);
 
     device T *out_ptr =
-        out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
     for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
@@ -1313,6 +1363,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const constant int &kv_block_stride [[buffer(16)]],                      \
       const constant int &kv_head_stride [[buffer(17)]],                       \
       const device float *sinks [[buffer(18), function_constant(use_sinks)]],  \
+      device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
+      const constant int &num_seqs [[buffer(20)]],                             \
+      const constant int &sliding_window [[buffer(21)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \

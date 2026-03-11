@@ -332,9 +332,6 @@ def test_metal_unified_attn_decode_only(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="v2 Metal kernel not yet implemented"
-)
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )

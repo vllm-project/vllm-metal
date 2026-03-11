@@ -139,7 +139,7 @@ def _metal_kernel_prefill_attention(
 
 
 # ---------------------------------------------------------------------------
-# Decode attention (reshape_and_cache + paged_attention_v1)
+# Decode attention (reshape_and_cache + paged_attention_v2_online)
 # ---------------------------------------------------------------------------
 
 
@@ -155,7 +155,7 @@ def _metal_kernel_decode_attention(
     """Batched decode: B=batch_size, L=1.
 
     Per-request RoPE, write new token via ``reshape_and_cache``,
-    then zero-copy attention via ``paged_attention_v1``.
+    then zero-copy attention via ``paged_attention_v2_online``.
     """
     B = queries.shape[0]  # noqa: N806
     n_heads = queries.shape[1]
@@ -211,21 +211,28 @@ def _metal_kernel_decode_attention(
     max_seq_len = max(ctx.context_lens)
     scale = attn_module.scale
 
-    # Zero-copy paged attention
-    ops.paged_attention_v1(
+    # Build cu_seqlens_q for varlen dispatch: decode has q_len=1 per sequence.
+    cu_seqlens_q = mx.array(list(range(B + 1)), dtype=mx.int32)
+    mx.eval(cu_seqlens_q)
+
+    # Zero-copy paged attention (v2, online softmax, varlen-capable)
+    ops.paged_attention_v2_online(
         out,
         q_3d,
         cache.key_caches[layer_idx],
         cache.value_caches[layer_idx],
         cache.num_kv_heads,
         scale,
+        0.0,           # softcap (0 = disabled)
         block_tables,
         seq_lens,
+        cu_seqlens_q,
         cache.block_size,
         max_seq_len,
+        -1,            # sliding_window (-1 = disabled)
     )
 
-    # Synchronize GPU: paged_attention_v1 wrote to out's buffer via a raw
+    # Synchronize GPU: paged_attention_v2_online wrote to out's buffer via a raw
     # Metal dispatch that MLX's lazy graph doesn't track.  mx.eval(out) would
     # be a no-op here (out was already evaluated as zeros), so we must use
     # mx.synchronize() to flush the command encoder and wait for the kernel.
