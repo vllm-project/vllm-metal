@@ -204,9 +204,7 @@ class TestLoadModel:
 
     def test_unknown_model_type_raises(self, tmp_path: Path) -> None:
         """Unknown model_type values should not fall through to Whisper."""
-        (tmp_path / "config.json").write_text(
-            json.dumps({"model_type": "mystery_stt"})
-        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "mystery_stt"}))
 
         with pytest.raises(ValueError, match="Unsupported STT model_type"):
             load_model(tmp_path)
