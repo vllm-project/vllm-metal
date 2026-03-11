@@ -31,6 +31,68 @@ _KERNELS_DIR = _THIS_DIR / "kernels_v1"
 _ops_module: ModuleType | None = None
 
 
+def metal_unified_attention(
+    q,               # [total_q_tokens, num_q_heads, head_size]
+    k,               # [num_blocks, block_size, num_kv_heads, head_size]
+    v,               # [num_blocks, block_size, num_kv_heads, head_size]
+    out,             # [total_q_tokens, num_q_heads, head_size]
+    cu_seqlens_q,    # [num_seqs + 1], int32
+    seqused_k,       # [num_seqs], int32
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    block_table,     # [num_seqs, max_blocks_per_seq], int32
+    softcap: float,
+) -> None:
+    """Unified varlen paged attention for Metal.
+
+    Step 1 (decode-only): delegates to the v1 paged_attention kernel.
+    All sequences must have q_len=1. Sliding window and softcap are
+    not yet supported and must be disabled (window_size=(-1,-1), softcap=0).
+
+    This function will be replaced by a native v2 Metal kernel that
+    supports variable-length queries (prefill + decode) with online softmax.
+    """
+    import mlx.core as mx
+
+    assert max_seqlen_q == 1, (
+        f"metal_unified_attention Step 1 only supports decode (max_seqlen_q=1), "
+        f"got {max_seqlen_q}"
+    )
+    assert window_size == (-1, -1), (
+        f"Sliding window not yet supported, got window_size={window_size}"
+    )
+    assert softcap == 0, (
+        f"Soft capping not yet supported, got softcap={softcap}"
+    )
+
+    # Extract dimensions from cache shape
+    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
+    num_kv_heads = k.shape[2]
+    block_size = k.shape[1]
+
+    ops = get_ops()
+
+    # Ensure all inputs are evaluated before raw Metal dispatch
+    mx.eval(out, q, k, v, block_table, seqused_k)
+
+    ops.paged_attention_v1(
+        out,
+        q,
+        k,
+        v,
+        num_kv_heads,
+        softmax_scale,
+        block_table,
+        seqused_k,       # same as seq_lens in v1
+        block_size,
+        max_seqlen_k,    # same as max_seq_len in v1
+    )
+    mx.synchronize()
+
+
 def _read_metal_source(path: Path) -> str:
     """Read a .metal file and strip local #include directives."""
     text = path.read_text()
