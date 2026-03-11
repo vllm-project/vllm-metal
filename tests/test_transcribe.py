@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 from vllm_metal.stt.transcribe import (
     _MAX_PROMPT_TOKENS,
     TranscriptionResult,
     WhisperTranscriber,
+    load_model,
 )
 
 # ===========================================================================
@@ -167,17 +170,11 @@ class TestLoadModel:
 
     def test_missing_config_json(self, tmp_path: Path) -> None:
         """Should raise FileNotFoundError when config.json is absent."""
-        from vllm_metal.stt.transcribe import load_model
-
         with pytest.raises(FileNotFoundError, match="config.json not found"):
             load_model(tmp_path)
 
     def test_missing_weight_files(self, tmp_path: Path) -> None:
         """Should raise FileNotFoundError when no weight files exist."""
-        import json
-
-        from vllm_metal.stt.transcribe import load_model
-
         config = {
             "n_mels": 80,
             "n_audio_ctx": 10,
@@ -193,6 +190,25 @@ class TestLoadModel:
         (tmp_path / "config.json").write_text(json.dumps(config))
 
         with pytest.raises(FileNotFoundError, match="No weight files"):
+            load_model(tmp_path)
+
+    def test_empty_model_path_raises(self) -> None:
+        """Whitespace-only model paths should fail fast."""
+        with pytest.raises(ValueError, match="model_path"):
+            load_model("   ")
+
+    def test_invalid_dtype_raises(self, tmp_path: Path) -> None:
+        """Non-floating dtypes are rejected before any file I/O."""
+        with pytest.raises(TypeError, match="Unsupported STT model dtype"):
+            load_model(tmp_path, dtype=mx.int32)
+
+    def test_unknown_model_type_raises(self, tmp_path: Path) -> None:
+        """Unknown model_type values should not fall through to Whisper."""
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "mystery_stt"})
+        )
+
+        with pytest.raises(ValueError, match="Unsupported STT model_type"):
             load_model(tmp_path)
 
 
