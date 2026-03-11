@@ -57,16 +57,19 @@ def metal_unified_attention(
     """
     import mlx.core as mx
 
-    assert max_seqlen_q == 1, (
-        f"metal_unified_attention Step 1 only supports decode (max_seqlen_q=1), "
-        f"got {max_seqlen_q}"
-    )
-    assert window_size == (-1, -1), (
-        f"Sliding window not yet supported, got window_size={window_size}"
-    )
-    assert softcap == 0, (
-        f"Soft capping not yet supported, got softcap={softcap}"
-    )
+    if max_seqlen_q != 1:
+        raise NotImplementedError(
+            f"metal_unified_attention Step 1 only supports decode (max_seqlen_q=1), "
+            f"got {max_seqlen_q}"
+        )
+    if window_size != (-1, -1):
+        raise NotImplementedError(
+            f"Sliding window not yet supported, got window_size={window_size}"
+        )
+    if softcap != 0:
+        raise NotImplementedError(
+            f"Soft capping not yet supported, got softcap={softcap}"
+        )
 
     # Extract dimensions from cache shape
     # k shape: [num_blocks, block_size, num_kv_heads, head_size]
