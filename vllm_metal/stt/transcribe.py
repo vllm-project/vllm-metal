@@ -273,8 +273,7 @@ class WhisperTranscriber:
                 f"Unsupported STT task: {task!r}. Must be one of {supported}."
             )
 
-        is_multilingual = getattr(self.model, "is_multilingual", True)
-        if is_multilingual:
+        if self.model.is_multilingual:
             return validate_language(language, default=None), task
 
         resolved_language = validate_language(language, default=None)
@@ -331,7 +330,6 @@ class WhisperTranscriber:
         Returns:
             List of decoded token IDs (excluding special prefix).
         """
-        language, task = self._resolve_decode_options(language, task)
         if max_tokens is None:
             max_tokens = (
                 WHISPER_MAX_DECODE_TOKENS if with_timestamps else _MAX_PROMPT_TOKENS
@@ -339,7 +337,7 @@ class WhisperTranscriber:
 
         prefix = self._encode_prompt(prompt)
         prefix.append(self._get_token_id("<|startoftranscript|>"))
-        if getattr(self.model, "is_multilingual", True):
+        if self.model.is_multilingual:
             prefix.append(self._get_token_id(f"<|{language or 'en'}|>"))
             prefix.append(self._get_token_id(f"<|{task}|>"))
         if not with_timestamps:

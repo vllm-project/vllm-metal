@@ -57,7 +57,6 @@ class TestSpeechToTextConfig:
                 "overlap_chunk_second",
             ),
             ({"min_energy_split_window_size": 0}, "min_energy_split_window_size"),
-            ({"sample_rate": 0}, "sample_rate"),
         ],
     )
     def test_invalid_values_raise(

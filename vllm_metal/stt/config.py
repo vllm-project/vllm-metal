@@ -84,8 +84,6 @@ class SpeechToTextConfig:
             raise ValueError("overlap_chunk_second must be < max_audio_clip_s")
         if self.min_energy_split_window_size <= 0:
             raise ValueError("min_energy_split_window_size must be > 0")
-        if self.sample_rate <= 0:
-            raise ValueError("sample_rate must be > 0")
 
 
 def is_stt_model(model_path: str) -> bool:
