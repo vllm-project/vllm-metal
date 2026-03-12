@@ -12,10 +12,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # STT model types that can be auto-detected from config.json
-_STT_MODEL_TYPES = {"whisper"}
+_STT_MODEL_TYPES = {"whisper", "qwen3_asr"}
 
 # Maximum decode tokens for Whisper models (matches Whisper's context window).
 WHISPER_MAX_DECODE_TOKENS = 448
+
+# Maximum decode tokens for Qwen3-ASR models.
+QWEN3_ASR_MAX_DECODE_TOKENS = 1024
 
 # Nominal memory reported to vLLM scheduler for STT models.
 # No KV cache is actually allocated; this just passes minimum-memory checks.

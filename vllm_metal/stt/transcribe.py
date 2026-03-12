@@ -27,9 +27,16 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
-from vllm_metal.stt.config import WHISPER_MAX_DECODE_TOKENS, SpeechToTextConfig
+from vllm_metal.stt.config import (
+    QWEN3_ASR_MAX_DECODE_TOKENS,
+    WHISPER_MAX_DECODE_TOKENS,
+    SpeechToTextConfig,
+)
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
+
+# Tag used by Qwen3-ASR to wrap transcription text
+_ASR_TEXT_TAG = "<asr_text>"
 
 logger = logging.getLogger(__name__)
 
@@ -398,26 +405,166 @@ class WhisperTranscriber:
 
 
 # ===========================================================================
+# Qwen3-ASR Transcriber
+# ===========================================================================
+
+
+class Qwen3ASRTranscriber:
+    """Transcriber for Qwen3-ASR models.
+
+    Handles prompt construction with audio_pad tokens,
+    embedding injection, and greedy autoregressive decoding.
+
+    Args:
+        model: Loaded :class:`Qwen3ASRModel`.
+        model_path: Path to model directory (for tokenizer loading).
+    """
+
+    def __init__(self, model, model_path: str | None = None):
+        self.model = model
+        self.model_path = model_path
+        self._tokenizer = None
+
+    @property
+    def tokenizer(self):
+        """Lazily-loaded tokenizer (Qwen2Tokenizer via AutoTokenizer)."""
+        if self._tokenizer is None:
+            self._tokenizer = _load_qwen3_asr_tokenizer(self.model_path)
+        return self._tokenizer
+
+    def greedy_decode_tokens(
+        self,
+        audio_features: mx.array,
+        prompt_token_ids: list[int],
+        max_tokens: int | None = None,
+    ) -> list[int]:
+        """Greedy autoregressive decode with audio embedding injection.
+
+        Args:
+            audio_features: Audio embeddings from the encoder.
+            prompt_token_ids: Full prompt with audio_pad placeholders.
+            max_tokens: Maximum decode steps
+                (default: :data:`QWEN3_ASR_MAX_DECODE_TOKENS`).
+
+        Returns:
+            Decoded token IDs (excluding prompt prefix, excluding EOS).
+        """
+        if max_tokens is None:
+            max_tokens = QWEN3_ASR_MAX_DECODE_TOKENS
+
+        if not prompt_token_ids:
+            logger.warning("Empty prompt_token_ids; returning no tokens")
+            return []
+
+        eos_token = self.model.config.eos_token_id
+        tokens = mx.array([prompt_token_ids], dtype=mx.int32)
+
+        # Prefill with audio embedding injection
+        logits, cache = self.model.prefill(tokens, audio_features)
+        mx.eval(logits)
+
+        output_tokens: list[int] = []
+        next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+        if next_token == eos_token:
+            return output_tokens
+        output_tokens.append(next_token)
+
+        # Autoregressive decode
+        for _ in range(max_tokens - 1):
+            token_input = mx.array([[next_token]], dtype=mx.int32)
+            logits, cache = self.model.decode_step(token_input, cache)
+            mx.eval(logits)
+            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            if next_token == eos_token:
+                break
+            output_tokens.append(next_token)
+
+        return output_tokens
+
+    def build_prompt_tokens(self, n_audio_frames: int) -> list[int]:
+        """Build prompt token IDs with audio placeholders.
+
+        Format: ``<|im_start|>user\\n<|audio_start|>{N*audio_pad}<|audio_end|>\\n<|im_end|>\\n<|im_start|>assistant\\n``
+
+        Args:
+            n_audio_frames: Number of audio_pad tokens to insert.
+
+        Returns:
+            List of token IDs.
+        """
+        tok = self.tokenizer
+        audio_pad_id = self.model.config.audio_token_id
+        audio_start_id = self.model.config.audio_start_token_id
+        audio_end_id = self.model.config.audio_end_token_id
+
+        # Encode structural tokens
+        im_start = tok.encode("<|im_start|>", add_special_tokens=False)
+        im_end = tok.encode("<|im_end|>", add_special_tokens=False)
+        user = tok.encode("user\n", add_special_tokens=False)
+        assistant = tok.encode("assistant\n", add_special_tokens=False)
+        newline = tok.encode("\n", add_special_tokens=False)
+
+        prompt = (
+            im_start
+            + user
+            + [audio_start_id]
+            + [audio_pad_id] * n_audio_frames
+            + [audio_end_id]
+            + newline
+            + im_end
+            + newline
+            + im_start
+            + assistant
+        )
+        return prompt
+
+    @staticmethod
+    def post_process_output(text: str) -> str:
+        """Strip ``language {lang}<asr_text>`` prefix and trailing tags."""
+        if not text:
+            return ""
+        if _ASR_TEXT_TAG not in text:
+            return text
+        _, text_part = text.rsplit(_ASR_TEXT_TAG, 1)
+        # Truncate at first special token marker
+        for marker in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
+            idx = text_part.find(marker)
+            if idx >= 0:
+                text_part = text_part[:idx]
+        return text_part.strip()
+
+
+# ===========================================================================
 # Model loading
 # ===========================================================================
 
 
-def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16) -> WhisperModel:
-    """Load a Whisper model from a local directory or HuggingFace repo.
+def _read_config(model_path: Path) -> dict:
+    """Read and return config.json from a model directory."""
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found in {model_path}")
+    with open(config_path) as f:
+        return json.load(f)
 
-    Args:
-        model_path: Local path or HuggingFace repo ID.
-        dtype: Model dtype (default: float16).
 
-    Returns:
-        Loaded :class:`WhisperModel` ready for inference.
+def _load_weights(model_path: Path) -> dict[str, mx.array]:
+    """Load model weights from safetensors or npz files."""
+    weight_files = sorted(model_path.glob("*.safetensors"))
+    if not weight_files:
+        weight_files = sorted(model_path.glob("*.npz"))
+    if not weight_files:
+        raise FileNotFoundError(f"No weight files in {model_path}")
 
-    Raises:
-        ValueError: If the model cannot be found or downloaded.
-        FileNotFoundError: If config.json or weight files are missing.
-    """
+    weights: dict[str, mx.array] = {}
+    for wf in weight_files:
+        weights.update(mx.load(str(wf)))
+    return weights
+
+
+def _resolve_model_path(model_path: str | Path) -> Path:
+    """Resolve model path, downloading from HF if needed."""
     model_path = Path(model_path)
-
     if not model_path.exists():
         try:
             from huggingface_hub import snapshot_download
@@ -430,29 +577,49 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16) -> WhisperM
             ) from e
         except OSError as e:
             raise ValueError(f"Could not download model: {model_path}") from e
+    return model_path
 
-    config_path = model_path / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"config.json not found in {model_path}")
 
-    with open(config_path) as f:
-        config_dict = json.load(f)
+def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
+    """Load an STT model from a local directory or HuggingFace repo.
 
-    config = WhisperConfig.from_dict(config_dict)
-    model = WhisperModel(config, dtype)
+    Auto-detects model type from config.json and dispatches to the
+    appropriate loader (Whisper or Qwen3-ASR).
 
-    # Load weights — prefer safetensors over npz
-    weight_files = sorted(model_path.glob("*.safetensors"))
-    if not weight_files:
-        weight_files = sorted(model_path.glob("*.npz"))
-    if not weight_files:
-        raise FileNotFoundError(f"No weight files in {model_path}")
+    Args:
+        model_path: Local path or HuggingFace repo ID.
+        dtype: Model dtype (default: float16).
 
-    weights: dict[str, mx.array] = {}
-    for wf in weight_files:
-        weights.update(mx.load(str(wf)))
+    Returns:
+        Loaded model ready for inference.
 
-    # Apply quantization if specified in config
+    Raises:
+        ValueError: If the model type is unsupported or download fails.
+        FileNotFoundError: If config.json or weight files are missing.
+    """
+    model_path = _resolve_model_path(model_path)
+    config_dict = _read_config(model_path)
+    model_type = config_dict.get("model_type", "").lower()
+
+    if model_type == "qwen3_asr":
+        return _load_qwen3_asr_model(model_path, config_dict, dtype)
+    # Default to Whisper for backward compatibility
+    return _load_whisper_model(model_path, config_dict, dtype)
+
+
+def _load_and_init_model(model, model_path: Path, config_dict: dict):
+    """Shared loader: quantize, sanitize, load weights, and eval.
+
+    Args:
+        model: Instantiated model with a ``sanitize`` method.
+        model_path: Path to weight files.
+        config_dict: Raw config.json dict (checked for ``quantization``).
+
+    Returns:
+        The model with weights loaded and evaluated.
+    """
+    weights = _load_weights(model_path)
+
     quantization = config_dict.get("quantization")
     if quantization is not None:
 
@@ -465,6 +632,24 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16) -> WhisperM
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model
+
+
+def _load_whisper_model(
+    model_path: Path, config_dict: dict, dtype: mx.Dtype
+) -> WhisperModel:
+    """Load a Whisper model from config and weights."""
+    config = WhisperConfig.from_dict(config_dict)
+    model = WhisperModel(config, dtype)
+    return _load_and_init_model(model, model_path, config_dict)
+
+
+def _load_qwen3_asr_model(model_path: Path, config_dict: dict, dtype: mx.Dtype):
+    """Load a Qwen3-ASR model from config and weights."""
+    from vllm_metal.stt.qwen3_asr import Qwen3ASRConfig, Qwen3ASRModel
+
+    config = Qwen3ASRConfig.from_dict(config_dict)
+    model = Qwen3ASRModel(config, dtype)
+    return _load_and_init_model(model, model_path, config_dict)
 
 
 # ===========================================================================
@@ -498,6 +683,29 @@ def _load_tokenizer(model_path: str | None = None):
         return WhisperTokenizer.from_pretrained(
             "openai/whisper-small", local_files_only=True
         )
+
+
+def _load_qwen3_asr_tokenizer(model_path: str | None = None):
+    """Load a Qwen3-ASR tokenizer (Qwen2Tokenizer via AutoTokenizer).
+
+    Args:
+        model_path: Local model directory with tokenizer files.
+
+    Returns:
+        A tokenizer instance.
+    """
+    from transformers import AutoTokenizer
+
+    if model_path:
+        try:
+            return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        except (OSError, ValueError) as e:
+            logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
+
+    raise ValueError(
+        "Qwen3-ASR requires a local tokenizer. "
+        "Provide a model_path with tokenizer files."
+    )
 
 
 # ===========================================================================

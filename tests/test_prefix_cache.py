@@ -93,6 +93,41 @@ class TestPrefixCacheHybridGuard:
         insert_spy.assert_called_once()
 
 
+class TestPrefixCacheRestoreOffset:
+    class _KVCacheWithoutOffsetSideEffect:
+        def __init__(self) -> None:
+            self._state: list[mx.array | None] = [None, None]
+            self.offset = 0
+
+        @property
+        def state(self) -> list[mx.array | None]:
+            return self._state
+
+        @state.setter
+        def state(self, value: list[mx.array]) -> None:
+            # Intentionally does not mutate offset.
+            self._state = value
+
+    def test_restore_cache_sets_offset_explicitly(self, monkeypatch) -> None:
+        def fake_make_prompt_cache(_model):
+            return [self._KVCacheWithoutOffsetSideEffect()]
+
+        monkeypatch.setattr(mr, "KVCache", self._KVCacheWithoutOffsetSideEffect)
+        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+
+        k = mx.zeros((1, 2, 7, 8), dtype=mx.float32)
+        v = mx.zeros((1, 2, 7, 8), dtype=mx.float32)
+        cached = mr.CachedPrefix(token_ids=[1, 2, 3], cache_state=[(k, v)])
+
+        manager = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        restored = manager.restore_cache(cached, model=MagicMock(), is_vlm=False)
+
+        restored_layer = restored[0]
+        assert restored_layer.offset == 7
+        assert bool(mx.allclose(restored_layer.state[0], k))
+        assert bool(mx.allclose(restored_layer.state[1], v))
+
+
 class TestHybridCacheMergeExtract:
     """Regression tests for hybrid (KV + ArraysCache) batching.
 

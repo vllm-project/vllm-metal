@@ -68,6 +68,10 @@ import mlx.nn as nn
 
 from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
+from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+    apply_packed_rope,
+    build_packed_causal_mask,
+)
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
     find_layers_and_attr,
@@ -89,25 +93,36 @@ def _metal_kernel_prefill_attention(
     ctx: PagedAttentionContext,
     offset_cache: Any,
 ) -> mx.array:
-    """Prefill: B=1, L=prompt_len.
+    """Prefill: B=1, L=prompt_len (single) or L=total_tokens (packed).
 
     Inline causal SDPA in MLX, then write K/V to paged cache via
-    ``reshape_and_cache``.
+    ``reshape_and_cache``.  When ``ctx.cu_seqlens`` is set, builds a
+    block-diagonal causal mask so packed requests don't cross-attend.
     """
     B, _, L, _ = queries.shape  # noqa: N806
 
-    # RoPE
+    # RoPE — per-request position reset for packed prefill
     if not hasattr(attn_module, "rope"):
         raise NotImplementedError(
             f"Attention module {type(attn_module).__name__} does not have a 'rope' "
             "attribute. Only RoPE-based models are supported by paged attention."
         )
-    offset = offset_cache.offset if offset_cache is not None else 0
-    queries = attn_module.rope(queries, offset=offset)
-    keys = attn_module.rope(keys, offset=offset)
 
-    # Causal SDPA (inline — K/V already in hand)
-    attn_mask = "causal" if L > 1 else None
+    # SCAFFOLDING: packed RoPE + mask — remove when varlen kernel is ready.
+    if ctx.cu_seqlens is not None:
+        queries, keys = apply_packed_rope(attn_module, queries, keys, ctx.cu_seqlens)
+    else:
+        offset = offset_cache.offset if offset_cache is not None else 0
+        queries = attn_module.rope(queries, offset=offset)
+        keys = attn_module.rope(keys, offset=offset)
+
+    # Causal SDPA
+    # SCAFFOLDING: dense mask — remove when varlen kernel is ready.
+    if ctx.cu_seqlens is not None and len(ctx.cu_seqlens) > 2:
+        attn_mask = build_packed_causal_mask(ctx.cu_seqlens, L, dtype=queries.dtype)
+    else:
+        attn_mask = "causal" if L > 1 else None
+
     output = mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=attn_module.scale, mask=attn_mask
     )
