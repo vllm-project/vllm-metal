@@ -12,8 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-# TODO: import from vllm_metal.metal once the kernel is implemented
-# from vllm_metal.metal import metal_unified_attention
+from vllm_metal.metal import metal_unified_attention
 
 # Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
 #   HEAD_SIZES = [128, 256]
@@ -28,52 +27,6 @@ NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128]
 BLOCK_SIZES = [16]
 DTYPES = [mx.float16]
-
-
-# ---------------------------------------------------------------------------
-# Kernel stub — replace with real Metal kernel dispatch
-# ---------------------------------------------------------------------------
-
-
-def metal_unified_attention(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    out: mx.array,
-    cu_seqlens_q: mx.array,
-    seqused_k: mx.array,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    causal: bool,
-    window_size: tuple[int, int],
-    block_table: mx.array,
-    softcap: float,
-) -> None:
-    """Unified varlen paged attention for Metal.
-
-    Handles both prefill (q_len > 1) and decode (q_len = 1) sequences
-    packed into a single batch via cu_seqlens_q.
-
-    Args:
-        q: Query tensor       [total_q_tokens, num_q_heads, head_size]
-        k: Key cache           [num_blocks, block_size, num_kv_heads, head_size]
-        v: Value cache         [num_blocks, block_size, num_kv_heads, head_size]
-        out: Output tensor     [total_q_tokens, num_q_heads, head_size]
-        cu_seqlens_q: Cumulative query lengths [num_seqs + 1], int32
-        seqused_k: KV lengths  [num_seqs], int32
-        max_seqlen_q: Maximum query length in batch
-        max_seqlen_k: Maximum KV length in batch
-        softmax_scale: Scale factor (typically head_size ** -0.5)
-        causal: Whether to apply causal masking
-        window_size: (left, right) sliding window; (-1, -1) = no window
-        block_table: Block indices [num_seqs, max_blocks_per_seq], int32
-        softcap: Soft capping value; 0 = disabled
-    """
-    raise NotImplementedError(
-        "metal_unified_attention not yet implemented. "
-        "Build the Metal kernel to make this test pass."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +238,6 @@ def _run_v1_paged_attention(
     return out
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="v2 Metal kernel not yet implemented"
-)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -382,9 +332,6 @@ def test_metal_unified_attn_decode_only(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="v2 Metal kernel not yet implemented"
-)
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
@@ -409,6 +356,13 @@ def test_metal_unified_attn(
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
+
+    # xfail cases that need features not yet in the v2 kernel:
+    # varlen (q_len > 1), sliding window, or soft capping.
+    # Decode-only cases with no extras already work and should pass.
+    max_query_len_val = max(query_lens)
+    if max_query_len_val > 1 or sliding_window is not None or soft_cap is not None:
+        pytest.xfail("v2 varlen/sliding-window/soft-cap not yet implemented")
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0

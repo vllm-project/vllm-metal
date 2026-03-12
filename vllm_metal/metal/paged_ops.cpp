@@ -26,6 +26,7 @@ using namespace mlx::core;
 
 static std::string reshape_cache_source_;
 static std::string paged_attention_source_;
+static std::string v2_paged_attention_source_;
 
 void init_libraries(
     const std::string& reshape_src,
@@ -40,6 +41,14 @@ void init_libraries(
   d.get_library(
       "paged_attention_kern",
       [&]() { return paged_attention_source_; });
+}
+
+void init_v2_library(const std::string& v2_src) {
+  v2_paged_attention_source_ = v2_src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library(
+      "paged_attention_v2_kern",
+      [&]() { return v2_paged_attention_source_; });
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +255,114 @@ void paged_attention_v1_impl(
 }
 
 // ---------------------------------------------------------------------------
+// paged_attention_v2_online — dispatches the online-softmax v2 kernel
+// ---------------------------------------------------------------------------
+
+void paged_attention_v2_online_impl(
+    nb::handle out_h,
+    nb::handle query_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    int num_kv_heads,
+    float scale,
+    nb::handle block_tables_h,
+    nb::handle seq_lens_h,
+    int block_size,
+    int max_seq_len
+) {
+  auto& out          = *nb::inst_ptr<array>(out_h);
+  auto& query        = *nb::inst_ptr<array>(query_h);
+  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
+  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
+
+  auto s = default_stream(Device::gpu);
+  auto& d = metal::device(Device::gpu);
+
+  int num_seqs   = static_cast<int>(query.shape(0));
+  int num_heads  = static_cast<int>(query.shape(1));
+  int head_size  = static_cast<int>(query.shape(2));
+  int max_blocks = static_cast<int>(block_tables.shape(1));
+
+  // Same kernel name format as v1 — the template instantiation is identical.
+  auto dt = dtype_to_metal(query.dtype());
+  std::string kname =
+      "paged_attention_" + dt + "_cache_" + dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size) +
+      "_nt256_nsl32_ps0";
+
+  bool use_partitioning = false;
+  bool use_alibi        = false;
+  bool use_fp8          = false;
+  bool use_sinks        = false;
+
+  // Use the v2 library (online softmax kernel).
+  // get_kernel(function_name, library, cache_key, constants)
+  // Cache key must differ from v1 to avoid collision in MLX's kernel cache.
+  auto* lib = d.get_library("paged_attention_v2_kern");
+  auto* kernel = d.get_kernel(
+      kname, lib, kname + "_v2",
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
+       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+
+  // Threadgroup shared memory for online softmax:
+  // During KV loop: NUM_WARPS * BLOCK_SIZE floats (per-warp score buffer)
+  // During merge: 2*NUM_WARPS floats (m, l) + NUM_WARPS * HEAD_SIZE floats (O)
+  constexpr int NUM_THREADS    = 256;
+  constexpr int NUM_SIMD_LANES = 32;
+  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
+  int warp_scores_bytes = NUM_WARPS * block_size
+                          * static_cast<int>(sizeof(float));
+  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
+                    * static_cast<int>(sizeof(float));
+  size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
+
+  auto& enc = d.get_command_encoder(s.index);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  // Buffer bindings — identical to v1.
+  enc.set_output_array(out,         2);
+  enc.set_input_array(query,        3);
+  enc.set_input_array(key_cache,    4);
+  enc.set_input_array(value_cache,  5);
+
+  int32_t nkv = static_cast<int32_t>(num_kv_heads);
+  enc.set_bytes(nkv,   8);
+  enc.set_bytes(scale, 9);
+  float softcapping = 1.0f;
+  enc.set_bytes(softcapping, 10);
+
+  enc.set_input_array(block_tables, 11);
+  enc.set_input_array(seq_lens,     12);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
+  enc.set_bytes(max_blocks_i, 13);
+
+  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
+  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
+  enc.set_bytes(q_stride,        15);
+  enc.set_bytes(kv_block_stride, 16);
+  enc.set_bytes(kv_head_stride,  17);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, num_seqs, 1),
+      MTL::Size::Make(NUM_THREADS, 1, 1));
+
+  d.add_temporary(out, s.index);
+  d.add_temporary(query, s.index);
+  d.add_temporary(key_cache, s.index);
+  d.add_temporary(value_cache, s.index);
+  d.add_temporary(block_tables, s.index);
+  d.add_temporary(seq_lens, s.index);
+}
+
+// ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
 
@@ -253,6 +370,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_libraries", &init_libraries,
         nb::arg("reshape_src"), nb::arg("paged_attn_src"),
         "JIT-compile the vendored Metal shaders.");
+
+  m.def("init_v2_library", &init_v2_library,
+        nb::arg("v2_src"),
+        "JIT-compile the v2 online-softmax Metal shader.");
 
   m.def("reshape_and_cache", &reshape_and_cache_impl,
         nb::arg("key"), nb::arg("value"),
@@ -267,4 +388,12 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
         "Zero-copy paged attention (v1, no partitioning).");
+
+  m.def("paged_attention_v2_online", &paged_attention_v2_online_impl,
+        nb::arg("out"), nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        "Online-softmax paged attention (v2, decode-only).");
 }

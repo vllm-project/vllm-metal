@@ -878,34 +878,56 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Use fp32 on softmax logits for better accuracy
-  threadgroup float *logits = reinterpret_cast<threadgroup float *>(shared_mem);
-  // Workspace for reduction
+  // Workspace for cross-warp reduction of online softmax state.
+  // Layout: [NUM_WARPS] for m, [NUM_WARPS] for l, then HEAD_SIZE floats
+  // for the tree reduction of O accumulators.
   threadgroup float red_smem[2 * NUM_WARPS];
 
   // Token stride within a block: num_kv_heads * HEAD_SIZE
   const int kv_token_stride = num_kv_heads * HEAD_SIZE;
-  float qk_max = -FLT_MAX;
 
-  // Iterate over the key blocks.
-  // Each warp fetches a block of keys for each iteration.
-  // Each thread group in a warp fetches a key from the block, and computes
-  // dot product with the query.
+  // ========== Online softmax: per-warp state ==========
+  // Each warp maintains its own running (m, l, O) across its KV blocks.
+  // m = running max of QK scores (for numerical stability)
+  // l = running sum of exp(score - m) (softmax denominator)
+  // O = running unnormalized output accumulator
+  float warp_m = -FLT_MAX;  // running max
+  float warp_l = 0.f;       // running exp sum
+
+  constexpr int V_ELEMS_PER_THREAD =
+      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_SIMD_LANES);
+  float v_accs[V_ELEMS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+    v_accs[i] = 0.f;
+  }
+
+  // ========== Fused QK + online softmax + V accumulation ==========
+  // Each warp processes a subset of KV blocks. Within each block, we:
+  //   1. Compute QK dot products (same thread-group mechanism as v1)
+  //   2. Collect scores for this block into a per-warp buffer
+  //   3. Update online softmax state (m, l) and rescale O
+  //   4. Accumulate weighted V into O
+  //
+  // The scores for one KV block (up to BLOCK_SIZE floats per warp) are
+  // stored in threadgroup memory. Each warp uses its own slice so there
+  // are no conflicts between warps.
+  threadgroup float *warp_scores =
+      reinterpret_cast<threadgroup float *>(shared_mem) +
+      warp_idx * BLOCK_SIZE;
+
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
+
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
        block_idx += NUM_WARPS) {
-    // NOTE: The block number is stored in int32. However, we cast it to int64
-    // because int32 can lead to overflow when this variable is multiplied by
-    // large numbers (e.g., kv_block_stride).
     const int64_t physical_block_number =
         static_cast<int64_t>(block_table[block_idx]);
 
-    // Load a key to registers.
-    // Each thread in a thread group has a different part of the key.
-    // For example, if the thread group size is 4, then the first thread in the
-    // group has 0, 4, 8, ... th vectors of the key, and the second thread has
-    // 1, 5, 9, ... th vectors of the key, and so on.
+    // --- Step 1: Compute QK scores for this block ---
+    // The QK dot product uses "thread groups" (sub-warp groups) where
+    // each thread group cooperatively computes the dot product for one
+    // KV token. Only thread_group_offset==0 holds the final score.
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
       const int physical_block_offset =
           (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
@@ -914,8 +936,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
-        // head_size is contiguous — direct vector load
         const device CACHE_T *k_ptr =
             k_cache + physical_block_number * kv_block_stride +
             physical_block_offset * kv_token_stride +
@@ -923,133 +943,84 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
 
         if constexpr (is_uchar<CACHE_T>()) {
-          // FP8 support
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + vec_idx * VEC_SIZE);
           k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
         } else {
-          // Non-FP8 default
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
               k_ptr + vec_idx * VEC_SIZE);
         }
       }
 
-      // Compute dot product.
-      // This includes a reduction across the threads in the same thread group.
       float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                              q_vecs[thread_group_offset], k_vecs);
 
-      // Apply softcapping
       if (softcapping != 1.0) {
         qk = tanh(qk / softcapping) * softcapping;
       }
 
-      // Add the ALiBi bias if slopes are given.
       qk +=
           (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;
 
       if (thread_group_offset == 0) {
-        // Store the partial reductions to shared memory.
-        // NOTE: It is required to zero out the masked logits.
         const bool mask = token_idx >= context_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
-        // Update the max value.
-        qk_max = mask ? qk_max : max(qk_max, qk);
+        warp_scores[physical_block_offset] = mask ? -FLT_MAX : qk;
       }
     }
-  }
 
-  // Perform reduction across the threads in the same warp to get the
-  // max qk value for each "warp" (not across the thread block yet).
-  // The 0-th thread of each thread group already has its max qk value.
+    // Ensure all scores for this block are written before reading them.
+    // Each warp writes/reads its own warp_scores slice, so we only need
+    // intra-SIMD-group visibility. Using simdgroup_barrier (not
+    // threadgroup_barrier) because warps may have different iteration
+    // counts in the warp-strided loop — threadgroup_barrier would be UB.
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Step 2: Online softmax update ---
+    // Find block-local max (only lane 0 of each thread group has scores,
+    // but for V accumulation ALL lanes need the weights, so we broadcast).
+    // Valid tokens in this block:
+    const int block_start_token = block_idx * BLOCK_SIZE;
+    const int block_valid_tokens =
+        MIN(BLOCK_SIZE, (int)context_len - block_start_token);
+
+    // Find max score in this block (all lanes participate for speed).
+    float block_max = -FLT_MAX;
+    for (int t = lane; t < block_valid_tokens; t += NUM_SIMD_LANES) {
+      block_max = max(block_max, warp_scores[t]);
+    }
+    // Reduce max within the warp.
 #pragma unroll
-  for (int mask = NUM_SIMD_LANES / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
-    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
-  }
-  if (lane == 0) {
-    red_smem[warp_idx] = qk_max;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+      block_max = max(block_max, simd_shuffle_xor(block_max, mask));
+    }
 
-  // Get the max qk value for the sequence.
-  qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+    // Compute correction factor to rescale previous state.
+    float new_m = max(warp_m, block_max);
+    // NaN-safe: if new_m is still -inf (all masked), clamp to 0.
+    if (new_m == -FLT_MAX) new_m = 0.f;
+
+    float old_correction = exp(warp_m - new_m);
+    // If warp_m was -FLT_MAX (first iteration), correction = 0, which
+    // correctly zeroes out the (already zero) previous O and l.
+    if (warp_m == -FLT_MAX) old_correction = 0.f;
+
+    // Rescale running state.
 #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
-  }
-  // Broadcast the max qk value to all threads.
-  qk_max = simd_shuffle(qk_max, 0);
+    for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+      v_accs[i] *= old_correction;
+    }
+    warp_l *= old_correction;
+    warp_m = new_m;
 
-  // For non-partitioned (V1) mode, include the sink in the max.
-  // For V2 (partitioned), the sink is handled once in the reduce kernel.
-  if (!USE_PARTITIONING && use_sinks) {
-    qk_max = max(qk_max, sinks[head_idx]);
-  }
+    // --- Step 3: Compute exp weights and accumulate V ---
+    // For each valid token in this block, compute its softmax weight
+    // (unnormalized) and accumulate into O.
+    for (int tok = 0; tok < block_valid_tokens; tok++) {
+      const float score = warp_scores[tok];
+      const float w = exp(score - warp_m);
+      warp_l += w;
 
-  // Get the sum of the exp values.
-  float exp_sum = 0.f;
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    float val = exp(logits[i] - qk_max);
-    logits[i] = val;
-    exp_sum += val;
-  }
-  exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
-                                                 simd_tid, simd_lid);
-
-  // For non-partitioned (V1) mode, include the sink in the exp sum.
-  if (!USE_PARTITIONING && use_sinks) {
-    exp_sum += exp(sinks[head_idx] - qk_max);
-  }
-
-  // Compute softmax.
-  const float inv_sum = 1.f / (exp_sum + 1e-6f);
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    logits[i] *= inv_sum;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // If partitioning is enabled, store the max logit and exp_sum.
-  if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
-    device float *max_logits_ptr =
-        max_logits + seq_idx * num_heads * max_num_partitions +
-        head_idx * max_num_partitions + partition_idx;
-    *max_logits_ptr = qk_max;
-    device float *exp_sums_ptr = exp_sums +
-                                 seq_idx * num_heads * max_num_partitions +
-                                 head_idx * max_num_partitions + partition_idx;
-    *exp_sums_ptr = exp_sum;
-  }
-
-  // ========== V accumulation ==========
-  // Token-outer, head_dim-inner loop (matches the new cache layout where
-  // head_size is contiguous per token).
-  //
-  // Each SIMD lane owns a fixed set of head_dim elements:
-  //   lane l owns elements at indices: l, l+NUM_SIMD_LANES, l+2*NUM_SIMD_LANES, ...
-  // No intra-warp reduction is needed — each lane independently accumulates
-  // its own output elements.
-  constexpr int V_ELEMS_PER_THREAD =
-      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_SIMD_LANES);
-
-  // NOTE: We use FP32 for the accumulator for better accuracy.
-  float v_accs[V_ELEMS_PER_THREAD];
-#pragma unroll
-  for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
-    v_accs[i] = 0.f;
-  }
-
-  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
-       block_idx += NUM_WARPS) {
-    const int64_t physical_block_number =
-        static_cast<int64_t>(block_table[block_idx]);
-
-    for (int tok = 0; tok < BLOCK_SIZE; tok++) {
-      const int token_idx = block_idx * BLOCK_SIZE + tok;
-      if (token_idx >= context_len) break;
-
-      const float logit_val = logits[token_idx - start_token_idx];
-
-      // V cache layout: [num_blocks, block_size, num_kv_heads, head_size]
+      // Load V and accumulate: O += w * V
       const device CACHE_T *v_ptr =
           v_cache + physical_block_number * kv_block_stride +
           tok * kv_token_stride +
@@ -1065,51 +1036,112 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
           } else {
             v_val = float(v_ptr[d]);
           }
-          v_accs[i] += logit_val * v_val;
+          v_accs[i] += w * v_val;
         }
       }
     }
+
+    // Barrier before next iteration reuses warp_scores.
+    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // NOTE: A barrier is required because the shared memory space for logits
-  // is reused for the output.
+  // Ensure all warps have finished the KV loop before reusing shared_mem
+  // for the merge. Without this barrier, early-exiting warps could write
+  // merge state into shared_mem regions still used as warp_scores by
+  // slower warps (the memory aliases).
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Perform reduction across warps.
-  threadgroup float *out_smem =
-      reinterpret_cast<threadgroup float *>(shared_mem);
-#pragma unroll
-  for (int i = NUM_WARPS; i > 1; i /= 2) {
-    int mid = i / 2;
-    // Upper warps write to shared memory.
-    if (warp_idx >= mid && warp_idx < i) {
-      threadgroup float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
-#pragma unroll
-      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
-        const int d = lane + j * NUM_SIMD_LANES;
-        if (d < HEAD_SIZE) {
-          dst[d] = v_accs[j];
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  // ========== Cross-warp merge of online softmax state ==========
+  // Each warp has its own (warp_m, warp_l, v_accs[]). We merge by having
+  // all warps write their state to shared memory, then warp 0 reads and
+  // merges sequentially. Simple and barrier-safe (all barriers are
+  // reached by all threads in the threadgroup).
 
-    // Lower warps update the output.
-    if (warp_idx < mid) {
-      const threadgroup float *src = &out_smem[warp_idx * HEAD_SIZE];
-#pragma unroll
-      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
-        const int d = lane + j * NUM_SIMD_LANES;
-        if (d < HEAD_SIZE) {
-          v_accs[j] += src[d];
-        }
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  // If partitioning is enabled, store the partial result for the reduce kernel.
+  if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
+    device float *max_logits_ptr =
+        max_logits + seq_idx * num_heads * max_num_partitions +
+        head_idx * max_num_partitions + partition_idx;
+    *max_logits_ptr = warp_m;
+    device float *exp_sums_ptr = exp_sums +
+                                 seq_idx * num_heads * max_num_partitions +
+                                 head_idx * max_num_partitions + partition_idx;
+    *exp_sums_ptr = warp_l;
   }
 
-  // Write the final output.
+  // For non-partitioned mode, include the sink in each warp's state.
+  if (!USE_PARTITIONING && use_sinks) {
+    float sink_val = sinks[head_idx];
+    float new_m = max(warp_m, sink_val);
+    float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp(warp_m - new_m);
+#pragma unroll
+    for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+      v_accs[i] *= old_corr;
+    }
+    warp_l = warp_l * old_corr + exp(sink_val - new_m);
+    warp_m = new_m;
+  }
+
+  // Shared memory layout for merge:
+  //   merge_m[NUM_WARPS]: per-warp max values
+  //   merge_l[NUM_WARPS]: per-warp exp sums
+  //   merge_O[NUM_WARPS * HEAD_SIZE]: per-warp O accumulators
+  threadgroup float *merge_m =
+      reinterpret_cast<threadgroup float *>(shared_mem);
+  threadgroup float *merge_l = merge_m + NUM_WARPS;
+  threadgroup float *merge_O =
+      reinterpret_cast<threadgroup float *>(shared_mem) + 2 * NUM_WARPS;
+
+  // All warps write their state to shared memory.
+  if (lane == 0) {
+    merge_m[warp_idx] = warp_m;
+    merge_l[warp_idx] = warp_l;
+  }
+  // Each warp writes its O accumulator.
+  {
+    threadgroup float *my_O = &merge_O[warp_idx * HEAD_SIZE];
+#pragma unroll
+    for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+      const int d = lane + j * NUM_SIMD_LANES;
+      if (d < HEAD_SIZE) {
+        my_O[d] = v_accs[j];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Warp 0 reads all warp states and merges sequentially.
   if (warp_idx == 0) {
+    // Start with warp 0's state (already in v_accs, warp_m, warp_l).
+    // Merge warps 1..NUM_WARPS-1 into it.
+    for (int w = 1; w < NUM_WARPS; w++) {
+      float other_m = merge_m[w];
+      float other_l = merge_l[w];
+
+      // Skip warps that processed no blocks (m == -FLT_MAX).
+      if (other_m == -FLT_MAX && other_l == 0.f) continue;
+
+      float new_m = max(warp_m, other_m);
+      if (new_m == -FLT_MAX) new_m = 0.f;
+
+      float my_corr = (warp_m == -FLT_MAX) ? 0.f : exp(warp_m - new_m);
+      float other_corr = (other_m == -FLT_MAX) ? 0.f : exp(other_m - new_m);
+
+      const threadgroup float *other_O = &merge_O[w * HEAD_SIZE];
+#pragma unroll
+      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+        const int d = lane + j * NUM_SIMD_LANES;
+        if (d < HEAD_SIZE) {
+          v_accs[j] = v_accs[j] * my_corr + other_O[d] * other_corr;
+        }
+      }
+      warp_m = new_m;
+      warp_l = warp_l * my_corr + other_l * other_corr;
+    }
+
+    // Final normalization: O = O / l
+    const float inv_l = 1.f / (warp_l + 1e-6f);
+
     device T *out_ptr =
         out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
@@ -1117,7 +1149,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
       const int d = lane + j * NUM_SIMD_LANES;
       if (d < HEAD_SIZE) {
-        *(out_ptr + d) = T(v_accs[j]);
+        *(out_ptr + d) = T(v_accs[j] * inv_l);
       }
     }
   }

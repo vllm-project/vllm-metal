@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_DIR = _THIS_DIR / "kernels_v1"
+_KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
@@ -59,6 +60,78 @@ def _build_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
+def _build_v2_paged_attention_source() -> str:
+    """Concatenate float8 + utils + v2 paged_attention (online softmax)."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "float8.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
+    ]
+    return "\n".join(parts)
+
+
+def metal_unified_attention(
+    q,  # [total_q_tokens, num_q_heads, head_size]
+    k,  # [num_blocks, block_size, num_kv_heads, head_size]
+    v,  # [num_blocks, block_size, num_kv_heads, head_size]
+    out,  # [total_q_tokens, num_q_heads, head_size]
+    cu_seqlens_q,  # [num_seqs + 1], int32
+    seqused_k,  # [num_seqs], int32
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    block_table,  # [num_seqs, max_blocks_per_seq], int32
+    softcap: float,
+) -> None:
+    """Unified varlen paged attention for Metal.
+
+    Currently supports decode-only (max_seqlen_q=1). Sliding window and
+    soft capping are not yet supported. These will be enabled when the v2
+    kernel is extended to handle variable-length queries (prefill + decode).
+    """
+    import mlx.core as mx
+
+    if max_seqlen_q != 1:
+        raise NotImplementedError(
+            f"metal_unified_attention only supports decode (max_seqlen_q=1), "
+            f"got {max_seqlen_q}"
+        )
+    if window_size != (-1, -1):
+        raise NotImplementedError(
+            f"Sliding window not yet supported, got window_size={window_size}"
+        )
+    if softcap != 0:
+        raise NotImplementedError(
+            f"Soft capping not yet supported, got softcap={softcap}"
+        )
+
+    # Extract dimensions from cache shape
+    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
+    num_kv_heads = k.shape[2]
+    block_size = k.shape[1]
+
+    ops = get_ops()
+
+    # Ensure all inputs are evaluated before raw Metal dispatch
+    mx.eval(out, q, k, v, block_table, seqused_k)
+
+    ops.paged_attention_v2_online(
+        out,
+        q,
+        k,
+        v,
+        num_kv_heads,
+        softmax_scale,
+        block_table,
+        seqused_k,
+        block_size,
+        max_seqlen_k,
+    )
+    mx.synchronize()
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 
@@ -90,6 +163,10 @@ def get_ops() -> ModuleType:
     reshape_src = _build_reshape_cache_source()
     paged_attn_src = _build_paged_attention_source()
     mod.init_libraries(reshape_src, paged_attn_src)
+
+    # 4. Initialise v2 library (online softmax kernel)
+    v2_src = _build_v2_paged_attention_source()
+    mod.init_v2_library(v2_src)
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
