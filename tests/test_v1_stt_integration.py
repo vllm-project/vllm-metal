@@ -185,7 +185,10 @@ class TestSamplingParamsValidation:
         """Non-zero temperature should raise ValueError."""
         runner = _make_runner()
         non_greedy = SamplingParams(temperature=0.7)
-        req = _make_new_req(sampling_params=non_greedy, mm_features=None)
+        req = _make_new_req(
+            sampling_params=non_greedy,
+            mm_features=_make_valid_mm_features(),
+        )
         sched = _make_scheduler_output(new_reqs=[req])
 
         with pytest.raises(ValueError, match="greedy"):
@@ -238,6 +241,16 @@ class TestExecuteSTTProtocol:
         sched = _make_scheduler_output(new_reqs=[req])
 
         with pytest.raises(ValueError, match="broken-req"):
+            self._run_stt(runner, sched)
+
+    def test_missing_req_id_uses_adapter_error(self) -> None:
+        """Missing req_id should raise the adapter validation error."""
+        runner = _make_runner()
+        req = _make_new_req(mm_features=_make_valid_mm_features())
+        del req.req_id
+        sched = _make_scheduler_output(new_reqs=[req])
+
+        with pytest.raises(ValueError, match="missing req_id"):
             self._run_stt(runner, sched)
 
     def test_encode_valueerror_propagates(self) -> None:

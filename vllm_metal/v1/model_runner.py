@@ -2283,7 +2283,7 @@ class MetalModelRunner:
         eot_token = self._stt_executor.eot_token
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            req_id = new_req.req_id
+            stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
             sampling_params = new_req.sampling_params or SamplingParams()
 
             # Only greedy decoding is supported for STT
@@ -2293,7 +2293,6 @@ class MetalModelRunner:
                     f"Got temperature={sampling_params.temperature}"
                 )
 
-            stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
             audio_features = self._stt_executor.extract_audio_features(
                 stt_request.input_features
             )
