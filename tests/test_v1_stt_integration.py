@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections import UserDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,27 +15,15 @@ vllm = pytest.importorskip("vllm", reason="vllm not installed")
 
 from vllm.sampling_params import SamplingParams  # noqa: E402
 
+from vllm_metal.stt.audio import (  # noqa: E402
+    N_FRAMES,
+    SAMPLE_RATE,
+    log_mel_spectrogram,
+    pad_or_trim,
+)
 from vllm_metal.stt.config import STT_SCHED_BLOCK_BYTES  # noqa: E402
-from vllm_metal.v1.model_runner import STTExecutor  # noqa: E402
-
-# ===========================================================================
-# Helpers
-# ===========================================================================
-
-
-def _make_executor() -> STTExecutor:
-    """Create a STTExecutor with a mock model and pre-cached transcriber."""
-    model = MagicMock()
-    executor = STTExecutor(model, "/fake/model/path")
-
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.convert_tokens_to_ids.return_value = 50257
-    mock_transcriber = MagicMock()
-    mock_transcriber.tokenizer = mock_tokenizer
-    mock_transcriber.greedy_decode_tokens.return_value = [100, 200]
-    executor._transcriber = mock_transcriber
-
-    return executor
+from vllm_metal.stt.transcribe import load_model  # noqa: E402
+from vllm_metal.v1.model_runner import MetalModelRunner, STTExecutor  # noqa: E402
 
 
 class _StubRunner:
@@ -47,17 +34,15 @@ class _StubRunner:
     Only the fields consumed by ``_execute_stt`` are initialised.
     """
 
-    from vllm_metal.v1.model_runner import MetalModelRunner
-
-    # Inherit the real method — no __get__ rebinding needed.
     _execute_stt = MetalModelRunner._execute_stt
 
-    def __init__(self) -> None:
+    def __init__(self, executor: STTExecutor) -> None:
         self._is_stt = True
         self.model = MagicMock()
+        self.model.encode = MagicMock(return_value=mx.ones((1, 1500, 512)))
         self._request_states: dict = {}
         self._pending_output = None
-        self._stt_executor = _make_executor()
+        self._stt_executor = executor
         self._stt_executor.model = self.model
 
     @property
@@ -65,13 +50,31 @@ class _StubRunner:
         return self._is_stt
 
 
+def _make_executor() -> STTExecutor:
+    model = MagicMock()
+    model.encode = MagicMock(return_value=mx.ones((1, 1500, 512)))
+    executor = STTExecutor(model, "/fake/model/path")
+
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.convert_tokens_to_ids.return_value = 50257
+    mock_transcriber = MagicMock()
+    mock_transcriber.tokenizer = mock_tokenizer
+    mock_transcriber.greedy_decode_tokens.return_value = [100, 200]
+    executor._transcriber = mock_transcriber
+    return executor
+
+
+def _make_valid_mm_features() -> list[dict[str, np.ndarray]]:
+    return [{"input_features": np.zeros((80, 3000), dtype=np.float32)}]
+
+
 def _make_runner() -> _StubRunner:
-    """Create a lightweight runner stub with STT enabled."""
-    return _StubRunner()
+    return _StubRunner(_make_executor())
 
 
-def _make_scheduler_output(new_reqs=None, finished_req_ids=None, cached_req_ids=None):
-    """Create a minimal SchedulerOutput-like object."""
+def _make_scheduler_output(
+    new_reqs=None, finished_req_ids=None, cached_req_ids=None
+) -> SimpleNamespace:
     out = SimpleNamespace()
     out.scheduled_new_reqs = new_reqs or []
     out.finished_req_ids = finished_req_ids or set()
@@ -82,12 +85,11 @@ def _make_scheduler_output(new_reqs=None, finished_req_ids=None, cached_req_ids=
 
 
 def _make_new_req(
-    req_id="req-1",
+    req_id: str = "req-1",
     prompt_token_ids=None,
     sampling_params=None,
     mm_features=None,
-):
-    """Create a minimal new request object."""
+) -> SimpleNamespace:
     req = SimpleNamespace()
     req.req_id = req_id
     req.prompt_token_ids = prompt_token_ids or [50258, 50259, 50359]
@@ -96,23 +98,19 @@ def _make_new_req(
     return req
 
 
-# ===========================================================================
-# TestSTTExecutorDecode
-# ===========================================================================
-
-
 class TestSTTExecutorDecode:
     """Tests for STTExecutor.decode (delegates to transcriber)."""
 
     def test_empty_prompt_returns_eot(self) -> None:
         """Empty prompt should return just the EOT token."""
         executor = _make_executor()
+
         result = executor.decode(
             audio_features=mx.zeros((1, 10, 80)),
             prompt_token_ids=[],
         )
+
         assert result == [50257]
-        # greedy_decode_tokens should NOT be called for empty prompts
         executor._transcriber.greedy_decode_tokens.assert_not_called()
 
     def test_delegates_to_transcriber(self) -> None:
@@ -124,6 +122,7 @@ class TestSTTExecutorDecode:
             audio_features=mx.zeros((1, 10, 80)),
             prompt_token_ids=[50258],
         )
+
         assert result == [100, 200, 50257]
         executor._transcriber.greedy_decode_tokens.assert_called_once()
 
@@ -136,45 +135,12 @@ class TestSTTExecutorDecode:
             audio_features=mx.zeros((1, 10, 80)),
             prompt_token_ids=[50258],
         )
+
         assert result[-1] == 50257
 
 
-# ===========================================================================
-# TestExtractAudioFeatures
-# ===========================================================================
-
-
 class TestExtractAudioFeatures:
-    """Tests for STTExecutor.extract_audio_features error paths."""
-
-    def test_missing_mm_features_returns_none(self) -> None:
-        """Request without mm_features should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=None)
-        del req.mm_features  # completely absent
-        result = executor.extract_audio_features(req)
-        assert result is None
-
-    def test_empty_list_returns_none(self) -> None:
-        """Empty mm_features list should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=[])
-        result = executor.extract_audio_features(req)
-        assert result is None
-
-    def test_wrong_type_returns_none(self) -> None:
-        """Non-dict first element should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=["not-a-dict"])
-        result = executor.extract_audio_features(req)
-        assert result is None
-
-    def test_missing_key_returns_none(self) -> None:
-        """Dict without 'input_features' key should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=[{"other_key": np.zeros((80, 3000))}])
-        result = executor.extract_audio_features(req)
-        assert result is None
+    """Tests for STTExecutor.extract_audio_features."""
 
     def test_valid_numpy_input(self) -> None:
         """Valid numpy input should return encoded features."""
@@ -183,61 +149,33 @@ class TestExtractAudioFeatures:
         executor.model.encode = MagicMock(return_value=encoded)
 
         mel = np.zeros((80, 3000), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+
+        result = executor.extract_audio_features(mel)
+
         assert result is not None
         executor.model.encode.assert_called_once()
 
 
-# ===========================================================================
-# TestMalformedMMFeatures
-# ===========================================================================
 
 
-class TestMalformedMMFeatures:
-    """Additional error path coverage for mm_features handling."""
-
-    def test_none_attribute(self) -> None:
-        """mm_features=None should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=None)
-        result = executor.extract_audio_features(req)
-        assert result is None
-
-    def test_non_list_type(self) -> None:
-        """mm_features that isn't a list should return None."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features="not-a-list")
-        result = executor.extract_audio_features(req)
-        assert result is None
-
-    def test_list_of_none(self) -> None:
-        """mm_features=[None] should return None (not a dict)."""
-        executor = _make_executor()
-        req = _make_new_req(mm_features=[None])
-        result = executor.extract_audio_features(req)
-        assert result is None
+class TestExtractAudioFeatureValidation:
+    """Validation of normalized STT input features."""
 
     def test_1d_mel_raises_valueerror(self) -> None:
         """1D mel input should raise ValueError (expected 2D or 3D)."""
         executor = _make_executor()
         mel = np.zeros((3000,), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
+
         with pytest.raises(ValueError, match="rank"):
-            executor.extract_audio_features(req)
+            executor.extract_audio_features(mel)
 
     def test_4d_mel_raises_valueerror(self) -> None:
         """4D mel input should raise ValueError (expected 2D or 3D)."""
         executor = _make_executor()
         mel = np.zeros((1, 1, 80, 3000), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
+
         with pytest.raises(ValueError, match="rank"):
-            executor.extract_audio_features(req)
-
-
-# ===========================================================================
-# TestSamplingParamsValidation
-# ===========================================================================
+            executor.extract_audio_features(mel)
 
 
 class TestSamplingParamsValidation:
@@ -259,17 +197,15 @@ class TestSamplingParamsValidation:
         greedy = SamplingParams(temperature=0)
         req = _make_new_req(
             sampling_params=greedy,
-            mm_features=None,
+            mm_features=_make_valid_mm_features(),
         )
         sched = _make_scheduler_output(new_reqs=[req])
 
-        # Should not raise — the request has no audio so it returns EOT
-        runner._execute_stt(sched)
+        result = runner._execute_stt(sched)
 
-
-# ===========================================================================
-# TestExecuteSTTProtocol
-# ===========================================================================
+        assert result is None
+        assert runner._pending_output is not None
+        assert runner._pending_output.sampled_token_ids == [[100, 200, 50257]]
 
 
 class TestExecuteSTTProtocol:
@@ -285,7 +221,7 @@ class TestExecuteSTTProtocol:
         This is the protocol expected by vLLM's sample_tokens() flow.
         """
         runner = _make_runner()
-        req = _make_new_req(mm_features=None)
+        req = _make_new_req(mm_features=_make_valid_mm_features())
         sched = _make_scheduler_output(new_reqs=[req])
 
         result = self._run_stt(runner, sched)
@@ -293,8 +229,26 @@ class TestExecuteSTTProtocol:
         assert result is None, "execute_stt must return None (not ModelRunnerOutput)"
         assert runner._pending_output is not None
         assert runner._pending_output.req_ids == ["req-1"]
-        # No audio → EOT token
-        assert runner._pending_output.sampled_token_ids == [[50257]]
+        assert runner._pending_output.sampled_token_ids == [[100, 200, 50257]]
+
+    def test_invalid_audio_request_raises_with_req_id(self) -> None:
+        """Malformed STT requests should fail with request context."""
+        runner = _make_runner()
+        req = _make_new_req(req_id="broken-req", mm_features=None)
+        sched = _make_scheduler_output(new_reqs=[req])
+
+        with pytest.raises(ValueError, match="broken-req"):
+            self._run_stt(runner, sched)
+
+    def test_encode_valueerror_propagates(self) -> None:
+        """Model encode failures should keep their original error."""
+        runner = _make_runner()
+        runner.model.encode = MagicMock(side_effect=ValueError("encode failed"))
+        req = _make_new_req(mm_features=_make_valid_mm_features())
+        sched = _make_scheduler_output(new_reqs=[req])
+
+        with pytest.raises(ValueError, match="encode failed"):
+            self._run_stt(runner, sched)
 
     def test_cached_requests_get_eot(self) -> None:
         """Cached (decode-phase) requests should receive EOT to finish them."""
@@ -317,7 +271,7 @@ class TestExecuteSTTProtocol:
         runner = _make_runner()
         runner._request_states = {"old-1": "state", "old-2": "state"}
         sched = _make_scheduler_output(
-            new_reqs=[_make_new_req(mm_features=None)],
+            new_reqs=[_make_new_req(mm_features=_make_valid_mm_features())],
             finished_req_ids={"old-1"},
         )
 
@@ -341,8 +295,8 @@ class TestExecuteSTTProtocol:
     def test_multiple_new_requests(self) -> None:
         """Multiple new requests should all appear in output."""
         runner = _make_runner()
-        req1 = _make_new_req(req_id="r1", mm_features=None)
-        req2 = _make_new_req(req_id="r2", mm_features=None)
+        req1 = _make_new_req(req_id="r1", mm_features=_make_valid_mm_features())
+        req2 = _make_new_req(req_id="r2", mm_features=_make_valid_mm_features())
         sched = _make_scheduler_output(new_reqs=[req1, req2])
 
         self._run_stt(runner, sched)
@@ -353,37 +307,8 @@ class TestExecuteSTTProtocol:
         assert output.req_id_to_index == {"r1": 0, "r2": 1}
 
 
-# ===========================================================================
-# TestExtractAudioFeaturesFormats
-# ===========================================================================
-
-
 class TestExtractAudioFeaturesFormats:
-    """Tests for STTExecutor.extract_audio_features input format handling."""
-
-    def test_userdict_multimodal_spec(self) -> None:
-        """MultiModalFeatureSpec with UserDict .data should be handled.
-
-        vLLM's MultiModalKwargsItem extends UserDict, not dict.
-        This was a production bug — isinstance(UserDict(), dict) is False.
-        """
-        executor = _make_executor()
-        encoded = mx.ones((1, 1500, 512))
-        executor.model.encode = MagicMock(return_value=encoded)
-
-        # Simulate vLLM's MultiModalFeatureSpec structure:
-        # spec.data is a UserDict (MultiModalKwargsItem)
-        # spec.data["input_features"] is a MultiModalFieldElem with .data
-        inner_tensor = np.zeros((80, 3000), dtype=np.float32)
-        field_elem = SimpleNamespace(data=inner_tensor)
-        kwargs_item = UserDict({"input_features": field_elem})
-        feature_spec = SimpleNamespace(data=kwargs_item)
-
-        req = _make_new_req(mm_features=[feature_spec])
-        result = executor.extract_audio_features(req)
-
-        assert result is not None
-        executor.model.encode.assert_called_once()
+    """Tests for STTExecutor.extract_audio_features input handling."""
 
     def test_torch_float32_tensor(self) -> None:
         """torch float32 tensor should be converted correctly."""
@@ -392,8 +317,7 @@ class TestExtractAudioFeaturesFormats:
         executor.model.encode = MagicMock(return_value=encoded)
 
         mel = torch.zeros(80, 3000, dtype=torch.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
 
         assert result is not None
         executor.model.encode.assert_called_once()
@@ -409,8 +333,7 @@ class TestExtractAudioFeaturesFormats:
         executor.model.encode = MagicMock(return_value=encoded)
 
         mel = torch.zeros(80, 3000, dtype=torch.bfloat16)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
 
         assert result is not None
         executor.model.encode.assert_called_once()
@@ -427,8 +350,8 @@ class TestExtractAudioFeaturesFormats:
         executor.model.encode = capture_encode
 
         mel = np.zeros((80, 3000), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
+
         assert result is not None
 
     def test_3d_mel_transposed_correctly(self) -> None:
@@ -442,14 +365,9 @@ class TestExtractAudioFeaturesFormats:
         executor.model.encode = capture_encode
 
         mel = np.zeros((1, 80, 3000), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
+
         assert result is not None
-
-
-# ===========================================================================
-# TestKVCacheSTT
-# ===========================================================================
 
 
 class TestKVCacheSTT:
@@ -461,8 +379,6 @@ class TestKVCacheSTT:
         runner.metal_config = MagicMock()
         runner.metal_config.block_size = 16
 
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner.get_kv_cache_spec = MetalModelRunner.get_kv_cache_spec.__get__(runner)
         spec = runner.get_kv_cache_spec()
 
@@ -473,17 +389,10 @@ class TestKVCacheSTT:
         """STT should return STT_SCHED_BLOCK_BYTES."""
         runner = _make_runner()
 
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner.get_cache_block_size_bytes = (
             MetalModelRunner.get_cache_block_size_bytes.__get__(runner)
         )
         assert runner.get_cache_block_size_bytes() == STT_SCHED_BLOCK_BYTES
-
-
-# ===========================================================================
-# TestSTTExecutorTranscriberCaching
-# ===========================================================================
 
 
 class TestSTTExecutorTranscriberCaching:
@@ -513,11 +422,6 @@ class TestSTTExecutorTranscriberCaching:
         assert t1 is t2
 
 
-# ===========================================================================
-# TestIsSTTProperty
-# ===========================================================================
-
-
 class TestIsSTTProperty:
     """Tests for the public is_stt property on MetalModelRunner."""
 
@@ -526,9 +430,8 @@ class TestIsSTTProperty:
         runner = MagicMock()
         runner._is_stt = False
 
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         prop = MetalModelRunner.is_stt.fget(runner)  # type: ignore[attr-defined]
+
         assert prop is False
 
     def test_is_stt_true_after_loading(self) -> None:
@@ -536,15 +439,9 @@ class TestIsSTTProperty:
         runner = MagicMock()
         runner._is_stt = True
 
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         prop = MetalModelRunner.is_stt.fget(runner)  # type: ignore[attr-defined]
+
         assert prop is True
-
-
-# ===========================================================================
-# End-to-end smoke test (requires real Whisper model)
-# ===========================================================================
 
 
 @pytest.mark.slow
@@ -556,14 +453,6 @@ class TestSTTExecutorEndToEnd:
 
     def test_decode_silence_produces_tokens(self) -> None:
         """Decoding silence through a real model should not crash."""
-        from vllm_metal.stt.audio import (
-            N_FRAMES,
-            SAMPLE_RATE,
-            log_mel_spectrogram,
-            pad_or_trim,
-        )
-        from vllm_metal.stt.transcribe import load_model
-
         model = load_model("openai/whisper-tiny")
         executor = STTExecutor(model, "openai/whisper-tiny")
 
