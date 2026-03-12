@@ -342,7 +342,7 @@ def _make_stub_class():
         Transcription-only — text generation is not supported.
         """
 
-        # Derived from HF config.support_languages at init time.
+        # Populated from HF config.support_languages in get_speech_to_text_config.
         supported_languages: Mapping[str, str] = {}
         supports_transcription = True
         supports_transcription_only = True
@@ -451,13 +451,16 @@ def _make_stub_class():
         ) -> int | None:
             from vllm_metal.stt.qwen3_asr import _get_feat_extract_output_lengths
 
-            # mel frames from audio duration (hop_length=160, 10ms at 16kHz)
-            hop_length = 160
+            # Derive hop_length from WhisperFeatureExtractor defaults
+            hop_length = WhisperFeatureExtractor().hop_length
+
+            # Derive n_window from audio encoder config
+            n_window = model_config.hf_config.thinker_config.audio_config.n_window
+
             mel_frames = math.ceil(
                 audio_duration_s * stt_config.sample_rate / hop_length
             )
-            # Conv2d downsampling + chunking gives actual token count
-            return _get_feat_extract_output_lengths(mel_frames)
+            return _get_feat_extract_output_lengths(mel_frames, n_window=n_window)
 
     # Attach multimodal processor factory to the stub class
     Qwen3ASRStub._processor_factory = _ProcessorFactories(

@@ -618,11 +618,13 @@ class TestSTTExecutorQwen3ASRDispatch:
         # + eot (151643) appended
         assert result == [200, 300, 151643]
 
-    def test_decode_empty_prompt_returns_eot(self) -> None:
-        """Empty prompt should return only Qwen3-ASR EOT."""
+    def test_decode_empty_prompt_rebuilds(self) -> None:
+        """Qwen3-ASR rebuilds prompt even when caller passes empty list."""
         executor = _make_qwen3_executor()
         result = executor.decode(mx.ones((50, 1024)), [])
-        assert result == [151643]
+        # Should rebuild prompt and decode normally, not early-return EOT
+        assert len(result) > 1
+        assert result[-1] == 151643  # ends with EOT
 
 
 # ===========================================================================

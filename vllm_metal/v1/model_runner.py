@@ -686,9 +686,6 @@ class STTExecutor:
             List of decoded token IDs ending with EOT.
         """
         eot = self.eot_token
-        if not prompt_token_ids:
-            logger.warning("STT: empty prompt_token_ids, returning EOT")
-            return [eot]
 
         if self._model_type == "qwen3_asr":
             # Qwen3-ASR uses a fixed prompt format — language, task, and
@@ -697,6 +694,9 @@ class STTExecutor:
             # matching the audio encoder output length.
             n_audio_frames = audio_features.shape[0]
             prompt_token_ids = self.transcriber.build_prompt_tokens(n_audio_frames)
+        elif not prompt_token_ids:
+            logger.warning("STT: empty prompt_token_ids, returning EOT")
+            return [eot]
 
         tokens = self.transcriber.greedy_decode_tokens(audio_features, prompt_token_ids)
 
