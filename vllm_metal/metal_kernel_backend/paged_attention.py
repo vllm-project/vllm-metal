@@ -226,8 +226,8 @@ def _metal_kernel_decode_attention(
     max_seq_len = max(ctx.context_lens)
     scale = attn_module.scale
 
-    # Zero-copy paged attention
-    ops.paged_attention_v1(
+    # Zero-copy paged attention (v2, online softmax)
+    ops.paged_attention_v2_online(
         out,
         q_3d,
         cache.key_caches[layer_idx],
@@ -240,7 +240,7 @@ def _metal_kernel_decode_attention(
         max_seq_len,
     )
 
-    # Synchronize GPU: paged_attention_v1 wrote to out's buffer via a raw
+    # Synchronize GPU: paged_attention_v2_online wrote to out's buffer via a raw
     # Metal dispatch that MLX's lazy graph doesn't track.  mx.eval(out) would
     # be a no-op here (out was already evaluated as zeros), so we must use
     # mx.synchronize() to flush the command encoder and wait for the kernel.
