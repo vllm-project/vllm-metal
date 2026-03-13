@@ -565,8 +565,7 @@ class TestSTTExecutorQwen3ASRDispatch:
         executor.model.encode = capture_encode
 
         mel = np.zeros((128, 500), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
         assert result is not None
         assert result.shape == (50, 1024)
 
@@ -582,8 +581,7 @@ class TestSTTExecutorQwen3ASRDispatch:
         executor.model.encode = capture_encode
 
         mel = np.zeros((1, 128, 500), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
-        result = executor.extract_audio_features(req)
+        result = executor.extract_audio_features(mel)
         assert result is not None
 
     def test_extract_audio_features_1d_raises(self) -> None:
@@ -591,9 +589,8 @@ class TestSTTExecutorQwen3ASRDispatch:
         executor = _make_qwen3_executor()
 
         mel = np.zeros((500,), dtype=np.float32)
-        req = _make_new_req(mm_features=[{"input_features": mel}])
         with pytest.raises(ValueError, match="rank"):
-            executor.extract_audio_features(req)
+            executor.extract_audio_features(mel)
 
     def test_decode_rebuilds_prompt_with_audio_frames(self) -> None:
         """Qwen3-ASR decode should rebuild prompt using build_prompt_tokens."""
