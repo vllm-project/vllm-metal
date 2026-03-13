@@ -189,11 +189,6 @@ class TestMetalKernelPagedVsStandard:
         )
 
     @pytest.mark.slow
-    @pytest.mark.xfail(
-        reason="B=2 batched GEMM produces different floats than B=1, "
-        "causing token divergence after ~5 decode steps (not a kernel bug). "
-        "See https://github.com/vllm-project/vllm-metal/issues/119"
-    )
     def test_batched_decode_matches(self, qwen3_model):
         """Batched Metal kernel paged decode must match per-request sequential."""
         model, tokenizer = qwen3_model
