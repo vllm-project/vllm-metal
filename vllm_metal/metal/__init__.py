@@ -11,8 +11,6 @@ Usage::
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import logging
 import re
 from pathlib import Path
@@ -26,9 +24,7 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
-# .metal source files requires restarting the Python interpreter to pick up
-# changes (the .cpp extension itself is rebuilt automatically by build.py when
-# paged_ops.cpp is newer than the .so).
+# .metal source files requires restarting the Python interpreter to pick up changes.
 _ops_module: ModuleType | None = None
 
 
@@ -133,38 +129,27 @@ def metal_unified_attention(
 
 
 def get_ops() -> ModuleType:
-    """JIT-build and import the native paged_ops extension.
+    """Return the native paged_ops extension backed by the Rust/_rs module.
 
     The Metal shader sources are read, pre-processed (includes inlined),
-    and passed to the C++ extension which JIT-compiles them via
+    and passed to the Rust extension which JIT-compiles them via
     ``mlx::core::metal::Device::get_library()``.
 
     Returns:
-        The ``_paged_ops`` module with ``reshape_and_cache()`` and
-        ``paged_attention_v1()``.
+        The ``vllm_metal._rs.paged_ops`` submodule.
     """
     global _ops_module
     if _ops_module is not None:
         return _ops_module
 
-    # 1. JIT-build the C++ extension if needed
-    from vllm_metal.metal.build import build
+    from vllm_metal._rs import paged_ops as mod  # type: ignore[attr-defined]
 
-    so_path = build()
-
-    # 2. Import the built extension
-    spec = importlib.util.spec_from_file_location("_paged_ops", str(so_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load extension from {so_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # 3. Initialise Metal libraries (JIT-compile shaders)
+    # Initialise Metal libraries (JIT-compile shaders)
     reshape_src = _build_reshape_cache_source()
     paged_attn_src = _build_paged_attention_source()
     mod.init_libraries(reshape_src, paged_attn_src)
 
-    # 4. Initialise v2 library (online softmax kernel)
+    # Initialise v2 library (online softmax kernel)
     v2_src = _build_v2_paged_attention_source()
     mod.init_v2_library(v2_src)
 

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! High-performance Rust extension for vLLM Metal.
+
+pub mod paged_ops;
 //!
 //! This module provides optimized implementations of performance-critical
 //! operations that are bottlenecks in the Python code:
@@ -491,5 +493,6 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_compute_kv_indices, m)?)?;
     m.add_function(wrap_pyfunction!(flatten_token_ids_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(compute_positions_numpy, m)?)?;
+    paged_ops::register(m)?;
     Ok(())
 }
