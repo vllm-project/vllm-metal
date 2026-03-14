@@ -1,0 +1,22 @@
+[package]
+name = "paged-ops"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust rewrite of paged_ops.cpp — PyO3 bridge for Metal paged attention kernels"
+
+[lib]
+name = "_paged_ops"
+crate-type = ["cdylib"]
+path = "../paged_ops.rs"
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
