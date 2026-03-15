@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Speech-to-Text support for vLLM Metal."""
 
+from vllm_metal.stt.base import TranscriptionResult
 from vllm_metal.stt.config import (
     SpeechToTextConfig,
     get_supported_languages,
@@ -12,7 +13,6 @@ from vllm_metal.stt.formatting import format_as_srt, format_as_vtt
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.transcribe import (
     Qwen3ASRTranscriber,
-    TranscriptionResult,
     WhisperTranscriber,
     load_model,
     transcribe,

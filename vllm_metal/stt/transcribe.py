@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Speech-to-Text transcription orchestration.
 
-Provides :class:`WhisperTranscriber` — the single owning class for Whisper
-inference — plus a convenience :func:`transcribe` entrypoint and
-:func:`load_model` for checkpoint loading.
+Provides model-specific transcribers plus convenience helpers for checkpoint
+loading and one-shot transcription.
 """
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -27,6 +25,7 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
+from vllm_metal.stt.base import TranscriptionResult
 from vllm_metal.stt.config import (
     QWEN3_ASR_MAX_DECODE_TOKENS,
     WHISPER_MAX_DECODE_TOKENS,
@@ -63,28 +62,6 @@ _WHISPER_TASKS = frozenset({"transcribe", "translate"})
 
 # Supported floating-point dtypes for STT model loading.
 _SUPPORTED_LOAD_DTYPES = frozenset({mx.float16, mx.float32, mx.bfloat16})
-
-
-# ===========================================================================
-# Data types
-# ===========================================================================
-
-
-@dataclass
-class TranscriptionResult:
-    """Result of a transcription operation.
-
-    Attributes:
-        text: Full transcribed text.
-        language: Language code used for transcription.
-        segments: Timestamped segments (populated only with ``with_timestamps``).
-        duration: Total audio duration in seconds.
-    """
-
-    text: str
-    language: str | None = None
-    segments: list[TranscriptionSegment] = field(default_factory=list)
-    duration: float = 0.0
 
 
 # ===========================================================================
