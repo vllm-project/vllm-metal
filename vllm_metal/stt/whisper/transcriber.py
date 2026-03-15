@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from transformers import WhisperTokenizer
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -28,11 +28,6 @@ from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
 
 from .model import WhisperModel
 
-try:
-    from transformers import WhisperTokenizer
-except ImportError:  # pragma: no cover
-    WhisperTokenizer = None  # type: ignore[assignment]
-
 logger = logging.getLogger(__name__)
 
 SEEK_MULTIPLIER = 100
@@ -49,7 +44,7 @@ class WhisperTranscriber:
         model: WhisperModel,
         model_path: str | None = None,
         config: SpeechToTextConfig | None = None,
-        tokenizer: Any | None = None,
+        tokenizer: WhisperTokenizer | None = None,
     ) -> None:
         self.model = model
         self.config = config or SpeechToTextConfig()
@@ -284,10 +279,7 @@ class WhisperTranscriber:
         return features
 
 
-def _load_tokenizer(model_path: str | None) -> Any:
-    if WhisperTokenizer is None:
-        raise ImportError("WhisperTokenizer requires transformers to be installed.")
-
+def _load_tokenizer(model_path: str | None) -> WhisperTokenizer:
     if model_path:
         try:
             return WhisperTokenizer.from_pretrained(model_path)

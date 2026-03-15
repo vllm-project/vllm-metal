@@ -7,15 +7,11 @@ import logging
 from typing import Any
 
 import mlx.core as mx
+from transformers import AutoTokenizer
 
 from vllm_metal.stt.config import QWEN3_ASR_MAX_DECODE_TOKENS
 
 from .model import Qwen3ASRModel
-
-try:
-    from transformers import AutoTokenizer
-except ImportError:  # pragma: no cover
-    AutoTokenizer = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +107,6 @@ class Qwen3ASRTranscriber:
 
 
 def _load_tokenizer(model_path: str | None) -> Any:
-    if AutoTokenizer is None:
-        raise ImportError("Qwen3-ASR tokenizer requires transformers to be installed.")
     if not model_path:
         raise ValueError("Qwen3-ASR requires a local tokenizer model_path.")
     return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
