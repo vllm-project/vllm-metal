@@ -17,6 +17,7 @@ import logging
 from transformers.configuration_utils import PretrainedConfig
 
 from vllm_metal.stt.config import get_whisper_languages
+from vllm_metal.stt.qwen3_asr import get_feat_extract_output_lengths
 
 logger = logging.getLogger(__name__)
 
@@ -449,8 +450,6 @@ def _make_stub_class():
             stt_config: SpeechToTextConfig,
             model_config: ModelConfig,
         ) -> int | None:
-            from vllm_metal.stt.qwen3_asr import get_feat_extract_output_lengths
-
             # Derive hop_length from WhisperFeatureExtractor defaults
             hop_length = WhisperFeatureExtractor().hop_length
 
