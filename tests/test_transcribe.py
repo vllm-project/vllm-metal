@@ -11,11 +11,11 @@ import mlx.core as mx
 import pytest
 
 from vllm_metal.stt.transcribe import (
-    _MAX_PROMPT_TOKENS,
     TranscriptionResult,
     WhisperTranscriber,
     load_model,
 )
+from vllm_metal.stt.whisper.transcriber import MAX_PROMPT_TOKENS
 
 # ===========================================================================
 # Fixtures
@@ -33,8 +33,8 @@ def transcriber():
     except ImportError:
         pytest.skip("transformers not available")
 
-    t = WhisperTranscriber(model=None, model_path=None)  # type: ignore[arg-type]
-    t._tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
+    tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
+    t = WhisperTranscriber(model=None, tokenizer=tokenizer)  # type: ignore[arg-type]
     return t
 
 
@@ -153,11 +153,11 @@ class TestEncodePrompt:
         assert len(result) >= 2
 
     def test_long_prompt_truncated(self, transcriber: WhisperTranscriber) -> None:
-        """Very long prompt should be truncated to _MAX_PROMPT_TOKENS + 1."""
+        """Very long prompt should be truncated to MAX_PROMPT_TOKENS + 1."""
         long_text = "word " * 500
         result = transcriber._encode_prompt(long_text)
-        # startofprev (1) + at most _MAX_PROMPT_TOKENS text tokens
-        assert len(result) <= _MAX_PROMPT_TOKENS + 1
+        # startofprev (1) + at most MAX_PROMPT_TOKENS text tokens
+        assert len(result) <= MAX_PROMPT_TOKENS + 1
 
 
 # ===========================================================================
