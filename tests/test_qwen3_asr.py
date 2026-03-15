@@ -12,12 +12,14 @@ import mlx.core as mx
 import pytest
 
 from vllm_metal.stt.config import is_stt_model
-from vllm_metal.stt.qwen3_asr import (
-    AudioEncoder,
+from vllm_metal.stt.qwen3_asr.config import (
     Qwen3ASRAudioConfig,
     Qwen3ASRConfig,
-    Qwen3ASRModel,
     Qwen3ASRTextConfig,
+)
+from vllm_metal.stt.qwen3_asr.model import (
+    AudioEncoder,
+    Qwen3ASRModel,
     Qwen3Attention,
     Qwen3LM,
 )

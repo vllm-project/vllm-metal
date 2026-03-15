@@ -13,11 +13,9 @@ import numpy as np
 
 from vllm_metal.stt.config import SpeechToTextConfig
 from vllm_metal.stt.protocol import TranscriptionResult
-from vllm_metal.stt.qwen3_asr import (
-    Qwen3ASRConfig,
-    Qwen3ASRModel,
-    Qwen3ASRTranscriber,  # noqa: F401
-)
+from vllm_metal.stt.qwen3_asr.config import Qwen3ASRConfig
+from vllm_metal.stt.qwen3_asr.model import Qwen3ASRModel
+from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber  # noqa: F401
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel, WhisperTranscriber
 
 logger = logging.getLogger(__name__)
