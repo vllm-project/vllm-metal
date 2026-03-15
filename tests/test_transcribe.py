@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from vllm_metal.stt.base import TranscriptionResult as SharedTranscriptionResult
 from vllm_metal.stt.transcribe import (
     _MAX_PROMPT_TOKENS,
     TranscriptionResult,
@@ -45,6 +46,10 @@ def transcriber():
 
 class TestTranscriptionResult:
     """Tests for TranscriptionResult dataclass."""
+
+    def test_reexport_matches_shared_base(self) -> None:
+        """transcribe.py should re-export the shared TranscriptionResult."""
+        assert TranscriptionResult is SharedTranscriptionResult
 
     def test_defaults(self) -> None:
         """Default fields should be None / empty / zero."""
