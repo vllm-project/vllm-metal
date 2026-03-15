@@ -1,26 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-ASR STT implementation (model-owned package)."""
+"""Qwen3-ASR configuration and entrypoints.
 
-from .config import (
-    Qwen3ASRAudioConfig,
-    Qwen3ASRConfig,
-    Qwen3ASRTextConfig,
-)
-from .model import (
-    AudioEncoder,
-    Qwen3ASRModel,
-    Qwen3Attention,
-    Qwen3LM,
-)
-from .transcriber import Qwen3ASRTranscriber
+Keep this module MLX-free so ``vllm_metal.stt.hf_config`` can import
+``vllm_metal.stt.qwen3_asr.config`` without pulling in the model stack.
+"""
+
+from .config import Qwen3ASRAudioConfig, Qwen3ASRConfig, Qwen3ASRTextConfig
 
 __all__ = [
-    "AudioEncoder",
     "Qwen3ASRAudioConfig",
     "Qwen3ASRConfig",
-    "Qwen3ASRModel",
     "Qwen3ASRTextConfig",
-    "Qwen3ASRTranscriber",
-    "Qwen3Attention",
-    "Qwen3LM",
 ]
