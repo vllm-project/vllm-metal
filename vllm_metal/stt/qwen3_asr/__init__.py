@@ -5,8 +5,6 @@ from .config import (
     Qwen3ASRAudioConfig,
     Qwen3ASRConfig,
     Qwen3ASRTextConfig,
-    get_cnn_output_lengths,
-    get_feat_extract_output_lengths,
 )
 from .model import (
     AudioEncoder,
@@ -25,6 +23,4 @@ __all__ = [
     "Qwen3ASRTranscriber",
     "Qwen3Attention",
     "Qwen3LM",
-    "get_cnn_output_lengths",
-    "get_feat_extract_output_lengths",
 ]

@@ -119,15 +119,3 @@ class Qwen3ASRConfig:
             n_mels=audio_cfg.num_mel_bins,
             n_audio_ctx=audio_cfg.max_source_positions,
         )
-
-
-def get_cnn_output_lengths(input_length: int) -> int:
-    """Compatibility wrapper for older call sites."""
-    return Qwen3ASRAudioConfig.cnn_output_length(input_length)
-
-
-def get_feat_extract_output_lengths(num_mel_frames: int, n_window: int = 50) -> int:
-    """Compatibility wrapper for older call sites."""
-    return Qwen3ASRAudioConfig(n_window=n_window).feat_extract_output_length(
-        num_mel_frames
-    )
