@@ -265,10 +265,13 @@ void paged_attention_v2_online_impl(
     nb::handle value_cache_h,
     int num_kv_heads,
     float scale,
+    float softcap,
     nb::handle block_tables_h,
     nb::handle seq_lens_h,
+    nb::handle cu_seqlens_q_h,
     int block_size,
-    int max_seq_len
+    int max_seq_len,
+    int sliding_window
 ) {
   auto& out          = *nb::inst_ptr<array>(out_h);
   auto& query        = *nb::inst_ptr<array>(query_h);
@@ -276,14 +279,17 @@ void paged_attention_v2_online_impl(
   auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
   auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
   auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
 
   auto s = default_stream(Device::gpu);
   auto& d = metal::device(Device::gpu);
 
-  int num_seqs   = static_cast<int>(query.shape(0));
+  // Varlen: query shape is [total_q_tokens, num_heads, head_size]
+  int total_q_tokens = static_cast<int>(query.shape(0));
   int num_heads  = static_cast<int>(query.shape(1));
   int head_size  = static_cast<int>(query.shape(2));
   int max_blocks = static_cast<int>(block_tables.shape(1));
+  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   // Same kernel name format as v1 — the template instantiation is identical.
   auto dt = dtype_to_metal(query.dtype());
@@ -325,7 +331,7 @@ void paged_attention_v2_online_impl(
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  // Buffer bindings — identical to v1.
+  // Buffer bindings
   enc.set_output_array(out,         2);
   enc.set_input_array(query,        3);
   enc.set_input_array(key_cache,    4);
@@ -334,7 +340,8 @@ void paged_attention_v2_online_impl(
   int32_t nkv = static_cast<int32_t>(num_kv_heads);
   enc.set_bytes(nkv,   8);
   enc.set_bytes(scale, 9);
-  float softcapping = 1.0f;
+  // softcap=0 means disabled; the kernel uses 1.0 as the disabled sentinel.
+  float softcapping = (softcap == 0.f) ? 1.0f : softcap;
   enc.set_bytes(softcapping, 10);
 
   enc.set_input_array(block_tables, 11);
@@ -350,8 +357,16 @@ void paged_attention_v2_online_impl(
   enc.set_bytes(kv_block_stride, 16);
   enc.set_bytes(kv_head_stride,  17);
 
+  // Varlen buffers (new in v2)
+  enc.set_input_array(cu_seqlens_q, 19);
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  enc.set_bytes(num_seqs_i, 20);
+  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
+  enc.set_bytes(sliding_window_i, 21);
+
+  // Grid: one threadgroup per (head, query_token)
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, num_seqs, 1),
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   d.add_temporary(out, s.index);
@@ -360,6 +375,7 @@ void paged_attention_v2_online_impl(
   d.add_temporary(value_cache, s.index);
   d.add_temporary(block_tables, s.index);
   d.add_temporary(seq_lens, s.index);
+  d.add_temporary(cu_seqlens_q, s.index);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +409,10 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("out"), nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("softcap"),
         nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
-        "Online-softmax paged attention (v2, decode-only).");
+        nb::arg("sliding_window"),
+        "Online-softmax varlen paged attention (v2, unified prefill+decode).");
 }

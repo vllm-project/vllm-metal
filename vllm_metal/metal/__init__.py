@@ -87,35 +87,32 @@ def metal_unified_attention(
 ) -> None:
     """Unified varlen paged attention for Metal.
 
-    Currently supports decode-only (max_seqlen_q=1). Sliding window and
-    soft capping are not yet supported. These will be enabled when the v2
-    kernel is extended to handle variable-length queries (prefill + decode).
+    Supports variable-length queries (prefill + decode) with online softmax,
+    paged KV cache, causal masking, sliding window, and soft capping.
+
+    Grid: one threadgroup per (head, query_token). Each threadgroup uses
+    binary search on cu_seqlens_q to find its sequence and computes causal
+    attention against the paged KV cache.
     """
     import mlx.core as mx
-
-    if max_seqlen_q != 1:
-        raise NotImplementedError(
-            f"metal_unified_attention only supports decode (max_seqlen_q=1), "
-            f"got {max_seqlen_q}"
-        )
-    if window_size != (-1, -1):
-        raise NotImplementedError(
-            f"Sliding window not yet supported, got window_size={window_size}"
-        )
-    if softcap != 0:
-        raise NotImplementedError(
-            f"Soft capping not yet supported, got softcap={softcap}"
-        )
 
     # Extract dimensions from cache shape
     # k shape: [num_blocks, block_size, num_kv_heads, head_size]
     num_kv_heads = k.shape[2]
     block_size = k.shape[1]
 
+    # Convert window_size tuple to a single sliding_window int.
+    # window_size = (left, right) where left = sw-1, right = 0 for causal.
+    # sliding_window = left + 1 = total window size. -1 = disabled.
+    if window_size == (-1, -1):
+        sliding_window = -1
+    else:
+        sliding_window = window_size[0] + 1
+
     ops = get_ops()
 
     # Ensure all inputs are evaluated before raw Metal dispatch
-    mx.eval(out, q, k, v, block_table, seqused_k)
+    mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
 
     ops.paged_attention_v2_online(
         out,
@@ -124,10 +121,13 @@ def metal_unified_attention(
         v,
         num_kv_heads,
         softmax_scale,
+        softcap,
         block_table,
         seqused_k,
+        cu_seqlens_q,
         block_size,
         max_seqlen_k,
+        sliding_window,
     )
     mx.synchronize()
 

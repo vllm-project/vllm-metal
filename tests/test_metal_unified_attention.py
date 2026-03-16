@@ -357,12 +357,6 @@ def test_metal_unified_attn(
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
 
-    # xfail cases that need features not yet in the v2 kernel:
-    # varlen (q_len > 1), sliding window, or soft capping.
-    # Decode-only cases with no extras already work and should pass.
-    max_query_len_val = max(query_lens)
-    if max_query_len_val > 1 or sliding_window is not None or soft_cap is not None:
-        pytest.xfail("v2 varlen/sliding-window/soft-cap not yet implemented")
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
