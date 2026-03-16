@@ -87,14 +87,14 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
         MLX array with the same data
     """
     # Move to CPU if on MPS for numpy conversion
-    if tensor.device.type == "mps":
+    if tensor.device.type != "cpu":
         tensor = tensor.cpu()
 
     tensor = tensor.detach()
 
     # Note: numpy does not support bfloat16.
     if tensor.dtype == torch.bfloat16:
-        return mx.array(tensor.float().numpy(), dtype=mx.bfloat16)
+        return mx.array(tensor)
 
     return mx.array(tensor.numpy())
 
