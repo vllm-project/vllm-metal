@@ -226,7 +226,11 @@ def _metal_kernel_decode_attention(
     max_seq_len = max(ctx.context_lens)
     scale = attn_module.scale
 
-    # Zero-copy paged attention (v2, online softmax)
+    # Build cu_seqlens_q for varlen dispatch: decode has q_len=1 per sequence.
+    cu_seqlens_q = mx.array(list(range(B + 1)), dtype=mx.int32)
+    mx.eval(cu_seqlens_q)
+
+    # Zero-copy paged attention (v2, online softmax, varlen-capable)
     ops.paged_attention_v2_online(
         out,
         q_3d,
@@ -234,10 +238,13 @@ def _metal_kernel_decode_attention(
         cache.value_caches[layer_idx],
         cache.num_kv_heads,
         scale,
+        0.0,  # softcap (0 = disabled)
         block_tables,
         seq_lens,
+        cu_seqlens_q,
         cache.block_size,
         max_seq_len,
+        -1,  # sliding_window (-1 = disabled)
     )
 
     # Synchronize GPU: paged_attention_v2_online wrote to out's buffer via a raw
