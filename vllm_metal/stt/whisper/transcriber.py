@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import cast
 
 import mlx.core as mx
 import numpy as np
@@ -176,7 +177,7 @@ class WhisperTranscriber:
         return output_tokens
 
     def _get_token_id(self, token: str) -> int:
-        return self.tokenizer.convert_tokens_to_ids(token)
+        return cast(int, self.tokenizer.convert_tokens_to_ids(token))
 
     def _resolve_decode_options(
         self,
