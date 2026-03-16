@@ -48,9 +48,8 @@ class WhisperTranscriber:
     ) -> None:
         self.model = model
         self.config = config or SpeechToTextConfig()
-        self.tokenizer = (
-            tokenizer if tokenizer is not None else self.load_tokenizer(model_path)
-        )
+        self._model_path = model_path
+        self._tokenizer = tokenizer
 
     @staticmethod
     def load_tokenizer(model_path: str | None) -> WhisperTokenizer:
@@ -66,6 +65,16 @@ class WhisperTranscriber:
             return WhisperTokenizer.from_pretrained(
                 "openai/whisper-small", local_files_only=True
             )
+
+    @property
+    def tokenizer(self) -> WhisperTokenizer:
+        if self._tokenizer is None:
+            self._tokenizer = self.load_tokenizer(self._model_path)
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer: WhisperTokenizer | None) -> None:
+        self._tokenizer = tokenizer
 
     def transcribe(
         self,
