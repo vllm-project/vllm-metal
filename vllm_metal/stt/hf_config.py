@@ -196,11 +196,11 @@ def _make_stub_class():
     )
     from vllm.multimodal.parse import MultiModalDataItems
     from vllm.multimodal.processing import (
+        BaseDummyInputsBuilder,
         BaseMultiModalProcessor,
         BaseProcessingInfo,
         PromptUpdate,
     )
-    from vllm.multimodal.profiling import BaseDummyInputsBuilder
     from vllm.multimodal.registry import _ProcessorFactories
     from vllm.tokenizers import get_tokenizer
 
@@ -228,6 +228,8 @@ def _make_stub_class():
             return self.ctx.get_tokenizer()
 
     class _DummyInputs(BaseDummyInputsBuilder[_Info]):
+        """Minimal dummy inputs builder for Qwen3-ASR audio."""
+
         def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
             return "<|audio_pad|>"
 
