@@ -94,6 +94,7 @@ def metal_unified_attention(
     binary search on cu_seqlens_q to find its sequence and computes causal
     attention against the paged KV cache.
     """
+    assert causal, "Only causal attention is supported"
     import mlx.core as mx
 
     # Extract dimensions from cache shape

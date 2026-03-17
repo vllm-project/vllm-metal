@@ -1108,13 +1108,14 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // reached by all threads in the threadgroup).
 
   // If partitioning is enabled, store the partial result for the reduce kernel.
+  // Indexed by q_token_idx (not seq_idx) for varlen compatibility.
   if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
     device float *max_logits_ptr =
-        max_logits + seq_idx * num_heads * max_num_partitions +
+        max_logits + q_token_idx * num_heads * max_num_partitions +
         head_idx * max_num_partitions + partition_idx;
     *max_logits_ptr = warp_m;
     device float *exp_sums_ptr = exp_sums +
-                                 seq_idx * num_heads * max_num_partitions +
+                                 q_token_idx * num_heads * max_num_partitions +
                                  head_idx * max_num_partitions + partition_idx;
     *exp_sums_ptr = warp_l;
   }
@@ -1215,6 +1216,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     const constant int &max_num_partitions [[buffer(5)]],
     const device float *sinks
     [[buffer(6), function_constant(use_sinks)]], // [num_heads]
+    device const int32_t *cu_seqlens_q [[buffer(7)]],  // [num_seqs + 1]
+    const constant int &num_seqs [[buffer(8)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1224,15 +1227,21 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     uint simd_lid [[thread_index_in_simdgroup]]) {
   const int num_heads = threadgroups_per_grid.x;
   const int head_idx = threadgroup_position_in_grid.x;
-  const int seq_idx = threadgroup_position_in_grid.y;
+  // Varlen: grid.y is q_token_idx (one per query token), not seq_idx.
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int seq_idx = find_seq_idx(cu_seqlens_q, q_token_idx, num_seqs);
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int q_pos_in_seq = q_token_idx - q_seq_start;
   const uint32_t context_len = context_lens[seq_idx];
-  const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
+  const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
+  const int num_partitions = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
   if (num_partitions == 1 && !use_sinks) {
     // No need to reduce. Only copy tmp_out to out.
     device T *out_ptr =
-        out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+        out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
     const device T *tmp_out_ptr =
-        tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE;
     for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
          i += threads_per_threadgroup.x) {
@@ -1253,7 +1262,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   threadgroup float *shared_max_logits =
       reinterpret_cast<threadgroup float *>(shared_mem);
   const device float *max_logits_ptr =
-      max_logits + seq_idx * num_heads * max_num_partitions +
+      max_logits + q_token_idx * num_heads * max_num_partitions +
       head_idx * max_num_partitions;
   float max_logit = -FLT_MAX;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
@@ -1292,7 +1301,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
       shared_mem + sizeof(float) * num_partitions);
   const device float *exp_sums_ptr = exp_sums +
-                                     seq_idx * num_heads * max_num_partitions +
+                                     q_token_idx * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions;
   float global_exp_sum = 0.0f;
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
@@ -1315,10 +1324,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
 
   // Aggregate tmp_out to out.
   const device T *tmp_out_ptr =
-      tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+      tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE;
   device T *out_ptr =
-      out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+      out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
 #pragma unroll
   for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
        i += NUM_THREADS) {
@@ -1387,6 +1396,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       device uint32_t *context_lens [[buffer(4)]],                             \
       const constant int &max_num_partitions [[buffer(5)]],                    \
       const device float *sinks [[buffer(6), function_constant(use_sinks)]],   \
+      device const int32_t *cu_seqlens_q [[buffer(7)]],                        \
+      const constant int &num_seqs [[buffer(8)]],                              \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
