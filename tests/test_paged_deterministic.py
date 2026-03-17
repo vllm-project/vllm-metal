@@ -46,6 +46,7 @@ PROMPTS = [
     "One plus one equals",
     "The largest planet in our solar system is",
     "Water boils at a temperature of",
+    "Machine learning is",
 ]
 
 # fmt: off
@@ -57,6 +58,7 @@ GOLDEN_MLX = {
     "One plus one equals":                        [825, 11, 825, 5519, 825, 16819, 1378, 13, 2055, 11],
     "The largest planet in our solar system is":  [1112, 30, 362, 13, 43562, 425, 13, 48976, 356, 13],
     "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 13, 3555, 374, 279, 9315],
+    "Machine learning is":                         [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 
 # Golden token IDs from paged KV cache (HF kernel on main branch), greedy decoding.
@@ -68,6 +70,7 @@ GOLDEN_PAGED = {
     "One plus one equals":                        [825, 11, 825, 5519, 825, 16819, 1378, 13, 2055, 11],
     "The largest planet in our solar system is":  [1112, 30, 362, 13, 43562, 425, 13, 48976, 356, 13],
     "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 13, 3555, 374, 279, 9315],
+    "Machine learning is":                         [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 # fmt: on
 
