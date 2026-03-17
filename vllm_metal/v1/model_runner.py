@@ -743,9 +743,9 @@ class STTExecutor:
         return tokens[start:end]
 
 
-# SCAFFOLDING: remove when varlen kernel is ready.
-# Cap total packed-prefill tokens to bound the O(N²) dense causal mask.
-# Batches exceeding this limit are split into multiple forward passes.
+# Cap total packed-prefill tokens per forward pass to bound activation
+# memory (QKV projections + FFN intermediates scale linearly with total
+# tokens) and avoid Metal GPU command-buffer timeouts on large dispatches.
 MAX_PACKED_PREFILL_TOKENS = 4096
 
 
@@ -1712,8 +1712,6 @@ class MetalModelRunner:
         Splits *paged_complete* into batches that fit within
         ``MAX_PACKED_PREFILL_TOKENS``, runs each batch through
         ``_prefill_packed_paged``, and fills *sampled_tokens* in-place.
-
-        SCAFFOLDING: batching removed when varlen kernel is ready.
         """
         # Split into batches that fit within the packed-length cap.
         batches: list[list[tuple]] = [[]]
