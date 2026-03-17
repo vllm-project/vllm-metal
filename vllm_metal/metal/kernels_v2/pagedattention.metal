@@ -1000,7 +1000,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                              q_vecs[thread_group_offset], k_vecs);
 
-      if (softcapping != 1.0) {
+      if (softcapping > 0.0f) {
         qk = tanh(qk / softcapping) * softcapping;
       }
 

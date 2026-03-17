@@ -227,7 +227,7 @@ def _metal_kernel_decode_attention(
     scale = attn_module.scale
 
     # Build cu_seqlens_q for varlen dispatch: decode has q_len=1 per sequence.
-    cu_seqlens_q = mx.array(list(range(B + 1)), dtype=mx.int32)
+    cu_seqlens_q = mx.arange(B + 1, dtype=mx.int32)
     mx.eval(cu_seqlens_q)
 
     # Zero-copy paged attention (v2, online softmax, varlen-capable)

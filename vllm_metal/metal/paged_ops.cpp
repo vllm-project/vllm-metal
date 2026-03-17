@@ -340,8 +340,8 @@ void paged_attention_v2_online_impl(
   int32_t nkv = static_cast<int32_t>(num_kv_heads);
   enc.set_bytes(nkv,   8);
   enc.set_bytes(scale, 9);
-  // softcap=0 means disabled; the kernel uses 1.0 as the disabled sentinel.
-  float softcapping = (softcap == 0.f) ? 1.0f : softcap;
+  // softcap: 0.0 = disabled, >0 = enabled. Passed through to kernel as-is.
+  float softcapping = softcap;
   enc.set_bytes(softcapping, 10);
 
   enc.set_input_array(block_tables, 11);
