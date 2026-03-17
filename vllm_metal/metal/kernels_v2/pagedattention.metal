@@ -848,7 +848,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // Causal: this query token can attend to KV positions [0, effective_context_len).
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
   if (effective_context_len <= 0) {
-    // No KV tokens to attend to — output zeros (handled naturally by loop not executing).
+    // No KV tokens to attend to. Caller guarantees out is zero-initialized.
     return;
   }
 
