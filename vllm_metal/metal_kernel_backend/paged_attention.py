@@ -10,7 +10,7 @@ all cached K/V blocks.
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
-Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill``,
+Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill_packed``,
 ``prepare_decode``, ``clear_context`` from ``paged_attention_common``.
 
 Backend replacement guide
@@ -100,7 +100,7 @@ def _metal_kernel_prefill_attention(
     """
     B, n_heads, L, head_dim = queries.shape  # noqa: N806
 
-    # RoPE — per-request position reset for packed prefill
+    # RoPE — per-request position reset
     if not hasattr(attn_module, "rope"):
         raise NotImplementedError(
             f"Attention module {type(attn_module).__name__} does not have a 'rope' "

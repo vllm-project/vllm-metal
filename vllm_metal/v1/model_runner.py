@@ -53,7 +53,6 @@ from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     prepare_decode,
-    prepare_prefill,
     prepare_prefill_packed,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
@@ -1596,81 +1595,6 @@ class MetalModelRunner:
     # Paged attention paths
     # ------------------------------------------------------------------
 
-    def _prefill_single_request_paged(
-        self,
-        req_id: str,
-        token_ids: list[int],
-        sampling_params: SamplingParams,
-        block_ids: list[int],
-        generator: torch.Generator | None = None,
-        prompt_len: int | None = None,
-    ) -> int:
-        """Paged-attention prefill for a single request.
-
-        Uses MLX for inline SDPA, then writes K/V to MPS paged cache via
-        the HF reshape_and_cache kernel. Returns the next token.
-        """
-        num_tokens = len(token_ids)
-        if prompt_len is None:
-            prompt_len = num_tokens
-
-        # Stash per-request metadata (slot_mapping) in thread-local so the
-        # patched attention wrappers can read it during the forward pass.
-        prepare_prefill(block_ids, num_tokens, self._paged_block_size)
-
-        # OffsetCache is a fake cache — it stores no KV data.  It only
-        # satisfies mlx_lm's RoPE offset and mask protocol.  Real KV is
-        # written to the MPS paged cache by the attention wrapper.
-        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
-
-        # The model forward calls each layer's self_attn, which has been
-        # replaced by MetalKernelPagedAttentionWrapper.  The wrapper:
-        # - ignores cache= (OffsetCache) for KV storage
-        # - reads get_context() for slot_mapping
-        # - computes attention via MLX SDPA
-        # - writes K/V to MPS paged cache via reshape_and_cache
-        input_ids = mx.array([token_ids], dtype=mx.int32)
-        try:
-            model_output = self.model(input_ids, cache=offset_caches)
-            logits = self._extract_logits(model_output)
-            last_logits = logits[:, -1, :]
-        finally:
-            clear_context()
-
-        # Sample
-        is_greedy = sampling_params.temperature < 1e-5
-        needs_advanced = (
-            sampling_params.top_k > 0
-            or sampling_params.top_p < 1.0
-            or sampling_params.frequency_penalty != 0
-            or sampling_params.presence_penalty != 0
-            or sampling_params.repetition_penalty != 1.0
-        )
-
-        if is_greedy and not needs_advanced:
-            next_token_mlx = _mlx_greedy_sample(last_logits)
-            mx.eval(next_token_mlx)
-            next_token = int(next_token_mlx.item())
-        else:
-            mx.eval(last_logits)
-            logits_torch = mlx_to_torch(
-                last_logits.astype(mx.float32), device=self.device
-            )
-            generators = {} if generator is None else {0: generator}
-            metadata = self._make_sampling_metadata(
-                [sampling_params],
-                [token_ids[:prompt_len]],
-                [token_ids[prompt_len:]],
-                generators=generators,
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
-
-        # Track sequence length
-        self._paged_request_seq_lens[req_id] = num_tokens
-
-        return next_token
-
     def _prefill_packed_paged(
         self,
         pack_reqs: list[
@@ -1995,13 +1919,18 @@ class MetalModelRunner:
                     # Intermediate chunk: sample then drop (async scheduler
                     # allocates no placeholder for intermediate chunks).
                     cur_len = computed_tokens + scheduled_tokens
-                    _discarded = self._prefill_single_request_paged(
-                        req_id,
-                        token_ids[:cur_len],
-                        sampling_params,
-                        block_ids=sched_block_ids,
-                        generator=generator,
-                    )
+                    _discarded = self._prefill_packed_paged(
+                        [
+                            (
+                                req_id,
+                                token_ids[:cur_len],
+                                sampling_params,
+                                sched_block_ids,
+                                generator,
+                                None,
+                            ),
+                        ]
+                    )[0]
                     cache: list = []
                     sampled_tokens.append([])
                     self._request_states[req_id] = RequestState(
@@ -2123,26 +2052,35 @@ class MetalModelRunner:
 
                         if target_len < len(state.token_ids):
                             # Intermediate chunk: sample then drop
-                            _discarded = self._prefill_single_request_paged(
-                                req_id,
-                                state.token_ids[:target_len],
-                                state.sampling_params,
-                                block_ids=state.block_ids,
-                                generator=state.generator,
-                            )
+                            _discarded = self._prefill_packed_paged(
+                                [
+                                    (
+                                        req_id,
+                                        state.token_ids[:target_len],
+                                        state.sampling_params,
+                                        state.block_ids,
+                                        state.generator,
+                                        None,
+                                    ),
+                                ]
+                            )[0]
                             req_ids.append(req_id)
                             req_id_to_index[req_id] = len(req_ids) - 1
                             sampled_tokens.append([])
                         else:
                             # Last chunk: sample and keep (drains async placeholder)
-                            next_token = self._prefill_single_request_paged(
-                                req_id,
-                                state.token_ids,
-                                state.sampling_params,
-                                block_ids=state.block_ids,
-                                generator=state.generator,
-                                prompt_len=state.prompt_len,
-                            )
+                            next_token = self._prefill_packed_paged(
+                                [
+                                    (
+                                        req_id,
+                                        state.token_ids,
+                                        state.sampling_params,
+                                        state.block_ids,
+                                        state.generator,
+                                        state.prompt_len,
+                                    ),
+                                ]
+                            )[0]
                             state.token_ids.append(next_token)
                             state.generated_tokens = (
                                 len(state.token_ids) - state.prompt_len

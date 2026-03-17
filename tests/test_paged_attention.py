@@ -12,7 +12,6 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     get_context,
     prepare_decode,
-    prepare_prefill,
     prepare_prefill_packed,
 )
 
@@ -35,15 +34,12 @@ class TestPrepare:
     def teardown_method(self):
         clear_context()
 
-    def test_prepare_prefill_slot_mapping(self):
-        # Arrange
-        block_ids = [10, 11]
-
-        # Act
-        prepare_prefill(block_ids, num_tokens=5, block_size=4)
+    def test_prepare_prefill_single_request(self):
+        # Single request via prepare_prefill_packed
+        prepare_prefill_packed([([10, 11], 5)], block_size=4)
         ctx = get_context()
 
-        # Assert — block 10: slots 40,41,42,43; block 11: slot 44
+        # block 10: slots 40,41,42,43; block 11: slot 44
         assert ctx is not None
         assert ctx.is_prefill
         assert ctx.slot_mapping == [40, 41, 42, 43, 44]
@@ -67,7 +63,7 @@ class TestPrepare:
         assert ctx.context_lens == [3, 2]
 
     def test_prepare_prefill_packed_single_request(self):
-        # Single request should still produce valid cu_seqlens
+        # Single request through packed path should produce valid metadata
         requests = [([5, 6], 5)]
         prepare_prefill_packed(requests, block_size=4)
         ctx = get_context()

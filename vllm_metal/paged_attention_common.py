@@ -5,7 +5,7 @@ Provides the thread-local ``PagedAttentionContext`` and ``OffsetCache`` used by
 both the Metal kernel paged attention backend and the model runner.
 
 Usage:
-    1. Before each forward pass call ``prepare_prefill()`` or ``prepare_decode()``
+    1. Before each forward pass call ``prepare_prefill_packed()`` or ``prepare_decode()``
     2. Run ``model(input_ids, cache=offset_caches)`` as normal
     3. The attention wrapper reads ``get_context()`` to decide prefill vs decode
     4. Call ``clear_context()`` after the forward pass
@@ -26,7 +26,7 @@ from mlx_lm.models.base import create_causal_mask
 # Thread-local storage used to pass per-request metadata (slot_mapping,
 # block_tables, etc.) to attention wrappers buried inside the model.
 # We cannot add extra arguments to the mlx_lm forward signature, so
-# instead: prepare_prefill/decode() stashes context here before the
+# instead: prepare_prefill_packed/decode() stashes context here before the
 # forward pass, each attention wrapper reads it via get_context(), and
 # clear_context() cleans up afterwards.
 _thread_local = threading.local()
@@ -148,36 +148,13 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
 # ---------------------------------------------------------------------------
 
 
-def prepare_prefill(
-    block_ids: list[int],
-    num_tokens: int,
-    block_size: int,
-) -> None:
-    """Compute slot_mapping for prefill and set global context."""
-    slot_mapping = []
-    for pos in range(num_tokens):
-        block_idx = block_ids[pos // block_size]
-        slot = block_idx * block_size + (pos % block_size)
-        slot_mapping.append(slot)
-
-    set_context(
-        PagedAttentionContext(
-            is_prefill=True,
-            slot_mapping=slot_mapping,
-            block_tables=[block_ids],
-            context_lens=[num_tokens],
-            cu_seqlens=[0, num_tokens],
-        )
-    )
-
-
 def prepare_prefill_packed(
     requests: list[tuple[list[int], int]],
     block_size: int,
 ) -> None:
-    """Compute slot_mapping, cu_seqlens, block_tables, context_lens for packed prefill.
+    """Compute slot_mapping, cu_seqlens, block_tables, context_lens for prefill.
 
-    Packs multiple prefill requests into a single forward pass.  The
+    Packs one or more prefill requests into a single forward pass.  The
     varlen Metal kernel uses ``cu_seqlens`` to locate each sequence's
     query tokens and ``block_tables`` / ``context_lens`` to read K/V
     from the paged cache.
