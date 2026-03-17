@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paged attention using vendored Metal kernels dispatched through MLX.
 
-Prefill: MLX inline SDPA (causal), then ``reshape_and_cache`` to write
-projected K/V into the paged cache.
+Prefill: ``reshape_and_cache`` to write projected K/V into the paged cache,
+then varlen Metal kernel (``paged_attention_v2_online``) for attention.
 
 Decode: MLX projections + per-request RoPE, ``reshape_and_cache`` to write
 the new token, then ``paged_attention_v1`` for zero-copy attention over
@@ -70,7 +70,6 @@ from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
-    build_packed_causal_mask,
 )
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
@@ -79,7 +78,7 @@ from vllm_metal.paged_attention_common import (
 )
 
 # ---------------------------------------------------------------------------
-# Prefill attention (MLX SDPA + reshape_and_cache write)
+# Prefill attention (reshape_and_cache write + varlen Metal kernel)
 # ---------------------------------------------------------------------------
 
 
@@ -95,11 +94,12 @@ def _metal_kernel_prefill_attention(
 ) -> mx.array:
     """Prefill: B=1, L=prompt_len (single) or L=total_tokens (packed).
 
-    Inline causal SDPA in MLX, then write K/V to paged cache via
-    ``reshape_and_cache``.  When ``ctx.cu_seqlens`` is set, builds a
-    block-diagonal causal mask so packed requests don't cross-attend.
+    Write K/V to paged cache via ``reshape_and_cache``, then compute
+    attention using the varlen Metal kernel (``paged_attention_v2_online``).
+    The kernel uses ``cu_seqlens_q`` to locate each sequence's query tokens
+    and enforces causal masking internally — no dense mask needed.
     """
-    B, _, L, _ = queries.shape  # noqa: N806
+    B, n_heads, L, head_dim = queries.shape  # noqa: N806
 
     # RoPE — per-request position reset for packed prefill
     if not hasattr(attn_module, "rope"):
@@ -108,49 +108,72 @@ def _metal_kernel_prefill_attention(
             "attribute. Only RoPE-based models are supported by paged attention."
         )
 
-    # SCAFFOLDING: packed RoPE + mask — remove when varlen kernel is ready.
-    if ctx.cu_seqlens is not None:
+    if len(ctx.cu_seqlens) > 2:
+        # Packed prefill: per-request RoPE with position reset
         queries, keys = apply_packed_rope(attn_module, queries, keys, ctx.cu_seqlens)
     else:
+        # Single prefill
         offset = offset_cache.offset if offset_cache is not None else 0
         queries = attn_module.rope(queries, offset=offset)
         keys = attn_module.rope(keys, offset=offset)
 
-    # Causal SDPA
-    # SCAFFOLDING: dense mask — remove when varlen kernel is ready.
-    if ctx.cu_seqlens is not None and len(ctx.cu_seqlens) > 2:
-        attn_mask = build_packed_causal_mask(ctx.cu_seqlens, L, dtype=queries.dtype)
-    else:
-        attn_mask = "causal" if L > 1 else None
-
-    output = mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=attn_module.scale, mask=attn_mask
-    )
-
-    # Write K/V into paged cache via reshape_and_cache
-    # keys/values: (1, kv_heads, L, head_dim) → (L, kv_heads, head_dim)
-    k_flat = keys[0].transpose(1, 0, 2)  # (L, kv_heads, head_dim)
-    v_flat = values[0].transpose(1, 0, 2)
-
-    # Ensure contiguous + correct dtype
-    k_flat = mx.contiguous(k_flat.astype(cache.dtype))
-    v_flat = mx.contiguous(v_flat.astype(cache.dtype))
+    # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
+    q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(cache.dtype))
+    k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(cache.dtype))
+    v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(cache.dtype))
 
     slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
-    mx.eval(k_flat, v_flat, slot_mapping)
+
+    # Build block_tables and seq_lens from context
+    max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
+    block_tables_list = [
+        bt + [0] * (max_blocks_per_seq - len(bt)) for bt in ctx.block_tables
+    ]
+    block_tables = mx.array(block_tables_list, dtype=mx.int32)
+    seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
+    cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
+
+    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens, cu_seqlens_q)
 
     ops = get_ops()
+
+    # Write K/V into paged cache BEFORE attention — the kernel reads from
+    # the paged cache via block_table, not from raw tensors.
     ops.reshape_and_cache(
-        k_flat,
-        v_flat,
+        k_3d,
+        v_3d,
         cache.key_caches[layer_idx],
         cache.value_caches[layer_idx],
         slot_mapping,
     )
 
-    # output: (B, heads, L, head_dim) → (B, L, heads, head_dim) → (B, L, D)
-    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-    return attn_module.o_proj(output)
+    # Allocate output and run varlen paged attention
+    out = mx.zeros((L, n_heads, head_dim), dtype=cache.dtype)
+    mx.eval(out)
+
+    max_seq_len = max(ctx.context_lens)
+
+    ops.paged_attention_v2_online(
+        out,
+        q_3d,
+        cache.key_caches[layer_idx],
+        cache.value_caches[layer_idx],
+        cache.num_kv_heads,
+        attn_module.scale,
+        0.0,  # softcap (0 = disabled)
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        cache.block_size,
+        max_seq_len,
+        -1,  # sliding_window (-1 = disabled)
+    )
+
+    mx.synchronize()
+
+    # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
+    out = out.reshape(B, L, n_heads * head_dim)
+    return attn_module.o_proj(out)
 
 
 # ---------------------------------------------------------------------------

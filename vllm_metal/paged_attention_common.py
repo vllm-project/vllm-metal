@@ -164,6 +164,9 @@ def prepare_prefill(
         PagedAttentionContext(
             is_prefill=True,
             slot_mapping=slot_mapping,
+            block_tables=[block_ids],
+            context_lens=[num_tokens],
+            cu_seqlens=[0, num_tokens],
         )
     )
 
@@ -172,11 +175,12 @@ def prepare_prefill_packed(
     requests: list[tuple[list[int], int]],
     block_size: int,
 ) -> None:
-    """Compute slot_mapping and cu_seqlens for packed prefill.
+    """Compute slot_mapping, cu_seqlens, block_tables, context_lens for packed prefill.
 
     Packs multiple prefill requests into a single forward pass.  The
-    attention wrapper uses ``cu_seqlens`` to build a block-diagonal
-    causal mask so that each request only attends to its own tokens.
+    varlen Metal kernel uses ``cu_seqlens`` to locate each sequence's
+    query tokens and ``block_tables`` / ``context_lens`` to read K/V
+    from the paged cache.
 
     Args:
         requests: list of (block_ids, num_tokens) per request.
@@ -184,6 +188,8 @@ def prepare_prefill_packed(
     """
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
+    block_tables: list[list[int]] = []
+    context_lens: list[int] = []
 
     for block_ids, num_tokens in requests:
         for pos in range(num_tokens):
@@ -191,11 +197,15 @@ def prepare_prefill_packed(
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        block_tables.append(block_ids)
+        context_lens.append(num_tokens)
 
     set_context(
         PagedAttentionContext(
             is_prefill=True,
             slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
             cu_seqlens=cu_seqlens,
         )
     )

@@ -47,6 +47,9 @@ class TestPrepare:
         assert ctx is not None
         assert ctx.is_prefill
         assert ctx.slot_mapping == [40, 41, 42, 43, 44]
+        assert ctx.block_tables == [[10, 11]]
+        assert ctx.context_lens == [5]
+        assert ctx.cu_seqlens == [0, 5]
 
     def test_prepare_prefill_packed_slot_mapping(self):
         # Two requests: 3 tokens in block 10, 2 tokens in block 20
@@ -60,6 +63,8 @@ class TestPrepare:
         # Request 1: block 20, slots 80,81
         assert ctx.slot_mapping == [40, 41, 42, 80, 81]
         assert ctx.cu_seqlens == [0, 3, 5]
+        assert ctx.block_tables == [[10], [20]]
+        assert ctx.context_lens == [3, 2]
 
     def test_prepare_prefill_packed_single_request(self):
         # Single request should still produce valid cu_seqlens
@@ -71,6 +76,8 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 5]
         # block 5: slots 20,21,22,23; block 6: slot 24
         assert ctx.slot_mapping == [20, 21, 22, 23, 24]
+        assert ctx.block_tables == [[5, 6]]
+        assert ctx.context_lens == [5]
 
     def test_prepare_decode(self):
         # Arrange
