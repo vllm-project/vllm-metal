@@ -32,6 +32,7 @@ PROMPTS = [
     "One plus one equals",
     "The largest planet in our solar system is",
     "Water boils at a temperature of",
+    "Machine learning is",
 ]
 
 if __name__ == "__main__":
