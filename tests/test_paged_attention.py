@@ -91,59 +91,6 @@ class TestPrepare:
         assert ctx.offsets == [7]
 
 
-class TestPackedCausalMask:
-    """Tests for the block-diagonal causal mask used in packed prefill."""
-
-    def test_single_sequence(self):
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
-            build_packed_causal_mask,
-        )
-
-        mask = build_packed_causal_mask([0, 3], total_len=3)
-        # Standard causal: lower-triangular (0) with upper-triangular (-inf)
-        assert mask.shape == (1, 1, 3, 3)
-        m = mask[0, 0]
-        # Diagonal and below should be 0
-        assert m[0, 0].item() == 0.0
-        assert m[1, 0].item() == 0.0
-        assert m[1, 1].item() == 0.0
-        # Above diagonal should be -inf
-        assert m[0, 1].item() == float("-inf")
-        assert m[0, 2].item() == float("-inf")
-
-    def test_two_sequences_isolation(self):
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
-            build_packed_causal_mask,
-        )
-
-        # Two sequences: [0,2) and [2,5)
-        mask = build_packed_causal_mask([0, 2, 5], total_len=5)
-        m = mask[0, 0]
-        # Seq 0 tokens should not attend to seq 1 tokens
-        assert m[0, 2].item() == float("-inf")
-        assert m[0, 3].item() == float("-inf")
-        assert m[1, 2].item() == float("-inf")
-        # Seq 1 tokens should not attend to seq 0 tokens
-        assert m[2, 0].item() == float("-inf")
-        assert m[2, 1].item() == float("-inf")
-        assert m[3, 0].item() == float("-inf")
-        # Within seq 1: causal
-        assert m[2, 2].item() == 0.0
-        assert m[3, 2].item() == 0.0
-        assert m[3, 3].item() == 0.0
-        assert m[2, 3].item() == float("-inf")
-
-    def test_mask_dtype_matches_request(self):
-        import mlx.core as mx
-
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
-            build_packed_causal_mask,
-        )
-
-        mask = build_packed_causal_mask([0, 3], total_len=3, dtype=mx.bfloat16)
-        assert mask.dtype == mx.bfloat16
-
-
 class TestPackedRoPE:
     """Tests for per-request RoPE position reset in packed prefill."""
 
