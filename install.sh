@@ -134,6 +134,12 @@ main() {
   cd -
   rm -rf vllm-$vllm_v*
 
+  # Upgrade transformers beyond vllm's <5 pin.
+  # mlx-lm 0.30+ and mlx-vlm 0.3.10+ require transformers>=5.0.0 for newer
+  # model architectures (Qwen3.5, Nemotron, etc.). vllm works fine with v5 —
+  # upstream is tracking the official upgrade in vllm-project/vllm#30566.
+  uv pip install 'transformers>=5.0.0'
+
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
   else
