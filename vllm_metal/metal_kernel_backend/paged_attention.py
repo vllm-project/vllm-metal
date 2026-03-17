@@ -90,7 +90,6 @@ def _metal_kernel_prefill_attention(
     cache: MetalPagedKVCache,
     layer_idx: int,
     ctx: PagedAttentionContext,
-    offset_cache: Any,
 ) -> mx.array:
     """Prefill: B=1, L=prompt_len (single) or L=total_tokens (packed).
 
@@ -108,14 +107,9 @@ def _metal_kernel_prefill_attention(
             "attribute. Only RoPE-based models are supported by paged attention."
         )
 
-    if len(ctx.cu_seqlens) > 2:
-        # Packed prefill: per-request RoPE with position reset
-        queries, keys = apply_packed_rope(attn_module, queries, keys, ctx.cu_seqlens)
-    else:
-        # Single prefill
-        offset = offset_cache.offset if offset_cache is not None else 0
-        queries = attn_module.rope(queries, offset=offset)
-        keys = attn_module.rope(keys, offset=offset)
+    # NOTE: apply_packed_rope always uses offset=0 per request. Chunked
+    # prefill will need per-request offsets (like decode) for continuation chunks.
+    queries, keys = apply_packed_rope(attn_module, queries, keys, ctx.cu_seqlens)
 
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(cache.dtype))
@@ -339,7 +333,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
 
         if ctx.is_prefill:
             return _metal_kernel_prefill_attention(
-                inner, queries, keys, values, kv_cache, layer_idx, ctx, cache
+                inner, queries, keys, values, kv_cache, layer_idx, ctx
             )
         else:
             return _metal_kernel_decode_attention(
