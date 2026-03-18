@@ -64,4 +64,3 @@ class STTRuntimeAdapter(ABC):
     def warm_up(self) -> None:
         """Run a dummy encode to JIT-compile the model at startup."""
         ...
-

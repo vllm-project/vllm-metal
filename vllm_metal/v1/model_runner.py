@@ -617,7 +617,9 @@ class MetalModelRunner:
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_stt: bool = False  # Will be set during model loading
-        self._stt_runtime_adapter: STTRuntimeAdapter | None = None  # Set during STT loading
+        self._stt_runtime_adapter: STTRuntimeAdapter | None = (
+            None  # Set during STT loading
+        )
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -748,7 +750,9 @@ class MetalModelRunner:
                 )
                 self.tokenizer = None  # Whisper manages its own tokenizer
                 self._is_stt = True
-                self._stt_runtime_adapter = self.model.create_runtime_adapter(model_name)
+                self._stt_runtime_adapter = self.model.create_runtime_adapter(
+                    model_name
+                )
                 return
 
         # Local import: keep non-STT startup/import path light.
