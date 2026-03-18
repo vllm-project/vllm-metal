@@ -557,6 +557,13 @@ class Qwen3ASRModel(nn.Module):
     def model_type(self) -> str:
         return "qwen3_asr"
 
+    def create_runtime_adapter(self, model_path: str):
+        """Create the model-owned runtime adapter used by the vLLM runner."""
+        # Local import: avoid import-time cycles (adapter imports transcriber).
+        from .adapter import Qwen3ASRRuntimeAdapter
+
+        return Qwen3ASRRuntimeAdapter(self, model_path)
+
     def sanitize(self, weights: dict) -> dict:
         """Map HF weight keys to MLX model structure.
 
