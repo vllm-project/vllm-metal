@@ -122,6 +122,18 @@ def vllm_outputs():
     Uses max_num_seqs=1 to avoid batch-invariance non-determinism on Metal.
     """
     llm = LLM(model=MODEL_NAME, max_model_len=512, max_num_seqs=1)
+
+    # Verify paged KV path is active when requested
+    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1":
+        runner = llm.llm_engine.model_executor.driver_worker.model_runner
+        assert runner._paged_kv_cache is not None, "Paged KV cache not initialised"
+        from vllm_metal.metal_kernel_backend.paged_attention import (
+            MetalKernelPagedAttentionWrapper,
+        )
+
+        attn = runner.model.model.layers[0].self_attn
+        assert isinstance(attn, MetalKernelPagedAttentionWrapper)
+
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
     outputs = llm.generate(PROMPTS, sp)
     return {o.prompt: o for o in outputs}

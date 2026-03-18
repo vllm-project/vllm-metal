@@ -127,7 +127,9 @@ def _metal_kernel_prefill_attention(
     seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
     cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
 
-    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens, cu_seqlens_q)
+    # Allocate output buffer before eval so we can materialize everything in one call
+    out = mx.zeros((L, n_heads, head_dim), dtype=cache.dtype)
+    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens, cu_seqlens_q, out)
 
     ops = get_ops()
 
@@ -140,10 +142,6 @@ def _metal_kernel_prefill_attention(
         cache.value_caches[layer_idx],
         slot_mapping,
     )
-
-    # Allocate output and run varlen paged attention
-    out = mx.zeros((L, n_heads, head_dim), dtype=cache.dtype)
-    mx.eval(out)
 
     max_seq_len = max(ctx.context_lens)
 
