@@ -14,6 +14,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from vllm_metal.stt.runtime import STTRuntimeAdapter
+
 from .config import WhisperConfig
 
 # ===========================================================================
@@ -270,7 +272,7 @@ class WhisperModel(nn.Module):
         all_heads[config.n_text_layer // 2 :] = True
         self._alignment_heads = mx.array(np.asarray(all_heads.nonzero()).T)
 
-    def create_runtime_adapter(self, model_path: str):
+    def create_runtime_adapter(self, model_path: str) -> STTRuntimeAdapter:
         """Create the model-owned runtime adapter used by the vLLM runner."""
         # Local import: avoid import-time cycles (adapter imports transcriber).
         from .adapter import WhisperRuntimeAdapter

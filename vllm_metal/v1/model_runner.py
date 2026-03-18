@@ -752,7 +752,7 @@ class MetalModelRunner:
                 return
 
         # Local import: keep non-STT startup/import path light.
-        from vllm_metal.stt.transcribe import load_model as stt_load_model
+        from vllm_metal.stt.loader import load_model as stt_load_model
 
         logger.info(f"Loading STT model: {model_name}")
         self.model = stt_load_model(model_name)
