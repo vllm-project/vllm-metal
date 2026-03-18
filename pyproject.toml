@@ -56,7 +56,7 @@ dev = [
     "mypy>=1.19.1",
 ]
 all = [
-    "vllm-metal[vllm,stt,dev]",
+    "vllm-metal[stt,dev]",
 ]
 
 [project.urls]
