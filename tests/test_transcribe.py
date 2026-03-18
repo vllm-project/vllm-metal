@@ -10,11 +10,9 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from vllm_metal.stt.transcribe import (
-    TranscriptionResult,
-    WhisperTranscriber,
-    load_model,
-)
+from vllm_metal.stt.loader import load_model
+from vllm_metal.stt.protocol import TranscriptionResult
+from vllm_metal.stt.whisper import WhisperTranscriber
 from vllm_metal.stt.whisper.transcriber import MAX_PROMPT_TOKENS
 
 # ===========================================================================
@@ -370,11 +368,12 @@ class TestTranscribeIntegration:
         import mlx.core as mx
 
         from vllm_metal.stt.audio import SAMPLE_RATE
-        from vllm_metal.stt.transcribe import load_model, transcribe
+        from vllm_metal.stt.loader import load_model
+        from vllm_metal.stt.whisper import WhisperTranscriber
 
         model = load_model("openai/whisper-tiny")
         audio = mx.zeros(SAMPLE_RATE * 3)  # 3s silence
-        result = transcribe(model, audio)
+        result = WhisperTranscriber(model).transcribe(audio)
         # Whisper may hallucinate on silence; just check it doesn't crash
         assert isinstance(result.text, str)
 
@@ -383,9 +382,10 @@ class TestTranscribeIntegration:
         import mlx.core as mx
 
         from vllm_metal.stt.audio import SAMPLE_RATE
-        from vllm_metal.stt.transcribe import load_model, transcribe
+        from vllm_metal.stt.loader import load_model
+        from vllm_metal.stt.whisper import WhisperTranscriber
 
         model = load_model("openai/whisper-tiny")
         audio = mx.zeros(SAMPLE_RATE * 3)
-        result = transcribe(model, audio, with_timestamps=True)
+        result = WhisperTranscriber(model).transcribe(audio, with_timestamps=True)
         assert result.duration == pytest.approx(3.0)
