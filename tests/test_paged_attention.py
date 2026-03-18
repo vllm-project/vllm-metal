@@ -11,8 +11,8 @@ from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     get_context,
-    prepare_decode,
     prepare_prefill_packed,
+    prepare_unified,
 )
 
 
@@ -75,20 +75,36 @@ class TestPrepare:
         assert ctx.block_tables == [[5, 6]]
         assert ctx.context_lens == [5]
 
-    def test_prepare_decode(self):
-        # Arrange
-        requests = [([5, 6], 7)]
-
-        # Act
-        prepare_decode(requests, block_size=4)
+    def test_prepare_unified_decode_only(self):
+        # Single decode request via prepare_unified
+        decode_requests = [([5, 6], 7)]
+        prepare_unified(decode_requests, [], block_size=4)
         ctx = get_context()
 
-        # Assert — new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
+        # new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
         assert ctx is not None
-        assert not ctx.is_prefill
+        assert ctx.is_prefill  # unified always sets True
         assert ctx.slot_mapping == [27]
         assert ctx.context_lens == [8]
         assert ctx.offsets == [7]
+        assert ctx.cu_seqlens == [0, 1]
+
+    def test_prepare_unified_mixed(self):
+        # 1 decode + 1 prefill
+        decode_requests = [([5, 6], 7)]  # seq_len=7
+        prefill_requests = [([10, 11], 5)]  # 5 tokens
+
+        prepare_unified(decode_requests, prefill_requests, block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        # Decode slot: pos=7, block 6, slot=6*4+3=27
+        # Prefill slots: block 10 slots 40,41,42,43; block 11 slot 44
+        assert ctx.slot_mapping == [27, 40, 41, 42, 43, 44]
+        assert ctx.cu_seqlens == [0, 1, 6]
+        assert ctx.offsets == [7, 0]
+        assert ctx.context_lens == [8, 5]
+        assert ctx.block_tables == [[5, 6], [10, 11]]
 
 
 class TestPackedRoPE:

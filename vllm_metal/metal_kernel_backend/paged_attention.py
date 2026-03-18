@@ -10,8 +10,8 @@ all cached K/V blocks.
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
-Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill_packed``,
-``prepare_decode``, ``clear_context`` from ``paged_attention_common``.
+Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
+``prepare_prefill_packed``, ``clear_context`` from ``paged_attention_common``.
 
 Backend replacement guide
 -------------------------
@@ -175,109 +175,6 @@ def _metal_kernel_prefill_attention(
 
 
 # ---------------------------------------------------------------------------
-# Decode attention (reshape_and_cache + paged_attention_v1)
-# ---------------------------------------------------------------------------
-
-
-def _metal_kernel_decode_attention(
-    attn_module: Any,
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    cache: MetalPagedKVCache,
-    layer_idx: int,
-    ctx: PagedAttentionContext,
-) -> mx.array:
-    """Batched decode: B=batch_size, L=1.
-
-    Per-request RoPE, write new token via ``reshape_and_cache``,
-    then zero-copy attention via ``paged_attention_v1``.
-    """
-    B = queries.shape[0]  # noqa: N806
-    n_heads = queries.shape[1]
-    head_dim = queries.shape[3]
-
-    # Per-request RoPE
-    if not hasattr(attn_module, "rope"):
-        raise NotImplementedError(
-            f"Attention module {type(attn_module).__name__} does not have a 'rope' "
-            "attribute. Only RoPE-based models are supported by paged attention."
-        )
-    q_parts = []
-    k_parts = []
-    for i in range(B):
-        q_parts.append(attn_module.rope(queries[i : i + 1], offset=ctx.offsets[i]))
-        k_parts.append(attn_module.rope(keys[i : i + 1], offset=ctx.offsets[i]))
-    queries = mx.concatenate(q_parts, axis=0)  # (B, heads, 1, head_dim)
-    keys_new = mx.concatenate(k_parts, axis=0)  # (B, kv_heads, 1, head_dim)
-
-    # Squeeze seq dim: (B, heads, 1, hd) → (B, heads, hd)
-    q_3d = mx.contiguous(queries[:, :, 0, :].astype(cache.dtype))
-    k_3d = mx.contiguous(keys_new[:, :, 0, :].astype(cache.dtype))
-    v_3d = mx.contiguous(values[:, :, 0, :].astype(cache.dtype))
-
-    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
-
-    # Build block_tables and seq_lens
-    max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
-    block_tables_list = [
-        bt + [0] * (max_blocks_per_seq - len(bt)) for bt in ctx.block_tables
-    ]
-    block_tables = mx.array(block_tables_list, dtype=mx.int32)
-    seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
-
-    # Eval all inputs before kernel dispatch
-    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens)
-
-    ops = get_ops()
-
-    # Write new K/V tokens into paged cache
-    ops.reshape_and_cache(
-        k_3d,
-        v_3d,
-        cache.key_caches[layer_idx],
-        cache.value_caches[layer_idx],
-        slot_mapping,
-    )
-
-    # Allocate output
-    out = mx.zeros((B, n_heads, head_dim), dtype=cache.dtype)
-    mx.eval(out)
-
-    max_seq_len = max(ctx.context_lens)
-    scale = attn_module.scale
-
-    # Build cu_seqlens_q for varlen dispatch: decode has q_len=1 per sequence.
-    cu_seqlens_q = mx.arange(B + 1, dtype=mx.int32)
-    mx.eval(cu_seqlens_q)
-
-    # Zero-copy paged attention (v2, online softmax, varlen-capable)
-    ops.paged_attention_v2_online(
-        out,
-        q_3d,
-        cache.key_caches[layer_idx],
-        cache.value_caches[layer_idx],
-        cache.num_kv_heads,
-        scale,
-        0.0,  # softcap (0 = disabled)
-        block_tables,
-        seq_lens,
-        cu_seqlens_q,
-        cache.block_size,
-        max_seq_len,
-        -1,  # sliding_window (-1 = disabled)
-    )
-
-    # Synchronize GPU: paged_attention_v2_online wrote to out's buffer via a raw
-    # Metal dispatch that MLX's lazy graph doesn't track.  mx.eval(out) would
-    # be a no-op here (out was already evaluated as zeros), so we must use
-    # mx.synchronize() to flush the command encoder and wait for the kernel.
-    mx.synchronize()
-    out = out.reshape(B, 1, n_heads * head_dim)
-    return attn_module.o_proj(out)
-
-
-# ---------------------------------------------------------------------------
 # Wrapper nn.Module
 # ---------------------------------------------------------------------------
 
@@ -335,14 +232,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        if ctx.is_prefill:
-            return _metal_kernel_prefill_attention(
-                inner, queries, keys, values, kv_cache, layer_idx, ctx
-            )
-        else:
-            return _metal_kernel_decode_attention(
-                inner, queries, keys, values, kv_cache, layer_idx, ctx
-            )
+        return _metal_kernel_prefill_attention(
+            inner, queries, keys, values, kv_cache, layer_idx, ctx
+        )
 
 
 # ---------------------------------------------------------------------------
