@@ -12,6 +12,7 @@ import mlx.core as mx
 import pytest
 
 from vllm_metal.stt.config import is_stt_model
+from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.qwen3_asr.config import (
     Qwen3ASRAudioConfig,
     Qwen3ASRConfig,
@@ -23,7 +24,6 @@ from vllm_metal.stt.qwen3_asr.model import (
     Qwen3Attention,
     Qwen3LM,
 )
-from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 
 # ===========================================================================
