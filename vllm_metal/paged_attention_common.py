@@ -188,6 +188,64 @@ def prepare_prefill_packed(
     )
 
 
+def prepare_unified(
+    decode_requests: list[tuple[list[int], int]],
+    prefill_requests: list[tuple[list[int], int]],
+    block_size: int,
+) -> None:
+    """Compute metadata for a unified prefill + decode forward pass.
+
+    Packs decode tokens (1 per request) followed by prefill tokens into a
+    single flattened sequence.  ``cu_seqlens`` marks request boundaries so
+    the varlen kernel handles both decode (length-1) and prefill (length-N)
+    subsequences in one dispatch.
+
+    Args:
+        decode_requests: list of ``(block_ids, seq_len)`` for decode requests.
+            ``seq_len`` = tokens already cached before this step.
+        prefill_requests: list of ``(block_ids, num_tokens)`` for prefill.
+        block_size: tokens per KV cache block.
+    """
+    slot_mapping: list[int] = []
+    cu_seqlens: list[int] = [0]
+    block_tables: list[list[int]] = []
+    context_lens: list[int] = []
+    offsets: list[int] = []
+
+    # Decode requests first (1 token each)
+    for block_ids, seq_len in decode_requests:
+        new_pos = seq_len
+        block_idx = block_ids[new_pos // block_size]
+        slot = block_idx * block_size + (new_pos % block_size)
+        slot_mapping.append(slot)
+        cu_seqlens.append(cu_seqlens[-1] + 1)
+        block_tables.append(block_ids)
+        context_lens.append(seq_len + 1)  # including new token
+        offsets.append(seq_len)  # RoPE position
+
+    # Prefill requests (variable tokens each)
+    for block_ids, num_tokens in prefill_requests:
+        for pos in range(num_tokens):
+            block_idx = block_ids[pos // block_size]
+            slot = block_idx * block_size + (pos % block_size)
+            slot_mapping.append(slot)
+        cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        block_tables.append(block_ids)
+        context_lens.append(num_tokens)
+        offsets.append(0)  # prefill starts at position 0
+
+    set_context(
+        PagedAttentionContext(
+            is_prefill=True,  # use varlen code path
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens=cu_seqlens,
+            offsets=offsets,
+        )
+    )
+
+
 def prepare_decode(
     requests: list[tuple[list[int], int]],
     block_size: int,

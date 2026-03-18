@@ -107,9 +107,15 @@ def _metal_kernel_prefill_attention(
             "attribute. Only RoPE-based models are supported by paged attention."
         )
 
-    # NOTE: apply_packed_rope always uses offset=0 per request. Chunked
-    # prefill will need per-request offsets (like decode) for continuation chunks.
-    queries, keys = apply_packed_rope(attn_module, queries, keys, ctx.cu_seqlens)
+    # Per-segment RoPE: offset=0 for fresh prefill, offset=seq_len for decode
+    # tokens in a unified batch (ctx.offsets populated by prepare_unified).
+    queries, keys = apply_packed_rope(
+        attn_module,
+        queries,
+        keys,
+        ctx.cu_seqlens,
+        offsets=ctx.offsets if ctx.offsets else None,
+    )
 
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(cache.dtype))

@@ -54,6 +54,7 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     prepare_decode,
     prepare_prefill_packed,
+    prepare_unified,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.stt.config import (
@@ -1745,6 +1746,198 @@ class MetalModelRunner:
                 if self._rust_state_manager is not None:
                     self._rust_state_manager.add_request(rid, list(tids) + [nt])
 
+    # ------------------------------------------------------------------
+    # Unified prefill + decode (single forward pass)
+    # ------------------------------------------------------------------
+
+    def _unified_prefill_decode_paged(
+        self,
+        prefill_reqs: list[
+            tuple[
+                str,
+                list[int],
+                SamplingParams,
+                list[int],
+                torch.Generator | None,
+                int | None,
+            ]
+        ],
+        decode_reqs: list[tuple[str, RequestState]],
+    ) -> tuple[list[int], list[int]]:
+        """Single forward pass for mixed prefill + decode requests.
+
+        Packs decode tokens (1 per request) followed by prefill tokens into
+        a flat ``(1, total_tokens)`` input.  The varlen kernel uses
+        ``cu_seqlens`` to handle variable-length subsequences.
+
+        Args:
+            prefill_reqs: list of
+                ``(req_id, token_ids, sampling_params, block_ids,
+                generator, prompt_len)`` — complete prefill requests.
+            decode_reqs: list of ``(req_id, RequestState)`` — decode requests.
+
+        Returns:
+            ``(prefill_next_tokens, decode_next_tokens)``
+        """
+        num_decode = len(decode_reqs)
+        num_prefill = len(prefill_reqs)
+
+        # ---- build unified token sequence: decode first, then prefill ----
+        all_token_ids: list[int] = []
+
+        # Decode: last token per request
+        if self._rust_state_manager is not None:
+            last_tokens = self._rust_state_manager.get_last_tokens_batch(
+                [rid for rid, _ in decode_reqs]
+            )
+        else:
+            last_tokens = [
+                state.token_ids[-1] if state.token_ids else 0
+                for _, state in decode_reqs
+            ]
+        all_token_ids.extend(last_tokens)
+
+        # Prefill: all tokens per request
+        for _, token_ids, _, _, _, _ in prefill_reqs:
+            all_token_ids.extend(token_ids)
+
+        # ---- build metadata for prepare_unified ----
+        decode_info: list[tuple[list[int], int]] = []
+        for req_id, state in decode_reqs:
+            seq_len = self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 1)
+            decode_info.append((state.block_ids, seq_len))
+
+        prefill_info: list[tuple[list[int], int]] = []
+        for _, token_ids, _, block_ids, _, _ in prefill_reqs:
+            prefill_info.append((block_ids, len(token_ids)))
+
+        prepare_unified(decode_info, prefill_info, self._paged_block_size)
+
+        # ---- forward ----
+        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+        input_ids = mx.array([all_token_ids], dtype=mx.int32)
+        try:
+            model_output = self.model(input_ids, cache=offset_caches)
+            logits = self._extract_logits(model_output)
+        finally:
+            clear_context()
+
+        # ---- build cu_seqlens for logit extraction ----
+        cu_seqlens: list[int] = [0]
+        for _ in decode_reqs:
+            cu_seqlens.append(cu_seqlens[-1] + 1)
+        for _, token_ids, _, _, _, _ in prefill_reqs:
+            cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
+
+        # ---- sample decode tokens ----
+        decode_next_tokens: list[int] = []
+        if decode_reqs:
+            # All decode logits are at positions 0..num_decode-1
+            decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
+
+            sampling_params_list = [state.sampling_params for _, state in decode_reqs]
+            all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
+            any_advanced = any(
+                sp.top_k > 0
+                or sp.top_p < 1.0
+                or sp.frequency_penalty != 0
+                or sp.presence_penalty != 0
+                or sp.repetition_penalty != 1.0
+                for sp in sampling_params_list
+            )
+
+            if all_greedy and not any_advanced:
+                next_tokens_mlx = _mlx_greedy_sample(decode_logits)
+                mx.eval(next_tokens_mlx)
+                decode_next_tokens = next_tokens_mlx.tolist()
+            else:
+                mx.eval(decode_logits)
+                prompt_token_ids_list = [
+                    state.token_ids[: state.prompt_len] for _, state in decode_reqs
+                ]
+                output_tokens_list = [
+                    state.token_ids[state.prompt_len :] for _, state in decode_reqs
+                ]
+                generators = {
+                    i: state.generator
+                    for i, (_, state) in enumerate(decode_reqs)
+                    if state.generator is not None
+                }
+                logits_torch = mlx_to_torch(
+                    decode_logits.astype(mx.float32), device=self.device
+                )
+                metadata = self._make_sampling_metadata(
+                    sampling_params_list,
+                    prompt_token_ids_list,
+                    output_tokens_list,
+                    generators=generators,
+                )
+                output = self._sampler.forward(logits_torch, metadata)
+                decode_next_tokens = [
+                    int(output.sampled_token_ids[i, 0].item())
+                    for i in range(num_decode)
+                ]
+
+            # Update decode state
+            for i, (req_id, state) in enumerate(decode_reqs):
+                state.token_ids.append(decode_next_tokens[i])
+                state.generated_tokens += 1
+                self._paged_request_seq_lens[req_id] = (
+                    self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2)
+                    + 1
+                )
+                if self._rust_state_manager is not None:
+                    self._rust_state_manager.append_token(req_id, decode_next_tokens[i])
+
+        # ---- sample prefill tokens ----
+        prefill_next_tokens: list[int] = []
+        for j, (
+            req_id,
+            token_ids,
+            sampling_params,
+            _block_ids,
+            generator,
+            prompt_len,
+        ) in enumerate(prefill_reqs):
+            last_idx = cu_seqlens[num_decode + j + 1] - 1
+            last_logits = logits[:, last_idx : last_idx + 1, :]
+
+            if prompt_len is None:
+                prompt_len = len(token_ids)
+
+            is_greedy = sampling_params.temperature < 1e-5
+            needs_advanced = (
+                sampling_params.top_k > 0
+                or sampling_params.top_p < 1.0
+                or sampling_params.frequency_penalty != 0
+                or sampling_params.presence_penalty != 0
+                or sampling_params.repetition_penalty != 1.0
+            )
+
+            if is_greedy and not needs_advanced:
+                next_token_mlx = _mlx_greedy_sample(last_logits[0])
+                mx.eval(next_token_mlx)
+                next_token = int(next_token_mlx.item())
+            else:
+                mx.eval(last_logits)
+                logits_torch = mlx_to_torch(
+                    last_logits[0].astype(mx.float32), device=self.device
+                )
+                generators = {} if generator is None else {0: generator}
+                metadata = self._make_sampling_metadata(
+                    [sampling_params],
+                    [token_ids[:prompt_len]],
+                    [token_ids[prompt_len:]],
+                    generators=generators,
+                )
+                output = self._sampler.forward(logits_torch, metadata)
+                next_token = int(output.sampled_token_ids[0, 0].item())
+
+            self._paged_request_seq_lens[req_id] = len(token_ids)
+            prefill_next_tokens.append(next_token)
+
+        return prefill_next_tokens, decode_next_tokens
+
     def _batched_decode_paged(
         self, decode_reqs: list[tuple[str, RequestState]]
     ) -> list[int]:
@@ -1980,10 +2173,8 @@ class MetalModelRunner:
                         req_id, list(token_ids) + [next_token]
                     )
 
-        # Process collected complete paged prefill requests via unified
-        # packed path (handles 1 or more requests).
-        if paged_complete:
-            self._run_packed_prefill(paged_complete, sampled_tokens)
+        # Defer paged_complete to unified forward pass during PHASE 2.
+        # If no cached requests exist, it is consumed after PHASE 2.
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -2094,13 +2285,64 @@ class MetalModelRunner:
                         # Decode phase: collect for batched decode
                         paged_decode_reqs.append((req_id, state))
 
-                # Batch decode all generation-phase requests
-                if paged_decode_reqs:
-                    decode_tokens = self._batched_decode_paged(paged_decode_reqs)
-                    for i, (req_id, _) in enumerate(paged_decode_reqs):
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([decode_tokens[i]])
+                # === Unified forward: complete prefills + decode ===
+                if paged_decode_reqs or paged_complete:
+                    total_prefill_tokens = sum(
+                        len(entry[2]) for entry in paged_complete
+                    )
+                    total_tokens = total_prefill_tokens + len(paged_decode_reqs)
+
+                    if total_tokens <= MAX_PACKED_PREFILL_TOKENS:
+                        # Build pack input for prefill requests
+                        prefill_pack = [
+                            (rid, tids, sp, bids, gen, None)
+                            for _, rid, tids, sp, bids, gen in paged_complete
+                        ]
+                        prefill_tokens, decode_tokens = (
+                            self._unified_prefill_decode_paged(
+                                prefill_pack, paged_decode_reqs
+                            )
+                        )
+
+                        # Record prefill results + create state
+                        for i, (idx, rid, tids, sp, bids, gen) in enumerate(
+                            paged_complete
+                        ):
+                            nt = prefill_tokens[i]
+                            sampled_tokens[idx] = [nt]
+                            self._request_states[rid] = RequestState(
+                                token_ids=list(tids) + [nt],
+                                prompt_len=len(tids),
+                                cache=[],
+                                sampling_params=sp,
+                                generator=gen,
+                                generated_tokens=1,
+                                block_ids=bids,
+                            )
+                            if self._rust_state_manager is not None:
+                                self._rust_state_manager.add_request(
+                                    rid, list(tids) + [nt]
+                                )
+                        paged_complete = []  # consumed
+
+                        # Record decode results
+                        for i, (req_id, _) in enumerate(paged_decode_reqs):
+                            req_ids.append(req_id)
+                            req_id_to_index[req_id] = len(req_ids) - 1
+                            sampled_tokens.append([decode_tokens[i]])
+                    else:
+                        # Fallback: separate passes for large batches
+                        if paged_complete:
+                            self._run_packed_prefill(paged_complete, sampled_tokens)
+                            paged_complete = []  # consumed
+                        if paged_decode_reqs:
+                            decode_tokens = self._batched_decode_paged(
+                                paged_decode_reqs
+                            )
+                            for i, (req_id, _) in enumerate(paged_decode_reqs):
+                                req_ids.append(req_id)
+                                req_id_to_index[req_id] = len(req_ids) - 1
+                                sampled_tokens.append([decode_tokens[i]])
             else:
                 # Collect all valid decode requests
                 valid_decode_reqs = []
@@ -2127,6 +2369,11 @@ class MetalModelRunner:
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([0])
+
+        # Handle any paged_complete not consumed by the unified pass
+        # (happens when no cached requests exist in this step).
+        if paged_complete:
+            self._run_packed_prefill(paged_complete, sampled_tokens)
 
         # Consistency check: every scheduled request must be represented in
         # req_ids, and decode-phase scheduled requests should not emit empty
