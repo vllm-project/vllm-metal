@@ -152,7 +152,9 @@ class TestPagedDeterministic:
 
         mlx_match = token_ids == mlx_expected
         paged_match = token_ids == paged_expected
-
+        print(
+            f"VLLM_METAL_USE_PAGED_ATTENTION: {os.environ.get('VLLM_METAL_USE_PAGED_ATTENTION')}"
+        )
         print(f"\n  prompt: {prompt!r}")
         print(f"  output: {text!r}")
         print(f"  ids:    {token_ids}")
