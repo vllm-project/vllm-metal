@@ -1605,6 +1605,7 @@ class MetalModelRunner:
                 list[int],
                 torch.Generator | None,
                 int | None,
+                int,
             ]
         ],
         decode_reqs: list[tuple[str, RequestState]],
@@ -1618,7 +1619,9 @@ class MetalModelRunner:
         Args:
             prefill_reqs: list of
                 ``(req_id, token_ids, sampling_params, block_ids,
-                generator, prompt_len)`` — complete prefill requests.
+                generator, prompt_len, start_pos)`` — prefill requests.
+                ``start_pos`` is the RoPE offset / KV slot start (0 for
+                fresh prefill, >0 for continuation chunks).
             decode_reqs: list of ``(req_id, RequestState)`` — decode requests.
 
         Returns:
@@ -1641,8 +1644,8 @@ class MetalModelRunner:
             ]
         all_token_ids.extend(last_tokens)
 
-        # Prefill: all tokens per request
-        for _, token_ids, _, _, _, _ in prefill_reqs:
+        # Prefill: tokens per request
+        for _, token_ids, _, _, _, _, _ in prefill_reqs:
             all_token_ids.extend(token_ids)
 
         # ---- build metadata for prepare_unified ----
@@ -1651,9 +1654,9 @@ class MetalModelRunner:
             seq_len = self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 1)
             decode_info.append((state.block_ids, seq_len))
 
-        prefill_info: list[tuple[list[int], int]] = []
-        for _, token_ids, _, block_ids, _, _ in prefill_reqs:
-            prefill_info.append((block_ids, len(token_ids)))
+        prefill_info: list[tuple[list[int], int, int]] = []
+        for _, token_ids, _, block_ids, _, _, start_pos in prefill_reqs:
+            prefill_info.append((block_ids, len(token_ids), start_pos))
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
 
@@ -1670,7 +1673,7 @@ class MetalModelRunner:
         cu_seqlens: list[int] = [0]
         for _ in decode_reqs:
             cu_seqlens.append(cu_seqlens[-1] + 1)
-        for _, token_ids, _, _, _, _ in prefill_reqs:
+        for _, token_ids, _, _, _, _, _ in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
 
         # ---- sample decode tokens ----
@@ -1742,6 +1745,7 @@ class MetalModelRunner:
             _block_ids,
             generator,
             prompt_len,
+            _start_pos,
         ) in enumerate(prefill_reqs):
             last_idx = cu_seqlens[num_decode + j + 1] - 1
             last_logits = logits[:, last_idx : last_idx + 1, :]
@@ -1813,7 +1817,8 @@ class MetalModelRunner:
 
         # Paged-attention entries collected for the single unified forward.
         # Each prefill entry: (output_idx, req_id, token_ids, sampling_params,
-        #                      block_ids, generator, entry_type, prompt_len)
+        #                      block_ids, generator, entry_type, prompt_len,
+        #                      start_pos)
         # entry_type is one of: "new_intermediate", "new_complete",
         #                       "cached_intermediate", "cached_last_chunk"
         paged_prefill_entries: list[
@@ -1825,6 +1830,7 @@ class MetalModelRunner:
                 list[int],
                 torch.Generator | None,
                 str,
+                int,
                 int,
             ]
         ] = []
@@ -1859,12 +1865,13 @@ class MetalModelRunner:
                     (
                         output_idx,
                         req_id,
-                        token_ids[:cur_len] if is_intermediate else token_ids,
+                        token_ids[computed_tokens:cur_len],
                         sampling_params,
                         sched_block_ids,
                         generator,
                         "new_intermediate" if is_intermediate else "new_complete",
                         prompt_len,
+                        computed_tokens,  # start_pos / RoPE offset
                     )
                 )
 
@@ -1968,11 +1975,7 @@ class MetalModelRunner:
                             (
                                 output_idx,
                                 req_id,
-                                (
-                                    state.token_ids[:target_len]
-                                    if is_intermediate
-                                    else state.token_ids
-                                ),
+                                state.token_ids[computed:target_len],
                                 state.sampling_params,
                                 state.block_ids,
                                 state.generator,
@@ -1982,6 +1985,7 @@ class MetalModelRunner:
                                     else "cached_last_chunk"
                                 ),
                                 state.prompt_len,
+                                computed,  # start_pos / RoPE offset
                             )
                         )
                     else:
@@ -2014,8 +2018,8 @@ class MetalModelRunner:
         # === Single unified forward pass (paged path) ===
         if paged_prefill_entries or paged_decode_reqs:
             prefill_pack = [
-                (rid, tids, sp, bids, gen, None)
-                for _, rid, tids, sp, bids, gen, _, _ in paged_prefill_entries
+                (rid, tids, sp, bids, gen, None, start_pos)
+                for _, rid, tids, sp, bids, gen, _, _, start_pos in paged_prefill_entries
             ]
             prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
                 prefill_pack, paged_decode_reqs
@@ -2031,6 +2035,7 @@ class MetalModelRunner:
                 gen,
                 entry_type,
                 _prompt_len,
+                _start_pos,
             ) in enumerate(paged_prefill_entries):
                 nt = prefill_tokens[i]
 

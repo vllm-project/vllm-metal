@@ -154,7 +154,7 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
 
 def prepare_unified(
     decode_requests: list[tuple[list[int], int]],
-    prefill_requests: list[tuple[list[int], int]],
+    prefill_requests: list[tuple[list[int], int, int]],
     block_size: int,
 ) -> None:
     """Compute metadata for a unified prefill + decode forward pass.
@@ -167,7 +167,9 @@ def prepare_unified(
     Args:
         decode_requests: list of ``(block_ids, seq_len)`` for decode requests.
             ``seq_len`` = tokens already cached before this step.
-        prefill_requests: list of ``(block_ids, num_tokens)`` for prefill.
+        prefill_requests: list of ``(block_ids, num_tokens, start_pos)`` for
+            prefill.  ``start_pos`` is the position of the first token in this
+            chunk (0 for a fresh prefill, >0 for continuation chunks).
         block_size: tokens per KV cache block.
     """
     slot_mapping: list[int] = []
@@ -187,16 +189,16 @@ def prepare_unified(
         context_lens.append(seq_len + 1)  # including new token
         offsets.append(seq_len)  # RoPE position
 
-    # Prefill requests (variable tokens each)
-    for block_ids, num_tokens in prefill_requests:
-        for pos in range(num_tokens):
+    # Prefill requests (variable tokens each, starting at start_pos)
+    for block_ids, num_tokens, start_pos in prefill_requests:
+        for pos in range(start_pos, start_pos + num_tokens):
             block_idx = block_ids[pos // block_size]
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
         block_tables.append(block_ids)
-        context_lens.append(num_tokens)
-        offsets.append(0)  # prefill starts at position 0
+        context_lens.append(start_pos + num_tokens)
+        offsets.append(start_pos)
 
     set_context(
         PagedAttentionContext(

@@ -34,8 +34,8 @@ class TestPrepare:
         clear_context()
 
     def test_prepare_unified_prefill_single(self):
-        # Single prefill request via prepare_unified
-        prepare_unified([], [([10, 11], 5)], block_size=4)
+        # Single prefill request via prepare_unified (start_pos=0)
+        prepare_unified([], [([10, 11], 5, 0)], block_size=4)
         ctx = get_context()
 
         # block 10: slots 40,41,42,43; block 11: slot 44
@@ -49,7 +49,7 @@ class TestPrepare:
 
     def test_prepare_unified_prefill_packed(self):
         # Two prefill requests packed together
-        prepare_unified([], [([10], 3), ([20], 2)], block_size=4)
+        prepare_unified([], [([10], 3, 0), ([20], 2, 0)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
@@ -64,7 +64,7 @@ class TestPrepare:
 
     def test_prepare_unified_prefill_multiblock(self):
         # Single prefill spanning two blocks
-        prepare_unified([], [([5, 6], 5)], block_size=4)
+        prepare_unified([], [([5, 6], 5, 0)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
@@ -73,6 +73,24 @@ class TestPrepare:
         assert ctx.slot_mapping == [20, 21, 22, 23, 24]
         assert ctx.block_tables == [[5, 6]]
         assert ctx.context_lens == [5]
+
+    def test_prepare_unified_continuation_chunk(self):
+        # Continuation chunk: 3 new tokens starting at position 4
+        # block 10 has slots 40-43 (positions 0-3, already cached),
+        # block 11 has slots 44-47 (positions 4-6 are the new tokens)
+        prepare_unified([], [([10, 11], 3, 4)], block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        # Only 3 tokens in the query (positions 4, 5, 6)
+        assert ctx.cu_seqlens == [0, 3]
+        # Slots for positions 4, 5, 6: block 11 slots 44, 45, 46
+        assert ctx.slot_mapping == [44, 45, 46]
+        assert ctx.block_tables == [[10, 11]]
+        # Total context = start_pos + num_tokens = 4 + 3 = 7
+        assert ctx.context_lens == [7]
+        # RoPE offset = start_pos
+        assert ctx.offsets == [4]
 
     def test_prepare_unified_decode_only(self):
         # Single decode request via prepare_unified
@@ -91,7 +109,7 @@ class TestPrepare:
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill
         decode_requests = [([5, 6], 7)]  # seq_len=7
-        prefill_requests = [([10, 11], 5)]  # 5 tokens
+        prefill_requests = [([10, 11], 5, 0)]  # 5 tokens from position 0
 
         prepare_unified(decode_requests, prefill_requests, block_size=4)
         ctx = get_context()
