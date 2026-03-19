@@ -1818,8 +1818,14 @@ class MetalModelRunner:
         #                       "cached_intermediate", "cached_last_chunk"
         paged_prefill_entries: list[
             tuple[
-                int, str, list[int], SamplingParams, list[int],
-                torch.Generator | None, str, int,
+                int,
+                str,
+                list[int],
+                SamplingParams,
+                list[int],
+                torch.Generator | None,
+                str,
+                int,
             ]
         ] = []
         paged_decode_reqs: list[tuple[str, RequestState]] = []
