@@ -11,7 +11,6 @@ from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     get_context,
-    prepare_prefill_packed,
     prepare_unified,
 )
 
@@ -34,9 +33,9 @@ class TestPrepare:
     def teardown_method(self):
         clear_context()
 
-    def test_prepare_prefill_single_request(self):
-        # Single request via prepare_prefill_packed
-        prepare_prefill_packed([([10, 11], 5)], block_size=4)
+    def test_prepare_unified_prefill_single(self):
+        # Single prefill request via prepare_unified
+        prepare_unified([], [([10, 11], 5)], block_size=4)
         ctx = get_context()
 
         # block 10: slots 40,41,42,43; block 11: slot 44
@@ -46,11 +45,11 @@ class TestPrepare:
         assert ctx.block_tables == [[10, 11]]
         assert ctx.context_lens == [5]
         assert ctx.cu_seqlens == [0, 5]
+        assert ctx.offsets == [0]
 
-    def test_prepare_prefill_packed_slot_mapping(self):
-        # Two requests: 3 tokens in block 10, 2 tokens in block 20
-        requests = [([10], 3), ([20], 2)]
-        prepare_prefill_packed(requests, block_size=4)
+    def test_prepare_unified_prefill_packed(self):
+        # Two prefill requests packed together
+        prepare_unified([], [([10], 3), ([20], 2)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
@@ -61,11 +60,11 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 3, 5]
         assert ctx.block_tables == [[10], [20]]
         assert ctx.context_lens == [3, 2]
+        assert ctx.offsets == [0, 0]
 
-    def test_prepare_prefill_packed_single_request(self):
-        # Single request through packed path should produce valid metadata
-        requests = [([5, 6], 5)]
-        prepare_prefill_packed(requests, block_size=4)
+    def test_prepare_unified_prefill_multiblock(self):
+        # Single prefill spanning two blocks
+        prepare_unified([], [([5, 6], 5)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None

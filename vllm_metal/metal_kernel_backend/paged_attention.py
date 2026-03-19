@@ -11,7 +11,7 @@ all cached K/V blocks.
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
-``prepare_prefill_packed``, ``clear_context`` from ``paged_attention_common``.
+``clear_context`` from ``paged_attention_common``.
 
 Backend replacement guide
 -------------------------

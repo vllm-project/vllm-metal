@@ -52,7 +52,6 @@ from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
-    prepare_prefill_packed,
     prepare_unified,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
@@ -1592,159 +1591,6 @@ class MetalModelRunner:
         return next_tokens
 
     # ------------------------------------------------------------------
-    # Paged attention paths
-    # ------------------------------------------------------------------
-
-    def _prefill_packed_paged(
-        self,
-        pack_reqs: list[
-            tuple[
-                str,
-                list[int],
-                SamplingParams,
-                list[int],
-                torch.Generator | None,
-                int | None,
-            ]
-        ],
-    ) -> list[int]:
-        """Packed paged-attention prefill for multiple requests.
-
-        Concatenates token_ids from all requests into a single forward
-        pass using ``cu_seqlens`` to build a block-diagonal causal mask.
-        This avoids the overhead of N separate forward passes.
-
-        Args:
-            pack_reqs: list of
-                (req_id, token_ids, sampling_params, block_ids,
-                 generator, prompt_len) tuples.
-
-        Returns:
-            List of sampled next tokens, one per request.
-        """
-        # Build packed input
-        all_token_ids: list[int] = []
-        block_requests: list[tuple[list[int], int]] = []
-        for _, token_ids, _, block_ids, _, _ in pack_reqs:
-            all_token_ids.extend(token_ids)
-            block_requests.append((block_ids, len(token_ids)))
-
-        # Stash packed context (slot_mapping + cu_seqlens)
-        prepare_prefill_packed(block_requests, self._paged_block_size)
-
-        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
-        input_ids = mx.array([all_token_ids], dtype=mx.int32)
-        try:
-            model_output = self.model(input_ids, cache=offset_caches)
-            logits = self._extract_logits(model_output)
-        finally:
-            clear_context()
-
-        # Extract per-request last-token logits and sample
-        cu_seqlens = [0]
-        for _, token_ids, _, _, _, _ in pack_reqs:
-            cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
-
-        next_tokens: list[int] = []
-        for i, (
-            req_id,
-            token_ids,
-            sampling_params,
-            _,
-            generator,
-            prompt_len,
-        ) in enumerate(pack_reqs):
-            last_idx = cu_seqlens[i + 1] - 1
-            last_logits = logits[:, last_idx : last_idx + 1, :]
-
-            if prompt_len is None:
-                prompt_len = len(token_ids)
-
-            is_greedy = sampling_params.temperature < 1e-5
-            needs_advanced = (
-                sampling_params.top_k > 0
-                or sampling_params.top_p < 1.0
-                or sampling_params.frequency_penalty != 0
-                or sampling_params.presence_penalty != 0
-                or sampling_params.repetition_penalty != 1.0
-            )
-
-            if is_greedy and not needs_advanced:
-                next_token_mlx = _mlx_greedy_sample(last_logits[0])
-                mx.eval(next_token_mlx)
-                next_token = int(next_token_mlx.item())
-            else:
-                mx.eval(last_logits)
-                logits_torch = mlx_to_torch(
-                    last_logits[0].astype(mx.float32), device=self.device
-                )
-                generators = {} if generator is None else {0: generator}
-                metadata = self._make_sampling_metadata(
-                    [sampling_params],
-                    [token_ids[:prompt_len]],
-                    [token_ids[prompt_len:]],
-                    generators=generators,
-                )
-                output = self._sampler.forward(logits_torch, metadata)
-                next_token = int(output.sampled_token_ids[0, 0].item())
-
-            self._paged_request_seq_lens[req_id] = len(token_ids)
-            next_tokens.append(next_token)
-
-        return next_tokens
-
-    def _run_packed_prefill(
-        self,
-        paged_complete: list[
-            tuple[
-                int,
-                str,
-                list[int],
-                SamplingParams,
-                list[int],
-                torch.Generator | None,
-            ]
-        ],
-        sampled_tokens: list[list[int]],
-    ) -> None:
-        """Batch, dispatch, and write back state for packed paged prefill.
-
-        Splits *paged_complete* into batches that fit within
-        ``MAX_PACKED_PREFILL_TOKENS``, runs each batch through
-        ``_prefill_packed_paged``, and fills *sampled_tokens* in-place.
-        """
-        # Split into batches that fit within the packed-length cap.
-        batches: list[list[tuple]] = [[]]
-        batch_tokens = 0
-        for entry in paged_complete:
-            entry_tokens = len(entry[2])  # token_ids
-            if batch_tokens + entry_tokens > MAX_PACKED_PREFILL_TOKENS and batches[-1]:
-                batches.append([])
-                batch_tokens = 0
-            batches[-1].append(entry)
-            batch_tokens += entry_tokens
-
-        for batch in batches:
-            pack_input = [
-                (rid, tids, sp, bids, gen, None)
-                for _, rid, tids, sp, bids, gen in batch
-            ]
-            next_tokens = self._prefill_packed_paged(pack_input)
-            for i, (idx, rid, tids, sp, bids, gen) in enumerate(batch):
-                nt = next_tokens[i]
-                sampled_tokens[idx] = [nt]
-                self._request_states[rid] = RequestState(
-                    token_ids=list(tids) + [nt],
-                    prompt_len=len(tids),
-                    cache=[],
-                    sampling_params=sp,
-                    generator=gen,
-                    generated_tokens=1,
-                    block_ids=bids,
-                )
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.add_request(rid, list(tids) + [nt])
-
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)
     # ------------------------------------------------------------------
@@ -1962,17 +1808,31 @@ class MetalModelRunner:
         req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
 
-        # === PHASE 1: Process new requests (prefill phase) ===
+        # === Collect all requests into one unified batch ===
         new_reqs = scheduler_output.scheduled_new_reqs
+        cached_reqs = scheduler_output.scheduled_cached_reqs
 
-        # First pass: handle intermediate chunks immediately, collect
-        # complete paged prefill requests for potential packing.
-        paged_complete: list[
+        # Paged-attention entries collected for the single unified forward.
+        # Each prefill entry: (output_idx, req_id, token_ids, sampling_params,
+        #                      block_ids, generator, entry_type, prompt_len)
+        # entry_type is one of: "new_intermediate", "new_complete",
+        #                       "cached_intermediate", "cached_last_chunk"
+        _ENTRY_TYPE = str  # noqa: N806 — alias for readability
+        paged_prefill_entries: list[
             tuple[
-                int, str, list[int], SamplingParams, list[int], torch.Generator | None
+                int,
+                str,
+                list[int],
+                SamplingParams,
+                list[int],
+                torch.Generator | None,
+                _ENTRY_TYPE,
+                int,
             ]
         ] = []
+        paged_decode_reqs: list[tuple[str, RequestState]] = []
 
+        # --- New requests ---
         for new_req in new_reqs:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
@@ -1983,40 +1843,40 @@ class MetalModelRunner:
             req_id_to_index[req_id] = output_idx
 
             if not token_ids:
-                sampled_tokens.append([0])  # Fallback
+                sampled_tokens.append([0])
                 continue
 
             generator = _create_request_generator(self.device, sampling_params)
 
             if self._paged_kv_cache is not None:
-                # Paged attention path (Metal kernel)
                 sched_block_ids = list(new_req.block_ids[0])
                 scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
+                cur_len = computed_tokens + scheduled_tokens
+                is_intermediate = cur_len < prompt_len
 
-                if computed_tokens + scheduled_tokens < prompt_len:
-                    # Intermediate chunk: sample then drop (async scheduler
-                    # allocates no placeholder for intermediate chunks).
-                    cur_len = computed_tokens + scheduled_tokens
-                    _discarded = self._prefill_packed_paged(
-                        [
-                            (
-                                req_id,
-                                token_ids[:cur_len],
-                                sampling_params,
-                                sched_block_ids,
-                                generator,
-                                None,
-                            ),
-                        ]
-                    )[0]
-                    cache: list = []
-                    sampled_tokens.append([])
+                sampled_tokens.append([])  # placeholder
+                paged_prefill_entries.append(
+                    (
+                        output_idx,
+                        req_id,
+                        token_ids[:cur_len] if is_intermediate else token_ids,
+                        sampling_params,
+                        sched_block_ids,
+                        generator,
+                        "new_intermediate" if is_intermediate else "new_complete",
+                        prompt_len,
+                    )
+                )
+
+                # Create state immediately for intermediate chunks
+                # (needed if the request appears as cached next step).
+                if is_intermediate:
                     self._request_states[req_id] = RequestState(
                         token_ids=list(token_ids),
                         prompt_len=prompt_len,
-                        cache=cache,
+                        cache=[],
                         sampling_params=sampling_params,
                         generator=generator,
                         generated_tokens=0,
@@ -2026,20 +1886,6 @@ class MetalModelRunner:
                         self._rust_state_manager.add_request(
                             req_id, list(token_ids[:cur_len])
                         )
-                    continue
-
-                # Complete prefill — collect for packed processing
-                sampled_tokens.append([])  # placeholder, filled below
-                paged_complete.append(
-                    (
-                        output_idx,
-                        req_id,
-                        token_ids,
-                        sampling_params,
-                        sched_block_ids,
-                        generator,
-                    )
-                )
             else:
                 next_token, cache = self._prefill_single(
                     req_id,
@@ -2062,21 +1908,14 @@ class MetalModelRunner:
                         req_id, list(token_ids) + [next_token]
                     )
 
-        # Defer paged_complete to unified forward pass during PHASE 2.
-        # If no cached requests exist, it is consumed after PHASE 2.
-
-        # === PHASE 2: Process cached requests (TRUE batched decode) ===
-        cached_reqs = scheduler_output.scheduled_cached_reqs
+        # --- Cached requests ---
         decode_req_ids = list(cached_reqs.req_ids)
 
         if decode_req_ids:
             if self._paged_kv_cache is not None:
-                # Paged attention path: unified flow using model-runner-local
-                # state (state.generated_tokens) instead of is_context_phase().
                 req_id_to_cached_idx = {
                     rid: i for i, rid in enumerate(cached_reqs.req_ids)
                 }
-                paged_decode_reqs: list[tuple[str, RequestState]] = []
 
                 # Update block_ids from scheduler (append or replace on resume)
                 for i, req_id in enumerate(cached_reqs.req_ids):
@@ -2090,13 +1929,6 @@ class MetalModelRunner:
                         if new_block_ids is not None:
                             state.block_ids.extend(new_block_ids[0])
                     else:
-                        # Preempted → full recompute with fresh blocks.
-                        # Keep prompt_len at the original prompt boundary
-                        # (used for sampling penalty split). The prefill
-                        # loop uses len(state.token_ids) — which already
-                        # includes previously generated output tokens —
-                        # to determine the recompute scope, matching
-                        # upstream vLLM's use of request.num_tokens.
                         assert new_block_ids is not None
                         state.block_ids = list(new_block_ids[0])
                         state.generated_tokens = 0
@@ -2107,17 +1939,17 @@ class MetalModelRunner:
                                 req_id, list(state.token_ids)
                             )
 
+                # Categorise each cached request
                 for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
                     if state is None:
-                        # Edge case: no state — emit dummy token
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([0])
                         continue
 
                     if state.generated_tokens == 0:
-                        # Still prefilling prompt (or re-prefilling after preemption)
+                        # Still prefilling (or re-prefilling after preemption)
                         idx = req_id_to_cached_idx.get(req_id)
                         if idx is not None and idx < len(
                             cached_reqs.num_computed_tokens
@@ -2126,88 +1958,38 @@ class MetalModelRunner:
                         else:
                             computed = self._paged_request_seq_lens.get(req_id, 0)
                         scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                        target_len = computed + scheduled  # FIX: was just `computed`
+                        target_len = computed + scheduled
+                        is_intermediate = target_len < len(state.token_ids)
 
-                        if target_len < len(state.token_ids):
-                            # Intermediate chunk: sample then drop
-                            _discarded = self._prefill_packed_paged(
-                                [
-                                    (
-                                        req_id,
-                                        state.token_ids[:target_len],
-                                        state.sampling_params,
-                                        state.block_ids,
-                                        state.generator,
-                                        None,
-                                    ),
-                                ]
-                            )[0]
-                            req_ids.append(req_id)
-                            req_id_to_index[req_id] = len(req_ids) - 1
-                            sampled_tokens.append([])
-                        else:
-                            # Last chunk: sample and keep (drains async placeholder)
-                            next_token = self._prefill_packed_paged(
-                                [
-                                    (
-                                        req_id,
-                                        state.token_ids,
-                                        state.sampling_params,
-                                        state.block_ids,
-                                        state.generator,
-                                        state.prompt_len,
-                                    ),
-                                ]
-                            )[0]
-                            state.token_ids.append(next_token)
-                            state.generated_tokens = (
-                                len(state.token_ids) - state.prompt_len
-                            )
-                            if self._rust_state_manager is not None:
-                                self._rust_state_manager.append_token(
-                                    req_id, next_token
-                                )
-                            req_ids.append(req_id)
-                            req_id_to_index[req_id] = len(req_ids) - 1
-                            sampled_tokens.append([next_token])
-                    else:
-                        # Decode phase: collect for batched decode
-                        paged_decode_reqs.append((req_id, state))
-
-                # === Unified forward: complete prefills + decode ===
-                if paged_decode_reqs or paged_complete:
-                    prefill_pack = [
-                        (rid, tids, sp, bids, gen, None)
-                        for _, rid, tids, sp, bids, gen in paged_complete
-                    ]
-                    prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
-                        prefill_pack, paged_decode_reqs
-                    )
-
-                    # Record prefill results + create state
-                    for i, (idx, rid, tids, sp, bids, gen) in enumerate(paged_complete):
-                        nt = prefill_tokens[i]
-                        sampled_tokens[idx] = [nt]
-                        self._request_states[rid] = RequestState(
-                            token_ids=list(tids) + [nt],
-                            prompt_len=len(tids),
-                            cache=[],
-                            sampling_params=sp,
-                            generator=gen,
-                            generated_tokens=1,
-                            block_ids=bids,
-                        )
-                        if self._rust_state_manager is not None:
-                            self._rust_state_manager.add_request(rid, list(tids) + [nt])
-                    paged_complete = []  # consumed
-
-                    # Record decode results
-                    for i, (req_id, _) in enumerate(paged_decode_reqs):
                         req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([decode_tokens[i]])
+                        output_idx = len(req_ids) - 1
+                        req_id_to_index[req_id] = output_idx
+                        sampled_tokens.append([])  # placeholder
+
+                        paged_prefill_entries.append(
+                            (
+                                output_idx,
+                                req_id,
+                                (
+                                    state.token_ids[:target_len]
+                                    if is_intermediate
+                                    else state.token_ids
+                                ),
+                                state.sampling_params,
+                                state.block_ids,
+                                state.generator,
+                                (
+                                    "cached_intermediate"
+                                    if is_intermediate
+                                    else "cached_last_chunk"
+                                ),
+                                state.prompt_len,
+                            )
+                        )
+                    else:
+                        paged_decode_reqs.append((req_id, state))
             else:
-                # Collect all valid decode requests
+                # Non-paged (MLX) path — unchanged
                 valid_decode_reqs = []
                 for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
@@ -2220,23 +2002,69 @@ class MetalModelRunner:
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
 
-                    # Add decode results to output
                     for i, (req_id, _) in enumerate(valid_decode_reqs):
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([decode_tokens[i]])
 
-                # Handle requests with no cached state (edge case)
                 for req_id in decode_req_ids:
                     if req_id not in req_id_to_index:
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([0])
 
-        # Handle any paged_complete not consumed by the unified pass
-        # (happens when no cached requests exist in this step).
-        if paged_complete:
-            self._run_packed_prefill(paged_complete, sampled_tokens)
+        # === Single unified forward pass (paged path) ===
+        if paged_prefill_entries or paged_decode_reqs:
+            prefill_pack = [
+                (rid, tids, sp, bids, gen, None)
+                for _, rid, tids, sp, bids, gen, _, _ in paged_prefill_entries
+            ]
+            prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
+                prefill_pack, paged_decode_reqs
+            )
+
+            # Post-process prefill results
+            for i, (
+                idx,
+                rid,
+                tids,
+                sp,
+                bids,
+                gen,
+                entry_type,
+                prompt_len,
+            ) in enumerate(paged_prefill_entries):
+                nt = prefill_tokens[i]
+
+                if entry_type.endswith("_intermediate"):
+                    # KV cache populated; discard sampled token
+                    sampled_tokens[idx] = []
+                elif entry_type == "new_complete":
+                    sampled_tokens[idx] = [nt]
+                    self._request_states[rid] = RequestState(
+                        token_ids=list(tids) + [nt],
+                        prompt_len=len(tids),
+                        cache=[],
+                        sampling_params=sp,
+                        generator=gen,
+                        generated_tokens=1,
+                        block_ids=bids,
+                    )
+                    if self._rust_state_manager is not None:
+                        self._rust_state_manager.add_request(rid, list(tids) + [nt])
+                elif entry_type == "cached_last_chunk":
+                    sampled_tokens[idx] = [nt]
+                    state = self._request_states[rid]
+                    state.token_ids.append(nt)
+                    state.generated_tokens = len(state.token_ids) - state.prompt_len
+                    if self._rust_state_manager is not None:
+                        self._rust_state_manager.append_token(rid, nt)
+
+            # Post-process decode results
+            for i, (req_id, _) in enumerate(paged_decode_reqs):
+                req_ids.append(req_id)
+                req_id_to_index[req_id] = len(req_ids) - 1
+                sampled_tokens.append([decode_tokens[i]])
 
         # Consistency check: every scheduled request must be represented in
         # req_ids, and decode-phase scheduled requests should not emit empty
