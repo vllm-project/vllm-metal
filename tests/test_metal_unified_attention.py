@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn, run_v1_paged_attention
-from vllm_metal.metal import metal_unified_attention
+from vllm_metal.metal import PARTITION_THRESHOLD, metal_unified_attention
 
 # Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
 #   HEAD_SIZES = [128, 256]
@@ -220,9 +220,14 @@ def test_metal_unified_attn_decode_only(
         softcap=0,
     )
 
-    # v2 must match v1 exactly (same algorithm, same precision)
+    # Partitioned decode changes the reduction order versus v1, so long-context
+    # cases need a slightly looser tolerance than the no-partition exact-match
+    # path.
+    atol = rtol = 1e-4
+    if max_kv_len >= PARTITION_THRESHOLD:
+        atol = rtol = 3e-4
     np.testing.assert_allclose(
-        np.array(v2_output), np.array(v1_output), atol=1e-4, rtol=1e-4
+        np.array(v2_output), np.array(v1_output), atol=atol, rtol=rtol
     )
 
 

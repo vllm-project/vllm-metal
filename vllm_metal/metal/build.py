@@ -12,10 +12,14 @@ import subprocess
 import sysconfig
 from pathlib import Path
 
+from vllm_metal.metal.constants import PARTITION_SIZE
+
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
+_BUILD = _THIS_DIR / "build.py"
+_CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 _CACHE_DIR = Path.home() / ".cache" / "vllm-metal"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,8 +44,12 @@ def needs_rebuild() -> bool:
     """Return True if the .so is missing or older than the source."""
     if not _OUT.exists():
         return True
-    src_mtime = _SRC.stat().st_mtime
-    return _OUT.stat().st_mtime < src_mtime
+    latest_input_mtime = max(
+        _SRC.stat().st_mtime,
+        _BUILD.stat().st_mtime,
+        _CONSTANTS.stat().st_mtime,
+    )
+    return _OUT.stat().st_mtime < latest_input_mtime
 
 
 def build() -> Path:
@@ -94,6 +102,7 @@ def build() -> Path:
         f"-Wl,-rpath,{mlx_lib}",
         "-D_METAL_",
         "-DACCELERATE_NEW_LAPACK",
+        f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
         "-undefined",
         "dynamic_lookup",
         str(nb_src),

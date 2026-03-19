@@ -20,6 +20,10 @@
 namespace nb = nanobind;
 using namespace mlx::core;
 
+#ifndef VLLM_METAL_PARTITION_SIZE
+#define VLLM_METAL_PARTITION_SIZE 512
+#endif
+
 // ---------------------------------------------------------------------------
 // Library caching
 // ---------------------------------------------------------------------------
@@ -27,6 +31,7 @@ using namespace mlx::core;
 static std::string reshape_cache_source_;
 static std::string paged_attention_source_;
 static std::string v2_paged_attention_source_;
+constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
 void init_libraries(
     const std::string& reshape_src,
@@ -258,7 +263,7 @@ void paged_attention_v1_impl(
 // paged_attention_v2_online — dispatches the online-softmax v2 kernel
 // ---------------------------------------------------------------------------
 
-void paged_attention_v2_online_impl(
+void paged_attention_v2_online_impl_common(
     nb::handle out_h,
     nb::handle query_h,
     nb::handle key_cache_h,
@@ -271,7 +276,11 @@ void paged_attention_v2_online_impl(
     nb::handle cu_seqlens_q_h,
     int block_size,
     int max_seq_len,
-    int sliding_window
+    int sliding_window,
+    array* exp_sums,
+    array* max_logits,
+    array* tmp_out,
+    array* sinks
 ) {
   auto& out          = *nb::inst_ptr<array>(out_h);
   auto& query        = *nb::inst_ptr<array>(query_h);
@@ -290,6 +299,11 @@ void paged_attention_v2_online_impl(
   int head_size  = static_cast<int>(query.shape(2));
   int max_blocks = static_cast<int>(block_tables.shape(1));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  int max_num_partitions =
+      std::max(1, (max_seq_len + kPartitionSize - 1) / kPartitionSize);
+  bool use_partitioning =
+      exp_sums != nullptr && max_logits != nullptr && tmp_out != nullptr &&
+      kPartitionSize % block_size == 0 && max_num_partitions > 1;
 
   // Same kernel name format as v1 — the template instantiation is identical.
   auto dt = dtype_to_metal(query.dtype());
@@ -297,12 +311,12 @@ void paged_attention_v2_online_impl(
       "paged_attention_" + dt + "_cache_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps0";
+      "_nt256_nsl32_ps" +
+      std::to_string(use_partitioning ? kPartitionSize : 0);
 
-  bool use_partitioning = false;
   bool use_alibi        = false;
   bool use_fp8          = false;
-  bool use_sinks        = false;
+  bool use_sinks        = sinks != nullptr;
 
   // Use the v2 library (online softmax kernel).
   // get_kernel(function_name, library, cache_key, constants)
@@ -332,7 +346,17 @@ void paged_attention_v2_online_impl(
   enc.set_threadgroup_memory_length(shmem, 0);
 
   // Buffer bindings
-  enc.set_output_array(out,         2);
+  if (use_partitioning) {
+    if (exp_sums == nullptr || max_logits == nullptr || tmp_out == nullptr) {
+      throw std::runtime_error(
+          "Partitioned v2 attention requires scratch buffers");
+    }
+    enc.set_output_array(*exp_sums, 0);
+    enc.set_output_array(*max_logits, 1);
+    enc.set_output_array(*tmp_out, 2);
+  } else {
+    enc.set_output_array(out, 2);
+  }
   enc.set_input_array(query,        3);
   enc.set_input_array(key_cache,    4);
   enc.set_input_array(value_cache,  5);
@@ -356,6 +380,9 @@ void paged_attention_v2_online_impl(
   enc.set_bytes(q_stride,        15);
   enc.set_bytes(kv_block_stride, 16);
   enc.set_bytes(kv_head_stride,  17);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 18);
+  }
 
   // Varlen buffers (new in v2)
   enc.set_input_array(cu_seqlens_q, 19);
@@ -365,9 +392,43 @@ void paged_attention_v2_online_impl(
   enc.set_bytes(sliding_window_i, 21);
 
   // Grid: one threadgroup per (head, query_token)
+  const int32_t grid_z =
+      static_cast<int32_t>(use_partitioning ? max_num_partitions : 1);
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(num_heads, total_q_tokens, grid_z),
       MTL::Size::Make(NUM_THREADS, 1, 1));
+
+  if (use_partitioning) {
+    std::string reduce_kname =
+        "paged_attention_v2_reduce_" + dt +
+        "_hs" + std::to_string(head_size) +
+        "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
+    auto* reduce_kernel = d.get_kernel(
+        reduce_kname,
+        lib,
+        reduce_kname + "_v2_reduce",
+        {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+    size_t reduce_shmem =
+        static_cast<size_t>(2 * max_num_partitions * sizeof(float));
+    enc.set_compute_pipeline_state(reduce_kernel);
+    enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+    enc.set_output_array(out,         0);
+    enc.set_input_array(*exp_sums,    1);
+    enc.set_input_array(*max_logits,  2);
+    enc.set_input_array(*tmp_out,     3);
+    enc.set_input_array(seq_lens,     4);
+    int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+    enc.set_bytes(max_num_partitions_i, 5);
+    if (use_sinks) {
+      enc.set_input_array(*sinks, 6);
+    }
+    enc.set_input_array(cu_seqlens_q, 7);
+    enc.set_bytes(num_seqs_i, 8);
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_heads, total_q_tokens, 1),
+        MTL::Size::Make(NUM_THREADS, 1, 1));
+  }
 
   d.add_temporary(out, s.index);
   d.add_temporary(query, s.index);
@@ -376,6 +437,90 @@ void paged_attention_v2_online_impl(
   d.add_temporary(block_tables, s.index);
   d.add_temporary(seq_lens, s.index);
   d.add_temporary(cu_seqlens_q, s.index);
+  if (use_partitioning) {
+    d.add_temporary(*exp_sums, s.index);
+    d.add_temporary(*max_logits, s.index);
+    d.add_temporary(*tmp_out, s.index);
+  }
+  if (use_sinks) {
+    d.add_temporary(*sinks, s.index);
+  }
+}
+
+void paged_attention_v2_online_impl(
+    nb::handle out_h,
+    nb::handle query_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    int num_kv_heads,
+    float scale,
+    float softcap,
+    nb::handle block_tables_h,
+    nb::handle seq_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    int max_seq_len,
+    int sliding_window
+) {
+  paged_attention_v2_online_impl_common(
+      out_h,
+      query_h,
+      key_cache_h,
+      value_cache_h,
+      num_kv_heads,
+      scale,
+      softcap,
+      block_tables_h,
+      seq_lens_h,
+      cu_seqlens_q_h,
+      block_size,
+      max_seq_len,
+      sliding_window,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr);
+}
+
+void paged_attention_v2_online_partitioned_impl(
+    nb::handle out_h,
+    nb::handle query_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    int num_kv_heads,
+    float scale,
+    float softcap,
+    nb::handle block_tables_h,
+    nb::handle seq_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    int max_seq_len,
+    int sliding_window,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h
+) {
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  paged_attention_v2_online_impl_common(
+      out_h,
+      query_h,
+      key_cache_h,
+      value_cache_h,
+      num_kv_heads,
+      scale,
+      softcap,
+      block_tables_h,
+      seq_lens_h,
+      cu_seqlens_q_h,
+      block_size,
+      max_seq_len,
+      sliding_window,
+      &exp_sums,
+      &max_logits,
+      &tmp_out,
+      nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +528,8 @@ void paged_attention_v2_online_impl(
 // ---------------------------------------------------------------------------
 
 NB_MODULE(_paged_ops, m) {
+  m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
+
   m.def("init_libraries", &init_libraries,
         nb::arg("reshape_src"), nb::arg("paged_attn_src"),
         "JIT-compile the vendored Metal shaders.");
@@ -415,4 +562,18 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
         "Online-softmax varlen paged attention (v2, unified prefill+decode).");
+
+  m.def("paged_attention_v2_online_partitioned",
+        &paged_attention_v2_online_partitioned_impl,
+        nb::arg("out"), nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("softcap"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        nb::arg("sliding_window"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        "Online-softmax varlen paged attention (v2) with caller-provided "
+        "partition scratch buffers.");
 }

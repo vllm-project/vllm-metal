@@ -1367,15 +1367,17 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
                                          num_simd_lanes, 0);
 
 // TODO: tune num_threads = 256
-// NOTE: partition_size = 512
+// NOTE: partition_size = VLLM_METAL_PARTITION_SIZE
 #define instantiate_paged_attention_v2(type, cache_type, num_simd_lanes)       \
   instantiate_paged_attention_block_size(type, cache_type, 256,                \
-                                         num_simd_lanes, 512);
+                                         num_simd_lanes,                        \
+                                         VLLM_METAL_PARTITION_SIZE);
 
 // TODO: tune num_threads = 256
-// NOTE: partition_size = 512
+// NOTE: partition_size = VLLM_METAL_PARTITION_SIZE
 #define instantiate_paged_attention_v2_reduce(type, num_simd_lanes)            \
-  instantiate_paged_attention_v2_reduce_heads(type, 256, num_simd_lanes, 512);
+  instantiate_paged_attention_v2_reduce_heads(                                  \
+      type, 256, num_simd_lanes, VLLM_METAL_PARTITION_SIZE);
 
 instantiate_paged_attention_v1(float, float, 32);
 instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, 32);
