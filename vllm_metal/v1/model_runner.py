@@ -1625,7 +1625,6 @@ class MetalModelRunner:
             ``(prefill_next_tokens, decode_next_tokens)``
         """
         num_decode = len(decode_reqs)
-        num_prefill = len(prefill_reqs)
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
@@ -1817,17 +1816,10 @@ class MetalModelRunner:
         #                      block_ids, generator, entry_type, prompt_len)
         # entry_type is one of: "new_intermediate", "new_complete",
         #                       "cached_intermediate", "cached_last_chunk"
-        _ENTRY_TYPE = str  # noqa: N806 — alias for readability
         paged_prefill_entries: list[
             tuple[
-                int,
-                str,
-                list[int],
-                SamplingParams,
-                list[int],
-                torch.Generator | None,
-                _ENTRY_TYPE,
-                int,
+                int, str, list[int], SamplingParams, list[int],
+                torch.Generator | None, str, int,
             ]
         ] = []
         paged_decode_reqs: list[tuple[str, RequestState]] = []
@@ -2032,7 +2024,7 @@ class MetalModelRunner:
                 bids,
                 gen,
                 entry_type,
-                prompt_len,
+                _prompt_len,
             ) in enumerate(paged_prefill_entries):
                 nt = prefill_tokens[i]
 
