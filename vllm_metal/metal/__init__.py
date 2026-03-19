@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_DIR = _THIS_DIR / "kernels_v1"
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
+PARTITION_SIZE = 512
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
@@ -114,22 +115,55 @@ def metal_unified_attention(
 
     # Ensure all inputs are evaluated before raw Metal dispatch
     mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
+    max_num_partitions = max(1, (max_seqlen_k + PARTITION_SIZE - 1) // PARTITION_SIZE)
+    use_partitioning = PARTITION_SIZE % block_size == 0 and max_num_partitions > 1
 
-    ops.paged_attention_v2_online(
-        out,
-        q,
-        k,
-        v,
-        num_kv_heads,
-        softmax_scale,
-        softcap,
-        block_table,
-        seqused_k,
-        cu_seqlens_q,
-        block_size,
-        max_seqlen_k,
-        sliding_window,
-    )
+    if use_partitioning:
+        exp_sums = mx.zeros(
+            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
+        )
+        max_logits = mx.zeros(
+            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
+        )
+        tmp_out = mx.zeros(
+            (q.shape[0], q.shape[1], max_num_partitions, q.shape[2]),
+            dtype=q.dtype,
+        )
+        mx.eval(exp_sums, max_logits, tmp_out)
+        ops.paged_attention_v2_online_partitioned(
+            out,
+            q,
+            k,
+            v,
+            num_kv_heads,
+            softmax_scale,
+            softcap,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            block_size,
+            max_seqlen_k,
+            sliding_window,
+            exp_sums,
+            max_logits,
+            tmp_out,
+        )
+    else:
+        ops.paged_attention_v2_online(
+            out,
+            q,
+            k,
+            v,
+            num_kv_heads,
+            softmax_scale,
+            softcap,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            block_size,
+            max_seqlen_k,
+            sliding_window,
+        )
     mx.synchronize()
 
 
