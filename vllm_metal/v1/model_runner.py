@@ -1810,10 +1810,8 @@ class MetalModelRunner:
 
         # Paged-attention entries collected for the single unified forward.
         # Each prefill entry: (output_idx, req_id, token_ids, sampling_params,
-        #                      block_ids, generator, entry_type, prompt_len,
-        #                      start_pos)
-        # entry_type is one of: "new_intermediate", "new_complete",
-        #                       "cached_intermediate", "cached_last_chunk"
+        #                      block_ids, generator, is_new, is_intermediate,
+        #                      prompt_len, start_pos)
         paged_prefill_entries: list[
             tuple[
                 int,
@@ -1822,7 +1820,8 @@ class MetalModelRunner:
                 SamplingParams,
                 list[int],
                 torch.Generator | None,
-                str,
+                bool,
+                bool,
                 int,
                 int,
             ]
@@ -1862,7 +1861,8 @@ class MetalModelRunner:
                         sampling_params,
                         sched_block_ids,
                         generator,
-                        "new_intermediate" if is_intermediate else "new_complete",
+                        True,  # is_new
+                        is_intermediate,
                         prompt_len,
                         computed_tokens,  # start_pos / RoPE offset
                     )
@@ -1972,11 +1972,8 @@ class MetalModelRunner:
                                 state.sampling_params,
                                 state.block_ids,
                                 state.generator,
-                                (
-                                    "cached_intermediate"
-                                    if is_intermediate
-                                    else "cached_last_chunk"
-                                ),
+                                False,  # is_new
+                                is_intermediate,
                                 state.prompt_len,
                                 computed,  # start_pos / RoPE offset
                             )
@@ -2017,10 +2014,10 @@ class MetalModelRunner:
                     sp,
                     bids,
                     gen,
-                    prompt_len if not entry_type.endswith("_intermediate") else None,
+                    prompt_len if not is_intermediate else None,
                     start_pos,
                 )
-                for _, rid, tids, sp, bids, gen, entry_type, prompt_len, start_pos in paged_prefill_entries
+                for _, rid, tids, sp, bids, gen, _is_new, is_intermediate, prompt_len, start_pos in paged_prefill_entries
             ]
             prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
                 prefill_pack, paged_decode_reqs
@@ -2034,18 +2031,19 @@ class MetalModelRunner:
                 sp,
                 bids,
                 gen,
-                entry_type,
+                is_new,
+                is_intermediate,
                 _prompt_len,
                 _start_pos,
             ) in enumerate(paged_prefill_entries):
                 nt = prefill_tokens[i]
 
-                if entry_type.endswith("_intermediate"):
+                if is_intermediate:
                     # KV cache populated; discard sampled token
                     sampled_tokens[idx] = []
-                elif entry_type == "new_complete":
+                elif is_new:
                     assert _start_pos == 0, (
-                        "new_complete with start_pos > 0 not supported "
+                        "new complete prefill with start_pos > 0 not supported "
                         "(prefix caching not yet implemented in unified path)"
                     )
                     sampled_tokens[idx] = [nt]
@@ -2060,7 +2058,8 @@ class MetalModelRunner:
                     )
                     if self._rust_state_manager is not None:
                         self._rust_state_manager.add_request(rid, list(tids) + [nt])
-                elif entry_type == "cached_last_chunk":
+                else:
+                    # Cached last chunk — append token to existing state
                     sampled_tokens[idx] = [nt]
                     state = self._request_states[rid]
                     state.token_ids.append(nt)
