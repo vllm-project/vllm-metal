@@ -742,12 +742,6 @@ class STTExecutor:
         return tokens[start:end]
 
 
-# Cap total packed-prefill tokens per forward pass to bound activation
-# memory (QKV projections + FFN intermediates scale linearly with total
-# tokens) and avoid Metal GPU command-buffer timeouts on large dispatches.
-MAX_PACKED_PREFILL_TOKENS = 4096
-
-
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
