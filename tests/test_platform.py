@@ -2,6 +2,7 @@
 """Tests for Metal platform."""
 
 import platform
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -125,6 +126,43 @@ class TestMetalPlatform:
         MetalPlatform.verify_quantization("int8")
         MetalPlatform.verify_quantization("awq")
         MetalPlatform.verify_quantization("compressed-tensors")
+
+    def test_check_and_update_config_disables_chunked_prefill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Metal should disable chunked prefill until the runner supports it."""
+        import vllm_metal.stt.config as stt_config
+        import vllm_metal.utils as metal_utils
+
+        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
+        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: False)
+
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(block_size=None),
+            model_config=SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=True,
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.enable_chunked_prefill is False
+        assert (
+            vllm_config.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
+        )
+        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+        assert vllm_config.parallel_config.disable_custom_all_reduce is True
 
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch

@@ -20,7 +20,6 @@ from threading import Lock
 from typing import Any, TypeAlias
 
 import mlx.core as mx
-import numpy as np
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
@@ -59,6 +58,7 @@ from vllm_metal.stt.config import (
     STT_SCHED_BLOCK_BYTES,
     is_stt_model,
 )
+from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
 
@@ -773,7 +773,9 @@ class MetalModelRunner:
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_stt: bool = False  # Will be set during model loading
-        self._stt_executor: STTExecutor | None = None  # Set during STT loading
+        self._stt_runtime_adapter: STTRuntimeAdapter | None = (
+            None  # Set during STT loading
+        )
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -904,16 +906,19 @@ class MetalModelRunner:
                 )
                 self.tokenizer = None  # Whisper manages its own tokenizer
                 self._is_stt = True
-                self._stt_executor = STTExecutor(self.model, model_name)
+                self._stt_runtime_adapter = self.model.create_runtime_adapter(
+                    model_name
+                )
                 return
 
-        from vllm_metal.stt.transcribe import load_model as stt_load_model
+        # Local import: keep non-STT startup/import path light.
+        from vllm_metal.stt.loader import load_model as stt_load_model
 
         logger.info(f"Loading STT model: {model_name}")
         self.model = stt_load_model(model_name)
         self.tokenizer = None  # Whisper manages its own tokenizer
         self._is_stt = True
-        self._stt_executor = STTExecutor(self.model, model_name)
+        self._stt_runtime_adapter = self.model.create_runtime_adapter(model_name)
 
         with _model_cache_lock:
             _model_cache[model_name] = (self.model, None)
@@ -1037,7 +1042,7 @@ class MetalModelRunner:
             Dictionary mapping attention layer names to KV cache specs
         """
         if self._is_stt:
-            # Whisper manages its own KV cache internally.
+            # STT models manage their own KV cache internally.
             # vLLM requires a non-empty spec for scheduler initialization,
             # so we return a single minimal entry.
             return {
@@ -1120,18 +1125,9 @@ class MetalModelRunner:
             return
 
         if self._is_stt:
-            assert self._stt_executor is not None
+            assert self._stt_runtime_adapter is not None
             logger.info("Warming up STT model...")
-            n_mels = self.model.config.n_mels
-            n_audio_ctx = self.model.config.n_audio_ctx
-            if self._stt_executor._model_type == "qwen3_asr":
-                # Qwen3-ASR encoder expects (n_mels, time)
-                dummy_mel = mx.zeros((n_mels, n_audio_ctx * 2), dtype=mx.float16)
-            else:
-                # Whisper encoder expects (batch, time, n_mels)
-                dummy_mel = mx.zeros((1, n_audio_ctx * 2, n_mels), dtype=mx.float16)
-            features = self.model.encode(dummy_mel)
-            mx.eval(features)
+            self._stt_runtime_adapter.warm_up()
             logger.info("STT model warm-up complete")
             return
 
@@ -2231,13 +2227,13 @@ class MetalModelRunner:
         Raises:
             ValueError: If a request uses non-greedy sampling params.
         """
-        assert self._stt_executor is not None
+        assert self._stt_runtime_adapter is not None
 
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         sampled_tokens: list[list[int]] = []
 
-        eot_token = self._stt_executor.eot_token
+        eot_token = self._stt_runtime_adapter.eot_token
 
         for new_req in scheduler_output.scheduled_new_reqs:
             stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
@@ -2250,10 +2246,10 @@ class MetalModelRunner:
                     f"Got temperature={sampling_params.temperature}"
                 )
 
-            audio_features = self._stt_executor.extract_audio_features(
+            audio_features = self._stt_runtime_adapter.extract_audio_features(
                 stt_request.input_features
             )
-            tokens = self._stt_executor.decode(
+            tokens = self._stt_runtime_adapter.decode_tokens(
                 audio_features, list(stt_request.prompt_token_ids)
             )
 

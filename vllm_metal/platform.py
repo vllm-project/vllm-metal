@@ -223,6 +223,15 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
+        scheduler_config = vllm_config.scheduler_config
+        if getattr(scheduler_config, "enable_chunked_prefill", False):
+            # MetalModelRunner does not yet honor chunked-prefill scheduler
+            # boundaries on the non-paged MLX path. Disable the feature so the
+            # scheduler only requests full prefills, which matches the current
+            # model-runner contract.
+            scheduler_config.enable_chunked_prefill = False
+            logger.info("Metal: disabled chunked prefill")
+
         # Configure cache
         if cache_config.block_size is None:
             cache_config.block_size = config.block_size
@@ -246,7 +255,6 @@ class MetalPlatform(Platform):
             # STT processes entire audio in one execute_model call;
             # async scheduling's batch queue expects incremental decode
             # and would schedule cached requests that STT cannot handle.
-            scheduler_config = vllm_config.scheduler_config
             if getattr(scheduler_config, "async_scheduling", False):
                 scheduler_config.async_scheduling = False
                 logger.info("STT: disabled async_scheduling")

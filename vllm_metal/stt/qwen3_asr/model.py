@@ -12,6 +12,8 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.stt.runtime import STTRuntimeAdapter
+
 from .config import Qwen3ASRAudioConfig, Qwen3ASRConfig, Qwen3ASRTextConfig
 
 # ===========================================================================
@@ -479,6 +481,8 @@ class Qwen3ASRModel(nn.Module):
     4. Autoregressive decode until EOS
     """
 
+    model_type = "qwen3_asr"
+
     def __init__(self, config: Qwen3ASRConfig, dtype: mx.Dtype = mx.float16):
         super().__init__()
         self.config = config
@@ -553,9 +557,12 @@ class Qwen3ASRModel(nn.Module):
         embeds = self.language_model.embed(token_id)
         return self.language_model.forward_embeds(embeds, cache)
 
-    @property
-    def model_type(self) -> str:
-        return "qwen3_asr"
+    def create_runtime_adapter(self, model_path: str) -> STTRuntimeAdapter:
+        """Create the model-owned runtime adapter used by the vLLM runner."""
+        # Local import: avoid import-time cycles (adapter imports transcriber).
+        from .adapter import Qwen3ASRRuntimeAdapter
+
+        return Qwen3ASRRuntimeAdapter(self, model_path)
 
     def sanitize(self, weights: dict) -> dict:
         """Map HF weight keys to MLX model structure.
