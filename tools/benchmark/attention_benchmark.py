@@ -34,17 +34,16 @@ import math
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import mlx.core as mx
 import numpy as np
 
 if __package__ in (None, ""):
     raise SystemExit(
-        "Run this benchmark as a module: "
-        "python -m tools.benchmark.attention_benchmark"
+        "Run this benchmark as a module: python -m tools.benchmark.attention_benchmark"
     )
 
 from tools.attention_bench_utils import ref_paged_attn, run_v1_paged_attention
@@ -270,7 +269,9 @@ def resolve_case_names(args: argparse.Namespace) -> list[str]:
     return list(GROUPS[group_name])
 
 
-def build_case_invocations(args: argparse.Namespace) -> list[tuple[str, argparse.Namespace]]:
+def build_case_invocations(
+    args: argparse.Namespace,
+) -> list[tuple[str, argparse.Namespace]]:
     if manual_workload_requested(args):
         if args.group is not None or args.cases is not None:
             raise ValueError(
@@ -517,6 +518,7 @@ def benchmark_backend(
                 tokens_per_s=None,
                 notes="unsupported in varlen mode",
             )
+
         def fn() -> mx.array:
             out = None
             for layer_idx in range(workload.num_layers):
@@ -531,15 +533,20 @@ def benchmark_backend(
                     block_size=workload.block_size,
                     max_seq_len=workload.max_kv_len,
                 )
+            assert out is not None
             return out
+
         notes = "decode-only"
     elif backend == "v2":
+
         def fn() -> mx.array:
             out = None
             for layer_idx in range(workload.num_layers):
                 out = _run_v2(data, layer_idx)
+            assert out is not None
             return out
     elif backend == "textbook":
+
         def fn() -> mx.array:
             out = None
             for layer_idx in range(workload.num_layers):
@@ -554,26 +561,33 @@ def benchmark_backend(
                     sliding_window=None,
                     soft_cap=None,
                 )
+            assert out is not None
             return out
     elif backend == "sdpa-compute-only":
         prepared_per_layer = [
             gather_dense_sdpa_inputs(data, layer_idx)
             for layer_idx in range(workload.num_layers)
         ]
+
         def fn() -> mx.array:
             out = None
             for prepared in prepared_per_layer:
                 out = run_sdpa_from_prepared(prepared, workload.scale)
+            assert out is not None
             return out
+
         notes = "dense compute only"
     elif backend == "sdpa":
+
         def fn() -> mx.array:
             out = None
             for layer_idx in range(workload.num_layers):
                 out = run_sdpa_from_prepared(
                     gather_dense_sdpa_inputs(data, layer_idx), workload.scale
                 )
+            assert out is not None
             return out
+
         notes = "includes gather"
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -627,24 +641,32 @@ def _run_v2(data: WorkloadData, layer_idx: int) -> mx.array:
 def format_query_spec(workload: Workload) -> str:
     if workload.mode == "decode":
         return f"batch={workload.num_seqs}, q_len=1, kv_len={workload.kv_lens}"
-    return (
-        "seq_lens="
-        + str(list(zip(workload.query_lens, workload.kv_lens, strict=False)))
+    return "seq_lens=" + str(
+        list(zip(workload.query_lens, workload.kv_lens, strict=False))
     )
 
 
 def short_query_spec(workload: Workload) -> str:
     if workload.mode == "decode":
-        kv = workload.kv_lens[0] if len(set(workload.kv_lens)) == 1 else workload.kv_lens
+        kv = (
+            workload.kv_lens[0] if len(set(workload.kv_lens)) == 1 else workload.kv_lens
+        )
         return f"B={workload.num_seqs}, q=1, kv={kv}"
     pairs = list(zip(workload.query_lens, workload.kv_lens, strict=False))
     if len(pairs) <= 4:
         return " ".join(f"{q}/{kv}" for q, kv in pairs)
-    return f"{len(pairs)} seqs; max_q={workload.max_q_len}; max_kv={workload.max_kv_len}"
+    return (
+        f"{len(pairs)} seqs; max_q={workload.max_q_len}; max_kv={workload.max_kv_len}"
+    )
 
 
 def valid_results(results: list[Result]) -> list[Result]:
     return [result for result in results if result.mean_ms is not None]
+
+
+def mean_ms_key(result: Result) -> float:
+    assert result.mean_ms is not None
+    return result.mean_ms
 
 
 def ordered_backends(case_runs: list[CaseRun]) -> list[str]:
@@ -707,7 +729,11 @@ def comparison_rows(case_runs: list[CaseRun], backends: list[str]) -> list[list[
     rows: list[list[str]] = []
     for case_run in case_runs:
         results_by_backend = {result.backend: result for result in case_run.results}
-        best = min(valid_results(case_run.results), key=lambda result: result.mean_ms, default=None)
+        best = min(
+            valid_results(case_run.results),
+            key=mean_ms_key,
+            default=None,
+        )
         row = [
             display_case_name(case_run),
             case_kind(case_run.workload),
@@ -735,7 +761,9 @@ def print_text_table(headers: list[str], rows: list[list[str]]) -> None:
         print(" | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
 
 
-def summary_dict(case_runs: list[CaseRun], args: argparse.Namespace) -> dict[str, object]:
+def summary_dict(
+    case_runs: list[CaseRun], args: argparse.Namespace
+) -> dict[str, object]:
     block_sizes = sorted({run.workload.block_size for run in case_runs})
     dtypes = sorted({run.workload.dtype_name for run in case_runs})
     num_layers = sorted({run.workload.num_layers for run in case_runs})
@@ -751,7 +779,9 @@ def summary_dict(case_runs: list[CaseRun], args: argparse.Namespace) -> dict[str
     }
 
 
-def comparison_rows_dict(case_runs: list[CaseRun], backends: list[str]) -> list[dict[str, object]]:
+def comparison_rows_dict(
+    case_runs: list[CaseRun], backends: list[str]
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for case_run in case_runs:
         row: dict[str, object] = {
@@ -762,21 +792,34 @@ def comparison_rows_dict(case_runs: list[CaseRun], backends: list[str]) -> list[
             "shape": short_query_spec(case_run.workload),
         }
         results_by_backend = {result.backend: result for result in case_run.results}
-        best = min(valid_results(case_run.results), key=lambda result: result.mean_ms, default=None)
+        best = min(
+            valid_results(case_run.results),
+            key=mean_ms_key,
+            default=None,
+        )
         for backend in backends:
             result = results_by_backend.get(backend)
             label = backend_label(backend)
-            row[label] = None if result is None or result.mean_ms is None else round(result.mean_ms, 3)
+            row[label] = (
+                None
+                if result is None or result.mean_ms is None
+                else round(result.mean_ms, 3)
+            )
             row[f"{label}_vs_best"] = (
                 None
-                if result is None or result.mean_ms is None or best is None or best.mean_ms is None
+                if result is None
+                or result.mean_ms is None
+                or best is None
+                or best.mean_ms is None
                 else round(result.mean_ms / best.mean_ms * 100.0, 1)
             )
         rows.append(row)
     return rows
 
 
-def json_payload(case_runs: list[CaseRun], args: argparse.Namespace) -> dict[str, object]:
+def json_payload(
+    case_runs: list[CaseRun], args: argparse.Namespace
+) -> dict[str, object]:
     backends = ordered_backends(case_runs)
     return {
         "summary": summary_dict(case_runs, args),
@@ -792,7 +835,11 @@ def write_json(path: Path, case_runs: list[CaseRun], args: argparse.Namespace) -
 def write_csv(path: Path, case_runs: list[CaseRun]) -> None:
     backends = ordered_backends(case_runs)
     rows = comparison_rows_dict(case_runs, backends)
-    fieldnames = list(rows[0].keys()) if rows else ["case", "case_name", "type", "batch", "shape"]
+    fieldnames = (
+        list(rows[0].keys())
+        if rows
+        else ["case", "case_name", "type", "batch", "shape"]
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -810,12 +857,20 @@ def write_exports(case_runs: list[CaseRun], args: argparse.Namespace) -> None:
 def print_summary(case_runs: list[CaseRun], args: argparse.Namespace) -> None:
     summary = summary_dict(case_runs, args)
     summary_parts = [
-        f"num_layers: {summary['num_layers']}" if isinstance(summary["num_layers"], int) else "num_layers: mixed",
-        f"block_size: {summary['block_size']}" if isinstance(summary["block_size"], int) else "block_size: mixed",
-        f"dtype: {summary['dtype']}" if isinstance(summary["dtype"], str) else "dtype: mixed",
+        f"num_layers: {summary['num_layers']}"
+        if isinstance(summary["num_layers"], int)
+        else "num_layers: mixed",
+        f"block_size: {summary['block_size']}"
+        if isinstance(summary["block_size"], int)
+        else "block_size: mixed",
+        f"dtype: {summary['dtype']}"
+        if isinstance(summary["dtype"], str)
+        else "dtype: mixed",
         f"warmup: {args.warmup}",
         f"iters: {args.iters}",
-        f"seed: {summary['seed']}" if isinstance(summary["seed"], int) else "seed: mixed",
+        f"seed: {summary['seed']}"
+        if isinstance(summary["seed"], int)
+        else "seed: mixed",
     ]
     print("  ".join(summary_parts))
 

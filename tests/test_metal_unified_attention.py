@@ -12,8 +12,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from vllm_metal.metal import metal_unified_attention
 from tools.attention_bench_utils import ref_paged_attn, run_v1_paged_attention
+from vllm_metal.metal import metal_unified_attention
 
 # Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
 #   HEAD_SIZES = [128, 256]
