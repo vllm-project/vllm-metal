@@ -62,3 +62,39 @@ python -m tools.benchmark.attention_benchmark --mode decode --batch-size 8 --kv-
 # Define a manual varlen workload
 python -m tools.benchmark.attention_benchmark --mode varlen --q-lens 1,4,16,64 --kv-lens 128,256,512,1024
 ```
+
+## Prefix Caching Benchmark
+
+Measures TTFT with shared-prefix workloads using `prefix_repetition` dataset.
+Establishes a baseline before prefix caching is implemented (#159).
+
+**1. Start the server:**
+
+```bash
+# Adjust MEMORY_FRACTION based on available RAM (lower if OOM).
+VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
+  vllm serve Qwen/Qwen3-0.6B \
+    --port 8000 --max-model-len 2048 --max-num-seqs 8
+```
+
+**2. Run the benchmark:**
+
+```bash
+vllm bench serve \
+  --backend openai \
+  --base-url http://localhost:8000 \
+  --model Qwen/Qwen3-0.6B \
+  --dataset-name prefix_repetition \
+  --num-prompts 100 \
+  --prefix-repetition-prefix-len 256 \
+  --prefix-repetition-suffix-len 256 \
+  --prefix-repetition-num-prefixes 10 \
+  --prefix-repetition-output-len 128 \
+  --request-rate inf \
+  --percentile-metrics ttft,tpot,e2el \
+  --metric-percentiles 50,99 \
+  --save-result --label baseline
+```
+
+Key metric is **TTFT** — with prefix caching enabled, requests sharing
+the same prefix should show lower TTFT on cache hits.
