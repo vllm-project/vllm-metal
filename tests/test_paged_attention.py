@@ -40,7 +40,6 @@ class TestPrepare:
 
         # block 10: slots 40,41,42,43; block 11: slot 44
         assert ctx is not None
-        assert ctx.is_prefill
         assert ctx.slot_mapping == [40, 41, 42, 43, 44]
         assert ctx.block_tables == [[10, 11]]
         assert ctx.context_lens == [5]
@@ -53,7 +52,6 @@ class TestPrepare:
         ctx = get_context()
 
         assert ctx is not None
-        assert ctx.is_prefill
         # Request 0: block 10, slots 40,41,42
         # Request 1: block 20, slots 80,81
         assert ctx.slot_mapping == [40, 41, 42, 80, 81]
@@ -100,7 +98,6 @@ class TestPrepare:
 
         # new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
         assert ctx is not None
-        assert ctx.is_prefill  # unified always sets True
         assert ctx.slot_mapping == [27]
         assert ctx.context_lens == [8]
         assert ctx.offsets == [7]

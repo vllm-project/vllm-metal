@@ -41,7 +41,6 @@ class PagedAttentionContext:
     into a single flat sequence).
     """
 
-    is_prefill: bool  # kept for compatibility; always True
     slot_mapping: list[int]
     block_tables: list[list[int]] = field(default_factory=list)
     context_lens: list[int] = field(default_factory=list)
@@ -202,7 +201,6 @@ def prepare_unified(
 
     set_context(
         PagedAttentionContext(
-            is_prefill=True,  # use varlen code path
             slot_mapping=slot_mapping,
             block_tables=block_tables,
             context_lens=context_lens,

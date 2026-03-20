@@ -2018,8 +2018,16 @@ class MetalModelRunner:
         # === Single unified forward pass (paged path) ===
         if paged_prefill_entries or paged_decode_reqs:
             prefill_pack = [
-                (rid, tids, sp, bids, gen, None, start_pos)
-                for _, rid, tids, sp, bids, gen, _, _, start_pos in paged_prefill_entries
+                (
+                    rid,
+                    tids,
+                    sp,
+                    bids,
+                    gen,
+                    prompt_len if not entry_type.endswith("_intermediate") else None,
+                    start_pos,
+                )
+                for _, rid, tids, sp, bids, gen, entry_type, prompt_len, start_pos in paged_prefill_entries
             ]
             prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
                 prefill_pack, paged_decode_reqs
@@ -2043,6 +2051,10 @@ class MetalModelRunner:
                     # KV cache populated; discard sampled token
                     sampled_tokens[idx] = []
                 elif entry_type == "new_complete":
+                    assert _start_pos == 0, (
+                        "new_complete with start_pos > 0 not supported "
+                        "(prefix caching not yet implemented in unified path)"
+                    )
                     sampled_tokens[idx] = [nt]
                     self._request_states[rid] = RequestState(
                         token_ids=list(tids) + [nt],
