@@ -19,8 +19,11 @@ DV = 128
 HK = 16
 
 # Absolute tolerance for fp16 gating-order differences.
-# Output values are O(0.01-0.1) with scale=0.1 inputs; max_abs < 0.001.
-ATOL = 0.05
+# Empirical max_abs is ~0.000031 for output and ~0.000061 for state.
+# Set tolerance at 10x empirical to allow for hardware variance while
+# still catching meaningful drift.
+ATOL_Y = 0.001
+ATOL_S = 0.001
 
 
 def _make_inputs(B, T, Hv, dtype=mx.float16):  # noqa: N803
@@ -69,8 +72,8 @@ def test_decode_matches_reference(B, Hv):  # noqa: N803
     y_diff = mx.abs(y_ref.astype(mx.float32) - y_fused.astype(mx.float32)).max().item()
     s_diff = mx.abs(s_ref.astype(mx.float32) - s_fused.astype(mx.float32)).max().item()
 
-    assert y_diff < ATOL, f"y max_abs_diff={y_diff}"
-    assert s_diff < ATOL, f"state max_abs_diff={s_diff}"
+    assert y_diff < ATOL_Y, f"y max_abs_diff={y_diff}"
+    assert s_diff < ATOL_S, f"state max_abs_diff={s_diff}"
 
 
 # --- Prefill (T>1) ---
@@ -85,8 +88,8 @@ def test_prefill_matches_reference(T):  # noqa: N803
     y_diff = mx.abs(y_ref.astype(mx.float32) - y_fused.astype(mx.float32)).max().item()
     s_diff = mx.abs(s_ref.astype(mx.float32) - s_fused.astype(mx.float32)).max().item()
 
-    assert y_diff < ATOL, f"y max_abs_diff={y_diff}"
-    assert s_diff < ATOL, f"state max_abs_diff={s_diff}"
+    assert y_diff < ATOL_Y, f"y max_abs_diff={y_diff}"
+    assert s_diff < ATOL_S, f"state max_abs_diff={s_diff}"
 
 
 # --- Output shape ---

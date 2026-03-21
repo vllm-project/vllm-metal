@@ -222,11 +222,12 @@ def main():
 
     dtype = mx.float16 if args.dtype == "float16" else mx.bfloat16
 
-    # Always run correctness check first
-    ok = check_correctness(n_v_heads=args.hv[0], dtype=dtype)
-    if not ok:
-        print("CORRECTNESS CHECK FAILED — aborting benchmark")
-        sys.exit(1)
+    # Validate correctness for every requested Hv before benchmarking
+    for hv in args.hv:
+        ok = check_correctness(n_v_heads=hv, dtype=dtype)
+        if not ok:
+            print(f"CORRECTNESS CHECK FAILED for Hv={hv} — aborting benchmark")
+            sys.exit(1)
     print()
 
     if args.check:
