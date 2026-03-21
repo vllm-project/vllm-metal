@@ -232,6 +232,15 @@ class MetalPlatform(Platform):
             scheduler_config.enable_chunked_prefill = False
             logger.info("Metal: disabled chunked prefill")
 
+        if config.use_paged_attention and getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            # The unified paged path does not yet safely support vLLM core
+            # prefix-cache hits for new requests. Disable the feature at the
+            # platform layer until that path is fully supported.
+            cache_config.enable_prefix_caching = False
+            logger.info("Metal: disabled prefix caching")
+
         # Configure cache
         if cache_config.block_size is None:
             cache_config.block_size = config.block_size
