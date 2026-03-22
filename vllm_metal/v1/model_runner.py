@@ -15,9 +15,9 @@ import math
 import os
 import time
 from array import array
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Lock
-from typing import Any, TypeAlias
+from typing import Any
 
 import mlx.core as mx
 import torch
@@ -47,6 +47,13 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.v1.states import (
+    AnyCache,
+    RequestState,
+    SamplerOutput,
+    _create_request_generator,
+    _mlx_greedy_sample,
+)
 from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 from vllm_metal.paged_attention_common import (
     OffsetCache,
@@ -301,14 +308,6 @@ class PrefixCacheManager:
         }
 
 
-# Type alias for any per-layer cache type supported by the model.
-#
-# Notes:
-# - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
-# - Hybrid models use `ArraysCache` for non-attention state.
-AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
-
-
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
     """Merge per-request ArraysCache objects into a single batched ArraysCache.
 
@@ -423,62 +422,6 @@ def _merge_rotating_kv_caches(
     cache._offset = keys.shape[2]
 
     return cache
-
-
-def _mlx_greedy_sample(logits: mx.array) -> mx.array:
-    """Native MLX greedy sampling - avoids PyTorch round-trip.
-
-    Args:
-        logits: Logits tensor of shape (batch_size, vocab_size)
-
-    Returns:
-        Token IDs of shape (batch_size,)
-    """
-    return mx.argmax(logits, axis=-1)
-
-
-def _create_request_generator(
-    device: torch.device,
-    sampling_params: SamplingParams,
-) -> torch.Generator | None:
-    """Create a per-request generator for seeded sampling.
-
-    vLLM uses a per-request generator only when an explicit seed is provided.
-    For unseeded sampling, vLLM relies on the global RNG state.
-    """
-    if sampling_params.seed is None:
-        return None
-    if sampling_params.temperature < 1e-5:
-        return None
-    generator = torch.Generator(device=device)
-    generator.manual_seed(sampling_params.seed)
-    return generator
-
-
-@dataclass
-class SamplerOutput:
-    """Output from the sampler."""
-
-    token_ids: list[int]
-    logprobs: list[float] | None = None
-
-
-@dataclass
-class RequestState:
-    """State for an ongoing request with KV cache."""
-
-    token_ids: list[int]
-    # Length of the original prompt (prefix) within `token_ids`.
-    # vLLM applies repetition penalties to both prompt+output tokens, but applies
-    # presence/frequency penalties only to generated (output) tokens.
-    prompt_len: int
-    cache: list[AnyCache]  # Per-layer caches (KVCache, RotatingKVCache, or ArraysCache)
-    sampling_params: SamplingParams  # Sampling parameters for this request
-    generator: torch.Generator | None = None
-    generated_tokens: int = 0
-    block_ids: list[int] = field(
-        default_factory=list
-    )  # Scheduler-assigned paged KV blocks
 
 
 def _merge_kv_caches(

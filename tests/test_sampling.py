@@ -12,11 +12,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.model_runner import (
-    MetalModelRunner,
-    RequestState,
-    _create_request_generator,
-)
+from vllm_metal.v1.model_runner import MetalModelRunner
+from vllm_metal.v1.states import RequestState, _create_request_generator
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
