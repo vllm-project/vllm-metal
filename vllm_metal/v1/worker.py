@@ -135,8 +135,13 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # Patch model for paged attention if enabled (skip for STT)
-        if self.metal_config.use_paged_attention and not self.model_runner.is_stt:
+        # Boundary ownership:
+        # - Worker owns resource setup.
+        # - Runner owns STT/runtime capability decisions.
+        if (
+            self.metal_config.use_paged_attention
+            and self.model_runner.should_setup_paged_attention()
+        ):
             self._setup_paged_attention()
 
     def _setup_paged_attention(self) -> None:
@@ -322,33 +327,36 @@ class MetalWorker(WorkerBase):
         Returns:
             Available memory in bytes
         """
-        # STT models don't use vLLM's KV cache.
-        # Return a generous value so the scheduler's minimum-memory check
-        # passes.  No KV cache is actually allocated for STT.
-        if self.model_runner.is_stt:
+        mode = self.model_runner.scheduler_memory_reporting_mode(
+            paged_attention_enabled=self.metal_config.use_paged_attention
+        )
+
+        if mode == "stt_nominal":
+            # STT models don't use vLLM's KV cache. Return a nominal value so
+            # scheduler minimum-memory checks pass.
             logger.info("STT model: reporting nominal memory for scheduler")
             return STT_SCHED_AVAILABLE_BYTES
 
-        # --- Paged attention: report real MPS cache capacity ---
-        if self.metal_config.use_paged_attention:
+        if mode == "paged_attention_capacity":
             runner = self.model_runner
-            if (
-                hasattr(runner, "_paged_kv_cache")
-                and runner._paged_kv_cache is not None
-            ):
-                paged_cache = runner._paged_kv_cache
-                block_size_bytes = self.get_cache_block_size_bytes()
-                available = paged_cache.num_blocks * block_size_bytes
-                logger.info(
-                    "Paged attention: reporting MPS cache capacity "
-                    "(%d blocks × %d bytes = %.2f GB)",
-                    paged_cache.num_blocks,
-                    block_size_bytes,
-                    available / 1e9,
+            paged_cache = runner._paged_kv_cache
+            if paged_cache is None:
+                raise RuntimeError(
+                    "Paged-attention memory reporting selected without an "
+                    "initialized paged KV cache."
                 )
-                return available
+            block_size_bytes = self.get_cache_block_size_bytes()
+            available = paged_cache.num_blocks * block_size_bytes
+            logger.info(
+                "Paged attention: reporting MPS cache capacity "
+                "(%d blocks × %d bytes = %.2f GB)",
+                paged_cache.num_blocks,
+                block_size_bytes,
+                available / 1e9,
+            )
+            return available
 
-        # --- MLX path: one max-length sequence for admission control ---
+        # Default MLX path: one max-length sequence for admission control.
         available = self._one_sequence_kv_bytes()
         logger.info(
             "MLX path: reporting %.2fGB for scheduler admission control "
@@ -473,9 +481,7 @@ class MetalWorker(WorkerBase):
         Returns:
             Tuple of supported task types
         """
-        if self.model_runner.is_stt:
-            return ("transcription",)
-        return ("generate",)
+        return self.model_runner.supported_worker_tasks()
 
     def sleep(self, level: int = 1) -> None:
         """Enter sleep mode (not supported on Metal).
