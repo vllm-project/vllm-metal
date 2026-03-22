@@ -164,6 +164,72 @@ class TestMetalPlatform:
         assert vllm_config.parallel_config.distributed_executor_backend == "uni"
         assert vllm_config.parallel_config.disable_custom_all_reduce is True
 
+    def test_check_and_update_config_applies_stt_scheduler_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STT models should get tokenizer fallback and async scheduling disabled."""
+        import vllm_metal.stt.config as stt_config
+        import vllm_metal.utils as metal_utils
+
+        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
+        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: True)
+
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(block_size=None),
+            model_config=SimpleNamespace(
+                model="openai/whisper-tiny",
+                disable_cascade_attn=False,
+                tokenizer=None,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=False,
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.tokenizer == "openai/whisper-tiny"
+        assert vllm_config.scheduler_config.async_scheduling is False
+
+    def test_check_and_update_config_preserves_existing_tokenizer_for_stt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STT policy should not overwrite an explicitly configured tokenizer."""
+        import vllm_metal.stt.config as stt_config
+        import vllm_metal.utils as metal_utils
+
+        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
+        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: True)
+
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(block_size=None),
+            model_config=SimpleNamespace(
+                model="openai/whisper-tiny",
+                disable_cascade_attn=False,
+                tokenizer="custom-tokenizer",
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=False,
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.tokenizer == "custom-tokenizer"
+        assert vllm_config.scheduler_config.async_scheduling is False
+
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
