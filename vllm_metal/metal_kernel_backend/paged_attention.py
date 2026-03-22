@@ -20,9 +20,9 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal_kernel_backend.attention_standard import (
-    is_standard_mha,
-    standard_mha_forward,
+from vllm_metal.metal_kernel_backend.attention_sdpa import (
+    is_sdpa,
+    sdpa_forward,
 )
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_common import (
@@ -66,15 +66,13 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         inner = self._inner
 
         # Dispatch to the right attention backend
-        if is_standard_mha(inner):
-            return standard_mha_forward(
-                inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx
-            )
+        if is_sdpa(inner):
+            return sdpa_forward(inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx)
         else:
             raise NotImplementedError(
                 f"No Metal attention backend for {type(inner).__name__}. "
                 f"Module attributes: {[a for a in dir(inner) if not a.startswith('_')]}. "
-                "Supported: standard MHA (q_proj + k_proj + v_proj + o_proj)."
+                "Supported: SDPA (q_proj + k_proj + v_proj + o_proj)."
             )
 
 

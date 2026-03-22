@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Standard multi-head attention (Qwen3, Llama, Mistral, etc.) on Metal.
+"""Scaled dot-product attention (SDPA) on Metal.
+
+Supports MHA, GQA, and MQA as variants of the same kernel — the head ratio
+between ``n_heads`` (queries) and ``n_kv_heads`` (keys/values) is handled
+transparently by the Metal paged attention kernel.
 
 Handles models whose attention module exposes:
 - ``q_proj``, ``k_proj``, ``v_proj``, ``o_proj`` linear projections
@@ -7,12 +11,12 @@ Handles models whose attention module exposes:
 - ``n_heads``, ``n_kv_heads`` head counts
 - Optionally ``q_norm``, ``k_norm`` (Qwen3 per-head RMSNorm before RoPE)
 
+Covers: Qwen3, Llama, Mistral, and other standard transformer architectures.
+
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,8 +29,8 @@ from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
 
-def is_standard_mha(module: nn.Module) -> bool:
-    """Return True if *module* looks like a standard MHA attention layer."""
+def is_sdpa(module: nn.Module) -> bool:
+    """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA)."""
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
@@ -35,19 +39,18 @@ def is_standard_mha(module: nn.Module) -> bool:
     )
 
 
-def standard_mha_forward(
+def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
     ctx: PagedAttentionContext,
     kv_cache: MetalPagedKVCache,
     layer_idx: int,
 ) -> mx.array:
-    """Full forward pass for standard MHA: project → norm → RoPE → Metal kernel.
+    """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
-    This combines the projection/reshape step (previously in the wrapper's
-    ``__call__``) with the Metal kernel dispatch (previously
-    ``_metal_kernel_prefill_attention``), so the entire attention-type-specific
-    logic lives in one place.
+    Handles MHA, GQA, and MQA uniformly — the head ratio between
+    ``inner.n_heads`` and ``inner.n_kv_heads`` is passed to the Metal
+    kernel which handles the broadcast internally.
     """
     B, L, D = x.shape  # noqa: N806
 
