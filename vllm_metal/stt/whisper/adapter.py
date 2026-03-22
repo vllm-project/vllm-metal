@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import mlx.core as mx
 
-from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
 
 from .model import WhisperModel
 from .transcriber import WhisperTranscriber
@@ -33,7 +32,7 @@ class WhisperRuntimeAdapter(STTRuntimeAdapter):
     def eot_token(self) -> int:
         return int(self.transcriber.tokenizer.convert_tokens_to_ids("<|endoftext|>"))
 
-    def extract_audio_features(self, input_features: Any) -> mx.array:
+    def extract_audio_features(self, input_features: STTAudioInput) -> mx.array:
         mel = self._to_mx_float16(input_features)
 
         # Whisper encoder expects: (batch, time, n_mels).

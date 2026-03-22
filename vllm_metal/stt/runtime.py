@@ -8,10 +8,21 @@ The vLLM runner delegates STT execution to model-owned runtime adapters under
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Sequence
+from typing import TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
+from numpy.typing import NDArray
+
+STTAudioInput: TypeAlias = (
+    mx.array
+    | torch.Tensor
+    | NDArray[np.generic]
+    | Sequence[float]
+    | Sequence[Sequence[float]]
+)
 
 
 class STTRuntimeAdapter(ABC):
@@ -22,12 +33,12 @@ class STTRuntimeAdapter(ABC):
     - decoding strategy (prompt handling, token extraction, EOT selection)
     """
 
-    def __init__(self, model: Any, model_path: str) -> None:
+    def __init__(self, model: object, model_path: str) -> None:
         self.model = model
         self._model_path = model_path
 
     @staticmethod
-    def _to_mx_float16(value: Any) -> mx.array:
+    def _to_mx_float16(value: STTAudioInput) -> mx.array:
         """Convert common multimodal payload types into ``mx.float16``."""
         if isinstance(value, torch.Tensor):
             from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
@@ -44,14 +55,14 @@ class STTRuntimeAdapter(ABC):
 
     @property
     @abstractmethod
-    def transcriber(self) -> Any: ...
+    def transcriber(self) -> object: ...
 
     @property
     @abstractmethod
     def eot_token(self) -> int: ...
 
     @abstractmethod
-    def extract_audio_features(self, input_features: Any) -> mx.array: ...
+    def extract_audio_features(self, input_features: STTAudioInput) -> mx.array: ...
 
     @abstractmethod
     def decode_tokens(
