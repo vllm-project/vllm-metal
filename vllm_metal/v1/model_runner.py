@@ -17,7 +17,7 @@ import time
 from array import array
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import mlx.core as mx
 import torch
@@ -37,6 +37,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -307,6 +308,11 @@ class PrefixCacheManager:
 # - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
 # - Hybrid models use `ArraysCache` for non-attention state.
 AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
+SchedulerMemoryReportingMode: TypeAlias = Literal[
+    "stt_nominal",
+    "paged_attention_capacity",
+    "single_sequence_estimate",
+]
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -663,6 +669,34 @@ class MetalModelRunner:
     def is_stt(self) -> bool:
         """Whether the loaded model is a Speech-to-Text model."""
         return self._is_stt
+
+    def should_setup_paged_attention(self) -> bool:
+        """Whether worker-side paged-attention setup should run.
+
+        STT models own their runtime path and do not use the paged-attention
+        cache path that the text/VLM runner uses.
+        """
+        return not self._is_stt
+
+    def scheduler_memory_reporting_mode(
+        self, *, paged_attention_enabled: bool
+    ) -> SchedulerMemoryReportingMode:
+        """Return which scheduler memory-reporting mode worker should use.
+
+        Worker delegates this decision to the runner so STT-specific policy is
+        not open-coded in `worker.py`.
+        """
+        if self._is_stt:
+            return "stt_nominal"
+        if paged_attention_enabled and self._paged_kv_cache is not None:
+            return "paged_attention_capacity"
+        return "single_sequence_estimate"
+
+    def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
+        """Return worker task capabilities for the loaded model."""
+        if self._is_stt:
+            return ("transcription",)
+        return ("generate",)
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
