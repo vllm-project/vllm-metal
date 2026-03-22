@@ -114,6 +114,52 @@ CASES: dict[str, dict[str, object]] = {
         "kv_lens": (4096, 8192, 512, 2048),
         "num_blocks": 512,
     },
+    # ---- Small head-dim cases (head_dim=64, GQA 16/8) ----
+    # Exercises the 128-thread kernel path selected for head_dim<=96.
+    # Architecture: 16 Q-heads, 8 KV-heads, head_dim=64 (common in small GQA models).
+    "small-head-decode-small": {
+        "mode": "decode",
+        "batch_size": 1,
+        "kv_lens": (128,),
+        "num_q_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+    },
+    "small-head-decode-typical": {
+        "mode": "decode",
+        "batch_size": 8,
+        "kv_lens": (2048,),
+        "num_q_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+    },
+    "small-head-decode-long": {
+        "mode": "decode",
+        "batch_size": 16,
+        "kv_lens": (4096,),
+        "num_q_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+        "num_blocks": 512,
+    },
+    "small-head-varlen-decode": {
+        "mode": "varlen",
+        "q_lens": (1, 1, 1, 1, 1, 1, 1, 1),
+        "kv_lens": (512, 1024, 512, 2048, 256, 1024, 768, 2048),
+        "num_q_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+        "num_blocks": 512,
+    },
+    "small-head-varlen-prefill": {
+        "mode": "varlen",
+        "q_lens": (32, 64, 128, 256),
+        "kv_lens": (512, 1024, 2048, 4096),
+        "num_q_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+        "num_blocks": 512,
+    },
 }
 GROUPS: dict[str, tuple[str, ...]] = {
     "all": tuple(CASES),
@@ -126,6 +172,14 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "decode-long",
         "varlen-single-long",
         "varlen-ragged-longtail",
+    ),
+    # Small head-dim group (head_dim<=96) — exercises the 128-thread kernel path
+    "small-head": (
+        "small-head-decode-small",
+        "small-head-decode-typical",
+        "small-head-decode-long",
+        "small-head-varlen-decode",
+        "small-head-varlen-prefill",
     ),
 }
 PRESET_FIELDS = (
