@@ -1432,6 +1432,7 @@ class MetalModelRunner:
                 torch.Generator | None,
                 int | None,
                 int,
+                list[int] | None,
             ]
         ],
         decode_reqs: list[tuple[str, RequestState]],
@@ -1445,9 +1446,13 @@ class MetalModelRunner:
         Args:
             prefill_reqs: list of
                 ``(req_id, token_ids, sampling_params, block_ids,
-                generator, prompt_len, start_pos)`` — prefill requests.
+                generator, prompt_len, start_pos,
+                full_prompt_token_ids)`` — prefill requests.
                 ``start_pos`` is the RoPE offset / KV slot start (0 for
                 fresh prefill, >0 for continuation chunks).
+                ``full_prompt_token_ids`` is the complete prompt for
+                sampling metadata (needed when token_ids is a suffix
+                slice due to prefix cache hit).
             decode_reqs: list of ``(req_id, RequestState)`` — decode requests.
 
         Returns:
@@ -1471,7 +1476,7 @@ class MetalModelRunner:
         all_token_ids.extend(last_tokens)
 
         # Prefill: tokens per request
-        for _, token_ids, _, _, _, _, _ in prefill_reqs:
+        for _, token_ids, _, _, _, _, _, _ in prefill_reqs:
             all_token_ids.extend(token_ids)
 
         # ---- build metadata for prepare_unified ----
@@ -1481,7 +1486,7 @@ class MetalModelRunner:
             decode_info.append((state.block_ids, seq_len))
 
         prefill_info: list[tuple[list[int], int, int]] = []
-        for _, token_ids, _, block_ids, _, _, start_pos in prefill_reqs:
+        for _, token_ids, _, block_ids, _, _, start_pos, _ in prefill_reqs:
             prefill_info.append((block_ids, len(token_ids), start_pos))
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
@@ -1499,7 +1504,7 @@ class MetalModelRunner:
         cu_seqlens: list[int] = [0]
         for _ in decode_reqs:
             cu_seqlens.append(cu_seqlens[-1] + 1)
-        for _, token_ids, _, _, _, _, _ in prefill_reqs:
+        for _, token_ids, _, _, _, _, _, _ in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
 
         # ---- sample decode tokens ----
@@ -1572,6 +1577,7 @@ class MetalModelRunner:
             generator,
             prompt_len,
             _start_pos,
+            full_prompt_token_ids,
         ) in enumerate(prefill_reqs):
             last_idx = cu_seqlens[num_decode + j + 1] - 1
             last_logits = logits[:, last_idx : last_idx + 1, :]
@@ -1598,16 +1604,23 @@ class MetalModelRunner:
                     last_logits[0].astype(mx.float32), device=self.device
                 )
                 generators = {} if generator is None else {0: generator}
+                # Use full prompt for penalty computation when available
+                # (prefix cache hit supplies suffix-only token_ids).
+                prompt_for_meta = (
+                    full_prompt_token_ids
+                    if full_prompt_token_ids is not None
+                    else token_ids
+                )
                 metadata = self._make_sampling_metadata(
                     [sampling_params],
-                    [token_ids[:prompt_len]],
-                    [token_ids[prompt_len:]],
+                    [prompt_for_meta[:prompt_len]],
+                    [prompt_for_meta[prompt_len:]],
                     generators=generators,
                 )
                 output = self._sampler.forward(logits_torch, metadata)
                 next_token = int(output.sampled_token_ids[0, 0].item())
 
-            self._paged_request_seq_lens[req_id] = len(token_ids)
+            self._paged_request_seq_lens[req_id] = _start_pos + len(token_ids)
             prefill_next_tokens.append(next_token)
 
         return prefill_next_tokens, decode_next_tokens
@@ -1639,6 +1652,7 @@ class MetalModelRunner:
 
         # === Collect all requests into one unified batch ===
         new_reqs = scheduler_output.scheduled_new_reqs
+        new_reqs_by_id = {r.req_id: r for r in new_reqs}
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
         # Paged-attention entries collected for the single unified forward.
@@ -1840,18 +1854,41 @@ class MetalModelRunner:
 
         # === Single unified forward pass (paged path) ===
         if paged_prefill_entries or paged_decode_reqs:
-            prefill_pack = [
-                (
-                    rid,
-                    tids,
-                    sp,
-                    bids,
-                    gen,
-                    prompt_len if not is_intermediate else None,
-                    start_pos,
+            prefill_pack = []
+            for (
+                _,
+                rid,
+                tids,
+                sp,
+                bids,
+                gen,
+                is_new,
+                is_intermediate,
+                prompt_len,
+                start_pos,
+            ) in paged_prefill_entries:
+                # Recover full prompt for sampling metadata when only
+                # a suffix was forwarded (start_pos > 0).
+                if start_pos > 0:
+                    if is_new:
+                        full_prompt = list(new_reqs_by_id[rid].prompt_token_ids)
+                    else:
+                        state = self._request_states[rid]
+                        full_prompt = state.token_ids[: state.prompt_len]
+                else:
+                    full_prompt = None
+                prefill_pack.append(
+                    (
+                        rid,
+                        tids,
+                        sp,
+                        bids,
+                        gen,
+                        prompt_len if not is_intermediate else None,
+                        start_pos,
+                        full_prompt,
+                    )
                 )
-                for _, rid, tids, sp, bids, gen, _is_new, is_intermediate, prompt_len, start_pos in paged_prefill_entries
-            ]
             prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
                 prefill_pack, paged_decode_reqs
             )
@@ -1875,14 +1912,16 @@ class MetalModelRunner:
                     # KV cache populated; discard sampled token
                     sampled_tokens[idx] = []
                 elif is_new:
-                    assert _start_pos == 0, (
-                        "new complete prefill with start_pos > 0 not supported "
-                        "(prefix caching not yet implemented in unified path)"
-                    )
                     sampled_tokens[idx] = [nt]
+                    # When prefix cache hits (start_pos > 0), tids is only
+                    # the suffix slice.  State needs the full prompt.
+                    if _start_pos > 0:
+                        full_prompt = list(new_reqs_by_id[rid].prompt_token_ids)
+                    else:
+                        full_prompt = list(tids)
                     self._request_states[rid] = RequestState(
-                        token_ids=list(tids) + [nt],
-                        prompt_len=len(tids),
+                        token_ids=full_prompt + [nt],
+                        prompt_len=_prompt_len,
                         cache=[],
                         sampling_params=sp,
                         generator=gen,
@@ -1890,7 +1929,7 @@ class MetalModelRunner:
                         block_ids=bids,
                     )
                     if self._rust_state_manager is not None:
-                        self._rust_state_manager.add_request(rid, list(tids) + [nt])
+                        self._rust_state_manager.add_request(rid, full_prompt + [nt])
                 else:
                     # Cached last chunk — append token to existing state
                     sampled_tokens[idx] = [nt]
@@ -1910,7 +1949,6 @@ class MetalModelRunner:
         # req_ids, and decode-phase scheduled requests should not emit empty
         # token lists. Missing/empty outputs here can leave placeholders stale.
         if scheduler_output.total_num_scheduled_tokens > 0:
-            new_reqs_by_id = {r.req_id: r for r in new_reqs}
             missing_req_ids: list[str] = []
             unexpected_empty_req_ids: list[str] = []
             for req_id in scheduler_output.num_scheduled_tokens:
