@@ -66,7 +66,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import PARTITION_SIZE, get_ops
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
@@ -150,22 +150,52 @@ def _metal_kernel_prefill_attention(
     )
 
     max_seq_len = max(ctx.context_lens)
-
-    ops.paged_attention_v2_online(
-        out,
-        q_3d,
-        cache.key_caches[layer_idx],
-        cache.value_caches[layer_idx],
-        cache.num_kv_heads,
-        attn_module.scale,
-        0.0,  # softcap (0 = disabled)
-        block_tables,
-        seq_lens,
-        cu_seqlens_q,
-        cache.block_size,
-        max_seq_len,
-        -1,  # sliding_window (-1 = disabled)
+    max_num_partitions = max(1, (max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE)
+    use_partitioning = (
+        PARTITION_SIZE % cache.block_size == 0 and max_num_partitions > 1
     )
+
+    if use_partitioning:
+        exp_sums = mx.zeros((L, n_heads, max_num_partitions), dtype=mx.float32)
+        max_logits = mx.zeros((L, n_heads, max_num_partitions), dtype=mx.float32)
+        tmp_out = mx.zeros(
+            (L, n_heads, max_num_partitions, head_dim), dtype=cache.dtype
+        )
+        mx.eval(exp_sums, max_logits, tmp_out)
+        ops.paged_attention_v2_online_partitioned(
+            out,
+            q_3d,
+            cache.key_caches[layer_idx],
+            cache.value_caches[layer_idx],
+            cache.num_kv_heads,
+            attn_module.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+            exp_sums,
+            max_logits,
+            tmp_out,
+        )
+    else:
+        ops.paged_attention_v2_online(
+            out,
+            q_3d,
+            cache.key_caches[layer_idx],
+            cache.value_caches[layer_idx],
+            cache.num_kv_heads,
+            attn_module.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+        )
 
     mx.synchronize()
 

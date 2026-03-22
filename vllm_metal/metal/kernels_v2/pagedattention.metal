@@ -1107,19 +1107,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // merges sequentially. Simple and barrier-safe (all barriers are
   // reached by all threads in the threadgroup).
 
-  // If partitioning is enabled, store the partial result for the reduce kernel.
-  // Indexed by q_token_idx (not seq_idx) for varlen compatibility.
-  if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
-    device float *max_logits_ptr =
-        max_logits + q_token_idx * num_heads * max_num_partitions +
-        head_idx * max_num_partitions + partition_idx;
-    *max_logits_ptr = warp_m;
-    device float *exp_sums_ptr = exp_sums +
-                                 q_token_idx * num_heads * max_num_partitions +
-                                 head_idx * max_num_partitions + partition_idx;
-    *exp_sums_ptr = warp_l;
-  }
-
   // For non-partitioned mode, include the sink in each warp's state.
   if (!USE_PARTITIONING && use_sinks) {
     float sink_val = sinks[head_idx];
@@ -1188,6 +1175,19 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       }
       warp_m = new_m;
       warp_l = warp_l * my_corr + other_l * other_corr;
+    }
+
+    // For partitioned mode, persist the merged partition statistics for the
+    // reduce kernel. These must match the normalized tmp_out written below.
+    if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
+      device float *max_logits_ptr =
+          max_logits + q_token_idx * num_heads * max_num_partitions +
+          head_idx * max_num_partitions + partition_idx;
+      *max_logits_ptr = warp_m;
+      device float *exp_sums_ptr = exp_sums +
+                                   q_token_idx * num_heads * max_num_partitions +
+                                   head_idx * max_num_partitions + partition_idx;
+      *exp_sums_ptr = warp_l;
     }
 
     // Final normalization: O = O / l
