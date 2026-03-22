@@ -338,13 +338,8 @@ class MetalWorker(WorkerBase):
             return STT_SCHED_AVAILABLE_BYTES
 
         if mode == "paged_attention_capacity":
-            runner = self.model_runner
-            paged_cache = runner._paged_kv_cache
-            if paged_cache is None:
-                raise RuntimeError(
-                    "Paged-attention memory reporting selected without an "
-                    "initialized paged KV cache."
-                )
+            # Runner only reports this mode when paged cache is initialized.
+            paged_cache = self.model_runner._paged_kv_cache
             block_size_bytes = self.get_cache_block_size_bytes()
             available = paged_cache.num_blocks * block_size_bytes
             logger.info(

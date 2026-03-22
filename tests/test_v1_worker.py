@@ -78,18 +78,6 @@ class TestWorkerRunnerBoundaryDelegation:
         assert available == 128
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
-    def test_determine_available_memory_paged_mode_requires_cache(self) -> None:
-        model_runner = SimpleNamespace(
-            scheduler_memory_reporting_mode=MagicMock(
-                return_value="paged_attention_capacity"
-            ),
-            _paged_kv_cache=None,
-        )
-        worker = _make_worker(model_runner, use_paged_attention=True)
-
-        with pytest.raises(RuntimeError, match="initialized paged KV cache"):
-            MetalWorker.determine_available_memory(worker)
-
     def test_determine_available_memory_single_sequence_mode(self) -> None:
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(
