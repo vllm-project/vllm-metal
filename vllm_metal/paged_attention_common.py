@@ -159,9 +159,7 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
         attr = find_attn_attr(layer_list[0])
         if attr is not None:
             return layer_list, attr
-        raise ValueError(
-            f"Cannot find attention module in layer {type(layer_list[0])}"
-        )
+        raise ValueError(f"Cannot find attention module in layer {type(layer_list[0])}")
     return layer_list, "self_attn"
 
 
