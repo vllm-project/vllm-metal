@@ -205,7 +205,7 @@ class MetalWorker(WorkerBase):
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
-                "use a smaller model, or add more RAM."
+                "use a smaller or more quantized model."
             )
 
         num_blocks = kv_budget // per_block_bytes
@@ -222,7 +222,7 @@ class MetalWorker(WorkerBase):
                 f"kv_budget={kv_budget / 1e9:.2f}GB, "
                 f"per_block_bytes={per_block_bytes}. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
-                "use a smaller model, or add more RAM."
+                "use a smaller or more quantized model."
             )
 
         max_tokens_cached = num_blocks * block_size
