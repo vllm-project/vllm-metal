@@ -9,7 +9,9 @@ import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 
+from vllm_metal.config import PAGED_ATTENTION_OVERHEAD_BYTES
 from vllm_metal.platform import MetalPlatform
+from vllm_metal.v1.worker import MetalWorker
 
 
 class TestMetalPlatform:
@@ -226,3 +228,51 @@ class TestMetalPlatform:
 
         MetalPlatform.synchronize()
         assert called is True
+
+
+class TestKvBudgetBytes:
+    """Tests for MetalWorker._kv_budget_bytes.
+
+    Numbers mirror a real M2 Max with GLM-4.7-Flash-4bit loaded:
+      metal_limit = 22.9 GB (max_recommended_working_set_size)
+      model_memory = 16.85 GB (mx.get_active_memory() after load)
+    """
+
+    _METAL_LIMIT = int(22.9e9)
+    _MODEL_MEM   = int(16.85e9)
+
+    def test_normal_case(self) -> None:
+        budget = MetalWorker._kv_budget_bytes(self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9)
+
+        assert budget == int(self._METAL_LIMIT * 0.9) - self._MODEL_MEM - PAGED_ATTENTION_OVERHEAD_BYTES
+        assert budget > 0
+
+    def test_fraction_too_low_yields_negative_budget(self) -> None:
+        # fraction=0.3 → usable=6.9 GB < model(16.85 GB) → negative
+        budget = MetalWorker._kv_budget_bytes(self._METAL_LIMIT, self._MODEL_MEM, fraction=0.3)
+
+        assert budget < 0
+
+    def test_boundary_zero(self) -> None:
+        # Craft inputs so budget lands exactly at zero.
+        limit = self._MODEL_MEM + PAGED_ATTENTION_OVERHEAD_BYTES
+
+        budget = MetalWorker._kv_budget_bytes(limit, self._MODEL_MEM, fraction=1.0)
+
+        assert budget == 0
+
+    def test_custom_overhead(self) -> None:
+        budget_zero_overhead = MetalWorker._kv_budget_bytes(
+            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9, overhead=0
+        )
+        budget_default = MetalWorker._kv_budget_bytes(
+            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9
+        )
+
+        assert budget_zero_overhead - budget_default == PAGED_ATTENTION_OVERHEAD_BYTES
+
+    def test_large_model_has_positive_budget_at_default_fraction(self) -> None:
+        # GLM-4.7-Flash-4bit at fraction=0.9 must yield > 1 GB for KV cache.
+        budget = MetalWorker._kv_budget_bytes(self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9)
+
+        assert budget > 1e9

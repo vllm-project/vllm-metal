@@ -139,15 +139,28 @@ class MetalWorker(WorkerBase):
         if self.metal_config.use_paged_attention and not self.model_runner.is_stt:
             self._setup_paged_attention()
 
+    @staticmethod
+    def _kv_budget_bytes(
+        metal_limit: int,
+        model_memory: int,
+        fraction: float,
+        overhead: int = PAGED_ATTENTION_OVERHEAD_BYTES,
+    ) -> int:
+        """KV cache budget = fraction of Metal limit minus model and overhead.
+
+        All three quantities live in the same domain: Metal-managed memory.
+        psutil.available is intentionally excluded — it reflects OS page-cache
+        state and is blind to MLX wired buffers holding model weights.
+        """
+        return int(metal_limit * fraction) - model_memory - overhead
+
     def _setup_paged_attention(self) -> None:
         """Create MetalPagedKVCache and patch model attention for native Metal kernel.
 
-        Computes num_blocks from available system RAM, model weight size, and
+        Computes num_blocks from Metal memory headroom, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
         max_model_len.
         """
-        import psutil
-
         from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
         from vllm_metal.metal_kernel_backend.paged_attention import (
             patch_model_attention_metal_kernel,
@@ -167,37 +180,28 @@ class MetalWorker(WorkerBase):
         else:
             fraction = self.metal_config.memory_fraction
 
-        # --- Gather memory numbers ---
-        total_ram = psutil.virtual_memory().total
+        # --- Gather Metal memory numbers ---
+        # KV cache lives in Metal-managed (wired) memory. psutil.available
+        # reflects OS page-cache state and excludes MLX wired buffers, making
+        # it appear nearly zero when a large model is loaded. Use
+        # max_recommended_working_set_size — the OS-reported Metal headroom —
+        # as the budget ceiling instead.
+        device_info = mx.device_info()
+        recommended = device_info.get("max_recommended_working_set_size", 0)
+        metal_limit = int(recommended if recommended > 0
+                          else device_info.get("memory_size", 0) * 0.75)
         model_memory = self._get_model_memory_usage()
         per_block_bytes = self.get_cache_block_size_bytes()
 
         # --- Compute KV budget ---
-        usable_ram = int(total_ram * fraction)
-        available_ram = psutil.virtual_memory().available
-
-        if usable_ram > available_ram:
-            raise ValueError(
-                "Paged attention: requested memory exceeds available RAM. "
-                f"total_ram={total_ram / 1e9:.2f}GB, "
-                f"fraction={fraction}, "
-                f"usable_ram={usable_ram / 1e9:.2f}GB, "
-                f"available_ram={available_ram / 1e9:.2f}GB. "
-                "The OS and other processes are using "
-                f"{(total_ram - available_ram) / 1e9:.2f}GB. "
-                "Mitigations: lower VLLM_METAL_MEMORY_FRACTION "
-                f"(try {available_ram / total_ram:.2f} or less), "
-                "close other applications, or add more RAM."
-            )
-
-        kv_budget = usable_ram - model_memory - PAGED_ATTENTION_OVERHEAD_BYTES
+        kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
 
         if kv_budget <= 0:
             raise ValueError(
-                "Paged attention: not enough memory for KV cache. "
-                f"total_ram={total_ram / 1e9:.2f}GB, "
+                "Paged attention: not enough Metal memory for KV cache. "
+                f"metal_limit={metal_limit / 1e9:.2f}GB, "
                 f"fraction={fraction}, "
-                f"usable_ram={usable_ram / 1e9:.2f}GB, "
+                f"usable_metal={int(metal_limit * fraction) / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
@@ -211,9 +215,9 @@ class MetalWorker(WorkerBase):
             raise ValueError(
                 "Paged attention: computed num_blocks too low "
                 f"({num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
-                f"total_ram={total_ram / 1e9:.2f}GB, "
+                f"metal_limit={metal_limit / 1e9:.2f}GB, "
                 f"fraction={fraction}, "
-                f"usable_ram={usable_ram / 1e9:.2f}GB, "
+                f"usable_metal={int(metal_limit * fraction) / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB, "
@@ -226,13 +230,13 @@ class MetalWorker(WorkerBase):
 
         logger.info(
             "Paged attention memory breakdown: "
-            "total_ram=%.2fGB, fraction=%.2f, usable_ram=%.2fGB, "
+            "metal_limit=%.2fGB, fraction=%.2f, usable_metal=%.2fGB, "
             "model_memory=%.2fGB, overhead=%.2fGB, "
             "kv_budget=%.2fGB, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
-            total_ram / 1e9,
+            metal_limit / 1e9,
             fraction,
-            usable_ram / 1e9,
+            int(metal_limit * fraction) / 1e9,
             model_memory / 1e9,
             PAGED_ATTENTION_OVERHEAD_BYTES / 1e9,
             kv_budget / 1e9,
