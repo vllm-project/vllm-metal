@@ -12,23 +12,13 @@ import pytest
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    raises=(NotImplementedError, ValueError),
-    reason=(
-        "Qwen3.5 paged attention is blocked by two issues: "
-        "(1) mlx_vlm does not support qwen3_5 model type yet (ValueError), "
-        "(2) linear attention (GatedDeltaNet) Metal kernel not implemented (NotImplementedError). "
-        "Once model loading is fixed, this test should hit NotImplementedError."
-    ),
+    raises=NotImplementedError,
+    reason="Linear attention (GatedDeltaNet) Metal kernel not yet implemented",
     strict=True,
 )
 def test_qwen35_paged_attention_raises_on_linear_layers():
-    """Loading Qwen/Qwen3.5-0.8B with paged attention must eventually raise
-    NotImplementedError on the linear attention layers.
-
-    Currently fails earlier at model loading (mlx_vlm does not support
-    qwen3_5).  Once that is resolved, the failure will move to the
-    linear attention dispatch.
-    """
+    """Loading Qwen/Qwen3.5-0.8B with paged attention raises
+    NotImplementedError on the linear attention layers."""
     from vllm import LLM, SamplingParams
 
     with pytest.MonkeyPatch.context() as mp:

@@ -6,9 +6,12 @@ with a mix of SDPA and linear attention layers.  In mlx_lm, the linear
 attention module is ``Qwen3NextGatedDeltaNet`` and lives on
 ``layer.linear_attn`` (as opposed to ``layer.self_attn`` for SDPA layers).
 
-Detection heuristic: the module has ``in_proj_qkvz`` and ``conv1d``
-(combined Q/K/V/Z projection + 1-D convolution) — attributes that no
-standard SDPA module has.
+Detection heuristic: the module has ``conv1d`` (1-D convolution before
+attention) and no ``q_proj`` (which would indicate SDPA).  This works across
+all known implementations:
+- mlx_lm ``qwen3_next``: ``in_proj_qkvz`` + ``conv1d``
+- mlx_lm ``qwen3_5``: ``in_proj_qkv`` + ``conv1d``
+- mlx_vlm ``qwen3_5``: ``in_proj_qkv`` + ``conv1d``
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 """
@@ -23,8 +26,12 @@ from vllm_metal.paged_attention_common import PagedAttentionContext
 
 
 def is_linear_attention(module: nn.Module) -> bool:
-    """Return True if *module* is a linear attention layer (e.g. GatedDeltaNet)."""
-    return hasattr(module, "in_proj_qkvz") and hasattr(module, "conv1d")
+    """Return True if *module* is a linear attention layer (e.g. GatedDeltaNet).
+
+    Checks for ``conv1d`` (present in all known GatedDeltaNet variants) and
+    the absence of ``q_proj`` (which would indicate SDPA).
+    """
+    return hasattr(module, "conv1d") and not hasattr(module, "q_proj")
 
 
 def linear_attention_forward(
