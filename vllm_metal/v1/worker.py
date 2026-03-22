@@ -187,13 +187,12 @@ class MetalWorker(WorkerBase):
         # max_recommended_working_set_size — the OS-reported Metal headroom —
         # as the budget ceiling instead.
         device_info = mx.device_info()
-        recommended = device_info.get("max_recommended_working_set_size", 0)
-        metal_limit = int(recommended if recommended > 0
-                          else device_info.get("memory_size", 0) * 0.75)
+        metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
         model_memory = self._get_model_memory_usage()
         per_block_bytes = self.get_cache_block_size_bytes()
 
         # --- Compute KV budget ---
+        usable_metal = int(metal_limit * fraction)
         kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
 
         if kv_budget <= 0:
@@ -201,7 +200,7 @@ class MetalWorker(WorkerBase):
                 "Paged attention: not enough Metal memory for KV cache. "
                 f"metal_limit={metal_limit / 1e9:.2f}GB, "
                 f"fraction={fraction}, "
-                f"usable_metal={int(metal_limit * fraction) / 1e9:.2f}GB, "
+                f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
@@ -217,7 +216,7 @@ class MetalWorker(WorkerBase):
                 f"({num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
                 f"metal_limit={metal_limit / 1e9:.2f}GB, "
                 f"fraction={fraction}, "
-                f"usable_metal={int(metal_limit * fraction) / 1e9:.2f}GB, "
+                f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB, "
@@ -236,7 +235,7 @@ class MetalWorker(WorkerBase):
             "num_blocks=%d, max_tokens_cached=%d",
             metal_limit / 1e9,
             fraction,
-            int(metal_limit * fraction) / 1e9,
+            usable_metal / 1e9,
             model_memory / 1e9,
             PAGED_ATTENTION_OVERHEAD_BYTES / 1e9,
             kv_budget / 1e9,
