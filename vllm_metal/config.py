@@ -47,6 +47,13 @@ class MetalConfig:
                 "The MLX path must use VLLM_METAL_MEMORY_FRACTION=auto."
             )
 
+        if self.use_paged_attention and not self.is_auto_memory:
+            if not (0 < self.memory_fraction <= 1):
+                raise ValueError(
+                    f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
+                    "Must be a finite value in (0, 1] when paged attention is enabled."
+                )
+
     @property
     def is_auto_memory(self) -> bool:
         """Check if memory fraction is set to auto mode."""

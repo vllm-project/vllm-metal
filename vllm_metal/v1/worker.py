@@ -188,6 +188,13 @@ class MetalWorker(WorkerBase):
         # as the budget ceiling instead.
         device_info = mx.device_info()
         metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
+        if metal_limit <= 0:
+            raise RuntimeError(
+                "Paged attention: mx.device_info() did not return "
+                "max_recommended_working_set_size. "
+                "Ensure MLX is up to date and running on Apple Silicon. "
+                f"Reported device_info keys: {list(device_info.keys())}"
+            )
         model_memory = self._get_model_memory_usage()
         per_block_bytes = self.get_cache_block_size_bytes()
 

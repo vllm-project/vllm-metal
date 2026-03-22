@@ -136,3 +136,26 @@ class TestMetalConfig:
             os.environ["VLLM_METAL_BLOCK_SIZE"] = value
             with pytest.raises(ValueError, match="Invalid VLLM_METAL_BLOCK_SIZE"):
                 MetalConfig.from_env()
+
+    def test_fraction_above_one_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Invalid VLLM_METAL_MEMORY_FRACTION"):
+            MetalConfig(
+                memory_fraction=1.5,
+                use_mlx=False,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=True,
+            )
+
+    def test_fraction_zero_or_negative_rejected(self) -> None:
+        for fraction in [0.0, -0.1]:
+            with pytest.raises(ValueError, match="Invalid VLLM_METAL_MEMORY_FRACTION"):
+                MetalConfig(
+                    memory_fraction=fraction,
+                    use_mlx=False,
+                    mlx_device="gpu",
+                    block_size=16,
+                    debug=False,
+                    use_paged_attention=True,
+                )
