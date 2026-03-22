@@ -110,39 +110,58 @@ class OffsetCache:
 # ---------------------------------------------------------------------------
 
 
-def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
-    """Find transformer layers and the attention attribute name.
+def find_layers(model: Any) -> list[Any]:
+    """Find transformer layers in an mlx_lm / mlx-vlm model.
 
-    Returns (layer_list, attn_attr_name) where each layer has
-    getattr(layer, attn_attr_name) pointing to the attention module.
-
-    Supports mlx_lm model structures like:
-        model.language_model.model.layers[i].self_attn   (VLMs)
-        model.model.layers[i].self_attn
-        model.layers[i].self_attn
+    Supports model structures like:
+        model.language_model.model.layers   (VLMs)
+        model.model.layers
+        model.layers
     """
     # Unwrap VLM wrapper (e.g. LLaVA, Pixtral via mlx-vlm)
     root = getattr(model, "language_model", model)
     # Try root.model.layers (Qwen3 Model wrapper)
     layers_container = getattr(root, "model", root)
     if hasattr(layers_container, "layers"):
-        layer_list = layers_container.layers
+        return layers_container.layers
     elif hasattr(root, "layers"):
-        layer_list = root.layers
+        return root.layers
     else:
         raise ValueError(
             f"Cannot find transformer layers in model of type {type(model)}"
         )
 
-    # Determine attribute name
+
+# Attribute names to probe on each layer, in priority order.
+_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention")
+
+
+def find_attn_attr(layer: Any) -> str | None:
+    """Return the attention attribute name for a single layer, or None."""
+    for name in _ATTN_ATTR_NAMES:
+        if hasattr(layer, name):
+            return name
+    return None
+
+
+def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
+    """Find transformer layers and the attention attribute name.
+
+    Returns (layer_list, attn_attr_name) where each layer has
+    getattr(layer, attn_attr_name) pointing to the attention module.
+
+    .. deprecated::
+        Use :func:`find_layers` + :func:`find_attn_attr` for hybrid models
+        where different layers may use different attribute names.
+    """
+    layer_list = find_layers(model)
     if layer_list:
-        sample = layer_list[0]
-        if hasattr(sample, "self_attn"):
-            return layer_list, "self_attn"
-        elif hasattr(sample, "attention"):
-            return layer_list, "attention"
-        else:
-            raise ValueError(f"Cannot find attention module in layer {type(sample)}")
+        attr = find_attn_attr(layer_list[0])
+        if attr is not None:
+            return layer_list, attr
+        raise ValueError(
+            f"Cannot find attention module in layer {type(layer_list[0])}"
+        )
     return layer_list, "self_attn"
 
 

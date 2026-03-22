@@ -4,8 +4,9 @@
 The wrapper intercepts mlx_lm attention modules and dispatches to the
 appropriate Metal attention backend based on the module's structure:
 
-- Standard MHA (Qwen3, Llama, Mistral, …) → ``attention_standard.py``
-- Future attention types (MLA, linear, …) → add detection + forward function
+- SDPA (Qwen3, Llama, Mistral, …) → ``attention_sdpa.py``
+- Linear attention (Qwen3.5 GatedDeltaNet, …) → ``attention_linear.py`` (stub)
+- Future attention types (MLA, …) → add detection + forward function
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
@@ -20,16 +21,20 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.metal_kernel_backend.attention_linear import (
+    is_linear_attention,
+    linear_attention_forward,
+)
 from vllm_metal.metal_kernel_backend.attention_sdpa import (
     is_sdpa,
     sdpa_forward,
 )
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_common import (
-    find_layers_and_attr,
+    find_attn_attr,
+    find_layers,
     get_context,
 )
-
 
 # ---------------------------------------------------------------------------
 # Wrapper nn.Module
@@ -68,6 +73,10 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         # Dispatch to the right attention backend
         if is_sdpa(inner):
             return sdpa_forward(inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx)
+        elif is_linear_attention(inner):
+            return linear_attention_forward(
+                inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx
+            )
         else:
             raise NotImplementedError(
                 f"No Metal attention backend for {type(inner).__name__}. "
@@ -89,12 +98,19 @@ def patch_model_attention_metal_kernel(
     """Walk model layers and replace each attention module with a
     ``MetalKernelPagedAttentionWrapper``.
 
+    Supports hybrid models (e.g. Qwen3.5) where different layers use
+    different attribute names (``self_attn``, ``linear_attn``, etc.).
+
     Returns the number of patched layers.
     """
-    layer_list, attn_attr = find_layers_and_attr(model)
+    layer_list = find_layers(model)
     patched = 0
 
     for layer_idx, layer in enumerate(layer_list):
+        attn_attr = find_attn_attr(layer)
+        if attn_attr is None:
+            continue
+
         attn = getattr(layer, attn_attr)
         if isinstance(attn, MetalKernelPagedAttentionWrapper):
             # Already patched — update cache reference
