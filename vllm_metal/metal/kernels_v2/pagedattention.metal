@@ -1456,23 +1456,39 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   instantiate_paged_attention_heads(type, cache_type, 32, num_threads,         \
                                     num_simd_lanes, partition_size);
 
-// TODO: tune num_threads = 256
 // NOTE: partition_size = 0
 #define instantiate_paged_attention_v1(type, cache_type, num_simd_lanes)       \
   instantiate_paged_attention_block_size(type, cache_type, 256,                \
                                          num_simd_lanes, 0);
 
-// TODO: tune num_threads = 256
+// 128-thread variant for small head sizes (head_dim<=96). Fewer threads per
+// threadgroup → lower shared-memory footprint → better GPU occupancy on
+// Apple M-series.
+// NOTE: partition_size = 0
+#define instantiate_paged_attention_v1_nt128(type, cache_type, num_simd_lanes) \
+  instantiate_paged_attention_block_size(type, cache_type, 128,                \
+                                         num_simd_lanes, 0);
+
 // NOTE: partition_size = 512
 #define instantiate_paged_attention_v2(type, cache_type, num_simd_lanes)       \
   instantiate_paged_attention_block_size(type, cache_type, 256,                \
                                          num_simd_lanes, 512);
 
-// TODO: tune num_threads = 256
+// 128-thread variant for small head sizes.
+// NOTE: partition_size = 512
+#define instantiate_paged_attention_v2_nt128(type, cache_type, num_simd_lanes) \
+  instantiate_paged_attention_block_size(type, cache_type, 128,                \
+                                         num_simd_lanes, 512);
+
 // NOTE: partition_size = 512
 #define instantiate_paged_attention_v2_reduce(type, num_simd_lanes)            \
   instantiate_paged_attention_v2_reduce_heads(type, 256, num_simd_lanes, 512);
 
+// 128-thread reduce variant for small head sizes.
+#define instantiate_paged_attention_v2_reduce_nt128(type, num_simd_lanes)      \
+  instantiate_paged_attention_v2_reduce_heads(type, 128, num_simd_lanes, 512);
+
+// 256-thread variants (default — all head sizes)
 instantiate_paged_attention_v1(float, float, 32);
 instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, 32);
 instantiate_paged_attention_v1(half, half, 32);
@@ -1492,3 +1508,25 @@ instantiate_paged_attention_v2(half, half, 32);
 instantiate_paged_attention_v2(float, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, uchar, 32);
 instantiate_paged_attention_v2(half, uchar, 32);
+
+// 128-thread variants for small head sizes (head_dim <= 96)
+// Better GPU occupancy on Apple M-series via lower shared-memory footprint.
+instantiate_paged_attention_v1_nt128(float, float, 32);
+instantiate_paged_attention_v1_nt128(bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_v1_nt128(half, half, 32);
+
+instantiate_paged_attention_v1_nt128(float, uchar, 32);
+instantiate_paged_attention_v1_nt128(bfloat16_t, uchar, 32);
+instantiate_paged_attention_v1_nt128(half, uchar, 32);
+
+instantiate_paged_attention_v2_reduce_nt128(float, 32);
+instantiate_paged_attention_v2_reduce_nt128(bfloat16_t, 32);
+instantiate_paged_attention_v2_reduce_nt128(half, 32);
+
+instantiate_paged_attention_v2_nt128(float, float, 32);
+instantiate_paged_attention_v2_nt128(bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_v2_nt128(half, half, 32);
+
+instantiate_paged_attention_v2_nt128(float, uchar, 32);
+instantiate_paged_attention_v2_nt128(bfloat16_t, uchar, 32);
+instantiate_paged_attention_v2_nt128(half, uchar, 32);

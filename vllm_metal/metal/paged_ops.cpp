@@ -173,13 +173,19 @@ void paged_attention_v1_impl(
   int head_size  = static_cast<int>(query.shape(2));
   int max_blocks = static_cast<int>(block_tables.shape(1));
 
+  // Select thread count: 128 threads for small head sizes (<=96) gives better
+  // GPU occupancy on Apple M-series via lower shared-memory footprint per
+  // threadgroup; 256 threads for larger head sizes.
+  constexpr int NUM_SIMD_LANES = 32;
+  const int NUM_THREADS = (head_size <= 96) ? 128 : 256;
+
   // Kernel name
   auto dt = dtype_to_metal(query.dtype());
   std::string kname =
       "paged_attention_" + dt + "_cache_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps0";
+      "_nt" + std::to_string(NUM_THREADS) + "_nsl32_ps0";
 
   // Function constants
   bool use_partitioning = false;
@@ -196,8 +202,6 @@ void paged_attention_v1_impl(
        {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
 
   // Threadgroup shared memory
-  constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
   int padded_ctx = ((max_seq_len + block_size - 1) / block_size) * block_size;
   int logits_bytes  = padded_ctx * static_cast<int>(sizeof(float));
   int outputs_bytes = (NUM_THREADS / NUM_SIMD_LANES / 2)
@@ -291,13 +295,19 @@ void paged_attention_v2_online_impl(
   int max_blocks = static_cast<int>(block_tables.shape(1));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
+  // Select thread count: 128 threads for small head sizes (<=96) gives better
+  // GPU occupancy on Apple M-series via lower shared-memory footprint per
+  // threadgroup; 256 threads for larger head sizes.
+  constexpr int NUM_SIMD_LANES = 32;
+  const int NUM_THREADS = (head_size <= 96) ? 128 : 256;
+
   // Same kernel name format as v1 — the template instantiation is identical.
   auto dt = dtype_to_metal(query.dtype());
   std::string kname =
       "paged_attention_" + dt + "_cache_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps0";
+      "_nt" + std::to_string(NUM_THREADS) + "_nsl32_ps0";
 
   bool use_partitioning = false;
   bool use_alibi        = false;
@@ -318,9 +328,7 @@ void paged_attention_v2_online_impl(
   // Threadgroup shared memory for online softmax:
   // During KV loop: NUM_WARPS * BLOCK_SIZE floats (per-warp score buffer)
   // During merge: 2*NUM_WARPS floats (m, l) + NUM_WARPS * HEAD_SIZE floats (O)
-  constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
+  const int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
   int warp_scores_bytes = NUM_WARPS * block_size
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
