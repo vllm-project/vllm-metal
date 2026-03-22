@@ -32,7 +32,10 @@ from vllm_metal.stt.config import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:
-    from vllm_metal.v1.model_runner import MetalModelRunner
+    from vllm_metal.v1.model_runner import (
+        MetalModelRunner,
+        SchedulerMemoryReportingMode,
+    )
 
 logger = init_logger(__name__)
 
@@ -327,8 +330,10 @@ class MetalWorker(WorkerBase):
         Returns:
             Available memory in bytes
         """
-        mode = self.model_runner.scheduler_memory_reporting_mode(
-            paged_attention_enabled=self.metal_config.use_paged_attention
+        mode: SchedulerMemoryReportingMode = (
+            self.model_runner.scheduler_memory_reporting_mode(
+                paged_attention_enabled=self.metal_config.use_paged_attention
+            )
         )
 
         if mode == "stt_nominal":

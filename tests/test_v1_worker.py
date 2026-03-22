@@ -25,7 +25,12 @@ class TestWorkerRunnerBoundaryDelegation:
     """Worker should delegate STT capability decisions to model runner."""
 
     @pytest.mark.parametrize(
-        ("use_paged_attention", "runner_allows_setup", "expect_setup", "expect_cap_call"),
+        (
+            "use_paged_attention",
+            "runner_allows_setup",
+            "expect_setup",
+            "expect_cap_call",
+        ),
         [
             (True, True, True, 1),
             (True, False, False, 1),
@@ -64,18 +69,20 @@ class TestWorkerRunnerBoundaryDelegation:
         )
 
     def test_determine_available_memory_paged_capacity_mode(self) -> None:
+        num_blocks = 8
+        block_size_bytes = 16
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_capacity"
             ),
-            _paged_kv_cache=SimpleNamespace(num_blocks=8),
+            _paged_kv_cache=SimpleNamespace(num_blocks=num_blocks),
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
-        worker.get_cache_block_size_bytes = MagicMock(return_value=16)
+        worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
 
         available = MetalWorker.determine_available_memory(worker)
 
-        assert available == 128
+        assert available == num_blocks * block_size_bytes
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
