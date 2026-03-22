@@ -98,3 +98,30 @@ vllm bench serve \
 
 Key metric is **TTFT** — with prefix caching enabled, requests sharing
 the same prefix should show lower TTFT on cache hits.
+
+## GDN Linear Attention Benchmark
+
+Benchmark for GatedDeltaNet (GDN) linear attention kernels used in Qwen3.5's
+linear attention layers. Compares four backends:
+
+- **fused**: vllm-metal fused kernel (gating + recurrence in 1 Metal dispatch)
+- **metal**: mlx_lm Metal kernel (compute_g + sigmoid + kernel)
+- **precomp**: mlx_lm kernel only (gating pre-computed, excluded from timing)
+- **ops**: mlx_lm ops reference (mx.compile'd Python)
+
+```bash
+# Correctness check only
+PYTHONPATH=. python tools/bench_gdn_kernel.py --check
+
+# Full benchmark (all batch sizes, seq lens, head configs)
+PYTHONPATH=. python tools/bench_gdn_kernel.py
+
+# Decode-only (T=1) with batch scaling
+PYTHONPATH=. python tools/bench_gdn_kernel.py --seq-lens 1 --batch 1 4 8 16 32
+
+# Qwen3.5-4B config (Hv=32)
+PYTHONPATH=. python tools/bench_gdn_kernel.py --hv 32
+
+# Qwen3.5-27B config (Hv=48)
+PYTHONPATH=. python tools/bench_gdn_kernel.py --hv 48
+```
