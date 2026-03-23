@@ -51,26 +51,28 @@ PROMPTS = [
 
 # fmt: off
 # Golden token IDs from MLX inline cache (default path), greedy decoding.
-# Generated on main branch via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
+# Generated via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
+# Environment: mlx 0.31.1, mlx-lm 0.31.1
 GOLDEN_MLX = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
     "One plus one equals":                        [825, 11, 825, 5519, 825, 16819, 1378, 13, 2055, 11],
     "The largest planet in our solar system is":  [1112, 30, 362, 13, 43562, 425, 13, 48976, 356, 13],
     "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 13, 3555, 374, 279, 9315],
-    "Machine learning is":                         [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
+    "Machine learning is":                        [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 
-# Golden token IDs from paged KV cache (HF kernel on main branch), greedy decoding.
-# Generated on main branch via: VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.3 \
-#                                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
+# Golden token IDs from paged KV cache (Metal kernel), greedy decoding.
+# Generated via: VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.2 \
+#                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
+# Environment: mlx 0.31.1, mlx-lm 0.31.1
 GOLDEN_PAGED = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
     "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
-    "One plus one equals":                        [825, 11, 825, 5519, 825, 16819, 1378, 13, 2055, 11],
+    "One plus one equals":                        [825, 13, 3776, 5519, 825, 16819, 1378, 13, 3776, 5519],
     "The largest planet in our solar system is":  [1112, 30, 362, 13, 43562, 425, 13, 48976, 356, 13],
-    "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 13, 3555, 374, 279, 9315],
-    "Machine learning is":                         [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
+    "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 518, 5297, 44375, 7262, 13],
+    "Machine learning is":                        [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 # fmt: on
 
