@@ -54,6 +54,9 @@ class MHAPagedAttentionBackend:
         return patch_model_attention_metal_kernel(model, self._cache, self._block_size)
 
     def warm_up(self) -> None:
+        if self._cache is None:
+            raise RuntimeError("warm_up() called before initialize()")
+
         from vllm_metal.metal import get_ops
 
         cache = self._cache
