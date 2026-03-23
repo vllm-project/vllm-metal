@@ -60,6 +60,7 @@ from vllm_metal.stt.config import (
 )
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
+from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
@@ -659,7 +660,7 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
+        self._paged_attention_backend: PagedAttentionBackend | None = None
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
@@ -687,7 +688,7 @@ class MetalModelRunner:
         """
         if self._is_stt:
             return "stt_nominal"
-        if paged_attention_enabled and self._paged_kv_cache is not None:
+        if paged_attention_enabled and self._paged_attention_backend is not None:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
@@ -1019,63 +1020,8 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-        # Paged attention kernel warm-up: load kernel + smoke-test Metal ops
-        if hasattr(self, "_paged_kv_cache") and self._paged_kv_cache is not None:
-            self._warm_up_paged_attention_kernel()
-
-    def _warm_up_paged_attention_kernel(self) -> None:
-        """JIT-compile vendored Metal shaders and verify ops work.
-
-        Calls ``get_ops()`` which triggers JIT build of the C++ nanobind
-        extension + Metal shader compilation via MLX's device.get_library().
-        Then runs a single-token ``reshape_and_cache`` smoke test against
-        layer 0 of the already-allocated cache.
-        """
-        import platform
-
-        from vllm_metal.metal import get_ops
-
-        cache = self._paged_kv_cache
-
-        logger.info("Warming up paged attention Metal kernel...")
-
-        try:
-            ops = get_ops()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to build/load native paged-attention Metal kernel: {e}. "
-                f"macOS version: {platform.mac_ver()[0]}"
-            ) from e
-
-        # Smoke-test: single-token reshape_and_cache on layer 0
-        try:
-            dummy_k = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_v = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_slot = mx.zeros((1,), dtype=mx.int64)
-            mx.eval(dummy_k, dummy_v, dummy_slot)
-
-            ops.reshape_and_cache(
-                dummy_k,
-                dummy_v,
-                cache.key_caches[0],
-                cache.value_caches[0],
-                dummy_slot,
-            )
-            mx.eval(cache.key_caches[0])
-            logger.info("Paged attention Metal kernel warm-up complete")
-        except RuntimeError as e:
-            mac_ver = platform.mac_ver()[0]
-            if "language version" in str(e):
-                raise RuntimeError(
-                    f"Metal kernel incompatible with this OS (macOS {mac_ver}). "
-                    f"The kernel requires a newer Metal language version than "
-                    f"this OS supports. Original error: {e}"
-                ) from e
-            raise
+        if self._paged_attention_backend is not None:
+            self._paged_attention_backend.warm_up()
 
     def _make_sampling_metadata(
         self,
@@ -1716,7 +1662,7 @@ class MetalModelRunner:
 
             generator = _create_request_generator(self.device, sampling_params)
 
-            if self._paged_kv_cache is not None:
+            if self._paged_attention_backend is not None:
                 sched_block_ids = list(new_req.block_ids[0])
                 scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
                 computed_tokens = new_req.num_computed_tokens
@@ -1782,7 +1728,7 @@ class MetalModelRunner:
         decode_req_ids = list(cached_reqs.req_ids)
 
         if decode_req_ids:
-            if self._paged_kv_cache is not None:
+            if self._paged_attention_backend is not None:
                 req_id_to_cached_idx = {
                     rid: i for i, rid in enumerate(cached_reqs.req_ids)
                 }
