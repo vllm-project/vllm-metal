@@ -48,6 +48,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
@@ -60,7 +61,6 @@ from vllm_metal.stt.config import (
 )
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
-from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
@@ -908,7 +908,7 @@ class MetalModelRunner:
         # layer, not per-head K/V. One virtual head sized kv_lora_rank +
         # qk_rope_head_dim keeps get_cache_block_size_bytes() correct without
         # MLA-specific logic in the sizing path.
-        if "kv_lora_rank" in args:
+        if self.is_mla:
             self.num_kv_heads = 1
             self.head_dim = int(args["kv_lora_rank"]) + int(args.get("qk_rope_head_dim", 64))
 

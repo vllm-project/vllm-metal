@@ -57,13 +57,14 @@ class MHAPagedAttentionBackend:
         from vllm_metal.metal import get_ops
 
         cache = self._cache
+        macos_version = platform.mac_ver()[0]
         logger.info("Warming up paged attention Metal kernel...")
 
         try:
             ops = get_ops()
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load Metal kernel: {e}. macOS {platform.mac_ver()[0]}"
+                f"Failed to load Metal kernel: {e}. macOS {macos_version}"
             ) from e
 
         try:
@@ -79,9 +80,11 @@ class MHAPagedAttentionBackend:
         except RuntimeError as e:
             if "language version" in str(e):
                 raise RuntimeError(
-                    f"Metal kernel incompatible with macOS {platform.mac_ver()[0]}: {e}"
+                    f"Metal kernel incompatible with macOS {macos_version}: {e}"
                 ) from e
             raise
 
     def num_blocks(self) -> int:
+        if self._cache is None:
+            raise RuntimeError("num_blocks() called before initialize()")
         return self._cache.num_blocks
