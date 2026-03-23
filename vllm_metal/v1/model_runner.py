@@ -17,7 +17,7 @@ import time
 from array import array
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
 import torch
@@ -484,6 +484,19 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
+
+
+class PrefillRequest(NamedTuple):
+    """Packed prefill request passed to ``_unified_prefill_decode_paged``."""
+
+    req_id: str
+    token_ids: list[int]  # suffix slice forwarded through the model
+    sampling_params: SamplingParams
+    block_ids: list[int]
+    generator: torch.Generator | None
+    prompt_len: int | None  # full prompt length (None for intermediate chunks)
+    start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
+    full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
 
 
 def _merge_kv_caches(
@@ -1462,17 +1475,7 @@ class MetalModelRunner:
 
     def _unified_prefill_decode_paged(
         self,
-        prefill_reqs: list[
-            tuple[
-                str,
-                list[int],
-                SamplingParams,
-                list[int],
-                torch.Generator | None,
-                int | None,
-                int,
-            ]
-        ],
+        prefill_reqs: list[PrefillRequest],
         decode_reqs: list[tuple[str, RequestState]],
     ) -> tuple[list[int], list[int]]:
         """Single forward pass for mixed prefill + decode requests.
@@ -1480,14 +1483,6 @@ class MetalModelRunner:
         Packs decode tokens (1 per request) followed by prefill tokens into
         a flat ``(1, total_tokens)`` input.  The varlen kernel uses
         ``cu_seqlens`` to handle variable-length subsequences.
-
-        Args:
-            prefill_reqs: list of
-                ``(req_id, token_ids, sampling_params, block_ids,
-                generator, prompt_len, start_pos)`` — prefill requests.
-                ``start_pos`` is the RoPE offset / KV slot start (0 for
-                fresh prefill, >0 for continuation chunks).
-            decode_reqs: list of ``(req_id, RequestState)`` — decode requests.
 
         Returns:
             ``(prefill_next_tokens, decode_next_tokens)``
@@ -1510,8 +1505,8 @@ class MetalModelRunner:
         all_token_ids.extend(last_tokens)
 
         # Prefill: tokens per request
-        for _, token_ids, _, _, _, _, _ in prefill_reqs:
-            all_token_ids.extend(token_ids)
+        for pr in prefill_reqs:
+            all_token_ids.extend(pr.token_ids)
 
         # ---- build metadata for prepare_unified ----
         decode_info: list[tuple[list[int], int]] = []
@@ -1520,8 +1515,8 @@ class MetalModelRunner:
             decode_info.append((state.block_ids, seq_len))
 
         prefill_info: list[tuple[list[int], int, int]] = []
-        for _, token_ids, _, block_ids, _, _, start_pos in prefill_reqs:
-            prefill_info.append((block_ids, len(token_ids), start_pos))
+        for pr in prefill_reqs:
+            prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
 
@@ -1538,8 +1533,8 @@ class MetalModelRunner:
         cu_seqlens: list[int] = [0]
         for _ in decode_reqs:
             cu_seqlens.append(cu_seqlens[-1] + 1)
-        for _, token_ids, _, _, _, _, _ in prefill_reqs:
-            cu_seqlens.append(cu_seqlens[-1] + len(token_ids))
+        for pr in prefill_reqs:
+            cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
 
         # ---- sample decode tokens ----
         decode_next_tokens: list[int] = []
@@ -1603,28 +1598,24 @@ class MetalModelRunner:
 
         # ---- sample prefill tokens ----
         prefill_next_tokens: list[int] = []
-        for j, (
-            req_id,
-            token_ids,
-            sampling_params,
-            _block_ids,
-            generator,
-            prompt_len,
-            _start_pos,
-        ) in enumerate(prefill_reqs):
+        for j, pr in enumerate(prefill_reqs):
             last_idx = cu_seqlens[num_decode + j + 1] - 1
             last_logits = logits[:, last_idx : last_idx + 1, :]
 
-            if prompt_len is None:
-                prompt_len = len(token_ids)
+            if pr.full_prompt_token_ids is not None:
+                prompt_len = len(pr.full_prompt_token_ids)
+            elif pr.prompt_len is not None:
+                prompt_len = pr.prompt_len
+            else:
+                prompt_len = len(pr.token_ids)
 
-            is_greedy = sampling_params.temperature < 1e-5
+            is_greedy = pr.sampling_params.temperature < 1e-5
             needs_advanced = (
-                sampling_params.top_k > 0
-                or sampling_params.top_p < 1.0
-                or sampling_params.frequency_penalty != 0
-                or sampling_params.presence_penalty != 0
-                or sampling_params.repetition_penalty != 1.0
+                pr.sampling_params.top_k > 0
+                or pr.sampling_params.top_p < 1.0
+                or pr.sampling_params.frequency_penalty != 0
+                or pr.sampling_params.presence_penalty != 0
+                or pr.sampling_params.repetition_penalty != 1.0
             )
 
             if is_greedy and not needs_advanced:
@@ -1636,17 +1627,24 @@ class MetalModelRunner:
                 logits_torch = mlx_to_torch(
                     last_logits[0].astype(mx.float32), device=self.device
                 )
-                generators = {} if generator is None else {0: generator}
+                generators = {} if pr.generator is None else {0: pr.generator}
+                # Use full prompt for penalty computation when available
+                # (prefix cache hit supplies suffix-only token_ids).
+                prompt_for_meta = (
+                    pr.full_prompt_token_ids
+                    if pr.full_prompt_token_ids is not None
+                    else pr.token_ids
+                )
                 metadata = self._make_sampling_metadata(
-                    [sampling_params],
-                    [token_ids[:prompt_len]],
-                    [token_ids[prompt_len:]],
+                    [pr.sampling_params],
+                    [prompt_for_meta[:prompt_len]],
+                    [prompt_for_meta[prompt_len:]],
                     generators=generators,
                 )
                 output = self._sampler.forward(logits_torch, metadata)
                 next_token = int(output.sampled_token_ids[0, 0].item())
 
-            self._paged_request_seq_lens[req_id] = len(token_ids)
+            self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(pr.token_ids)
             prefill_next_tokens.append(next_token)
 
         return prefill_next_tokens, decode_next_tokens
@@ -1678,6 +1676,7 @@ class MetalModelRunner:
 
         # === Collect all requests into one unified batch ===
         new_reqs = scheduler_output.scheduled_new_reqs
+        new_reqs_by_id = {r.req_id: r for r in new_reqs}
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
         # Paged-attention entries collected for the single unified forward.
@@ -1879,18 +1878,41 @@ class MetalModelRunner:
 
         # === Single unified forward pass (paged path) ===
         if paged_prefill_entries or paged_decode_reqs:
-            prefill_pack = [
-                (
-                    rid,
-                    tids,
-                    sp,
-                    bids,
-                    gen,
-                    prompt_len if not is_intermediate else None,
-                    start_pos,
+            prefill_pack: list[PrefillRequest] = []
+            for (
+                _,
+                rid,
+                tids,
+                sp,
+                bids,
+                gen,
+                _is_new,
+                is_intermediate,
+                prompt_len,
+                start_pos,
+            ) in paged_prefill_entries:
+                # Full prompt for sampling metadata (needed when token_ids
+                # is a suffix slice due to prefix cache hit).
+                state = self._request_states.get(rid)
+                full_prompt = (
+                    list(state.token_ids[: state.prompt_len])
+                    if start_pos > 0 and state is not None
+                    else list(new_reqs_by_id[rid].prompt_token_ids)
+                    if start_pos > 0
+                    else None
                 )
-                for _, rid, tids, sp, bids, gen, _is_new, is_intermediate, prompt_len, start_pos in paged_prefill_entries
-            ]
+                prefill_pack.append(
+                    PrefillRequest(
+                        req_id=rid,
+                        token_ids=tids,
+                        sampling_params=sp,
+                        block_ids=bids,
+                        generator=gen,
+                        prompt_len=prompt_len if not is_intermediate else None,
+                        start_pos=start_pos,
+                        full_prompt_token_ids=full_prompt,
+                    )
+                )
             prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
                 prefill_pack, paged_decode_reqs
             )
@@ -1914,14 +1936,16 @@ class MetalModelRunner:
                     # KV cache populated; discard sampled token
                     sampled_tokens[idx] = []
                 elif is_new:
-                    assert _start_pos == 0, (
-                        "new complete prefill with start_pos > 0 not supported "
-                        "(prefix caching not yet implemented in unified path)"
-                    )
                     sampled_tokens[idx] = [nt]
+                    # When prefix cache hits (start_pos > 0), tids is only
+                    # the suffix slice.  State needs the full prompt.
+                    if _start_pos > 0:
+                        full_prompt = list(new_reqs_by_id[rid].prompt_token_ids)
+                    else:
+                        full_prompt = list(tids)
                     self._request_states[rid] = RequestState(
-                        token_ids=list(tids) + [nt],
-                        prompt_len=len(tids),
+                        token_ids=full_prompt + [nt],
+                        prompt_len=_prompt_len,
                         cache=[],
                         sampling_params=sp,
                         generator=gen,
@@ -1929,7 +1953,7 @@ class MetalModelRunner:
                         block_ids=bids,
                     )
                     if self._rust_state_manager is not None:
-                        self._rust_state_manager.add_request(rid, list(tids) + [nt])
+                        self._rust_state_manager.add_request(rid, full_prompt + [nt])
                 else:
                     # Cached last chunk — append token to existing state
                     sampled_tokens[idx] = [nt]
@@ -1949,7 +1973,6 @@ class MetalModelRunner:
         # req_ids, and decode-phase scheduled requests should not emit empty
         # token lists. Missing/empty outputs here can leave placeholders stale.
         if scheduler_output.total_num_scheduled_tokens > 0:
-            new_reqs_by_id = {r.req_id: r for r in new_reqs}
             missing_req_ids: list[str] = []
             unexpected_empty_req_ids: list[str] = []
             for req_id in scheduler_output.num_scheduled_tokens:
