@@ -75,7 +75,7 @@ class TestWorkerRunnerBoundaryDelegation:
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_capacity"
             ),
-            _paged_kv_cache=SimpleNamespace(num_blocks=num_blocks),
+            _paged_attention_backend=SimpleNamespace(num_blocks=lambda: num_blocks),
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)

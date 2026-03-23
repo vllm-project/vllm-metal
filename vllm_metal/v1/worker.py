@@ -169,10 +169,7 @@ class MetalWorker(WorkerBase):
         a configurable memory fraction, rather than blindly scaling from
         max_model_len.
         """
-        from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            patch_model_attention_metal_kernel,
-        )
+        from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 
         runner = self.model_runner
         block_size = self.metal_config.block_size
@@ -263,18 +260,15 @@ class MetalWorker(WorkerBase):
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
-        metal_kv_cache = MetalPagedKVCache(
+        backend = MHAPagedAttentionBackend(
             num_layers=runner.num_layers,
             num_kv_heads=runner.num_kv_heads,
             head_dim=runner.head_dim,
-            num_blocks=num_blocks,
             block_size=block_size,
             dtype=runner.kv_cache_dtype,
         )
-
-        n_patched = patch_model_attention_metal_kernel(
-            runner.model, metal_kv_cache, block_size
-        )
+        backend.initialize(num_blocks)
+        n_patched = backend.patch_model(runner.model)
         logger.info(
             "Metal kernel paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
@@ -285,8 +279,7 @@ class MetalWorker(WorkerBase):
             runner.head_dim,
         )
 
-        # Store on model runner for use by paged prefill/decode
-        runner._paged_kv_cache = metal_kv_cache
+        runner._paged_attention_backend = backend
         runner._paged_block_size = block_size
 
     def _get_model_memory_usage(self) -> int:
@@ -354,13 +347,13 @@ class MetalWorker(WorkerBase):
 
         if mode == "paged_attention_capacity":
             # Runner only reports this mode when paged cache is initialized.
-            paged_cache = self.model_runner._paged_kv_cache
+            backend = self.model_runner._paged_attention_backend
             block_size_bytes = self.get_cache_block_size_bytes()
-            available = paged_cache.num_blocks * block_size_bytes
+            available = backend.num_blocks() * block_size_bytes
             logger.info(
                 "Paged attention: reporting MPS cache capacity "
                 "(%d blocks × %d bytes = %.2f GB)",
-                paged_cache.num_blocks,
+                backend.num_blocks(),
                 block_size_bytes,
                 available / 1e9,
             )
