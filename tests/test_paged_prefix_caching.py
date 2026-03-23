@@ -203,6 +203,67 @@ class TestPagedPrefixCacheHit:
             runner.execute_model(sched_out)
 
 
+class TestSamplingMetadataWithPenalties:
+    """Verify advanced sampling uses full prompt on prefix cache hits."""
+
+    def test_sampling_metadata_uses_full_prompt_with_penalties(self):
+        """When repetition_penalty is set, _make_sampling_metadata must
+        receive the full prompt, not just the suffix slice."""
+        runner = _make_paged_runner()
+        prompt = [10, 20, 30, 40, 50, 60, 70, 80]
+        num_computed = 4
+
+        vocab = 100
+        suffix_len = len(prompt) - num_computed
+        logits = mx.zeros((1, suffix_len, vocab))
+        runner.model.return_value = MagicMock(logits=logits)
+
+        # Use repetition_penalty to force the advanced sampling path
+        sp = SamplingParams(temperature=0.8, repetition_penalty=1.2)
+
+        captured_metadata: list = []
+
+        def spy_make(self_, *args, **kwargs):
+            captured_metadata.append(args)
+            return MagicMock()
+
+        fake_sampler_output = MagicMock()
+        fake_sampler_output.sampled_token_ids = torch.tensor([[99]])
+
+        with (
+            patch.object(
+                mr.MetalModelRunner,
+                "_extract_logits",
+                return_value=logits,
+            ),
+            patch.object(
+                mr.MetalModelRunner,
+                "_make_sampling_metadata",
+                spy_make,
+            ),
+            patch(
+                "vllm_metal.paged_attention_common.prepare_unified",
+            ),
+            patch(
+                "vllm_metal.paged_attention_common.clear_context",
+            ),
+        ):
+            runner._sampler = MagicMock()
+            runner._sampler.forward.return_value = fake_sampler_output
+
+            new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
+            new_req.sampling_params = sp
+            sched_out = _make_scheduler_output([new_req])
+            runner.execute_model(sched_out)
+
+        # _make_sampling_metadata should have been called with the full
+        # prompt as prompt_token_ids, not just the suffix.
+        assert len(captured_metadata) >= 1
+        # args[1] is prompt_token_ids_list
+        prompt_token_ids_passed = captured_metadata[-1][1][0]
+        assert prompt_token_ids_passed == prompt
+
+
 def _make_cached_scheduler_output(
     req_ids: list[str],
     num_computed_tokens: list[int],
