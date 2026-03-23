@@ -894,6 +894,15 @@ class MetalModelRunner:
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
 
+        # MLA (GLM/DeepSeek lineage): cache stores a joint latent vector per
+        # layer, not per-head K/V. One virtual head sized kv_lora_rank +
+        # qk_rope_head_dim keeps get_cache_block_size_bytes() correct without
+        # MLA-specific logic in the sizing path.
+        if "kv_lora_rank" in args:
+            self.num_kv_heads = 1
+            self.head_dim = int(args["kv_lora_rank"]) + int(args.get("qk_rope_head_dim", 64))
+
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
