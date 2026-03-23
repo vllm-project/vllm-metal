@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 import platform
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 from vllm.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
+
 logger = init_logger(__name__)
+
+# Substring present in Metal shader compilation errors when the OS's Metal
+# language version is too old for the kernel. Matched against str(e) because
+# the C++/nanobind layer does not raise a typed exception for this case.
+_METAL_LANGUAGE_VERSION_ERROR = "language version"
 
 
 class MHAPagedAttentionBackend:
@@ -32,7 +40,11 @@ class MHAPagedAttentionBackend:
         self._head_dim = head_dim
         self._block_size = block_size
         self._dtype = dtype
-        self._cache: Any = None
+        self._cache: MetalPagedKVCache | None = None
+
+    def _require_initialized(self, caller: str) -> None:
+        if self._cache is None:
+            raise RuntimeError(f"{caller}() called before initialize()")
 
     def initialize(self, num_blocks: int) -> None:
         from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
@@ -47,8 +59,7 @@ class MHAPagedAttentionBackend:
         )
 
     def patch_model(self, model: Any) -> int:
-        if self._cache is None:
-            raise RuntimeError("patch_model() called before initialize()")
+        self._require_initialized("patch_model")
 
         from vllm_metal.metal_kernel_backend.paged_attention import (
             patch_model_attention_metal_kernel,
@@ -57,8 +68,7 @@ class MHAPagedAttentionBackend:
         return patch_model_attention_metal_kernel(model, self._cache, self._block_size)
 
     def warm_up(self) -> None:
-        if self._cache is None:
-            raise RuntimeError("warm_up() called before initialize()")
+        self._require_initialized("warm_up")
 
         from vllm_metal.metal import get_ops
 
@@ -84,13 +94,12 @@ class MHAPagedAttentionBackend:
             mx.eval(cache.key_caches[0])
             logger.info("Paged attention Metal kernel warm-up complete")
         except RuntimeError as e:
-            if "language version" in str(e):
+            if _METAL_LANGUAGE_VERSION_ERROR in str(e):
                 raise RuntimeError(
                     f"Metal kernel incompatible with macOS {macos_version}: {e}"
                 ) from e
             raise
 
     def num_blocks(self) -> int:
-        if self._cache is None:
-            raise RuntimeError("num_blocks() called before initialize()")
-        return self._cache.num_blocks
+        self._require_initialized("num_blocks")
+        return self._cache.num_blocks  # type: ignore[union-attr]
