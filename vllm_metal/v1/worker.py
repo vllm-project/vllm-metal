@@ -163,7 +163,7 @@ class MetalWorker(WorkerBase):
         return int(metal_limit * fraction) - model_memory - overhead
 
     def _setup_paged_attention(self) -> None:
-        """Create MetalPagedKVCache and patch model attention for native Metal kernel.
+        """Allocate paged KV cache and patch model attention layers.
 
         Computes num_blocks from Metal memory headroom, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
@@ -348,12 +348,13 @@ class MetalWorker(WorkerBase):
         if mode == "paged_attention_capacity":
             # Runner only reports this mode when paged cache is initialized.
             backend = self.model_runner._paged_attention_backend
+            num_blocks = backend.num_blocks()
             block_size_bytes = self.get_cache_block_size_bytes()
-            available = backend.num_blocks() * block_size_bytes
+            available = num_blocks * block_size_bytes
             logger.info(
                 "Paged attention: reporting MPS cache capacity "
                 "(%d blocks × %d bytes = %.2f GB)",
-                backend.num_blocks(),
+                num_blocks,
                 block_size_bytes,
                 available / 1e9,
             )

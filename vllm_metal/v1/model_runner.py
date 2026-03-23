@@ -83,6 +83,10 @@ except ImportError:
 _MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
 _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
+# MLA default rope head dim (GLM/DeepSeek lineage; used when qk_rope_head_dim
+# is absent from model config).
+_MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
 
@@ -674,9 +678,9 @@ class MetalModelRunner:
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).
 
-        MLA models (GLM/DeepSeek lineage) cannot use the standard Metal kernel
-        because they have no q_proj/k_proj/v_proj. Worker uses this to select
-        MLAPagedAttentionBackend instead of MHAPagedAttentionBackend.
+        MLA models (GLM/DeepSeek lineage) have no q_proj/k_proj/v_proj and
+        cannot use the standard Metal kernel. Worker uses this to select the
+        appropriate paged attention backend for PR2.
         """
         return "kv_lora_rank" in self.model_args
 
@@ -910,8 +914,9 @@ class MetalModelRunner:
         # MLA-specific logic in the sizing path.
         if self.is_mla:
             self.num_kv_heads = 1
-            self.head_dim = int(args["kv_lora_rank"]) + int(args.get("qk_rope_head_dim", 64))
-
+            self.head_dim = int(args["kv_lora_rank"]) + int(
+                args.get("qk_rope_head_dim", _MLA_DEFAULT_QK_ROPE_HEAD_DIM)
+            )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.

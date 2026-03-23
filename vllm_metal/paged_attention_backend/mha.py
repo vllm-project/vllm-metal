@@ -47,6 +47,9 @@ class MHAPagedAttentionBackend:
         )
 
     def patch_model(self, model: Any) -> int:
+        if self._cache is None:
+            raise RuntimeError("patch_model() called before initialize()")
+
         from vllm_metal.metal_kernel_backend.paged_attention import (
             patch_model_attention_metal_kernel,
         )
