@@ -5,7 +5,6 @@ Optimized for performance with:
 - True batched decode using BatchKVCache for O(1) forward passes per batch
 - Async evaluation pipeline for pipelined computation
 - Pre-allocated input buffers to reduce allocation overhead
-- Rust-based token state management for efficient batch operations
 - Global model cache for fast repeated loads
 - Content hash prefix caching for shared prompt reuse
 """
@@ -68,15 +67,6 @@ logger = init_logger(__name__)
 _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
 _model_cache_lock = Lock()
 
-
-# Try to import Rust extension for high-performance token state management
-try:
-    from vllm_metal._rs import RequestStateManager as RustRequestStateManager
-
-    _RUST_AVAILABLE = True
-except ImportError:
-    _RUST_AVAILABLE = False
-    logger.debug("Rust extension not available, using Python fallback")
 
 # Configuration for batched operations
 _MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
@@ -634,11 +624,6 @@ class MetalModelRunner:
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
-
-        # Rust-based token state manager (optional, for batch operations)
-        self._rust_state_manager: Any = None
-        if _RUST_AVAILABLE:
-            self._rust_state_manager = RustRequestStateManager()
 
         # Pre-allocated buffer for decode input tokens
         self._max_batch_size = _MAX_BATCH_SIZE
@@ -1317,16 +1302,10 @@ class MetalModelRunner:
         """
         batch_size = len(decode_reqs)
 
-        # Use Rust extension for efficient batch token retrieval if available
-        if self._rust_state_manager is not None:
-            last_tokens = self._rust_state_manager.get_last_tokens_batch(
-                [req_id for req_id, _ in decode_reqs]
-            )
-        else:
-            last_tokens = [
-                state.token_ids[-1] if state.token_ids else 0
-                for _, state in decode_reqs
-            ]
+        last_tokens = [
+            state.token_ids[-1] if state.token_ids else 0
+            for _, state in decode_reqs
+        ]
 
         # Collect individual caches for merging
         caches_list = [state.cache for _, state in decode_reqs]
@@ -1396,10 +1375,6 @@ class MetalModelRunner:
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
 
-            # Update Rust state manager if available
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_tokens[i])
-
         return next_tokens
 
     def _sequential_decode(
@@ -1463,10 +1438,6 @@ class MetalModelRunner:
             state.token_ids.append(next_token)
             state.generated_tokens += 1
 
-            # Update Rust state manager if available
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_token)
-
         return next_tokens
 
     # ------------------------------------------------------------------
@@ -1493,15 +1464,10 @@ class MetalModelRunner:
         all_token_ids: list[int] = []
 
         # Decode: last token per request
-        if self._rust_state_manager is not None:
-            last_tokens = self._rust_state_manager.get_last_tokens_batch(
-                [rid for rid, _ in decode_reqs]
-            )
-        else:
-            last_tokens = [
-                state.token_ids[-1] if state.token_ids else 0
-                for _, state in decode_reqs
-            ]
+        last_tokens = [
+            state.token_ids[-1] if state.token_ids else 0
+            for _, state in decode_reqs
+        ]
         all_token_ids.extend(last_tokens)
 
         # Prefill: tokens per request
@@ -1593,8 +1559,6 @@ class MetalModelRunner:
                     self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2)
                     + 1
                 )
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.append_token(req_id, decode_next_tokens[i])
 
         # ---- sample prefill tokens ----
         prefill_next_tokens: list[int] = []
@@ -1751,10 +1715,6 @@ class MetalModelRunner:
                         generated_tokens=0,
                         block_ids=sched_block_ids,
                     )
-                    if self._rust_state_manager is not None:
-                        self._rust_state_manager.add_request(
-                            req_id, list(token_ids[:cur_len])
-                        )
             else:
                 next_token, cache = self._prefill_single(
                     req_id,
@@ -1772,10 +1732,6 @@ class MetalModelRunner:
                     generated_tokens=1,
                     block_ids=[],
                 )
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.add_request(
-                        req_id, list(token_ids) + [next_token]
-                    )
 
         # --- Cached requests ---
         decode_req_ids = list(cached_reqs.req_ids)
@@ -1802,11 +1758,6 @@ class MetalModelRunner:
                         state.block_ids = list(new_block_ids[0])
                         state.generated_tokens = 0
                         self._paged_request_seq_lens.pop(req_id, None)
-                        if self._rust_state_manager is not None:
-                            self._rust_state_manager.remove_request(req_id)
-                            self._rust_state_manager.add_request(
-                                req_id, list(state.token_ids)
-                            )
 
                 # Categorise each cached request
                 for req_id in decode_req_ids:
@@ -1952,16 +1903,12 @@ class MetalModelRunner:
                         generated_tokens=1,
                         block_ids=bids,
                     )
-                    if self._rust_state_manager is not None:
-                        self._rust_state_manager.add_request(rid, full_prompt + [nt])
                 else:
                     # Cached last chunk — append token to existing state
                     sampled_tokens[idx] = [nt]
                     state = self._request_states[rid]
                     state.token_ids.append(nt)
                     state.generated_tokens = len(state.token_ids) - state.prompt_len
-                    if self._rust_state_manager is not None:
-                        self._rust_state_manager.append_token(rid, nt)
 
             # Post-process decode results
             for i, (req_id, _) in enumerate(paged_decode_reqs):
@@ -2029,10 +1976,6 @@ class MetalModelRunner:
                 # Clean up paged attention tracking state.
                 # Block freeing is handled by the scheduler's kv_cache_manager.
                 self._paged_request_seq_lens.pop(req_id, None)
-
-                # Remove from Rust state manager if available
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.remove_request(req_id)
 
             # Lazy cache clearing - only clear periodically to avoid sync overhead
             self._finished_request_count += len(scheduler_output.finished_req_ids)

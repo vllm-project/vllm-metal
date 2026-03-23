@@ -271,7 +271,6 @@ class TestV1SeededSamplingGenerator:
         runner.device = torch.device("cpu")
         runner.model_args = {"vocab_size": vocab_size}
         runner._sampler = Sampler()
-        runner._rust_state_manager = None
         runner.model = uniform_logits_model(vocab_size)
 
         sp = SamplingParams(temperature=1.0, seed=123)
@@ -353,7 +352,6 @@ class TestV1PenaltyTokenAccounting:
         runner.device = torch.device("cpu")
         runner.model_args = {"vocab_size": vocab_size}
         runner._sampler = Sampler()
-        runner._rust_state_manager = None
         return runner
 
     def test_presence_penalty_does_not_apply_to_prompt_tokens(self) -> None:
