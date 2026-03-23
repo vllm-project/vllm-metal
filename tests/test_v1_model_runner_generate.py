@@ -144,3 +144,12 @@ class TestResolveModelDims:
         r = self._runner({"num_hidden_layers": 32})
         with pytest.raises(ValueError, match="Cannot resolve model dimensions"):
             r._resolve_model_dims()
+
+    def test_is_mla_true_when_kv_lora_rank_present(self) -> None:
+        r = self._runner({"kv_lora_rank": 512})
+        assert r.is_mla is True
+
+    def test_is_mla_false_for_standard_mha(self) -> None:
+        r = self._runner({"num_hidden_layers": 32, "num_attention_heads": 32,
+                          "hidden_size": 4096})
+        assert r.is_mla is False

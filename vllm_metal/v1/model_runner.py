@@ -670,6 +670,16 @@ class MetalModelRunner:
         """Whether the loaded model is a Speech-to-Text model."""
         return self._is_stt
 
+    @property
+    def is_mla(self) -> bool:
+        """Whether the model uses Multi-head Latent Attention (MLA).
+
+        MLA models (GLM/DeepSeek lineage) cannot use the standard Metal kernel
+        because they have no q_proj/k_proj/v_proj. Worker uses this to select
+        MLAPagedAttentionBackend instead of MHAPagedAttentionBackend.
+        """
+        return "kv_lora_rank" in self.model_args
+
     def should_setup_paged_attention(self) -> bool:
         """Whether worker-side paged-attention setup should run.
 
