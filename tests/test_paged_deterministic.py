@@ -128,7 +128,9 @@ def vllm_outputs():
     # Verify paged KV path is active when requested
     if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1":
         runner = llm.llm_engine.model_executor.driver_worker.model_runner
-        assert runner._paged_attention_backend is not None, "Paged attention backend not initialised"
+        assert runner._paged_attention_backend is not None, (
+            "Paged attention backend not initialised"
+        )
         from vllm_metal.metal_kernel_backend.paged_attention import (
             MetalKernelPagedAttentionWrapper,
         )
