@@ -61,6 +61,7 @@ from vllm_metal.stt.config import (
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.cache_utils import supports_batched_decode
 
 logger = init_logger(__name__)
 
@@ -664,6 +665,10 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
+        # Whether the model supports batched decode via BatchKVCache.
+        # Determined in load_model() by probing cache layer types.
+        self._supports_batched_decode: bool = True
+
     @property
     def is_stt(self) -> bool:
         """Whether the loaded model is a Speech-to-Text model."""
@@ -736,6 +741,7 @@ class MetalModelRunner:
                 self._extract_model_args()
                 self._resolve_model_dims()
                 self._initialize_kv_cache_dtype()
+                self._detect_batched_decode_support()
                 return
 
         # Load model using appropriate backend
@@ -760,6 +766,7 @@ class MetalModelRunner:
         self._extract_model_args()
         self._resolve_model_dims()
         self._initialize_kv_cache_dtype()
+        self._detect_batched_decode_support()
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -811,6 +818,17 @@ class MetalModelRunner:
         self.kv_cache_dtype = torch_to_mlx(
             torch.empty(0, dtype=self.model_config.dtype)
         ).dtype
+
+    def _detect_batched_decode_support(self) -> None:
+        """Probe cache types and disable batched decode for hybrid models."""
+        self._supports_batched_decode = supports_batched_decode(
+            self.model, is_vlm=self._is_vlm
+        )
+        if not self._supports_batched_decode:
+            logger.info(
+                "Model uses hybrid cache (e.g. ArraysCache + KVCache); "
+                "batched decode disabled, using sequential decode."
+            )
 
     def _extract_model_args(self) -> None:
         """Extract model configuration from loaded model.
@@ -1861,7 +1879,10 @@ class MetalModelRunner:
                         valid_decode_reqs.append((req_id, state))
 
                 if valid_decode_reqs:
-                    if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
+                    if (
+                        self._supports_batched_decode
+                        and len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING
+                    ):
                         decode_tokens = self._batched_decode(valid_decode_reqs)
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
