@@ -84,8 +84,12 @@ class MHAPagedAttentionBackend:
             ) from e
 
         try:
-            dummy_k = mx.zeros((1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype)
-            dummy_v = mx.zeros((1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype)
+            dummy_k = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
+            )
+            dummy_v = mx.zeros(
+                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
+            )
             dummy_slot = mx.zeros((1,), dtype=mx.int64)
             mx.eval(dummy_k, dummy_v, dummy_slot)
             ops.reshape_and_cache(

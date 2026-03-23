@@ -118,8 +118,14 @@ class TestResolveModelDims:
         return r
 
     def test_standard_mha(self) -> None:
-        r = self._make_runner({"num_hidden_layers": 32, "num_attention_heads": 32,
-                               "num_key_value_heads": 8, "hidden_size": 4096})
+        r = self._make_runner(
+            {
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 4096,
+            }
+        )
         r._resolve_model_dims()
         assert r.num_layers == 32
         assert r.num_kv_heads == 8
@@ -127,16 +133,29 @@ class TestResolveModelDims:
 
     def test_mla_overrides_kv_heads_and_head_dim(self) -> None:
         # GLM-4.7-Flash: kv_lora_rank=512, qk_rope_head_dim=64
-        r = self._make_runner({"num_hidden_layers": 47, "num_attention_heads": 20,
-                               "num_key_value_heads": 20, "hidden_size": 2048,
-                               "kv_lora_rank": 512, "qk_rope_head_dim": 64})
+        r = self._make_runner(
+            {
+                "num_hidden_layers": 47,
+                "num_attention_heads": 20,
+                "num_key_value_heads": 20,
+                "hidden_size": 2048,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+            }
+        )
         r._resolve_model_dims()
         assert r.num_kv_heads == 1
         assert r.head_dim == 576  # 512 + 64
 
     def test_mla_default_rope_head_dim(self) -> None:
-        r = self._make_runner({"num_hidden_layers": 28, "num_attention_heads": 16,
-                               "hidden_size": 2048, "kv_lora_rank": 256})
+        r = self._make_runner(
+            {
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "hidden_size": 2048,
+                "kv_lora_rank": 256,
+            }
+        )
         r._resolve_model_dims()
         assert r.head_dim == 320  # 256 + default 64
 
@@ -150,6 +169,7 @@ class TestResolveModelDims:
         assert r.is_mla is True
 
     def test_is_mla_false_for_standard_mha(self) -> None:
-        r = self._make_runner({"num_hidden_layers": 32, "num_attention_heads": 32,
-                               "hidden_size": 4096})
+        r = self._make_runner(
+            {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
+        )
         assert r.is_mla is False
