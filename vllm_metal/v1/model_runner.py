@@ -1303,8 +1303,7 @@ class MetalModelRunner:
         batch_size = len(decode_reqs)
 
         last_tokens = [
-            state.token_ids[-1] if state.token_ids else 0
-            for _, state in decode_reqs
+            state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
         ]
 
         # Collect individual caches for merging
@@ -1370,7 +1369,7 @@ class MetalModelRunner:
             ]
 
         # Extract updated caches back to individual requests
-        for i, (req_id, state) in enumerate(decode_reqs):
+        for i, (_req_id, state) in enumerate(decode_reqs):
             state.cache = _extract_kv_cache(batch_cache, i)
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
@@ -1392,7 +1391,7 @@ class MetalModelRunner:
         """
         next_tokens = []
 
-        for req_id, state in decode_reqs:
+        for _req_id, state in decode_reqs:
             last_token = state.token_ids[-1] if state.token_ids else 0
             input_ids = mx.array([[last_token]], dtype=mx.int32)
 
@@ -1465,8 +1464,7 @@ class MetalModelRunner:
 
         # Decode: last token per request
         last_tokens = [
-            state.token_ids[-1] if state.token_ids else 0
-            for _, state in decode_reqs
+            state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
         ]
         all_token_ids.extend(last_tokens)
 
