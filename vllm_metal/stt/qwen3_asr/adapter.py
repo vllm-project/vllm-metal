@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import mlx.core as mx
 
-from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
 
 from .model import Qwen3ASRModel
 from .transcriber import Qwen3ASRTranscriber
@@ -32,7 +30,7 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
     def eot_token(self) -> int:
         return self.model.config.eos_token_id
 
-    def extract_audio_features(self, input_features: Any) -> mx.array:
+    def extract_audio_features(self, input_features: STTAudioInput) -> mx.array:
         mel = self._to_mx_float16(input_features)
 
         # Qwen3-ASR encoder expects: (n_mels, time) or (batch, n_mels, time).

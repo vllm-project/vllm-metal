@@ -123,6 +123,7 @@ class TestPrefixCacheRestoreOffset:
         restored = manager.restore_cache(cached, model=MagicMock(), is_vlm=False)
 
         restored_layer = restored[0]
+        assert isinstance(restored_layer, self._KVCacheWithoutOffsetSideEffect)
         assert restored_layer.offset == 7
         assert bool(mx.allclose(restored_layer.state[0], k))
         assert bool(mx.allclose(restored_layer.state[1], v))

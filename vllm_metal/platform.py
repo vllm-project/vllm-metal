@@ -11,6 +11,7 @@ from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_metal.config import get_config
+from vllm_metal.stt.policy import apply_stt_scheduler_policy
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -259,13 +260,9 @@ class MetalPlatform(Platform):
             else None
         )
         if resolved_model is not None and is_stt_model(resolved_model):
-            if not getattr(model_config, "tokenizer", None):
-                model_config.tokenizer = model_config.model
-            # STT processes entire audio in one execute_model call;
-            # async scheduling's batch queue expects incremental decode
-            # and would schedule cached requests that STT cannot handle.
-            if getattr(scheduler_config, "async_scheduling", False):
-                scheduler_config.async_scheduling = False
+            was_async_scheduling = bool(scheduler_config.async_scheduling)
+            apply_stt_scheduler_policy(model_config, scheduler_config)
+            if was_async_scheduling and not scheduler_config.async_scheduling:
                 logger.info("STT: disabled async_scheduling")
             logger.info("STT model detected")
 

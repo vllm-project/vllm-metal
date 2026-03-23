@@ -17,7 +17,7 @@ import time
 from array import array
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, NamedTuple, TypeAlias
+from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
 import torch
@@ -37,6 +37,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -47,13 +48,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
-from vllm_metal.kv_cache_dtype import infer_kv_cache_dtype_from_model
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     prepare_unified,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
 from vllm_metal.stt.config import (
     STT_SCHED_BLOCK_BYTES,
     is_stt_model,
@@ -307,6 +307,11 @@ class PrefixCacheManager:
 # - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
 # - Hybrid models use `ArraysCache` for non-attention state.
 AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
+SchedulerMemoryReportingMode: TypeAlias = Literal[
+    "stt_nominal",
+    "paged_attention_capacity",
+    "single_sequence_estimate",
+]
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -677,6 +682,34 @@ class MetalModelRunner:
         """Whether the loaded model is a Speech-to-Text model."""
         return self._is_stt
 
+    def should_setup_paged_attention(self) -> bool:
+        """Whether worker-side paged-attention setup should run.
+
+        STT models own their runtime path and do not use the paged-attention
+        cache path that the text/VLM runner uses.
+        """
+        return not self._is_stt
+
+    def scheduler_memory_reporting_mode(
+        self, *, paged_attention_enabled: bool
+    ) -> SchedulerMemoryReportingMode:
+        """Return which scheduler memory-reporting mode worker should use.
+
+        Worker delegates this decision to the runner so STT-specific policy is
+        not open-coded in `worker.py`.
+        """
+        if self._is_stt:
+            return "stt_nominal"
+        if paged_attention_enabled and self._paged_kv_cache is not None:
+            return "paged_attention_capacity"
+        return "single_sequence_estimate"
+
+    def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
+        """Return worker task capabilities for the loaded model."""
+        if self._is_stt:
+            return ("transcription",)
+        return ("generate",)
+
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
 
@@ -777,14 +810,20 @@ class MetalModelRunner:
         logger.info(f"STT model loaded in {load_time:.2f}s: {model_name}")
 
     def _initialize_kv_cache_dtype(self) -> None:
-        """Infer and store the KV cache dtype for this runner."""
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
+        """Resolve the KV cache element dtype from model_config.dtype.
 
-        paged_kv_dtype = infer_kv_cache_dtype_from_model(self.model)
-        if paged_kv_dtype.warning:
-            logger.warning("%s", paged_kv_dtype.warning)
-        self.kv_cache_dtype = paged_kv_dtype.dtype
+        model_config.dtype is the authoritative compute dtype, set from
+        config.json torch_dtype at engine startup — the same source upstream
+        vLLM uses for kv_cache_dtype. Quantization changes weight storage
+        format but not compute precision, so this is correct for all model
+        families (dense, MoE, MLA) and quantisation levels.
+
+        torch_to_mlx on a zero-element probe tensor maps the torch.dtype to
+        its MLX equivalent without allocating memory.
+        """
+        self.kv_cache_dtype = torch_to_mlx(
+            torch.empty(0, dtype=self.model_config.dtype)
+        ).dtype
 
     def _extract_model_args(self) -> None:
         """Extract model configuration from loaded model.
