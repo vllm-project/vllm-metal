@@ -42,9 +42,10 @@ class MHAPagedAttentionBackend:
         self._dtype = dtype
         self._cache: MetalPagedKVCache | None = None
 
-    def _require_initialized(self, caller: str) -> None:
+    def _require_initialized(self, caller: str) -> MetalPagedKVCache:
         if self._cache is None:
             raise RuntimeError(f"{caller}() called before initialize()")
+        return self._cache
 
     def initialize(self, num_blocks: int) -> None:
         from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
@@ -59,20 +60,19 @@ class MHAPagedAttentionBackend:
         )
 
     def patch_model(self, model: Any) -> int:
-        self._require_initialized("patch_model")
+        cache = self._require_initialized("patch_model")
 
         from vllm_metal.metal_kernel_backend.paged_attention import (
             patch_model_attention_metal_kernel,
         )
 
-        return patch_model_attention_metal_kernel(model, self._cache, self._block_size)
+        return patch_model_attention_metal_kernel(model, cache, self._block_size)
 
     def warm_up(self) -> None:
-        self._require_initialized("warm_up")
+        cache = self._require_initialized("warm_up")
 
         from vllm_metal.metal import get_ops
 
-        cache = self._cache
         macos_version = platform.mac_ver()[0]
         logger.info("Warming up paged attention Metal kernel...")
 
@@ -105,5 +105,4 @@ class MHAPagedAttentionBackend:
             raise
 
     def num_blocks(self) -> int:
-        self._require_initialized("num_blocks")
-        return self._cache.num_blocks  # type: ignore[union-attr]
+        return self._require_initialized("num_blocks").num_blocks

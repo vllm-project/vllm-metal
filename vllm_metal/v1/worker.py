@@ -348,6 +348,7 @@ class MetalWorker(WorkerBase):
         if mode == "paged_attention_capacity":
             # Runner only reports this mode when paged cache is initialized.
             backend = self.model_runner._paged_attention_backend
+            assert backend is not None
             num_blocks = backend.num_blocks()
             block_size_bytes = self.get_cache_block_size_bytes()
             available = num_blocks * block_size_bytes
