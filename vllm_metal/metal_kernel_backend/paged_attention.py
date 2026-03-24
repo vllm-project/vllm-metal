@@ -55,12 +55,19 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         layer_idx: int,
         kv_cache: MetalPagedKVCache,
         block_size: int,
+        *,
+        cache_idx: int | None = None,
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_mk_layer_idx", layer_idx)
         object.__setattr__(self, "_mk_kv_cache", kv_cache)
         object.__setattr__(self, "_mk_block_size", block_size)
+        # For compact caches (hybrid models), cache_idx maps to the
+        # per-type cache array.  Defaults to layer_idx for non-hybrid.
+        object.__setattr__(
+            self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
+        )
 
     def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
         ctx = get_context()
@@ -71,12 +78,11 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         inner = self._inner
 
         # Dispatch to the right attention backend
+        cache_idx = self._mk_cache_idx
         if is_sdpa(inner):
-            return sdpa_forward(inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx)
+            return sdpa_forward(inner, x, ctx, self._mk_kv_cache, cache_idx)
         elif is_linear_attention(inner):
-            return linear_attention_forward(
-                inner, x, ctx, self._mk_kv_cache, self._mk_layer_idx
-            )
+            return linear_attention_forward(inner, x, ctx, self._mk_kv_cache, cache_idx)
         else:
             raise NotImplementedError(
                 f"No Metal attention backend for {type(inner).__name__}. "
@@ -94,12 +100,20 @@ def patch_model_attention_metal_kernel(
     model: Any,
     kv_cache: MetalPagedKVCache,
     block_size: int,
+    *,
+    cache_idx_map: dict[int, int] | None = None,
 ) -> int:
     """Walk model layers and replace each attention module with a
     ``MetalKernelPagedAttentionWrapper``.
 
     Supports hybrid models (e.g. Qwen3.5) where different layers use
     different attribute names (``self_attn``, ``linear_attn``, etc.).
+
+    Args:
+        cache_idx_map: Optional mapping from model layer_idx to compact
+            cache index.  Used by ``HybridPagedAttentionBackend`` so that
+            a compact ``MetalPagedKVCache`` (SDPA layers only) is indexed
+            correctly.  When ``None``, ``layer_idx`` is used directly.
 
     Returns the number of patched layers.
     """
@@ -119,8 +133,13 @@ def patch_model_attention_metal_kernel(
             patched += 1
             continue
 
+        cache_idx = (
+            cache_idx_map[layer_idx]
+            if cache_idx_map is not None and layer_idx in cache_idx_map
+            else layer_idx
+        )
         wrapper = MetalKernelPagedAttentionWrapper(
-            attn, layer_idx, kv_cache, block_size
+            attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
         )
         setattr(layer, attn_attr, wrapper)
         patched += 1

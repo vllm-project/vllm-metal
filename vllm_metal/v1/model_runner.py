@@ -682,6 +682,16 @@ class MetalModelRunner:
         """
         return "kv_lora_rank" in self.model_args
 
+    @property
+    def is_hybrid(self) -> bool:
+        """Whether the model mixes SDPA and linear attention layers.
+
+        Hybrid models (Qwen3.5) have ``full_attention_interval`` in their
+        config: every N-th layer uses SDPA, the rest use GDN linear attention.
+        """
+        fai = self.model_args.get("full_attention_interval", 0)
+        return isinstance(fai, int) and fai > 0
+
     def should_setup_paged_attention(self) -> bool:
         """Whether worker-side paged-attention setup should run.
 
@@ -857,6 +867,17 @@ class MetalModelRunner:
                 "Cannot extract model config: model has neither .args nor "
                 ".config attribute."
             )
+        # Qwen3.5 wrapper: model.args has {model_type, text_config: {…}}
+        # with real dims inside text_config.  Flatten so _resolve_model_dims
+        # finds num_hidden_layers, full_attention_interval, etc.
+        if (
+            "text_config" in self.model_args
+            and isinstance(self.model_args["text_config"], dict)
+            and "num_hidden_layers" not in self.model_args
+        ):
+            for k, v in self.model_args["text_config"].items():
+                self.model_args.setdefault(k, v)
+
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
 
@@ -916,6 +937,21 @@ class MetalModelRunner:
                 args.get("qk_rope_head_dim", _MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
 
+        # Hybrid (Qwen3.5): mix of SDPA and GDN linear attention layers.
+        # Store per-type layer counts and GDN dimensions for cache allocation.
+        if self.is_hybrid:
+            fai = int(args["full_attention_interval"])
+            self.full_attention_interval: int = fai
+            self.num_sdpa_layers = sum(
+                1 for i in range(self.num_layers) if (i + 1) % fai == 0
+            )
+            self.num_linear_layers = self.num_layers - self.num_sdpa_layers
+            self.linear_num_k_heads: int = int(args["linear_num_key_heads"])
+            self.linear_num_v_heads: int = int(args["linear_num_value_heads"])
+            self.linear_key_head_dim: int = int(args["linear_key_head_dim"])
+            self.linear_value_head_dim: int = int(args["linear_value_head_dim"])
+            self.linear_conv_kernel_dim: int = int(args["linear_conv_kernel_dim"])
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -962,16 +998,39 @@ class MetalModelRunner:
 
         torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
 
-        # Create a spec for each layer
+        # Create a spec for each layer.  Hybrid models (Qwen3.5) emit
+        # FullAttentionSpec for SDPA layers and MambaSpec for GDN layers.
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
-            layer_name = f"layers.{layer_idx}.self_attn"
-            specs[layer_name] = FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                dtype=torch_dtype,
-            )
+            if self.is_hybrid and (layer_idx + 1) % self.full_attention_interval != 0:
+                # GDN linear attention layer — fixed-size recurrent state
+                from vllm.v1.kv_cache_interface import MambaSpec
+
+                conv_dim = (
+                    self.linear_num_k_heads * self.linear_key_head_dim * 2
+                    + self.linear_num_v_heads * self.linear_value_head_dim
+                )
+                layer_name = f"layers.{layer_idx}.linear_attn"
+                specs[layer_name] = MambaSpec(
+                    shapes=(
+                        (self.linear_conv_kernel_dim - 1, conv_dim),
+                        (
+                            self.linear_num_v_heads,
+                            self.linear_value_head_dim,
+                            self.linear_key_head_dim,
+                        ),
+                    ),
+                    dtypes=(torch_dtype, torch_dtype),
+                    block_size=1,
+                )
+            else:
+                layer_name = f"layers.{layer_idx}.self_attn"
+                specs[layer_name] = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_dim,
+                    dtype=torch_dtype,
+                )
 
         return specs
 
@@ -997,14 +1056,16 @@ class MetalModelRunner:
 
         block_size = self.metal_config.block_size
 
-        # Each block stores key and value for all layers
-        # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+        # Each block stores key and value for SDPA layers only.
+        # Hybrid models (Qwen3.5) have linear attention layers that use
+        # fixed-size recurrent state, not paged KV — exclude them.
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
+        num_kv_layers = self.num_sdpa_layers if self.is_hybrid else self.num_layers
         return (
             2
-            * self.num_layers
+            * num_kv_layers
             * block_size
             * self.num_kv_heads
             * self.head_dim

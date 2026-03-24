@@ -260,23 +260,43 @@ class MetalWorker(WorkerBase):
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
-        backend = MHAPagedAttentionBackend(
-            num_layers=runner.num_layers,
-            num_kv_heads=runner.num_kv_heads,
-            head_dim=runner.head_dim,
-            block_size=block_size,
-            dtype=runner.kv_cache_dtype,
-        )
+        if runner.is_hybrid:
+            from vllm_metal.paged_attention_backend.hybrid import (
+                HybridPagedAttentionBackend,
+            )
+
+            backend = HybridPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                full_attention_interval=runner.full_attention_interval,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                linear_num_k_heads=runner.linear_num_k_heads,
+                linear_num_v_heads=runner.linear_num_v_heads,
+                linear_key_head_dim=runner.linear_key_head_dim,
+                linear_value_head_dim=runner.linear_value_head_dim,
+                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
+        else:
+            backend = MHAPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
         backend.initialize(num_blocks)
         n_patched = backend.patch_model(runner.model)
         logger.info(
             "Metal kernel paged attention enabled: %d layers patched, "
-            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
+            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d, hybrid=%s)",
             n_patched,
             num_blocks,
             block_size,
             runner.num_kv_heads,
             runner.head_dim,
+            runner.is_hybrid,
         )
 
         runner._paged_attention_backend = backend
