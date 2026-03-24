@@ -226,6 +226,80 @@ def test_metal_unified_attn_decode_only(
     )
 
 
+def test_metal_unified_attn_decode_only_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Experimental primitive path matches the existing raw v2 path."""
+    mx.random.seed(0)
+    seq_lens = [(1, 523), (1, 37), (1, 2011)]
+    num_query_heads = 4
+    num_kv_heads = 4
+    head_size = 128
+    block_size = 16
+    num_blocks = 256
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(len(seq_lens), num_query_heads, head_size)).astype(
+        mx.float16
+    )
+    key_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(mx.float16)
+    value_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(mx.float16)
+    cu_query_lens = mx.cumsum(mx.array([0] + query_lens, dtype=mx.int32))
+    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = mx.random.randint(
+        0, num_blocks, shape=(len(seq_lens), max_num_blocks_per_seq)
+    ).astype(mx.int32)
+
+    expected = mx.zeros_like(query)
+    monkeypatch.delenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE", raising=False)
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=expected,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=1,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+    )
+
+    monkeypatch.setenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE", "1")
+    actual = mx.zeros_like(query)
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=actual,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=1,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+    )
+
+    np.testing.assert_allclose(
+        np.array(actual), np.array(expected), atol=1e-4, rtol=1e-4
+    )
+
+
 # ---------------------------------------------------------------------------
 # Triangle edge: v2 == ref (full varlen unified attention)
 # ---------------------------------------------------------------------------

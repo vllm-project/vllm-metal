@@ -9,12 +9,14 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <memory>
 #include <string>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
 #include "mlx/mlx.h"
+#include "mlx/primitives.h"
 #include "mlx/backend/metal/device.h"
 
 namespace nb = nanobind;
@@ -258,29 +260,21 @@ void paged_attention_v1_impl(
 // paged_attention_v2_online — dispatches the online-softmax v2 kernel
 // ---------------------------------------------------------------------------
 
-void paged_attention_v2_online_impl(
-    nb::handle out_h,
-    nb::handle query_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
+static void dispatch_paged_attention_v2_online(
+    array& out,
+    const array& query,
+    const array& key_cache,
+    const array& value_cache,
     int num_kv_heads,
     float scale,
     float softcap,
-    nb::handle block_tables_h,
-    nb::handle seq_lens_h,
-    nb::handle cu_seqlens_q_h,
+    const array& block_tables,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
     int block_size,
     int max_seq_len,
     int sliding_window
 ) {
-  auto& out          = *nb::inst_ptr<array>(out_h);
-  auto& query        = *nb::inst_ptr<array>(query_h);
-  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
-  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
-  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
-  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
-  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
-
   auto s = default_stream(Device::gpu);
   auto& d = metal::device(Device::gpu);
 
@@ -378,6 +372,141 @@ void paged_attention_v2_online_impl(
   d.add_temporary(cu_seqlens_q, s.index);
 }
 
+class PagedAttentionV2OnlinePrimitive : public UnaryPrimitive {
+ public:
+  PagedAttentionV2OnlinePrimitive(
+      Stream stream,
+      int num_kv_heads,
+      float scale,
+      float softcap,
+      int block_size,
+      int max_seq_len,
+      int sliding_window)
+      : UnaryPrimitive(stream),
+        num_kv_heads_(num_kv_heads),
+        scale_(scale),
+        softcap_(softcap),
+        block_size_(block_size),
+        max_seq_len_(max_seq_len),
+        sliding_window_(sliding_window) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "paged_attention_v2_online primitive only supports GPU execution");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_paged_attention_v2_online(
+        out,
+        inputs[0],
+        inputs[1],
+        inputs[2],
+        num_kv_heads_,
+        scale_,
+        softcap_,
+        inputs[3],
+        inputs[4],
+        inputs[5],
+        block_size_,
+        max_seq_len_,
+        sliding_window_);
+  }
+
+  DEFINE_NAME(PagedAttentionV2OnlinePrimitive)
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const PagedAttentionV2OnlinePrimitive*>(&other);
+    return rhs != nullptr &&
+           num_kv_heads_ == rhs->num_kv_heads_ &&
+           scale_ == rhs->scale_ &&
+           softcap_ == rhs->softcap_ &&
+           block_size_ == rhs->block_size_ &&
+           max_seq_len_ == rhs->max_seq_len_ &&
+           sliding_window_ == rhs->sliding_window_;
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {inputs[0].shape()};
+  }
+
+ private:
+  int num_kv_heads_;
+  float scale_;
+  float softcap_;
+  int block_size_;
+  int max_seq_len_;
+  int sliding_window_;
+};
+
+void paged_attention_v2_online_impl(
+    nb::handle out_h,
+    nb::handle query_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    int num_kv_heads,
+    float scale,
+    float softcap,
+    nb::handle block_tables_h,
+    nb::handle seq_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    int max_seq_len,
+    int sliding_window
+) {
+  auto& out          = *nb::inst_ptr<array>(out_h);
+  auto& query        = *nb::inst_ptr<array>(query_h);
+  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
+  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_paged_attention_v2_online(
+      out,
+      query,
+      key_cache,
+      value_cache,
+      num_kv_heads,
+      scale,
+      softcap,
+      block_tables,
+      seq_lens,
+      cu_seqlens_q,
+      block_size,
+      max_seq_len,
+      sliding_window);
+}
+
+array paged_attention_v2_online_primitive_impl(
+    const array& query,
+    const array& key_cache,
+    const array& value_cache,
+    int num_kv_heads,
+    float scale,
+    float softcap,
+    const array& block_tables,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    int max_seq_len,
+    int sliding_window
+) {
+  auto primitive = std::make_shared<PagedAttentionV2OnlinePrimitive>(
+      default_stream(Device::gpu),
+      num_kv_heads,
+      scale,
+      softcap,
+      block_size,
+      max_seq_len,
+      sliding_window);
+  return array(
+      query.shape(),
+      query.dtype(),
+      std::move(primitive),
+      {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
+}
+
 // ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
@@ -415,4 +544,16 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
         "Online-softmax varlen paged attention (v2, unified prefill+decode).");
+
+  m.def("paged_attention_v2_online_primitive",
+        &paged_attention_v2_online_primitive_impl,
+        nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("softcap"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        nb::arg("sliding_window"),
+        "Experimental lazy primitive-backed paged attention (v2).");
 }
