@@ -361,14 +361,13 @@ class TestMixedDecodeAndPrefixHitPrefill:
 class TestCachedRequestContinuation:
     """Verify the cached/intermediate-chunk path works with prefix offsets."""
 
-    def test_cached_intermediate_chunk_with_offset(self):
-        """A cached request continuing prefill with computed > 0 must
-        produce correct state and seq_lens tracking."""
+    def test_cached_final_chunk_with_offset(self):
+        """Final chunk (computed + scheduled == prompt_len) with offset:
+        token is kept and state transitions to decode phase."""
         runner = _make_paged_runner()
         prompt = list(range(1, 13))  # 12 tokens
         block_ids = list(range(4))
 
-        # Simulate: first chunk already processed tokens 0-5 (6 tokens)
         runner._request_states["req-1"] = mr.RequestState(
             token_ids=list(prompt),
             prompt_len=len(prompt),
@@ -380,10 +379,9 @@ class TestCachedRequestContinuation:
         )
         runner._paged_request_seq_lens["req-1"] = 6
 
-        # Second chunk: computed=6, scheduled=6 → tokens[6:12], complete
+        # Final chunk: computed=6, scheduled=6 → 6+6=12=prompt_len
         vocab = 100
-        suffix_len = 6
-        logits = mx.zeros((1, suffix_len, vocab))
+        logits = mx.zeros((1, 6, vocab))
         runner.model.return_value = MagicMock(logits=logits)
 
         fake_token = 42
@@ -397,12 +395,8 @@ class TestCachedRequestContinuation:
                 "vllm_metal.v1.model_runner._mlx_greedy_sample",
                 return_value=mx.array(fake_token),
             ),
-            patch(
-                "vllm_metal.paged_attention_common.prepare_unified",
-            ),
-            patch(
-                "vllm_metal.paged_attention_common.clear_context",
-            ),
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             sched_out = _make_cached_scheduler_output(
                 req_ids=["req-1"],
@@ -412,11 +406,62 @@ class TestCachedRequestContinuation:
             runner.execute_model(sched_out)
 
         state = runner._request_states["req-1"]
-        # Should have full prompt + sampled token
         assert state.token_ids == prompt + [fake_token]
         assert state.generated_tokens == len(state.token_ids) - state.prompt_len
-        # seq_lens must reflect full sequence
         assert runner._paged_request_seq_lens["req-1"] == len(prompt)
+
+    def test_true_intermediate_chunk_with_prefix_cache_hit(self):
+        """Intermediate chunk (computed + scheduled < prompt_len) with
+        num_computed > 0: sampled token must be discarded, generated_tokens
+        stays 0, and _paged_request_seq_lens tracks partial progress."""
+        runner = _make_paged_runner()
+        prompt = list(range(1, 13))  # 12 tokens
+        block_ids = list(range(4))
+
+        # Prefix cache hit: 4 tokens already computed
+        runner._request_states["req-1"] = mr.RequestState(
+            token_ids=list(prompt),
+            prompt_len=len(prompt),
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            generated_tokens=0,
+            block_ids=block_ids,
+        )
+        runner._paged_request_seq_lens["req-1"] = 4
+
+        # Intermediate chunk: computed=4, scheduled=4 → 4+4=8 < 12
+        vocab = 100
+        chunk_len = 4
+        logits = mx.zeros((1, chunk_len, vocab))
+        runner.model.return_value = MagicMock(logits=logits)
+
+        with (
+            patch.object(
+                mr.MetalModelRunner,
+                "_extract_logits",
+                return_value=logits,
+            ),
+            patch(
+                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                return_value=mx.array(0),
+            ),
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            sched_out = _make_cached_scheduler_output(
+                req_ids=["req-1"],
+                num_computed_tokens=[4],
+                num_scheduled={"req-1": 4},
+            )
+            runner.execute_model(sched_out)
+
+        state = runner._request_states["req-1"]
+        # Still prefilling — no token appended, generated_tokens stays 0
+        assert state.generated_tokens == 0
+        assert state.token_ids == prompt
+        # seq_lens = start_pos(4) + chunk_len(4) = 8
+        assert runner._paged_request_seq_lens["req-1"] == 8
 
 
 def _make_paged_ctx_spy(
