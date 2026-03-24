@@ -170,6 +170,50 @@ def sdpa_forward(
             f"{phase}.ops.paged_attention_v2_online_primitive",
             time.perf_counter() - t0,
         )
+    elif _use_attention_primitive():
+        t0 = time.perf_counter()
+        mx.eval(
+            q_3d,
+            k_3d,
+            v_3d,
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+        )
+        sync_profile.record(f"{phase}.eval", time.perf_counter() - t0)
+
+        # Write K/V into paged cache BEFORE attention — the kernel reads from
+        # the paged cache via block_table, not from raw tensors.
+        t0 = time.perf_counter()
+        ops.reshape_and_cache(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
+        sync_profile.record(f"{phase}.ops.reshape_and_cache", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        out = ops.paged_attention_v2_online_primitive(
+            q_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kv_cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+        )
+        sync_profile.record(
+            f"{phase}.ops.paged_attention_v2_online_primitive",
+            time.perf_counter() - t0,
+        )
     else:
         # Allocate output buffer before eval so we can materialize everything
         # in one call on the raw path.
@@ -199,50 +243,29 @@ def sdpa_forward(
         )
         sync_profile.record(f"{phase}.ops.reshape_and_cache", time.perf_counter() - t0)
 
-        if _use_attention_primitive():
-            t0 = time.perf_counter()
-            out = ops.paged_attention_v2_online_primitive(
-                q_3d,
-                kv_cache.key_caches[layer_idx],
-                kv_cache.value_caches[layer_idx],
-                kv_cache.num_kv_heads,
-                inner.scale,
-                0.0,  # softcap (0 = disabled)
-                block_tables,
-                seq_lens,
-                cu_seqlens_q,
-                kv_cache.block_size,
-                max_seq_len,
-                -1,  # sliding_window (-1 = disabled)
-            )
-            sync_profile.record(
-                f"{phase}.ops.paged_attention_v2_online_primitive",
-                time.perf_counter() - t0,
-            )
-        else:
-            t0 = time.perf_counter()
-            ops.paged_attention_v2_online(
-                out,
-                q_3d,
-                kv_cache.key_caches[layer_idx],
-                kv_cache.value_caches[layer_idx],
-                kv_cache.num_kv_heads,
-                inner.scale,
-                0.0,  # softcap (0 = disabled)
-                block_tables,
-                seq_lens,
-                cu_seqlens_q,
-                kv_cache.block_size,
-                max_seq_len,
-                -1,  # sliding_window (-1 = disabled)
-            )
-            sync_profile.record(
-                f"{phase}.ops.paged_attention_v2_online", time.perf_counter() - t0
-            )
+        t0 = time.perf_counter()
+        ops.paged_attention_v2_online(
+            out,
+            q_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kv_cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+        )
+        sync_profile.record(
+            f"{phase}.ops.paged_attention_v2_online", time.perf_counter() - t0
+        )
 
-            t0 = time.perf_counter()
-            mx.synchronize()
-            sync_profile.record(f"{phase}.synchronize", time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        mx.synchronize()
+        sync_profile.record(f"{phase}.synchronize", time.perf_counter() - t0)
 
     # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
     out = out.reshape(B, L, n_heads * head_dim)
