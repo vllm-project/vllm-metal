@@ -72,20 +72,12 @@ static std::string dtype_to_metal(Dtype dt) {
 // reshape_and_cache
 // ---------------------------------------------------------------------------
 
-void reshape_and_cache_impl(
-    nb::handle key_h,
-    nb::handle value_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
-    nb::handle slot_mapping_h
-) {
-  // Extract C++ arrays from Python handles
-  auto& key         = *nb::inst_ptr<array>(key_h);
-  auto& value       = *nb::inst_ptr<array>(value_h);
-  auto& key_cache   = *nb::inst_ptr<array>(key_cache_h);
-  auto& value_cache = *nb::inst_ptr<array>(value_cache_h);
-  auto& slot_mapping = *nb::inst_ptr<array>(slot_mapping_h);
-
+static void dispatch_reshape_and_cache(
+    const array& key,
+    const array& value,
+    array& key_cache,
+    array& value_cache,
+    const array& slot_mapping) {
   auto s = default_stream(Device::gpu);
   auto& d = metal::device(Device::gpu);
 
@@ -142,6 +134,66 @@ void reshape_and_cache_impl(
   d.add_temporary(key_cache, s.index);
   d.add_temporary(value_cache, s.index);
   d.add_temporary(slot_mapping, s.index);
+}
+
+void reshape_and_cache_impl(
+    nb::handle key_h,
+    nb::handle value_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    nb::handle slot_mapping_h
+) {
+  // Extract C++ arrays from Python handles
+  auto& key          = *nb::inst_ptr<array>(key_h);
+  auto& value        = *nb::inst_ptr<array>(value_h);
+  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
+  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
+  auto& slot_mapping = *nb::inst_ptr<array>(slot_mapping_h);
+
+  dispatch_reshape_and_cache(
+      key, value, key_cache, value_cache, slot_mapping);
+}
+
+class ReshapeAndCachePrimitive : public UnaryPrimitive {
+ public:
+  explicit ReshapeAndCachePrimitive(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "reshape_and_cache primitive only supports GPU execution");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_reshape_and_cache(
+        inputs[0],
+        inputs[1],
+        const_cast<array&>(inputs[2]),
+        const_cast<array&>(inputs[3]),
+        inputs[4]);
+  }
+
+  DEFINE_NAME(ReshapeAndCachePrimitive)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {Shape{1}};
+  }
+};
+
+array reshape_and_cache_primitive_impl(
+    const array& key,
+    const array& value,
+    const array& key_cache,
+    const array& value_cache,
+    const array& slot_mapping) {
+  auto primitive = std::make_shared<ReshapeAndCachePrimitive>(
+      default_stream(Device::gpu));
+  return array(
+      Shape{1},
+      uint8,
+      std::move(primitive),
+      {key, value, key_cache, value_cache, slot_mapping});
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +559,43 @@ array paged_attention_v2_online_primitive_impl(
       {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
 }
 
+array paged_attention_v2_online_primitive_with_dep_impl(
+    const array& query,
+    const array& key_cache,
+    const array& value_cache,
+    int num_kv_heads,
+    float scale,
+    float softcap,
+    const array& block_tables,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    int max_seq_len,
+    int sliding_window,
+    const array& dependency) {
+  auto primitive = std::make_shared<PagedAttentionV2OnlinePrimitive>(
+      default_stream(Device::gpu),
+      num_kv_heads,
+      scale,
+      softcap,
+      block_size,
+      max_seq_len,
+      sliding_window);
+  return array(
+      query.shape(),
+      query.dtype(),
+      std::move(primitive),
+      {
+          query,
+          key_cache,
+          value_cache,
+          block_tables,
+          seq_lens,
+          cu_seqlens_q,
+          dependency,
+      });
+}
+
 // ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
@@ -525,6 +614,13 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("slot_mapping"),
         "Write projected K/V into the paged cache.");
+
+  m.def("reshape_and_cache_primitive",
+        &reshape_and_cache_primitive_impl,
+        nb::arg("key"), nb::arg("value"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("slot_mapping"),
+        "Experimental lazy primitive-backed reshape_and_cache.");
 
   m.def("paged_attention_v1", &paged_attention_v1_impl,
         nb::arg("out"), nb::arg("query"),
@@ -556,4 +652,17 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
         "Experimental lazy primitive-backed paged attention (v2).");
+
+  m.def("paged_attention_v2_online_primitive_with_dep",
+        &paged_attention_v2_online_primitive_with_dep_impl,
+        nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("softcap"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        nb::arg("sliding_window"),
+        nb::arg("dependency"),
+        "Experimental primitive-backed paged attention with an explicit dependency token.");
 }

@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn, run_v1_paged_attention
-from vllm_metal.metal import metal_unified_attention
+from vllm_metal.metal import get_ops, metal_unified_attention
 
 # Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
 #   HEAD_SIZES = [128, 256]
@@ -297,6 +297,114 @@ def test_metal_unified_attn_decode_only_primitive(
 
     np.testing.assert_allclose(
         np.array(actual), np.array(expected), atol=1e-4, rtol=1e-4
+    )
+
+
+def test_reshape_and_cache_primitive_dependency_chain() -> None:
+    """Experimental reshape-and-cache primitive sequences cache writes for v2."""
+    mx.random.seed(0)
+
+    num_tokens = 4
+    num_heads = 4
+    head_size = 128
+    block_size = 16
+    num_blocks = 4
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(
+        mx.float16
+    )
+    key = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(mx.float16)
+    value = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(
+        mx.float16
+    )
+    slot_mapping = mx.array([0, 1, 2, 3], dtype=mx.int64)
+    block_tables = mx.array([[0]], dtype=mx.int32)
+    seq_lens = mx.array([num_tokens], dtype=mx.int32)
+    cu_seqlens_q = mx.array([0, num_tokens], dtype=mx.int32)
+
+    ops = get_ops()
+
+    raw_key_cache = mx.zeros(
+        (num_blocks, block_size, num_heads, head_size), dtype=mx.float16
+    )
+    raw_value_cache = mx.zeros_like(raw_key_cache)
+    raw_out = mx.zeros_like(query)
+    mx.eval(
+        query,
+        key,
+        value,
+        slot_mapping,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        raw_key_cache,
+        raw_value_cache,
+        raw_out,
+    )
+    ops.reshape_and_cache(
+        key,
+        value,
+        raw_key_cache,
+        raw_value_cache,
+        slot_mapping,
+    )
+    ops.paged_attention_v2_online(
+        raw_out,
+        query,
+        raw_key_cache,
+        raw_value_cache,
+        num_heads,
+        scale,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        block_size,
+        num_tokens,
+        -1,
+    )
+    mx.synchronize()
+
+    primitive_key_cache = mx.zeros_like(raw_key_cache)
+    primitive_value_cache = mx.zeros_like(raw_value_cache)
+    # Match MetalPagedKVCache behavior: cache buffers are allocated up front.
+    mx.eval(primitive_key_cache, primitive_value_cache)
+    cache_write_token = ops.reshape_and_cache_primitive(
+        key,
+        value,
+        primitive_key_cache,
+        primitive_value_cache,
+        slot_mapping,
+    )
+    primitive_out = ops.paged_attention_v2_online_primitive_with_dep(
+        query,
+        primitive_key_cache,
+        primitive_value_cache,
+        num_heads,
+        scale,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        block_size,
+        num_tokens,
+        -1,
+        cache_write_token,
+    )
+    mx.eval(primitive_out)
+
+    np.testing.assert_allclose(
+        np.array(primitive_key_cache), np.array(raw_key_cache), atol=1e-4, rtol=1e-4
+    )
+    np.testing.assert_allclose(
+        np.array(primitive_value_cache),
+        np.array(raw_value_cache),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    np.testing.assert_allclose(
+        np.array(primitive_out), np.array(raw_out), atol=1e-4, rtol=1e-4
     )
 
 
