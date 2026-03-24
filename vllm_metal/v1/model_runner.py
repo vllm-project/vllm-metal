@@ -1871,7 +1871,9 @@ class MetalModelRunner:
                 elif is_new:
                     sampled_tokens[idx] = [nt]
                     cached_full_prompt = prefill_pack[i].full_prompt_token_ids
-                    full_prompt = cached_full_prompt if cached_full_prompt is not None else tids
+                    full_prompt = (
+                        cached_full_prompt if cached_full_prompt is not None else tids
+                    )
                     self._request_states[rid] = RequestState(
                         token_ids=full_prompt + [nt],
                         prompt_len=_prompt_len,

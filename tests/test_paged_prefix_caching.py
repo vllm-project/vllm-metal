@@ -11,6 +11,7 @@ Run with:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,7 @@ import mlx.core as mx
 import torch
 from vllm.sampling_params import SamplingParams
 
+import vllm_metal.paged_attention_common as pac
 import vllm_metal.v1.model_runner as mr
 
 
@@ -289,6 +291,73 @@ def _make_cached_scheduler_output(
     )
 
 
+class TestMixedDecodeAndPrefixHitPrefill:
+    """Verify a decode request and a prefix-hit prefill in the same unified step."""
+
+    def test_decode_and_prefix_hit_prefill_produce_correct_state(self):
+        runner = _make_paged_runner()
+        prompt_a = [10, 20, 30]
+        runner._request_states["req-A"] = mr.RequestState(
+            token_ids=prompt_a + [99],
+            prompt_len=len(prompt_a),
+            cache=[],
+            sampling_params=_greedy_sp(),
+            generator=None,
+            generated_tokens=1,
+            block_ids=[0, 1],
+        )
+        runner._paged_request_seq_lens["req-A"] = len(prompt_a)
+
+        prompt_b = [1, 2, 3, 4, 5, 6]
+        num_computed_b = 4
+        suffix_len_b = len(prompt_b) - num_computed_b
+        logits = mx.zeros((1, 1 + suffix_len_b, 100))
+        runner.model.return_value = MagicMock(logits=logits)
+
+        decode_token = 55
+        prefill_token = 77
+        # Decode is processed before prefill in execute_model; side_effect order matches.
+        greedy_tokens = [mx.array([decode_token]), mx.array([prefill_token])]
+
+        new_req_b = _make_new_req("req-B", prompt_b, num_computed_tokens=num_computed_b)
+        sched_out = SimpleNamespace(
+            scheduled_new_reqs=[new_req_b],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["req-A"],
+                new_block_ids=[None],
+                resumed_req_ids=set(),
+                num_computed_tokens=[len(prompt_a)],
+            ),
+            num_scheduled_tokens={"req-A": 1, "req-B": suffix_len_b},
+            total_num_scheduled_tokens=1 + suffix_len_b,
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            grammar_bitmask=None,
+        )
+
+        with (
+            patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
+            patch(
+                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                side_effect=greedy_tokens,
+            ),
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            runner.execute_model(sched_out)
+
+        state_a = runner._request_states["req-A"]
+        assert state_a.token_ids[-1] == decode_token
+        assert state_a.generated_tokens == 2
+
+        state_b = runner._request_states.get("req-B")
+        assert state_b is not None
+        assert state_b.token_ids == prompt_b + [prefill_token]
+        assert state_b.prompt_len == len(prompt_b)
+        assert state_b.generated_tokens == 1
+        assert runner._paged_request_seq_lens.get("req-B") == len(prompt_b)
+
+
 class TestCachedRequestContinuation:
     """Verify the cached/intermediate-chunk path works with prefix offsets."""
 
@@ -348,3 +417,87 @@ class TestCachedRequestContinuation:
         assert state.generated_tokens == len(state.token_ids) - state.prompt_len
         # seq_lens must reflect full sequence
         assert runner._paged_request_seq_lens["req-1"] == len(prompt)
+
+
+def _make_paged_ctx_spy(
+    captured: list,
+) -> Callable[[pac.PagedAttentionContext], None]:
+    def spy(ctx: pac.PagedAttentionContext) -> None:
+        captured.append(ctx)
+        pac._thread_local.paged_ctx = ctx
+
+    return spy
+
+
+class TestPrepareUnifiedSlotMapping:
+    """Verify prepare_unified is called with correct slot mapping and RoPE offsets.
+
+    All other tests in this file patch prepare_unified out.  These tests let it
+    run for real and spy on set_context to confirm the runner passes the right
+    block_ids, num_tokens, and start_pos arguments so that slot mapping and RoPE
+    offsets are exercised end-to-end.
+    """
+
+    def test_fresh_prefill_slot_mapping_and_rope_offset(self):
+        """start_pos == 0: slots cover positions 0..N-1, offset is 0."""
+        runner = _make_paged_runner()
+        prompt = [10, 20, 30, 40]
+        block_ids = [0]  # block_size=4, block 0 covers positions 0-3
+        logits = mx.zeros((1, len(prompt), 100))
+        runner.model.return_value = MagicMock(logits=logits)
+
+        captured: list[pac.PagedAttentionContext] = []
+
+        new_req = _make_new_req(
+            "req-1", prompt, num_computed_tokens=0, block_ids=block_ids
+        )
+        sched_out = _make_scheduler_output([new_req])
+
+        with (
+            patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
+            patch(
+                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                return_value=mx.array([0]),
+            ),
+            patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
+        ):
+            runner.execute_model(sched_out)
+
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert ctx.slot_mapping == [0, 1, 2, 3]
+        assert ctx.offsets == [0]
+        assert ctx.context_lens == [4]
+
+    def test_prefix_hit_slot_mapping_starts_at_start_pos(self):
+        """start_pos == 2: slots cover positions 2-3, RoPE offset is 2."""
+        runner = _make_paged_runner()
+        prompt = [10, 20, 30, 40]
+        num_computed = 2
+        block_ids = [0]  # block_size=4, block 0 covers positions 0-3
+        suffix_len = len(prompt) - num_computed
+        logits = mx.zeros((1, suffix_len, 100))
+        runner.model.return_value = MagicMock(logits=logits)
+
+        captured: list[pac.PagedAttentionContext] = []
+
+        new_req = _make_new_req(
+            "req-1", prompt, num_computed_tokens=num_computed, block_ids=block_ids
+        )
+        sched_out = _make_scheduler_output([new_req])
+
+        with (
+            patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
+            patch(
+                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                return_value=mx.array([0]),
+            ),
+            patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
+        ):
+            runner.execute_model(sched_out)
+
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert ctx.slot_mapping == [2, 3]  # positions 2-3 in block 0
+        assert ctx.offsets == [2]
+        assert ctx.context_lens == [4]  # start_pos + num_tokens = 2 + 2
