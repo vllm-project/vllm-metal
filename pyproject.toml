@@ -36,7 +36,7 @@ dependencies = [
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
     # Native Metal extension JIT build
-    "nanobind>=2.0.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",

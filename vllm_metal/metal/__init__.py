@@ -14,9 +14,13 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import os
 import re
+import time
 from pathlib import Path
 from types import ModuleType
+
+from . import sync_profile
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,10 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 # changes (the .cpp extension itself is rebuilt automatically by build.py when
 # paged_ops.cpp is newer than the .so).
 _ops_module: ModuleType | None = None
+
+
+def _use_attention_primitive() -> bool:
+    return os.getenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE") == "1"
 
 
 def _read_metal_source(path: Path) -> str:
@@ -112,25 +120,57 @@ def metal_unified_attention(
 
     ops = get_ops()
 
-    # Ensure all inputs are evaluated before raw Metal dispatch
-    mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
+    sync_profile.ensure_registered()
 
-    ops.paged_attention_v2_online(
-        out,
-        q,
-        k,
-        v,
-        num_kv_heads,
-        softmax_scale,
-        softcap,
-        block_table,
-        seqused_k,
-        cu_seqlens_q,
-        block_size,
-        max_seqlen_k,
-        sliding_window,
-    )
-    mx.synchronize()
+    if _use_attention_primitive():
+        t0 = time.perf_counter()
+        primitive_out = ops.paged_attention_v2_online_primitive(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            softmax_scale,
+            softcap,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            block_size,
+            max_seqlen_k,
+            sliding_window,
+        )
+        sync_profile.record(
+            "unified.ops.paged_attention_v2_online_primitive",
+            time.perf_counter() - t0,
+        )
+        out[:] = primitive_out
+    else:
+        # Ensure all inputs are evaluated before raw Metal dispatch
+        t0 = time.perf_counter()
+        mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
+        sync_profile.record("unified.eval", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        ops.paged_attention_v2_online(
+            out,
+            q,
+            k,
+            v,
+            num_kv_heads,
+            softmax_scale,
+            softcap,
+            block_table,
+            seqused_k,
+            cu_seqlens_q,
+            block_size,
+            max_seqlen_k,
+            sliding_window,
+        )
+        sync_profile.record(
+            "unified.ops.paged_attention_v2_online", time.perf_counter() - t0
+        )
+        t0 = time.perf_counter()
+        mx.synchronize()
+        sync_profile.record("unified.synchronize", time.perf_counter() - t0)
 
 
 def get_ops() -> ModuleType:

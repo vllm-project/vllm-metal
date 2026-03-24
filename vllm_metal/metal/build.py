@@ -79,6 +79,7 @@ def build() -> Path:
         "-fPIC",
         "-O2",
         "-fvisibility=default",
+        "-DNB_DOMAIN=mlx",
         f"-I{py_include}",
         f"-I{nb_path / 'include'}",
         f"-I{nb_path / 'src'}",

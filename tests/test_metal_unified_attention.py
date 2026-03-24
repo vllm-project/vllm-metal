@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn, run_v1_paged_attention
-from vllm_metal.metal import metal_unified_attention
+from vllm_metal.metal import get_ops, metal_unified_attention
 
 # Original upstream parameters (vLLM Triton/CUDA test_triton_unified_attention.py):
 #   HEAD_SIZES = [128, 256]
@@ -223,6 +223,188 @@ def test_metal_unified_attn_decode_only(
     # v2 must match v1 exactly (same algorithm, same precision)
     np.testing.assert_allclose(
         np.array(v2_output), np.array(v1_output), atol=1e-4, rtol=1e-4
+    )
+
+
+def test_metal_unified_attn_decode_only_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Experimental primitive path matches the existing raw v2 path."""
+    mx.random.seed(0)
+    seq_lens = [(1, 523), (1, 37), (1, 2011)]
+    num_query_heads = 4
+    num_kv_heads = 4
+    head_size = 128
+    block_size = 16
+    num_blocks = 256
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(len(seq_lens), num_query_heads, head_size)).astype(
+        mx.float16
+    )
+    key_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(mx.float16)
+    value_cache = mx.random.normal(
+        shape=(num_blocks, block_size, num_kv_heads, head_size)
+    ).astype(mx.float16)
+    cu_query_lens = mx.cumsum(mx.array([0] + query_lens, dtype=mx.int32))
+    kv_lens_arr = mx.array(kv_lens, dtype=mx.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = mx.random.randint(
+        0, num_blocks, shape=(len(seq_lens), max_num_blocks_per_seq)
+    ).astype(mx.int32)
+
+    expected = mx.zeros_like(query)
+    monkeypatch.delenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE", raising=False)
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=expected,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=1,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+    )
+
+    monkeypatch.setenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE", "1")
+    actual = mx.zeros_like(query)
+    metal_unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=actual,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_arr,
+        max_seqlen_q=1,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+    )
+
+    np.testing.assert_allclose(
+        np.array(actual), np.array(expected), atol=1e-4, rtol=1e-4
+    )
+
+
+def test_reshape_and_cache_primitive_dependency_chain() -> None:
+    """Experimental reshape-and-cache primitive sequences cache writes for v2."""
+    mx.random.seed(0)
+
+    num_tokens = 4
+    num_heads = 4
+    head_size = 128
+    block_size = 16
+    num_blocks = 4
+    scale = head_size**-0.5
+
+    query = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(
+        mx.float16
+    )
+    key = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(mx.float16)
+    value = mx.random.normal(shape=(num_tokens, num_heads, head_size)).astype(
+        mx.float16
+    )
+    slot_mapping = mx.array([0, 1, 2, 3], dtype=mx.int64)
+    block_tables = mx.array([[0]], dtype=mx.int32)
+    seq_lens = mx.array([num_tokens], dtype=mx.int32)
+    cu_seqlens_q = mx.array([0, num_tokens], dtype=mx.int32)
+
+    ops = get_ops()
+
+    raw_key_cache = mx.zeros(
+        (num_blocks, block_size, num_heads, head_size), dtype=mx.float16
+    )
+    raw_value_cache = mx.zeros_like(raw_key_cache)
+    raw_out = mx.zeros_like(query)
+    mx.eval(
+        query,
+        key,
+        value,
+        slot_mapping,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        raw_key_cache,
+        raw_value_cache,
+        raw_out,
+    )
+    ops.reshape_and_cache(
+        key,
+        value,
+        raw_key_cache,
+        raw_value_cache,
+        slot_mapping,
+    )
+    ops.paged_attention_v2_online(
+        raw_out,
+        query,
+        raw_key_cache,
+        raw_value_cache,
+        num_heads,
+        scale,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        block_size,
+        num_tokens,
+        -1,
+    )
+    mx.synchronize()
+
+    primitive_key_cache = mx.zeros_like(raw_key_cache)
+    primitive_value_cache = mx.zeros_like(raw_value_cache)
+    # Match MetalPagedKVCache behavior: cache buffers are allocated up front.
+    mx.eval(primitive_key_cache, primitive_value_cache)
+    cache_write_token = ops.reshape_and_cache_primitive(
+        key,
+        value,
+        primitive_key_cache,
+        primitive_value_cache,
+        slot_mapping,
+    )
+    primitive_out = ops.paged_attention_v2_online_primitive_with_dep(
+        query,
+        primitive_key_cache,
+        primitive_value_cache,
+        num_heads,
+        scale,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        block_size,
+        num_tokens,
+        -1,
+        cache_write_token,
+    )
+    mx.eval(primitive_out)
+
+    np.testing.assert_allclose(
+        np.array(primitive_key_cache), np.array(raw_key_cache), atol=1e-4, rtol=1e-4
+    )
+    np.testing.assert_allclose(
+        np.array(primitive_value_cache),
+        np.array(raw_value_cache),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    np.testing.assert_allclose(
+        np.array(primitive_out), np.array(raw_out), atol=1e-4, rtol=1e-4
     )
 
 

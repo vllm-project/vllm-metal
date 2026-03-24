@@ -18,10 +18,13 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import os
+import time
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import get_ops, sync_profile
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
@@ -37,6 +40,29 @@ def is_sdpa(module: nn.Module) -> bool:
         and hasattr(module, "v_proj")
         and hasattr(module, "o_proj")
     )
+
+
+def _phase_name(ctx: PagedAttentionContext) -> str:
+    if ctx.cu_seqlens and ctx.offsets:
+        q_lens = [
+            ctx.cu_seqlens[i + 1] - ctx.cu_seqlens[i]
+            for i in range(len(ctx.cu_seqlens) - 1)
+        ]
+        if (
+            q_lens
+            and all(q_len == 1 for q_len in q_lens)
+            and all(offset > 0 for offset in ctx.offsets)
+        ):
+            return "decode"
+    return "prefill"
+
+
+def _use_attention_primitive() -> bool:
+    return os.getenv("VLLM_METAL_USE_ATTENTION_PRIMITIVE") == "1"
+
+
+def _use_reshape_cache_primitive() -> bool:
+    return os.getenv("VLLM_METAL_USE_RESHAPE_CACHE_PRIMITIVE") == "1"
 
 
 def sdpa_forward(
@@ -105,41 +131,141 @@ def sdpa_forward(
     seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
     cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
 
-    # Allocate output buffer before eval so we can materialize everything in one call
-    out = mx.zeros((L, n_heads, head_dim), dtype=kv_cache.dtype)
-    mx.eval(q_3d, k_3d, v_3d, slot_mapping, block_tables, seq_lens, cu_seqlens_q, out)
-
     ops = get_ops()
-
-    # Write K/V into paged cache BEFORE attention — the kernel reads from
-    # the paged cache via block_table, not from raw tensors.
-    ops.reshape_and_cache(
-        k_3d,
-        v_3d,
-        kv_cache.key_caches[layer_idx],
-        kv_cache.value_caches[layer_idx],
-        slot_mapping,
-    )
-
+    phase = _phase_name(ctx)
+    sync_profile.ensure_registered()
     max_seq_len = max(ctx.context_lens)
 
-    ops.paged_attention_v2_online(
-        out,
-        q_3d,
-        kv_cache.key_caches[layer_idx],
-        kv_cache.value_caches[layer_idx],
-        kv_cache.num_kv_heads,
-        inner.scale,
-        0.0,  # softcap (0 = disabled)
-        block_tables,
-        seq_lens,
-        cu_seqlens_q,
-        kv_cache.block_size,
-        max_seq_len,
-        -1,  # sliding_window (-1 = disabled)
-    )
+    if _use_attention_primitive() and _use_reshape_cache_primitive():
+        t0 = time.perf_counter()
+        cache_write_token = ops.reshape_and_cache_primitive(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
+        sync_profile.record(
+            f"{phase}.ops.reshape_and_cache_primitive",
+            time.perf_counter() - t0,
+        )
 
-    mx.synchronize()
+        t0 = time.perf_counter()
+        out = ops.paged_attention_v2_online_primitive_with_dep(
+            q_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kv_cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+            cache_write_token,
+        )
+        sync_profile.record(
+            f"{phase}.ops.paged_attention_v2_online_primitive",
+            time.perf_counter() - t0,
+        )
+    elif _use_attention_primitive():
+        t0 = time.perf_counter()
+        mx.eval(
+            q_3d,
+            k_3d,
+            v_3d,
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+        )
+        sync_profile.record(f"{phase}.eval", time.perf_counter() - t0)
+
+        # Write K/V into paged cache BEFORE attention — the kernel reads from
+        # the paged cache via block_table, not from raw tensors.
+        t0 = time.perf_counter()
+        ops.reshape_and_cache(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
+        sync_profile.record(f"{phase}.ops.reshape_and_cache", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        out = ops.paged_attention_v2_online_primitive(
+            q_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kv_cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+        )
+        sync_profile.record(
+            f"{phase}.ops.paged_attention_v2_online_primitive",
+            time.perf_counter() - t0,
+        )
+    else:
+        # Allocate output buffer before eval so we can materialize everything
+        # in one call on the raw path.
+        out = mx.zeros((L, n_heads, head_dim), dtype=kv_cache.dtype)
+        t0 = time.perf_counter()
+        mx.eval(
+            q_3d,
+            k_3d,
+            v_3d,
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            out,
+        )
+        sync_profile.record(f"{phase}.eval", time.perf_counter() - t0)
+
+        # Write K/V into paged cache BEFORE attention — the kernel reads from
+        # the paged cache via block_table, not from raw tensors.
+        t0 = time.perf_counter()
+        ops.reshape_and_cache(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
+        sync_profile.record(f"{phase}.ops.reshape_and_cache", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        ops.paged_attention_v2_online(
+            out,
+            q_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kv_cache.block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+        )
+        sync_profile.record(
+            f"{phase}.ops.paged_attention_v2_online", time.perf_counter() - t0
+        )
+
+        t0 = time.perf_counter()
+        mx.synchronize()
+        sync_profile.record(f"{phase}.synchronize", time.perf_counter() - t0)
 
     # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
     out = out.reshape(B, L, n_heads * head_dim)
