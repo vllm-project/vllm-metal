@@ -26,11 +26,10 @@ _LATENT_DIM = _KV_LORA_RANK + _QK_ROPE_HEAD_DIM
 
 
 class TestMLAPagedLatentCache:
-    def test_latent_dim_is_sum_of_lora_rank_and_rope_head_dim(self) -> None:
+    def test_latent_dim_stored_correctly(self) -> None:
         cache = MLAPagedLatentCache(
             num_layers=4,
-            kv_lora_rank=_KV_LORA_RANK,
-            qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+            latent_dim=_LATENT_DIM,
             num_blocks=10,
             block_size=16,
             dtype=mx.float16,
@@ -41,8 +40,7 @@ class TestMLAPagedLatentCache:
     def test_per_layer_array_shape(self) -> None:
         cache = MLAPagedLatentCache(
             num_layers=3,
-            kv_lora_rank=256,
-            qk_rope_head_dim=32,
+            latent_dim=288,
             num_blocks=8,
             block_size=16,
             dtype=mx.float16,
@@ -56,8 +54,7 @@ class TestMLAPagedLatentCache:
     def test_bfloat16_dtype_accepted(self) -> None:
         cache = MLAPagedLatentCache(
             num_layers=2,
-            kv_lora_rank=128,
-            qk_rope_head_dim=64,
+            latent_dim=192,
             num_blocks=4,
             block_size=8,
             dtype=mx.bfloat16,
@@ -69,8 +66,7 @@ class TestMLAPagedLatentCache:
         with pytest.raises(ValueError, match="Unsupported dtype"):
             MLAPagedLatentCache(
                 num_layers=2,
-                kv_lora_rank=_KV_LORA_RANK,
-                qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+                latent_dim=_LATENT_DIM,
                 num_blocks=5,
                 block_size=16,
                 dtype=mx.int32,
@@ -81,8 +77,7 @@ class TestMLAPagedAttentionBackend:
     def _make_backend(self) -> MLAPagedAttentionBackend:
         return MLAPagedAttentionBackend(
             num_layers=4,
-            kv_lora_rank=_KV_LORA_RANK,
-            qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+            latent_dim=_LATENT_DIM,
             block_size=16,
             dtype=mx.float16,
         )
@@ -153,8 +148,7 @@ class TestPatchModelAttentionMla:
     def _make_backend(self, num_layers: int) -> MLAPagedAttentionBackend:
         backend = MLAPagedAttentionBackend(
             num_layers=num_layers,
-            kv_lora_rank=_KV_LORA_RANK,
-            qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+            latent_dim=_LATENT_DIM,
             block_size=16,
             dtype=mx.float16,
         )
@@ -274,8 +268,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
     def _make_cache(self) -> MLAPagedLatentCache:
         return MLAPagedLatentCache(
             num_layers=1,
-            kv_lora_rank=_KV_RANK,
-            qk_rope_head_dim=_ROPE_DIM,
+            latent_dim=_KV_RANK + _ROPE_DIM,
             num_blocks=4,
             block_size=4,
             dtype=mx.float16,

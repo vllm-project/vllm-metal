@@ -261,12 +261,9 @@ class MetalWorker(WorkerBase):
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
         if runner.is_mla:
-            kv_lora_rank = int(runner.model_args["kv_lora_rank"])
-            latent_dim = runner.mla_latent_dim  # kv_lora_rank + qk_rope_head_dim
             backend = MLAPagedAttentionBackend(
                 num_layers=runner.num_layers,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=latent_dim - kv_lora_rank,
+                latent_dim=runner.mla_latent_dim,
                 block_size=block_size,
                 dtype=runner.kv_cache_dtype,
             )

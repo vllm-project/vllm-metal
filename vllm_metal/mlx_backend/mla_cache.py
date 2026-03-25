@@ -11,8 +11,7 @@ class MLAPagedLatentCache:
       - kv_norm = kv_a_layernorm(compressed_kv) — the normalised KV latent
       - k_pe    = rope(k_pe_raw)                — RoPE-encoded position key
 
-    Layout per layer: [num_blocks, block_size, latent_dim]
-    where latent_dim = kv_lora_rank + qk_rope_head_dim.
+    Layout per layer: [num_blocks, block_size, latent_dim].
 
     Block allocation is managed externally by the scheduler's KV cache manager.
     """
@@ -20,8 +19,7 @@ class MLAPagedLatentCache:
     def __init__(
         self,
         num_layers: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
+        latent_dim: int,
         num_blocks: int,
         block_size: int,
         dtype: mx.Dtype = mx.float16,
@@ -30,16 +28,13 @@ class MLAPagedLatentCache:
             raise ValueError(f"Unsupported dtype for MLA paged cache: {dtype}")
 
         self.num_layers = num_layers
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.latent_dim = kv_lora_rank + qk_rope_head_dim
+        self.latent_dim = latent_dim
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.dtype = dtype
 
-        # Per-layer latent caches: [num_blocks, block_size, latent_dim]
         self.latent_caches: list[mx.array] = [
-            mx.zeros((num_blocks, block_size, self.latent_dim), dtype=dtype)
+            mx.zeros((num_blocks, block_size, latent_dim), dtype=dtype)
             for _ in range(num_layers)
         ]
         # Force allocation so Metal buffers exist before use
