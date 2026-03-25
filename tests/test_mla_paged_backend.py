@@ -16,7 +16,6 @@ from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
 from vllm_metal.paged_attention_backend.mla import (
     MLAPagedAttentionBackend,
     MLAPagedAttentionWrapper,
-    patch_model_attention_mla,
 )
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 
@@ -151,21 +150,21 @@ class _FakeModel:
 
 
 class TestPatchModelAttentionMla:
-    def _make_cache(self, num_layers: int) -> MLAPagedLatentCache:
-        return MLAPagedLatentCache(
+    def _make_backend(self, num_layers: int) -> MLAPagedAttentionBackend:
+        backend = MLAPagedAttentionBackend(
             num_layers=num_layers,
             kv_lora_rank=_KV_LORA_RANK,
             qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-            num_blocks=5,
             block_size=16,
             dtype=mx.float16,
         )
+        backend.initialize(5)
+        return backend
 
     def test_replaces_all_attention_layers(self) -> None:
         model = _FakeModel(num_layers=3)
-        cache = self._make_cache(num_layers=3)
 
-        n = patch_model_attention_mla(model, cache)
+        n = self._make_backend(num_layers=3).patch_model(model)
 
         assert n == 3
         for layer in model.model.layers:
@@ -173,30 +172,28 @@ class TestPatchModelAttentionMla:
 
     def test_wrapped_layer_has_correct_index(self) -> None:
         model = _FakeModel(num_layers=2)
-        cache = self._make_cache(num_layers=2)
 
-        patch_model_attention_mla(model, cache)
+        self._make_backend(num_layers=2).patch_model(model)
 
         for idx, layer in enumerate(model.model.layers):
             assert layer.self_attn._mla_layer_idx == idx
 
     def test_already_patched_layers_update_cache_reference(self) -> None:
         model = _FakeModel(num_layers=1)
-        cache_a = self._make_cache(num_layers=1)
-        cache_b = self._make_cache(num_layers=1)
-        patch_model_attention_mla(model, cache_a)
+        backend_a = self._make_backend(num_layers=1)
+        backend_b = self._make_backend(num_layers=1)
+        backend_a.patch_model(model)
 
-        n = patch_model_attention_mla(model, cache_b)
+        n = backend_b.patch_model(model)
 
         assert n == 1
-        assert model.model.layers[0].self_attn._mla_latent_cache is cache_b
+        assert model.model.layers[0].self_attn._mla_latent_cache is backend_b._cache
 
     def test_returns_correct_patch_count(self) -> None:
         for n_layers in (1, 4, 10):
             model = _FakeModel(num_layers=n_layers)
-            cache = self._make_cache(num_layers=n_layers)
 
-            count = patch_model_attention_mla(model, cache)
+            count = self._make_backend(num_layers=n_layers).patch_model(model)
 
             assert count == n_layers
 

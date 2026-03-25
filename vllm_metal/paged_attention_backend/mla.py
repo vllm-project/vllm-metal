@@ -203,7 +203,26 @@ class MLAPagedAttentionBackend:
 
     def patch_model(self, model: Any) -> int:
         cache = self._require_initialized("patch_model")
-        return patch_model_attention_mla(model, cache)
+        return self._patch_model(model, cache)
+
+    def _patch_model(self, model: Any, latent_cache: MLAPagedLatentCache) -> int:
+        layer_list, attn_attr = find_layers_and_attr(model)
+        patched = 0
+
+        for layer_idx, layer in enumerate(layer_list):
+            attn = getattr(layer, attn_attr)
+            if isinstance(attn, MLAPagedAttentionWrapper):
+                # Already patched — refresh cache reference (e.g. after re-initialisation)
+                object.__setattr__(attn, "_mla_latent_cache", latent_cache)
+                patched += 1
+                continue
+
+            setattr(
+                layer, attn_attr, MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
+            )
+            patched += 1
+
+        return patched
 
     def warm_up(self) -> None:
         # MLX ops JIT-compile on first use; no Metal shader warm-up needed.
@@ -212,34 +231,3 @@ class MLAPagedAttentionBackend:
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
-
-
-def patch_model_attention_mla(
-    model: Any,
-    latent_cache: MLAPagedLatentCache,
-) -> int:
-    """Walk model layers and replace each attention module with MLAPagedAttentionWrapper.
-
-    Mirrors patch_model_attention_metal_kernel from the MHA backend — separating
-    the layer-walk logic from the backend lifecycle keeps each concern independently
-    testable and lets the worker call patch_model without knowing the walk details.
-
-    Returns the number of patched layers.
-    """
-    layer_list, attn_attr = find_layers_and_attr(model)
-    patched = 0
-
-    for layer_idx, layer in enumerate(layer_list):
-        attn = getattr(layer, attn_attr)
-        if isinstance(attn, MLAPagedAttentionWrapper):
-            # Already patched — refresh cache reference (e.g. after re-initialisation)
-            object.__setattr__(attn, "_mla_latent_cache", latent_cache)
-            patched += 1
-            continue
-
-        setattr(
-            layer, attn_attr, MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
-        )
-        patched += 1
-
-    return patched
