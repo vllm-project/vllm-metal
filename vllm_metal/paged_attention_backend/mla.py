@@ -85,7 +85,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             q_pe,
             k_pe,
             ctx.cu_seqlens,
-            offsets=ctx.offsets if ctx.offsets else None,
+            offsets=ctx.offsets or None,
         )
 
         # Concatenate kv_norm and the roped k_pe into a single per-token latent,
@@ -103,15 +103,16 @@ class MLAPagedAttentionWrapper(nn.Module):
         flat = latent_cache.latent_caches[layer_idx].reshape(
             -1, latent_cache.latent_dim
         )
-        flat[mx.array(ctx.slot_mapping, dtype=mx.uint32)] = latent_flat
+        flat[mx.array(ctx.slot_mapping, dtype=mx.int64)] = latent_flat
         latent_cache.latent_caches[layer_idx] = flat.reshape(
             latent_cache.num_blocks, latent_cache.block_size, latent_cache.latent_dim
         )
 
+        # Pre-convert block tables once to avoid a new mx.array allocation per request
+        block_tables_mx = [mx.array(bt, dtype=mx.int32) for bt in ctx.block_tables]
+
         outputs = []
-        for req_idx, (block_ids, ctx_len) in enumerate(
-            zip(ctx.block_tables, ctx.context_lens, strict=True)
-        ):
+        for req_idx, ctx_len in enumerate(ctx.context_lens):
             req_start = ctx.cu_seqlens[req_idx]
             req_end = ctx.cu_seqlens[req_idx + 1]
             num_new = req_end - req_start
@@ -120,7 +121,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             # Gather this request's full context from the paged cache.
             # Block indexing: each block holds block_size contiguous token slots.
             n_blocks = math.ceil(ctx_len / latent_cache.block_size)
-            blocks = mx.array(block_ids[:n_blocks], dtype=mx.uint32)
+            blocks = block_tables_mx[req_idx][:n_blocks]
             all_latent = latent_cache.latent_caches[layer_idx][blocks].reshape(
                 -1, latent_cache.latent_dim
             )[:ctx_len]
