@@ -129,7 +129,7 @@ class TestMLAPagedAttentionBackend:
 
 
 class _FakeAttn(nn.Module):
-    """Minimal stand-in for an MLA attention module."""
+    pass
 
 
 class _FakeLayer:
