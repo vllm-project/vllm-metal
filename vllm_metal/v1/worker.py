@@ -260,24 +260,47 @@ class MetalWorker(WorkerBase):
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
-        backend = MHAPagedAttentionBackend(
-            num_layers=runner.num_layers,
-            num_kv_heads=runner.num_kv_heads,
-            head_dim=runner.head_dim,
-            block_size=block_size,
-            dtype=runner.kv_cache_dtype,
-        )
+        if runner.is_mla:
+            from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
+
+            kv_lora_rank = int(runner.model_args["kv_lora_rank"])
+            latent_dim = runner.mla_latent_dim  # kv_lora_rank + qk_rope_head_dim
+            backend = MLAPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=latent_dim - kv_lora_rank,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
+        else:
+            backend = MHAPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
         backend.initialize(num_blocks)
         n_patched = backend.patch_model(runner.model)
-        logger.info(
-            "Metal kernel paged attention enabled: %d layers patched, "
-            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
-            n_patched,
-            num_blocks,
-            block_size,
-            runner.num_kv_heads,
-            runner.head_dim,
-        )
+        if runner.is_mla:
+            logger.info(
+                "MLA paged attention enabled: %d layers patched, "
+                "%d blocks allocated (block_size=%d, latent_dim=%d)",
+                n_patched,
+                num_blocks,
+                block_size,
+                latent_dim,
+            )
+        else:
+            logger.info(
+                "Metal kernel paged attention enabled: %d layers patched, "
+                "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
+                n_patched,
+                num_blocks,
+                block_size,
+                runner.num_kv_heads,
+                runner.head_dim,
+            )
 
         runner._paged_attention_backend = backend
         runner._paged_block_size = block_size
