@@ -43,6 +43,9 @@ class LinearAttentionCache:
         self.key_head_dim = key_head_dim
         self.dtype = dtype
 
+        if dtype not in (mx.float16, mx.bfloat16, mx.float32):
+            raise ValueError(f"Unsupported dtype for linear attention cache: {dtype}")
+
         conv_state_shape = (num_blocks, conv_kernel_dim - 1, conv_dim)
         recurrent_shape = (num_blocks, num_v_heads, value_head_dim, key_head_dim)
 

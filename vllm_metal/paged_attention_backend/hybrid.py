@@ -12,15 +12,19 @@ block IDs.
 
 from __future__ import annotations
 
-import platform
 from typing import Any
 
 import mlx.core as mx
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
+from vllm_metal.metal_kernel_backend.cache_linear import LinearAttentionCache
+from vllm_metal.metal_kernel_backend.paged_attention import (
+    patch_model_attention_metal_kernel,
+)
+from vllm_metal.paged_attention_backend.mha import warm_up_paged_cache
 
-_METAL_LANGUAGE_VERSION_ERROR = "language version"
+logger = init_logger(__name__)
 
 
 class HybridPagedAttentionBackend:
@@ -41,12 +45,11 @@ class HybridPagedAttentionBackend:
         linear_key_head_dim: int,
         linear_value_head_dim: int,
         linear_conv_kernel_dim: int,
+        linear_conv_dim: int,
         # Common
         block_size: int,
         dtype: mx.Dtype,
     ) -> None:
-        self._num_layers = num_layers
-        self._full_attention_interval = full_attention_interval
         self._max_num_seqs = max_num_seqs
         self._block_size = block_size
         self._dtype = dtype
@@ -56,11 +59,11 @@ class HybridPagedAttentionBackend:
         self._head_dim = head_dim
 
         # GDN params
-        self._linear_num_k_heads = linear_num_k_heads
         self._linear_num_v_heads = linear_num_v_heads
         self._linear_key_head_dim = linear_key_head_dim
         self._linear_value_head_dim = linear_value_head_dim
         self._linear_conv_kernel_dim = linear_conv_kernel_dim
+        self._linear_conv_dim = linear_conv_dim
 
         # Classify layers
         self._sdpa_indices: list[int] = []
@@ -71,18 +74,15 @@ class HybridPagedAttentionBackend:
             else:
                 self._linear_indices.append(i)
 
-        self._kv_cache: Any = None  # MetalPagedKVCache
-        self._linear_cache: Any = None  # LinearAttentionCache
-        self._num_blocks: int = 0
+        self._kv_cache: MetalPagedKVCache | None = None
+        self._linear_cache: LinearAttentionCache | None = None
+
+    def _require_initialized(self, caller: str) -> MetalPagedKVCache:
+        if self._kv_cache is None:
+            raise RuntimeError(f"{caller}() called before initialize()")
+        return self._kv_cache
 
     def initialize(self, num_blocks: int) -> None:
-        from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-        from vllm_metal.metal_kernel_backend.cache_linear import (
-            LinearAttentionCache,
-        )
-
-        self._num_blocks = num_blocks
-
         # SDPA cache: paged KV for attention layers
         self._kv_cache = MetalPagedKVCache(
             num_layers=len(self._sdpa_indices),
@@ -96,15 +96,11 @@ class HybridPagedAttentionBackend:
         # Linear cache: fixed-size recurrent state, one slot per concurrent
         # request.  Uses max_num_seqs (not num_blocks) because linear state
         # is O(1) per request, unlike SDPA KV which grows with seq_len.
-        conv_dim = (
-            self._linear_num_k_heads * self._linear_key_head_dim * 2
-            + self._linear_num_v_heads * self._linear_value_head_dim
-        )
         self._linear_cache = LinearAttentionCache(
             num_layers=len(self._linear_indices),
             num_blocks=self._max_num_seqs,
             conv_kernel_dim=self._linear_conv_kernel_dim,
-            conv_dim=conv_dim,
+            conv_dim=self._linear_conv_dim,
             num_v_heads=self._linear_num_v_heads,
             value_head_dim=self._linear_value_head_dim,
             key_head_dim=self._linear_key_head_dim,
@@ -122,12 +118,7 @@ class HybridPagedAttentionBackend:
         )
 
     def patch_model(self, model: Any) -> int:
-        if self._kv_cache is None:
-            raise RuntimeError("patch_model() called before initialize()")
-
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            patch_model_attention_metal_kernel,
-        )
+        cache = self._require_initialized("patch_model")
 
         # Map SDPA layer indices to compact cache indices so the wrapper
         # indexes into the compact MetalPagedKVCache correctly.
@@ -136,58 +127,19 @@ class HybridPagedAttentionBackend:
             for cache_idx, layer_idx in enumerate(self._sdpa_indices)
         }
         return patch_model_attention_metal_kernel(
-            model, self._kv_cache, self._block_size, cache_idx_map=sdpa_cache_idx
+            model, cache, self._block_size, cache_idx_map=sdpa_cache_idx
         )
 
     def warm_up(self) -> None:
-        if self._kv_cache is None:
-            raise RuntimeError("warm_up() called before initialize()")
-
-        from vllm_metal.metal import get_ops
-
-        macos_version = platform.mac_ver()[0]
-        logger.info("Warming up hybrid paged attention Metal kernel...")
-
-        try:
-            ops = get_ops()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load Metal kernel: {e}. macOS {macos_version}"
-            ) from e
-
-        try:
-            cache = self._kv_cache
-            dummy_k = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_v = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_slot = mx.zeros((1,), dtype=mx.int64)
-            mx.eval(dummy_k, dummy_v, dummy_slot)
-            ops.reshape_and_cache(
-                dummy_k,
-                dummy_v,
-                cache.key_caches[0],
-                cache.value_caches[0],
-                dummy_slot,
-            )
-            mx.eval(cache.key_caches[0])
-            logger.info("Hybrid paged attention Metal kernel warm-up complete")
-        except RuntimeError as e:
-            if _METAL_LANGUAGE_VERSION_ERROR in str(e):
-                raise RuntimeError(
-                    f"Metal kernel incompatible with macOS {macos_version}: {e}"
-                ) from e
-            raise
+        warm_up_paged_cache(self._require_initialized("warm_up"))
 
     def num_blocks(self) -> int:
-        return self._num_blocks
+        return self._require_initialized("num_blocks").num_blocks
 
     @property
-    def kv_cache(self) -> Any:
+    def kv_cache(self) -> MetalPagedKVCache | None:
         return self._kv_cache
 
     @property
-    def linear_cache(self) -> Any:
+    def linear_cache(self) -> LinearAttentionCache | None:
         return self._linear_cache

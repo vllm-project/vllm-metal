@@ -40,7 +40,12 @@ from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MambaSpec,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -951,6 +956,11 @@ class MetalModelRunner:
             self.linear_key_head_dim: int = int(args["linear_key_head_dim"])
             self.linear_value_head_dim: int = int(args["linear_value_head_dim"])
             self.linear_conv_kernel_dim: int = int(args["linear_conv_kernel_dim"])
+            # Derived: total conv1d channel width (key_dim*2 + value_dim)
+            self.linear_conv_dim: int = (
+                self.linear_num_k_heads * self.linear_key_head_dim * 2
+                + self.linear_num_v_heads * self.linear_value_head_dim
+            )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1004,12 +1014,7 @@ class MetalModelRunner:
         for layer_idx in range(self.num_layers):
             if self.is_hybrid and (layer_idx + 1) % self.full_attention_interval != 0:
                 # GDN linear attention layer — fixed-size recurrent state
-                from vllm.v1.kv_cache_interface import MambaSpec
-
-                conv_dim = (
-                    self.linear_num_k_heads * self.linear_key_head_dim * 2
-                    + self.linear_num_v_heads * self.linear_value_head_dim
-                )
+                conv_dim = self.linear_conv_dim
                 layer_name = f"layers.{layer_idx}.linear_attn"
                 specs[layer_name] = MambaSpec(
                     shapes=(

@@ -169,8 +169,6 @@ class MetalWorker(WorkerBase):
         a configurable memory fraction, rather than blindly scaling from
         max_model_len.
         """
-        from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
-
         runner = self.model_runner
         block_size = self.metal_config.block_size
 
@@ -271,33 +269,7 @@ class MetalWorker(WorkerBase):
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
-        if runner.is_hybrid:
-            from vllm_metal.paged_attention_backend.hybrid import (
-                HybridPagedAttentionBackend,
-            )
-
-            backend = HybridPagedAttentionBackend(
-                num_layers=runner.num_layers,
-                full_attention_interval=runner.full_attention_interval,
-                max_num_seqs=runner.scheduler_config.max_num_seqs,
-                num_kv_heads=runner.num_kv_heads,
-                head_dim=runner.head_dim,
-                linear_num_k_heads=runner.linear_num_k_heads,
-                linear_num_v_heads=runner.linear_num_v_heads,
-                linear_key_head_dim=runner.linear_key_head_dim,
-                linear_value_head_dim=runner.linear_value_head_dim,
-                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
-                block_size=block_size,
-                dtype=runner.kv_cache_dtype,
-            )
-        else:
-            backend = MHAPagedAttentionBackend(
-                num_layers=runner.num_layers,
-                num_kv_heads=runner.num_kv_heads,
-                head_dim=runner.head_dim,
-                block_size=block_size,
-                dtype=runner.kv_cache_dtype,
-            )
+        backend = self._make_backend(runner, block_size)
         backend.initialize(num_blocks)
         n_patched = backend.patch_model(runner.model)
         logger.info(
@@ -313,6 +285,40 @@ class MetalWorker(WorkerBase):
 
         runner._paged_attention_backend = backend
         runner._paged_block_size = block_size
+
+    @staticmethod
+    def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
+        """Create the right paged attention backend for the model type."""
+        from vllm_metal.paged_attention_backend.hybrid import (
+            HybridPagedAttentionBackend,
+        )
+        from vllm_metal.paged_attention_backend.mha import (
+            MHAPagedAttentionBackend,
+        )
+
+        if runner.is_hybrid:
+            return HybridPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                full_attention_interval=runner.full_attention_interval,
+                max_num_seqs=runner.scheduler_config.max_num_seqs,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                linear_num_k_heads=runner.linear_num_k_heads,
+                linear_num_v_heads=runner.linear_num_v_heads,
+                linear_key_head_dim=runner.linear_key_head_dim,
+                linear_value_head_dim=runner.linear_value_head_dim,
+                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
+                linear_conv_dim=runner.linear_conv_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
+        return MHAPagedAttentionBackend(
+            num_layers=runner.num_layers,
+            num_kv_heads=runner.num_kv_heads,
+            head_dim=runner.head_dim,
+            block_size=block_size,
+            dtype=runner.kv_cache_dtype,
+        )
 
     def _get_model_memory_usage(self) -> int:
         """Get current model memory usage from MLX.
