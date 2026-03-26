@@ -44,31 +44,34 @@ def _seed_random_generators() -> None:
 
 
 # === Model config fixtures ===
-
-
-def _load_hf_text_config(repo_id: str) -> dict:
-    """Load config.json from HuggingFace and return flattened text_config.
-
-    Downloads only the config file (~1 KB), not model weights.
-    """
-    import json
-
-    from huggingface_hub import hf_hub_download
-
-    path = hf_hub_download(repo_id, "config.json")
-    with open(path) as f:
-        cfg = json.load(f)
-    tc = cfg.get("text_config", cfg)
-    return dict(tc)
+# Values from HuggingFace config.json for each model.
 
 
 @pytest.fixture(scope="session")
 def qwen35_4b_args() -> dict:
-    """Qwen3.5-4B model args from HuggingFace config.json → text_config."""
-    return _load_hf_text_config("Qwen/Qwen3.5-4B")
+    """Qwen3.5-4B text_config (source: Qwen/Qwen3.5-4B config.json)."""
+    return {
+        "num_hidden_layers": 32,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "hidden_size": 2560,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
 
 
 @pytest.fixture(scope="session")
 def llama_args() -> dict:
-    """Llama-3.2-1B model args from HuggingFace config.json."""
-    return _load_hf_text_config("meta-llama/Llama-3.2-1B")
+    """Llama-3.2-1B config (source: meta-llama/Llama-3.2-1B config.json)."""
+    return {
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "hidden_size": 2048,
+    }
