@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for STT data types, config, formatting, and audio pipeline."""
+"""Tests for STT data types, config, and audio pipeline."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from vllm_metal.stt.config import (
     get_whisper_languages,
     validate_language,
 )
-from vllm_metal.stt.formatting import format_as_srt, format_as_vtt
 from vllm_metal.stt.protocol import TranscriptionSegment
 
 # ===========================================================================
@@ -138,73 +137,6 @@ class TestTranscriptionSegment:
         assert seg.avg_logprob == 0.0
         assert seg.compression_ratio == 0.0
         assert seg.no_speech_prob == 0.0
-
-
-# ===========================================================================
-# Formatting (SRT / VTT)
-# ===========================================================================
-
-
-class TestFormatting:
-    """Tests for SRT and VTT subtitle formatting."""
-
-    @pytest.fixture()
-    def sample_segments(self) -> list[TranscriptionSegment]:
-        return [
-            TranscriptionSegment(
-                id=0,
-                seek=0,
-                start=0.0,
-                end=2.5,
-                text=" Hello world.",
-                tokens=[1, 2, 3],
-            ),
-            TranscriptionSegment(
-                id=1,
-                seek=250,
-                start=2.5,
-                end=5.0,
-                text=" How are you?",
-                tokens=[4, 5, 6],
-            ),
-        ]
-
-    def test_srt_format(self, sample_segments: list[TranscriptionSegment]) -> None:
-        srt = format_as_srt(sample_segments)
-        lines = srt.split("\n")
-        assert lines[0] == "1"
-        assert "00:00:00,000 --> 00:00:02,500" in lines[1]
-        assert "Hello world." in lines[2]
-        assert lines[4] == "2"
-        assert "00:00:02,500 --> 00:00:05,000" in lines[5]
-
-    def test_vtt_format(self, sample_segments: list[TranscriptionSegment]) -> None:
-        vtt = format_as_vtt(sample_segments)
-        lines = vtt.split("\n")
-        assert lines[0] == "WEBVTT"
-        assert lines[1] == ""
-        assert "00:00:00.000 --> 00:00:02.500" in lines[2]
-        assert "Hello world." in lines[3]
-
-    def test_srt_empty_segments(self) -> None:
-        assert format_as_srt([]) == ""
-
-    def test_vtt_empty_segments(self) -> None:
-        vtt = format_as_vtt([])
-        assert vtt.startswith("WEBVTT")
-
-    def test_srt_long_timestamps(self) -> None:
-        seg = TranscriptionSegment(
-            id=0,
-            seek=0,
-            start=3661.123,
-            end=3665.456,
-            text=" One hour in.",
-            tokens=[1],
-        )
-        srt = format_as_srt([seg])
-        assert "01:01:01,123" in srt
-        assert "01:01:05,456" in srt
 
 
 # ===========================================================================
