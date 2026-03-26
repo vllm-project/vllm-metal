@@ -1085,11 +1085,9 @@ class MetalModelRunner:
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
-        conv_dim = (
-            self.linear_num_k_heads * self.linear_key_head_dim * 2
-            + self.linear_num_v_heads * self.linear_value_head_dim
+        conv_bytes = (
+            (self.linear_conv_kernel_dim - 1) * self.linear_conv_dim * dtype_size
         )
-        conv_bytes = (self.linear_conv_kernel_dim - 1) * conv_dim * dtype_size
         recurrent_bytes = (
             self.linear_num_v_heads
             * self.linear_value_head_dim
