@@ -15,6 +15,7 @@ import vllm_metal.stt.whisper.transcriber as whisper_transcriber_mod
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.protocol import TranscriptionResult
 from vllm_metal.stt.whisper import WhisperTranscriber
+from vllm_metal.stt.whisper.transcriber import DEFAULT_SEGMENT_DURATION
 from vllm_metal.stt.whisper.transcriber import MAX_PROMPT_TOKENS
 
 # ===========================================================================
@@ -290,6 +291,32 @@ class TestChunkingPolicy:
 
         assert result.text == "ok"
         assert result.duration > 0
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            SpeechToTextConfig(max_audio_clip_s=None),
+            SpeechToTextConfig(min_energy_split_window_size=None),
+        ],
+    )
+    def test_transcribe_raises_when_chunking_disabled_for_long_audio(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        config: SpeechToTextConfig,
+    ) -> None:
+        transcriber = self._make_stub_transcriber(config)
+
+        def _unexpected_split(*_args, **_kwargs):
+            raise AssertionError("split_audio should not be called")
+
+        monkeypatch.setattr(whisper_transcriber_mod, "split_audio", _unexpected_split)
+        long_audio = mx.zeros(
+            int((DEFAULT_SEGMENT_DURATION + 1) * whisper_transcriber_mod.SAMPLE_RATE),
+            dtype=mx.float32,
+        )
+
+        with pytest.raises(ValueError, match="Audio chunking is disabled"):
+            transcriber.transcribe(long_audio)
 
 
 # ===========================================================================

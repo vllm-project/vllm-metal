@@ -135,6 +135,14 @@ class WhisperTranscriber:
         max_clip_s = self.config.max_audio_clip_s
         window_size = self.config.min_energy_split_window_size
         if max_clip_s is None or window_size is None:
+            max_chunk_samples = int(DEFAULT_SEGMENT_DURATION * SAMPLE_RATE)
+            if audio.shape[-1] > max_chunk_samples:
+                raise ValueError(
+                    "Audio chunking is disabled, but input exceeds Whisper's "
+                    f"{DEFAULT_SEGMENT_DURATION:.0f}s encoder window. "
+                    "Enable chunking by setting both max_audio_clip_s and "
+                    "min_energy_split_window_size."
+                )
             return [(audio, 0.0)]
 
         return split_audio(
