@@ -132,11 +132,13 @@ class WhisperTranscriber:
 
     def _prepare_audio_chunks(self, audio: mx.array) -> list[tuple[mx.array, float]]:
         """Return one chunk or split chunks based on STT chunking policy."""
+        audio_samples = audio.shape[0]
+        max_chunk_samples = int(DEFAULT_SEGMENT_DURATION * SAMPLE_RATE)
         max_clip_s = self.config.max_audio_clip_s
         window_size = self.config.min_energy_split_window_size
+
         if max_clip_s is None or window_size is None:
-            max_chunk_samples = int(DEFAULT_SEGMENT_DURATION * SAMPLE_RATE)
-            if audio.shape[-1] > max_chunk_samples:
+            if audio_samples > max_chunk_samples:
                 raise ValueError(
                     "Audio chunking is disabled, but input exceeds Whisper's "
                     f"{DEFAULT_SEGMENT_DURATION:.0f}s encoder window. "
@@ -144,6 +146,13 @@ class WhisperTranscriber:
                     "min_energy_split_window_size."
                 )
             return [(audio, 0.0)]
+
+        if max_clip_s > DEFAULT_SEGMENT_DURATION and audio_samples > max_chunk_samples:
+            raise ValueError(
+                f"max_audio_clip_s={max_clip_s} exceeds Whisper's "
+                f"{DEFAULT_SEGMENT_DURATION:.0f}s encoder window for long audio. "
+                "Set max_audio_clip_s <= 30 for Whisper."
+            )
 
         return split_audio(
             audio,
