@@ -15,8 +15,10 @@ import vllm_metal.stt.whisper.transcriber as whisper_transcriber_mod
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.protocol import TranscriptionResult
 from vllm_metal.stt.whisper import WhisperTranscriber
-from vllm_metal.stt.whisper.transcriber import DEFAULT_SEGMENT_DURATION
-from vllm_metal.stt.whisper.transcriber import MAX_PROMPT_TOKENS
+from vllm_metal.stt.whisper.transcriber import (
+    DEFAULT_SEGMENT_DURATION,
+    MAX_PROMPT_TOKENS,
+)
 
 # ===========================================================================
 # Fixtures
