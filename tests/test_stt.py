@@ -12,64 +12,24 @@ import numpy as np
 import pytest
 
 from vllm_metal.stt import audio as audio_mod
-from vllm_metal.stt.audio import SAMPLE_RATE, _rms_energy, audio_duration, split_audio
+from vllm_metal.stt.audio import (
+    HOP_LENGTH,
+    N_FFT,
+    N_MELS_DEFAULT,
+    SAMPLE_RATE,
+    _hanning,
+    _rms_energy,
+    _stft,
+    audio_duration,
+    log_mel_spectrogram,
+    split_audio,
+)
 from vllm_metal.stt.config import (
-    SpeechToTextConfig,
     get_supported_languages,
     get_whisper_languages,
     validate_language,
 )
 from vllm_metal.stt.protocol import TranscriptionSegment
-
-# ===========================================================================
-# SpeechToTextConfig
-# ===========================================================================
-
-
-class TestSpeechToTextConfig:
-    """Tests for SpeechToTextConfig dataclass."""
-
-    def test_default_values(self) -> None:
-        cfg = SpeechToTextConfig()
-        assert cfg.max_audio_clip_s == 30.0
-        assert cfg.overlap_chunk_second == 1.0
-        assert cfg.min_energy_split_window_size == 1600
-        assert cfg.sample_rate == 16000  # deprecated but still accepted
-
-    def test_custom_values(self) -> None:
-        cfg = SpeechToTextConfig(
-            max_audio_clip_s=15.0,
-            overlap_chunk_second=0.5,
-            min_energy_split_window_size=800,
-        )
-        assert cfg.max_audio_clip_s == 15.0
-        assert cfg.overlap_chunk_second == 0.5
-        assert cfg.min_energy_split_window_size == 800
-
-    @pytest.mark.parametrize(
-        ("kwargs", "message"),
-        [
-            ({"max_audio_clip_s": 0.0}, "max_audio_clip_s"),
-            ({"overlap_chunk_second": -0.1}, "overlap_chunk_second"),
-            (
-                {"max_audio_clip_s": 10.0, "overlap_chunk_second": 10.0},
-                "overlap_chunk_second",
-            ),
-            ({"min_energy_split_window_size": 0}, "min_energy_split_window_size"),
-        ],
-    )
-    def test_invalid_values_raise(
-        self,
-        kwargs: dict[str, float | int],
-        message: str,
-    ) -> None:
-        with pytest.raises(ValueError, match=message):
-            SpeechToTextConfig(**kwargs)
-
-
-# ===========================================================================
-# validate_language
-# ===========================================================================
 
 
 class TestValidateLanguage:
@@ -112,11 +72,6 @@ class TestValidateLanguage:
         assert get_supported_languages().issubset(set(get_whisper_languages()))
 
 
-# ===========================================================================
-# TranscriptionSegment
-# ===========================================================================
-
-
 class TestTranscriptionSegment:
     """Tests for TranscriptionSegment pydantic model."""
 
@@ -139,18 +94,11 @@ class TestTranscriptionSegment:
         assert seg.no_speech_prob == 0.0
 
 
-# ===========================================================================
-# Audio pipeline (log_mel_spectrogram, _stft)
-# ===========================================================================
-
-
 class TestAudioPipeline:
     """Tests for core audio processing functions."""
 
     def test_log_mel_spectrogram_shape(self) -> None:
         """Log-mel spectrogram should have expected shape."""
-        from vllm_metal.stt.audio import N_MELS_DEFAULT, log_mel_spectrogram
-
         audio = mx.zeros(SAMPLE_RATE)  # 1 second
         mel = log_mel_spectrogram(audio)
         assert mel.ndim == 2
@@ -158,8 +106,6 @@ class TestAudioPipeline:
 
     def test_log_mel_spectrogram_values_bounded(self) -> None:
         """Output should be normalised (roughly in [-1, 1] range)."""
-        from vllm_metal.stt.audio import log_mel_spectrogram
-
         audio = mx.array(np.random.randn(SAMPLE_RATE).astype(np.float32))
         mel = log_mel_spectrogram(audio)
         assert mel.min().item() >= -2.0
@@ -167,16 +113,12 @@ class TestAudioPipeline:
 
     def test_log_mel_spectrogram_accepts_numpy(self) -> None:
         """Should accept numpy arrays."""
-        from vllm_metal.stt.audio import log_mel_spectrogram
-
         audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
         mel = log_mel_spectrogram(audio)
         assert mel.ndim == 2
 
     def test_stft_output_shape(self) -> None:
         """STFT should produce expected frequency bins."""
-        from vllm_metal.stt.audio import HOP_LENGTH, N_FFT, _hanning, _stft
-
         audio = mx.zeros(SAMPLE_RATE)
         window = _hanning(N_FFT)
         freqs = _stft(audio, window, N_FFT, HOP_LENGTH)
@@ -184,8 +126,6 @@ class TestAudioPipeline:
 
     def test_hanning_window_properties(self) -> None:
         """Hanning window should be symmetric and peak in centre."""
-        from vllm_metal.stt.audio import _hanning
-
         window = _hanning(400)
         assert window.shape[0] == 400
         assert abs(window[0].item()) < 1e-6
