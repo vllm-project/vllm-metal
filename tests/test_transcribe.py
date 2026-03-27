@@ -265,7 +265,7 @@ class TestChunkingPolicy:
             tokenizer=tokenizer,  # type: ignore[arg-type]
         )
         transcriber._encode_chunk = lambda _chunk: mx.zeros((1, 1, 1), dtype=mx.float32)  # type: ignore[method-assign]
-        transcriber._greedy_decode = (lambda *_args, **_kwargs: [1])  # type: ignore[method-assign]
+        transcriber._greedy_decode = lambda *_args, **_kwargs: [1]  # type: ignore[method-assign]
         return transcriber
 
     @pytest.mark.parametrize(
@@ -290,6 +290,7 @@ class TestChunkingPolicy:
 
         assert result.text == "ok"
         assert result.duration > 0
+
 
 # ===========================================================================
 # Greedy decode and encode chunk (require tiny model)
