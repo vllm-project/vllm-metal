@@ -21,8 +21,8 @@ _OFFICIALLY_SUPPORTED = {
 
 
 @lru_cache(maxsize=1)
-def _get_whisper_languages() -> dict[str, str]:
-    """Get Whisper language map from transformers."""
+def get_whisper_languages() -> dict[str, str]:
+    """Get full Whisper language map (100 languages)."""
     try:
         from transformers.models.whisper.tokenization_whisper import LANGUAGES
 
@@ -30,11 +30,6 @@ def _get_whisper_languages() -> dict[str, str]:
     except ImportError:
         logger.warning("transformers not available, using fallback language list")
         return {"en": "english"}
-
-
-def get_whisper_languages() -> dict[str, str]:
-    """Get full Whisper language map (100 languages)."""
-    return _get_whisper_languages()
 
 
 def get_supported_languages() -> set[str]:
