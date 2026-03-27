@@ -27,6 +27,8 @@ from vllm_metal.config import (
     PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.stt.config import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
@@ -289,13 +291,6 @@ class MetalWorker(WorkerBase):
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
-        from vllm_metal.paged_attention_backend.hybrid import (
-            HybridPagedAttentionBackend,
-        )
-        from vllm_metal.paged_attention_backend.mha import (
-            MHAPagedAttentionBackend,
-        )
-
         if runner.is_hybrid:
             return HybridPagedAttentionBackend(
                 num_layers=runner.num_layers,

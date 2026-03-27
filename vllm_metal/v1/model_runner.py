@@ -40,12 +40,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MambaSpec,
-)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -872,15 +867,11 @@ class MetalModelRunner:
                 "Cannot extract model config: model has neither .args nor "
                 ".config attribute."
             )
-        # Qwen3.5 wrapper: model.args has {model_type, text_config: {…}}
-        # with real dims inside text_config.  Flatten so _resolve_model_dims
-        # finds num_hidden_layers, full_attention_interval, etc.
-        if (
-            "text_config" in self.model_args
-            and isinstance(self.model_args["text_config"], dict)
-            and "num_hidden_layers" not in self.model_args
-        ):
-            for k, v in self.model_args["text_config"].items():
+        # Merge nested text_config (Qwen3.5, VLMs) into top-level args.
+        # setdefault preserves any top-level keys that already exist.
+        tc = self.model_args.get("text_config")
+        if isinstance(tc, dict):
+            for k, v in tc.items():
                 self.model_args.setdefault(k, v)
 
         if self.metal_config.debug:
@@ -947,9 +938,10 @@ class MetalModelRunner:
         if self.is_hybrid:
             fai = int(args["full_attention_interval"])
             self.full_attention_interval: int = fai
-            self.num_sdpa_layers = sum(
-                1 for i in range(self.num_layers) if (i + 1) % fai == 0
+            self.sdpa_layer_indices: frozenset[int] = frozenset(
+                i for i in range(self.num_layers) if (i + 1) % fai == 0
             )
+            self.num_sdpa_layers = len(self.sdpa_layer_indices)
             self.num_linear_layers = self.num_layers - self.num_sdpa_layers
             self.linear_num_k_heads: int = int(args["linear_num_key_heads"])
             self.linear_num_v_heads: int = int(args["linear_num_value_heads"])
@@ -1008,26 +1000,16 @@ class MetalModelRunner:
 
         torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
 
-        # Create a spec for each layer.  Hybrid models (Qwen3.5) emit
-        # FullAttentionSpec for SDPA layers and MambaSpec for GDN layers.
+        if self.is_hybrid:
+            from vllm_metal.paged_attention_backend.hybrid import (
+                build_linear_layer_spec,
+            )
+
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
-            if self.is_hybrid and (layer_idx + 1) % self.full_attention_interval != 0:
-                # GDN linear attention layer — fixed-size recurrent state
-                conv_dim = self.linear_conv_dim
+            if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
                 layer_name = f"layers.{layer_idx}.linear_attn"
-                specs[layer_name] = MambaSpec(
-                    shapes=(
-                        (self.linear_conv_kernel_dim - 1, conv_dim),
-                        (
-                            self.linear_num_v_heads,
-                            self.linear_value_head_dim,
-                            self.linear_key_head_dim,
-                        ),
-                    ),
-                    dtypes=(torch_dtype, torch_dtype),
-                    block_size=1,
-                )
+                specs[layer_name] = build_linear_layer_spec(self, torch_dtype)
             else:
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
@@ -1078,10 +1060,9 @@ class MetalModelRunner:
         )
 
     def linear_cache_bytes_per_slot(self) -> int:
-        """Bytes for one request's linear attention state across all GDN layers.
-
-        Only valid when ``is_hybrid`` is True.
-        """
+        """Bytes for one request's linear attention state across all GDN layers."""
+        if not self.is_hybrid:
+            raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size

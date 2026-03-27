@@ -16,6 +16,7 @@ from typing import Any
 
 import mlx.core as mx
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.cache_linear import LinearAttentionCache
@@ -25,6 +26,25 @@ from vllm_metal.metal_kernel_backend.paged_attention import (
 from vllm_metal.paged_attention_backend.mha import warm_up_paged_cache
 
 logger = init_logger(__name__)
+
+
+def build_linear_layer_spec(runner: Any, torch_dtype: Any) -> Any:
+    """Build a MambaSpec for one GDN linear attention layer.
+
+    Keeps model-family-specific shape construction out of ModelRunner.
+    """
+    return MambaSpec(
+        shapes=(
+            (runner.linear_conv_kernel_dim - 1, runner.linear_conv_dim),
+            (
+                runner.linear_num_v_heads,
+                runner.linear_value_head_dim,
+                runner.linear_key_head_dim,
+            ),
+        ),
+        dtypes=(torch_dtype, torch_dtype),
+        block_size=1,
+    )
 
 
 class HybridPagedAttentionBackend:
@@ -137,9 +157,11 @@ class HybridPagedAttentionBackend:
         return self._require_initialized("num_blocks").num_blocks
 
     @property
-    def kv_cache(self) -> MetalPagedKVCache | None:
-        return self._kv_cache
+    def kv_cache(self) -> MetalPagedKVCache:
+        return self._require_initialized("kv_cache")
 
     @property
-    def linear_cache(self) -> LinearAttentionCache | None:
+    def linear_cache(self) -> LinearAttentionCache:
+        if self._linear_cache is None:
+            raise RuntimeError("linear_cache accessed before initialize()")
         return self._linear_cache
