@@ -55,10 +55,8 @@ from vllm_metal.paged_attention_common import (
     prepare_unified,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
-from vllm_metal.stt.config import (
-    STT_SCHED_BLOCK_BYTES,
-    is_stt_model,
-)
+from vllm_metal.stt.detection import is_stt_model
+from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path

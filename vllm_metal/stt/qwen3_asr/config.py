@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Maximum decode tokens for Qwen3-ASR decode loop.
+QWEN3_ASR_MAX_DECODE_TOKENS = 1024
+
 
 @dataclass
 class Qwen3ASRAudioConfig:

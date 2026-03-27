@@ -10,6 +10,7 @@ from typing import cast
 import mlx.core as mx
 import numpy as np
 from transformers import WhisperTokenizer
+from vllm.config import SpeechToTextConfig
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -20,13 +21,10 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
-from vllm_metal.stt.config import (
-    WHISPER_MAX_DECODE_TOKENS,
-    SpeechToTextConfig,
-    validate_language,
-)
+from vllm_metal.stt.config import validate_language
 from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
 
+from .config import WHISPER_MAX_DECODE_TOKENS
 from .model import WhisperModel
 
 logger = logging.getLogger(__name__)
@@ -94,13 +92,7 @@ class WhisperTranscriber:
 
         total_duration = audio_duration(audio, SAMPLE_RATE)
 
-        chunks = split_audio(
-            audio,
-            max_clip_s=self.config.max_audio_clip_s,
-            overlap_s=self.config.overlap_chunk_second,
-            window_size=self.config.min_energy_split_window_size,
-            sample_rate=SAMPLE_RATE,
-        )
+        chunks = self._prepare_audio_chunks(audio)
 
         all_segments: list[TranscriptionSegment] = []
         all_text_parts: list[str] = []
@@ -136,6 +128,21 @@ class WhisperTranscriber:
             language=language,
             segments=all_segments if with_timestamps else [],
             duration=total_duration,
+        )
+
+    def _prepare_audio_chunks(self, audio: mx.array) -> list[tuple[mx.array, float]]:
+        """Return one chunk or split chunks based on STT chunking policy."""
+        max_clip_s = self.config.max_audio_clip_s
+        window_size = self.config.min_energy_split_window_size
+        if max_clip_s is None or window_size is None:
+            return [(audio, 0.0)]
+
+        return split_audio(
+            audio,
+            max_clip_s=max_clip_s,
+            overlap_s=self.config.overlap_chunk_second,
+            window_size=window_size,
+            sample_rate=SAMPLE_RATE,
         )
 
     def greedy_decode_tokens(

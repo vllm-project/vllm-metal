@@ -30,7 +30,7 @@ from vllm_metal.config import (
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
-from vllm_metal.stt.config import STT_SCHED_AVAILABLE_BYTES
+from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:

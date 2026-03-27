@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Maximum decode tokens for Whisper models (matches Whisper context window).
+WHISPER_MAX_DECODE_TOKENS = 448
+
 
 @dataclass
 class WhisperConfig:

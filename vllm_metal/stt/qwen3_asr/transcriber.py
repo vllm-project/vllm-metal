@@ -9,8 +9,7 @@ from typing import Any
 import mlx.core as mx
 from transformers import AutoTokenizer
 
-from vllm_metal.stt.config import QWEN3_ASR_MAX_DECODE_TOKENS
-
+from .config import QWEN3_ASR_MAX_DECODE_TOKENS
 from .model import Qwen3ASRModel
 
 logger = logging.getLogger(__name__)

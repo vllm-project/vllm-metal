@@ -5,6 +5,13 @@ from __future__ import annotations
 
 from typing import Protocol
 
+# Nominal memory reported to vLLM scheduler for STT models.
+# No KV cache is actually allocated; this just passes minimum-memory checks.
+STT_SCHED_AVAILABLE_BYTES = 1 << 30  # 1 GiB
+
+# Block size reported to vLLM for STT models (minimal, no real KV cache).
+STT_SCHED_BLOCK_BYTES = 1
+
 
 class _ModelConfigLike(Protocol):
     model: str

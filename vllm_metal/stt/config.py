@@ -1,31 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Speech-to-Text configuration and language constants."""
+"""Whisper language validation helpers shared by STT code."""
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# STT model types that can be auto-detected from config.json
-_STT_MODEL_TYPES = {"whisper", "qwen3_asr"}
-
-# Maximum decode tokens for Whisper models (matches Whisper's context window).
-WHISPER_MAX_DECODE_TOKENS = 448
-
-# Maximum decode tokens for Qwen3-ASR models.
-QWEN3_ASR_MAX_DECODE_TOKENS = 1024
-
-# Nominal memory reported to vLLM scheduler for STT models.
-# No KV cache is actually allocated; this just passes minimum-memory checks.
-STT_SCHED_AVAILABLE_BYTES = 1 << 30  # 1 GiB
-
-# Block size reported to vLLM for STT models (minimal, no real KV cache).
-STT_SCHED_BLOCK_BYTES = 1
 
 # Officially supported languages (OpenAI docs subset).
 # fmt: off
@@ -59,62 +40,6 @@ def get_whisper_languages() -> dict[str, str]:
 def get_supported_languages() -> set[str]:
     """Get officially supported language codes."""
     return _OFFICIALLY_SUPPORTED.copy()
-
-
-@dataclass
-class SpeechToTextConfig:
-    """Runtime configuration for STT processing.
-
-    Controls audio chunking and energy-based splitting parameters.
-    """
-
-    max_audio_clip_s: float = 30.0
-    overlap_chunk_second: float = 1.0
-    min_energy_split_window_size: int = 1600
-    # Deprecated: Whisper requires 16kHz; this field is ignored.
-    sample_rate: int = 16000
-
-    def __post_init__(self) -> None:
-        """Validate runtime chunking parameters."""
-        if self.max_audio_clip_s <= 0:
-            raise ValueError("max_audio_clip_s must be > 0")
-        if self.overlap_chunk_second < 0:
-            raise ValueError("overlap_chunk_second must be >= 0")
-        if self.overlap_chunk_second >= self.max_audio_clip_s:
-            raise ValueError("overlap_chunk_second must be < max_audio_clip_s")
-        if self.min_energy_split_window_size <= 0:
-            raise ValueError("min_energy_split_window_size must be > 0")
-
-
-def is_stt_model(model_path: str) -> bool:
-    """Return ``True`` if *model_path* points to a Speech-to-Text model.
-
-    Detection is based on ``model_type`` in the model's ``config.json``.
-    Falls back to ``False`` if the config cannot be read.
-    """
-    p = Path(model_path)
-    config_file = p / "config.json" if p.is_dir() else None
-
-    # For HuggingFace hub IDs, try downloading config.json
-    if config_file is None or not config_file.exists():
-        try:
-            from huggingface_hub import hf_hub_download
-
-            config_file = Path(
-                hf_hub_download(repo_id=model_path, filename="config.json")
-            )
-        except (ImportError, OSError, ValueError):
-            return False
-
-    if config_file is None or not config_file.exists():
-        return False
-
-    try:
-        with open(config_file) as f:
-            cfg = json.load(f)
-        return cfg.get("model_type", "").lower() in _STT_MODEL_TYPES
-    except (OSError, json.JSONDecodeError, KeyError):
-        return False
 
 
 def validate_language(
