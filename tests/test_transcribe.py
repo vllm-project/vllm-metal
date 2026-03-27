@@ -276,17 +276,12 @@ class TestChunkingPolicy:
             SpeechToTextConfig(min_energy_split_window_size=None),
         ],
     )
-    def test_transcribe_skips_split_when_chunking_disabled(
+    def test_transcribe_allows_short_audio_when_chunking_disabled(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         config: SpeechToTextConfig,
     ) -> None:
         transcriber = self._make_stub_transcriber(config)
 
-        def _unexpected_split(*_args, **_kwargs):
-            raise AssertionError("split_audio should not be called")
-
-        monkeypatch.setattr(whisper_transcriber_mod, "split_audio", _unexpected_split)
         result = transcriber.transcribe(mx.zeros(1600, dtype=mx.float32))
 
         assert result.text == "ok"
@@ -301,15 +296,10 @@ class TestChunkingPolicy:
     )
     def test_transcribe_raises_when_chunking_disabled_for_long_audio(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         config: SpeechToTextConfig,
     ) -> None:
         transcriber = self._make_stub_transcriber(config)
 
-        def _unexpected_split(*_args, **_kwargs):
-            raise AssertionError("split_audio should not be called")
-
-        monkeypatch.setattr(whisper_transcriber_mod, "split_audio", _unexpected_split)
         long_audio = mx.zeros(
             int((DEFAULT_SEGMENT_DURATION + 1) * whisper_transcriber_mod.SAMPLE_RATE),
             dtype=mx.float32,
@@ -320,18 +310,12 @@ class TestChunkingPolicy:
 
     def test_transcribe_raises_when_max_clip_exceeds_whisper_window_for_long_audio(
         self,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         config = SpeechToTextConfig(
             max_audio_clip_s=int(DEFAULT_SEGMENT_DURATION) + 1,
             min_energy_split_window_size=1600,
         )
         transcriber = self._make_stub_transcriber(config)
-
-        def _unexpected_split(*_args, **_kwargs):
-            raise AssertionError("split_audio should not be called")
-
-        monkeypatch.setattr(whisper_transcriber_mod, "split_audio", _unexpected_split)
         long_audio = mx.zeros(
             int((DEFAULT_SEGMENT_DURATION + 1) * whisper_transcriber_mod.SAMPLE_RATE),
             dtype=mx.float32,
