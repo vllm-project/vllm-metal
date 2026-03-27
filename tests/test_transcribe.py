@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from vllm.config import SpeechToTextConfig
 
+import vllm_metal.stt.whisper.transcriber as whisper_transcriber_mod
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.protocol import TranscriptionResult
 from vllm_metal.stt.whisper import WhisperTranscriber
@@ -249,6 +251,45 @@ class TestResolveDecodeOptions:
         with pytest.raises(ValueError, match="only support English transcription"):
             transcriber._resolve_decode_options("fr", "transcribe")
 
+
+class TestChunkingPolicy:
+    """Tests for chunking behavior with upstream SpeechToTextConfig."""
+
+    @staticmethod
+    def _make_stub_transcriber(config: SpeechToTextConfig) -> WhisperTranscriber:
+        tokenizer = SimpleNamespace(decode=lambda *_args, **_kwargs: "ok")
+        transcriber = WhisperTranscriber(
+            model=SimpleNamespace(is_multilingual=True),
+            model_path=None,
+            config=config,
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+        )
+        transcriber._encode_chunk = lambda _chunk: mx.zeros((1, 1, 1), dtype=mx.float32)  # type: ignore[method-assign]
+        transcriber._greedy_decode = (lambda *_args, **_kwargs: [1])  # type: ignore[method-assign]
+        return transcriber
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            SpeechToTextConfig(max_audio_clip_s=None),
+            SpeechToTextConfig(min_energy_split_window_size=None),
+        ],
+    )
+    def test_transcribe_skips_split_when_chunking_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        config: SpeechToTextConfig,
+    ) -> None:
+        transcriber = self._make_stub_transcriber(config)
+
+        def _unexpected_split(*_args, **_kwargs):
+            raise AssertionError("split_audio should not be called")
+
+        monkeypatch.setattr(whisper_transcriber_mod, "split_audio", _unexpected_split)
+        result = transcriber.transcribe(mx.zeros(1600, dtype=mx.float32))
+
+        assert result.text == "ok"
+        assert result.duration > 0
 
 # ===========================================================================
 # Greedy decode and encode chunk (require tiny model)

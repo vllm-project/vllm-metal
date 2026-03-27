@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
-from vllm_metal.stt.config import is_stt_model
+from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.qwen3_asr.config import (
     Qwen3ASRAudioConfig,

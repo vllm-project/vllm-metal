@@ -17,6 +17,18 @@ from vllm_metal.v1.worker import MetalWorker
 class TestMetalPlatform:
     """Tests for MetalPlatform class."""
 
+    @staticmethod
+    def _patch_stt_resolution(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        is_stt: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            "vllm_metal.platform.get_model_download_path",
+            lambda model: model,
+        )
+        monkeypatch.setattr("vllm_metal.platform.is_stt_model", lambda _model: is_stt)
+
     def test_device_name(self) -> None:
         """Test device name retrieval."""
         name = MetalPlatform.get_device_name()
@@ -138,12 +150,7 @@ class TestMetalPlatform:
         least max_model_len so the scheduler can schedule the entire prompt
         in a single step.
         """
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: False)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -184,12 +191,7 @@ class TestMetalPlatform:
         than max_model_len, it must be raised to match max_model_len so that
         the scheduler can schedule the full prompt in a single step.
         """
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: False)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -225,12 +227,7 @@ class TestMetalPlatform:
         If the user has explicitly set a token budget larger than max_model_len,
         that setting must be preserved.
         """
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: False)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -270,12 +267,7 @@ class TestMetalPlatform:
         max_model_len, that setting must be preserved (only values strictly
         below max_model_len are bumped up).
         """
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: False)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -310,12 +302,7 @@ class TestMetalPlatform:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """STT models should get tokenizer fallback and async scheduling disabled."""
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: True)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -343,12 +330,7 @@ class TestMetalPlatform:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """STT policy should not overwrite an explicitly configured tokenizer."""
-        import vllm_metal.stt.config as stt_config
-        import vllm_metal.utils as metal_utils
-
-        monkeypatch.setattr(metal_utils, "get_model_download_path", lambda model: model)
-        monkeypatch.setattr(stt_config, "is_stt_model", lambda _model: True)
-
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",

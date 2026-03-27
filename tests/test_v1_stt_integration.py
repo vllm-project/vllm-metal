@@ -21,8 +21,8 @@ from vllm_metal.stt.audio import (  # noqa: E402
     log_mel_spectrogram,
     pad_or_trim,
 )
-from vllm_metal.stt.config import STT_SCHED_BLOCK_BYTES  # noqa: E402
 from vllm_metal.stt.loader import load_model  # noqa: E402
+from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES  # noqa: E402
 from vllm_metal.stt.runtime import STTRuntimeAdapter  # noqa: E402
 from vllm_metal.v1.model_runner import MetalModelRunner  # noqa: E402
 

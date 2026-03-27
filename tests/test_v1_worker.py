@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
-from vllm_metal.stt.config import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
+from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
 
