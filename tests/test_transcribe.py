@@ -324,7 +324,7 @@ class TestChunkingPolicy:
         with pytest.raises(ValueError, match="max_audio_clip_s="):
             transcriber.transcribe(long_audio)
 
-    def test_transcribe_allows_short_audio_when_max_clip_exceeds_whisper_window(
+    def test_transcribe_raises_when_max_clip_exceeds_whisper_window_for_short_audio(
         self,
     ) -> None:
         config = SpeechToTextConfig(
@@ -337,10 +337,8 @@ class TestChunkingPolicy:
             dtype=mx.float32,
         )
 
-        result = transcriber.transcribe(short_audio)
-
-        assert result.text == "ok"
-        assert result.duration == pytest.approx(DEFAULT_SEGMENT_DURATION - 1)
+        with pytest.raises(ValueError, match="max_audio_clip_s="):
+            transcriber.transcribe(short_audio)
 
 
 # ===========================================================================

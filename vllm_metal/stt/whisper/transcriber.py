@@ -14,6 +14,7 @@ from vllm.config import SpeechToTextConfig
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
+    N_SAMPLES,
     SAMPLE_RATE,
     audio_duration,
     load_audio,
@@ -133,7 +134,7 @@ class WhisperTranscriber:
     def _prepare_audio_chunks(self, audio: mx.array) -> list[tuple[mx.array, float]]:
         """Return one chunk or split chunks based on STT chunking policy."""
         audio_samples = audio.shape[0]
-        max_chunk_samples = int(DEFAULT_SEGMENT_DURATION * SAMPLE_RATE)
+        max_chunk_samples = N_SAMPLES
         max_clip_s = self.config.max_audio_clip_s
         window_size = self.config.min_energy_split_window_size
 
@@ -147,10 +148,10 @@ class WhisperTranscriber:
                 )
             return [(audio, 0.0)]
 
-        if max_clip_s > DEFAULT_SEGMENT_DURATION and audio_samples > max_chunk_samples:
+        if max_clip_s > DEFAULT_SEGMENT_DURATION:
             raise ValueError(
                 f"max_audio_clip_s={max_clip_s} exceeds Whisper's "
-                f"{DEFAULT_SEGMENT_DURATION:.0f}s encoder window for long audio. "
+                f"{DEFAULT_SEGMENT_DURATION:.0f}s encoder window. "
                 "Set max_audio_clip_s <= 30 for Whisper."
             )
 
