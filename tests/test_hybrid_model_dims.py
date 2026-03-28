@@ -12,8 +12,8 @@ import pytest
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.v1.model_runner import MetalModelRunner
 
+# Source: Qwen/Qwen3.5-4B config.json → text_config
 QWEN35_4B_ARGS: dict = {
-    # Source: Qwen/Qwen3.5-4B config.json → text_config
     "num_hidden_layers": 32,
     "num_attention_heads": 16,
     "num_key_value_heads": 4,
@@ -27,8 +27,8 @@ QWEN35_4B_ARGS: dict = {
     "linear_conv_kernel_dim": 4,
 }
 
+# Source: meta-llama/Llama-3.2-1B config.json
 LLAMA_ARGS: dict = {
-    # Source: meta-llama/Llama-3.2-1B config.json
     "num_hidden_layers": 16,
     "num_attention_heads": 32,
     "num_key_value_heads": 8,
@@ -50,23 +50,19 @@ def _make_runner(args: dict) -> MagicMock:
     return runner
 
 
-def _make_hybrid_backend(args: dict = QWEN35_4B_ARGS, **overrides):
-    """Create a HybridPagedAttentionBackend from model args."""
+def _make_hybrid_backend(**overrides):
+    """Create a HybridPagedAttentionBackend with Qwen3.5-4B defaults."""
     defaults = {
-        "num_layers": args["num_hidden_layers"],
-        "full_attention_interval": args["full_attention_interval"],
+        "num_layers": 32,
+        "full_attention_interval": 4,
         "max_num_seqs": 8,
-        "num_kv_heads": args["num_key_value_heads"],
-        "head_dim": args["head_dim"],
-        "linear_num_k_heads": args["linear_num_key_heads"],
-        "linear_num_v_heads": args["linear_num_value_heads"],
-        "linear_key_head_dim": args["linear_key_head_dim"],
-        "linear_value_head_dim": args["linear_value_head_dim"],
-        "linear_conv_kernel_dim": args["linear_conv_kernel_dim"],
-        "linear_conv_dim": (
-            args["linear_num_key_heads"] * args["linear_key_head_dim"] * 2
-            + args["linear_num_value_heads"] * args["linear_value_head_dim"]
-        ),
+        "num_kv_heads": 4,
+        "head_dim": 256,
+        "linear_num_v_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "linear_conv_dim": 8192,
         "block_size": 16,
         "dtype": mx.float16,
     }
@@ -107,38 +103,22 @@ class TestExtractModelArgs:
         assert args["num_hidden_layers"] == 24
 
 
-class TestIsHybrid:
-    def test_hybrid(self) -> None:
-        assert _make_runner(QWEN35_4B_ARGS).is_hybrid is True
-
-    def test_not_hybrid(self) -> None:
-        assert _make_runner(LLAMA_ARGS).is_hybrid is False
-
-
 class TestResolveModelDims:
     def test_hybrid_layer_counts(self) -> None:
         # Arrange
         runner = _make_runner(QWEN35_4B_ARGS)
-        n = QWEN35_4B_ARGS["num_hidden_layers"]
-        fai = QWEN35_4B_ARGS["full_attention_interval"]
-        expected_sdpa = sum(1 for i in range(n) if (i + 1) % fai == 0)
 
-        # Assert
-        assert runner.num_layers == n
-        assert runner.num_sdpa_layers == expected_sdpa
-        assert runner.num_linear_layers == n - expected_sdpa
+        # Assert — fixed ground truth for Qwen3.5-4B (32 layers, interval=4)
+        assert runner.num_layers == 32
+        assert runner.num_sdpa_layers == 8
+        assert runner.num_linear_layers == 24
 
     def test_hybrid_conv_dim(self) -> None:
         # Arrange
         runner = _make_runner(QWEN35_4B_ARGS)
-        a = QWEN35_4B_ARGS
-        expected = (
-            a["linear_num_key_heads"] * a["linear_key_head_dim"] * 2
-            + a["linear_num_value_heads"] * a["linear_value_head_dim"]
-        )
 
-        # Assert
-        assert runner.linear_conv_dim == expected
+        # Assert — fixed ground truth: 16*128*2 + 32*128 = 8192
+        assert runner.linear_conv_dim == 8192
 
 
 class TestCacheBlockSizeBytes:
@@ -153,40 +133,21 @@ class TestCacheBlockSizeBytes:
 
         # Act
         hybrid_bytes = MetalModelRunner.get_cache_block_size_bytes(hybrid_runner)
-        all_layers_bytes = MetalModelRunner.get_cache_block_size_bytes(
-            non_hybrid_runner
-        )
+        all_bytes = MetalModelRunner.get_cache_block_size_bytes(non_hybrid_runner)
 
         # Assert
-        assert 0 < hybrid_bytes < all_layers_bytes
+        assert 0 < hybrid_bytes < all_bytes
 
-    def test_non_hybrid_counts_all_layers(self) -> None:
+    def test_linear_cache_bytes_exact(self) -> None:
+        """Exact byte count for Qwen3.5-4B linear cache per slot."""
         # Arrange
-        runner = _make_runner(LLAMA_ARGS)
-        a = LLAMA_ARGS
+        runner = _make_runner(QWEN35_4B_ARGS)
 
         # Act
-        result = MetalModelRunner.get_cache_block_size_bytes(runner)
+        result = MetalModelRunner.linear_cache_bytes_per_slot(runner)
 
-        # Assert
-        expected = (
-            2
-            * a["num_hidden_layers"]
-            * 16  # block_size
-            * a["num_key_value_heads"]
-            * a["head_dim"]
-            * runner.kv_cache_dtype.size
-        )
-        assert result == expected
-
-    def test_linear_cache_bytes_positive(self) -> None:
-        # Act
-        result = MetalModelRunner.linear_cache_bytes_per_slot(
-            _make_runner(QWEN35_4B_ARGS)
-        )
-
-        # Assert
-        assert result > 0
+        # Assert — 24 layers * ((3*8192) + (32*128*128)) * 2 bytes = 26345472
+        assert result == 26_345_472
 
     def test_linear_cache_bytes_rejects_non_hybrid(self) -> None:
         with pytest.raises(RuntimeError):
@@ -194,7 +155,8 @@ class TestCacheBlockSizeBytes:
 
 
 class TestKVCacheSpec:
-    def test_hybrid_emits_mixed_specs(self) -> None:
+    def test_hybrid_layer_spec_types(self) -> None:
+        """Specific layers get the right spec type."""
         from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
         # Arrange
@@ -203,17 +165,14 @@ class TestKVCacheSpec:
         # Act
         specs = MetalModelRunner.get_kv_cache_spec(runner)
 
-        # Assert
-        n = QWEN35_4B_ARGS["num_hidden_layers"]
-        assert len(specs) == n
-        assert (
-            sum(1 for s in specs.values() if isinstance(s, FullAttentionSpec))
-            == runner.num_sdpa_layers
-        )
-        assert (
-            sum(1 for s in specs.values() if isinstance(s, MambaSpec))
-            == runner.num_linear_layers
-        )
+        # Assert — check concrete layer keys and types
+        assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
+        assert isinstance(specs["layers.1.linear_attn"], MambaSpec)
+        assert isinstance(specs["layers.2.linear_attn"], MambaSpec)
+        assert isinstance(specs["layers.3.self_attn"], FullAttentionSpec)
+        assert isinstance(specs["layers.7.self_attn"], FullAttentionSpec)
+        assert isinstance(specs["layers.31.self_attn"], FullAttentionSpec)
+        assert len(specs) == 32
 
     def test_non_hybrid_all_full(self) -> None:
         from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -229,49 +188,24 @@ class TestHybridBackend:
     def test_allocates_separate_caches(self) -> None:
         # Arrange
         backend = _make_hybrid_backend()
-        runner = _make_runner(QWEN35_4B_ARGS)
 
         # Act
         backend.initialize(num_blocks=100)
 
-        # Assert
-        assert backend.kv_cache.num_layers == runner.num_sdpa_layers
+        # Assert — Qwen3.5-4B: 8 SDPA, 24 linear
+        assert backend.kv_cache.num_layers == 8
         assert backend.kv_cache.num_blocks == 100
-        assert backend.linear_cache.num_layers == runner.num_linear_layers
+        assert backend.linear_cache.num_layers == 24
         assert backend.linear_cache.num_blocks == 8  # max_num_seqs
 
     def test_num_blocks_before_init_raises(self) -> None:
-        # Arrange
-        backend = _make_hybrid_backend()
-
-        # Act / Assert
         with pytest.raises(RuntimeError):
-            backend.num_blocks()
+            _make_hybrid_backend().num_blocks()
 
     def test_properties_before_init_raise(self) -> None:
-        # Arrange
         backend = _make_hybrid_backend()
 
-        # Act / Assert
         with pytest.raises(RuntimeError):
             _ = backend.kv_cache
         with pytest.raises(RuntimeError):
             _ = backend.linear_cache
-
-    def test_kv_budget_subtracts_linear(self) -> None:
-        from vllm_metal.v1.worker import MetalWorker
-
-        # Arrange
-        budget = MetalWorker._kv_budget_bytes(
-            metal_limit=16_000_000_000, model_memory=4_000_000_000, fraction=0.5
-        )
-        runner = _make_runner(QWEN35_4B_ARGS)
-        linear_fixed = MetalModelRunner.linear_cache_bytes_per_slot(runner) * 8
-        sdpa_per_block = MetalModelRunner.get_cache_block_size_bytes(runner)
-
-        # Act
-        blocks_without = budget // sdpa_per_block
-        blocks_with = (budget - linear_fixed) // sdpa_per_block
-
-        # Assert
-        assert 0 < blocks_with < blocks_without

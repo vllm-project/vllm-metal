@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import mlx.core as mx
+import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -28,19 +29,20 @@ from vllm_metal.paged_attention_backend.mha import warm_up_paged_cache
 logger = init_logger(__name__)
 
 
-def build_linear_layer_spec(runner: Any, torch_dtype: Any) -> Any:
-    """Build a MambaSpec for one GDN linear attention layer.
-
-    Keeps model-family-specific shape construction out of ModelRunner.
-    """
+def build_linear_layer_spec(
+    *,
+    conv_kernel_dim: int,
+    conv_dim: int,
+    num_v_heads: int,
+    value_head_dim: int,
+    key_head_dim: int,
+    torch_dtype: torch.dtype,
+) -> MambaSpec:
+    """Build a MambaSpec for one GDN linear attention layer."""
     return MambaSpec(
         shapes=(
-            (runner.linear_conv_kernel_dim - 1, runner.linear_conv_dim),
-            (
-                runner.linear_num_v_heads,
-                runner.linear_value_head_dim,
-                runner.linear_key_head_dim,
-            ),
+            (conv_kernel_dim - 1, conv_dim),
+            (num_v_heads, value_head_dim, key_head_dim),
         ),
         dtypes=(torch_dtype, torch_dtype),
         block_size=1,
@@ -60,7 +62,6 @@ class HybridPagedAttentionBackend:
         num_kv_heads: int,
         head_dim: int,
         # GDN dims
-        linear_num_k_heads: int,
         linear_num_v_heads: int,
         linear_key_head_dim: int,
         linear_value_head_dim: int,
@@ -140,14 +141,19 @@ class HybridPagedAttentionBackend:
     def patch_model(self, model: Any) -> int:
         cache = self._require_initialized("patch_model")
 
-        # Map SDPA layer indices to compact cache indices so the wrapper
-        # indexes into the compact MetalPagedKVCache correctly.
+        # Only patch SDPA layers.  Linear attention layers are left
+        # unpatched (they keep their original mlx_lm forward) until
+        # Stage C wires the linear attention kernel.
         sdpa_cache_idx = {
             layer_idx: cache_idx
             for cache_idx, layer_idx in enumerate(self._sdpa_indices)
         }
         return patch_model_attention_metal_kernel(
-            model, cache, self._block_size, cache_idx_map=sdpa_cache_idx
+            model,
+            cache,
+            self._block_size,
+            cache_idx_map=sdpa_cache_idx,
+            only_layers=self._sdpa_indices,
         )
 
     def warm_up(self) -> None:

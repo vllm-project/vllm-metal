@@ -102,6 +102,7 @@ def patch_model_attention_metal_kernel(
     block_size: int,
     *,
     cache_idx_map: dict[int, int] | None = None,
+    only_layers: list[int] | None = None,
 ) -> int:
     """Walk model layers and replace each attention module with a
     ``MetalKernelPagedAttentionWrapper``.
@@ -114,13 +115,20 @@ def patch_model_attention_metal_kernel(
             cache index.  Used by ``HybridPagedAttentionBackend`` so that
             a compact ``MetalPagedKVCache`` (SDPA layers only) is indexed
             correctly.  When ``None``, ``layer_idx`` is used directly.
+        only_layers: If provided, only patch these layer indices and skip
+            the rest.  Used by hybrid backend to avoid wrapping linear
+            attention layers that have no kernel implementation yet.
 
     Returns the number of patched layers.
     """
     layer_list = find_layers(model)
+    only_set = set(only_layers) if only_layers is not None else None
     patched = 0
 
     for layer_idx, layer in enumerate(layer_list):
+        if only_set is not None and layer_idx not in only_set:
+            continue
+
         attn_attr = find_attn_attr(layer)
         if attn_attr is None:
             continue

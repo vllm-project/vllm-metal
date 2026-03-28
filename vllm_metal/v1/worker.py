@@ -298,7 +298,6 @@ class MetalWorker(WorkerBase):
                 max_num_seqs=runner.scheduler_config.max_num_seqs,
                 num_kv_heads=runner.num_kv_heads,
                 head_dim=runner.head_dim,
-                linear_num_k_heads=runner.linear_num_k_heads,
                 linear_num_v_heads=runner.linear_num_v_heads,
                 linear_key_head_dim=runner.linear_key_head_dim,
                 linear_value_head_dim=runner.linear_value_head_dim,

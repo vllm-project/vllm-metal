@@ -1020,7 +1020,14 @@ class MetalModelRunner:
         for layer_idx in range(self.num_layers):
             if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
                 layer_name = f"layers.{layer_idx}.linear_attn"
-                specs[layer_name] = build_linear_layer_spec(self, torch_dtype)
+                specs[layer_name] = build_linear_layer_spec(
+                    conv_kernel_dim=self.linear_conv_kernel_dim,
+                    conv_dim=self.linear_conv_dim,
+                    num_v_heads=self.linear_num_v_heads,
+                    value_head_dim=self.linear_value_head_dim,
+                    key_head_dim=self.linear_key_head_dim,
+                    torch_dtype=torch_dtype,
+                )
             else:
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
