@@ -679,6 +679,16 @@ class MetalModelRunner:
         return "kv_lora_rank" in self.model_args
 
     @property
+    def is_hybrid(self) -> bool:
+        """Whether the model mixes SDPA and linear attention layers.
+
+        Hybrid models (Qwen3.5) have ``full_attention_interval`` in their
+        config: every N-th layer uses SDPA, the rest use GDN linear attention.
+        """
+        fai = self.model_args.get("full_attention_interval", 0)
+        return isinstance(fai, int) and fai > 0
+
+    @property
     def mla_latent_dim(self) -> int:
         """Combined latent dimension for MLA cache: kv_lora_rank + qk_rope_head_dim.
 
@@ -866,6 +876,13 @@ class MetalModelRunner:
                 "Cannot extract model config: model has neither .args nor "
                 ".config attribute."
             )
+        # Merge nested text_config (Qwen3.5, VLMs) into top-level args.
+        # setdefault preserves any top-level keys that already exist.
+        tc = self.model_args.get("text_config")
+        if isinstance(tc, dict):
+            for k, v in tc.items():
+                self.model_args.setdefault(k, v)
+
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
 
@@ -925,6 +942,27 @@ class MetalModelRunner:
                 args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
 
+        # Hybrid (Qwen3.5): mix of SDPA and GDN linear attention layers.
+        # Store per-type layer counts and GDN dimensions for cache allocation.
+        if self.is_hybrid:
+            fai = int(args["full_attention_interval"])
+            self.full_attention_interval: int = fai
+            self.sdpa_layer_indices: frozenset[int] = frozenset(
+                i for i in range(self.num_layers) if (i + 1) % fai == 0
+            )
+            self.num_sdpa_layers = len(self.sdpa_layer_indices)
+            self.num_linear_layers = self.num_layers - self.num_sdpa_layers
+            self.linear_num_k_heads: int = int(args["linear_num_key_heads"])
+            self.linear_num_v_heads: int = int(args["linear_num_value_heads"])
+            self.linear_key_head_dim: int = int(args["linear_key_head_dim"])
+            self.linear_value_head_dim: int = int(args["linear_value_head_dim"])
+            self.linear_conv_kernel_dim: int = int(args["linear_conv_kernel_dim"])
+            # Derived: total conv1d channel width (key_dim*2 + value_dim)
+            self.linear_conv_dim: int = (
+                self.linear_num_k_heads * self.linear_key_head_dim * 2
+                + self.linear_num_v_heads * self.linear_value_head_dim
+            )
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -971,16 +1009,31 @@ class MetalModelRunner:
 
         torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
 
-        # Create a spec for each layer
+        if self.is_hybrid:
+            from vllm_metal.paged_attention_backend.hybrid import (
+                build_linear_layer_spec,
+            )
+
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
-            layer_name = f"layers.{layer_idx}.self_attn"
-            specs[layer_name] = FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                dtype=torch_dtype,
-            )
+            if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
+                layer_name = f"layers.{layer_idx}.linear_attn"
+                specs[layer_name] = build_linear_layer_spec(
+                    conv_kernel_dim=self.linear_conv_kernel_dim,
+                    conv_dim=self.linear_conv_dim,
+                    num_v_heads=self.linear_num_v_heads,
+                    value_head_dim=self.linear_value_head_dim,
+                    key_head_dim=self.linear_key_head_dim,
+                    torch_dtype=torch_dtype,
+                )
+            else:
+                layer_name = f"layers.{layer_idx}.self_attn"
+                specs[layer_name] = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_dim,
+                    dtype=torch_dtype,
+                )
 
         return specs
 
@@ -1006,19 +1059,39 @@ class MetalModelRunner:
 
         block_size = self.metal_config.block_size
 
-        # Each block stores key and value for all layers
-        # Block memory = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+        # Each block stores key and value for SDPA layers only.
+        # Hybrid models (Qwen3.5) have linear attention layers that use
+        # fixed-size recurrent state, not paged KV — exclude them.
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
+        num_kv_layers = self.num_sdpa_layers if self.is_hybrid else self.num_layers
         return (
             2
-            * self.num_layers
+            * num_kv_layers
             * block_size
             * self.num_kv_heads
             * self.head_dim
             * dtype_size
         )
+
+    def linear_cache_bytes_per_slot(self) -> int:
+        """Bytes for one request's linear attention state across all GDN layers."""
+        if not self.is_hybrid:
+            raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
+        if self.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
+        dtype_size = self.kv_cache_dtype.size
+        conv_bytes = (
+            (self.linear_conv_kernel_dim - 1) * self.linear_conv_dim * dtype_size
+        )
+        recurrent_bytes = (
+            self.linear_num_v_heads
+            * self.linear_value_head_dim
+            * self.linear_key_head_dim
+            * dtype_size
+        )
+        return self.num_linear_layers * (conv_bytes + recurrent_bytes)
 
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.

@@ -27,6 +27,7 @@ from vllm_metal.config import (
     PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
@@ -174,6 +175,14 @@ class MetalWorker(WorkerBase):
         runner = self.model_runner
         block_size = self.metal_config.block_size
 
+        if runner.is_hybrid:
+            raise RuntimeError(
+                "Paged attention is not yet supported for hybrid models "
+                "(Qwen3.5). Linear attention kernel is not implemented "
+                "(Stage C of #194). Use the mlx_lm inline cache path instead "
+                "by unsetting VLLM_METAL_USE_PAGED_ATTENTION."
+            )
+
         # --- Determine memory fraction ---
         if self.metal_config.is_auto_memory:
             fraction = PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
@@ -207,6 +216,16 @@ class MetalWorker(WorkerBase):
         usable_metal = int(metal_limit * fraction)
         kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
 
+        # For hybrid models, subtract the fixed linear cache cost first.
+        # Linear state is O(1) per request (not per token), so it's a
+        # fixed allocation based on max_num_seqs.
+        linear_cache_bytes = 0
+        if runner.is_hybrid:
+            linear_cache_bytes = runner.linear_cache_bytes_per_slot() * (
+                runner.scheduler_config.max_num_seqs
+            )
+            kv_budget -= linear_cache_bytes
+
         if kv_budget <= 0:
             raise ValueError(
                 "Paged attention: not enough Metal memory for KV cache. "
@@ -214,6 +233,7 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
+                f"linear_cache={linear_cache_bytes / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
@@ -260,45 +280,54 @@ class MetalWorker(WorkerBase):
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
+        backend = self._make_backend(runner, block_size)
+        backend.initialize(num_blocks)
+        n_patched = backend.patch_model(runner.model)
+        logger.info(
+            "Paged attention enabled: %d layers patched, "
+            "%d blocks allocated (block_size=%d, hybrid=%s, mla=%s)",
+            n_patched,
+            num_blocks,
+            block_size,
+            runner.is_hybrid,
+            runner.is_mla,
+        )
+
+        runner._paged_attention_backend = backend
+        runner._paged_block_size = block_size
+
+    @staticmethod
+    def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
+        """Create the right paged attention backend for the model type."""
+        if runner.is_hybrid:
+            return HybridPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                full_attention_interval=runner.full_attention_interval,
+                max_num_seqs=runner.scheduler_config.max_num_seqs,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                linear_num_v_heads=runner.linear_num_v_heads,
+                linear_key_head_dim=runner.linear_key_head_dim,
+                linear_value_head_dim=runner.linear_value_head_dim,
+                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
+                linear_conv_dim=runner.linear_conv_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
         if runner.is_mla:
-            backend = MLAPagedAttentionBackend(
+            return MLAPagedAttentionBackend(
                 num_layers=runner.num_layers,
                 latent_dim=runner.mla_latent_dim,
                 block_size=block_size,
                 dtype=runner.kv_cache_dtype,
             )
-        else:
-            backend = MHAPagedAttentionBackend(
-                num_layers=runner.num_layers,
-                num_kv_heads=runner.num_kv_heads,
-                head_dim=runner.head_dim,
-                block_size=block_size,
-                dtype=runner.kv_cache_dtype,
-            )
-        backend.initialize(num_blocks)
-        n_patched = backend.patch_model(runner.model)
-        if runner.is_mla:
-            logger.info(
-                "MLA paged attention enabled: %d layers patched, "
-                "%d blocks allocated (block_size=%d, latent_dim=%d)",
-                n_patched,
-                num_blocks,
-                block_size,
-                runner.mla_latent_dim,
-            )
-        else:
-            logger.info(
-                "Metal kernel paged attention enabled: %d layers patched, "
-                "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
-                n_patched,
-                num_blocks,
-                block_size,
-                runner.num_kv_heads,
-                runner.head_dim,
-            )
-
-        runner._paged_attention_backend = backend
-        runner._paged_block_size = block_size
+        return MHAPagedAttentionBackend(
+            num_layers=runner.num_layers,
+            num_kv_heads=runner.num_kv_heads,
+            head_dim=runner.head_dim,
+            block_size=block_size,
+            dtype=runner.kv_cache_dtype,
+        )
 
     def _get_model_memory_usage(self) -> int:
         """Get current model memory usage from MLX.
