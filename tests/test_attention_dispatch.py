@@ -112,13 +112,14 @@ def test_find_layers_on_qwen3_model():
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="Linear attention (GatedDeltaNet) Metal kernel not yet implemented",
+    raises=RuntimeError,
+    reason="Hybrid model paged attention gated until Stage C (#194)",
     strict=True,
 )
 def test_qwen35_paged_attention_raises_on_linear_layers():
     """Loading Qwen/Qwen3.5-0.8B with paged attention raises
-    NotImplementedError on the linear attention layers."""
+    RuntimeError at setup — hybrid models are not yet supported on the
+    paged path (linear attention kernel is Stage C)."""
     from vllm import LLM, SamplingParams
 
     with pytest.MonkeyPatch.context() as mp:
