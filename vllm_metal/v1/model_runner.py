@@ -38,11 +38,10 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -60,6 +59,11 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.sampling_batch import (
+    DEFAULT_VOCAB_SIZE,
+    GREEDY_TEMPERATURE_EPS,
+    SamplingBatch,
+)
 
 logger = init_logger(__name__)
 
@@ -444,7 +448,7 @@ def _create_request_generator(
     """
     if sampling_params.seed is None:
         return None
-    if sampling_params.temperature < 1e-5:
+    if sampling_params.temperature < GREEDY_TEMPERATURE_EPS:
         return None
     generator = torch.Generator(device=device)
     generator.manual_seed(sampling_params.seed)
@@ -1061,116 +1065,16 @@ class MetalModelRunner:
         output_token_id_lists: list[list[int]],
         generators: dict[int, torch.Generator] | None = None,
     ) -> SamplingMetadata:
-        """Create SamplingMetadata from per-request SamplingParams.
-
-        Args:
-            sampling_params_list: List of SamplingParams, one per request
-            prompt_token_id_lists: Prompt token IDs per request (prefix used for
-                repetition penalty).
-            output_token_id_lists: Generated token IDs per request (used for
-                presence/frequency penalties, and also repetition penalty).
-            generators: Optional per-request torch generators keyed by batch index.
-                If omitted, sampler falls back to the global RNG for those entries.
-
-        Returns:
-            SamplingMetadata for the batch
-        """
-        batch_size = len(sampling_params_list)
-        if len(prompt_token_id_lists) != batch_size:
-            raise ValueError(
-                "Expected prompt token ids for each request in the batch "
-                f"(len(prompt_token_id_lists)={len(prompt_token_id_lists)} "
-                f"!= batch_size={batch_size})."
-            )
-        if len(output_token_id_lists) != batch_size:
-            raise ValueError(
-                "Expected output token ids for each request in the batch "
-                f"(len(output_token_id_lists)={len(output_token_id_lists)} "
-                f"!= batch_size={batch_size})."
-            )
-
-        # Determine sampling mode
-        all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        all_random = not all_greedy and all(
-            sp.temperature >= 1e-5 for sp in sampling_params_list
-        )
-
-        # Check if any penalties are applied
-        no_penalties = all(
-            sp.frequency_penalty == 0
-            and sp.presence_penalty == 0
-            and sp.repetition_penalty == 1.0
-            for sp in sampling_params_list
-        )
-
-        generators = generators or {}
-
-        # top_k: pass None if all values indicate no filtering
-        # -1 = vLLM default (no filtering), 0 = OpenAI API convention (no filtering)
-        # vLLM's sampler expects None to skip top-k entirely
-        top_k_values = [sp.top_k for sp in sampling_params_list]
-        top_k = (
-            None
-            if all(k <= 0 for k in top_k_values)
-            else torch.tensor(top_k_values, dtype=torch.int32, device=self.device)
-        )
-
-        # top_p: pass None if all values are 1.0 (no filtering)
-        # vLLM's sampler expects None to skip top-p entirely
-        top_p_values = [sp.top_p for sp in sampling_params_list]
-        top_p = (
-            None
-            if all(p == 1.0 for p in top_p_values)
-            else torch.tensor(top_p_values, dtype=torch.float32, device=self.device)
-        )
-
-        vocab_size = self.model_args.get("vocab_size", 32000)
-        prompt_token_ids_tensor = None
-        if not no_penalties:
-            prompt_token_ids_tensor = make_tensor_with_pad(
-                prompt_token_id_lists,
-                pad=vocab_size,
-                device=self.device,
-                dtype=torch.int64,
-                pin_memory=False,
-            )
-
-        return SamplingMetadata(
-            temperature=None
-            if all_greedy
-            else torch.tensor(
-                [sp.temperature for sp in sampling_params_list],
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            all_greedy=all_greedy,
-            all_random=all_random,
-            top_p=top_p,
-            top_k=top_k,
+        """Create SamplingMetadata from per-request SamplingParams."""
+        return SamplingBatch(
+            sampling_params_list,
+            prompt_token_id_lists,
+            output_token_id_lists,
+            vocab_size=self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE),
+            device=self.device,
+            logitsprocs=getattr(self, "_logitsprocs", None),
             generators=generators,
-            max_num_logprobs=None,
-            prompt_token_ids=prompt_token_ids_tensor,
-            output_token_ids=output_token_id_lists,
-            frequency_penalties=torch.tensor(
-                [sp.frequency_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            presence_penalties=torch.tensor(
-                [sp.presence_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            repetition_penalties=torch.tensor(
-                [sp.repetition_penalty for sp in sampling_params_list],
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            no_penalties=no_penalties,
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
-            logitsprocs=getattr(self, "_logitsprocs", None) or LogitsProcessors(),
-        )
+        ).make_sampling_metadata()
 
     def _prefill_single(
         self,
@@ -1231,17 +1135,7 @@ class MetalModelRunner:
         # Extract last token logits
         last_logits = logits[:, -1, :]
 
-        # Use native MLX greedy sampling when possible (avoids PyTorch round-trip)
-        is_greedy = sampling_params.temperature < 1e-5
-        needs_advanced_sampling = (
-            sampling_params.top_k > 0
-            or sampling_params.top_p < 1.0
-            or sampling_params.frequency_penalty != 0
-            or sampling_params.presence_penalty != 0
-            or sampling_params.repetition_penalty != 1.0
-        )
-
-        if is_greedy and not needs_advanced_sampling:
+        if SamplingBatch.can_use_native_greedy([sampling_params]):
             # Fast path: native MLX greedy sampling
             next_token_mlx = _mlx_greedy_sample(last_logits)
             # Single eval for logits, token, and cache state together
@@ -1302,18 +1196,7 @@ class MetalModelRunner:
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
         sampling_params_list = [state.sampling_params for _, state in decode_reqs]
 
-        # Check if all requests can use fast greedy sampling
-        all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        any_advanced = any(
-            sp.top_k > 0
-            or sp.top_p < 1.0
-            or sp.frequency_penalty != 0
-            or sp.presence_penalty != 0
-            or sp.repetition_penalty != 1.0
-            for sp in sampling_params_list
-        )
-
-        if all_greedy and not any_advanced:
+        if SamplingBatch.can_use_native_greedy(sampling_params_list):
             # Fast path: native MLX greedy sampling for entire batch
             next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
             # Single eval - no intermediate sync needed
@@ -1378,18 +1261,8 @@ class MetalModelRunner:
             logits = self._extract_logits(model_output)
             last_logits = logits[:, -1, :]
 
-            # Use native MLX greedy sampling when possible
             sp = state.sampling_params
-            is_greedy = sp.temperature < 1e-5
-            needs_advanced = (
-                sp.top_k > 0
-                or sp.top_p < 1.0
-                or sp.frequency_penalty != 0
-                or sp.presence_penalty != 0
-                or sp.repetition_penalty != 1.0
-            )
-
-            if is_greedy and not needs_advanced:
+            if SamplingBatch.can_use_native_greedy([sp]):
                 # Fast path: native MLX greedy sampling
                 next_token_mlx = _mlx_greedy_sample(last_logits)
                 mx.eval(next_token_mlx)
@@ -1486,17 +1359,7 @@ class MetalModelRunner:
             decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
 
             sampling_params_list = [state.sampling_params for _, state in decode_reqs]
-            all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-            any_advanced = any(
-                sp.top_k > 0
-                or sp.top_p < 1.0
-                or sp.frequency_penalty != 0
-                or sp.presence_penalty != 0
-                or sp.repetition_penalty != 1.0
-                for sp in sampling_params_list
-            )
-
-            if all_greedy and not any_advanced:
+            if SamplingBatch.can_use_native_greedy(sampling_params_list):
                 next_tokens_mlx = _mlx_greedy_sample(decode_logits)
                 mx.eval(next_tokens_mlx)
                 decode_next_tokens = next_tokens_mlx.tolist()
@@ -1550,16 +1413,7 @@ class MetalModelRunner:
             else:
                 prompt_len = len(pr.token_ids)
 
-            is_greedy = pr.sampling_params.temperature < 1e-5
-            needs_advanced = (
-                pr.sampling_params.top_k > 0
-                or pr.sampling_params.top_p < 1.0
-                or pr.sampling_params.frequency_penalty != 0
-                or pr.sampling_params.presence_penalty != 0
-                or pr.sampling_params.repetition_penalty != 1.0
-            )
-
-            if is_greedy and not needs_advanced:
+            if SamplingBatch.can_use_native_greedy([pr.sampling_params]):
                 next_token_mlx = _mlx_greedy_sample(last_logits[0])
                 mx.eval(next_token_mlx)
                 next_token = int(next_token_mlx.item())
@@ -2146,7 +2000,7 @@ class MetalModelRunner:
 
         # Create sampler based on temperature (mlx_lm 0.29+ uses sampler param)
         def sampler(logits: mx.array) -> mx.array:
-            if temperature < 1e-5:
+            if temperature < GREEDY_TEMPERATURE_EPS:
                 return mx.argmax(logits, axis=-1)
             return mx.random.categorical(logits / temperature)
 

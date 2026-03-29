@@ -17,6 +17,7 @@ from vllm_metal.v1.model_runner import (
     RequestState,
     _create_request_generator,
 )
+from vllm_metal.v1.sampling_batch import SamplingBatch
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -293,6 +294,44 @@ class TestV1SeededSamplingGenerator:
 
         assert not torch.equal(after_first, before)
         assert not torch.equal(after_second, after_first)
+
+
+class TestV1SamplingBatch:
+    def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
+        assert SamplingBatch.can_use_native_greedy([SamplingParams(temperature=0.0)])
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.8)]
+        )
+        # vLLM normalizes top-k/top-p back to no-op under greedy decoding.
+        assert SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, top_k=5)]
+        )
+        assert SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, top_p=0.9)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.8, top_k=5)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.8, top_p=0.9)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, presence_penalty=0.5)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, repetition_penalty=1.1)]
+        )
+
+    def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
+        assert SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0), SamplingParams(temperature=0.3)]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0), SamplingParams(temperature=0.8, top_k=4)]
+        )
 
 
 class TestV1SamplingMetadataLogitsProcessors:
