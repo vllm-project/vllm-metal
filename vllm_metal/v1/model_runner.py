@@ -47,13 +47,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
-from vllm_metal.v1.states import (
-    AnyCache,
-    RequestState,
-    SamplerOutput,
-    _create_request_generator,
-    _mlx_greedy_sample,
-)
+from vllm_metal.v1.sampling_utils import create_request_generator, mlx_greedy_sample
+from vllm_metal.v1.states import AnyCache, RequestState
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
@@ -1188,7 +1183,7 @@ class MetalModelRunner:
 
         if is_greedy and not needs_advanced_sampling:
             # Fast path: native MLX greedy sampling
-            next_token_mlx = _mlx_greedy_sample(last_logits)
+            next_token_mlx = mlx_greedy_sample(last_logits)
             # Single eval for logits, token, and cache state together
             mx.eval(next_token_mlx, *[c.state for c in cache])
             next_token = int(next_token_mlx.item())
@@ -1260,7 +1255,7 @@ class MetalModelRunner:
 
         if all_greedy and not any_advanced:
             # Fast path: native MLX greedy sampling for entire batch
-            next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
+            next_tokens_mlx = mlx_greedy_sample(next_token_logits)
             # Single eval - no intermediate sync needed
             mx.eval(next_tokens_mlx)
             next_tokens: list[int] = next_tokens_mlx.tolist()
@@ -1336,7 +1331,7 @@ class MetalModelRunner:
 
             if is_greedy and not needs_advanced:
                 # Fast path: native MLX greedy sampling
-                next_token_mlx = _mlx_greedy_sample(last_logits)
+                next_token_mlx = mlx_greedy_sample(last_logits)
                 mx.eval(next_token_mlx)
                 next_token = int(next_token_mlx.item())
             else:
@@ -1442,7 +1437,7 @@ class MetalModelRunner:
             )
 
             if all_greedy and not any_advanced:
-                next_tokens_mlx = _mlx_greedy_sample(decode_logits)
+                next_tokens_mlx = mlx_greedy_sample(decode_logits)
                 mx.eval(next_tokens_mlx)
                 decode_next_tokens = next_tokens_mlx.tolist()
             else:
@@ -1505,7 +1500,7 @@ class MetalModelRunner:
             )
 
             if is_greedy and not needs_advanced:
-                next_token_mlx = _mlx_greedy_sample(last_logits[0])
+                next_token_mlx = mlx_greedy_sample(last_logits[0])
                 mx.eval(next_token_mlx)
                 next_token = int(next_token_mlx.item())
             else:
@@ -1599,7 +1594,7 @@ class MetalModelRunner:
                 sampled_tokens.append([0])
                 continue
 
-            generator = _create_request_generator(self.device, sampling_params)
+            generator = create_request_generator(self.device, sampling_params)
 
             if self._paged_attention_backend is not None:
                 sched_block_ids = list(new_req.block_ids[0])
