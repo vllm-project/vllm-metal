@@ -110,3 +110,50 @@ class TestWorkerRunnerBoundaryDelegation:
 
         assert tasks == ("transcription",)
         model_runner.supported_worker_tasks.assert_called_once_with()
+
+
+class TestOneSequenceKvBytes:
+    """_one_sequence_kv_bytes must account for hybrid linear state."""
+
+    def test_non_hybrid_counts_all_layers(self) -> None:
+        # Arrange
+        import mlx.core as mx
+
+        model_runner = SimpleNamespace(
+            is_hybrid=False,
+            num_layers=16,
+            num_kv_heads=8,
+            head_dim=64,
+            kv_cache_dtype=mx.float16,
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+
+        # Act
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        # Assert — 2 * 16 * 2048 * 8 * 64 * 2
+        assert result == 2 * 16 * 2048 * 8 * 64 * 2
+
+    def test_hybrid_adds_linear_state(self) -> None:
+        # Arrange
+        import mlx.core as mx
+
+        linear_bytes = 1_000_000
+        model_runner = SimpleNamespace(
+            is_hybrid=True,
+            num_sdpa_layers=8,
+            num_kv_heads=4,
+            head_dim=256,
+            kv_cache_dtype=mx.float16,
+            linear_cache_bytes_per_slot=MagicMock(return_value=linear_bytes),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+
+        # Act
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        # Assert — SDPA bytes + linear state
+        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        assert result == sdpa_bytes + linear_bytes

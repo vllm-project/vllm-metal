@@ -328,19 +328,26 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of KV cache (K + V)."""
+        """Bytes for one max-length sequence of cache state."""
         runner = self.model_runner
-        dtype_size = (
-            runner.kv_cache_dtype.size if runner.kv_cache_dtype is not None else 2
+        if runner.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
+        dtype_size = runner.kv_cache_dtype.size
+
+        num_kv_layers = (
+            runner.num_sdpa_layers if runner.is_hybrid else runner.num_layers
         )
-        return (
-            2  # K and V
-            * runner.num_layers
+        sdpa_kv_bytes = (
+            2
+            * num_kv_layers
             * self.model_config.max_model_len
             * runner.num_kv_heads
             * runner.head_dim
             * dtype_size
         )
+        if runner.is_hybrid:
+            return sdpa_kv_bytes + runner.linear_cache_bytes_per_slot()
+        return sdpa_kv_bytes
 
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
