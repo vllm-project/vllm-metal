@@ -27,7 +27,6 @@ from vllm_metal.config import (
     PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
-from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
@@ -216,16 +215,6 @@ class MetalWorker(WorkerBase):
         usable_metal = int(metal_limit * fraction)
         kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
 
-        # For hybrid models, subtract the fixed linear cache cost first.
-        # Linear state is O(1) per request (not per token), so it's a
-        # fixed allocation based on max_num_seqs.
-        linear_cache_bytes = 0
-        if runner.is_hybrid:
-            linear_cache_bytes = runner.linear_cache_bytes_per_slot() * (
-                runner.scheduler_config.max_num_seqs
-            )
-            kv_budget -= linear_cache_bytes
-
         if kv_budget <= 0:
             raise ValueError(
                 "Paged attention: not enough Metal memory for KV cache. "
@@ -233,7 +222,6 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
-                f"linear_cache={linear_cache_bytes / 1e9:.2f}GB, "
                 f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
@@ -285,11 +273,10 @@ class MetalWorker(WorkerBase):
         n_patched = backend.patch_model(runner.model)
         logger.info(
             "Paged attention enabled: %d layers patched, "
-            "%d blocks allocated (block_size=%d, hybrid=%s, mla=%s)",
+            "%d blocks allocated (block_size=%d, mla=%s)",
             n_patched,
             num_blocks,
             block_size,
-            runner.is_hybrid,
             runner.is_mla,
         )
 
@@ -299,21 +286,6 @@ class MetalWorker(WorkerBase):
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
-        if runner.is_hybrid:
-            return HybridPagedAttentionBackend(
-                num_layers=runner.num_layers,
-                full_attention_interval=runner.full_attention_interval,
-                max_num_seqs=runner.scheduler_config.max_num_seqs,
-                num_kv_heads=runner.num_kv_heads,
-                head_dim=runner.head_dim,
-                linear_num_v_heads=runner.linear_num_v_heads,
-                linear_key_head_dim=runner.linear_key_head_dim,
-                linear_value_head_dim=runner.linear_value_head_dim,
-                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
-                linear_conv_dim=runner.linear_conv_dim,
-                block_size=block_size,
-                dtype=runner.kv_cache_dtype,
-            )
         if runner.is_mla:
             return MLAPagedAttentionBackend(
                 num_layers=runner.num_layers,

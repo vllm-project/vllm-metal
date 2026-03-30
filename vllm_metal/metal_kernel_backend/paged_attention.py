@@ -112,9 +112,9 @@ def patch_model_attention_metal_kernel(
 
     Args:
         cache_idx_map: Optional mapping from model layer_idx to compact
-            cache index.  Used by ``HybridPagedAttentionBackend`` so that
-            a compact ``MetalPagedKVCache`` (SDPA layers only) is indexed
-            correctly.  When ``None``, ``layer_idx`` is used directly.
+            cache index.  Used for hybrid models so that a compact
+            ``MetalPagedKVCache`` (SDPA layers only) is indexed correctly.
+            When ``None``, ``layer_idx`` is used directly.
         only_layers: If provided, only patch these layer indices and skip
             the rest.  Used by hybrid backend to avoid wrapping linear
             attention layers that have no kernel implementation yet.

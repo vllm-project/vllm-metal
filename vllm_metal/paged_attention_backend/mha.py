@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.metal import get_ops
+
 if TYPE_CHECKING:
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 
@@ -23,8 +25,6 @@ def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
 
     Shared by MHA and Hybrid backends to avoid duplicating warm-up logic.
     """
-    from vllm_metal.metal import get_ops
-
     macos_version = platform.mac_ver()[0]
     logger.info("Warming up paged attention Metal kernel...")
 

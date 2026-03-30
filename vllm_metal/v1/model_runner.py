@@ -47,6 +47,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.paged_attention_backend.hybrid import _build_linear_layer_spec
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
@@ -1011,16 +1012,11 @@ class MetalModelRunner:
 
         torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
 
-        if self.is_hybrid:
-            from vllm_metal.paged_attention_backend.hybrid import (
-                build_linear_layer_spec,
-            )
-
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
             if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
                 layer_name = f"layers.{layer_idx}.linear_attn"
-                specs[layer_name] = build_linear_layer_spec(
+                specs[layer_name] = _build_linear_layer_spec(
                     conv_kernel_dim=self.linear_conv_kernel_dim,
                     conv_dim=self.linear_conv_dim,
                     num_v_heads=self.linear_num_v_heads,
