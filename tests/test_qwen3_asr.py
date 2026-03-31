@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import mlx.core as mx
 import numpy as np
@@ -27,6 +29,48 @@ from vllm_metal.stt.qwen3_asr.model import (
     Qwen3LM,
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
+
+
+class TestQwen3ASRConfigAdaptation:
+    """Tests for adapting the upstream config into the local MLX config."""
+
+    def test_from_vllm_config_keeps_local_eos_default_when_upstream_omits_it(
+        self,
+    ) -> None:
+        upstream_config = SimpleNamespace(
+            thinker_config=SimpleNamespace(
+                audio_config=SimpleNamespace(
+                    d_model=896,
+                    num_mel_bins=128,
+                    encoder_layers=18,
+                    encoder_attention_heads=14,
+                    encoder_ffn_dim=3584,
+                    downsample_hidden_size=480,
+                    output_dim=1024,
+                    max_source_positions=1500,
+                    n_window=50,
+                    n_window_infer=800,
+                    activation_function="gelu",
+                ),
+                text_config=SimpleNamespace(
+                    hidden_size=1024,
+                    num_hidden_layers=28,
+                    num_attention_heads=16,
+                    num_key_value_heads=8,
+                    head_dim=128,
+                    intermediate_size=3072,
+                    vocab_size=151936,
+                    rms_norm_eps=1e-6,
+                    rope_theta=1000000.0,
+                    tie_word_embeddings=True,
+                ),
+                audio_token_id=151676,
+            )
+        )
+        config = Qwen3ASRConfig._from_vllm_config(cast(Any, upstream_config))
+
+        assert config.audio_token_id == 151676
+        assert config.eos_token_id == 151643
 
 
 class TestCNNOutputLengths:

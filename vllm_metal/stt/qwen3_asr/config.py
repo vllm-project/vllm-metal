@@ -113,14 +113,20 @@ class Qwen3ASRConfig:
             rope_theta=text.rope_theta,
             tie_word_embeddings=text.tie_word_embeddings,
         )
-        return cls(
-            audio_config=audio_cfg,
-            text_config=text_cfg,
-            audio_token_id=thinker.audio_token_id,
-            eos_token_id=config.eos_token_id,
-            n_mels=audio_cfg.num_mel_bins,
-            n_audio_ctx=audio_cfg.max_source_positions,
-        )
+        config_kwargs = {
+            "audio_config": audio_cfg,
+            "text_config": text_cfg,
+            "audio_token_id": thinker.audio_token_id,
+            "n_mels": audio_cfg.num_mel_bins,
+            "n_audio_ctx": audio_cfg.max_source_positions,
+        }
+        # The nested text config may omit eos_token_id entirely depending on how
+        # upstream constructs Qwen3-ASR configs. Preserve the local model
+        # default unless upstream exposes an explicit value here.
+        eos_token_id = getattr(text, "eos_token_id", None)
+        if eos_token_id is not None:
+            config_kwargs["eos_token_id"] = eos_token_id
+        return cls(**config_kwargs)
 
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3ASRConfig:
