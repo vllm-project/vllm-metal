@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
+from transformers.models.whisper.tokenization_whisper import LANGUAGES
+from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 
 from vllm_metal.stt import audio as audio_mod
 from vllm_metal.stt.audio import (
@@ -24,74 +26,45 @@ from vllm_metal.stt.audio import (
     log_mel_spectrogram,
     split_audio,
 )
-from vllm_metal.stt.config import (
-    get_supported_languages,
-    get_whisper_languages,
-    validate_language,
-)
-from vllm_metal.stt.protocol import TranscriptionSegment
+from vllm_metal.stt.whisper.transcriber import WhisperTranscriber
 
 
 class TestValidateLanguage:
-    """Tests for validate_language() — three-tier validation."""
+    """Tests for Whisper language validation."""
 
     def test_none_defaults_to_en(self) -> None:
-        assert validate_language(None) == "en"
+        assert WhisperTranscriber.validate_language(None) == "en"
 
     def test_none_with_no_default(self) -> None:
-        assert validate_language(None, default=None) is None
+        assert WhisperTranscriber.validate_language(None, default=None) is None
 
     def test_officially_supported(self) -> None:
-        assert validate_language("en") == "en"
-        assert validate_language("zh") == "zh"
-        assert validate_language("ja") == "ja"
+        assert WhisperTranscriber.validate_language("en") == "en"
+        assert WhisperTranscriber.validate_language("zh") == "zh"
+        assert WhisperTranscriber.validate_language("ja") == "ja"
 
     def test_known_but_unsupported(self) -> None:
         code = "yue"  # cantonese — in Whisper but not officially supported
-        whisper_langs = get_whisper_languages()
-        supported = get_supported_languages()
-        assert code in whisper_langs
-        assert code not in supported
-        assert validate_language(code) == "yue"
+        assert code in LANGUAGES
+        assert code not in ISO639_1_SUPPORTED_LANGS
+        assert WhisperTranscriber.validate_language(code) == "yue"
 
     def test_unknown_code_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported language"):
-            validate_language("zz")
+            WhisperTranscriber.validate_language("zz")
 
     def test_case_insensitive(self) -> None:
-        assert validate_language("EN") == "en"
-        assert validate_language("Zh") == "zh"
+        assert WhisperTranscriber.validate_language("EN") == "en"
+        assert WhisperTranscriber.validate_language("Zh") == "zh"
+
+    def test_language_name_maps_to_iso_code(self) -> None:
+        assert WhisperTranscriber.validate_language("French") == "fr"
 
     def test_strips_whitespace(self) -> None:
-        assert validate_language("  fr  ") == "fr"
+        assert WhisperTranscriber.validate_language("  fr  ") == "fr"
 
-    def test_whisper_languages_count(self) -> None:
-        assert len(get_whisper_languages()) == 100
-
-    def test_supported_is_subset_of_whisper(self) -> None:
-        assert get_supported_languages().issubset(set(get_whisper_languages()))
-
-
-class TestTranscriptionSegment:
-    """Tests for TranscriptionSegment pydantic model."""
-
-    def test_create_segment(self) -> None:
-        seg = TranscriptionSegment(
-            id=0, seek=0, start=0.0, end=2.5, text=" Hello.", tokens=[1, 2]
-        )
-        assert seg.id == 0
-        assert seg.start == 0.0
-        assert seg.end == 2.5
-        assert seg.text == " Hello."
-        assert seg.tokens == [1, 2]
-
-    def test_default_values(self) -> None:
-        seg = TranscriptionSegment(
-            id=0, seek=0, start=0.0, end=1.0, text="hi", tokens=[]
-        )
-        assert seg.avg_logprob == 0.0
-        assert seg.compression_ratio == 0.0
-        assert seg.no_speech_prob == 0.0
+    def test_supported_languages_match_upstream_vllm_subset(self) -> None:
+        assert set(ISO639_1_SUPPORTED_LANGS) <= set(LANGUAGES)
 
 
 class TestAudioPipeline:
@@ -197,11 +170,6 @@ class TestAudioLoading:
 
         with pytest.raises(ValueError, match="ffmpeg timeout must be > 0"):
             audio_mod._load_audio_ffmpeg("dummy.wav", SAMPLE_RATE, timeout_s=timeout_s)
-
-
-# ===========================================================================
-# Audio chunking
-# ===========================================================================
 
 
 class TestAudioChunking:

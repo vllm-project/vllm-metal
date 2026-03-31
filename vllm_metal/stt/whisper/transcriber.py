@@ -10,7 +10,9 @@ from typing import cast
 import mlx.core as mx
 import numpy as np
 from transformers import WhisperTokenizer
+from transformers.models.whisper.tokenization_whisper import LANGUAGES, TO_LANGUAGE_CODE
 from vllm.config import SpeechToTextConfig
+from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -22,7 +24,6 @@ from vllm_metal.stt.audio import (
     pad_or_trim,
     split_audio,
 )
-from vllm_metal.stt.config import validate_language
 from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
 
 from .config import WHISPER_MAX_DECODE_TOKENS
@@ -33,12 +34,38 @@ logger = logging.getLogger(__name__)
 SEEK_MULTIPLIER = 100
 DEFAULT_SEGMENT_DURATION = 30.0
 MAX_PROMPT_TOKENS = 224
+_SUPPORTED_LANGUAGE_CODES = frozenset(ISO639_1_SUPPORTED_LANGS)
 
 TIMESTAMP_RE = re.compile(r"<\|(\d+\.\d+)\|>")
 WHISPER_TASKS = frozenset({"transcribe", "translate"})
 
 
 class WhisperTranscriber:
+    @staticmethod
+    def validate_language(
+        code: str | None,
+        *,
+        default: str | None = "en",
+    ) -> str | None:
+        """Validate and normalize an ISO 639-1 language code."""
+        if code is None:
+            return default
+
+        code = code.strip().lower()
+        code = TO_LANGUAGE_CODE.get(code, code)
+
+        if code in _SUPPORTED_LANGUAGE_CODES:
+            return code
+
+        if code in LANGUAGES:
+            logger.debug("Language %r is not officially supported", code)
+            return code
+
+        raise ValueError(
+            f"Unsupported language: {code!r}. "
+            "Use a valid Whisper language code or name."
+        )
+
     def __init__(
         self,
         model: WhisperModel,
@@ -217,9 +244,9 @@ class WhisperTranscriber:
             )
 
         if self.model.is_multilingual:
-            return validate_language(language, default=None), task
+            return self.validate_language(language, default=None), task
 
-        resolved_language = validate_language(language, default=None)
+        resolved_language = self.validate_language(language, default=None)
         if task == "translate":
             raise ValueError("English-only Whisper models do not support translation.")
         if resolved_language not in (None, "en"):
@@ -231,9 +258,29 @@ class WhisperTranscriber:
     def _encode_prompt(self, prompt: str | None) -> list[int]:
         if not prompt:
             return []
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        prompt_ids = prompt_ids[-MAX_PROMPT_TOKENS:]
-        return [self._get_token_id("<|startofprev|>"), *prompt_ids]
+        prompt_ids = [
+            int(token_id) for token_id in self.tokenizer.get_prompt_ids(prompt)
+        ]
+        if len(prompt_ids) <= MAX_PROMPT_TOKENS + 1:
+            return prompt_ids
+        return [prompt_ids[0], *prompt_ids[-MAX_PROMPT_TOKENS:]]
+
+    def _decoder_prompt_token_ids(
+        self,
+        language: str | None,
+        task: str,
+        *,
+        with_timestamps: bool,
+    ) -> list[int]:
+        forced_decoder_ids = self.tokenizer.get_decoder_prompt_ids(
+            language=language if self.model.is_multilingual else None,
+            task=task if self.model.is_multilingual else None,
+            no_timestamps=not with_timestamps,
+        )
+        return [
+            self._get_token_id("<|startoftranscript|>"),
+            *(token_id for _, token_id in forced_decoder_ids),
+        ]
 
     def _greedy_decode(
         self,
@@ -250,12 +297,13 @@ class WhisperTranscriber:
             )
 
         prefix = self._encode_prompt(prompt)
-        prefix.append(self._get_token_id("<|startoftranscript|>"))
-        if self.model.is_multilingual:
-            prefix.append(self._get_token_id(f"<|{language or 'en'}|>"))
-            prefix.append(self._get_token_id(f"<|{task}|>"))
-        if not with_timestamps:
-            prefix.append(self._get_token_id("<|notimestamps|>"))
+        prefix.extend(
+            self._decoder_prompt_token_ids(
+                language,
+                task,
+                with_timestamps=with_timestamps,
+            )
+        )
 
         return self.greedy_decode_tokens(audio_features, prefix, max_tokens)
 
