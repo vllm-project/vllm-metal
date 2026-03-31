@@ -10,21 +10,22 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.models.registry import ModelRegistry
+from vllm.sampling_params import SamplingParams
+from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
-vllm = pytest.importorskip("vllm", reason="vllm not installed")
-
-from vllm.sampling_params import SamplingParams  # noqa: E402
-
-from vllm_metal.stt.audio import (  # noqa: E402
+from vllm_metal.stt.audio import (
     N_FRAMES,
     SAMPLE_RATE,
     log_mel_spectrogram,
     pad_or_trim,
 )
-from vllm_metal.stt.loader import load_model  # noqa: E402
-from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES  # noqa: E402
-from vllm_metal.stt.runtime import STTRuntimeAdapter  # noqa: E402
-from vllm_metal.v1.model_runner import MetalModelRunner  # noqa: E402
+from vllm_metal.stt.loader import load_model
+from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
+from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
+from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
+from vllm_metal.v1.model_runner import MetalModelRunner
 
 
 class _StubRunner:
@@ -52,7 +53,6 @@ class _StubRunner:
 def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:
     model = MagicMock()
     model.encode = MagicMock(return_value=mx.ones((1, 1500, 512)))
-    from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 
     adapter = WhisperRuntimeAdapter(model, "/fake/model/path")
 
@@ -411,7 +411,6 @@ class TestWhisperRuntimeAdapterTranscriberCaching:
     def test_transcriber_created_lazily_with_model_path(self) -> None:
         """Transcriber should be created lazily with the correct model_path."""
         model = MagicMock()
-        from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 
         adapter = WhisperRuntimeAdapter(model, "/fake/model/path")
         assert adapter._transcriber is None  # not yet created
@@ -476,14 +475,16 @@ class TestWhisperRuntimeAdapterEndToEnd:
         mel = pad_or_trim(mel, N_FRAMES, axis=-1)
         features = adapter.extract_audio_features(mel)
 
-        # Build prompt: <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
         tokenizer = adapter.transcriber.tokenizer
-        prompt_ids = [
-            tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
-            tokenizer.convert_tokens_to_ids("<|en|>"),
-            tokenizer.convert_tokens_to_ids("<|transcribe|>"),
-            tokenizer.convert_tokens_to_ids("<|notimestamps|>"),
-        ]
+        prompt_ids = [tokenizer.convert_tokens_to_ids("<|startoftranscript|>")]
+        prompt_ids.extend(
+            token
+            for _, token in tokenizer.get_decoder_prompt_ids(
+                language="en",
+                task="transcribe",
+                no_timestamps=True,
+            )
+        )
 
         result = adapter.decode_tokens(features, prompt_ids)
         assert isinstance(result, list)
@@ -493,18 +494,11 @@ class TestWhisperRuntimeAdapterEndToEnd:
         assert result[-1] == eot
 
 
-# ===========================================================================
-# Qwen3-ASR runtime adapter dispatch & integration
-# ===========================================================================
-
-
 def _make_qwen3_runtime_adapter():
     """Create a Qwen3-ASR runtime adapter with a stub model + transcriber."""
     model = MagicMock()
     model.config = SimpleNamespace(eos_token_id=151643)
     model.encode = MagicMock(return_value=mx.ones((50, 1024)))
-
-    from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 
     adapter = Qwen3ASRRuntimeAdapter(model, "/fake/qwen3-asr")
 
@@ -520,9 +514,6 @@ def _make_qwen3_runtime_adapter():
     )
     mock_transcriber = MagicMock()
     mock_transcriber.tokenizer = mock_tokenizer
-    mock_transcriber.build_prompt_tokens = MagicMock(
-        return_value=[1, 2, 3]  # simplified prompt
-    )
     # Return token stream: <lang> <asr_text> hello world <|im_end|>
     mock_transcriber.greedy_decode_tokens = MagicMock(
         return_value=[100, 151674, 200, 300, 151645]
@@ -543,7 +534,6 @@ class TestQwen3ASRRuntimeAdapterDispatch:
     def test_transcriber_dispatches_to_qwen3(self) -> None:
         """Qwen3-ASR adapter should create Qwen3ASRTranscriber."""
         model = MagicMock()
-        from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 
         adapter = Qwen3ASRRuntimeAdapter(model, "/fake/path")
 
@@ -591,15 +581,17 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         with pytest.raises(ValueError, match="rank"):
             adapter.extract_audio_features(mel)
 
-    def test_decode_rebuilds_prompt_with_audio_frames(self) -> None:
-        """Qwen3-ASR decode should rebuild prompt using build_prompt_tokens."""
+    def test_decode_uses_vllm_prompt_token_ids(self) -> None:
+        """Qwen3-ASR decode should consume vLLM-provided prompt_token_ids."""
         adapter = _make_qwen3_runtime_adapter()
 
         audio = mx.ones((50, 1024))  # 50 audio frames
-        adapter.decode_tokens(audio, [1, 2, 3])
+        prompt_ids = [1, 2, 3]
+        adapter.decode_tokens(audio, prompt_ids)
 
-        # build_prompt_tokens should be called with n_audio_frames=50
-        adapter.transcriber.build_prompt_tokens.assert_called_once_with(50)
+        adapter.transcriber.greedy_decode_tokens.assert_called_once_with(
+            audio, prompt_ids
+        )
 
     def test_decode_extracts_asr_text_tokens(self) -> None:
         """Qwen3-ASR decode should extract tokens between <asr_text> and <|im_end|>."""
@@ -614,18 +606,19 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         # + eot (151643) appended
         assert result == [200, 300, 151643]
 
-    def test_decode_empty_prompt_rebuilds(self) -> None:
-        """Qwen3-ASR rebuilds prompt even when caller passes empty list."""
+    def test_decode_empty_prompt_raises(self) -> None:
+        """Qwen3-ASR requires vLLM to provide prompt_token_ids."""
         adapter = _make_qwen3_runtime_adapter()
-        result = adapter.decode_tokens(mx.ones((50, 1024)), [])
-        # Should rebuild prompt and decode normally, not early-return EOT
-        assert len(result) > 1
-        assert result[-1] == 151643  # ends with EOT
+        with pytest.raises(ValueError, match="prompt_token_ids"):
+            adapter.decode_tokens(mx.ones((50, 1024)), [])
 
 
-# ===========================================================================
-# TestExtractASRTextTokens
-# ===========================================================================
+class TestQwen3ASRUpstreamContract:
+    """Tests for the upstream vLLM contract used by the Metal plugin."""
+
+    def test_upstream_qwen3_asr_support_is_available(self) -> None:
+        assert "qwen3_asr" in _CONFIG_REGISTRY
+        assert "Qwen3ASRForConditionalGeneration" in ModelRegistry.get_supported_archs()
 
 
 class TestExtractASRTextTokens:
@@ -680,32 +673,3 @@ class TestExtractASRTextTokens:
         result = adapter._extract_asr_text_tokens(tokens)
         # start=3, which equals len(tokens), so returns original
         assert result == [100, 200, 151674]
-
-
-# ===========================================================================
-# TestQwen3ASRStubRejectsTranslate
-# ===========================================================================
-
-
-class TestQwen3ASRStubRejectsTranslate:
-    """Qwen3-ASR does not support translation — must reject explicitly."""
-
-    def test_translate_raises_valueerror(self) -> None:
-        """task_type='translate' must raise ValueError, not silently transcribe."""
-        from vllm_metal.stt.hf_config import _make_stub_class
-
-        stub_cls = _make_stub_class()
-        model_config = MagicMock()
-        model_config.tokenizer = "Qwen/Qwen3-ASR-0.6B"
-        stt_config = MagicMock()
-
-        with pytest.raises(ValueError, match="does not support translation"):
-            stub_cls.get_generation_prompt(
-                audio=np.zeros(16000, dtype=np.float32),
-                stt_config=stt_config,
-                model_config=model_config,
-                language="en",
-                task_type="translate",
-                request_prompt="",
-                to_language=None,
-            )

@@ -55,10 +55,9 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
         audio_features: mx.array,
         prompt_token_ids: list[int],
     ) -> list[int]:
-        del prompt_token_ids
+        if not prompt_token_ids:
+            raise ValueError("Qwen3-ASR request must include prompt_token_ids.")
 
-        n_audio_frames = audio_features.shape[0]
-        prompt_token_ids = self.transcriber.build_prompt_tokens(n_audio_frames)
         tokens = self.transcriber.greedy_decode_tokens(audio_features, prompt_token_ids)
         tokens = self._extract_asr_text_tokens(tokens)
         tokens.append(self.eot_token)

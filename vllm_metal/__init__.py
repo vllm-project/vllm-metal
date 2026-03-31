@@ -63,8 +63,6 @@ def __getattr__(name):
         return MetalPlatform
     elif name == "register":
         return _register
-    elif name == "register_ops":
-        return _register_ops
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -74,7 +72,6 @@ __all__ = [
     "get_config",
     "reset_config",
     "register",
-    "register_ops",
 ]
 
 
@@ -93,15 +90,3 @@ def _register() -> str | None:
     if MetalPlatform.is_available():
         return "vllm_metal.platform.MetalPlatform"
     return None
-
-
-def _register_ops() -> None:
-    """Register Metal operations and custom configs with vLLM.
-
-    This is the entry point for vLLM's general plugin system.
-    Registers STT model configs so that vLLM/transformers can
-    recognise model types like ``qwen3_asr``.
-    """
-    from vllm_metal.stt.hf_config import register_qwen3_asr_config
-
-    register_qwen3_asr_config()

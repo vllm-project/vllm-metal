@@ -67,9 +67,6 @@ Issues = "https://github.com/vllm-project/vllm-metal/issues"
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 
-[project.entry-points."vllm.general_plugins"]
-metal_ops = "vllm_metal:register_ops"
-
 # Maturin configuration for mixed Rust/Python project
 [tool.maturin]
 # Build both the Rust extension and include Python source

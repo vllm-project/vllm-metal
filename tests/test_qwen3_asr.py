@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Qwen3-ASR model: config, encoder shapes, weight sanitization."""
+"""Tests for Qwen3-ASR model behavior and weight mapping."""
 
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import mlx.core as mx
+import numpy as np
 import pytest
+from transformers import WhisperFeatureExtractor
 
+from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.qwen3_asr.config import (
@@ -25,73 +27,6 @@ from vllm_metal.stt.qwen3_asr.model import (
     Qwen3LM,
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
-
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-
-class TestQwen3ASRConfig:
-    """Tests for Qwen3ASRConfig.from_dict with 0.6B config."""
-
-    def test_from_dict_basic(self) -> None:
-        """Config should be parsed from nested thinker_config dict."""
-        d = {
-            "model_type": "qwen3_asr",
-            "thinker_config": {
-                "audio_config": {
-                    "d_model": 896,
-                    "num_mel_bins": 128,
-                    "encoder_layers": 18,
-                    "encoder_attention_heads": 14,
-                    "encoder_ffn_dim": 3584,
-                    "downsample_hidden_size": 480,
-                    "output_dim": 1024,
-                    "max_source_positions": 1500,
-                    "n_window": 50,
-                    "n_window_infer": 800,
-                },
-                "text_config": {
-                    "hidden_size": 1024,
-                    "num_hidden_layers": 28,
-                    "num_attention_heads": 16,
-                    "num_key_value_heads": 8,
-                    "head_dim": 128,
-                    "intermediate_size": 3072,
-                    "vocab_size": 151936,
-                    "rms_norm_eps": 1e-6,
-                    "rope_theta": 1000000.0,
-                    "tie_word_embeddings": True,
-                },
-                "audio_token_id": 151676,
-                "audio_start_token_id": 151669,
-                "audio_end_token_id": 151670,
-            },
-        }
-        config = Qwen3ASRConfig.from_dict(d)
-        assert config.audio_config.d_model == 896
-        assert config.audio_config.encoder_layers == 18
-        assert config.audio_config.num_mel_bins == 128
-        assert config.audio_config.n_window == 50
-        assert config.text_config.hidden_size == 1024
-        assert config.text_config.num_hidden_layers == 28
-        assert config.text_config.num_attention_heads == 16
-        assert config.text_config.num_key_value_heads == 8
-        assert config.audio_token_id == 151676
-        assert config.n_mels == 128
-        assert config.n_audio_ctx == 1500
-
-    def test_defaults(self) -> None:
-        """Default config should have 0.6B model values."""
-        config = Qwen3ASRConfig()
-        assert config.audio_config.d_model == 896
-        assert config.text_config.vocab_size == 151936
-        assert config.eos_token_id == 151643
-
-
-# ===========================================================================
-# CNN output lengths
-# ===========================================================================
 
 
 class TestCNNOutputLengths:
@@ -125,11 +60,6 @@ class TestCNNOutputLengths:
     def test_feat_extract_3000_frames(self) -> None:
         """30 seconds at 16kHz/hop160 = 3000 frames → 30 * 13 = 390."""
         assert Qwen3ASRAudioConfig().feat_extract_output_length(3000) == 390
-
-
-# ===========================================================================
-# Audio Encoder shapes
-# ===========================================================================
 
 
 class TestAudioEncoderShapes:
@@ -180,11 +110,6 @@ class TestAudioEncoderShapes:
         out = tiny_encoder(mel)
         mx.eval(out)
         assert out.shape == (13, 48)
-
-
-# ===========================================================================
-# Qwen3 Attention
-# ===========================================================================
 
 
 class TestQwen3Attention:
@@ -241,11 +166,6 @@ class TestQwen3Attention:
         mx.eval(out2)
         assert out2.shape == (1, 1, 64)
         assert cache2[0].shape == (1, 2, 6, 16)  # 5 + 1 = 6
-
-
-# ===========================================================================
-# Weight sanitization
-# ===========================================================================
 
 
 class TestWeightSanitize:
@@ -353,11 +273,6 @@ class TestWeightSanitize:
         assert sanitized["audio_tower.ln_post.weight"].dtype == mx.float32
 
 
-# ===========================================================================
-# Qwen3 LM forward
-# ===========================================================================
-
-
 class TestQwen3LM:
     """Tests for Qwen3LM forward pass."""
 
@@ -393,11 +308,6 @@ class TestQwen3LM:
         assert logits.shape == (1, 1, 100)
 
 
-# ===========================================================================
-# Full model
-# ===========================================================================
-
-
 class TestQwen3ASRModel:
     """Tests for the full Qwen3ASRModel."""
 
@@ -430,9 +340,6 @@ class TestQwen3ASRModel:
         )
         return Qwen3ASRModel(config, dtype=mx.float32)
 
-    def test_model_type(self, tiny_model) -> None:
-        assert tiny_model.model_type == "qwen3_asr"
-
     def test_encode(self, tiny_model) -> None:
         """Encode should produce audio embeddings."""
         mel = mx.random.normal((16, 100))
@@ -464,11 +371,6 @@ class TestQwen3ASRModel:
         assert logits2.shape == (1, 1, 100)
 
 
-# ===========================================================================
-# Post-process output
-# ===========================================================================
-
-
 class TestPostProcessOutput:
     """Tests for Qwen3ASRTranscriber.post_process_output."""
 
@@ -482,11 +384,6 @@ class TestPostProcessOutput:
 
     def test_empty_string(self) -> None:
         assert Qwen3ASRTranscriber.post_process_output("") == ""
-
-
-# ===========================================================================
-# Config detection
-# ===========================================================================
 
 
 class TestPostProcessOutputTruncation:
@@ -513,88 +410,6 @@ class TestPostProcessOutputTruncation:
         assert Qwen3ASRTranscriber.post_process_output(text) == "Hello world"
 
 
-# ===========================================================================
-# Build prompt tokens
-# ===========================================================================
-
-
-class TestBuildPromptTokens:
-    """Tests for Qwen3ASRTranscriber.build_prompt_tokens structure."""
-
-    @pytest.fixture()
-    def transcriber(self, tmp_path):
-        """Create a transcriber with a mock tokenizer for prompt tests."""
-        config = Qwen3ASRConfig(
-            audio_token_id=99,
-            audio_start_token_id=97,
-            audio_end_token_id=98,
-            eos_token_id=0,
-        )
-        model = MagicMock()
-        model.config = config
-
-        # Inject mock tokenizer with deterministic encode
-        mock_tok = MagicMock()
-        _encode_map = {
-            "<|im_start|>": [10],
-            "<|im_end|>": [11],
-            "user\n": [20],
-            "assistant\n": [30],
-            "\n": [40],
-        }
-        mock_tok.encode = MagicMock(
-            side_effect=lambda s, add_special_tokens=False: _encode_map.get(s, [0])
-        )
-        t = Qwen3ASRTranscriber(model, tokenizer=mock_tok)
-        return t
-
-    def test_audio_pad_count_matches_frames(self, transcriber) -> None:
-        """Number of audio_pad tokens should equal n_audio_frames."""
-        # Act
-        prompt = transcriber.build_prompt_tokens(50)
-
-        # Assert
-        audio_pad_count = prompt.count(99)  # audio_token_id
-        assert audio_pad_count == 50
-
-    def test_audio_pad_count_zero(self, transcriber) -> None:
-        """Zero audio frames should produce no audio_pad tokens."""
-        # Act
-        prompt = transcriber.build_prompt_tokens(0)
-
-        # Assert
-        assert prompt.count(99) == 0
-
-    def test_prompt_contains_structural_tokens(self, transcriber) -> None:
-        """Prompt should contain audio_start, audio_end, im_start, user, assistant."""
-        # Act
-        prompt = transcriber.build_prompt_tokens(5)
-
-        # Assert
-        assert 97 in prompt  # audio_start
-        assert 98 in prompt  # audio_end
-        assert 10 in prompt  # im_start
-        assert 20 in prompt  # user
-        assert 30 in prompt  # assistant
-
-    def test_prompt_structure_order(self, transcriber) -> None:
-        """Audio tokens should be between audio_start and audio_end."""
-        # Act
-        prompt = transcriber.build_prompt_tokens(3)
-
-        # Assert
-        start_idx = prompt.index(97)  # audio_start
-        end_idx = prompt.index(98)  # audio_end
-        for i, tok in enumerate(prompt):
-            if tok == 99:
-                assert start_idx < i < end_idx
-
-
-# ===========================================================================
-# Config detection
-# ===========================================================================
-
-
 class TestConfigDetection:
     """Tests for is_stt_model with Qwen3-ASR config."""
 
@@ -603,11 +418,6 @@ class TestConfigDetection:
         config = {"model_type": "qwen3_asr"}
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert is_stt_model(str(tmp_path)) is True
-
-
-# ===========================================================================
-# Slow tests (require real model)
-# ===========================================================================
 
 
 @pytest.mark.slow
@@ -629,7 +439,7 @@ class TestModelLoad:
     def test_load_model(self) -> None:
         """Should load model without errors."""
         model = load_model(self._MODEL_PATH)
-        assert model.model_type == "qwen3_asr"
+        assert isinstance(model, Qwen3ASRModel)
 
     def test_encode_dummy_mel(self) -> None:
         """Should encode a dummy mel spectrogram."""
@@ -642,11 +452,6 @@ class TestModelLoad:
 
     def test_greedy_decode(self) -> None:
         """Should encode + decode a real audio file using WhisperFeatureExtractor."""
-        import numpy as np
-        from transformers import WhisperFeatureExtractor
-
-        from vllm_metal.stt.audio import load_audio
-
         audio_path = os.environ.get("QWEN3_ASR_AUDIO_PATH")
         if not audio_path or not Path(audio_path).exists():
             pytest.skip("QWEN3_ASR_AUDIO_PATH not set or file not found")
@@ -669,7 +474,24 @@ class TestModelLoad:
 
         # Build prompt
         n_audio = audio_emb.shape[0]
-        prompt = transcriber.build_prompt_tokens(n_audio)
+        tokenizer = transcriber.tokenizer
+        audio_start_token_id = tokenizer.convert_tokens_to_ids(
+            tokenizer.audio_bos_token
+        )
+        audio_token_id = tokenizer.convert_tokens_to_ids(tokenizer.audio_token)
+        audio_end_token_id = tokenizer.convert_tokens_to_ids(tokenizer.audio_eos_token)
+        prompt = (
+            tokenizer.encode("<|im_start|>", add_special_tokens=False)
+            + tokenizer.encode("user\n", add_special_tokens=False)
+            + [audio_start_token_id]
+            + [audio_token_id] * n_audio
+            + [audio_end_token_id]
+            + tokenizer.encode("\n", add_special_tokens=False)
+            + tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            + tokenizer.encode("\n", add_special_tokens=False)
+            + tokenizer.encode("<|im_start|>", add_special_tokens=False)
+            + tokenizer.encode("assistant\n", add_special_tokens=False)
+        )
 
         # Decode
         tokens = transcriber.greedy_decode_tokens(audio_emb, prompt, max_tokens=100)

@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from vllm.transformers_utils.configs.qwen3_asr import (
+    Qwen3ASRConfig as VllmQwen3ASRConfig,
+)
+
 # Maximum decode tokens for Qwen3-ASR decode loop.
 QWEN3_ASR_MAX_DECODE_TOKENS = 1024
 
@@ -72,53 +76,53 @@ class Qwen3ASRConfig:
     audio_config: Qwen3ASRAudioConfig = field(default_factory=Qwen3ASRAudioConfig)
     text_config: Qwen3ASRTextConfig = field(default_factory=Qwen3ASRTextConfig)
     audio_token_id: int = 151676
-    audio_start_token_id: int = 151669
-    audio_end_token_id: int = 151670
     eos_token_id: int = 151643
     # Compatibility with Whisper interface for load_model dispatching
     n_mels: int = 128
     n_audio_ctx: int = 1500
 
     @classmethod
-    def from_dict(cls, d: dict) -> Qwen3ASRConfig:
-        """Create config from config.json dictionary."""
-        thinker = d.get("thinker_config", d)
+    def _from_vllm_config(cls, config: VllmQwen3ASRConfig) -> Qwen3ASRConfig:
+        """Adapt the upstream vLLM/HF config into the local MLX model config."""
+        thinker = config.thinker_config
+        audio = thinker.audio_config
+        text = thinker.text_config
 
-        audio_dict = thinker.get("audio_config", {})
         audio_cfg = Qwen3ASRAudioConfig(
-            num_mel_bins=audio_dict.get("num_mel_bins", 128),
-            d_model=audio_dict.get("d_model", 896),
-            encoder_layers=audio_dict.get("encoder_layers", 18),
-            encoder_attention_heads=audio_dict.get("encoder_attention_heads", 14),
-            encoder_ffn_dim=audio_dict.get("encoder_ffn_dim", 3584),
-            downsample_hidden_size=audio_dict.get("downsample_hidden_size", 480),
-            output_dim=audio_dict.get("output_dim", 1024),
-            max_source_positions=audio_dict.get("max_source_positions", 1500),
-            n_window=audio_dict.get("n_window", 50),
-            n_window_infer=audio_dict.get("n_window_infer", 800),
-            activation_function=audio_dict.get("activation_function", "gelu"),
+            num_mel_bins=audio.num_mel_bins,
+            d_model=audio.d_model,
+            encoder_layers=audio.encoder_layers,
+            encoder_attention_heads=audio.encoder_attention_heads,
+            encoder_ffn_dim=audio.encoder_ffn_dim,
+            downsample_hidden_size=audio.downsample_hidden_size,
+            output_dim=audio.output_dim,
+            max_source_positions=audio.max_source_positions,
+            n_window=audio.n_window,
+            n_window_infer=audio.n_window_infer,
+            activation_function=audio.activation_function,
         )
-
-        text_dict = thinker.get("text_config", {})
         text_cfg = Qwen3ASRTextConfig(
-            hidden_size=text_dict.get("hidden_size", 1024),
-            num_hidden_layers=text_dict.get("num_hidden_layers", 28),
-            num_attention_heads=text_dict.get("num_attention_heads", 16),
-            num_key_value_heads=text_dict.get("num_key_value_heads", 8),
-            head_dim=text_dict.get("head_dim", 128),
-            intermediate_size=text_dict.get("intermediate_size", 3072),
-            vocab_size=text_dict.get("vocab_size", 151936),
-            rms_norm_eps=text_dict.get("rms_norm_eps", 1e-6),
-            rope_theta=text_dict.get("rope_theta", 1000000.0),
-            tie_word_embeddings=text_dict.get("tie_word_embeddings", True),
+            hidden_size=text.hidden_size,
+            num_hidden_layers=text.num_hidden_layers,
+            num_attention_heads=text.num_attention_heads,
+            num_key_value_heads=text.num_key_value_heads,
+            head_dim=text.head_dim,
+            intermediate_size=text.intermediate_size,
+            vocab_size=text.vocab_size,
+            rms_norm_eps=text.rms_norm_eps,
+            rope_theta=text.rope_theta,
+            tie_word_embeddings=text.tie_word_embeddings,
         )
-
         return cls(
             audio_config=audio_cfg,
             text_config=text_cfg,
-            audio_token_id=thinker.get("audio_token_id", 151676),
-            audio_start_token_id=thinker.get("audio_start_token_id", 151669),
-            audio_end_token_id=thinker.get("audio_end_token_id", 151670),
+            audio_token_id=thinker.audio_token_id,
+            eos_token_id=config.eos_token_id,
             n_mels=audio_cfg.num_mel_bins,
             n_audio_ctx=audio_cfg.max_source_positions,
         )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Qwen3ASRConfig:
+        """Create config from config.json using the upstream schema owner."""
+        return cls._from_vllm_config(VllmQwen3ASRConfig.from_dict(d))

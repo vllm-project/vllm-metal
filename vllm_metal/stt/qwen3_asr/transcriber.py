@@ -3,16 +3,14 @@
 
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import cast
 
 import mlx.core as mx
 from transformers import AutoTokenizer
+from vllm.tokenizers import TokenizerLike
 
 from .config import QWEN3_ASR_MAX_DECODE_TOKENS
 from .model import Qwen3ASRModel
-
-logger = logging.getLogger(__name__)
 
 ASR_TEXT_TAG = "<asr_text>"
 
@@ -22,18 +20,21 @@ class Qwen3ASRTranscriber:
         self,
         model: Qwen3ASRModel,
         model_path: str | None = None,
-        tokenizer: Any | None = None,
+        tokenizer: TokenizerLike | None = None,
     ) -> None:
         self.model = model
-        self.tokenizer = (
+        self.tokenizer: TokenizerLike = (
             tokenizer if tokenizer is not None else self.load_tokenizer(model_path)
         )
 
     @staticmethod
-    def load_tokenizer(model_path: str | None) -> Any:
+    def load_tokenizer(model_path: str | None) -> TokenizerLike:
         if not model_path:
             raise ValueError("Qwen3-ASR requires a local tokenizer model_path.")
-        return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        return cast(
+            TokenizerLike,
+            AutoTokenizer.from_pretrained(model_path, trust_remote_code=True),
+        )
 
     def greedy_decode_tokens(
         self,
@@ -45,8 +46,7 @@ class Qwen3ASRTranscriber:
             max_tokens = QWEN3_ASR_MAX_DECODE_TOKENS
 
         if not prompt_token_ids:
-            logger.warning("Empty prompt_token_ids; returning no tokens")
-            return []
+            raise ValueError("Qwen3-ASR decode requires non-empty prompt_token_ids.")
 
         eos_token = self.model.config.eos_token_id
         tokens = mx.array([prompt_token_ids], dtype=mx.int32)
@@ -70,32 +70,6 @@ class Qwen3ASRTranscriber:
             output_tokens.append(next_token)
 
         return output_tokens
-
-    def build_prompt_tokens(self, n_audio_frames: int) -> list[int]:
-        tok = self.tokenizer
-        audio_pad_id = self.model.config.audio_token_id
-        audio_start_id = self.model.config.audio_start_token_id
-        audio_end_id = self.model.config.audio_end_token_id
-
-        im_start = tok.encode("<|im_start|>", add_special_tokens=False)
-        im_end = tok.encode("<|im_end|>", add_special_tokens=False)
-        user = tok.encode("user\n", add_special_tokens=False)
-        assistant = tok.encode("assistant\n", add_special_tokens=False)
-        newline = tok.encode("\n", add_special_tokens=False)
-
-        prompt = (
-            im_start
-            + user
-            + [audio_start_id]
-            + [audio_pad_id] * n_audio_frames
-            + [audio_end_id]
-            + newline
-            + im_end
-            + newline
-            + im_start
-            + assistant
-        )
-        return prompt
 
     @staticmethod
     def post_process_output(text: str) -> str:
