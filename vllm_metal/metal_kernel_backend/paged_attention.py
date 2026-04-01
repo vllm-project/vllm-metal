@@ -21,12 +21,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal_kernel_backend.attention_linear import (
-    is_linear_attention,
-    linear_attention_forward,
-)
 from vllm_metal.metal_kernel_backend.attention_sdpa import (
-    is_sdpa,
     sdpa_forward,
 )
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
@@ -77,18 +72,8 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
 
         inner = self._inner
 
-        # Dispatch to the right attention backend
-        cache_idx = self._mk_cache_idx
-        if is_sdpa(inner):
-            return sdpa_forward(inner, x, ctx, self._mk_kv_cache, cache_idx)
-        elif is_linear_attention(inner):
-            return linear_attention_forward(inner, x, ctx, self._mk_kv_cache, cache_idx)
-        else:
-            raise NotImplementedError(
-                f"No Metal attention backend for {type(inner).__name__}. "
-                f"Module attributes: {[a for a in dir(inner) if not a.startswith('_')]}. "
-                "Supported: SDPA (q_proj + k_proj + v_proj + o_proj)."
-            )
+        # SDPA attention via Metal kernel
+        return sdpa_forward(inner, x, ctx, self._mk_kv_cache, self._mk_cache_idx)
 
 
 # ---------------------------------------------------------------------------

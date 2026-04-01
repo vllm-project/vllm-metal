@@ -111,15 +111,17 @@ def test_find_layers_on_qwen3_model():
 
 
 @pytest.mark.slow
-def test_qwen35_paged_attention_raises_on_hybrid():
-    """Loading Qwen/Qwen3.5-0.8B with paged attention raises RuntimeError
-    at setup — hybrid models are not yet supported on the paged path."""
-    from vllm import LLM
+def test_qwen35_paged_attention_hybrid():
+    """Qwen3.5 hybrid model loads and generates with paged attention."""
+    from vllm import LLM, SamplingParams
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
+        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
-        with pytest.raises(RuntimeError, match="not yet supported for hybrid"):
-            LLM(model="Qwen/Qwen3.5-0.8B", max_model_len=512, max_num_seqs=1)
+        llm = LLM(model="Qwen/Qwen3.5-0.8B", max_model_len=512, max_num_seqs=1)
+        sp = SamplingParams(temperature=0, max_tokens=5)
+        outputs = llm.generate(["The capital of France is"], sp)
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs[0].token_ids) > 0

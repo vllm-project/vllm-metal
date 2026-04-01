@@ -174,14 +174,6 @@ class MetalWorker(WorkerBase):
         runner = self.model_runner
         block_size = self.metal_config.block_size
 
-        if runner.is_hybrid:
-            raise RuntimeError(
-                "Paged attention is not yet supported for hybrid models "
-                "(Qwen3.5). Linear attention kernel is not implemented "
-                "(Stage C of #194). Use the mlx_lm inline cache path instead "
-                "by unsetting VLLM_METAL_USE_PAGED_ATTENTION."
-            )
-
         # --- Determine memory fraction ---
         if self.metal_config.is_auto_memory:
             fraction = PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
@@ -214,6 +206,12 @@ class MetalWorker(WorkerBase):
         # --- Compute KV budget ---
         usable_metal = int(metal_limit * fraction)
         kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
+
+        # For hybrid models, subtract the fixed linear state cost first.
+        if runner.is_hybrid:
+            kv_budget -= runner.linear_cache_bytes_per_slot() * (
+                runner.scheduler_config.max_num_seqs
+            )
 
         if kv_budget <= 0:
             raise ValueError(
@@ -286,6 +284,25 @@ class MetalWorker(WorkerBase):
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
+        if runner.is_hybrid:
+            from vllm_metal.paged_attention_backend.hybrid import (
+                HybridPagedAttentionBackend,
+            )
+
+            return HybridPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                full_attention_interval=runner.full_attention_interval,
+                max_num_seqs=runner.scheduler_config.max_num_seqs,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                linear_num_v_heads=runner.linear_num_v_heads,
+                linear_key_head_dim=runner.linear_key_head_dim,
+                linear_value_head_dim=runner.linear_value_head_dim,
+                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
+                linear_conv_dim=runner.linear_conv_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
         if runner.is_mla:
             return MLAPagedAttentionBackend(
                 num_layers=runner.num_layers,
