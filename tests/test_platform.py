@@ -27,7 +27,9 @@ class TestMetalPlatform:
             "vllm_metal.platform.get_model_download_path",
             lambda model: model,
         )
-        monkeypatch.setattr("vllm_metal.platform.is_stt_model", lambda _model: is_stt)
+        monkeypatch.setattr(
+            "vllm_metal.stt.detection.is_stt_model", lambda _model: is_stt
+        )
 
     def test_device_name(self) -> None:
         """Test device name retrieval."""

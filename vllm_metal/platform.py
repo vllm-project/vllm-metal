@@ -11,8 +11,6 @@ from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_metal.config import get_config
-from vllm_metal.stt.detection import is_stt_model
-from vllm_metal.stt.policy import apply_stt_scheduler_policy
 from vllm_metal.utils import get_model_download_path
 
 if TYPE_CHECKING:
@@ -273,6 +271,11 @@ class MetalPlatform(Platform):
             model_config.disable_cascade_attn = True
 
         # STT model detection — set tokenizer fallback if not already configured.
+        # Lazy import to avoid circular import: platform.py is loaded during
+        # vllm.config init, and stt.detection imports from vllm.config.
+        from vllm_metal.stt.detection import is_stt_model
+        from vllm_metal.stt.policy import apply_stt_scheduler_policy
+
         resolved_model = (
             get_model_download_path(model_config.model)
             if model_config is not None
