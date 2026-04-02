@@ -129,6 +129,16 @@ main() {
   curl -OL $url_base/v$vllm_v/$filename
   tar xf $filename
   cd vllm-$vllm_v
+
+  # Patch chained comparisons that Apple Clang 21+ (Xcode 26) treats as errors.
+  # The sed -i flag differs between macOS (requires '') and Linux (no suffix).
+  if [[ "$OSTYPE" == darwin* ]]; then
+    sed -i '' 's/static_assert(0 < M <= 8)/static_assert(0 < M \&\& M <= 8)/g' \
+      csrc/cpu/cpu_attn_vec.hpp csrc/cpu/micro_gemm/cpu_micro_gemm_vec.hpp 2>/dev/null || true
+    sed -i '' 's/static_assert(0 < M <= 16)/static_assert(0 < M \&\& M <= 16)/g' \
+      csrc/cpu/cpu_attn_vec16.hpp 2>/dev/null || true
+  fi
+
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
   uv pip install .
   cd -
