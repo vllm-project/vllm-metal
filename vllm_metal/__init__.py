@@ -85,12 +85,8 @@ def _register() -> str | None:
     """
     _apply_macos_defaults()
 
-    try:
-        from vllm_metal.platform import MetalPlatform
+    from vllm_metal.platform import MetalPlatform
 
-        if MetalPlatform.is_available():
-            return "vllm_metal.platform.MetalPlatform"
-        return None
-    except Exception:
-        logger.debug("vllm-metal _register: platform unavailable", exc_info=True)
-        return None
+    if MetalPlatform.is_available():
+        return "vllm_metal.platform.MetalPlatform"
+    return None

@@ -106,7 +106,7 @@ class MetalPlatform(Platform):
             import mlx.core as mx
 
             return bool(mx.metal.is_available())
-        except Exception:
+        except (ImportError, AttributeError, RuntimeError):
             return False
 
     @classmethod
