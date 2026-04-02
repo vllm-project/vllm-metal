@@ -24,7 +24,7 @@ class TestMetalPlatform:
         is_stt: bool,
     ) -> None:
         monkeypatch.setattr(
-            "vllm_metal.platform.get_model_download_path",
+            "vllm_metal.utils.get_model_download_path",
             lambda model: model,
         )
         monkeypatch.setattr(
