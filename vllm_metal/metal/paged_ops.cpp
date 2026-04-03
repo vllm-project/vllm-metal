@@ -491,9 +491,9 @@ static void paged_attention_v2_online_impl_common(
 // encoder → Metal guarantees sequential ordering (write before read).
 // ---------------------------------------------------------------------------
 
-class FusedReshapeAndAttentionPrimitive : public Primitive {
+class PagedSDPAPrimitive : public Primitive {
  public:
-  FusedReshapeAndAttentionPrimitive(
+  PagedSDPAPrimitive(
       Stream stream, int num_kv_heads, float scale, float softcap,
       int block_size, int max_seq_len, int sliding_window)
       : Primitive(stream),
@@ -503,7 +503,7 @@ class FusedReshapeAndAttentionPrimitive : public Primitive {
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error(
-        "FusedReshapeAndAttentionPrimitive only supports GPU");
+        "PagedSDPAPrimitive only supports GPU");
   }
 
   void eval_gpu(
@@ -539,7 +539,7 @@ class FusedReshapeAndAttentionPrimitive : public Primitive {
   const char* name() const override { return "FusedReshapeAndAttention"; }
 
   bool is_equivalent(const Primitive& other) const override {
-    auto* rhs = dynamic_cast<const FusedReshapeAndAttentionPrimitive*>(&other);
+    auto* rhs = dynamic_cast<const PagedSDPAPrimitive*>(&other);
     return rhs && rhs->num_kv_heads_ == num_kv_heads_
         && rhs->scale_ == scale_ && rhs->softcap_ == softcap_
         && rhs->block_size_ == block_size_
@@ -556,7 +556,7 @@ class FusedReshapeAndAttentionPrimitive : public Primitive {
   int sliding_window_;
 };
 
-static std::vector<array> fused_reshape_attention_fn(
+static std::vector<array> paged_sdpa_primitive_fn(
     const array& query, const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping,
@@ -564,7 +564,7 @@ static std::vector<array> fused_reshape_attention_fn(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window) {
-  auto prim = std::make_shared<FusedReshapeAndAttentionPrimitive>(
+  auto prim = std::make_shared<PagedSDPAPrimitive>(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window);
@@ -708,7 +708,7 @@ NB_MODULE(_paged_ops, m) {
 
   // Fused primitive: reshape_and_cache + paged_attention in one eval_gpu.
   // Uses overwrite_descriptor to bypass cross-module nanobind RTTI.
-  m.def("fused_reshape_attention_primitive",
+  m.def("paged_sdpa_primitive",
         [](nb::handle query_h, nb::handle key_h, nb::handle value_h,
            nb::handle key_cache_h, nb::handle value_cache_h,
            nb::handle slot_mapping_h,
@@ -717,7 +717,7 @@ NB_MODULE(_paged_ops, m) {
            nb::handle cu_seqlens_q_h,
            int block_size, int max_seq_len, int sliding_window,
            nb::handle out_k_h, nb::handle out_v_h, nb::handle out_attn_h) {
-          auto result = fused_reshape_attention_fn(
+          auto result = paged_sdpa_primitive_fn(
               *nb::inst_ptr<array>(query_h),
               *nb::inst_ptr<array>(key_h),
               *nb::inst_ptr<array>(value_h),
@@ -742,6 +742,6 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
         nb::arg("out_key"), nb::arg("out_value"), nb::arg("out_attn"),
-        "Fused primitive: reshape_and_cache + paged_attention_v2_online "
+        "Paged SDPA primitive: reshape_and_cache + paged_attention_v2_online "
         "in a single eval_gpu dispatch (same command encoder).");
 }

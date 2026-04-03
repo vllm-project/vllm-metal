@@ -108,16 +108,17 @@ def sdpa_forward(
     ops = get_ops()
     max_seq_len = max(ctx.context_lens)
 
-    # Fused primitive: reshape_and_cache + paged_attention in one eval_gpu.
-    # Both Metal kernel dispatches go to the same command encoder, so
-    # Metal guarantees the cache write completes before the attention read.
-    # No per-layer mx.eval or mx.synchronize — fully lazy until the model
-    # runner evaluates the final logits.
+    # Paged SDPA primitive: reshape_and_cache + paged_attention in one
+    # eval_gpu.  Both Metal kernel dispatches go to the same command
+    # encoder, so Metal guarantees the cache write completes before the
+    # attention read.
     updated_k_cache = mx.array(0)
     updated_v_cache = mx.array(0)
     out = mx.array(0)
-    ops.fused_reshape_attention_primitive(
-        q_3d, k_3d, v_3d,
+    ops.paged_sdpa_primitive(
+        q_3d,
+        k_3d,
+        v_3d,
         kv_cache.key_caches[layer_idx],
         kv_cache.value_caches[layer_idx],
         slot_mapping,
@@ -135,7 +136,7 @@ def sdpa_forward(
         out,
     )
 
-    # Evaluate the fused primitive for this layer.  Required because
+    # Evaluate the paged SDPA primitive for this layer.  Required because
     # copy_shared_buffer cache aliasing is not safe across a fully-lazy
     # 28-layer graph — MLX's buffer management may reorder or reuse
     # aliased buffers.  Removing this eval is tracked as future work.
