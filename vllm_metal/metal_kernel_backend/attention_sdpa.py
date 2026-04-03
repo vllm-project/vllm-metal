@@ -94,7 +94,7 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
+    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int32)
 
     # Build block_tables and seq_lens from context
     max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
@@ -108,20 +108,36 @@ def sdpa_forward(
     ops = get_ops()
     max_seq_len = max(ctx.context_lens)
 
-    # Paged SDPA primitive: reshape_and_cache + paged_attention in one
-    # eval_gpu.  Both Metal kernel dispatches go to the same command
-    # encoder, so Metal guarantees the cache write completes before the
-    # attention read.
-    updated_k_cache = mx.array(0)
-    updated_v_cache = mx.array(0)
+    # --- Cache write: MLX-native scatter (pure functional, graph-tracked) ---
+    # Flatten cache to [num_slots, num_kv_heads, head_dim], scatter new K/V
+    # by slot_mapping, then reshape back.  This creates proper graph nodes
+    # that MLX's evaluator can track for dependency ordering and buffer
+    # donation — no in-place mutation, no copy_shared_buffer, no const_cast.
+    flat_k = kv_cache.key_caches[layer_idx].reshape(-1, kv_cache.num_kv_heads, head_dim)
+    flat_k[slot_mapping] = k_3d
+    new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
+
+    flat_v = kv_cache.value_caches[layer_idx].reshape(
+        -1, kv_cache.num_kv_heads, head_dim
+    )
+    flat_v[slot_mapping] = v_3d
+    new_v_cache = flat_v.reshape(kv_cache.value_caches[layer_idx].shape)
+
+    # Rebind so next layer / decode step uses the updated cache
+    kv_cache.key_caches[layer_idx] = new_k_cache
+    kv_cache.value_caches[layer_idx] = new_v_cache
+
+    # --- Attention: paged attention primitive (read-only, fully lazy) ---
+    # No per-layer eval or sync.  The primitive participates in MLX's lazy
+    # graph and is evaluated by the model runner at the end of the forward
+    # pass.  Fence-based synchronisation across command buffer boundaries
+    # works correctly because eval_gpu skips add_temporary (which would
+    # remove buffers from the encoder's fence tracking).
     out = mx.array(0)
-    ops.paged_sdpa_primitive(
+    ops.paged_attention_primitive(
         q_3d,
-        k_3d,
-        v_3d,
-        kv_cache.key_caches[layer_idx],
-        kv_cache.value_caches[layer_idx],
-        slot_mapping,
+        new_k_cache,
+        new_v_cache,
         kv_cache.num_kv_heads,
         inner.scale,
         0.0,  # softcap (0 = disabled)
@@ -131,20 +147,8 @@ def sdpa_forward(
         kv_cache.block_size,
         max_seq_len,
         -1,  # sliding_window (-1 = disabled)
-        updated_k_cache,
-        updated_v_cache,
         out,
     )
-
-    # Evaluate the paged SDPA primitive for this layer.  Required because
-    # copy_shared_buffer cache aliasing is not safe across a fully-lazy
-    # 28-layer graph — MLX's buffer management may reorder or reuse
-    # aliased buffers.  Removing this eval is tracked as future work.
-    mx.eval(updated_k_cache, updated_v_cache, out)
-
-    # Rebind cache references for next layer / decode step
-    kv_cache.key_caches[layer_idx] = updated_k_cache
-    kv_cache.value_caches[layer_idx] = updated_v_cache
 
     # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
     out = out.reshape(B, L, n_heads * head_dim)

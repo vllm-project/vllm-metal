@@ -76,10 +76,18 @@ static std::string dtype_to_metal(Dtype dt) {
 // reshape_and_cache — dispatch helper + eager binding
 // ---------------------------------------------------------------------------
 
+// When called from a primitive's eval_gpu, from_primitive should be true
+// to skip ALL add_temporary calls.  add_temporary removes buffer pointers
+// from the encoder's input/output tracking, defeating fence-based
+// synchronisation across command buffer boundaries.  Inside a primitive,
+// MLX's evaluator already manages array lifetimes via the completion
+// handler.  In the eager path, add_temporary is needed to keep
+// Python-owned arrays alive until the command buffer completes.
 static void dispatch_reshape_and_cache(
     const array& key, const array& value,
     array& key_cache, array& value_cache,
-    const array& slot_mapping, Stream s) {
+    const array& slot_mapping, Stream s,
+    bool from_primitive = false) {
   auto& d = metal::device(s.device);
 
   int num_tokens  = static_cast<int>(key.shape(0));
@@ -120,11 +128,13 @@ static void dispatch_reshape_and_cache(
       MTL::Size::Make(num_tokens, 1, 1),
       MTL::Size::Make(tpg, 1, 1));
 
-  d.add_temporary(key, s.index);
-  d.add_temporary(value, s.index);
-  d.add_temporary(key_cache, s.index);
-  d.add_temporary(value_cache, s.index);
-  d.add_temporary(slot_mapping, s.index);
+  if (!from_primitive) {
+    d.add_temporary(key, s.index);
+    d.add_temporary(value, s.index);
+    d.add_temporary(key_cache, s.index);
+    d.add_temporary(value_cache, s.index);
+    d.add_temporary(slot_mapping, s.index);
+  }
 }
 
 void reshape_and_cache_impl(
@@ -259,7 +269,8 @@ static void dispatch_paged_attention_v2_online(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window, Stream s) {
+    int block_size, int max_seq_len, int sliding_window, Stream s,
+    bool from_primitive = false) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -335,13 +346,15 @@ static void dispatch_paged_attention_v2_online(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
-  d.add_temporary(out, s.index);
-  d.add_temporary(query, s.index);
-  d.add_temporary(key_cache, s.index);
-  d.add_temporary(value_cache, s.index);
-  d.add_temporary(block_tables, s.index);
-  d.add_temporary(seq_lens, s.index);
-  d.add_temporary(cu_seqlens_q, s.index);
+  if (!from_primitive) {
+    d.add_temporary(out, s.index);
+    d.add_temporary(query, s.index);
+    d.add_temporary(key_cache, s.index);
+    d.add_temporary(value_cache, s.index);
+    d.add_temporary(block_tables, s.index);
+    d.add_temporary(seq_lens, s.index);
+    d.add_temporary(cu_seqlens_q, s.index);
+  }
 }
 
 // Eager wrapper — keeps the old handle-based API for metal_unified_attention
@@ -484,62 +497,47 @@ static void paged_attention_v2_online_impl_common(
 }
 
 // ---------------------------------------------------------------------------
-// Fused reshape_and_cache + paged_attention_v2_online PRIMITIVE
+// Paged attention primitive (read-only): paged_attention_v2_online only.
 //
-// Three outputs: [updated_key_cache, updated_value_cache, attention_output]
-// Both Metal kernel dispatches happen in the same eval_gpu → same command
-// encoder → Metal guarantees sequential ordering (write before read).
+// Single output: attention result.  The KV cache is read-only — cache
+// writes are handled upstream by MLX-native scatter (pure functional).
+// This is a clean pure function: inputs → output, no side effects.
 // ---------------------------------------------------------------------------
 
-class PagedSDPAPrimitive : public Primitive {
+class PagedAttentionPrimitive : public UnaryPrimitive {
  public:
-  PagedSDPAPrimitive(
+  PagedAttentionPrimitive(
       Stream stream, int num_kv_heads, float scale, float softcap,
       int block_size, int max_seq_len, int sliding_window)
-      : Primitive(stream),
+      : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window) {}
 
-  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+  void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
-        "PagedSDPAPrimitive only supports GPU");
+        "PagedAttentionPrimitive only supports GPU");
   }
 
-  void eval_gpu(
-      const std::vector<array>& inputs,
-      std::vector<array>& outputs) override {
-    // inputs:  [query, key, value, key_cache, value_cache, slot_mapping,
-    //           block_tables, seq_lens, cu_seqlens_q]
-    // outputs: [updated_key_cache, updated_value_cache, attention_output]
-
-    // 1. Cache outputs alias input cache buffers (zero-copy)
-    outputs[0].copy_shared_buffer(inputs[3]);  // key_cache
-    outputs[1].copy_shared_buffer(inputs[4]);  // value_cache
-
-    // 2. Dispatch reshape_and_cache — writes new K/V into cache
-    dispatch_reshape_and_cache(
-        inputs[1], inputs[2],    // key, value
-        outputs[0], outputs[1],  // cache buffers (aliased)
-        inputs[5],               // slot_mapping
-        stream());
-
-    // 3. Dispatch attention — reads from cache (same command encoder!)
-    outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    // inputs: [query, key_cache, value_cache, block_tables, seq_lens,
+    //          cu_seqlens_q]
+    out.set_data(allocator::malloc(out.nbytes()));
     dispatch_paged_attention_v2_online(
-        outputs[2],              // attention output
+        out,
         inputs[0],               // query
-        outputs[0], outputs[1],  // cache buffers (just written)
+        inputs[1], inputs[2],    // key_cache, value_cache
         num_kv_heads_, scale_, softcap_,
-        inputs[6], inputs[7], inputs[8],  // block_tables, seq_lens, cu_seqlens_q
+        inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_,
-        stream());
+        stream(),
+        /*from_primitive=*/true);
   }
 
-  const char* name() const override { return "FusedReshapeAndAttention"; }
+  const char* name() const override { return "PagedAttention"; }
 
   bool is_equivalent(const Primitive& other) const override {
-    auto* rhs = dynamic_cast<const PagedSDPAPrimitive*>(&other);
+    auto* rhs = dynamic_cast<const PagedAttentionPrimitive*>(&other);
     return rhs && rhs->num_kv_heads_ == num_kv_heads_
         && rhs->scale_ == scale_ && rhs->softcap_ == softcap_
         && rhs->block_size_ == block_size_
@@ -556,24 +554,20 @@ class PagedSDPAPrimitive : public Primitive {
   int sliding_window_;
 };
 
-static std::vector<array> paged_sdpa_primitive_fn(
-    const array& query, const array& key, const array& value,
+static array paged_attention_primitive_fn(
+    const array& query,
     const array& key_cache, const array& value_cache,
-    const array& slot_mapping,
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window) {
-  auto prim = std::make_shared<PagedSDPAPrimitive>(
+  auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window);
-  return array::make_arrays(
-      {key_cache.shape(), value_cache.shape(), query.shape()},
-      {key_cache.dtype(), value_cache.dtype(), query.dtype()},
-      std::move(prim),
-      {query, key, value, key_cache, value_cache, slot_mapping,
-       block_tables, seq_lens, cu_seqlens_q});
+  return array(
+      query.shape(), query.dtype(), std::move(prim),
+      {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
 }
 
 void paged_attention_v2_online_impl(
@@ -706,42 +700,36 @@ NB_MODULE(_paged_ops, m) {
         "Online-softmax varlen paged attention (v2) with caller-provided "
         "partition scratch buffers.");
 
-  // Fused primitive: reshape_and_cache + paged_attention in one eval_gpu.
+  // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
+  // Cache writes are handled by MLX-native scatter upstream.
   // Uses overwrite_descriptor to bypass cross-module nanobind RTTI.
-  m.def("paged_sdpa_primitive",
-        [](nb::handle query_h, nb::handle key_h, nb::handle value_h,
+  m.def("paged_attention_primitive",
+        [](nb::handle query_h,
            nb::handle key_cache_h, nb::handle value_cache_h,
-           nb::handle slot_mapping_h,
            int num_kv_heads, float scale, float softcap,
            nb::handle block_tables_h, nb::handle seq_lens_h,
            nb::handle cu_seqlens_q_h,
            int block_size, int max_seq_len, int sliding_window,
-           nb::handle out_k_h, nb::handle out_v_h, nb::handle out_attn_h) {
-          auto result = paged_sdpa_primitive_fn(
+           nb::handle out_h) {
+          auto result = paged_attention_primitive_fn(
               *nb::inst_ptr<array>(query_h),
-              *nb::inst_ptr<array>(key_h),
-              *nb::inst_ptr<array>(value_h),
               *nb::inst_ptr<array>(key_cache_h),
               *nb::inst_ptr<array>(value_cache_h),
-              *nb::inst_ptr<array>(slot_mapping_h),
               num_kv_heads, scale, softcap,
               *nb::inst_ptr<array>(block_tables_h),
               *nb::inst_ptr<array>(seq_lens_h),
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window);
-          nb::inst_ptr<array>(out_k_h)->overwrite_descriptor(result[0]);
-          nb::inst_ptr<array>(out_v_h)->overwrite_descriptor(result[1]);
-          nb::inst_ptr<array>(out_attn_h)->overwrite_descriptor(result[2]);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
-        nb::arg("query"), nb::arg("key"), nb::arg("value"),
+        nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("slot_mapping"),
         nb::arg("num_kv_heads"), nb::arg("scale"), nb::arg("softcap"),
         nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("cu_seqlens_q"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
-        nb::arg("out_key"), nb::arg("out_value"), nb::arg("out_attn"),
-        "Paged SDPA primitive: reshape_and_cache + paged_attention_v2_online "
-        "in a single eval_gpu dispatch (same command encoder).");
+        nb::arg("out"),
+        "Paged attention primitive (read-only). Cache writes are handled "
+        "by MLX-native scatter upstream.");
 }
