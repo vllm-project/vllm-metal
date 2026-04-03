@@ -51,7 +51,8 @@ class GDNPagedStateCache:
         self.conv_states: list[mx.array] = [
             mx.zeros(conv_shape, dtype=dtype) for _ in range(num_layers)
         ]
+        # Recurrent state uses float32 to avoid overflow in kernel accumulation.
         self.recurrent_states: list[mx.array] = [
-            mx.zeros(recurrent_shape, dtype=dtype) for _ in range(num_layers)
+            mx.zeros(recurrent_shape, dtype=mx.float32) for _ in range(num_layers)
         ]
         mx.eval(*self.conv_states, *self.recurrent_states)

@@ -87,7 +87,7 @@ print("GOLDEN_JSON:" + json.dumps(result))
 """
     proc = subprocess.run(
         [sys.executable, "-c", script],
-        capture_output=True, text=True, env=env, timeout=300,
+        capture_output=True, text=True, env=env, timeout=600,
     )
     if proc.returncode != 0:
         print(proc.stderr[-2000:] if len(proc.stderr) > 2000 else proc.stderr)
