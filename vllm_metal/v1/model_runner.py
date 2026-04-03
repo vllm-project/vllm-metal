@@ -1575,7 +1575,7 @@ class MetalModelRunner:
 
             if self._paged_attention_backend is not None:
                 sched_block_ids = list(new_req.block_ids[0])
-                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
                 cur_len = computed_tokens + scheduled_tokens
@@ -1852,9 +1852,7 @@ class MetalModelRunner:
                 if new_req is not None:
                     prompt_len = len(new_req.prompt_token_ids or [])
                     computed_tokens = new_req.num_computed_tokens
-                    scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
-                        req_id, 0
-                    )
+                    scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                     is_intermediate_ctx = (
                         computed_tokens + scheduled_tokens < prompt_len
                     )
