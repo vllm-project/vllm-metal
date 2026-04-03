@@ -1,15 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// GDN (Gated DeltaNet) linear attention kernel for paged state management.
-//
-// Reads/writes recurrent state in-place from a managed state pool via
-// slot_mapping, following the same pattern as reshape_and_cache.
-//
-// Threading model (same as mlx_lm gated_delta_kernel):
-//   Grid:        (Dv, 1, num_requests * Hv)
-//   Threadgroup: (32, 1, 1)
-//   Each SIMD group of 32 threads handles Dk elements (n_per_t = Dk/32).
-//   simd_sum() reduces across threads for dot products.
-
 #include <metal_stdlib>
 using namespace metal;
 
