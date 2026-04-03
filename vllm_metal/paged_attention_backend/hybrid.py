@@ -11,9 +11,8 @@ GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
 
 from __future__ import annotations
 
-from typing import Any
-
 import mlx.core as mx
+import mlx.nn as nn
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -149,7 +148,7 @@ class HybridPagedAttentionBackend:
             self._max_num_seqs,
         )
 
-    def patch_model(self, model: Any) -> int:
+    def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")
         if self._state_cache is None:
             raise RuntimeError("patch_model() called before initialize()")
