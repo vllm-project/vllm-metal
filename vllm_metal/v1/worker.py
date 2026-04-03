@@ -147,6 +147,12 @@ class MetalWorker(WorkerBase):
         # SDPA KV cache + GDN recurrent state management.
         if not self.metal_config.use_paged_attention and self.model_runner.is_hybrid:
             self.metal_config.use_paged_attention = True
+            # Prefix caching guard: check_and_update_config() skipped this
+            # because use_paged_attention was False at config time.
+            cache_config = self.vllm_config.cache_config
+            if getattr(cache_config, "enable_prefix_caching", False):
+                cache_config.enable_prefix_caching = False
+                logger.info("Metal: disabled prefix caching for hybrid model")
             logger.info("Auto-enabled paged attention for hybrid model")
         if self.metal_config.use_paged_attention and self.model_runner.should_setup_paged_attention():
             self._setup_paged_attention()
