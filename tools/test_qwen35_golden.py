@@ -27,9 +27,7 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
-MODEL_DEFAULT = os.environ.get(
-    "QWEN35_MODEL_PATH", "Qwen/Qwen3.5-4B"
-)
+MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-4B")
 MAX_TOKENS = 20
 
 PROMPTS = [
@@ -60,7 +58,9 @@ def print_golden(results: dict[str, list[int]], label: str) -> None:
     print("}")
 
 
-def _run_in_subprocess(model: str, max_tokens: int, paged: bool) -> dict[str, list[int]]:
+def _run_in_subprocess(
+    model: str, max_tokens: int, paged: bool
+) -> dict[str, list[int]]:
     """Run generation in a subprocess to avoid memory interference."""
     import json
     import subprocess
@@ -87,7 +87,10 @@ print("GOLDEN_JSON:" + json.dumps(result))
 """
     proc = subprocess.run(
         [sys.executable, "-c", script],
-        capture_output=True, text=True, env=env, timeout=600,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
     )
     if proc.returncode != 0:
         print(proc.stderr[-2000:] if len(proc.stderr) > 2000 else proc.stderr)
@@ -95,7 +98,7 @@ print("GOLDEN_JSON:" + json.dumps(result))
 
     for line in proc.stdout.splitlines():
         if line.startswith("GOLDEN_JSON:"):
-            return json.loads(line[len("GOLDEN_JSON:"):])
+            return json.loads(line[len("GOLDEN_JSON:") :])
     raise RuntimeError("No GOLDEN_JSON output found")
 
 
@@ -120,12 +123,16 @@ def run_test(model: str, max_tokens: int) -> bool:
             # Find first divergence
             for i, (a, b) in enumerate(zip(mlx_ids, paged_ids, strict=False)):
                 if a != b:
-                    print(f"  [{status}] {prompt!r} — diverges at token {i}: "
-                          f"mlx={a} vs paged={b}")
+                    print(
+                        f"  [{status}] {prompt!r} — diverges at token {i}: "
+                        f"mlx={a} vs paged={b}"
+                    )
                     break
             else:
-                print(f"  [{status}] {prompt!r} — length differs: "
-                      f"mlx={len(mlx_ids)} vs paged={len(paged_ids)}")
+                print(
+                    f"  [{status}] {prompt!r} — length differs: "
+                    f"mlx={len(mlx_ids)} vs paged={len(paged_ids)}"
+                )
         else:
             print(f"  [{status}] {prompt!r}")
 
@@ -134,12 +141,14 @@ def run_test(model: str, max_tokens: int) -> bool:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--model", default=MODEL_DEFAULT)
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
-    parser.add_argument("--gen-golden", action="store_true",
-                        help="Just print golden token IDs and exit")
+    parser.add_argument(
+        "--gen-golden", action="store_true", help="Just print golden token IDs and exit"
+    )
     args = parser.parse_args()
 
     if args.gen_golden:

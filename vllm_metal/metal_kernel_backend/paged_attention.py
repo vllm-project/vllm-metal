@@ -75,7 +75,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         ctx = get_context()
         if ctx is None:
             # No paged context → delegate to original attention
-            return self._inner(x, mask=mask, cache=cache, position_ids=position_ids, **kwargs)
+            return self._inner(
+                x, mask=mask, cache=cache, position_ids=position_ids, **kwargs
+            )
 
         inner = self._inner
 

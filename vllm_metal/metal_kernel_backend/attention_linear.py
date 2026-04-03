@@ -159,15 +159,32 @@ class GDNPagedAttentionWrapper(nn.Module):
         recurrent_pool = state_cache.recurrent_states[cache_idx]
 
         mx.eval(
-            q_flat, k_flat, v_flat, g_flat, beta_flat,
-            recurrent_pool, cu_seqlens_arr, slot_mapping, y_flat,
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            recurrent_pool,
+            cu_seqlens_arr,
+            slot_mapping,
+            y_flat,
         )
 
         ops = get_ops()
         ops.gdn_linear_attention(
-            q_flat, k_flat, v_flat, g_flat, beta_flat,
-            recurrent_pool, cu_seqlens_arr, slot_mapping, y_flat,
-            n_hk, n_hv, d_k, d_v,
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            recurrent_pool,
+            cu_seqlens_arr,
+            slot_mapping,
+            y_flat,
+            n_hk,
+            n_hv,
+            d_k,
+            d_v,
         )
         mx.eval(y_flat, recurrent_pool)
         y_flat = y_flat.astype(x.dtype)
