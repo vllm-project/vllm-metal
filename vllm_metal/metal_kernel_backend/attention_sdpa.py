@@ -135,10 +135,10 @@ def sdpa_forward(
         out,
     )
 
-    # Evaluate the fused primitive for this layer.
-    # TODO: investigate why fully-lazy (no per-layer eval) produces garbage.
-    # The fused primitive dispatches both kernels to the same command encoder,
-    # but something in the cross-layer lazy graph breaks correctness.
+    # Evaluate the fused primitive for this layer.  Required because
+    # copy_shared_buffer cache aliasing is not safe across a fully-lazy
+    # 28-layer graph — MLX's buffer management may reorder or reuse
+    # aliased buffers.  Removing this eval is tracked as future work.
     mx.eval(updated_k_cache, updated_v_cache, out)
 
     # Rebind cache references for next layer / decode step
