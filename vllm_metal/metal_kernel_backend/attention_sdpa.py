@@ -94,7 +94,7 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int32)
+    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
 
     # Build block_tables and seq_lens from context
     max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
