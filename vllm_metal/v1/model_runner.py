@@ -811,6 +811,7 @@ class MetalModelRunner:
         with _model_cache_lock:
             if model_name in _model_cache:
                 self.model, self.tokenizer = _model_cache[model_name]
+                self._is_vlm = is_vlm
                 load_time = time.time() - start_time
                 logger.info(
                     f"Model loaded from cache in {load_time:.3f}s: {model_name}"
@@ -1031,10 +1032,24 @@ class MetalModelRunner:
         return slot
 
     def _gdn_free_slot(self, req_id: str) -> None:
-        """Release a GDN state pool slot when a request finishes."""
+        """Release a GDN state pool slot and zero its state."""
         slot = self._gdn_req_to_slot.pop(req_id, None)
-        if slot is not None:
-            self._gdn_free_slots.append(slot)
+        if slot is None:
+            return
+        # Zero conv and recurrent state so the next request doesn't
+        # inherit the previous request's linear-attention history.
+        backend = self._paged_attention_backend
+        if backend is not None and hasattr(backend, "_state_cache"):
+            sc = backend._state_cache
+            if sc is not None:
+                for layer_idx in range(sc.num_layers):
+                    conv = sc.conv_states[layer_idx]
+                    conv[slot] = 0
+                    sc.conv_states[layer_idx] = conv
+                    rec = sc.recurrent_states[layer_idx]
+                    rec[slot] = 0
+                    sc.recurrent_states[layer_idx] = rec
+        self._gdn_free_slots.append(slot)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1129,7 +1144,9 @@ class MetalModelRunner:
         if self._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
-        block_size = self.metal_config.block_size
+        # Use cache_config.block_size (not metal_config) because vLLM's
+        # hybrid alignment may have adjusted it to match mamba page size.
+        block_size = self.cache_config.block_size
 
         # Each block stores key and value for SDPA layers only.
         # Hybrid models (Qwen3.5) have linear attention layers that use

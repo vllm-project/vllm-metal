@@ -154,7 +154,10 @@ class MetalWorker(WorkerBase):
                 cache_config.enable_prefix_caching = False
                 logger.info("Metal: disabled prefix caching for hybrid model")
             logger.info("Auto-enabled paged attention for hybrid model")
-        if self.metal_config.use_paged_attention and self.model_runner.should_setup_paged_attention():
+        if (
+            self.metal_config.use_paged_attention
+            and self.model_runner.should_setup_paged_attention()
+        ):
             self._setup_paged_attention()
 
     @staticmethod
