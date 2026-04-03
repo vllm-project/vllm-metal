@@ -1767,9 +1767,6 @@ class MetalModelRunner:
         prefill_pack: list[PrefillRequest],
     ) -> None:
         """Run paged prefill/decode and write results back into ``batch``."""
-        if not batch.has_paged_work():
-            return
-
         prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
             prefill_pack, batch.paged_decode_reqs
         )
