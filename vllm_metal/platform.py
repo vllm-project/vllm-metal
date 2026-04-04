@@ -348,16 +348,18 @@ class MetalPlatform(Platform):
         cls,
         vllm_config,
     ) -> None:
-        """Update block_size to ensure page size unification for hybrid models.
+        """Update block_size to unify page sizes for hybrid models.
 
-        For hybrid models (Qwen3.5), linear attention layers (MambaSpec) have
-        a fixed page size, while attention layers (FullAttentionSpec) have a
-        page size that scales with block_size. This method adjusts block_size
-        to ensure the attention page size is >= mamba page size, and pads
-        mamba page size to exactly match attention page size.
+        Hybrid models (e.g., Qwen3.5) have two types of layers:
+        - SDPA layers: page_size scales with block_size
+        - Mamba/linear layers: page_size is fixed
+
+        vLLM requires all layer page sizes to be divisible. This method:
+        1. Increases block_size so SDPA page_size >= Mamba page_size
+        2. Sets mamba_page_size_padded to match SDPA page_size exactly
 
         Args:
-            vllm_config: vLLM configuration
+            vllm_config: vLLM configuration (modified in-place)
         """
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -369,12 +371,12 @@ class MetalPlatform(Platform):
         if not model_config:
             return
 
-        # Check if this is a hybrid model
+        # Skip non-hybrid models
         is_hybrid = getattr(model_config, "is_hybrid", False)
         if not is_hybrid:
             return
 
-        # Compute attention page size for 1 token
+        # Step 1: Compute SDPA page size per token
         attn_page_size_1_token = FullAttentionSpec(
             block_size=1,
             num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
@@ -382,7 +384,7 @@ class MetalPlatform(Platform):
             dtype=model_config.dtype,
         ).page_size_bytes
 
-        # Compute mamba page size
+        # Step 2: Get Mamba page size (fixed, independent of block_size)
         try:
             model_cls, _ = ModelRegistry.resolve_model_cls(
                 model_config.architecture,
@@ -402,7 +404,7 @@ class MetalPlatform(Platform):
         if mamba_page_size == 0:
             return
 
-        # Calculate minimum block_size to make attention page_size >= mamba page_size
+        # Step 3: Calculate block_size so SDPA page_size >= Mamba page_size
         attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
 
         # Round up to nearest multiple of 32 for performance
@@ -419,10 +421,11 @@ class MetalPlatform(Platform):
                 attn_block_size,
             )
 
+        # Step 4: Sync mamba_block_size if using align mode
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
-        # Pad mamba page size to exactly match attention page size
+        # Step 5: Pad Mamba page size to exactly match SDPA page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
         if attn_page_size > mamba_page_size:
             cache_config.mamba_page_size_padded = attn_page_size
