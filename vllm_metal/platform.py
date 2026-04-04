@@ -331,6 +331,19 @@ class MetalPlatform(Platform):
         pass
 
     @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        """Metal platform supports hybrid KV cache via MLX.
+
+        MLX's make_prompt_cache() automatically handles hybrid models:
+        - SDPA layers → KVCache
+        - Linear attention layers → ArraysCache
+
+        Returns:
+            True - MLX supports hybrid KV cache natively
+        """
+        return True
+
+    @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Check if pin_memory is available for Metal platform.
 

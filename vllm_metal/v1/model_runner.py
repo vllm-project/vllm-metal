@@ -51,6 +51,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.paged_attention_backend.hybrid import _build_linear_layer_spec
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
@@ -1055,17 +1056,27 @@ class MetalModelRunner:
 
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self.num_layers):
-            # All layers use FullAttentionSpec for vLLM scheduler initialization.
-            # For hybrid models (Qwen3.5), linear attention layers actually use
-            # ArraysCache managed by MLX's make_prompt_cache() internally.
-            # This unified spec allows vLLM to initialize without errors.
-            layer_name = f"layers.{layer_idx}.self_attn"
-            specs[layer_name] = FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                dtype=torch_dtype,
-            )
+            if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
+                # Linear attention layers use MambaSpec for accurate representation
+                # MLX will use ArraysCache for these layers via make_prompt_cache()
+                layer_name = f"layers.{layer_idx}.linear_attn"
+                specs[layer_name] = _build_linear_layer_spec(
+                    conv_kernel_dim=self.linear_conv_kernel_dim,
+                    conv_dim=self.linear_conv_dim,
+                    num_v_heads=self.linear_num_v_heads,
+                    value_head_dim=self.linear_value_head_dim,
+                    key_head_dim=self.linear_key_head_dim,
+                    torch_dtype=torch_dtype,
+                )
+            else:
+                # SDPA layers use FullAttentionSpec
+                layer_name = f"layers.{layer_idx}.self_attn"
+                specs[layer_name] = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_dim,
+                    dtype=torch_dtype,
+                )
 
         return specs
 
