@@ -353,8 +353,8 @@ class MetalWorker(WorkerBase):
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path (default): reports one max-length sequence of KV cache
-        so the scheduler budgets for one concurrent sequence.
+        MLX path (default): reports available Metal memory for KV cache,
+        not based on max_model_len (which gives misleadingly small values).
 
         Returns:
             Available memory in bytes
@@ -366,8 +366,6 @@ class MetalWorker(WorkerBase):
         )
 
         if mode == "stt_nominal":
-            # STT models don't use vLLM's KV cache. Return a nominal value so
-            # scheduler minimum-memory checks pass.
             logger.info("STT model: reporting nominal memory for scheduler")
             return STT_SCHED_AVAILABLE_BYTES
 
@@ -387,13 +385,25 @@ class MetalWorker(WorkerBase):
             )
             return available
 
-        # Default MLX path: one max-length sequence for admission control.
-        available = self._one_sequence_kv_bytes()
+        # Default MLX path: Return actual available Metal memory.
+        # MLX manages its own KV cache internally, so we return a reasonable
+        # estimate based on remaining Metal memory.
+        device_info = mx.device_info()
+        metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
+        model_memory = self._get_model_memory_usage()
+
+        # Use 80% of remaining memory for KV cache (conservative estimate)
+        remaining = metal_limit - model_memory
+        available = int(remaining * 0.8)
+
         logger.info(
-            "MLX path: reporting %.2fGB for scheduler admission control "
-            "(one max-length sequence, max_model_len=%d)",
+            "MLX path: reporting %.2f GB for scheduler (Metal limit: %.2f GB, "
+            "Model: %.2f GB, Remaining: %.2f GB, KV budget: %.2f GB)",
             available / 1e9,
-            self.model_config.max_model_len,
+            metal_limit / 1e9,
+            model_memory / 1e9,
+            remaining / 1e9,
+            available / 1e9,
         )
         return available
 
