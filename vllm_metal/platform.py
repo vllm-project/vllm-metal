@@ -358,14 +358,6 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration
         """
-        from vllm.model_executor.models.config import is_hybrid_model
-
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-
-        if not is_hybrid_model(model_config):
-            return
-
         # For now, skip page size unification
         # MLX manages its own cache internally, so vLLM's page size
         # unification is not needed
