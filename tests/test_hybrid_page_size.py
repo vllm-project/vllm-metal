@@ -50,7 +50,6 @@ def test_update_block_size_for_backend_increases_block_size(
 ):
     """Test that update_block_size_for_backend() increases block_size for hybrid models."""
     from vllm.config import VllmConfig
-    from vllm.platforms import current_platform
 
     # Create a fresh VllmConfig without triggering auto-update
     vllm_config = VllmConfig(
@@ -62,9 +61,7 @@ def test_update_block_size_for_backend_increases_block_size(
     # So we just verify it's >= 16 and aligned to 32
     block_size = vllm_config.cache_config.block_size
     assert block_size >= 16
-    assert block_size % 32 == 0, (
-        f"block_size {block_size} should be aligned to 32"
-    )
+    assert block_size % 32 == 0, f"block_size {block_size} should be aligned to 32"
 
 
 def test_update_block_size_for_backend_sets_mamba_padding(hybrid_vllm_config):
