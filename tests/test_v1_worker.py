@@ -88,19 +88,33 @@ class TestWorkerRunnerBoundaryDelegation:
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
+        """Test MLX path returns 80% of remaining Metal memory."""
+        import mlx.core as mx
+
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="single_sequence_estimate"
             ),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
-        worker._one_sequence_kv_bytes = MagicMock(return_value=4096)
         worker.model_config = SimpleNamespace(max_model_len=2048)
 
-        available = MetalWorker.determine_available_memory(worker)
+        # Mock device_info and model memory
+        original_device_info = mx.device_info
+        mx.device_info = MagicMock(
+            return_value={"max_recommended_working_set_size": 16 * 1024**3}
+        )
+        worker._get_model_memory_usage = MagicMock(return_value=2 * 1024**3)
 
-        assert available == 4096
-        worker._one_sequence_kv_bytes.assert_called_once_with()
+        try:
+            available = MetalWorker.determine_available_memory(worker)
+
+            # Should return 80% of remaining memory
+            # (16GB - 2GB) * 0.8 = 11.2GB
+            expected = int((16 * 1024**3 - 2 * 1024**3) * 0.8)
+            assert available == expected
+        finally:
+            mx.device_info = original_device_info
 
     def test_get_supported_tasks_delegates_to_runner_capability(self) -> None:
         model_runner = SimpleNamespace(
