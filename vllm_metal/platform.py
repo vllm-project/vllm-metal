@@ -414,12 +414,11 @@ class MetalPlatform(Platform):
             return
 
         # Step 3: Calculate block_size so SDPA page_size >= Mamba page_size
-        attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
-
-        # Round up to nearest multiple of 32 for performance
-        kernel_block_alignment_size = 32
+        # Use the same formula as vLLM's CPU platform for consistency
+        kernel_block_alignment_size = 32  # Metal GPU kernel alignment
         attn_block_size = kernel_block_alignment_size * cdiv(
-            attn_tokens_per_mamba_state, kernel_block_alignment_size
+            mamba_page_size,
+            kernel_block_alignment_size * attn_page_size_1_token,
         )
 
         if cache_config.block_size < attn_block_size:
