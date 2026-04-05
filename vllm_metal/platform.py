@@ -365,11 +365,20 @@ class MetalPlatform(Platform):
                 dtypes=mamba_state_dtype,
                 block_size=-1,
             ).page_size_bytes
-        except Exception:
-            return
+        except Exception as e:
+            # For hybrid models, re-raise exception instead of silently returning
+            logger.error(
+                "Failed to get mamba state for hybrid model %s: %s",
+                model_config.architecture,
+                e,
+            )
+            raise
 
         if mamba_page_size == 0:
-            return
+            raise ValueError(
+                f"Computed mamba_page_size is zero for hybrid model "
+                f"{model_config.architecture}"
+            )
 
         # Step 3: Calculate block_size so SDPA page_size >= Mamba page_size
         # Use the same formula as vLLM's CPU platform for consistency
