@@ -145,6 +145,8 @@ class MetalWorker(WorkerBase):
         # - Runner owns STT/runtime capability decisions.
         # Hybrid models (Qwen3.5 SDPA+GDN) require paged attention for
         # SDPA KV cache + GDN recurrent state management.
+        # Note: _setup_paged_attention is called after
+        # update_block_size_for_backend() to ensure correct block_size.
         if not self.metal_config.use_paged_attention and self.model_runner.is_hybrid:
             self.metal_config.use_paged_attention = True
             # Prefix caching guard: check_and_update_config() skipped this
@@ -154,6 +156,13 @@ class MetalWorker(WorkerBase):
                 cache_config.enable_prefix_caching = False
                 logger.info("Metal: disabled prefix caching for hybrid model")
             logger.info("Auto-enabled paged attention for hybrid model")
+
+    def setup_paged_attention(self) -> None:
+        """Setup paged attention after block_size alignment.
+
+        This is called after update_block_size_for_backend() to ensure
+        the correct block_size is used for MLX KV cache allocation.
+        """
         if (
             self.metal_config.use_paged_attention
             and self.model_runner.should_setup_paged_attention()
