@@ -143,26 +143,10 @@ class MetalWorker(WorkerBase):
         # Boundary ownership:
         # - Worker owns resource setup.
         # - Runner owns STT/runtime capability decisions.
-        # Hybrid models (Qwen3.5 SDPA+GDN) require paged attention for
-        # SDPA KV cache + GDN recurrent state management.
-        # Note: _setup_paged_attention is called after
-        # update_block_size_for_backend() to ensure correct block_size.
-        if not self.metal_config.use_paged_attention and self.model_runner.is_hybrid:
-            self.metal_config.use_paged_attention = True
-            # Prefix caching guard: check_and_update_config() skipped this
-            # because use_paged_attention was False at config time.
-            cache_config = self.vllm_config.cache_config
-            if getattr(cache_config, "enable_prefix_caching", False):
-                cache_config.enable_prefix_caching = False
-                logger.info("Metal: disabled prefix caching for hybrid model")
-            logger.info("Auto-enabled paged attention for hybrid model")
-
-    def setup_paged_attention(self) -> None:
-        """Setup paged attention after block_size alignment.
-
-        This is called after update_block_size_for_backend() to ensure
-        the correct block_size is used for MLX KV cache allocation.
-        """
+        # Note: For hybrid models (Qwen3.5), we don't auto-enable paged attention
+        # because MLX's make_prompt_cache() handles hybrid KV cache natively.
+        # Paged attention for hybrid models requires splitting KV cache across
+        # multiple buffers to avoid Metal's max buffer size limit (~9.5GB).
         if (
             self.metal_config.use_paged_attention
             and self.model_runner.should_setup_paged_attention()
@@ -392,8 +376,8 @@ class MetalWorker(WorkerBase):
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path (default): reports one max-length sequence of KV cache
-        so the scheduler budgets for one concurrent sequence.
+        MLX path (default): reports available Metal memory for KV cache,
+        not based on max_model_len (which gives misleadingly small values).
 
         Returns:
             Available memory in bytes
@@ -426,13 +410,21 @@ class MetalWorker(WorkerBase):
             )
             return available
 
-        # Default MLX path: one max-length sequence for admission control.
-        available = self._one_sequence_kv_bytes()
+        # Default MLX path: report 80% of remaining memory for KV cache.
+        # Use max_recommended_working_set_size as the Metal memory limit.
+        device_info = mx.device_info()
+        metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
+        model_memory = self._get_model_memory_usage()
+        remaining = metal_limit - model_memory
+        available = int(remaining * 0.8)  # Conservative estimate
         logger.info(
-            "MLX path: reporting %.2fGB for scheduler admission control "
-            "(one max-length sequence, max_model_len=%d)",
+            "MLX path: reporting %.2f GB for scheduler (Metal limit: %.2f GB, "
+            "Model: %.2f GB, Remaining: %.2f GB, KV budget: %.2f GB)",
             available / 1e9,
-            self.model_config.max_model_len,
+            metal_limit / 1e9,
+            model_memory / 1e9,
+            remaining / 1e9,
+            available / 1e9,
         )
         return available
 

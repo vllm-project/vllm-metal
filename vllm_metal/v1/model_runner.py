@@ -1088,10 +1088,11 @@ class MetalModelRunner:
                 ),
             }
 
-        # Use cache_config.block_size (not metal_config.block_size) because
-        # vLLM's hybrid alignment may have adjusted it to unify page sizes
-        # across SDPA and Mamba/GDN layers.
-        block_size = self.cache_config.block_size
+        # Use metal_config.block_size because MLX uses this for its internal
+        # KV cache allocation via make_prompt_cache(). cache_config.block_size
+        # may be adjusted for vLLM scheduler validation but doesn't affect
+        # the actual Metal memory layout.
+        block_size = self.metal_config.block_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
@@ -1144,9 +1145,11 @@ class MetalModelRunner:
         if self._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
-        # Use cache_config.block_size (not metal_config) because vLLM's
-        # hybrid alignment may have adjusted it to match mamba page size.
-        block_size = self.cache_config.block_size
+        # Use metal_config.block_size (not cache_config.block_size) because
+        # this is for Metal memory allocation. cache_config.block_size may be
+        # adjusted for vLLM scheduler validation but doesn't affect actual
+        # Metal memory layout which uses MLX's make_prompt_cache().
+        block_size = self.metal_config.block_size
 
         # Each block stores key and value for SDPA layers only.
         # Hybrid models (Qwen3.5) have linear attention layers that use
