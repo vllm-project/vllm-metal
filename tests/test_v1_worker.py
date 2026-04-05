@@ -114,7 +114,7 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestOneSequenceKvBytes:
-    """_one_sequence_kv_bytes must account for hybrid linear state."""
+    """_one_sequence_kv_bytes must account for hybrid linear state and block alignment."""
 
     def test_non_hybrid_counts_all_layers(self) -> None:
         # Arrange
@@ -129,6 +129,10 @@ class TestOneSequenceKvBytes:
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
+        # block_size=16 divides 2048 evenly, so no padding
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
 
         # Act
         result = MetalWorker._one_sequence_kv_bytes(worker)
@@ -151,6 +155,9 @@ class TestOneSequenceKvBytes:
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
 
         # Act
         result = MetalWorker._one_sequence_kv_bytes(worker)
@@ -158,3 +165,38 @@ class TestOneSequenceKvBytes:
         # Assert — SDPA bytes + linear state
         sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
         assert result == sdpa_bytes + linear_bytes
+
+    def test_block_alignment_rounds_up_token_count(self) -> None:
+        """When block_size doesn't divide max_model_len evenly, the token
+        count must be rounded up to the next block boundary so that the
+        reported bytes match the scheduler's block-aligned accounting.
+
+        This reproduces the KV cache startup failure seen with Mamba-hybrid
+        models (e.g. Granite 4.0-H) where the attention block_size is padded
+        to 400 to match the mamba page size.
+        """
+        import mlx.core as mx
+
+        model_runner = SimpleNamespace(
+            is_hybrid=False,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=64,
+            kv_cache_dtype=mx.float16,
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+        # block_size=400 (Mamba-hybrid): ceil(2048/400)=6, 6*400=2400 tokens
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=400)
+        )
+
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        # Should use 2400 tokens (block-aligned), not 2048
+        aligned_tokens = 2400  # ceil(2048/400) * 400
+        expected = 2 * 4 * aligned_tokens * 4 * 64 * 2
+        assert result == expected
+        # Verify this is strictly more than the unaligned calculation
+        unaligned = 2 * 4 * 2048 * 4 * 64 * 2
+        assert result > unaligned

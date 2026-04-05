@@ -358,7 +358,13 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of cache state."""
+        """Bytes for one max-length sequence of cache state.
+
+        Uses block-aligned token count so the estimate matches the upstream
+        ``_check_enough_kv_cache_memory`` calculation, which rounds
+        ``max_model_len`` up to the nearest ``block_size`` boundary via
+        ``cdiv(max_model_len, block_size) * page_size_bytes``.
+        """
         runner = self.model_runner
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
@@ -367,10 +373,16 @@ class MetalWorker(WorkerBase):
         num_kv_layers = (
             runner.num_sdpa_layers if runner.is_hybrid else runner.num_layers
         )
+
+        # Round token count up to block boundary to match the scheduler's
+        # block-aligned memory accounting.
+        block_size = self.vllm_config.cache_config.block_size
+        max_tokens = -(-self.model_config.max_model_len // block_size) * block_size
+
         sdpa_kv_bytes = (
             2
             * num_kv_layers
-            * self.model_config.max_model_len
+            * max_tokens
             * runner.num_kv_heads
             * runner.head_dim
             * dtype_size
