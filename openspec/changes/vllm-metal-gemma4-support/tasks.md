@@ -30,5 +30,5 @@
 
 - [x] 5.1 Add `gemma4` to the Supported Models list in `README.md`
 - [x] 5.2 Add a note under "Limitations" covering Gemma 4 modality routing and mlx-vlm/mlx-lm PyPI status
-- [ ] 5.3 Reference mlx-lm commit `4469ad4` and this change in the PR description
-- [ ] 5.4 Open PR to `vllm-project/vllm-metal` targeting `main`
+- [x] 5.3 Reference mlx-lm commit `4469ad4` and this change in the PR description
+- [x] 5.4 Open PR to `vllm-project/vllm-metal` targeting `main`
