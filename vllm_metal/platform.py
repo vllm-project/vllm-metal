@@ -354,12 +354,21 @@ class MetalPlatform(Platform):
         - SDPA layers: page_size scales with block_size
         - Mamba/linear layers: page_size is fixed
 
-        vLLM requires all layer page sizes to be divisible. This method:
-        1. Increases block_size so SDPA page_size >= Mamba page_size
-        2. Sets mamba_page_size_padded to match SDPA page_size exactly
+        vLLM requires all layer page sizes to be divisible. This method adjusts
+        block_size and sets mamba_page_size_padded to satisfy vLLM's validation.
+
+        Note:
+            This is a "logical" fix for vLLM's scheduler validation only.
+            The Metal plugin manages KV cache internally via MLX's make_prompt_cache(),
+            independent of vLLM's block_size and page_size calculations.
+            These parameters are used only to pass vLLM's initialization checks.
+
+        Steps:
+        1. Increase block_size so SDPA page_size >= Mamba page_size
+        2. Set mamba_page_size_padded to match SDPA page_size exactly
 
         Args:
-            vllm_config: vLLM configuration (modified in-place)
+            vllm_config: vLLM configuration (modified in-place for vLLM validation)
         """
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
