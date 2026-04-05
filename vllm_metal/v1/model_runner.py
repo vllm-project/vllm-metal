@@ -86,6 +86,13 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
 
+# Registry of multimodal model types that route through mlx_lm_load() instead
+# of mlx_vlm_load(), even when vLLM reports is_multimodal_model=True.
+# Gemma 4 is intentionally absent: mlx-vlm now supports it natively and
+# provides the full vision + audio path.  Add a model_type here only when
+# mlx-lm support lands before mlx-vlm and a text-only workaround is needed.
+_MLX_LM_MULTIMODAL_MODELS: frozenset[str] = frozenset()
+
 # Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
 # in the environment (any value; unset to disable).
 
@@ -790,6 +797,14 @@ class MetalModelRunner:
             return self.model_config.is_multimodal_model
         return False
 
+    def _use_mlx_lm_for_multimodal(self, model_type: str) -> bool:
+        """Return True if this multimodal model_type should use mlx_lm_load().
+
+        Consults the module-level allowlist.  When False the caller falls
+        through to the standard mlx_vlm_load() path.
+        """
+        return model_type in _MLX_LM_MULTIMODAL_MODELS
+
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
 
@@ -803,15 +818,24 @@ class MetalModelRunner:
             return
 
         is_vlm = self._is_vlm_model()
+        model_type: str = getattr(
+            getattr(self.model_config, "hf_config", None), "model_type", ""
+        ) or ""
+        use_mlx_lm = not is_vlm or self._use_mlx_lm_for_multimodal(model_type)
 
-        logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")
+        logger.info(
+            "Loading model: %s (VLM: %s, mlx_lm path: %s)",
+            model_name,
+            is_vlm,
+            use_mlx_lm,
+        )
         start_time = time.time()
 
         # Check global cache first for fast repeated loads
         with _model_cache_lock:
             if model_name in _model_cache:
                 self.model, self.tokenizer = _model_cache[model_name]
-                self._is_vlm = is_vlm
+                self._is_vlm = is_vlm and not use_mlx_lm
                 load_time = time.time() - start_time
                 logger.info(
                     f"Model loaded from cache in {load_time:.3f}s: {model_name}"
@@ -822,12 +846,13 @@ class MetalModelRunner:
                 return
 
         # Load model using appropriate backend
-        if is_vlm:
+        if is_vlm and not self._use_mlx_lm_for_multimodal(model_type):
             logger.info("Using mlx-vlm for vision-language model")
             self.model, self.tokenizer = mlx_vlm_load(model_name)
             self._is_vlm = True
         else:
             # Load model and tokenizer using mlx_lm for text-only models
+            # (also used for multimodal models listed in _MLX_LM_MULTIMODAL_MODELS)
             self.model, self.tokenizer = mlx_lm_load(
                 model_name,
                 tokenizer_config={
@@ -927,7 +952,7 @@ class MetalModelRunner:
                 "Cannot extract model config: model has neither .args nor "
                 ".config attribute."
             )
-        # Merge nested text_config (Qwen3.5, VLMs) into top-level args.
+        # Merge nested text_config (Qwen3.5, VLMs, Gemma 4) into top-level args.
         # setdefault preserves any top-level keys that already exist.
         tc = self.model_args.get("text_config")
         if tc is not None:
@@ -939,6 +964,10 @@ class MetalModelRunner:
                 tc_dict = vars(tc) if hasattr(tc, "__dict__") else {}
             for k, v in tc_dict.items():
                 self.model_args.setdefault(k, v)
+            logger.debug(
+                "Merged text_config into model_args (%d keys from text_config)",
+                len(tc_dict),
+            )
 
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
@@ -963,10 +992,16 @@ class MetalModelRunner:
             or num_attention_heads
         )
         hidden_size = args.get("hidden_size")
-        head_dim = args.get("head_dim") or (
-            hidden_size // num_attention_heads
-            if hidden_size and num_attention_heads
-            else None
+        # Gemma 4 stores head_dim explicitly (256 for local, 512 for global).
+        # Use local head_dim first; fall back to global_head_dim, then derive.
+        head_dim = (
+            args.get("head_dim")
+            or args.get("global_head_dim")
+            or (
+                hidden_size // num_attention_heads
+                if hidden_size and num_attention_heads
+                else None
+            )
         )
 
         # Fail fast if critical dims are missing

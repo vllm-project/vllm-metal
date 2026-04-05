@@ -12,6 +12,27 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 - **Paged attention** *(experimental)*: Efficient KV cache management for long sequences — opt-in via `VLLM_METAL_USE_PAGED_ATTENTION=1`; default path uses MLX-managed KV cache. When enabled, expect significantly better serving performance (~82x TTFT, ~3.75x throughput in early benchmarks on Qwen3-0.6B). Other models may have rough edges.
 - **GQA support**: Grouped-Query Attention for efficient inference
 
+## Supported Models
+
+Text and vision-language models tested on vllm-metal:
+
+| Model family | Example | Backend |
+|---|---|---|
+| Llama 3 / 3.1 / 3.2 | `meta-llama/Llama-3.2-3B-Instruct` | mlx-lm |
+| Qwen3 | `Qwen/Qwen3-0.6B` | mlx-lm |
+| Qwen3.5 (hybrid) | `Qwen/Qwen3.5-7B-Instruct` | mlx-lm |
+| Qwen3-VL | `Qwen/Qwen3-VL-7B-Instruct` | mlx-vlm |
+| Gemma 4 | `google/gemma-4-E4B-it`, `google/gemma-4-31B-it` | mlx-vlm |
+| LLaVA | `llava-hf/llava-1.5-7b-hf` | mlx-vlm |
+| Whisper (STT) | `openai/whisper-large-v3` | mlx-whisper |
+
+> **Note**: Gemma 4 requires `mlx-lm >= 0.31.2` and `mlx-vlm` with Gemma 4 support (not yet on PyPI as of 2026-04-05; see [Installation](#installation) for the local-checkout workaround).
+
+## Limitations
+
+- **Gemma 4 — text-only inference**: Gemma 4 models (`google/gemma-4-*`) are routed through `mlx-vlm` for all modalities. Vision (image) and audio inputs are supported by mlx-vlm's Gemma 4 implementation. To force text-only inference via `mlx-lm`, add `"gemma4"` to `_MLX_LM_MULTIMODAL_MODELS` in `vllm_metal/v1/model_runner.py` — note that this uses `gemma4.Model.sanitize()` which drops vision/audio weights at load time.
+- **mlx-vlm Gemma 4 — PyPI release pending**: Until a tagged mlx-vlm release that includes Gemma 4 is published on PyPI, install mlx-vlm from a local checkout: `pip install -e <path/to/mlx-vlm>`. The same applies to `mlx-lm >= 0.31.2` if no PyPI release is available yet (use `pip install git+https://github.com/ml-explore/mlx-lm@4469ad4`).
+
 ## Requirements
 
 - macOS on Apple Silicon
