@@ -990,9 +990,9 @@ class MetalModelRunner:
         self.head_dim: int = int(head_dim)
 
         # MLA (GLM/DeepSeek lineage): cache stores a joint latent vector per
-        # layer, not per-head K/V. One virtual head sized kv_lora_rank +
-        # qk_rope_head_dim keeps get_cache_block_size_bytes() conservative (2x)
-        # without MLA-specific logic in the sizing path.
+        # layer, not per-head K/V. Use one virtual head sized kv_lora_rank +
+        # qk_rope_head_dim so shared sizing paths can reuse head_dim/num_kv_heads
+        # while get_cache_block_size_bytes() applies an MLA-specific factor.
         if self.is_mla:
             self.num_kv_heads = 1
             self.head_dim = int(args["kv_lora_rank"]) + int(
@@ -1155,8 +1155,9 @@ class MetalModelRunner:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
         num_kv_layers = self.num_sdpa_layers if self.is_hybrid else self.num_layers
+        kv_factor = 1 if self.is_mla else 2
         return (
-            2
+            kv_factor
             * num_kv_layers
             * block_size
             * self.num_kv_heads

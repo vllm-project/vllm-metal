@@ -379,8 +379,9 @@ class MetalWorker(WorkerBase):
         block_size = self.vllm_config.cache_config.block_size
         max_tokens = -(-self.model_config.max_model_len // block_size) * block_size
 
+        kv_factor = 1 if runner.is_mla else 2
         sdpa_kv_bytes = (
-            2
+            kv_factor
             * num_kv_layers
             * max_tokens
             * runner.num_kv_heads
