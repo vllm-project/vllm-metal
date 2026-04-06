@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import pytest
 
 pytest.importorskip("vllm", reason="vllm not installed")
@@ -117,11 +118,9 @@ class TestOneSequenceKvBytes:
     """_one_sequence_kv_bytes must account for hybrid linear state and block alignment."""
 
     def test_non_hybrid_counts_all_layers(self) -> None:
-        # Arrange
-        import mlx.core as mx
-
         model_runner = SimpleNamespace(
             is_hybrid=False,
+            is_mla=False,
             num_layers=16,
             num_kv_heads=8,
             head_dim=64,
@@ -141,12 +140,10 @@ class TestOneSequenceKvBytes:
         assert result == 2 * 16 * 2048 * 8 * 64 * 2
 
     def test_hybrid_adds_linear_state(self) -> None:
-        # Arrange
-        import mlx.core as mx
-
         linear_bytes = 1_000_000
         model_runner = SimpleNamespace(
             is_hybrid=True,
+            is_mla=False,
             num_sdpa_layers=8,
             num_kv_heads=4,
             head_dim=256,
@@ -175,10 +172,9 @@ class TestOneSequenceKvBytes:
         models (e.g. Granite 4.0-H) where the attention block_size is padded
         to 400 to match the mamba page size.
         """
-        import mlx.core as mx
-
         model_runner = SimpleNamespace(
             is_hybrid=False,
+            is_mla=False,
             num_layers=4,
             num_kv_heads=4,
             head_dim=64,
@@ -200,3 +196,23 @@ class TestOneSequenceKvBytes:
         # Verify this is strictly more than the unaligned calculation
         unaligned = 2 * 4 * 2048 * 4 * 64 * 2
         assert result > unaligned
+
+    def test_mla_uses_latent_only(self) -> None:
+        model_runner = SimpleNamespace(
+            is_hybrid=False,
+            is_mla=True,
+            num_layers=4,
+            num_kv_heads=1,
+            head_dim=576,
+            kv_cache_dtype=mx.float16,
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
+
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        expected = 1 * 4 * 2048 * 1 * 576 * 2
+        assert result == expected
