@@ -322,15 +322,19 @@ class MetalPlatform(Platform):
             These parameters are used only to pass vLLM's initialization checks.
 
         Steps:
-        1. Increase block_size so SDPA page_size >= Mamba page_size
-        2. Set mamba_page_size_padded to match SDPA page_size exactly
+        1. Compute attention page size per token (MLAAttentionSpec or FullAttentionSpec)
+        2. Get Mamba page size from model class
+        3. Calculate block_size so SDPA page_size >= Mamba page_size
+        4. Sync mamba_block_size if using align mode
+        5. Pad mamba_page_size to match SDPA page_size exactly
 
         Args:
             vllm_config: vLLM configuration (modified in-place for vLLM validation)
 
         Raises:
-            ValueError: If hybrid model is used with paged attention on Metal
-                        (unsupported configuration due to kernel limitations)
+            ValueError: If hybrid model is used with paged attention on Metal,
+                        or if computed mamba_page_size is zero
+            Exception: Model class resolution or mamba state query failures
         """
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv

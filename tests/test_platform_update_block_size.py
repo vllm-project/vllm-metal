@@ -127,7 +127,8 @@ class TestUpdateBlockSizeForBackend:
     ):
         """Test: Hybrid model with already-sufficient block_size.
 
-        When block_size is already large enough, no padding is needed.
+        When block_size is already large enough, block_size should not be reduced.
+        Note: mamba_page_size_padded may still be set if attn_page_size > mamba_page_size.
         """
         # Set a very large block_size upfront
         vllm_config.cache_config.block_size = 256
@@ -473,9 +474,6 @@ class TestMLAModels:
         Expected behavior:
         - Check model_config.use_mla == True
         - Use MLAAttentionSpec (which has different page_size calculation)
-        - block_size should be a multiple of 32 (Metal GPU alignment)
-
-        Note: This test will FAIL until MLA support is added to the implementation.
         """
         with patch("vllm.model_executor.models.ModelRegistry") as mock_registry:
             mock_model_cls = MagicMock()
