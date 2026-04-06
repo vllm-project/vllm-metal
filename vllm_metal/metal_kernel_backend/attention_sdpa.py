@@ -113,6 +113,12 @@ def sdpa_forward(
     # by slot_mapping, then reshape back.  This creates proper graph nodes
     # that MLX's evaluator can track for dependency ordering and buffer
     # donation — no in-place mutation, no copy_shared_buffer, no const_cast.
+    #
+    # DONATION INVARIANT: the rebind (below) must drop the list's reference
+    # to the old cache *before* mx.eval runs.  At eval time the old cache
+    # must have use_count == 1 (only the graph) for MLX to donate its
+    # buffer to the scatter output.  Do NOT insert mx.eval between the
+    # scatter and the rebind, or hold extra references to the old cache.
     flat_k = kv_cache.key_caches[layer_idx].reshape(-1, kv_cache.num_kv_heads, head_dim)
     flat_k[slot_mapping] = k_3d
     new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
