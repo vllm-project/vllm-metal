@@ -198,6 +198,11 @@ class TestOneSequenceKvBytes:
         assert result > unaligned
 
     def test_mla_uses_latent_only(self) -> None:
+        """MLA cache stores one latent vector per token, not K+V.
+
+        head_dim=576 represents kv_lora_rank + qk_rope_head_dim (e.g. GLM-4).
+        The 2x K/V factor must NOT be applied — kv_factor=1.
+        """
         model_runner = SimpleNamespace(
             is_hybrid=False,
             is_mla=True,
