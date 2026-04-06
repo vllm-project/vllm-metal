@@ -27,15 +27,15 @@ from vllm_metal.config import (
     PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
-
-# Memory budget fraction for MLX non-paged path.
-# Reports 80% of remaining Metal memory for KV cache.
-_MLX_MEMORY_BUDGET_FRACTION = 0.8
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
+
+# Memory budget fraction for MLX non-paged path.
+# Reports 80% of remaining Metal memory for KV cache.
+_MLX_MEMORY_BUDGET_FRACTION = 0.8
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import (

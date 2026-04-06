@@ -353,6 +353,44 @@ class TestUpdateBlockSizeForBackend:
                 vllm_config.cache_config.block_size
             )
 
+    def test_hybrid_with_paged_attention_raises_error(
+        self, vllm_config, mock_mamba_state
+    ):
+        """Test: Hybrid model + paged attention raises ValueError.
+
+        Metal paged attention kernels only support block_size in {8, 16, 32},
+        but hybrid models require block_size=160. This configuration is
+        unsupported and should raise a clear error message.
+        """
+        with (
+            patch("vllm.model_executor.models.ModelRegistry") as mock_registry,
+            patch("vllm_metal.config.get_config") as mock_get_config,
+        ):
+            mock_model_cls = MagicMock()
+            mock_model_cls.get_mamba_state_shape_from_config.return_value = (
+                mock_mamba_state["shape"]
+            )
+            mock_model_cls.get_mamba_state_dtype_from_config.return_value = (
+                mock_mamba_state["dtype"]
+            )
+            mock_registry.resolve_model_cls.return_value = (mock_model_cls, None)
+
+            # Mock metal config with paged attention enabled
+            mock_metal_config = MagicMock()
+            mock_metal_config.use_paged_attention = True
+            mock_get_config.return_value = mock_metal_config
+
+            # Execute and verify exception
+            with pytest.raises(ValueError) as exc_info:
+                MetalPlatform.update_block_size_for_backend(vllm_config)
+
+            # Verify exception message contains helpful guidance
+            error_msg = str(exc_info.value)
+            assert "Hybrid models" in error_msg
+            assert "not supported with paged attention" in error_msg
+            assert "block_size in {8, 16, 32}" in error_msg
+            assert "VLLM_METAL_USE_PAGED_ATTENTION=1" in error_msg
+
 
 # ============================================================================
 # MLA Model Tests
