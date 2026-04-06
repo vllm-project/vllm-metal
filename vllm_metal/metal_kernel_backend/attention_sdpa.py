@@ -49,17 +49,36 @@ def sdpa_forward(
     """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
-    ``inner.n_heads`` and ``inner.n_kv_heads`` is passed to the Metal
-    kernel which handles the broadcast internally.
+    query and KV heads is passed to the Metal kernel which handles
+    the broadcast internally.
     """
     B, L, D = x.shape  # noqa: N806
 
-    # --- Projections + reshape ---
-    queries = inner.q_proj(x).reshape(B, L, inner.n_heads, -1)
-    keys = inner.k_proj(x).reshape(B, L, inner.n_kv_heads, -1)
-    values = inner.v_proj(x).reshape(B, L, inner.n_kv_heads, -1)
+    # Resolve head counts — mlx_lm uses different attribute names:
+    #   Qwen3/Llama/Gemma: n_heads, n_kv_heads
+    #   Qwen3.5 (Qwen3Next): num_attention_heads, num_key_value_heads
+    n_heads = getattr(inner, "n_heads", None) or inner.num_attention_heads
+    n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
 
-    # Qwen3 per-head RMSNorm before RoPE
+    # --- Projections + reshape ---
+    # Qwen3.5 (Qwen3Next) uses gated attention: q_proj outputs 2x head_dim,
+    # split into queries (for attention) + gate (applied after attention).
+    q_proj_out = inner.q_proj(x)
+    gate = None
+    head_dim = inner.head_dim
+    q_full_head = q_proj_out.shape[-1] // n_heads
+    if q_full_head == 2 * head_dim:
+        # Gated: split into queries + gate
+        q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
+        queries, gate = mx.split(q_reshaped, 2, axis=-1)
+        gate = gate.reshape(B, L, -1)
+    else:
+        queries = q_proj_out.reshape(B, L, n_heads, -1)
+
+    keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
+    values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
+
+    # Per-head RMSNorm before RoPE (Qwen3, Qwen3.5)
     if hasattr(inner, "q_norm"):
         queries = inner.q_norm(queries)
     if hasattr(inner, "k_norm"):
@@ -71,10 +90,11 @@ def sdpa_forward(
     values = values.transpose(0, 2, 1, 3)
 
     # --- RoPE (per-request position reset) ---
-    if not hasattr(inner, "rope"):
+    # mlx_lm uses "rope", mlx_vlm Qwen3.5 uses "rotary_emb"
+    if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
         raise NotImplementedError(
             f"Attention module {type(inner).__name__} does not have a 'rope' "
-            "attribute. Only RoPE-based models are supported by paged attention."
+            "or 'rotary_emb' attribute. Only RoPE-based models are supported."
         )
 
     queries, keys = apply_packed_rope(
@@ -158,4 +178,6 @@ def sdpa_forward(
 
     # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
     out = out.reshape(B, L, n_heads * head_dim)
+    if gate is not None:
+        out = out * mx.sigmoid(gate)
     return inner.o_proj(out)

@@ -692,6 +692,87 @@ void paged_attention_v2_online_partitioned_impl(
 }
 
 // ---------------------------------------------------------------------------
+// GDN linear attention — in-place paged state
+// ---------------------------------------------------------------------------
+
+static std::string gdn_source_;
+
+void init_gdn_library(const std::string& src) {
+  gdn_source_ = src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library("gdn_kern", [&]() { return gdn_source_; });
+}
+
+void gdn_linear_attention_impl(
+    nb::handle q_h, nb::handle k_h, nb::handle v_h,
+    nb::handle g_h, nb::handle beta_h,
+    nb::handle state_pool_h,
+    nb::handle cu_seqlens_h, nb::handle slot_mapping_h,
+    nb::handle y_h,
+    int Hk, int Hv, int Dk, int Dv
+) {
+  auto& q           = *nb::inst_ptr<array>(q_h);
+  auto& k           = *nb::inst_ptr<array>(k_h);
+  auto& v           = *nb::inst_ptr<array>(v_h);
+  auto& g           = *nb::inst_ptr<array>(g_h);
+  auto& beta        = *nb::inst_ptr<array>(beta_h);
+  auto& state_pool  = *nb::inst_ptr<array>(state_pool_h);
+  auto& cu_seqlens  = *nb::inst_ptr<array>(cu_seqlens_h);
+  auto& slot_mapping = *nb::inst_ptr<array>(slot_mapping_h);
+  auto& y           = *nb::inst_ptr<array>(y_h);
+
+  int num_requests = static_cast<int>(cu_seqlens.shape(0)) - 1;
+
+  if (Dk > 256) {
+    throw std::runtime_error(
+        "GDN kernel supports Dk <= 256 (state[8] * 32 threads). "
+        "Got Dk=" + std::to_string(Dk));
+  }
+
+  auto s = default_stream(Device::gpu);
+  auto& d = metal::device(Device::gpu);
+
+  auto dt = dtype_to_metal(q.dtype());
+  std::string kname = "gdn_linear_attention_" + dt;
+  auto* lib = d.get_library("gdn_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  auto& enc = d.get_command_encoder(s.index);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(q, 0);
+  enc.set_input_array(k, 1);
+  enc.set_input_array(v, 2);
+  enc.set_input_array(g, 3);
+  enc.set_input_array(beta, 4);
+  enc.set_output_array(state_pool, 5);
+  enc.set_input_array(cu_seqlens, 6);
+  enc.set_input_array(slot_mapping, 7);
+  enc.set_output_array(y, 8);
+
+  enc.set_bytes(num_requests, 9);
+  enc.set_bytes(Hk, 10);
+  enc.set_bytes(Hv, 11);
+  enc.set_bytes(Dk, 12);
+  enc.set_bytes(Dv, 13);
+
+  // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(Dv, 1, num_requests * Hv),
+      MTL::Size::Make(32, 1, 1));
+
+  d.add_temporary(q, s.index);
+  d.add_temporary(k, s.index);
+  d.add_temporary(v, s.index);
+  d.add_temporary(g, s.index);
+  d.add_temporary(beta, s.index);
+  d.add_temporary(state_pool, s.index);
+  d.add_temporary(cu_seqlens, s.index);
+  d.add_temporary(slot_mapping, s.index);
+  d.add_temporary(y, s.index);
+}
+
+// ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
 
@@ -705,6 +786,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),
         "JIT-compile the v2 online-softmax Metal shader.");
+
+  m.def("init_gdn_library", &init_gdn_library,
+        nb::arg("gdn_src"),
+        "JIT-compile the GDN linear attention Metal shader.");
 
   m.def("reshape_and_cache", &reshape_and_cache_impl,
         nb::arg("key"), nb::arg("value"),
@@ -777,4 +862,12 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("out"),
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.");
+
+  m.def("gdn_linear_attention", &gdn_linear_attention_impl,
+        nb::arg("q"), nb::arg("k"), nb::arg("v"),
+        nb::arg("g"), nb::arg("beta"),
+        nb::arg("state_pool"), nb::arg("cu_seqlens"),
+        nb::arg("slot_mapping"), nb::arg("y"),
+        nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
+        "GDN linear attention with in-place paged state management.");
 }

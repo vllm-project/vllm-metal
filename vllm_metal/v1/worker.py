@@ -143,6 +143,17 @@ class MetalWorker(WorkerBase):
         # Boundary ownership:
         # - Worker owns resource setup.
         # - Runner owns STT/runtime capability decisions.
+        # Hybrid models (Qwen3.5 SDPA+GDN) require paged attention for
+        # SDPA KV cache + GDN recurrent state management.
+        if not self.metal_config.use_paged_attention and self.model_runner.is_hybrid:
+            self.metal_config.use_paged_attention = True
+            # Prefix caching guard: check_and_update_config() skipped this
+            # because use_paged_attention was False at config time.
+            cache_config = self.vllm_config.cache_config
+            if getattr(cache_config, "enable_prefix_caching", False):
+                cache_config.enable_prefix_caching = False
+                logger.info("Metal: disabled prefix caching for hybrid model")
+            logger.info("Auto-enabled paged attention for hybrid model")
         if (
             self.metal_config.use_paged_attention
             and self.model_runner.should_setup_paged_attention()
@@ -172,15 +183,9 @@ class MetalWorker(WorkerBase):
         max_model_len.
         """
         runner = self.model_runner
-        block_size = self.metal_config.block_size
-
-        if runner.is_hybrid:
-            raise RuntimeError(
-                "Paged attention is not yet supported for hybrid models "
-                "(Qwen3.5). Linear attention kernel is not implemented "
-                "(Stage C of #194). Use the mlx_lm inline cache path instead "
-                "by unsetting VLLM_METAL_USE_PAGED_ATTENTION."
-            )
+        # Use cache_config.block_size (not metal_config) because vLLM's
+        # hybrid alignment may have adjusted it to match mamba page size.
+        block_size = self.vllm_config.cache_config.block_size
 
         # --- Determine memory fraction ---
         if self.metal_config.is_auto_memory:
@@ -214,6 +219,12 @@ class MetalWorker(WorkerBase):
         # --- Compute KV budget ---
         usable_metal = int(metal_limit * fraction)
         kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
+
+        # For hybrid models, subtract the fixed linear state cost first.
+        if runner.is_hybrid:
+            kv_budget -= runner.linear_cache_bytes_per_slot() * (
+                runner.scheduler_config.max_num_seqs
+            )
 
         if kv_budget <= 0:
             raise ValueError(
@@ -286,6 +297,25 @@ class MetalWorker(WorkerBase):
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
+        if runner.is_hybrid:
+            from vllm_metal.paged_attention_backend.hybrid import (
+                HybridPagedAttentionBackend,
+            )
+
+            return HybridPagedAttentionBackend(
+                num_layers=runner.num_layers,
+                full_attention_interval=runner.full_attention_interval,
+                max_num_seqs=runner.scheduler_config.max_num_seqs,
+                num_kv_heads=runner.num_kv_heads,
+                head_dim=runner.head_dim,
+                linear_num_v_heads=runner.linear_num_v_heads,
+                linear_key_head_dim=runner.linear_key_head_dim,
+                linear_value_head_dim=runner.linear_value_head_dim,
+                linear_conv_kernel_dim=runner.linear_conv_kernel_dim,
+                linear_conv_dim=runner.linear_conv_dim,
+                block_size=block_size,
+                dtype=runner.kv_cache_dtype,
+            )
         if runner.is_mla:
             return MLAPagedAttentionBackend(
                 num_layers=runner.num_layers,
@@ -328,7 +358,13 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of cache state."""
+        """Bytes for one max-length sequence of cache state.
+
+        Uses block-aligned token count so the estimate matches the upstream
+        ``_check_enough_kv_cache_memory`` calculation, which rounds
+        ``max_model_len`` up to the nearest ``block_size`` boundary via
+        ``cdiv(max_model_len, block_size) * page_size_bytes``.
+        """
         runner = self.model_runner
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
@@ -337,10 +373,16 @@ class MetalWorker(WorkerBase):
         num_kv_layers = (
             runner.num_sdpa_layers if runner.is_hybrid else runner.num_layers
         )
+
+        # Round token count up to block boundary to match the scheduler's
+        # block-aligned memory accounting.
+        block_size = self.vllm_config.cache_config.block_size
+        max_tokens = -(-self.model_config.max_model_len // block_size) * block_size
+
         sdpa_kv_bytes = (
             2
             * num_kv_layers
-            * self.model_config.max_model_len
+            * max_tokens
             * runner.num_kv_heads
             * runner.head_dim
             * dtype_size

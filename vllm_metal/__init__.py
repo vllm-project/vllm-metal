@@ -85,6 +85,10 @@ def _register() -> str | None:
     """
     _apply_macos_defaults()
 
+    from vllm_metal.compat import apply_compat_patches
+
+    apply_compat_patches()
+
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():

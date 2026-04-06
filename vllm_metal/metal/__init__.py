@@ -74,6 +74,15 @@ def _build_v2_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
+def _build_gdn_source() -> str:
+    """GDN linear attention kernel source."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "gdn_linear_attention.metal"),
+    ]
+    return "\n".join(parts)
+
+
 def metal_unified_attention(
     q,  # [total_q_tokens, num_q_heads, head_size]
     k,  # [num_blocks, block_size, num_kv_heads, head_size]
@@ -211,6 +220,10 @@ def get_ops() -> ModuleType:
     # 4. Initialise v2 library (online softmax kernel)
     v2_src = _build_v2_paged_attention_source()
     mod.init_v2_library(v2_src)
+
+    # 5. Initialise GDN linear attention library
+    gdn_src = _build_gdn_source()
+    mod.init_gdn_library(gdn_src)
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")

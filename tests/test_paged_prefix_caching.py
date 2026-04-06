@@ -32,6 +32,9 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
     runner._paged_block_size = 4
     runner._paged_request_seq_lens = {}
     runner._request_states = {}
+    runner._gdn_req_to_slot = {}
+    runner._gdn_free_slots = []
+    runner.model_args = {}
     runner._rust_state_manager = None
     runner.num_layers = num_layers
     runner.device = torch.device("cpu")
@@ -289,6 +292,35 @@ def _make_cached_scheduler_output(
         preempted_req_ids=set(),
         grammar_bitmask=None,
     )
+
+
+class TestCachedRequestBlockUpdates:
+    def test_resumed_request_replaces_blocks_and_resets_prefill_state(self):
+        runner = _make_paged_runner()
+        runner._request_states["req-1"] = mr.RequestState(
+            token_ids=[10, 20, 30, 40, 50],
+            prompt_len=4,
+            cache=[],
+            sampling_params=_greedy_sp(),
+            generator=None,
+            generated_tokens=1,
+            block_ids=[0, 1],
+        )
+        runner._paged_request_seq_lens["req-1"] = 5
+
+        cached_reqs = SimpleNamespace(
+            req_ids=["req-1"],
+            new_block_ids=[([7, 8],)],
+            resumed_req_ids={"req-1"},
+            num_computed_tokens=[4],
+        )
+
+        runner._update_cached_request_blocks(cached_reqs)
+
+        state = runner._request_states["req-1"]
+        assert state.block_ids == [7, 8]
+        assert state.generated_tokens == 0
+        assert "req-1" not in runner._paged_request_seq_lens
 
 
 class TestMixedDecodeAndPrefixHitPrefill:

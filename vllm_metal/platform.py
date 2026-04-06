@@ -297,6 +297,11 @@ class MetalPlatform(Platform):
         )
 
     @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        """Metal supports hybrid KV cache for models like Qwen3.5 (SDPA + GDN)."""
+        return True
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",

@@ -111,6 +111,70 @@ class TestV1MetalModelRunnerSampleTokens:
             runner.sample_tokens(grammar_output=None)
 
 
+class TestV1MetalModelRunnerExecuteModel:
+    def _make_runner(self) -> mr.MetalModelRunner:
+        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
+        runner.model = object()
+        runner._is_stt = False
+        runner._paged_attention_backend = None
+        runner._request_states = {}
+        runner._paged_request_seq_lens = {}
+        runner._finished_request_count = 0
+        runner._prefix_cache = None
+        runner._pending_output = None
+        runner.use_async_scheduling = True
+        return runner
+
+    def _make_scheduler_output(
+        self, cached_req_ids: list[str] | None = None
+    ) -> SimpleNamespace:
+        req_ids = cached_req_ids or []
+        return SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=req_ids,
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[None] * len(req_ids),
+                num_computed_tokens=[0] * len(req_ids),
+                num_output_tokens=[0] * len(req_ids),
+            ),
+            num_scheduled_tokens=dict.fromkeys(req_ids, 1),
+            total_num_scheduled_tokens=len(req_ids),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=set(),
+        )
+
+    def test_returns_empty_output_directly_for_empty_batch(self) -> None:
+        runner = self._make_runner()
+
+        out = runner.execute_model(self._make_scheduler_output())
+
+        assert out is not None
+        assert out.req_ids == []
+        assert out.req_id_to_index == {}
+        assert out.sampled_token_ids == []
+        assert runner._pending_output is None
+
+    def test_non_paged_cached_request_without_state_emits_placeholder(self) -> None:
+        runner = self._make_runner()
+
+        out = runner.execute_model(self._make_scheduler_output(["req-0"]))
+
+        assert out is None
+        pending = runner.sample_tokens(grammar_output=None)
+        assert pending is not None
+        assert pending.req_ids == ["req-0"]
+        assert pending.req_id_to_index == {"req-0": 0}
+        assert pending.sampled_token_ids == [[0]]
+        assert runner._pending_output is None
+
+
 class TestResolveModelDims:
     def _make_runner(self, args: dict) -> mr.MetalModelRunner:
         r = mr.MetalModelRunner.__new__(mr.MetalModelRunner)

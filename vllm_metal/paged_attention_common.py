@@ -49,6 +49,9 @@ class PagedAttentionContext:
     # Cumulative sequence length array: [0, len0, len0+len1, ...]
     # (length = num_requests + 1).
     cu_seqlens: list[int] | None = None
+    # GDN state pool slot mapping: request batch position → stable slot ID.
+    # Populated by model_runner for hybrid models; None for non-hybrid.
+    gdn_slot_mapping: list[int] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

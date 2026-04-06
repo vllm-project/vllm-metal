@@ -129,8 +129,12 @@ main() {
   curl -OL $url_base/v$vllm_v/$filename
   tar xf $filename
   cd vllm-$vllm_v
+
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  uv pip install .
+  # TODO: remove -Wno-parentheses once vllm-project/vllm#38801 is in a release.
+  # Clang 21+ (Apple Clang 21 / Xcode 26) promotes -Wparentheses to an error
+  # for chained comparisons like `0 < M <= 8` in vllm's CPU attention headers.
+  CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
   rm -rf vllm-$vllm_v*
 
