@@ -28,6 +28,12 @@ from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
 )
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
+# === Metal kernel block-size support ===
+# The paged attention Metal kernel is template-instantiated for these block
+# sizes only.  Sorted descending so _pick_kernel_block_size selects the
+# largest valid divisor first, minimising the block-table expansion ratio.
+_KERNEL_BLOCK_SIZES = (32, 16, 8)
+
 
 def is_sdpa(module: nn.Module) -> bool:
     """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA)."""
@@ -37,6 +43,63 @@ def is_sdpa(module: nn.Module) -> bool:
         and hasattr(module, "v_proj")
         and hasattr(module, "o_proj")
     )
+
+
+# === Block-size translation helpers ===
+
+
+def _pick_kernel_block_size(cache_block_size: int) -> int:
+    """Pick the largest kernel-supported block size that divides evenly."""
+    for kbs in _KERNEL_BLOCK_SIZES:
+        if cache_block_size % kbs == 0:
+            return kbs
+    raise ValueError(
+        f"Cache block_size={cache_block_size} is not divisible by any "
+        f"supported kernel block size {_KERNEL_BLOCK_SIZES}. "
+        "Adjust VLLM_METAL_BLOCK_SIZE or the hybrid page alignment."
+    )
+
+
+def _build_block_tables(
+    raw_block_tables: list[list[int]],
+    cache_block_size: int,
+) -> tuple[mx.array, int]:
+    """Build kernel-compatible block tables, translating if necessary.
+
+    When ``cache_block_size`` exceeds the kernel's compiled block sizes,
+    each vLLM block ``b`` is expanded into ``ratio`` kernel blocks
+    ``[b*ratio, b*ratio+ratio)``.  The cache is reshaped later to
+    match (zero-copy).
+
+    Returns:
+        (block_tables, kernel_block_size)
+    """
+    if not raw_block_tables:
+        return mx.zeros((0, 0), dtype=mx.int32), cache_block_size
+
+    if cache_block_size in _KERNEL_BLOCK_SIZES:
+        # Fast path — no translation needed.
+        max_blocks = max(len(bt) for bt in raw_block_tables)
+        padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
+        return mx.array(padded, dtype=mx.int32), cache_block_size
+
+    # Hybrid path — translate large block_size to a kernel-compatible one.
+    # Vectorized: each vLLM block b → [b*ratio, b*ratio+1, …, b*ratio+ratio-1].
+    kernel_bs = _pick_kernel_block_size(cache_block_size)
+    ratio = cache_block_size // kernel_bs
+
+    max_blocks = max(len(bt) for bt in raw_block_tables)
+    padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
+    bt_arr = mx.array(padded, dtype=mx.int32)  # [num_seqs, max_blocks]
+    offsets = mx.arange(ratio, dtype=mx.int32)  # [ratio]
+    # [num_seqs, max_blocks, 1] * ratio + [1, 1, ratio] → [num_seqs, max_blocks, ratio]
+    expanded = (bt_arr[:, :, None] * ratio + offsets[None, None, :]).reshape(
+        bt_arr.shape[0], -1
+    )
+    return expanded, kernel_bs
+
+
+# === SDPA forward ===
 
 
 def sdpa_forward(
@@ -115,18 +178,19 @@ def sdpa_forward(
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
     slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
-
-    # Build block_tables and seq_lens from context
-    max_blocks_per_seq = max(len(bt) for bt in ctx.block_tables)
-    block_tables_list = [
-        bt + [0] * (max_blocks_per_seq - len(bt)) for bt in ctx.block_tables
-    ]
-    block_tables = mx.array(block_tables_list, dtype=mx.int32)
     seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
     cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
-
-    ops = get_ops()
     max_seq_len = max(ctx.context_lens)
+
+    # --- Block tables (with hybrid block-size translation) ---
+    # vLLM may inflate block_size (e.g. 544) to align attention pages with
+    # mamba pages in hybrid models.  The Metal kernel only supports small
+    # block sizes (8, 16, 32).  _build_block_tables handles the translation:
+    # it expands each vLLM block into multiple kernel blocks and returns the
+    # kernel-compatible block_size.  The cache is reshaped to match (zero-copy).
+    block_tables, kernel_block_size = _build_block_tables(
+        ctx.block_tables, kv_cache.block_size
+    )
 
     # --- Cache write: MLX-native scatter (pure functional, graph-tracked) ---
     # Flatten cache to [num_slots, num_kv_heads, head_dim], scatter new K/V
@@ -159,18 +223,33 @@ def sdpa_forward(
     # pass.  Fence-based synchronisation across command buffer boundaries
     # works correctly because eval_gpu skips add_temporary (which would
     # remove buffers from the encoder's fence tracking).
+    #
+    # When block-size translation is active (hybrid models), reshape the
+    # cache so the kernel sees kernel_block_size-token blocks.  This is a
+    # zero-copy view over the same physical memory.
+    kernel_k_cache = new_k_cache
+    kernel_v_cache = new_v_cache
+    if kernel_block_size != kv_cache.block_size:
+        kernel_k_cache = new_k_cache.reshape(
+            -1, kernel_block_size, kv_cache.num_kv_heads, head_dim
+        )
+        kernel_v_cache = new_v_cache.reshape(
+            -1, kernel_block_size, kv_cache.num_kv_heads, head_dim
+        )
+
+    ops = get_ops()
     out = mx.array(0)
     ops.paged_attention_primitive(
         q_3d,
-        new_k_cache,
-        new_v_cache,
+        kernel_k_cache,
+        kernel_v_cache,
         kv_cache.num_kv_heads,
         inner.scale,
         0.0,  # softcap (0 = disabled)
         block_tables,
         seq_lens,
         cu_seqlens_q,
-        kv_cache.block_size,
+        kernel_block_size,
         max_seq_len,
         -1,  # sliding_window (-1 = disabled)
         out,
