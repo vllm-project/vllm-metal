@@ -4,7 +4,7 @@
 Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import mlx.core as mx
 import torch
@@ -205,7 +205,7 @@ class SamplingBatch:
 
 
 # ---------------------------------------------------------------------------
-# Pure sampling functions (extracted from model_runner.py)
+# Pure sampling functions
 # ---------------------------------------------------------------------------
 
 
@@ -214,13 +214,41 @@ def _mlx_greedy_sample(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
 
 
+def sample_from_logits(
+    logits_2d: mx.array,
+    batch: SamplingBatch,
+    sampler: Sampler,
+    device: torch.device,
+) -> list[int]:
+    """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
+
+    Single entry point for all sampling paths.  Chooses native MLX greedy
+    when possible, otherwise bridges to the vLLM torch sampler.
+    """
+    n = logits_2d.shape[0]
+
+    if batch.all_greedy and batch.no_top_k and batch.no_top_p and batch.no_penalties:
+        tokens = _mlx_greedy_sample(logits_2d)
+        mx.eval(tokens)
+        flat = tokens.tolist()
+        return flat if isinstance(flat, list) else [flat]
+
+    mx.eval(logits_2d)
+    logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
+    metadata = batch.make_sampling_metadata()
+    output = sampler.forward(logits_torch, metadata)
+    return [int(output.sampled_token_ids[i, 0].item()) for i in range(n)]
+
+
 def sample_decode_tokens(
     logits: mx.array,
     decode_reqs: list[tuple[str, object]],
     num_decode: int,
     sampler: Sampler,
-    make_metadata: Callable,
     device: torch.device,
+    *,
+    vocab_size: int = DEFAULT_VOCAB_SIZE,
+    logitsprocs: LogitsProcessors | None = None,
 ) -> list[int]:
     """Sample one token per decode request from evaluated logits.
 
@@ -229,8 +257,9 @@ def sample_decode_tokens(
         decode_reqs: ``(req_id, RequestState)`` pairs for decode requests.
         num_decode: Number of decode requests (prefix of the token dimension).
         sampler: vLLM Sampler instance.
-        make_metadata: Callable matching ``_make_sampling_metadata`` signature.
         device: PyTorch device for the torch bridge path.
+        vocab_size: Model vocabulary size.
+        logitsprocs: Optional logits processors.
 
     Returns:
         List of sampled token IDs, one per decode request.
@@ -241,11 +270,6 @@ def sample_decode_tokens(
     decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
 
     sampling_params_list = [state.sampling_params for _, state in decode_reqs]
-    if SamplingBatch.can_use_native_greedy(sampling_params_list):
-        next_tokens_mlx = _mlx_greedy_sample(decode_logits)
-        mx.eval(next_tokens_mlx)
-        return list(next_tokens_mlx.tolist())
-
     prompt_token_ids_list = [
         state.token_ids[: state.prompt_len] for _, state in decode_reqs
     ]
@@ -257,15 +281,17 @@ def sample_decode_tokens(
         for i, (_, state) in enumerate(decode_reqs)
         if state.generator is not None
     }
-    logits_torch = mlx_to_torch(decode_logits.astype(mx.float32), device=device)
-    metadata = make_metadata(
+
+    batch = SamplingBatch(
         sampling_params_list,
         prompt_token_ids_list,
         output_tokens_list,
+        vocab_size=vocab_size,
+        device=device,
+        logitsprocs=logitsprocs,
         generators=generators,
     )
-    output = sampler.forward(logits_torch, metadata)
-    return [int(output.sampled_token_ids[i, 0].item()) for i in range(num_decode)]
+    return sample_from_logits(decode_logits, batch, sampler, device)
 
 
 def sample_prefill_tokens(
@@ -274,8 +300,10 @@ def sample_prefill_tokens(
     cu_seqlens: list[int],
     num_decode: int,
     sampler: Sampler,
-    make_metadata: Callable,
     device: torch.device,
+    *,
+    vocab_size: int = DEFAULT_VOCAB_SIZE,
+    logitsprocs: LogitsProcessors | None = None,
 ) -> list[int]:
     """Sample one token per prefill request from the last logit position.
 
@@ -285,8 +313,9 @@ def sample_prefill_tokens(
         cu_seqlens: Cumulative sequence lengths for logit position lookup.
         num_decode: Number of decode requests (offset into cu_seqlens).
         sampler: vLLM Sampler instance.
-        make_metadata: Callable matching ``_make_sampling_metadata`` signature.
         device: PyTorch device for the torch bridge path.
+        vocab_size: Model vocabulary size.
+        logitsprocs: Optional logits processors.
 
     Returns:
         List of sampled token IDs, one per prefill request.
@@ -294,7 +323,7 @@ def sample_prefill_tokens(
     prefill_next_tokens: list[int] = []
     for j, pr in enumerate(prefill_reqs):
         last_idx = cu_seqlens[num_decode + j + 1] - 1
-        last_logits = logits[:, last_idx : last_idx + 1, :]
+        last_logits = logits[0, last_idx : last_idx + 1, :]  # (1, vocab)
 
         if pr.full_prompt_token_ids is not None:
             prompt_len = len(pr.full_prompt_token_ids)
@@ -303,30 +332,23 @@ def sample_prefill_tokens(
         else:
             prompt_len = len(pr.token_ids)
 
-        if SamplingBatch.can_use_native_greedy([pr.sampling_params]):
-            next_token_mlx = _mlx_greedy_sample(last_logits[0])
-            mx.eval(next_token_mlx)
-            next_token = int(next_token_mlx.item())
-        else:
-            mx.eval(last_logits)
-            logits_torch = mlx_to_torch(
-                last_logits[0].astype(mx.float32), device=device
-            )
-            generators = {} if pr.generator is None else {0: pr.generator}
-            prompt_for_meta = (
-                pr.full_prompt_token_ids
-                if pr.full_prompt_token_ids is not None
-                else pr.token_ids
-            )
-            metadata = make_metadata(
-                [pr.sampling_params],
-                [prompt_for_meta[:prompt_len]],
-                [prompt_for_meta[prompt_len:]],
-                generators=generators,
-            )
-            output = sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
+        prompt_for_meta = (
+            pr.full_prompt_token_ids
+            if pr.full_prompt_token_ids is not None
+            else pr.token_ids
+        )
+        generators = {} if pr.generator is None else {0: pr.generator}
 
+        batch = SamplingBatch(
+            [pr.sampling_params],
+            [prompt_for_meta[:prompt_len]],
+            [prompt_for_meta[prompt_len:]],
+            vocab_size=vocab_size,
+            device=device,
+            logitsprocs=logitsprocs,
+            generators=generators,
+        )
+        [next_token] = sample_from_logits(last_logits, batch, sampler, device)
         prefill_next_tokens.append(next_token)
 
     return prefill_next_tokens

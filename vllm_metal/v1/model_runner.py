@@ -59,7 +59,7 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     prepare_unified,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch, torch_to_mlx
+from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
@@ -70,6 +70,7 @@ from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
     sample_decode_tokens,
+    sample_from_logits,
     sample_prefill_tokens,
 )
 
@@ -431,18 +432,6 @@ def _merge_rotating_kv_caches(
     cache._offset = keys.shape[2]
 
     return cache
-
-
-def _mlx_greedy_sample(logits: mx.array) -> mx.array:
-    """Native MLX greedy sampling - avoids PyTorch round-trip.
-
-    Args:
-        logits: Logits tensor of shape (batch_size, vocab_size)
-
-    Returns:
-        Token IDs of shape (batch_size,)
-    """
-    return mx.argmax(logits, axis=-1)
 
 
 def _create_request_generator(
@@ -1312,29 +1301,21 @@ class MetalModelRunner:
         # Extract last token logits
         last_logits = logits[:, -1, :]
 
-        if SamplingBatch.can_use_native_greedy([sampling_params]):
-            # Fast path: native MLX greedy sampling
-            next_token_mlx = _mlx_greedy_sample(last_logits)
-            # Single eval for logits, token, and cache state together
-            mx.eval(next_token_mlx, *[c.state for c in cache])
-            next_token = int(next_token_mlx.item())
-        else:
-            # Slow path: use vLLM sampler for advanced sampling
-            # Single eval for logits and cache state together
-            mx.eval(last_logits, *[c.state for c in cache])
-            # Convert to torch for sampling
-            logits_torch = mlx_to_torch(
-                last_logits.astype(mx.float32), device=self.device
-            )
-            generators = {} if generator is None else {0: generator}
-            metadata = self._make_sampling_metadata(
-                [sampling_params],
-                [token_ids],
-                [[]],
-                generators=generators,
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
+        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        generators = {} if generator is None else {0: generator}
+        batch = SamplingBatch(
+            [sampling_params],
+            [token_ids],
+            [[]],
+            vocab_size=vocab_size,
+            device=self.device,
+            logitsprocs=getattr(self, "_logitsprocs", None),
+            generators=generators,
+        )
+        [next_token] = sample_from_logits(
+            last_logits, batch, self._sampler, self.device
+        )
+        mx.eval(*[c.state for c in cache])
 
         return next_token, cache
 
@@ -1350,8 +1331,6 @@ class MetalModelRunner:
         Returns:
             List of next tokens for each request
         """
-        batch_size = len(decode_reqs)
-
         last_tokens = [
             state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
         ]
@@ -1371,41 +1350,32 @@ class MetalModelRunner:
 
         # Extract next token logits
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
-        sampling_params_list = [state.sampling_params for _, state in decode_reqs]
 
-        if SamplingBatch.can_use_native_greedy(sampling_params_list):
-            # Fast path: native MLX greedy sampling for entire batch
-            next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
-            # Single eval - no intermediate sync needed
-            mx.eval(next_tokens_mlx)
-            next_tokens: list[int] = next_tokens_mlx.tolist()
-        else:
-            # Slow path: use vLLM sampler for advanced sampling
-            mx.eval(next_token_logits)
-            prompt_token_ids_list = [
-                state.token_ids[: state.prompt_len] for _, state in decode_reqs
-            ]
-            output_tokens_list = [
-                state.token_ids[state.prompt_len :] for _, state in decode_reqs
-            ]
-            generators = {
-                i: state.generator
-                for i, (_, state) in enumerate(decode_reqs)
-                if state.generator is not None
-            }
-            logits_torch = mlx_to_torch(
-                next_token_logits.astype(mx.float32), device=self.device
-            )
-            metadata = self._make_sampling_metadata(
-                sampling_params_list,
-                prompt_token_ids_list,
-                output_tokens_list,
-                generators=generators,
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_tokens = [
-                int(output.sampled_token_ids[i, 0].item()) for i in range(batch_size)
-            ]
+        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        sampling_params_list = [state.sampling_params for _, state in decode_reqs]
+        prompt_token_ids_list = [
+            state.token_ids[: state.prompt_len] for _, state in decode_reqs
+        ]
+        output_tokens_list = [
+            state.token_ids[state.prompt_len :] for _, state in decode_reqs
+        ]
+        generators = {
+            i: state.generator
+            for i, (_, state) in enumerate(decode_reqs)
+            if state.generator is not None
+        }
+        batch = SamplingBatch(
+            sampling_params_list,
+            prompt_token_ids_list,
+            output_tokens_list,
+            vocab_size=vocab_size,
+            device=self.device,
+            logitsprocs=getattr(self, "_logitsprocs", None),
+            generators=generators,
+        )
+        next_tokens = sample_from_logits(
+            next_token_logits, batch, self._sampler, self.device
+        )
 
         # Extract updated caches back to individual requests
         for i, (_req_id, state) in enumerate(decode_reqs):
@@ -1438,27 +1408,20 @@ class MetalModelRunner:
             logits = self._extract_logits(model_output)
             last_logits = logits[:, -1, :]
 
-            sp = state.sampling_params
-            if SamplingBatch.can_use_native_greedy([sp]):
-                # Fast path: native MLX greedy sampling
-                next_token_mlx = _mlx_greedy_sample(last_logits)
-                mx.eval(next_token_mlx)
-                next_token = int(next_token_mlx.item())
-            else:
-                # Slow path: use vLLM sampler
-                mx.eval(last_logits)
-                logits_torch = mlx_to_torch(
-                    last_logits.astype(mx.float32), device=self.device
-                )
-                generators = {} if state.generator is None else {0: state.generator}
-                metadata = self._make_sampling_metadata(
-                    [state.sampling_params],
-                    [state.token_ids[: state.prompt_len]],
-                    [state.token_ids[state.prompt_len :]],
-                    generators=generators,
-                )
-                output = self._sampler.forward(logits_torch, metadata)
-                next_token = int(output.sampled_token_ids[0, 0].item())
+            vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+            generators = {} if state.generator is None else {0: state.generator}
+            batch = SamplingBatch(
+                [state.sampling_params],
+                [state.token_ids[: state.prompt_len]],
+                [state.token_ids[state.prompt_len :]],
+                vocab_size=vocab_size,
+                device=self.device,
+                logitsprocs=getattr(self, "_logitsprocs", None),
+                generators=generators,
+            )
+            [next_token] = sample_from_logits(
+                last_logits, batch, self._sampler, self.device
+            )
 
             next_tokens.append(next_token)
 
@@ -1579,13 +1542,16 @@ class MetalModelRunner:
         mx.eval(logits)
 
         # ---- sample tokens ----
+        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        logitsprocs = getattr(self, "_logitsprocs", None)
         decode_next_tokens = sample_decode_tokens(
             logits,
             decode_reqs,
             num_decode,
             self._sampler,
-            self._make_sampling_metadata,
             self.device,
+            vocab_size=vocab_size,
+            logitsprocs=logitsprocs,
         )
         prefill_next_tokens = sample_prefill_tokens(
             logits,
@@ -1593,8 +1559,9 @@ class MetalModelRunner:
             cu_seqlens,
             num_decode,
             self._sampler,
-            self._make_sampling_metadata,
             self.device,
+            vocab_size=vocab_size,
+            logitsprocs=logitsprocs,
         )
 
         # ---- update decode state ----

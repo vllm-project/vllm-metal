@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+import torch
 
 import vllm_metal.v1.model_runner as mr
 
@@ -22,6 +23,9 @@ class TestPrefixCacheHybridGuard:
         runner.model = MagicMock()
         runner._is_vlm = False
         runner._prefix_cache = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        runner.model_args = {"vocab_size": 100}
+        runner.device = torch.device("cpu")
+        runner._sampler = MagicMock()
         return runner
 
     def test_hybrid_model_skips_prefix_cache(self, monkeypatch) -> None:
