@@ -65,8 +65,9 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.sampling import sample_decode_tokens, sample_prefill_tokens
 from vllm_metal.v1.sampling_batch import (
+    sample_decode_tokens,
+    sample_prefill_tokens,
     DEFAULT_VOCAB_SIZE,
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
