@@ -81,19 +81,19 @@ def _build_block_tables(
         return mx.array(padded, dtype=mx.int32), cache_block_size
 
     # Hybrid path — translate large block_size to a kernel-compatible one.
+    # Vectorized: each vLLM block b → [b*ratio, b*ratio+1, …, b*ratio+ratio-1].
     kernel_bs = _pick_kernel_block_size(cache_block_size)
     ratio = cache_block_size // kernel_bs
 
-    expanded: list[list[int]] = []
-    for bt in raw_block_tables:
-        kernel_bt: list[int] = []
-        for b in bt:
-            kernel_bt.extend(range(b * ratio, b * ratio + ratio))
-        expanded.append(kernel_bt)
-
-    max_kernel_blocks = max(len(bt) for bt in expanded)
-    padded = [bt + [0] * (max_kernel_blocks - len(bt)) for bt in expanded]
-    return mx.array(padded, dtype=mx.int32), kernel_bs
+    max_blocks = max(len(bt) for bt in raw_block_tables)
+    padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
+    bt_arr = mx.array(padded, dtype=mx.int32)  # [num_seqs, max_blocks]
+    offsets = mx.arange(ratio, dtype=mx.int32)  # [ratio]
+    # [num_seqs, max_blocks, 1] * ratio + [1, 1, ratio] → [num_seqs, max_blocks, ratio]
+    expanded = (bt_arr[:, :, None] * ratio + offsets[None, None, :]).reshape(
+        bt_arr.shape[0], -1
+    )
+    return expanded, kernel_bs
 
 
 # === SDPA forward ===
