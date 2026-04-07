@@ -73,10 +73,12 @@ smoke_test_qwen35() {
 The capital of France is Paris."
 
   # 1. Start vLLM with paged attention (hybrid SDPA + GDN path)
+  # max-num-seqs=1: limits GDN linear state allocation (~10MB/slot × N slots)
+  # which is critical on CI runners with only ~5GB Metal memory.
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
-    VLLM_METAL_MEMORY_FRACTION=0.5 \
-    vllm serve "$model" --revision "$revision" --max-model-len 512 &
+    VLLM_METAL_MEMORY_FRACTION=0.8 \
+    vllm serve "$model" --revision "$revision" --max-model-len 512 --max-num-seqs 1 &
 
   local vllm_pid=$!
 
