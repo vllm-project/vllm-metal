@@ -1515,6 +1515,10 @@ class MetalModelRunner:
         try:
             model_output = self.model(input_ids, cache=offset_caches)
             logits = self._extract_logits(model_output)
+            # MLX uses lazy evaluation — model_output holds the entire
+            # computation graph.  Dropping it before mx.eval lets MLX
+            # free intermediate buffers (per-layer Q/K/V, MLP outputs)
+            # as the graph evaluates, rather than pinning them all.
             del model_output
         finally:
             clear_context()
