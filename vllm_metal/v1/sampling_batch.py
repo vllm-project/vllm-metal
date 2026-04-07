@@ -230,8 +230,9 @@ def sample_from_logits(
     if batch.all_greedy and batch.no_top_k and batch.no_top_p and batch.no_penalties:
         tokens = _mlx_greedy_sample(logits_2d)
         mx.eval(tokens)
-        flat = tokens.tolist()
-        return flat if isinstance(flat, list) else [flat]
+        if tokens.ndim == 0:
+            return [int(tokens.item())]
+        return [int(tokens[i].item()) for i in range(n)]
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
