@@ -66,11 +66,11 @@ from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.sampling_batch import (
-    sample_decode_tokens,
-    sample_prefill_tokens,
     DEFAULT_VOCAB_SIZE,
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
+    sample_decode_tokens,
+    sample_prefill_tokens,
 )
 
 logger = init_logger(__name__)
