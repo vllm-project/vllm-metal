@@ -10,7 +10,7 @@ smoke_test() {
   # 1. Start vLLM with paged attention (GQA path)
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
-    VLLM_METAL_MEMORY_FRACTION=0.4 \
+    VLLM_METAL_MEMORY_FRACTION=0.5 \
     vllm serve "$model" --max-model-len 512 &
 
   local vllm_pid=$!
