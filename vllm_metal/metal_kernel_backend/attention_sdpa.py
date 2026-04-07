@@ -32,7 +32,7 @@ from vllm_metal.paged_attention_common import PagedAttentionContext
 # The paged attention Metal kernel is template-instantiated for these block
 # sizes only.  Sorted descending so _pick_kernel_block_size selects the
 # largest valid divisor first, minimising the block-table expansion ratio.
-_KERNEL_BLOCK_SIZES = [32, 16, 8]
+_KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 
 def is_sdpa(module: nn.Module) -> bool:
@@ -68,12 +68,15 @@ def _build_block_tables(
 
     When ``cache_block_size`` exceeds the kernel's compiled block sizes,
     each vLLM block ``b`` is expanded into ``ratio`` kernel blocks
-    ``[b*ratio, …, b*ratio+ratio-1]``.  The cache is reshaped later to
+    ``[b*ratio, b*ratio+ratio)``.  The cache is reshaped later to
     match (zero-copy).
 
     Returns:
         (block_tables, kernel_block_size)
     """
+    if not raw_block_tables:
+        return mx.zeros((0, 0), dtype=mx.int32), cache_block_size
+
     if cache_block_size in _KERNEL_BLOCK_SIZES:
         # Fast path — no translation needed.
         max_blocks = max(len(bt) for bt in raw_block_tables)

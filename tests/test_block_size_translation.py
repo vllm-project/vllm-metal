@@ -82,3 +82,13 @@ class TestBuildBlockTables:
         bt, kbs = _build_block_tables([[0, 1, 2]], 544)
         ratio = 544 // 32
         assert bt.shape == (1, 3 * ratio)
+
+    def test_empty_block_tables(self):
+        bt, kbs = _build_block_tables([], 16)
+        assert bt.shape == (0, 0)
+        assert kbs == 16
+
+    def test_empty_block_tables_hybrid(self):
+        bt, kbs = _build_block_tables([], 544)
+        assert bt.shape == (0, 0)
+        assert kbs == 544
