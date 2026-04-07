@@ -536,6 +536,18 @@ class _ExecutionBatch:
         return bool(self.paged_prefill_entries or self.paged_decode_reqs)
 
 
+class _PagedForwardState(NamedTuple):
+    """State stashed by ``_start_paged_forward`` for ``_sample_paged_batch``."""
+
+    batch: _ExecutionBatch
+    prefill_reqs: list[PrefillRequest]
+    decode_reqs: list[tuple[str, RequestState]]
+    scheduler_output: SchedulerOutput
+    logits: mx.array
+    cu_seqlens: list[int]
+    num_decode: int
+
+
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
 ) -> list[BatchKVCache | BatchRotatingKVCache | ArraysCache]:
@@ -716,7 +728,7 @@ class MetalModelRunner:
 
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
-        self._execute_model_state: tuple | None = None
+        self._execute_model_state: _PagedForwardState | None = None
 
     @property
     def is_stt(self) -> bool:
@@ -1536,14 +1548,14 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
 
-        self._execute_model_state = (
-            batch,
-            prefill_reqs,
-            decode_reqs,
-            scheduler_output,
-            logits,
-            cu_seqlens,
-            num_decode,
+        self._execute_model_state = _PagedForwardState(
+            batch=batch,
+            prefill_reqs=prefill_reqs,
+            decode_reqs=decode_reqs,
+            scheduler_output=scheduler_output,
+            logits=logits,
+            cu_seqlens=cu_seqlens,
+            num_decode=num_decode,
         )
 
     def _sample_paged_batch(self) -> tuple[_ExecutionBatch, SchedulerOutput]:
@@ -1552,17 +1564,15 @@ class MetalModelRunner:
         Consumes state stashed by ``_start_paged_forward``.
         Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
-        (
-            batch,
-            prefill_reqs,
-            decode_reqs,
-            scheduler_output,
-            logits,
-            cu_seqlens,
-            num_decode,
-        ) = self._execute_model_state
-        prefill_pack = prefill_reqs
+        state = self._execute_model_state
         self._execute_model_state = None
+        batch = state.batch
+        prefill_reqs = state.prefill_reqs
+        decode_reqs = state.decode_reqs
+        scheduler_output = state.scheduler_output
+        logits = state.logits
+        cu_seqlens = state.cu_seqlens
+        num_decode = state.num_decode
 
         # ---- wait for GPU forward to complete ----
         mx.eval(logits)
@@ -1601,7 +1611,7 @@ class MetalModelRunner:
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
             next_token = prefill_next_tokens[i]
-            prefill = prefill_pack[i]
+            prefill = prefill_reqs[i]
 
             if entry.result_mode == "intermediate":
                 batch.sampled_tokens[entry.output_idx] = []
