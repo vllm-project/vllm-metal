@@ -1889,13 +1889,17 @@ class MetalModelRunner:
 
         return prefill_pack
 
-    def _run_paged_forward(
-        self,
-        batch: _ExecutionBatch,
-        prefill_pack: list[PrefillRequest],
-    ) -> None:
-        """Submit paged forward pass to GPU (async). Sampling deferred to sample_tokens."""
-        self._start_paged_forward(prefill_pack, batch.paged_decode_reqs)
+    @staticmethod
+    def _build_output(batch: _ExecutionBatch) -> ModelRunnerOutput:
+        """Build ``ModelRunnerOutput`` from a completed batch."""
+        return ModelRunnerOutput(
+            req_ids=batch.req_ids,
+            req_id_to_index=batch.req_id_to_index,
+            sampled_token_ids=batch.sampled_tokens,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[None] * len(batch.req_ids),
+        )
 
     def _run_non_paged_decode_batch(
         self,
@@ -2009,31 +2013,6 @@ class MetalModelRunner:
             stats["max_bytes"] / (1024 * 1024),
         )
 
-    def _finalize_output(
-        self,
-        batch: _ExecutionBatch,
-    ) -> ModelRunnerOutput | None:
-        """Store execute-time output for ``sample_tokens()`` or return empty."""
-        if not batch.req_ids:
-            return ModelRunnerOutput(
-                req_ids=[],
-                req_id_to_index={},
-                sampled_token_ids=[],
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[],
-            )
-
-        self._pending_output = ModelRunnerOutput(
-            req_ids=batch.req_ids,
-            req_id_to_index=batch.req_id_to_index,
-            sampled_token_ids=batch.sampled_tokens,
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[None] * len(batch.req_ids),
-        )
-        return None
-
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
@@ -2060,18 +2039,20 @@ class MetalModelRunner:
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
-            # Submit forward to GPU (async) — sampling deferred to sample_tokens
-            self._run_paged_forward(batch, prefill_pack)
-            # Stash batch state for sample_tokens
+            self._start_paged_forward(prefill_pack, batch.paged_decode_reqs)
             self._pending_paged_batch = (batch, prefill_pack, scheduler_output)
             return None
-        elif self._paged_attention_backend is None:
+
+        if self._paged_attention_backend is None:
             self._run_non_paged_decode_batch(batch)
 
-        # Non-paged path: complete synchronously (same as before)
+        # Non-paged path: complete synchronously
         self._validate_scheduled_outputs(batch, scheduler_output)
         self._cleanup_finished_requests(scheduler_output.finished_req_ids)
-        return self._finalize_output(batch)
+        if not batch.req_ids:
+            return self._build_output(batch)
+        self._pending_output = self._build_output(batch)
+        return None
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -2085,7 +2066,7 @@ class MetalModelRunner:
         """
         del grammar_output
 
-        # ---- paged path: eval + sample + postprocess ----
+        # Paged path: eval + sample + postprocess
         if self._pending_paged_batch is not None:
             batch, prefill_pack, scheduler_output = self._pending_paged_batch
             self._pending_paged_batch = None
@@ -2093,48 +2074,15 @@ class MetalModelRunner:
             self._sample_paged_batch(batch, prefill_pack)
             self._validate_scheduled_outputs(batch, scheduler_output)
             self._cleanup_finished_requests(scheduler_output.finished_req_ids)
+            return self._build_output(batch)
 
-            if not batch.req_ids:
-                return ModelRunnerOutput(
-                    req_ids=[],
-                    req_id_to_index={},
-                    sampled_token_ids=[],
-                    logprobs=None,
-                    prompt_logprobs_dict={},
-                    pooler_output=[],
-                )
-            return ModelRunnerOutput(
-                req_ids=batch.req_ids,
-                req_id_to_index=batch.req_id_to_index,
-                sampled_token_ids=batch.sampled_tokens,
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[None] * len(batch.req_ids),
-            )
+        # Non-paged path: return output built by execute_model
+        if self._pending_output is not None:
+            output = self._pending_output
+            self._pending_output = None
+            return output
 
-        # ---- non-paged / legacy path: return cached output ----
-        if self._pending_output is None:
-            model_id = None
-            model_config = getattr(self, "model_config", None)
-            if model_config is not None:
-                model_id = getattr(model_config, "model", None)
-
-            if getattr(self, "use_async_scheduling", False):
-                logger.error(
-                    "sample_tokens called without pending output from "
-                    "execute_model (model=%r). Returning None so vLLM can "
-                    "surface the original execute_model error.",
-                    model_id,
-                )
-                return None
-
-            raise RuntimeError(
-                "State error: sample_tokens called without pending output from "
-                f"execute_model (model={model_id!r})."
-            )
-        output = self._pending_output
-        self._pending_output = None
-        return output
+        return None
 
     # ------------------------------------------------------------------
     # STT (Speech-to-Text) helpers

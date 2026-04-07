@@ -130,7 +130,9 @@ class TestPagedPrefixCacheHit:
         ):
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
             sched_out = _make_scheduler_output([new_req])
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         state = runner._request_states.get("req-1")
         assert state is not None
@@ -170,7 +172,9 @@ class TestPagedPrefixCacheHit:
         ):
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
             sched_out = _make_scheduler_output([new_req])
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         # Must be full sequence length, not just suffix
         assert runner._paged_request_seq_lens["req-1"] == len(prompt)
@@ -205,7 +209,9 @@ class TestPagedPrefixCacheHit:
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
             sched_out = _make_scheduler_output([new_req])
             # This would raise AssertionError before the fix
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
 
 class TestSamplingMetadataWithPenalties:
@@ -259,7 +265,9 @@ class TestSamplingMetadataWithPenalties:
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
             new_req.sampling_params = sp
             sched_out = _make_scheduler_output([new_req])
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         # _make_sampling_metadata should have been called with the full
         # prompt as prompt_token_ids, not just the suffix.
@@ -376,7 +384,9 @@ class TestMixedDecodeAndPrefixHitPrefill:
             patch("vllm_metal.v1.model_runner.prepare_unified"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         state_a = runner._request_states["req-A"]
         assert state_a.token_ids[-1] == decode_token
@@ -435,7 +445,9 @@ class TestCachedRequestContinuation:
                 num_computed_tokens=[6],
                 num_scheduled={"req-1": 6},
             )
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         state = runner._request_states["req-1"]
         assert state.token_ids == prompt + [fake_token]
@@ -486,7 +498,9 @@ class TestCachedRequestContinuation:
                 num_computed_tokens=[4],
                 num_scheduled={"req-1": 4},
             )
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         state = runner._request_states["req-1"]
         # Still prefilling — no token appended, generated_tokens stays 0
@@ -538,7 +552,9 @@ class TestPrepareUnifiedSlotMapping:
             ),
             patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
         ):
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         assert len(captured) == 1
         ctx = captured[0]
@@ -571,7 +587,9 @@ class TestPrepareUnifiedSlotMapping:
             ),
             patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
         ):
-            runner.execute_model(sched_out)
+            result = runner.execute_model(sched_out)
+            if result is None:
+                runner.sample_tokens(None)
 
         assert len(captured) == 1
         ctx = captured[0]

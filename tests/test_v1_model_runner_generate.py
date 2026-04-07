@@ -75,6 +75,7 @@ class TestV1MetalModelRunnerSampleTokens:
     def _make_runner(self) -> mr.MetalModelRunner:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner._pending_output = None
+        runner._pending_paged_batch = None
         runner.use_async_scheduling = True
         return runner
 
@@ -101,14 +102,12 @@ class TestV1MetalModelRunnerSampleTokens:
 
         assert out is None
 
-    def test_raises_when_no_pending_output_and_not_async(self) -> None:
+    def test_returns_none_when_no_pending_output_and_not_async(self) -> None:
         runner = self._make_runner()
         runner.use_async_scheduling = False
 
-        with pytest.raises(
-            RuntimeError, match="sample_tokens called without pending output"
-        ):
-            runner.sample_tokens(grammar_output=None)
+        out = runner.sample_tokens(grammar_output=None)
+        assert out is None
 
 
 class TestV1MetalModelRunnerExecuteModel:
@@ -122,6 +121,7 @@ class TestV1MetalModelRunnerExecuteModel:
         runner._finished_request_count = 0
         runner._prefix_cache = None
         runner._pending_output = None
+        runner._pending_paged_batch = None
         runner.use_async_scheduling = True
         return runner
 
