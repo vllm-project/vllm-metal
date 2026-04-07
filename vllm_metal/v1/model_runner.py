@@ -1529,6 +1529,7 @@ class MetalModelRunner:
         Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
         state = self._execute_model_state
+        assert state is not None
         self._execute_model_state = None
         batch = state.batch
         prefill_reqs = state.prefill_reqs
@@ -1605,9 +1606,9 @@ class MetalModelRunner:
                 )
                 continue
 
-            state = self._request_states[prefill.req_id]
-            state.token_ids.append(next_token)
-            state.generated_tokens = len(state.token_ids) - state.prompt_len
+            req_state = self._request_states[prefill.req_id]
+            req_state.token_ids.append(next_token)
+            req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
             batch.add_output(req_id, [decode_next_tokens[i]])
