@@ -64,9 +64,7 @@ def sample_decode_tokens(
         for i, (_, state) in enumerate(decode_reqs)
         if state.generator is not None
     }
-    logits_torch = mlx_to_torch(
-        decode_logits.astype(mx.float32), device=device
-    )
+    logits_torch = mlx_to_torch(decode_logits.astype(mx.float32), device=device)
     metadata = make_metadata(
         sampling_params_list,
         prompt_token_ids_list,
@@ -74,10 +72,7 @@ def sample_decode_tokens(
         generators=generators,
     )
     output = sampler.forward(logits_torch, metadata)
-    return [
-        int(output.sampled_token_ids[i, 0].item())
-        for i in range(num_decode)
-    ]
+    return [int(output.sampled_token_ids[i, 0].item()) for i in range(num_decode)]
 
 
 def sample_prefill_tokens(

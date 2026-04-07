@@ -1537,8 +1537,13 @@ class MetalModelRunner:
             cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
 
         self._execute_model_state = (
-            batch, prefill_reqs, decode_reqs, scheduler_output,
-            logits, cu_seqlens, num_decode,
+            batch,
+            prefill_reqs,
+            decode_reqs,
+            scheduler_output,
+            logits,
+            cu_seqlens,
+            num_decode,
         )
 
     def _sample_paged_batch(self) -> tuple[_ExecutionBatch, SchedulerOutput]:
@@ -1548,8 +1553,13 @@ class MetalModelRunner:
         Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
         (
-            batch, prefill_reqs, decode_reqs, scheduler_output,
-            logits, cu_seqlens, num_decode,
+            batch,
+            prefill_reqs,
+            decode_reqs,
+            scheduler_output,
+            logits,
+            cu_seqlens,
+            num_decode,
         ) = self._execute_model_state
         prefill_pack = prefill_reqs
         self._execute_model_state = None
@@ -1559,12 +1569,21 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         decode_next_tokens = sample_decode_tokens(
-            logits, decode_reqs, num_decode,
-            self._sampler, self._make_sampling_metadata, self.device,
+            logits,
+            decode_reqs,
+            num_decode,
+            self._sampler,
+            self._make_sampling_metadata,
+            self.device,
         )
         prefill_next_tokens = sample_prefill_tokens(
-            logits, prefill_reqs, cu_seqlens, num_decode,
-            self._sampler, self._make_sampling_metadata, self.device,
+            logits,
+            prefill_reqs,
+            cu_seqlens,
+            num_decode,
+            self._sampler,
+            self._make_sampling_metadata,
+            self.device,
         )
 
         # ---- update decode state ----
@@ -1572,8 +1591,7 @@ class MetalModelRunner:
             state.token_ids.append(decode_next_tokens[i])
             state.generated_tokens += 1
             self._paged_request_seq_lens[req_id] = (
-                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2)
-                + 1
+                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
             )
 
         # ---- update prefill seq lens ----
@@ -1978,7 +1996,10 @@ class MetalModelRunner:
         if self._paged_attention_backend is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
             self._start_paged_forward(
-                batch, prefill_pack, batch.paged_decode_reqs, scheduler_output,
+                batch,
+                prefill_pack,
+                batch.paged_decode_reqs,
+                scheduler_output,
             )
             return None
 
