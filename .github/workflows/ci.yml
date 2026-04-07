@@ -39,6 +39,12 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Cache HuggingFace models
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface/hub
+        key: hf-${{ runner.os }}-qwen3-0.6b
+
     - name: Test
       run: |
         scripts/test.sh

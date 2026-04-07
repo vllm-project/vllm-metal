@@ -3,12 +3,16 @@
 smoke_test() {
   section "Running smoke test"
 
-  local model="HuggingFaceTB/SmolLM2-135M-Instruct"
+  local model="Qwen/Qwen3-0.6B"
+  local prompt="The capital of France is"
+  local expected=" Paris. The capital of Italy is Rome. The"
 
-  # 1. Start vLLM in the background
-  GLOO_SOCKET_IFNAME=lo0 vllm serve "$model" &
+  # 1. Start vLLM with paged attention (GQA path)
+  GLOO_SOCKET_IFNAME=lo0 \
+    VLLM_METAL_USE_PAGED_ATTENTION=1 \
+    VLLM_METAL_MEMORY_FRACTION=0.2 \
+    vllm serve "$model" --max-model-len 512 &
 
-  # Store the process ID
   local vllm_pid=$!
 
   # 2. Wait for the server to be ready
@@ -16,34 +20,44 @@ smoke_test() {
   local health_url="http://localhost:8000/health"
   if ! curl --retry 8 --retry-all-errors -s "$health_url" > /dev/null; then
     echo "vLLM failed to start."
-
     kill $vllm_pid
-
     exit 1
   fi
 
   echo "Model loaded successfully!"
 
-  # 3. Test chat completions endpoint
-  echo "Testing chat completions endpoint..."
-  local chat_url="http://localhost:8000/v1/chat/completions"
+  # 3. Test completions endpoint with golden comparison
+  echo "Testing completions with golden output..."
+  local completions_url="http://localhost:8000/v1/completions"
   local response
-  response=$(curl -s -X POST "$chat_url" \
+  response=$(curl -s -X POST "$completions_url" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"$model\",
-      \"messages\": [{\"role\": \"user\", \"content\": \"Say hello\"}],
-      \"max_tokens\": 32
+      \"prompt\": \"$prompt\",
+      \"temperature\": 0,
+      \"max_tokens\": 10
     }")
 
   if ! echo "$response" | grep -q '"choices"'; then
-    echo "Chat completions test failed. Response:"
+    echo "Completions test failed. Response:"
     echo "$response"
     kill $vllm_pid
     exit 1
   fi
 
-  echo "Chat completions test passed!"
+  local actual
+  actual=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['text'])")
+
+  if [ "$actual" != "$expected" ]; then
+    echo "Golden comparison FAILED"
+    echo "  expected: '$expected'"
+    echo "  actual:   '$actual'"
+    kill $vllm_pid
+    exit 1
+  fi
+
+  echo "Smoke test passed! Output matches golden."
 
   kill $vllm_pid
 }
