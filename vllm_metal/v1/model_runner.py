@@ -65,6 +65,7 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.sampling import sample_decode_tokens, sample_prefill_tokens
 from vllm_metal.v1.sampling_batch import (
     DEFAULT_VOCAB_SIZE,
     GREEDY_TEMPERATURE_EPS,
@@ -713,9 +714,9 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
-        # Async forward state (execute_model → sample_tokens split)
-        self._paged_forward_state: tuple | None = None
-        self._pending_paged_batch: tuple | None = None
+        # Async forward state: stashed by execute_model, consumed by
+        # sample_tokens (mirrors upstream's execute_model_state pattern).
+        self._execute_model_state: tuple | None = None
 
     @property
     def is_stt(self) -> bool:
@@ -1460,13 +1461,15 @@ class MetalModelRunner:
 
     def _start_paged_forward(
         self,
+        batch: _ExecutionBatch,
         prefill_reqs: list[PrefillRequest],
         decode_reqs: list[tuple[str, RequestState]],
+        scheduler_output: SchedulerOutput,
     ) -> None:
         """Build graph and submit forward pass to GPU (async).
 
-        Stashes logits and request metadata in ``_paged_forward_state``
-        for ``_sample_paged_batch`` to consume.
+        Stashes all state needed by ``sample_tokens`` in
+        ``_execute_model_state`` (mirrors upstream's pattern).
         """
         num_decode = len(decode_reqs)
 
@@ -1533,120 +1536,49 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
 
-        # Stash for sample_tokens
-        self._paged_forward_state = (
-            logits,
-            prefill_reqs,
-            decode_reqs,
-            cu_seqlens,
-            num_decode,
+        self._execute_model_state = (
+            batch, prefill_reqs, decode_reqs, scheduler_output,
+            logits, cu_seqlens, num_decode,
         )
 
-    def _sample_paged_batch(
-        self,
-        batch: _ExecutionBatch,
-        prefill_pack: list[PrefillRequest],
-    ) -> None:
+    def _sample_paged_batch(self) -> tuple[_ExecutionBatch, SchedulerOutput]:
         """Eval logits, sample tokens, and postprocess paged batch.
 
         Consumes state stashed by ``_start_paged_forward``.
+        Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
-        logits, prefill_reqs, decode_reqs, cu_seqlens, num_decode = (
-            self._paged_forward_state
-        )
-        self._paged_forward_state = None
+        (
+            batch, prefill_reqs, decode_reqs, scheduler_output,
+            logits, cu_seqlens, num_decode,
+        ) = self._execute_model_state
+        prefill_pack = prefill_reqs
+        self._execute_model_state = None
 
         # ---- wait for GPU forward to complete ----
         mx.eval(logits)
 
-        # ---- sample decode tokens ----
-        decode_next_tokens: list[int] = []
-        if decode_reqs:
-            # All decode logits are at positions 0..num_decode-1
-            decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
+        # ---- sample tokens ----
+        decode_next_tokens = sample_decode_tokens(
+            logits, decode_reqs, num_decode,
+            self._sampler, self._make_sampling_metadata, self.device,
+        )
+        prefill_next_tokens = sample_prefill_tokens(
+            logits, prefill_reqs, cu_seqlens, num_decode,
+            self._sampler, self._make_sampling_metadata, self.device,
+        )
 
-            sampling_params_list = [state.sampling_params for _, state in decode_reqs]
-            if SamplingBatch.can_use_native_greedy(sampling_params_list):
-                next_tokens_mlx = _mlx_greedy_sample(decode_logits)
-                mx.eval(next_tokens_mlx)
-                decode_next_tokens = next_tokens_mlx.tolist()
-            else:
-                prompt_token_ids_list = [
-                    state.token_ids[: state.prompt_len] for _, state in decode_reqs
-                ]
-                output_tokens_list = [
-                    state.token_ids[state.prompt_len :] for _, state in decode_reqs
-                ]
-                generators = {
-                    i: state.generator
-                    for i, (_, state) in enumerate(decode_reqs)
-                    if state.generator is not None
-                }
-                logits_torch = mlx_to_torch(
-                    decode_logits.astype(mx.float32), device=self.device
-                )
-                metadata = self._make_sampling_metadata(
-                    sampling_params_list,
-                    prompt_token_ids_list,
-                    output_tokens_list,
-                    generators=generators,
-                )
-                output = self._sampler.forward(logits_torch, metadata)
-                decode_next_tokens = [
-                    int(output.sampled_token_ids[i, 0].item())
-                    for i in range(num_decode)
-                ]
+        # ---- update decode state ----
+        for i, (req_id, state) in enumerate(decode_reqs):
+            state.token_ids.append(decode_next_tokens[i])
+            state.generated_tokens += 1
+            self._paged_request_seq_lens[req_id] = (
+                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2)
+                + 1
+            )
 
-            # Update decode state
-            for i, (req_id, state) in enumerate(decode_reqs):
-                state.token_ids.append(decode_next_tokens[i])
-                state.generated_tokens += 1
-                self._paged_request_seq_lens[req_id] = (
-                    self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2)
-                    + 1
-                )
-
-        # ---- sample prefill tokens ----
-        prefill_next_tokens: list[int] = []
-        for j, pr in enumerate(prefill_reqs):
-            last_idx = cu_seqlens[num_decode + j + 1] - 1
-            last_logits = logits[:, last_idx : last_idx + 1, :]
-
-            if pr.full_prompt_token_ids is not None:
-                prompt_len = len(pr.full_prompt_token_ids)
-            elif pr.prompt_len is not None:
-                prompt_len = pr.prompt_len
-            else:
-                prompt_len = len(pr.token_ids)
-
-            if SamplingBatch.can_use_native_greedy([pr.sampling_params]):
-                next_token_mlx = _mlx_greedy_sample(last_logits[0])
-                mx.eval(next_token_mlx)
-                next_token = int(next_token_mlx.item())
-            else:
-                mx.eval(last_logits)
-                logits_torch = mlx_to_torch(
-                    last_logits[0].astype(mx.float32), device=self.device
-                )
-                generators = {} if pr.generator is None else {0: pr.generator}
-                # Use full prompt for penalty computation when available
-                # (prefix cache hit supplies suffix-only token_ids).
-                prompt_for_meta = (
-                    pr.full_prompt_token_ids
-                    if pr.full_prompt_token_ids is not None
-                    else pr.token_ids
-                )
-                metadata = self._make_sampling_metadata(
-                    [pr.sampling_params],
-                    [prompt_for_meta[:prompt_len]],
-                    [prompt_for_meta[prompt_len:]],
-                    generators=generators,
-                )
-                output = self._sampler.forward(logits_torch, metadata)
-                next_token = int(output.sampled_token_ids[0, 0].item())
-
+        # ---- update prefill seq lens ----
+        for pr in prefill_reqs:
             self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(pr.token_ids)
-            prefill_next_tokens.append(next_token)
 
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
@@ -1683,6 +1615,8 @@ class MetalModelRunner:
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
             batch.add_output(req_id, [decode_next_tokens[i]])
+
+        return batch, scheduler_output
 
     def _handle_new_requests(
         self,
@@ -2043,8 +1977,9 @@ class MetalModelRunner:
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
-            self._start_paged_forward(prefill_pack, batch.paged_decode_reqs)
-            self._pending_paged_batch = (batch, prefill_pack, scheduler_output)
+            self._start_paged_forward(
+                batch, prefill_pack, batch.paged_decode_reqs, scheduler_output,
+            )
             return None
 
         if self._paged_attention_backend is None:
@@ -2071,11 +2006,8 @@ class MetalModelRunner:
         del grammar_output
 
         # Paged path: eval + sample + postprocess
-        if self._pending_paged_batch is not None:
-            batch, prefill_pack, scheduler_output = self._pending_paged_batch
-            self._pending_paged_batch = None
-
-            self._sample_paged_batch(batch, prefill_pack)
+        if self._execute_model_state is not None:
+            batch, scheduler_output = self._sample_paged_batch()
             self._validate_scheduled_outputs(batch, scheduler_output)
             self._cleanup_finished_requests(scheduler_output.finished_req_ids)
             return self._build_output(batch)

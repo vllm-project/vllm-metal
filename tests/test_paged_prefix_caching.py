@@ -118,7 +118,7 @@ class TestPagedPrefixCacheHit:
                 return_value=logits,
             ),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array(fake_token),
             ),
             patch(
@@ -160,7 +160,7 @@ class TestPagedPrefixCacheHit:
                 return_value=logits,
             ),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array(0),
             ),
             patch(
@@ -196,7 +196,7 @@ class TestPagedPrefixCacheHit:
                 return_value=logits,
             ),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array(0),
             ),
             patch(
@@ -378,7 +378,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
         with (
             patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 side_effect=greedy_tokens,
             ),
             patch("vllm_metal.v1.model_runner.prepare_unified"),
@@ -434,7 +434,7 @@ class TestCachedRequestContinuation:
                 return_value=logits,
             ),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array(fake_token),
             ),
             patch("vllm_metal.v1.model_runner.prepare_unified"),
@@ -487,7 +487,7 @@ class TestCachedRequestContinuation:
                 return_value=logits,
             ),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array(0),
             ),
             patch("vllm_metal.v1.model_runner.prepare_unified"),
@@ -547,7 +547,7 @@ class TestPrepareUnifiedSlotMapping:
         with (
             patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array([0]),
             ),
             patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
@@ -582,7 +582,7 @@ class TestPrepareUnifiedSlotMapping:
         with (
             patch.object(mr.MetalModelRunner, "_extract_logits", return_value=logits),
             patch(
-                "vllm_metal.v1.model_runner._mlx_greedy_sample",
+                "vllm_metal.v1.sampling._mlx_greedy_sample",
                 return_value=mx.array([0]),
             ),
             patch.object(pac, "set_context", side_effect=_make_paged_ctx_spy(captured)),
