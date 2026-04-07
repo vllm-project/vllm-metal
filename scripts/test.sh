@@ -4,6 +4,7 @@ smoke_test() {
   section "Running smoke test"
 
   local model="Qwen/Qwen3-0.6B"
+  local revision="c1899de289a04d12100db370d81485cdf75e47ca"
   local prompt="The capital of France is"
   local expected=" Paris. The capital of Italy is Rome. The"
 
@@ -11,7 +12,7 @@ smoke_test() {
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
     VLLM_METAL_MEMORY_FRACTION=0.5 \
-    vllm serve "$model" --max-model-len 512 &
+    vllm serve "$model" --revision "$revision" --max-model-len 512 &
 
   local vllm_pid=$!
 

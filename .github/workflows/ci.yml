@@ -43,7 +43,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/huggingface/hub
-        key: hf-${{ runner.os }}-qwen3-0.6b
+        key: hf-${{ runner.os }}-${{ hashFiles('scripts/test.sh') }}
 
     - name: Test
       run: |
