@@ -713,6 +713,10 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
+        # Async forward state (execute_model → sample_tokens split)
+        self._paged_forward_state: tuple | None = None
+        self._pending_paged_batch: tuple | None = None
+
     @property
     def is_stt(self) -> bool:
         """Whether the loaded model is a Speech-to-Text model."""
@@ -1454,19 +1458,15 @@ class MetalModelRunner:
     # Unified prefill + decode (single forward pass)
     # ------------------------------------------------------------------
 
-    def _unified_prefill_decode_paged(
+    def _start_paged_forward(
         self,
         prefill_reqs: list[PrefillRequest],
         decode_reqs: list[tuple[str, RequestState]],
-    ) -> tuple[list[int], list[int]]:
-        """Single forward pass for mixed prefill + decode requests.
+    ) -> None:
+        """Build graph and submit forward pass to GPU (async).
 
-        Packs decode tokens (1 per request) followed by prefill tokens into
-        a flat ``(1, total_tokens)`` input.  The varlen kernel uses
-        ``cu_seqlens`` to handle variable-length subsequences.
-
-        Returns:
-            ``(prefill_next_tokens, decode_next_tokens)``
+        Stashes logits and request metadata in ``_paged_forward_state``
+        for ``_sample_paged_batch`` to consume.
         """
         num_decode = len(decode_reqs)
 
@@ -1509,14 +1509,18 @@ class MetalModelRunner:
                     gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
                 ctx.gdn_slot_mapping = gdn_slots
 
-        # ---- forward ----
+        # ---- forward (lazy graph + async submit) ----
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
         try:
             model_output = self.model(input_ids, cache=offset_caches)
             logits = self._extract_logits(model_output)
+            del model_output
         finally:
             clear_context()
+
+        # Submit to GPU — returns immediately, GPU runs in background
+        mx.async_eval(logits)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -1524,6 +1528,32 @@ class MetalModelRunner:
             cu_seqlens.append(cu_seqlens[-1] + 1)
         for pr in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
+
+        # Stash for sample_tokens
+        self._paged_forward_state = (
+            logits,
+            prefill_reqs,
+            decode_reqs,
+            cu_seqlens,
+            num_decode,
+        )
+
+    def _sample_paged_batch(
+        self,
+        batch: _ExecutionBatch,
+        prefill_pack: list[PrefillRequest],
+    ) -> None:
+        """Eval logits, sample tokens, and postprocess paged batch.
+
+        Consumes state stashed by ``_start_paged_forward``.
+        """
+        logits, prefill_reqs, decode_reqs, cu_seqlens, num_decode = (
+            self._paged_forward_state
+        )
+        self._paged_forward_state = None
+
+        # ---- wait for GPU forward to complete ----
+        mx.eval(logits)
 
         # ---- sample decode tokens ----
         decode_next_tokens: list[int] = []
@@ -1537,7 +1567,6 @@ class MetalModelRunner:
                 mx.eval(next_tokens_mlx)
                 decode_next_tokens = next_tokens_mlx.tolist()
             else:
-                mx.eval(decode_logits)
                 prompt_token_ids_list = [
                     state.token_ids[: state.prompt_len] for _, state in decode_reqs
                 ]
@@ -1615,7 +1644,41 @@ class MetalModelRunner:
             self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(pr.token_ids)
             prefill_next_tokens.append(next_token)
 
-        return prefill_next_tokens, decode_next_tokens
+        # ---- postprocess: write results back into batch ----
+        for i, entry in enumerate(batch.paged_prefill_entries):
+            next_token = prefill_next_tokens[i]
+            prefill = prefill_pack[i]
+
+            if entry.result_mode == "intermediate":
+                batch.sampled_tokens[entry.output_idx] = []
+                continue
+
+            batch.sampled_tokens[entry.output_idx] = [next_token]
+            if entry.result_mode == "new_final":
+                prompt_len = prefill.prompt_len
+                assert prompt_len is not None
+                full_prompt = (
+                    prefill.full_prompt_token_ids
+                    if prefill.full_prompt_token_ids is not None
+                    else prefill.token_ids
+                )
+                self._request_states[prefill.req_id] = RequestState(
+                    token_ids=full_prompt + [next_token],
+                    prompt_len=prompt_len,
+                    cache=[],
+                    sampling_params=prefill.sampling_params,
+                    generator=prefill.generator,
+                    generated_tokens=1,
+                    block_ids=prefill.block_ids,
+                )
+                continue
+
+            state = self._request_states[prefill.req_id]
+            state.token_ids.append(next_token)
+            state.generated_tokens = len(state.token_ids) - state.prompt_len
+
+        for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
+            batch.add_output(req_id, [decode_next_tokens[i]])
 
     def _handle_new_requests(
         self,
@@ -1826,50 +1889,13 @@ class MetalModelRunner:
 
         return prefill_pack
 
-    def _run_paged_batch(
+    def _run_paged_forward(
         self,
         batch: _ExecutionBatch,
         prefill_pack: list[PrefillRequest],
     ) -> None:
-        """Run paged prefill/decode and write results back into ``batch``."""
-        prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
-            prefill_pack, batch.paged_decode_reqs
-        )
-
-        for i, entry in enumerate(batch.paged_prefill_entries):
-            next_token = prefill_tokens[i]
-            prefill = prefill_pack[i]
-
-            if entry.result_mode == "intermediate":
-                batch.sampled_tokens[entry.output_idx] = []
-                continue
-
-            batch.sampled_tokens[entry.output_idx] = [next_token]
-            if entry.result_mode == "new_final":
-                prompt_len = prefill.prompt_len
-                assert prompt_len is not None
-                full_prompt = (
-                    prefill.full_prompt_token_ids
-                    if prefill.full_prompt_token_ids is not None
-                    else prefill.token_ids
-                )
-                self._request_states[prefill.req_id] = RequestState(
-                    token_ids=full_prompt + [next_token],
-                    prompt_len=prompt_len,
-                    cache=[],
-                    sampling_params=prefill.sampling_params,
-                    generator=prefill.generator,
-                    generated_tokens=1,
-                    block_ids=prefill.block_ids,
-                )
-                continue
-
-            state = self._request_states[prefill.req_id]
-            state.token_ids.append(next_token)
-            state.generated_tokens = len(state.token_ids) - state.prompt_len
-
-        for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
-            batch.add_output(req_id, [decode_tokens[i]])
+        """Submit paged forward pass to GPU (async). Sampling deferred to sample_tokens."""
+        self._start_paged_forward(prefill_pack, batch.paged_decode_reqs)
 
     def _run_non_paged_decode_batch(
         self,
@@ -2011,7 +2037,12 @@ class MetalModelRunner:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
-        """Execute model inference with true batched decode."""
+        """Execute model forward pass and submit to GPU.
+
+        For the paged attention path, the forward pass is submitted
+        asynchronously — sampling and postprocessing are deferred to
+        ``sample_tokens`` so the scheduler can run while the GPU computes.
+        """
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
@@ -2029,10 +2060,15 @@ class MetalModelRunner:
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
-            self._run_paged_batch(batch, prefill_pack)
+            # Submit forward to GPU (async) — sampling deferred to sample_tokens
+            self._run_paged_forward(batch, prefill_pack)
+            # Stash batch state for sample_tokens
+            self._pending_paged_batch = (batch, prefill_pack, scheduler_output)
+            return None
         elif self._paged_attention_backend is None:
             self._run_non_paged_decode_batch(batch)
 
+        # Non-paged path: complete synchronously (same as before)
         self._validate_scheduled_outputs(batch, scheduler_output)
         self._cleanup_finished_requests(scheduler_output.finished_req_ids)
         return self._finalize_output(batch)
@@ -2040,15 +2076,43 @@ class MetalModelRunner:
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | None:
-        """Return sampled tokens produced by the last execute_model call.
+        """Wait for GPU forward, sample tokens, and postprocess.
 
-        vLLM's v1 engine calls ``sample_tokens`` after a successful
-        ``execute_model`` call that returned ``None``. When async scheduling is
-        enabled, vLLM may still call ``sample_tokens`` even if ``execute_model``
-        failed; returning ``None`` in that case allows vLLM to surface the
-        original exception from ``execute_model``.
+        Called by the vLLM v1 engine after ``execute_model`` returns ``None``.
+        For the paged path, this is where the actual GPU synchronization,
+        token sampling, and request state updates happen — allowing the
+        scheduler to run while the GPU was computing the forward pass.
         """
         del grammar_output
+
+        # ---- paged path: eval + sample + postprocess ----
+        if self._pending_paged_batch is not None:
+            batch, prefill_pack, scheduler_output = self._pending_paged_batch
+            self._pending_paged_batch = None
+
+            self._sample_paged_batch(batch, prefill_pack)
+            self._validate_scheduled_outputs(batch, scheduler_output)
+            self._cleanup_finished_requests(scheduler_output.finished_req_ids)
+
+            if not batch.req_ids:
+                return ModelRunnerOutput(
+                    req_ids=[],
+                    req_id_to_index={},
+                    sampled_token_ids=[],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                )
+            return ModelRunnerOutput(
+                req_ids=batch.req_ids,
+                req_id_to_index=batch.req_id_to_index,
+                sampled_token_ids=batch.sampled_tokens,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[None] * len(batch.req_ids),
+            )
+
+        # ---- non-paged / legacy path: return cached output ----
         if self._pending_output is None:
             model_id = None
             model_config = getattr(self, "model_config", None)
