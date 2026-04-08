@@ -9,7 +9,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 - **MLX-accelerated inference**: faster than PyTorch MPS on Apple Silicon
 - **Unified memory**: True zero-copy operations leveraging Apple Silicon's unified memory architecture
 - **vLLM compatibility**: Full integration with vLLM's engine, scheduler, and OpenAI-compatible API
-- **Paged attention** *(experimental)*: Efficient KV cache management for long sequences — opt-in via `VLLM_METAL_USE_PAGED_ATTENTION=1`; default path uses MLX-managed KV cache. When enabled, expect significantly better serving performance (~82x TTFT, ~3.75x throughput in early benchmarks on Qwen3-0.6B). Other models may have rough edges.
+- **Paged attention** *(default)*: Efficient KV cache management with native Metal kernels — enabled by default. Set `VLLM_METAL_USE_PAGED_ATTENTION=0` to fall back to the legacy MLX-managed KV cache path.
 - **GQA support**: Grouped-Query Attention for efficient inference
 
 ## Requirements
@@ -95,7 +95,7 @@ Environment variables for customization:
 | `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute (1=yes, 0=no) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
-| `VLLM_METAL_USE_PAGED_ATTENTION` | `0` | Enable experimental paged KV cache |
+| `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Paged KV cache with native Metal kernels (set `0` to use legacy MLX KV cache) |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
@@ -104,15 +104,15 @@ Environment variables for customization:
 
 ## Paged KV vs MLX KV memory settings
 
-- MLX path (`VLLM_METAL_USE_PAGED_ATTENTION=0`): `VLLM_METAL_MEMORY_FRACTION` must be `auto`.
-- Paged KV path (`VLLM_METAL_USE_PAGED_ATTENTION=1`): `VLLM_METAL_MEMORY_FRACTION` can be `auto` or a numeric fraction in `(0, 1]`.
+- Paged KV path (default, `VLLM_METAL_USE_PAGED_ATTENTION=1`): `VLLM_METAL_MEMORY_FRACTION` can be `auto` or a numeric fraction in `(0, 1]`.
 - For paged KV with `VLLM_METAL_MEMORY_FRACTION=auto`, vllm-metal uses a default fraction of `0.9`.
+- Legacy MLX path (`VLLM_METAL_USE_PAGED_ATTENTION=0`): `VLLM_METAL_MEMORY_FRACTION` must be `auto`.
 
 `VLLM_METAL_MEMORY_FRACTION` | `VLLM_METAL_USE_PAGED_ATTENTION` | Valid? | Notes
 -- | -- | -- | --
-`auto` | `0` | Yes | MLX path (default)
-`auto` | `1` | Yes | Paged KV path; defaults to 0.9 internally
+`auto` | `1` | Yes | Paged KV path (default); uses 0.9 internally
 `0.7` | `1` | Yes | Paged KV path with explicit memory budget
+`auto` | `0` | Yes | Legacy MLX path
 `0.7` | `0` | No | Explicit fraction without paged KV is invalid
 
 ## Acknowledgements

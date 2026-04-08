@@ -53,6 +53,7 @@ class TestMetalConfig:
         assert config.mlx_device == "gpu"
         assert config.block_size == 16
         assert config.debug is False
+        assert config.use_paged_attention is True
 
     def test_custom_config_from_env(self) -> None:
         """Test configuration from environment variables."""
@@ -111,7 +112,7 @@ class TestMetalConfig:
     def test_is_auto_memory_false_for_numeric(self) -> None:
         """Test that is_auto_memory is False for numeric values."""
         os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5"
-        os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
+        # Paged attention is now default, so no need to set env var
 
         config = MetalConfig.from_env()
 
@@ -120,7 +121,7 @@ class TestMetalConfig:
 
     def test_explicit_fraction_requires_paged_attention(self) -> None:
         """Test that explicit memory fraction without paged attention is rejected."""
-        with pytest.raises(ValueError, match="requires VLLM_METAL_USE_PAGED_ATTENTION"):
+        with pytest.raises(ValueError, match="only supported with paged attention"):
             MetalConfig(
                 memory_fraction=0.7,
                 use_mlx=False,
