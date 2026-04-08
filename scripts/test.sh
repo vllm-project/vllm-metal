@@ -16,7 +16,7 @@ run_smoke_test() {
   # 1. Start vLLM with paged attention
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
-    VLLM_METAL_MEMORY_FRACTION="${VLLM_METAL_MEMORY_FRACTION:-0.5}" \
+    VLLM_METAL_MEMORY_FRACTION=0.8 \
     vllm serve "$model" --revision "$revision" --max-model-len 512 ${extra_args[@]+"${extra_args[@]}"} &
 
   local vllm_pid=$!
@@ -78,7 +78,6 @@ smoke_tests() {
   # Qwen3.5-0.8B: hybrid SDPA + GDN linear attention paged path
   # max-num-seqs=1: limits GDN linear state allocation (~10MB/slot × N slots)
   # which is critical on CI runners with only ~5GB Metal memory.
-  VLLM_METAL_MEMORY_FRACTION=0.8 \
   run_smoke_test \
     "Qwen/Qwen3.5-0.8B" \
     "2fc06364715b967f1860aea9cf38778875588b17" \
