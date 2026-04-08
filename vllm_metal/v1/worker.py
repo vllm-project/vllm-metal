@@ -33,10 +33,6 @@ from vllm_metal.platform import MetalPlatform
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
 
-# Memory budget fraction for MLX non-paged path.
-# Reports 80% of remaining Metal memory for KV cache.
-_MLX_MEMORY_BUDGET_FRACTION = 0.8
-
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import (
         MetalModelRunner,
@@ -427,20 +423,18 @@ class MetalWorker(WorkerBase):
             )
             return available
 
-        # Default MLX path: report 80% of remaining memory for KV cache.
-        # Use max_recommended_working_set_size as the Metal memory limit.
+        # Default MLX path: report available Metal memory for KV cache.
+        # Use cache_config.gpu_memory_utilization (user-configurable, default 0.9)
+        # to determine how much of the total Metal memory should be used.
         device_info = mx.device_info()
         metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
-        model_memory = self._get_model_memory_usage()
-        remaining = metal_limit - model_memory
-        available = int(remaining * _MLX_MEMORY_BUDGET_FRACTION)
+        available = int(metal_limit * self.cache_config.gpu_memory_utilization)
         logger.info(
             "MLX path: reporting %.2f GB for scheduler (Metal limit: %.2f GB, "
-            "Model: %.2f GB, Remaining: %.2f GB, KV budget: %.2f GB)",
+            "GPU memory utilization: %.2f, KV budget: %.2f GB)",
             available / 1e9,
             metal_limit / 1e9,
-            model_memory / 1e9,
-            remaining / 1e9,
+            self.cache_config.gpu_memory_utilization,
             available / 1e9,
         )
         return available
