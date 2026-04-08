@@ -38,6 +38,7 @@ def make_stub_runner(
         "use_async_scheduling": True,
         "device": torch.device("cpu"),
         "_sampler": None,
+        "_logitsprocs": None,
         "model_args": _model_args,
     }
 

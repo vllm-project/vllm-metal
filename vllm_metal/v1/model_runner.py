@@ -1239,7 +1239,7 @@ class MetalModelRunner:
             output_token_id_lists,
             vocab_size=self._vocab_size,
             device=self.device,
-            logitsprocs=getattr(self, "_logitsprocs", None),
+            logitsprocs=self._logitsprocs,
             generators=generators,
         ).make_sampling_metadata()
 
@@ -1310,7 +1310,7 @@ class MetalModelRunner:
             [[]],
             vocab_size=vocab_size,
             device=self.device,
-            logitsprocs=getattr(self, "_logitsprocs", None),
+            logitsprocs=self._logitsprocs,
             generators=generators,
         )
         [next_token] = sample_from_logits(
@@ -1371,7 +1371,7 @@ class MetalModelRunner:
             output_tokens_list,
             vocab_size=vocab_size,
             device=self.device,
-            logitsprocs=getattr(self, "_logitsprocs", None),
+            logitsprocs=self._logitsprocs,
             generators=generators,
         )
         next_tokens = sample_from_logits(
@@ -1417,7 +1417,7 @@ class MetalModelRunner:
                 [state.token_ids[state.prompt_len :]],
                 vocab_size=vocab_size,
                 device=self.device,
-                logitsprocs=getattr(self, "_logitsprocs", None),
+                logitsprocs=self._logitsprocs,
                 generators=generators,
             )
             [next_token] = sample_from_logits(
@@ -1545,7 +1545,7 @@ class MetalModelRunner:
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
-        logitsprocs = getattr(self, "_logitsprocs", None)
+        logitsprocs = self._logitsprocs
         decode_next_tokens = sample_decode_tokens(
             logits,
             decode_reqs,

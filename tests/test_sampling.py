@@ -353,19 +353,6 @@ class TestV1SamplingMetadataLogitsProcessors:
 
         assert metadata.logitsprocs is expected_logitsprocs
 
-    def test_make_sampling_metadata_falls_back_without_init(self) -> None:
-        runner = self._make_runner()
-        assert not hasattr(runner, "_logitsprocs")
-
-        metadata = runner._make_sampling_metadata(
-            sampling_params_list=[SamplingParams(temperature=0.0)],
-            prompt_token_id_lists=[[]],
-            output_token_id_lists=[[]],
-        )
-
-        assert isinstance(metadata.logitsprocs, LogitsProcessors)
-        assert list(metadata.logitsprocs.all) == []
-
 
 class TestV1PenaltyTokenAccounting:
     """Regression tests for prompt vs output token accounting in penalties."""
