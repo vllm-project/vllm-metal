@@ -8,14 +8,12 @@ import pytest
 from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
+from tests.stub_runner import make_stub_runner
 
 
 class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
-        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner.model = object()
-        runner.tokenizer = object()
-        return runner
+        return make_stub_runner(tokenizer=object())
 
     def test_accumulates_streamed_segments(self, monkeypatch) -> None:
         captured: dict[str, object] = {}
@@ -73,11 +71,7 @@ class TestV1MetalModelRunnerSampleTokens:
     """
 
     def _make_runner(self) -> mr.MetalModelRunner:
-        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner._pending_output = None
-        runner._execute_model_state = None
-        runner.use_async_scheduling = True
-        return runner
+        return make_stub_runner()
 
     def test_returns_pending_output_and_clears_state(self) -> None:
         runner = self._make_runner()
@@ -112,18 +106,7 @@ class TestV1MetalModelRunnerSampleTokens:
 
 class TestV1MetalModelRunnerExecuteModel:
     def _make_runner(self) -> mr.MetalModelRunner:
-        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner.model = object()
-        runner._is_stt = False
-        runner._paged_attention_backend = None
-        runner._request_states = {}
-        runner._paged_request_seq_lens = {}
-        runner._finished_request_count = 0
-        runner._prefix_cache = None
-        runner._pending_output = None
-        runner._execute_model_state = None
-        runner.use_async_scheduling = True
-        return runner
+        return make_stub_runner()
 
     def _make_scheduler_output(
         self, cached_req_ids: list[str] | None = None
@@ -177,9 +160,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
 class TestResolveModelDims:
     def _make_runner(self, args: dict) -> mr.MetalModelRunner:
-        r = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        r.model_args = args
-        return r
+        return make_stub_runner(model_args=args)
 
     def test_standard_mha(self) -> None:
         r = self._make_runner(

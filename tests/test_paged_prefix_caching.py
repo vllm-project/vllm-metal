@@ -16,32 +16,25 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
-import torch
 from vllm.sampling_params import SamplingParams
 
 import vllm_metal.paged_attention_common as pac
 import vllm_metal.v1.model_runner as mr
+from tests.stub_runner import make_stub_runner
 
 
 def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
     """Build a minimal MetalModelRunner with paged KV wired up."""
-    runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-    runner.model = MagicMock()
-    runner._is_stt = False
-    runner._paged_attention_backend = MagicMock()  # non-None enables paged path
-    runner._paged_block_size = 4
-    runner._paged_request_seq_lens = {}
-    runner._request_states = {}
-    runner._gdn_req_to_slot = {}
-    runner._gdn_free_slots = []
-    runner.model_args = {}
-    runner._rust_state_manager = None
-    runner.num_layers = num_layers
-    runner.device = torch.device("cpu")
-    runner._sampler = None
-    runner._pending_output = None
-    runner.use_async_scheduling = True
-    return runner
+    return make_stub_runner(
+        model_args={"vocab_size": 32000},
+        model=MagicMock(),
+        _paged_attention_backend=MagicMock(),
+        _paged_block_size=4,
+        _gdn_req_to_slot={},
+        _gdn_free_slots=[],
+        _rust_state_manager=None,
+        num_layers=num_layers,
+    )
 
 
 def _greedy_sp() -> SamplingParams:

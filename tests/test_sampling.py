@@ -11,6 +11,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from tests.stub_runner import make_stub_runner
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.model_runner import (
     MetalModelRunner,
@@ -268,11 +269,11 @@ class TestV1SeededSamplingGenerator:
             return _model
 
         vocab_size = 32
-        runner = MetalModelRunner.__new__(MetalModelRunner)
-        runner.device = torch.device("cpu")
-        runner.model_args = {"vocab_size": vocab_size}
-        runner._sampler = Sampler()
-        runner.model = uniform_logits_model(vocab_size)
+        runner = make_stub_runner(
+            model_args={"vocab_size": vocab_size},
+            _sampler=Sampler(),
+            model=uniform_logits_model(vocab_size),
+        )
 
         sp = SamplingParams(temperature=1.0, seed=123)
         generator = _create_request_generator(runner.device, sp)
@@ -337,10 +338,7 @@ class TestV1SamplingBatch:
 class TestV1SamplingMetadataLogitsProcessors:
     @staticmethod
     def _make_runner(vocab_size: int = 32) -> MetalModelRunner:
-        runner = MetalModelRunner.__new__(MetalModelRunner)
-        runner.device = torch.device("cpu")
-        runner.model_args = {"vocab_size": vocab_size}
-        return runner
+        return make_stub_runner(model_args={"vocab_size": vocab_size})
 
     def test_make_sampling_metadata_uses_runner_logitsprocs(self) -> None:
         runner = self._make_runner()
@@ -387,11 +385,10 @@ class TestV1PenaltyTokenAccounting:
 
     @staticmethod
     def _make_runner(vocab_size: int) -> MetalModelRunner:
-        runner = MetalModelRunner.__new__(MetalModelRunner)
-        runner.device = torch.device("cpu")
-        runner.model_args = {"vocab_size": vocab_size}
-        runner._sampler = Sampler()
-        return runner
+        return make_stub_runner(
+            model_args={"vocab_size": vocab_size},
+            _sampler=Sampler(),
+        )
 
     def test_presence_penalty_does_not_apply_to_prompt_tokens(self) -> None:
         """Presence/frequency penalties should apply only to generated tokens."""

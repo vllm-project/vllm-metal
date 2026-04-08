@@ -16,7 +16,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
-DEFAULT_VOCAB_SIZE = 32000
+
 GREEDY_TEMPERATURE_EPS = 1e-5
 
 
@@ -248,7 +248,7 @@ def sample_decode_tokens(
     sampler: Sampler,
     device: torch.device,
     *,
-    vocab_size: int = DEFAULT_VOCAB_SIZE,
+    vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
 ) -> list[int]:
     """Sample one token per decode request from evaluated logits.
@@ -303,7 +303,7 @@ def sample_prefill_tokens(
     sampler: Sampler,
     device: torch.device,
     *,
-    vocab_size: int = DEFAULT_VOCAB_SIZE,
+    vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
 ) -> list[int]:
     """Sample one token per prefill request from the last logit position.

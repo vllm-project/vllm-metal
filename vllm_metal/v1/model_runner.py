@@ -66,7 +66,6 @@ from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.sampling_batch import (
-    DEFAULT_VOCAB_SIZE,
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
     sample_decode_tokens,
@@ -947,6 +946,8 @@ class MetalModelRunner:
             for k, v in tc_dict.items():
                 self.model_args.setdefault(k, v)
 
+        self._vocab_size: int = self.model_args["vocab_size"]
+
         if self.metal_config.debug:
             logger.info(f"Model args: {self.model_args}")
 
@@ -1236,7 +1237,7 @@ class MetalModelRunner:
             sampling_params_list,
             prompt_token_id_lists,
             output_token_id_lists,
-            vocab_size=self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE),
+            vocab_size=self._vocab_size,
             device=self.device,
             logitsprocs=getattr(self, "_logitsprocs", None),
             generators=generators,
@@ -1301,7 +1302,7 @@ class MetalModelRunner:
         # Extract last token logits
         last_logits = logits[:, -1, :]
 
-        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        vocab_size = self._vocab_size
         generators = {} if generator is None else {0: generator}
         batch = SamplingBatch(
             [sampling_params],
@@ -1351,7 +1352,7 @@ class MetalModelRunner:
         # Extract next token logits
         next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
 
-        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        vocab_size = self._vocab_size
         sampling_params_list = [state.sampling_params for _, state in decode_reqs]
         prompt_token_ids_list = [
             state.token_ids[: state.prompt_len] for _, state in decode_reqs
@@ -1408,7 +1409,7 @@ class MetalModelRunner:
             logits = self._extract_logits(model_output)
             last_logits = logits[:, -1, :]
 
-            vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+            vocab_size = self._vocab_size
             generators = {} if state.generator is None else {0: state.generator}
             batch = SamplingBatch(
                 [state.sampling_params],
@@ -1543,7 +1544,7 @@ class MetalModelRunner:
         mx.eval(logits)
 
         # ---- sample tokens ----
-        vocab_size = self.model_args.get("vocab_size", DEFAULT_VOCAB_SIZE)
+        vocab_size = self._vocab_size
         logitsprocs = getattr(self, "_logitsprocs", None)
         decode_next_tokens = sample_decode_tokens(
             logits,
@@ -2018,6 +2019,12 @@ class MetalModelRunner:
             self._pending_output = None
             return output
 
+        # Async scheduling: execute_model may have failed; return None so
+        # vLLM can surface the original exception.
+        logger.error(
+            "sample_tokens called with no pending state — "
+            "neither _execute_model_state nor _pending_output was set."
+        )
         return None
 
     # ------------------------------------------------------------------
