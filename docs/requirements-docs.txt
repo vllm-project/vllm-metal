@@ -1,0 +1,5 @@
+sphinx>=7.0
+sphinx-book-theme>=1.1
+myst-parser>=3.0
+sphinx-copybutton>=0.5
+sphinx-design>=0.6
