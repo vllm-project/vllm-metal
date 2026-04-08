@@ -83,11 +83,28 @@ class GDNPagedAttentionWrapper(nn.Module):
         total_tokens = x.shape[1]
 
         # === Step 1: Projections (stateless, on full packed input) ===
-        mixed_qkv = inner.in_proj_qkv(x)  # [1, total_tokens, conv_dim]
-        z = inner.in_proj_z(x)  # [1, total_tokens, Hv * Dv]
-        z = z.reshape(1, total_tokens, -1, inner.head_v_dim)
-        b = inner.in_proj_b(x)  # [1, total_tokens, Hv]
-        a = inner.in_proj_a(x)  # [1, total_tokens, Hk]
+        if hasattr(inner, "in_proj_qkvz"):
+            # Qwen3-Next style: combined projections
+            q_pre, k_pre, v_pre, z, b, a = inner.fix_query_key_value_ordering(
+                inner.in_proj_qkvz(x), inner.in_proj_ba(x)
+            )
+            # z: [1, total_tokens, num_v_heads, head_v_dim]
+            # b, a: [1, total_tokens, num_v_heads]
+            mixed_qkv = mx.concatenate(
+                [
+                    q_pre.reshape(1, total_tokens, -1),
+                    k_pre.reshape(1, total_tokens, -1),
+                    v_pre.reshape(1, total_tokens, -1),
+                ],
+                axis=-1,
+            )
+        else:
+            # Qwen3.5 style: separate projections
+            mixed_qkv = inner.in_proj_qkv(x)  # [1, total_tokens, conv_dim]
+            z = inner.in_proj_z(x)  # [1, total_tokens, Hv * Dv]
+            z = z.reshape(1, total_tokens, -1, inner.head_v_dim)
+            b = inner.in_proj_b(x)  # [1, total_tokens, Hv]
+            a = inner.in_proj_a(x)  # [1, total_tokens, Hk]
 
         # === Step 2: Conv1d (per-request, needs conv_state) ===
         # Use stable slot mapping for state pool access.

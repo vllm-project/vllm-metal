@@ -144,6 +144,8 @@ def mlx_to_torch(
 
     # Move to target device, but check for MPS size limits first
     if device.type == "mps":
+        # Ensure all MLX Metal commands complete before MPS uses the GPU
+        sync_mlx()
         if _is_safe_for_mps(array):
             tensor = tensor.to(device)
         else:

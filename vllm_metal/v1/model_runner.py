@@ -1042,6 +1042,9 @@ class MetalModelRunner:
         if backend is not None and hasattr(backend, "_state_cache"):
             sc = backend._state_cache
             if sc is not None:
+                # Materialize existing arrays to detach from previous
+                # request's computation graph, then zero only the freed slot.
+                mx.eval(*sc.conv_states, *sc.recurrent_states)
                 for layer_idx in range(sc.num_layers):
                     conv = sc.conv_states[layer_idx]
                     conv[slot] = 0
@@ -1049,6 +1052,7 @@ class MetalModelRunner:
                     rec = sc.recurrent_states[layer_idx]
                     rec[slot] = 0
                     sc.recurrent_states[layer_idx] = rec
+                mx.eval(*sc.conv_states, *sc.recurrent_states)
         self._gdn_free_slots.append(slot)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
