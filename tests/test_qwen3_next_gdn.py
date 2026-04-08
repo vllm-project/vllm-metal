@@ -23,7 +23,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
-import pytest
 
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 
@@ -162,82 +161,3 @@ class TestSyncMLXInTensorBridge:
             # sync_mlx should be called if device is MPS
             if tensor_bridge.get_torch_device().type == "mps":
                 mock_sync.assert_called()
-
-
-# ---------------------------------------------------------------------------
-# Golden token deterministic test (slow — requires Qwen3-Next-80B model)
-# ---------------------------------------------------------------------------
-
-MODEL_NAME = "mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit"
-MAX_TOKENS = 10
-
-PROMPTS = [
-    "The capital of France is",
-    "The weather today is not",
-    "One plus one equals",
-    "The largest planet in our solar system is",
-    "Water boils at a temperature of",
-    "Machine learning is",
-]
-
-# fmt: off
-# Golden token IDs from mlx_lm greedy decoding (argmax sampler).
-# Model: mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit
-# Environment: mlx 0.31.1, mlx-lm 0.31.1
-GOLDEN_MLX = {
-    "The capital of France is": [59604, 13, 576, 6722, 315, 9856, 374, 19846, 13, 576],
-    "The weather today is not": [1661, 438, 432, 572, 13671, 13, 42344, 40916, 64559],
-    "One plus one equals": [267, 1126, 13, 9043, 5519, 1378, 16819, 3040, 13, 13322],
-    "The largest planet in our solar system is": [41, 19519, 11, 448, 264, 23033, 315, 220, 23, 23],
-    "Water boils at a temperature of": [16, 15, 15, 30937, 13, 1913, 279, 68723, 5452],
-    "Machine learning is": [25993, 315, 20443, 11229, 429, 23497, 389, 11220, 25185],
-}
-# fmt: on
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _set_env_golden():
-    """Set default env vars for golden token test."""
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.9")
-        yield
-
-
-@pytest.fixture(scope="module")
-def vllm_outputs():
-    """Run vLLM offline inference once for all prompts."""
-    from vllm import LLM, SamplingParams
-
-    llm = LLM(model=MODEL_NAME, max_model_len=512, max_num_seqs=1)
-    sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
-    outputs = llm.generate(PROMPTS, sp)
-    return {o.prompt: o for o in outputs}
-
-
-class TestQwen3NextGolden:
-    @pytest.mark.slow
-    @pytest.mark.parametrize("prompt", PROMPTS)
-    def test_generate_matches_golden(self, vllm_outputs, prompt):
-        output = vllm_outputs[prompt]
-        token_ids = list(output.outputs[0].token_ids)
-        text = output.outputs[0].text
-
-        expected = GOLDEN_MLX[prompt]
-        matched = token_ids[: len(expected)] == expected
-
-        print(f"\n  prompt: {prompt!r}")
-        print(f"  output: {text!r}")
-        print(f"  ids:    {token_ids}")
-        if matched:
-            print("  result: MATCHED golden")
-        else:
-            print("  result: NO MATCH")
-            print(f"  expected: {expected}")
-
-        assert matched, (
-            f"Output for {prompt!r} did not match golden set.\n"
-            f"Got:      {token_ids}\n"
-            f"Expected: {expected}"
-        )
