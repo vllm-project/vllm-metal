@@ -478,7 +478,7 @@ class RequestState:
 
 
 class PrefillRequest(NamedTuple):
-    """Packed prefill request passed to ``_unified_prefill_decode_paged``."""
+    """Packed prefill request passed to ``_start_paged_forward``."""
 
     req_id: str
     token_ids: list[int]  # suffix slice forwarded through the model
