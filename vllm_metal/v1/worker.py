@@ -389,8 +389,8 @@ class MetalWorker(WorkerBase):
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path (default): reports available Metal memory for KV cache,
-        not based on max_model_len (which gives misleadingly small values).
+        MLX path (default): reports one max-length sequence of KV cache
+        so the scheduler budgets for one concurrent sequence.
 
         Returns:
             Available memory in bytes
@@ -423,19 +423,17 @@ class MetalWorker(WorkerBase):
             )
             return available
 
-        # Default MLX path: report available Metal memory for KV cache.
-        # Use cache_config.gpu_memory_utilization (user-configurable, default 0.9)
-        # to determine how much of the total Metal memory should be used.
-        device_info = mx.device_info()
-        metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
-        available = int(metal_limit * self.cache_config.gpu_memory_utilization)
+        # Default MLX path: report one max-length sequence for admission control.
+        # This matches the design from PR #229, which ensures the scheduler
+        # can admit at least one sequence without over-committing memory.
+        # MLX's make_prompt_cache() dynamically allocates KV cache per request,
+        # so we only need to report enough for one sequence.
+        available = self._one_sequence_kv_bytes()
         logger.info(
-            "MLX path: reporting %.2f GB for scheduler (Metal limit: %.2f GB, "
-            "GPU memory utilization: %.2f, KV budget: %.2f GB)",
+            "MLX path: reporting %.2f GB for scheduler admission control "
+            "(one max-length sequence, max_model_len=%d)",
             available / 1e9,
-            metal_limit / 1e9,
-            self.cache_config.gpu_memory_utilization,
-            available / 1e9,
+            self.model_config.max_model_len,
         )
         return available
 
