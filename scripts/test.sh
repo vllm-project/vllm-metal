@@ -1,25 +1,30 @@
 #!/bin/bash
 
-smoke_test() {
-  section "Running smoke test"
+# Run a paged-attention smoke test: serve a model, check golden output.
+#
+# Usage: run_smoke_test <model> <revision> <prompt> <expected> [extra_serve_args...]
+run_smoke_test() {
+  local model="$1"
+  local revision="$2"
+  local prompt="$3"
+  local expected="$4"
+  shift 4
+  local extra_args=("$@")
 
-  local model="Qwen/Qwen3-0.6B"
-  local revision="c1899de289a04d12100db370d81485cdf75e47ca"
-  local prompt="The capital of France is"
-  local expected=" Paris. The capital of Italy is Rome. The"
+  section "Smoke test: $model"
 
-  # 1. Start vLLM with paged attention (GQA path)
+  # 1. Start vLLM with paged attention
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
-    VLLM_METAL_MEMORY_FRACTION=0.5 \
-    vllm serve "$model" --revision "$revision" --max-model-len 512 &
+    VLLM_METAL_MEMORY_FRACTION=0.8 \
+    vllm serve "$model" --revision "$revision" --max-model-len 512 ${extra_args[@]+"${extra_args[@]}"} &
 
   local vllm_pid=$!
 
   # 2. Wait for the server to be ready
   echo "Waiting for vLLM to start..."
   local health_url="http://localhost:8000/health"
-  if ! curl --retry 8 --retry-all-errors -s "$health_url" > /dev/null; then
+  if ! curl --retry 30 --retry-delay 10 --retry-all-errors -s "$health_url" > /dev/null; then
     echo "vLLM failed to start."
     kill $vllm_pid
     exit 1
@@ -29,9 +34,8 @@ smoke_test() {
 
   # 3. Test completions endpoint with golden comparison
   echo "Testing completions with golden output..."
-  local completions_url="http://localhost:8000/v1/completions"
   local response
-  response=$(curl -s -X POST "$completions_url" \
+  response=$(curl -s -X POST "http://localhost:8000/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"$model\",
@@ -48,7 +52,7 @@ smoke_test() {
   fi
 
   local actual
-  actual=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['text'])")
+  actual=$(echo "$response" | python3 -c "import sys,json; print(json.loads(sys.stdin.read(), strict=False)['choices'][0]['text'])")
 
   if [ "$actual" != "$expected" ]; then
     echo "Golden comparison FAILED"
@@ -61,6 +65,26 @@ smoke_test() {
   echo "Smoke test passed! Output matches golden."
 
   kill $vllm_pid
+}
+
+smoke_tests() {
+  # Qwen3-0.6B: standard GQA paged attention path
+  run_smoke_test \
+    "Qwen/Qwen3-0.6B" \
+    "c1899de289a04d12100db370d81485cdf75e47ca" \
+    "The capital of France is" \
+    " Paris. The capital of Italy is Rome. The"
+
+  # Qwen3.5-0.8B: hybrid SDPA + GDN linear attention paged path
+  # max-num-seqs=1: limits GDN linear state allocation (~10MB/slot × N slots)
+  # which is critical on CI runners with only ~5GB Metal memory.
+  run_smoke_test \
+    "Qwen/Qwen3.5-0.8B" \
+    "2fc06364715b967f1860aea9cf38778875588b17" \
+    "The capital of France is" \
+    " Paris.
+The capital of France is Paris." \
+    --max-num-seqs 1
 }
 
 installs() {
@@ -90,7 +114,7 @@ main() {
     section "Verifying package import"
     python -c "import vllm_metal; print('vllm_metal imported successfully')"
 
-    smoke_test
+    smoke_tests
     section "Running tests"
     # Exclude perf/long-running tests by default; run them explicitly via:
     #   pytest -m slow tests/ -v --tb=short
