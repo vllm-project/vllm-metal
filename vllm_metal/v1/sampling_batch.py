@@ -16,7 +16,6 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
-
 GREEDY_TEMPERATURE_EPS = 1e-5
 
 

@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
-import torch
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
