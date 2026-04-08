@@ -73,7 +73,7 @@ def main():
             print(f"  expected: {expected}")
             failed += 1
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Results: {passed} passed, {failed} failed out of {len(PROMPTS)}")
     if failed:
         raise SystemExit(1)
