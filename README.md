@@ -115,6 +115,17 @@ Environment variables for customization:
 `0.7` | `1` | Yes | Paged KV path with explicit memory budget
 `0.7` | `0` | No | Explicit fraction without paged KV is invalid
 
+## Pre-commit hooks
+
+Install hooks to catch lint errors before push:
+
+```bash
+source .venv-vllm-metal/bin/activate
+pre-commit install    # sets up pre-commit + commit-msg hooks
+```
+
+This runs ruff, shellcheck, and mypy on every commit, and auto-appends `Signed-off-by` to commit messages.
+
 ## Acknowledgements
 
 - The Metal paged attention kernels are currently adapted from [mistral.rs](https://github.com/EricLBuehler/mistral.rs) (MIT license), via [HuggingFace kernels-community](https://github.com/huggingface/kernels-community). We plan to develop custom kernels in the future.
