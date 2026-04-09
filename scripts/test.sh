@@ -4,26 +4,27 @@
 #
 # Usage: run_smoke_test <model> <revision> <prompt> <expected> [extra_serve_args...]
 run_smoke_test() {
-  local model="$1"
-  local revision="$2"
-  local prompt="$3"
-  local expected="$4"
-  shift 4
+  local port="$1"
+  local model="$2"
+  local revision="$3"
+  local prompt="$4"
+  local expected="$5"
+  shift 5
   local extra_args=("$@")
 
-  section "Smoke test: $model"
+  section "Smoke test: $model (port $port)"
 
-  # 1. Start vLLM with paged attention
+  # 1. Start vLLM with paged attention on a dedicated port
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
     VLLM_METAL_MEMORY_FRACTION=0.8 \
-    vllm serve "$model" --revision "$revision" --max-model-len 512 ${extra_args[@]+"${extra_args[@]}"} &
+    vllm serve "$model" --revision "$revision" --max-model-len 512 --port "$port" ${extra_args[@]+"${extra_args[@]}"} &
 
   local vllm_pid=$!
 
   # 2. Wait for the server to be ready
   echo "Waiting for vLLM to start..."
-  local health_url="http://localhost:8000/health"
+  local health_url="http://localhost:${port}/health"
   if ! curl --retry 30 --retry-delay 10 --retry-all-errors -s "$health_url" > /dev/null; then
     echo "vLLM failed to start."
     kill $vllm_pid
@@ -35,7 +36,7 @@ run_smoke_test() {
   # 3. Test completions endpoint with golden comparison
   echo "Testing completions with golden output..."
   local response
-  response=$(curl -s -X POST "http://localhost:8000/v1/completions" \
+  response=$(curl -s -X POST "http://localhost:${port}/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"$model\",
@@ -69,7 +70,7 @@ run_smoke_test() {
 
 smoke_tests() {
   # Qwen3-0.6B: standard GQA paged attention path
-  run_smoke_test \
+  run_smoke_test 8100 \
     "Qwen/Qwen3-0.6B" \
     "c1899de289a04d12100db370d81485cdf75e47ca" \
     "The capital of France is" \
@@ -78,7 +79,7 @@ smoke_tests() {
   # Qwen3.5-0.8B: hybrid SDPA + GDN linear attention paged path
   # max-num-seqs=1: limits GDN linear state allocation (~10MB/slot × N slots)
   # which is critical on CI runners with only ~5GB Metal memory.
-  run_smoke_test \
+  run_smoke_test 8101 \
     "Qwen/Qwen3.5-0.8B" \
     "2fc06364715b967f1860aea9cf38778875588b17" \
     "The capital of France is" \

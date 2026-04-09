@@ -1229,9 +1229,7 @@ class MetalModelRunner:
         try:
             mx.clear_cache()
             cache_before = mx.get_cache_memory()
-            dummy_tokens = mx.array(
-                [list(range(warmup_len))], dtype=mx.int32
-            )
+            dummy_tokens = mx.array([list(range(warmup_len))], dtype=mx.int32)
             output = self.model(dummy_tokens)
             logits = self._extract_logits(output)
             mx.eval(logits)
