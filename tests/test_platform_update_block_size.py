@@ -365,32 +365,39 @@ class TestUpdateBlockSizeForBackend:
         """
         import logging
 
-        with (
-            patch("vllm.model_executor.models.ModelRegistry") as mock_registry,
-            patch("vllm_metal.config.get_config") as mock_get_config,
-            caplog.at_level(logging.WARNING),
-        ):
-            mock_model_cls = MagicMock()
-            mock_model_cls.get_mamba_state_shape_from_config.return_value = (
-                mock_mamba_state["shape"]
-            )
-            mock_model_cls.get_mamba_state_dtype_from_config.return_value = (
-                mock_mamba_state["dtype"]
-            )
-            mock_registry.resolve_model_cls.return_value = (mock_model_cls, None)
+        platform_logger = logging.getLogger("vllm_metal.platform")
+        original_level = platform_logger.level
+        platform_logger.addHandler(caplog.handler)
+        platform_logger.setLevel(logging.WARNING)
+        try:
+            with (
+                patch("vllm.model_executor.models.ModelRegistry") as mock_registry,
+                patch("vllm_metal.config.get_config") as mock_get_config,
+            ):
+                mock_model_cls = MagicMock()
+                mock_model_cls.get_mamba_state_shape_from_config.return_value = (
+                    mock_mamba_state["shape"]
+                )
+                mock_model_cls.get_mamba_state_dtype_from_config.return_value = (
+                    mock_mamba_state["dtype"]
+                )
+                mock_registry.resolve_model_cls.return_value = (mock_model_cls, None)
 
-            # Mock metal config with paged attention enabled
-            mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
-            mock_get_config.return_value = mock_metal_config
+                # Mock metal config with paged attention enabled
+                mock_metal_config = MagicMock()
+                mock_metal_config.use_paged_attention = True
+                mock_get_config.return_value = mock_metal_config
 
-            # Execute - should NOT raise, just log warning
-            MetalPlatform.update_block_size_for_backend(vllm_config)
+                # Execute - should NOT raise, just log warning
+                MetalPlatform.update_block_size_for_backend(vllm_config)
 
-            # Verify warning was logged with explanation
-            assert "block-size translation" in caplog.text
-            assert "PR #235" in caplog.text
-            assert "kernel blocks" in caplog.text
+                # Verify warning was logged with explanation
+                assert "block-size translation" in caplog.text
+                assert "PR #235" in caplog.text
+                assert "kernel blocks" in caplog.text
+        finally:
+            platform_logger.removeHandler(caplog.handler)
+            platform_logger.setLevel(original_level)
 
 
 # ============================================================================
