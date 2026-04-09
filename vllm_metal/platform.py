@@ -271,8 +271,14 @@ class MetalPlatform(Platform):
             cache_config.enable_prefix_caching = False
             logger.info("Metal: disabled prefix caching")
 
-        # Configure cache
-        if cache_config.block_size is None:
+        # Configure cache — ensure block_size is at least the Metal kernel
+        # minimum.  With chunked prefill enabled, upstream may default to
+        # block_size=1 for fine-grained scheduling, but our Metal paged
+        # attention kernel requires multiples of 8.
+        if (
+            cache_config.block_size is None
+            or cache_config.block_size < config.block_size
+        ):
             cache_config.block_size = config.block_size
 
         # Disable cascade attention (not supported)
