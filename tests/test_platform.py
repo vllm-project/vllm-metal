@@ -458,22 +458,21 @@ class TestKvBudgetBytes:
 
     def test_normal_case(self) -> None:
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9,
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
             overhead=self._OVERHEAD,
         )
 
-        assert (
-            budget
-            == int(self._METAL_LIMIT * 0.9)
-            - self._MODEL_MEM
-            - self._OVERHEAD
-        )
+        assert budget == int(self._METAL_LIMIT * 0.9) - self._MODEL_MEM - self._OVERHEAD
         assert budget > 0
 
     def test_fraction_too_low_yields_negative_budget(self) -> None:
         # fraction=0.3 → usable=6.9 GB < model(16.85 GB) → negative
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.3,
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.3,
             overhead=self._OVERHEAD,
         )
 
@@ -484,7 +483,10 @@ class TestKvBudgetBytes:
         limit = self._MODEL_MEM + self._OVERHEAD
 
         budget = MetalWorker._kv_budget_bytes(
-            limit, self._MODEL_MEM, fraction=1.0, overhead=self._OVERHEAD,
+            limit,
+            self._MODEL_MEM,
+            fraction=1.0,
+            overhead=self._OVERHEAD,
         )
 
         assert budget == 0
@@ -494,7 +496,9 @@ class TestKvBudgetBytes:
             self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9, overhead=0
         )
         budget_with_overhead = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9,
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
             overhead=self._OVERHEAD,
         )
 
@@ -503,7 +507,9 @@ class TestKvBudgetBytes:
     def test_large_model_has_positive_budget_at_default_fraction(self) -> None:
         # GLM-4.7-Flash-4bit at fraction=0.9 must yield > 1 GB for KV cache.
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9,
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
             overhead=self._OVERHEAD,
         )
 

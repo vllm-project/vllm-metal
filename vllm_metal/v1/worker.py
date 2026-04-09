@@ -203,9 +203,7 @@ class MetalWorker(WorkerBase):
 
         # --- Compute KV budget ---
         usable_metal = int(metal_limit * fraction)
-        kv_budget = self._kv_budget_bytes(
-            metal_limit, model_memory, fraction, overhead
-        )
+        kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction, overhead)
 
         # For hybrid models, subtract the fixed linear state cost first.
         if runner.is_hybrid:
