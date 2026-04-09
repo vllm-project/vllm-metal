@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Configuration for vLLM Metal plugin via environment variables."""
 
-import os
 from dataclasses import dataclass
 from typing import Literal
+
+import vllm_metal.envs as envs
 
 # Sentinel value indicating auto memory calculation
 AUTO_MEMORY_FRACTION = -1.0
@@ -63,20 +64,13 @@ class MetalConfig:
     @classmethod
     def from_env(cls) -> "MetalConfig":
         """Load configuration from environment variables."""
-        memory_fraction_str = os.environ.get("VLLM_METAL_MEMORY_FRACTION", "auto")
-        if memory_fraction_str.lower() == "auto":
-            memory_fraction = AUTO_MEMORY_FRACTION
-        else:
-            memory_fraction = float(memory_fraction_str)
-
         return cls(
-            memory_fraction=memory_fraction,
-            use_mlx=os.environ.get("VLLM_METAL_USE_MLX", "1") == "1",
-            mlx_device=os.environ.get("VLLM_MLX_DEVICE", "gpu"),  # type: ignore[arg-type]
-            block_size=int(os.environ.get("VLLM_METAL_BLOCK_SIZE", "16")),
-            debug=os.environ.get("VLLM_METAL_DEBUG", "0") == "1",
-            use_paged_attention=os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-            == "1",
+            memory_fraction=envs.VLLM_METAL_MEMORY_FRACTION,
+            use_mlx=envs.VLLM_METAL_USE_MLX,
+            mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
+            block_size=envs.VLLM_METAL_BLOCK_SIZE,
+            debug=envs.VLLM_METAL_DEBUG,
+            use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
         )
 
 

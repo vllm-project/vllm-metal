@@ -34,7 +34,9 @@ def get_model_download_path(model_repo_name: str) -> str:
         try:
             from modelscope.hub.snapshot_download import snapshot_download
 
-            model_cache_dir = os.environ.get("VLLM_METAL_MODELSCOPE_CACHE")
+            import vllm_metal.envs as envs
+
+            model_cache_dir = envs.VLLM_METAL_MODELSCOPE_CACHE
 
             logger.info(f"Downloading model {model_repo_name} from ModelScope...")
             model_path = snapshot_download(model_repo_name, cache_dir=model_cache_dir)
