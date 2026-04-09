@@ -1,0 +1,46 @@
+site_name: vllm-metal
+site_url: !ENV READTHEDOCS_CANONICAL_URL
+repo_url: https://github.com/vllm-project/vllm-metal
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: assets/logos/vllm-logo-only-light.ico
+  favicon: assets/logos/vllm-logo-only-light.ico
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: installation.md
+    - Configuration: configuration.md
+  - Features:
+    - Speech-to-Text: stt.md

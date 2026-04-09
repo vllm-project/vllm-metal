@@ -4,7 +4,7 @@ vllm-metal supports OpenAI-compatible Speech-to-Text using Whisper and Qwen3-ASR
 
 ## Installation
 
-First, install vllm-metal using the install script (see [README](../README.md)):
+First, install vllm-metal using the install script (see [Installation](installation.md)):
 
 ```bash
 ./install.sh

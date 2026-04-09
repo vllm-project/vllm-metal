@@ -12,17 +12,4 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 - **Paged attention** *(experimental)*: Efficient KV cache management for long sequences
 - **GQA support**: Grouped-Query Attention for efficient inference
 
-```{toctree}
-:maxdepth: 2
-:caption: Getting Started
-
-installation
-configuration
-```
-
-```{toctree}
-:maxdepth: 2
-:caption: Features
-
-stt
-```
+Check the sidebar for guides on installation, configuration, and supported features.
