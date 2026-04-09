@@ -18,7 +18,7 @@ run_smoke_test() {
   GLOO_SOCKET_IFNAME=lo0 \
     VLLM_METAL_USE_PAGED_ATTENTION=1 \
     VLLM_METAL_MEMORY_FRACTION=0.8 \
-    vllm serve "$model" --revision "$revision" --max-model-len 512 --port "$port" ${extra_args[@]+"${extra_args[@]}"} &
+    vllm serve "$model" --revision "$revision" --max-model-len 512 --max-num-batched-tokens 64 --port "$port" ${extra_args[@]+"${extra_args[@]}"} &
 
   local vllm_pid=$!
 
