@@ -64,8 +64,14 @@ class MetalConfig:
     @classmethod
     def from_env(cls) -> "MetalConfig":
         """Load configuration from environment variables."""
+        memory_fraction_str = envs.VLLM_METAL_MEMORY_FRACTION
+        if memory_fraction_str.lower() == "auto":
+            memory_fraction = AUTO_MEMORY_FRACTION
+        else:
+            memory_fraction = float(memory_fraction_str)
+
         return cls(
-            memory_fraction=envs.VLLM_METAL_MEMORY_FRACTION,
+            memory_fraction=memory_fraction,
             use_mlx=envs.VLLM_METAL_USE_MLX,
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
             block_size=envs.VLLM_METAL_BLOCK_SIZE,

@@ -18,20 +18,13 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-# Sentinel value indicating auto memory calculation (matches config.py).
-_AUTO_MEMORY_FRACTION: float = -1.0
-
-
-def _parse_memory_fraction() -> float:
-    """Parse VLLM_METAL_MEMORY_FRACTION, returning -1.0 for 'auto'."""
-    raw = os.getenv("VLLM_METAL_MEMORY_FRACTION", "auto")
-    return _AUTO_MEMORY_FRACTION if raw.lower() == "auto" else float(raw)
-
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
     # plugin calculates the minimal amount needed at startup.
-    "VLLM_METAL_MEMORY_FRACTION": _parse_memory_fraction,
+    # Returns the raw string; config.py handles "auto" → sentinel conversion.
+    "VLLM_METAL_MEMORY_FRACTION": lambda: os.getenv(
+        "VLLM_METAL_MEMORY_FRACTION", "auto"
+    ),
     # Whether to use MLX as the compute backend (default True).
     "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
     # MLX device type: "gpu" (default) or "cpu".
@@ -65,11 +58,16 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
+    # Mirrors vllm/envs.py; enables tab-completion and introspection.
     return list(environment_variables.keys())
 
 
 def is_set(name: str) -> bool:
-    """Check if an environment variable is explicitly set in os.environ."""
+    """Check if an environment variable is explicitly set in os.environ.
+
+    Mirrors ``vllm.envs.is_set``; not yet used but kept for parity
+    with upstream so plugin code can adopt it without a new PR.
+    """
     if name in environment_variables:
         return name in os.environ
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
