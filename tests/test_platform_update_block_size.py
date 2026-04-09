@@ -368,7 +368,7 @@ class TestUpdateBlockSizeForBackend:
         with (
             patch("vllm.model_executor.models.ModelRegistry") as mock_registry,
             patch("vllm_metal.config.get_config") as mock_get_config,
-            caplog.at_level(logging.WARNING),
+            caplog.at_level(logging.WARNING, logger="vllm_metal.platform"),
         ):
             mock_model_cls = MagicMock()
             mock_model_cls.get_mamba_state_shape_from_config.return_value = (
