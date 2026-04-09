@@ -12,6 +12,7 @@ import sysconfig
 from pathlib import Path
 
 from vllm.logger import init_logger
+
 from vllm_metal.metal.constants import PARTITION_SIZE
 
 logger = init_logger(__name__)

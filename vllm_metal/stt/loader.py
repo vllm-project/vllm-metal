@@ -8,8 +8,8 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from vllm.logger import init_logger
+
 from vllm_metal.stt.registry import get_stt_model_constructor
 
 logger = init_logger(__name__)

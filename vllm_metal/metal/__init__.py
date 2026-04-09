@@ -18,6 +18,7 @@ from pathlib import Path
 from types import ModuleType
 
 from vllm.logger import init_logger
+
 from vllm_metal.metal.constants import PARTITION_SIZE, PARTITION_THRESHOLD
 
 logger = init_logger(__name__)

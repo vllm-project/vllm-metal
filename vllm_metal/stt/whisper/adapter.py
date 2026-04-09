@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import mlx.core as mx
-
 from vllm.logger import init_logger
+
 from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
 
 from .model import WhisperModel

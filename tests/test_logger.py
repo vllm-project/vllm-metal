@@ -6,7 +6,6 @@ and have the correct effective log level (INFO).
 """
 
 import logging
-from unittest.mock import patch
 
 import pytest
 
@@ -19,12 +18,14 @@ class TestLoggerInitialization:
         """Setup vllm logging configuration before each test."""
         # Import vllm logger to configure logging
         from vllm.logger import init_logger as vllm_init_logger
+
         # This triggers vllm's logging configuration
         vllm_init_logger("vllm.test_setup")
 
     def test_vllm_metal_root_logger_level(self):
         """Test vllm_metal root logger has correct effective level."""
         from vllm_metal import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"vllm_metal logger effective level is {effective_level} "
@@ -34,6 +35,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_platform_logger_level(self):
         """Test platform module logger has correct effective level."""
         from vllm_metal.platform import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"platform logger effective level is {effective_level}, expected INFO or lower"
@@ -42,6 +44,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_utils_logger_level(self):
         """Test utils module logger has correct effective level."""
         from vllm_metal.utils import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"utils logger effective level is {effective_level}, expected INFO or lower"
@@ -50,6 +53,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_compat_logger_level(self):
         """Test compat module logger has correct effective level."""
         from vllm_metal.compat import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"compat logger effective level is {effective_level}, expected INFO or lower"
@@ -58,6 +62,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_metal_logger_level(self):
         """Test metal module logger has correct effective level."""
         from vllm_metal.metal import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"metal logger effective level is {effective_level}, expected INFO or lower"
@@ -66,6 +71,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_metal_build_logger_level(self):
         """Test metal.build module logger has correct effective level."""
         from vllm_metal.metal.build import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"metal.build logger effective level is {effective_level}, expected INFO or lower"
@@ -74,6 +80,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_tensor_bridge_logger_level(self):
         """Test pytorch_backend.tensor_bridge module logger has correct effective level."""
         from vllm_metal.pytorch_backend.tensor_bridge import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"tensor_bridge logger effective level is {effective_level}, expected INFO or lower"
@@ -82,6 +89,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_stt_detection_logger_level(self):
         """Test stt.detection module logger has correct effective level."""
         from vllm_metal.stt.detection import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"stt.detection logger effective level is {effective_level}, expected INFO or lower"
@@ -90,6 +98,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_stt_loader_logger_level(self):
         """Test stt.loader module logger has correct effective level."""
         from vllm_metal.stt.loader import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"stt.loader logger effective level is {effective_level}, expected INFO or lower"
@@ -98,6 +107,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_stt_whisper_adapter_logger_level(self):
         """Test stt.whisper.adapter module logger has correct effective level."""
         from vllm_metal.stt.whisper.adapter import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"stt.whisper.adapter logger effective level is {effective_level}, expected INFO or lower"
@@ -106,6 +116,7 @@ class TestLoggerInitialization:
     def test_vllm_metal_stt_whisper_transcriber_logger_level(self):
         """Test stt.whisper.transcriber module logger has correct effective level."""
         from vllm_metal.stt.whisper.transcriber import logger
+
         effective_level = logger.getEffectiveLevel()
         assert effective_level <= logging.INFO, (
             f"stt.whisper.transcriber logger effective level is {effective_level}, expected INFO or lower"
@@ -119,6 +130,7 @@ class TestLoggerOutput:
     def setup_vllm_logging(self):
         """Setup vllm logging configuration before each test."""
         from vllm.logger import init_logger as vllm_init_logger
+
         vllm_init_logger("vllm.test_setup")
 
     def test_logger_info_output(self, caplog):
@@ -153,15 +165,15 @@ class TestLoggerConsistency:
 
     def test_all_loggers_use_init_logger(self):
         """Verify all logger definitions use init_logger pattern.
-        
+
         This is a static check that ensures no module uses logging.getLogger().
         """
         import ast
-        import os
         from pathlib import Path
 
         # Get the vllm_metal package directory
         import vllm_metal
+
         package_dir = Path(vllm_metal.__file__).parent
 
         violations = []
