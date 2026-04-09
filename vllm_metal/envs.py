@@ -34,10 +34,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose debug logging (default False).
     "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
-    "VLLM_METAL_USE_PAGED_ATTENTION": lambda: os.getenv(
-        "VLLM_METAL_USE_PAGED_ATTENTION", "1"
-    )
-    == "1",
+    "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
+        os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
+    ),
     # Enable content-hash prefix caching (presence-based: set to any
     # value to enable, unset to disable).
     "VLLM_METAL_PREFIX_CACHE": lambda: "VLLM_METAL_PREFIX_CACHE" in os.environ,
