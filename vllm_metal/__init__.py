@@ -5,13 +5,14 @@ This plugin enables vLLM to run on Apple Silicon Macs using MLX as the
 primary compute backend, with PyTorch for model loading and interoperability.
 """
 
-import logging
 import os
 import sys
 
+from vllm.logger import init_logger
+
 __version__ = "0.1.0"
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 def _apply_macos_defaults() -> None:

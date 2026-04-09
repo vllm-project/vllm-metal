@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import cast
 
@@ -12,6 +11,7 @@ import numpy as np
 from transformers import WhisperTokenizer
 from transformers.models.whisper.tokenization_whisper import LANGUAGES, TO_LANGUAGE_CODE
 from vllm.config import SpeechToTextConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 
 from vllm_metal.stt.audio import (
@@ -29,7 +29,7 @@ from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
 from .config import WHISPER_MAX_DECODE_TOKENS
 from .model import WhisperModel
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 SEEK_MULTIPLIER = 100
 DEFAULT_SEGMENT_DURATION = 30.0

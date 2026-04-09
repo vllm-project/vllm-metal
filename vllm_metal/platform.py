@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal Platform implementation for vLLM."""
 
-import logging
 import platform as py_platform
 from typing import TYPE_CHECKING
 
 import psutil
 import torch
+from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class MetalPlatform(Platform):

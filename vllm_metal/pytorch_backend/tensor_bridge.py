@@ -4,13 +4,14 @@
 Provides zero-copy conversion when possible using Apple Silicon's unified memory.
 """
 
-import logging
 from typing import Literal
 
 import mlx.core as mx
 import torch
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # MPS has a 4GB (2^32 bytes) limit for MPSTemporaryNDArray allocations.
 # Metal may allocate multiple temporary buffers internally, so we use a

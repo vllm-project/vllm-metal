@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import logging
 import re
 from pathlib import Path
 from types import ModuleType
 
+from vllm.logger import init_logger
 from vllm_metal.metal.constants import PARTITION_SIZE, PARTITION_THRESHOLD
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_DIR = _THIS_DIR / "kernels_v1"

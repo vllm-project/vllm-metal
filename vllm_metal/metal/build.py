@@ -7,14 +7,14 @@ Metal shaders through MLX's own command encoder.
 
 from __future__ import annotations
 
-import logging
 import subprocess
 import sysconfig
 from pathlib import Path
 
+from vllm.logger import init_logger
 from vllm_metal.metal.constants import PARTITION_SIZE
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"

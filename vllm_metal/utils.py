@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal utility functions for vLLM Metal plugin."""
 
-import logging
 import os
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def get_model_download_path(model_repo_name: str) -> str:

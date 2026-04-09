@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
+
+from vllm.logger import init_logger
 
 try:
     from huggingface_hub import hf_hub_download
 except ImportError:  # pragma: no cover
     hf_hub_download = None
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # STT model types that can be auto-detected from config.json.
 _STT_MODEL_TYPES = frozenset({"whisper", "qwen3_asr"})

@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm.logger import init_logger
 from vllm_metal.stt.registry import get_stt_model_constructor
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # Supported floating-point dtypes for STT model loading.
 _SUPPORTED_LOAD_DTYPES = frozenset({mx.float16, mx.float32, mx.bfloat16})
