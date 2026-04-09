@@ -28,6 +28,17 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should delegate STT capability decisions to model runner."""
 
+    def test_load_model_does_not_setup_paged_attention(self) -> None:
+        """Paged attention setup moved to compile_or_warm_up_model (issue #234)."""
+        model_runner = MagicMock()
+        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker._setup_paged_attention = MagicMock()
+
+        MetalWorker.load_model(worker)
+
+        model_runner.load_model.assert_called_once_with()
+        worker._setup_paged_attention.assert_not_called()
+
     @pytest.mark.parametrize(
         (
             "use_paged_attention",
@@ -41,24 +52,31 @@ class TestWorkerRunnerBoundaryDelegation:
             (False, True, False, 0),
         ],
     )
-    def test_load_model_delegates_paged_attention_setup_decision(
+    def test_warm_up_delegates_paged_attention_setup(
         self,
         use_paged_attention: bool,
         runner_allows_setup: bool,
         expect_setup: bool,
         expect_cap_call: int,
     ) -> None:
+        """Paged attention setup uses warm-up measured overhead (issue #234)."""
         model_runner = MagicMock()
         model_runner.is_hybrid = False
+        model_runner.warm_up.return_value = 200 * 1024 * 1024  # 200 MB
         model_runner.should_setup_paged_attention.return_value = runner_allows_setup
         worker = _make_worker(model_runner, use_paged_attention=use_paged_attention)
         worker._setup_paged_attention = MagicMock()
+        worker.model_config = SimpleNamespace(seed=42)
 
-        MetalWorker.load_model(worker)
+        MetalWorker.compile_or_warm_up_model(worker)
 
-        model_runner.load_model.assert_called_once_with()
+        model_runner.warm_up.assert_called_once_with()
         assert model_runner.should_setup_paged_attention.call_count == expect_cap_call
         assert worker._setup_paged_attention.called is expect_setup
+        if expect_setup:
+            worker._setup_paged_attention.assert_called_once_with(
+                overhead=200 * 1024 * 1024
+            )
 
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
         model_runner = SimpleNamespace(

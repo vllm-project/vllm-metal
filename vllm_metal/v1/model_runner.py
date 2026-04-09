@@ -85,8 +85,8 @@ _MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
 _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 
-# Performance tuning
-_CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+# Periodic prefix-cache stats logging interval (in finished requests).
+_STATS_LOG_INTERVAL = 50
 
 # Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
 # in the environment (any value; unset to disable).
@@ -1197,39 +1197,51 @@ class MetalModelRunner:
         )
         return self.num_linear_layers * (conv_bytes + recurrent_bytes)
 
-    def warm_up(self) -> None:
+    def warm_up(self) -> int:
         """Warm up the model with a dummy forward pass.
 
-        When paged attention is enabled, also loads the HF Metal kernel and
-        runs a tiny ``reshape_and_cache`` to force Metal library creation.
-        This catches Metal language-version incompatibilities at startup
-        rather than during the first real inference request.
+        Measures MLX buffer cache usage during the forward pass so the caller
+        can use it as the activation-overhead term when sizing the KV cache.
+        Also calls ``mx.set_cache_limit`` to cap the buffer cache, preventing
+        unbounded memory growth during serving (see GitHub issue #234).
+
+        Returns:
+            Measured intermediate buffer overhead in bytes.
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
-            return
+            return 0
 
         if self._is_stt:
             assert self._stt_runtime_adapter is not None
             logger.info("Warming up STT model...")
             self._stt_runtime_adapter.warm_up()
             logger.info("STT model warm-up complete")
-            return
+            return 0
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference (standard MLX path)
+        # Run a small dummy inference and measure intermediate buffer usage.
+        measured_overhead = 0
         try:
+            mx.clear_cache()
+            cache_before = mx.get_cache_memory()
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
             output = self.model(dummy_tokens)
             logits = self._extract_logits(output)
             mx.eval(logits)
-            logger.info("Model warm-up complete")
+            cache_after = mx.get_cache_memory()
+            measured_overhead = max(0, cache_after - cache_before)
+            mx.set_cache_limit(measured_overhead)
+            logger.info(
+                "Model warm-up complete: "
+                "measured buffer overhead=%.2fMB, cache_limit set",
+                measured_overhead / (1024 * 1024),
+            )
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-        if self._paged_attention_backend is not None:
-            self._paged_attention_backend.warm_up()
+        return measured_overhead
 
     def _make_sampling_metadata(
         self,
@@ -1917,7 +1929,7 @@ class MetalModelRunner:
         self,
         finished_req_ids: set[str],
     ) -> None:
-        """Evict finished request state and periodically clear MLX cache."""
+        """Evict finished request state and periodically log prefix cache stats."""
         if not finished_req_ids:
             return
 
@@ -1933,10 +1945,8 @@ class MetalModelRunner:
             self._gdn_free_slot(req_id)
 
         self._finished_request_count += len(finished_req_ids)
-        if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
+        if self._finished_request_count < _STATS_LOG_INTERVAL:
             return
-
-        mx.clear_cache()
         self._finished_request_count = 0
 
         if self._prefix_cache is None:

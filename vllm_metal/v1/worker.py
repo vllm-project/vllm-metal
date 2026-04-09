@@ -24,7 +24,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
-    PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
@@ -140,27 +139,17 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # Boundary ownership:
-        # - Worker owns resource setup.
-        # - Runner owns STT/runtime capability decisions.
-        # Note: For hybrid models (Qwen3.5), we don't auto-enable paged attention
-        # because MLX's make_prompt_cache() handles hybrid KV cache natively.
-        # Paged attention for hybrid models requires splitting KV cache across
-        # multiple buffers to avoid Metal's max buffer size limit (~9.5GB).
-        if (
-            self.metal_config.use_paged_attention
-            and self.model_runner.should_setup_paged_attention()
-        ):
-            self._setup_paged_attention()
-
     @staticmethod
     def _kv_budget_bytes(
         metal_limit: int,
         model_memory: int,
         fraction: float,
-        overhead: int = PAGED_ATTENTION_OVERHEAD_BYTES,
+        overhead: int,
     ) -> int:
         """KV cache budget = fraction of Metal limit minus model and overhead.
+
+        ``overhead`` is the measured intermediate-buffer footprint from the
+        warm-up forward pass — see :pymethod:`MetalModelRunner.warm_up`.
 
         All three quantities live in the same domain: Metal-managed memory.
         psutil.available is intentionally excluded — it reflects OS page-cache
@@ -168,12 +157,15 @@ class MetalWorker(WorkerBase):
         """
         return int(metal_limit * fraction) - model_memory - overhead
 
-    def _setup_paged_attention(self) -> None:
+    def _setup_paged_attention(self, overhead: int) -> None:
         """Allocate paged KV cache and patch model attention layers.
 
         Computes num_blocks from Metal memory headroom, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
         max_model_len.
+
+        Args:
+            overhead: Measured intermediate-buffer footprint from warm-up (bytes).
         """
         runner = self.model_runner
         # Use cache_config.block_size (not metal_config) because vLLM's
@@ -211,7 +203,9 @@ class MetalWorker(WorkerBase):
 
         # --- Compute KV budget ---
         usable_metal = int(metal_limit * fraction)
-        kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
+        kv_budget = self._kv_budget_bytes(
+            metal_limit, model_memory, fraction, overhead
+        )
 
         # For hybrid models, subtract the fixed linear state cost first.
         if runner.is_hybrid:
@@ -226,7 +220,7 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
-                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"overhead={overhead / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
                 "use a smaller or more quantized model."
@@ -242,7 +236,7 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
-                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"overhead={overhead / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB, "
                 f"per_block_bytes={per_block_bytes}. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
@@ -254,14 +248,14 @@ class MetalWorker(WorkerBase):
         logger.info(
             "Paged attention memory breakdown: "
             "metal_limit=%.2fGB, fraction=%.2f, usable_metal=%.2fGB, "
-            "model_memory=%.2fGB, overhead=%.2fGB, "
+            "model_memory=%.2fGB, overhead=%.2fGB (measured), "
             "kv_budget=%.2fGB, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
             metal_limit / 1e9,
             fraction,
             usable_metal / 1e9,
             model_memory / 1e9,
-            PAGED_ATTENTION_OVERHEAD_BYTES / 1e9,
+            overhead / 1e9,
             kv_budget / 1e9,
             per_block_bytes,
             num_blocks,
@@ -286,6 +280,9 @@ class MetalWorker(WorkerBase):
 
         runner._paged_attention_backend = backend
         runner._paged_block_size = block_size
+
+        # Warm up the paged attention backend (Metal shader compilation).
+        backend.warm_up()
 
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
@@ -464,10 +461,24 @@ class MetalWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
-        """Warm up the model for inference."""
+        """Warm up the model and set up paged attention if enabled.
+
+        Runs a dummy forward pass to measure the intermediate-buffer overhead,
+        then uses that measurement to size the KV cache within the configured
+        ``VLLM_METAL_MEMORY_FRACTION``.  ``mx.set_cache_limit`` is set during
+        warm-up so the MLX buffer cache stays bounded (GitHub issue #234).
+        """
         # Reset seed for reproducibility
         set_random_seed(self.model_config.seed)
-        self.model_runner.warm_up()
+        measured_overhead = self.model_runner.warm_up()
+
+        # Paged attention setup runs *after* warm-up so the measured overhead
+        # replaces the former 800 MB placeholder in the KV budget calculation.
+        if (
+            self.metal_config.use_paged_attention
+            and self.model_runner.should_setup_paged_attention()
+        ):
+            self._setup_paged_attention(overhead=measured_overhead)
 
     def execute_model(
         self, scheduler_output: SchedulerOutput

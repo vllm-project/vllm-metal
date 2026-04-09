@@ -8,10 +8,6 @@ from typing import Literal
 # Sentinel value indicating auto memory calculation
 AUTO_MEMORY_FRACTION = -1.0
 
-# Paged attention: placeholder overhead for activations, framework, OS, etc.
-# Will be replaced by a profiling pass in a future PR.
-PAGED_ATTENTION_OVERHEAD_BYTES = 800 * 1024 * 1024  # 800 MB
-
 # Default memory fraction when user leaves VLLM_METAL_MEMORY_FRACTION as "auto"
 # but enables paged attention (auto is for the MLX path).
 PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
