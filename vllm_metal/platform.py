@@ -225,32 +225,42 @@ class MetalPlatform(Platform):
 
         scheduler_config = vllm_config.scheduler_config
         if getattr(scheduler_config, "enable_chunked_prefill", False):
-            # MetalModelRunner does not yet honor chunked-prefill scheduler
-            # boundaries on the non-paged MLX path. Disable the feature so the
-            # scheduler only requests full prefills, which matches the current
-            # model-runner contract.
-            scheduler_config.enable_chunked_prefill = False
+            if config.use_paged_attention:
+                # The paged path uses a unified varlen Metal kernel that
+                # handles mixed prefill + decode in a single forward pass,
+                # so chunked prefill works correctly.
+                logger.info(
+                    "Metal: chunked prefill enabled (paged attention), "
+                    "max_num_batched_tokens=%d",
+                    scheduler_config.max_num_batched_tokens,
+                )
+            else:
+                # The non-paged MLX path does not honor chunked-prefill
+                # scheduler boundaries.  Disable so the scheduler only
+                # requests full prefills.
+                scheduler_config.enable_chunked_prefill = False
 
-            # Without chunked prefill, the scheduler must fit the entire
-            # prompt in a single step.  Ensure max_num_batched_tokens (and
-            # max_num_scheduled_tokens) are at least max_model_len;
-            # otherwise the scheduler silently refuses to schedule any
-            # prompt that exceeds the budget (see Scheduler.schedule —
-            # the "chunked_prefill is disabled" break).
-            if model_config is not None:
-                model_max = model_config.max_model_len
-                if scheduler_config.max_num_batched_tokens < model_max:
-                    scheduler_config.max_num_batched_tokens = model_max
-                if (
-                    scheduler_config.max_num_scheduled_tokens is not None
-                    and scheduler_config.max_num_scheduled_tokens < model_max
-                ):
-                    scheduler_config.max_num_scheduled_tokens = model_max
+                # Without chunked prefill, the scheduler must fit the
+                # entire prompt in a single step.  Ensure
+                # max_num_batched_tokens (and max_num_scheduled_tokens)
+                # are at least max_model_len; otherwise the scheduler
+                # silently refuses to schedule any prompt that exceeds
+                # the budget.
+                if model_config is not None:
+                    model_max = model_config.max_model_len
+                    if scheduler_config.max_num_batched_tokens < model_max:
+                        scheduler_config.max_num_batched_tokens = model_max
+                    if (
+                        scheduler_config.max_num_scheduled_tokens is not None
+                        and scheduler_config.max_num_scheduled_tokens < model_max
+                    ):
+                        scheduler_config.max_num_scheduled_tokens = model_max
 
-            logger.info(
-                "Metal: disabled chunked prefill, max_num_batched_tokens=%d",
-                scheduler_config.max_num_batched_tokens,
-            )
+                logger.info(
+                    "Metal: disabled chunked prefill (non-paged path), "
+                    "max_num_batched_tokens=%d",
+                    scheduler_config.max_num_batched_tokens,
+                )
 
         if config.use_paged_attention and getattr(
             cache_config, "enable_prefix_caching", False
@@ -261,8 +271,14 @@ class MetalPlatform(Platform):
             cache_config.enable_prefix_caching = False
             logger.info("Metal: disabled prefix caching")
 
-        # Configure cache
-        if cache_config.block_size is None:
+        # Configure cache — ensure block_size is at least the Metal kernel
+        # minimum.  With chunked prefill enabled, upstream may default to
+        # block_size=1 for fine-grained scheduling, but our Metal paged
+        # attention kernel requires multiples of 8.
+        if (
+            cache_config.block_size is None
+            or cache_config.block_size < config.block_size
+        ):
             cache_config.block_size = config.block_size
 
         # Disable cascade attention (not supported)

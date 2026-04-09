@@ -10,7 +10,7 @@ import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 
-from vllm_metal.config import PAGED_ATTENTION_OVERHEAD_BYTES
+from vllm_metal.config import PAGED_ATTENTION_OVERHEAD_BYTES, reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.worker import MetalWorker
 
@@ -167,46 +167,95 @@ class TestMetalPlatform:
         MetalPlatform.verify_quantization("awq")
         MetalPlatform.verify_quantization("compressed-tensors")
 
-    def test_check_and_update_config_disables_chunked_prefill(
+    def test_check_and_update_config_disables_chunked_prefill_non_paged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Metal should disable chunked prefill until the runner supports it.
+        """Non-paged path should disable chunked prefill.
 
         When chunked prefill is disabled, max_num_batched_tokens must be at
         least max_model_len so the scheduler can schedule the entire prompt
         in a single step.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(block_size=None),
-            model_config=SimpleNamespace(
-                model="test-model",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=32768,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=True,
-                max_num_batched_tokens=2048,
-                max_num_scheduled_tokens=None,
-            ),
-        )
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
 
-        MetalPlatform.check_and_update_config(vllm_config)
+            MetalPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.enable_chunked_prefill is False
-        assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
-        assert (
-            vllm_config.parallel_config.worker_cls == "vllm_metal.v1.worker.MetalWorker"
-        )
-        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
-        assert vllm_config.parallel_config.disable_custom_all_reduce is True
+            assert vllm_config.scheduler_config.enable_chunked_prefill is False
+            assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
+            assert (
+                vllm_config.parallel_config.worker_cls
+                == "vllm_metal.v1.worker.MetalWorker"
+            )
+            assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+            assert vllm_config.parallel_config.disable_custom_all_reduce is True
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_keeps_chunked_prefill_for_paged_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Paged path should keep chunked prefill enabled.
+
+        The unified varlen Metal kernel handles mixed prefill + decode,
+        so chunked prefill works correctly on the paged path.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.scheduler_config.enable_chunked_prefill is True
+            # max_num_batched_tokens should NOT be bumped (chunked prefill handles it)
+            assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        finally:
+            reset_config()
 
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch
@@ -218,32 +267,37 @@ class TestMetalPlatform:
         the scheduler can schedule the full prompt in a single step.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(block_size=None),
-            model_config=SimpleNamespace(
-                model="test-model",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=32768,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=True,
-                max_num_batched_tokens=2048,
-                max_num_scheduled_tokens=2048,
-            ),
-        )
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=2048,
+                ),
+            )
 
-        MetalPlatform.check_and_update_config(vllm_config)
+            MetalPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.enable_chunked_prefill is False
-        assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
-        assert vllm_config.scheduler_config.max_num_scheduled_tokens == 32768
+            assert vllm_config.scheduler_config.enable_chunked_prefill is False
+            assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
+            assert vllm_config.scheduler_config.max_num_scheduled_tokens == 32768
+        finally:
+            reset_config()
 
     def test_check_and_update_config_does_not_reduce_large_max_num_batched_tokens(
         self, monkeypatch: pytest.MonkeyPatch
@@ -254,32 +308,37 @@ class TestMetalPlatform:
         that setting must be preserved.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(block_size=None),
-            model_config=SimpleNamespace(
-                model="test-model",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=32768,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=True,
-                max_num_batched_tokens=65536,
-                max_num_scheduled_tokens=None,
-            ),
-        )
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=65536,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
 
-        MetalPlatform.check_and_update_config(vllm_config)
+            MetalPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.enable_chunked_prefill is False
-        # 65536 > 32768, so the value must stay at 65536
-        assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
+            assert vllm_config.scheduler_config.enable_chunked_prefill is False
+            # 65536 > 32768, so the value must stay at 65536
+            assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
+        finally:
+            reset_config()
 
     @pytest.mark.parametrize("max_num_scheduled_tokens", [32768, 65536])
     def test_check_and_update_config_does_not_reduce_max_num_scheduled_tokens_when_at_least_max_model_len(
@@ -294,35 +353,40 @@ class TestMetalPlatform:
         below max_model_len are bumped up).
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(block_size=None),
-            model_config=SimpleNamespace(
-                model="test-model",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=32768,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=True,
-                max_num_batched_tokens=65536,
-                max_num_scheduled_tokens=max_num_scheduled_tokens,
-            ),
-        )
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=65536,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                ),
+            )
 
-        MetalPlatform.check_and_update_config(vllm_config)
+            MetalPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.enable_chunked_prefill is False
-        assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
-        assert (
-            vllm_config.scheduler_config.max_num_scheduled_tokens
-            == max_num_scheduled_tokens
-        )
+            assert vllm_config.scheduler_config.enable_chunked_prefill is False
+            assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
+            assert (
+                vllm_config.scheduler_config.max_num_scheduled_tokens
+                == max_num_scheduled_tokens
+            )
+        finally:
+            reset_config()
 
     def test_check_and_update_config_applies_stt_scheduler_policy(
         self, monkeypatch: pytest.MonkeyPatch
