@@ -52,20 +52,20 @@ class TestWorkerRunnerBoundaryDelegation:
             (False, True, False, 0),
         ],
     )
-    def test_warm_up_delegates_paged_attention_setup(
+    def test_compile_delegates_paged_attention_setup(
         self,
         use_paged_attention: bool,
         runner_allows_setup: bool,
         expect_setup: bool,
         expect_cap_call: int,
     ) -> None:
-        """Paged attention setup uses warm-up measured overhead (issue #234)."""
+        """Paged attention setup uses overhead measured in determine_available_memory."""
         model_runner = MagicMock()
         model_runner.is_hybrid = False
-        model_runner.warm_up.return_value = 200 * 1024 * 1024  # 200 MB
         model_runner.should_setup_paged_attention.return_value = runner_allows_setup
         worker = _make_worker(model_runner, use_paged_attention=use_paged_attention)
         worker._setup_paged_attention = MagicMock()
+        worker._measured_overhead = 200 * 1024 * 1024  # stored from profiling
         worker.model_config = SimpleNamespace(seed=42)
 
         MetalWorker.compile_or_warm_up_model(worker)
@@ -79,43 +79,50 @@ class TestWorkerRunnerBoundaryDelegation:
             )
 
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
-        model_runner = SimpleNamespace(
-            scheduler_memory_reporting_mode=MagicMock(return_value="stt_nominal"),
-        )
+        model_runner = SimpleNamespace(_is_stt=True)
         worker = _make_worker(model_runner, use_paged_attention=True)
 
         available = MetalWorker.determine_available_memory(worker)
 
         assert available == STT_SCHED_AVAILABLE_BYTES
-        model_runner.scheduler_memory_reporting_mode.assert_called_once_with(
-            paged_attention_enabled=True
-        )
 
-    def test_determine_available_memory_paged_capacity_mode(self) -> None:
-        num_blocks = 8
-        block_size_bytes = 16
+    def test_determine_available_memory_paged_profiles_and_reports_budget(self) -> None:
+        """Paged path profiles overhead then reports KV budget."""
+        measured_overhead = 200 * 1024 * 1024  # 200 MB
         model_runner = SimpleNamespace(
-            scheduler_memory_reporting_mode=MagicMock(
-                return_value="paged_attention_capacity"
-            ),
-            _paged_attention_backend=SimpleNamespace(num_blocks=lambda: num_blocks),
+            _is_stt=False,
+            is_hybrid=False,
+            should_setup_paged_attention=MagicMock(return_value=True),
+            profile_run=MagicMock(return_value=measured_overhead),
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
-        worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
+        worker.metal_config = SimpleNamespace(
+            use_paged_attention=True,
+            is_auto_memory=False,
+            memory_fraction=0.9,
+        )
+        # Mock _get_model_memory_usage and mx.device_info
+        worker._get_model_memory_usage = MagicMock(return_value=int(1e9))
+        import unittest.mock as um
 
-        available = MetalWorker.determine_available_memory(worker)
+        metal_limit = int(5e9)
+        with um.patch(
+            "mlx.core.device_info",
+            return_value={
+                "max_recommended_working_set_size": metal_limit,
+            },
+        ):
+            available = MetalWorker.determine_available_memory(worker)
 
-        assert available == num_blocks * block_size_bytes
-        worker.get_cache_block_size_bytes.assert_called_once_with()
+        model_runner.profile_run.assert_called_once_with()
+        expected = int(metal_limit * 0.9) - int(1e9) - measured_overhead
+        assert available == expected
+        assert worker._measured_overhead == measured_overhead
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
         """Test MLX path returns one max-length sequence estimate (PR #229)."""
-        import mlx.core as mx
-
         model_runner = SimpleNamespace(
-            scheduler_memory_reporting_mode=MagicMock(
-                return_value="single_sequence_estimate"
-            ),
+            _is_stt=False,
             kv_cache_dtype=mx.float16,
             is_hybrid=False,
             is_mla=False,
@@ -126,15 +133,12 @@ class TestWorkerRunnerBoundaryDelegation:
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
 
-        try:
-            available = MetalWorker.determine_available_memory(worker)
+        available = MetalWorker.determine_available_memory(worker)
 
-            # Should return one max-length sequence KV cache bytes
-            # 2 (K+V) * 16 layers * 2048 tokens * 8 heads * 128 head_dim * 2 bytes
-            expected = 2 * 16 * 2048 * 8 * 128 * 2
-            assert available == expected
-        finally:
-            pass
+        # Should return one max-length sequence KV cache bytes
+        # 2 (K+V) * 16 layers * 2048 tokens * 8 heads * 128 head_dim * 2 bytes
+        expected = 2 * 16 * 2048 * 8 * 128 * 2
+        assert available == expected
 
     def test_get_supported_tasks_delegates_to_runner_capability(self) -> None:
         model_runner = SimpleNamespace(

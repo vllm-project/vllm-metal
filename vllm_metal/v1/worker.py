@@ -33,10 +33,7 @@ from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:
-    from vllm_metal.v1.model_runner import (
-        MetalModelRunner,
-        SchedulerMemoryReportingMode,
-    )
+    from vllm_metal.v1.model_runner import MetalModelRunner
 
 logger = init_logger(__name__)
 
@@ -383,46 +380,60 @@ class MetalWorker(WorkerBase):
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
 
-        Paged attention: reports the actual MPS paged cache capacity.
+        Paged attention: runs a profile forward pass to measure activation
+        overhead, then computes the KV budget.  This mirrors upstream vLLM's
+        pattern of profiling inside ``determine_available_memory`` so the
+        measurement is available *before* upstream sizes the KV cache.
+
         MLX path (default): reports one max-length sequence of KV cache
         so the scheduler budgets for one concurrent sequence.
 
         Returns:
             Available memory in bytes
         """
-        mode: SchedulerMemoryReportingMode = (
-            self.model_runner.scheduler_memory_reporting_mode(
-                paged_attention_enabled=self.metal_config.use_paged_attention
-            )
-        )
-
-        if mode == "stt_nominal":
-            # STT models don't use vLLM's KV cache. Return a nominal value so
-            # scheduler minimum-memory checks pass.
+        if self.model_runner._is_stt:
             logger.info("STT model: reporting nominal memory for scheduler")
             return STT_SCHED_AVAILABLE_BYTES
 
-        if mode == "paged_attention_capacity":
-            # Runner only reports this mode when paged cache is initialized.
-            backend = self.model_runner._paged_attention_backend
-            assert backend is not None
-            num_blocks = backend.num_blocks()
-            block_size_bytes = self.get_cache_block_size_bytes()
-            available = num_blocks * block_size_bytes
+        if (
+            self.metal_config.use_paged_attention
+            and self.model_runner.should_setup_paged_attention()
+        ):
+            # Profile activation overhead (matching upstream's profile_run
+            # inside determine_available_memory).
+            self._measured_overhead = self.model_runner.profile_run()
+
+            # Compute KV budget using the same formula as _setup_paged_attention
+            # so upstream and our block allocation agree.
+            if self.metal_config.is_auto_memory:
+                fraction = PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
+            else:
+                fraction = self.metal_config.memory_fraction
+
+            device_info = mx.device_info()
+            metal_limit = int(device_info.get("max_recommended_working_set_size", 0))
+            model_memory = self._get_model_memory_usage()
+            kv_budget = self._kv_budget_bytes(
+                metal_limit, model_memory, fraction, self._measured_overhead
+            )
+
+            # For hybrid models, deduct fixed linear state cost.
+            runner = self.model_runner
+            if runner.is_hybrid:
+                kv_budget -= runner.linear_cache_bytes_per_slot() * (
+                    runner.scheduler_config.max_num_seqs
+                )
+
+            available = max(0, kv_budget)
             logger.info(
-                "Paged attention: reporting MPS cache capacity "
-                "(%d blocks × %d bytes = %.2f GB)",
-                num_blocks,
-                block_size_bytes,
+                "Paged attention: profiled overhead=%.2fMB, "
+                "reporting %.2f GB KV budget for scheduler",
+                self._measured_overhead / (1024 * 1024),
                 available / 1e9,
             )
             return available
 
         # Default MLX path: report one max-length sequence for admission control.
-        # This matches the design from PR #229, which ensures the scheduler
-        # can admit at least one sequence without over-committing memory.
-        # MLX's make_prompt_cache() dynamically allocates KV cache per request,
-        # so we only need to report enough for one sequence.
         available = self._one_sequence_kv_bytes()
         logger.info(
             "MLX path: reporting %.2f GB for scheduler admission control "
@@ -459,24 +470,25 @@ class MetalWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
-        """Warm up the model and set up paged attention if enabled.
+        """Set up paged attention and warm up the model.
 
-        Runs a dummy forward pass to measure the intermediate-buffer overhead,
-        then uses that measurement to size the KV cache within the configured
-        ``VLLM_METAL_MEMORY_FRACTION``.  ``mx.set_cache_limit`` is set during
-        warm-up so the MLX buffer cache stays bounded (GitHub issue #234).
+        Activation-overhead profiling was already done in
+        ``determine_available_memory`` (matching upstream's pattern).
+        This method uses the stored measurement to allocate the paged KV
+        cache, then runs any remaining warm-up (STT adapter, etc.).
         """
         # Reset seed for reproducibility
         set_random_seed(self.model_config.seed)
-        measured_overhead = self.model_runner.warm_up()
 
-        # Paged attention setup runs *after* warm-up so the measured overhead
-        # replaces the former 800 MB placeholder in the KV budget calculation.
+        # Set up paged attention using the overhead measured during profiling.
         if (
             self.metal_config.use_paged_attention
             and self.model_runner.should_setup_paged_attention()
         ):
-            self._setup_paged_attention(overhead=measured_overhead)
+            overhead = getattr(self, "_measured_overhead", 0)
+            self._setup_paged_attention(overhead=overhead)
+
+        self.model_runner.warm_up()
 
     def execute_model(
         self, scheduler_output: SchedulerOutput

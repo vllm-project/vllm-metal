@@ -310,11 +310,6 @@ class PrefixCacheManager:
 # - Some models (e.g. gpt_oss) use `RotatingKVCache` for sliding-window attention.
 # - Hybrid models use `ArraysCache` for non-attention state.
 AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
-SchedulerMemoryReportingMode: TypeAlias = Literal[
-    "stt_nominal",
-    "paged_attention_capacity",
-    "single_sequence_estimate",
-]
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -765,20 +760,6 @@ class MetalModelRunner:
         """
         return not self._is_stt
 
-    def scheduler_memory_reporting_mode(
-        self, *, paged_attention_enabled: bool
-    ) -> SchedulerMemoryReportingMode:
-        """Return which scheduler memory-reporting mode worker should use.
-
-        Worker delegates this decision to the runner so STT-specific policy is
-        not open-coded in `worker.py`.
-        """
-        if self._is_stt:
-            return "stt_nominal"
-        if paged_attention_enabled and self._paged_attention_backend is not None:
-            return "paged_attention_capacity"
-        return "single_sequence_estimate"
-
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
         if self._is_stt:
@@ -1197,33 +1178,25 @@ class MetalModelRunner:
         )
         return self.num_linear_layers * (conv_bytes + recurrent_bytes)
 
-    def warm_up(self) -> int:
-        """Warm up the model with a dummy forward pass.
+    def profile_run(self) -> int:
+        """Profile activation overhead with a dummy forward pass.
 
-        Measures MLX buffer cache usage during the forward pass so the caller
-        can use it as the activation-overhead term when sizing the KV cache.
-        Also calls ``mx.set_cache_limit`` to cap the buffer cache, preventing
-        unbounded memory growth during serving (see GitHub issue #234).
+        Measures MLX buffer cache usage during a forward pass sized to
+        ``max_num_batched_tokens`` (the scheduler's ceiling for a single
+        step), matching upstream vLLM's ``profile_run`` approach.  Also
+        calls ``mx.set_cache_limit`` to cap the buffer cache, preventing
+        unbounded memory growth during serving (GitHub issue #234).
+
+        Called from ``MetalWorker.determine_available_memory`` so the
+        measured overhead is available *before* upstream sizes the KV cache.
 
         Returns:
             Measured intermediate buffer overhead in bytes.
         """
         if self.model is None:
-            logger.warning("Model not loaded, skipping warm-up")
+            logger.warning("Model not loaded, skipping profile run")
             return 0
 
-        if self._is_stt:
-            assert self._stt_runtime_adapter is not None
-            logger.info("Warming up STT model...")
-            self._stt_runtime_adapter.warm_up()
-            logger.info("STT model warm-up complete")
-            return 0
-
-        logger.info("Warming up model...")
-
-        # Profile with max_num_batched_tokens — the scheduler's ceiling for a
-        # single forward pass — so the measured overhead reflects realistic
-        # worst-case serving, matching upstream vLLM's profile_run approach.
         warmup_len = self.scheduler_config.max_num_batched_tokens
         measured_overhead = 0
         try:
@@ -1237,15 +1210,31 @@ class MetalModelRunner:
             measured_overhead = max(0, cache_after - cache_before)
             mx.set_cache_limit(measured_overhead)
             logger.info(
-                "Model warm-up complete (warmup_len=%d): "
+                "Profile run complete (warmup_len=%d): "
                 "measured buffer overhead=%.2fMB, cache_limit set",
                 warmup_len,
                 measured_overhead / (1024 * 1024),
             )
         except Exception as e:
-            logger.warning(f"Model warm-up failed: {e}")
+            logger.warning(f"Profile run failed: {e}")
 
         return measured_overhead
+
+    def warm_up(self) -> None:
+        """Warm up the model (STT adapter, shader compilation, etc.).
+
+        The activation-overhead profiling is done separately in
+        ``profile_run``, called from the worker before KV cache init.
+        """
+        if self.model is None:
+            logger.warning("Model not loaded, skipping warm-up")
+            return
+
+        if self._is_stt:
+            assert self._stt_runtime_adapter is not None
+            logger.info("Warming up STT model...")
+            self._stt_runtime_adapter.warm_up()
+            logger.info("STT model warm-up complete")
 
     def _make_sampling_metadata(
         self,
