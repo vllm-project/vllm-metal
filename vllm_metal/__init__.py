@@ -5,6 +5,7 @@ This plugin enables vLLM to run on Apple Silicon Macs using MLX as the
 primary compute backend, with PyTorch for model loading and interoperability.
 """
 
+import logging
 import os
 import sys
 
@@ -13,6 +14,10 @@ from vllm.logger import init_logger
 __version__ = "0.1.0"
 
 logger = init_logger(__name__)
+# Ensure all vllm_metal loggers have INFO level by setting the root logger level
+# This is needed because vllm's logging config only configures "vllm" logger,
+# and "vllm_metal" loggers would inherit root's WARNING level otherwise.
+logging.getLogger("vllm_metal").setLevel(logging.INFO)
 
 
 def _apply_macos_defaults() -> None:
