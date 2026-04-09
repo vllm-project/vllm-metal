@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for vLLM Metal configuration."""
 
-import os
-
 import pytest
 
 from vllm_metal.config import (
@@ -16,32 +14,12 @@ from vllm_metal.config import (
 class TestMetalConfig:
     """Tests for MetalConfig class."""
 
-    def setup_method(self) -> None:
-        """Reset config before each test."""
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        """Reset config singleton before and after each test."""
         reset_config()
-        # Clear environment variables
-        for var in [
-            "VLLM_METAL_MEMORY_FRACTION",
-            "VLLM_METAL_USE_MLX",
-            "VLLM_MLX_DEVICE",
-            "VLLM_METAL_BLOCK_SIZE",
-            "VLLM_METAL_DEBUG",
-            "VLLM_METAL_USE_PAGED_ATTENTION",
-        ]:
-            os.environ.pop(var, None)
-
-    def teardown_method(self) -> None:
-        """Reset config after each test."""
+        yield
         reset_config()
-        for var in [
-            "VLLM_METAL_MEMORY_FRACTION",
-            "VLLM_METAL_USE_MLX",
-            "VLLM_MLX_DEVICE",
-            "VLLM_METAL_BLOCK_SIZE",
-            "VLLM_METAL_DEBUG",
-            "VLLM_METAL_USE_PAGED_ATTENTION",
-        ]:
-            os.environ.pop(var, None)
 
     def test_default_config(self) -> None:
         """Test default configuration values."""
@@ -55,14 +33,14 @@ class TestMetalConfig:
         assert config.debug is False
         assert config.use_paged_attention is True
 
-    def test_custom_config_from_env(self) -> None:
+    def test_custom_config_from_env(self, monkeypatch) -> None:
         """Test configuration from environment variables."""
-        os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.75"
-        os.environ["VLLM_METAL_USE_MLX"] = "0"
-        os.environ["VLLM_MLX_DEVICE"] = "cpu"
-        os.environ["VLLM_METAL_BLOCK_SIZE"] = "32"
-        os.environ["VLLM_METAL_DEBUG"] = "1"
-        os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
+        monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", "0.75")
+        monkeypatch.setenv("VLLM_METAL_USE_MLX", "0")
+        monkeypatch.setenv("VLLM_MLX_DEVICE", "cpu")
+        monkeypatch.setenv("VLLM_METAL_BLOCK_SIZE", "32")
+        monkeypatch.setenv("VLLM_METAL_DEBUG", "1")
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
 
         config = MetalConfig.from_env()
 
@@ -89,30 +67,29 @@ class TestMetalConfig:
         # (but with same values since env vars haven't changed)
         assert config1 is not config2
 
-    def test_auto_memory_fraction(self) -> None:
+    def test_auto_memory_fraction(self, monkeypatch) -> None:
         """Test that 'auto' is parsed as AUTO_MEMORY_FRACTION."""
-        os.environ["VLLM_METAL_MEMORY_FRACTION"] = "auto"
+        monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", "auto")
 
         config = MetalConfig.from_env()
 
         assert config.memory_fraction == AUTO_MEMORY_FRACTION
         assert config.is_auto_memory is True
 
-    def test_auto_memory_fraction_case_insensitive(self) -> None:
+    def test_auto_memory_fraction_case_insensitive(self, monkeypatch) -> None:
         """Test that 'AUTO' and 'Auto' are also accepted."""
         for value in ["AUTO", "Auto", "AuTo"]:
             reset_config()
-            os.environ["VLLM_METAL_MEMORY_FRACTION"] = value
+            monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", value)
 
             config = MetalConfig.from_env()
 
             assert config.memory_fraction == AUTO_MEMORY_FRACTION
             assert config.is_auto_memory is True
 
-    def test_is_auto_memory_false_for_numeric(self) -> None:
+    def test_is_auto_memory_false_for_numeric(self, monkeypatch) -> None:
         """Test that is_auto_memory is False for numeric values."""
-        os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5"
-        # Paged attention is now default, so no need to set env var
+        monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", "0.5")
 
         config = MetalConfig.from_env()
 
@@ -131,10 +108,10 @@ class TestMetalConfig:
                 use_paged_attention=False,
             )
 
-    def test_block_size_must_be_positive(self) -> None:
+    def test_block_size_must_be_positive(self, monkeypatch) -> None:
         for value in ["0", "-1"]:
             reset_config()
-            os.environ["VLLM_METAL_BLOCK_SIZE"] = value
+            monkeypatch.setenv("VLLM_METAL_BLOCK_SIZE", value)
             with pytest.raises(ValueError, match="Invalid VLLM_METAL_BLOCK_SIZE"):
                 MetalConfig.from_env()
 

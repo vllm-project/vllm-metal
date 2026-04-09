@@ -102,8 +102,9 @@ def _register() -> str | None:
 
     # Register our env vars with vLLM's registry so validate_environ()
     # does not warn about unknown VLLM_METAL_* / VLLM_MLX_* variables.
-    from vllm_metal.envs import environment_variables as metal_env_vars
     import vllm.envs
+
+    from vllm_metal.envs import environment_variables as metal_env_vars
 
     vllm.envs.environment_variables.update(metal_env_vars)
 
