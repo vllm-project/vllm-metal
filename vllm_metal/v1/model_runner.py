@@ -1221,12 +1221,17 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference and measure intermediate buffer usage.
+        # Profile with max_num_batched_tokens — the scheduler's ceiling for a
+        # single forward pass — so the measured overhead reflects realistic
+        # worst-case serving, matching upstream vLLM's profile_run approach.
+        warmup_len = self.scheduler_config.max_num_batched_tokens
         measured_overhead = 0
         try:
             mx.clear_cache()
             cache_before = mx.get_cache_memory()
-            dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+            dummy_tokens = mx.array(
+                [list(range(warmup_len))], dtype=mx.int32
+            )
             output = self.model(dummy_tokens)
             logits = self._extract_logits(output)
             mx.eval(logits)
@@ -1234,8 +1239,9 @@ class MetalModelRunner:
             measured_overhead = max(0, cache_after - cache_before)
             mx.set_cache_limit(measured_overhead)
             logger.info(
-                "Model warm-up complete: "
+                "Model warm-up complete (warmup_len=%d): "
                 "measured buffer overhead=%.2fMB, cache_limit set",
+                warmup_len,
                 measured_overhead / (1024 * 1024),
             )
         except Exception as e:
