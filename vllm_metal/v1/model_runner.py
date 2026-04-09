@@ -821,13 +821,27 @@ class MetalModelRunner:
                 self._initialize_kv_cache_dtype()
                 return
 
-        # Load model using appropriate backend
+        # Load model using appropriate backend.
+        # Prefer mlx_lm even for models vLLM flags as multimodal: mlx_lm
+        # handles the text backbone without mlx_vlm's AutoProcessor
+        # side-effects that can interfere with vLLM's scheduler.
+        # Fall back to mlx_vlm only when mlx_lm cannot load the model.
         if is_vlm:
-            logger.info("Using mlx-vlm for vision-language model")
-            self.model, self.tokenizer = mlx_vlm_load(model_name)
-            self._is_vlm = True
+            try:
+                self.model, self.tokenizer = mlx_lm_load(
+                    model_name,
+                    tokenizer_config={
+                        "trust_remote_code": self.model_config.trust_remote_code
+                    },
+                )
+                self._is_vlm = False
+                logger.info("Multimodal model loaded via mlx_lm (text backbone)")
+            except (ImportError, KeyError, ValueError, FileNotFoundError) as exc:
+                logger.debug("mlx_lm cannot load %s: %s", model_name, exc)
+                logger.info("Using mlx-vlm for vision-language model")
+                self.model, self.tokenizer = mlx_vlm_load(model_name)
+                self._is_vlm = True
         else:
-            # Load model and tokenizer using mlx_lm for text-only models
             self.model, self.tokenizer = mlx_lm_load(
                 model_name,
                 tokenizer_config={
