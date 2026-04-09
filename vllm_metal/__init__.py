@@ -14,10 +14,29 @@ from vllm.logger import init_logger
 __version__ = "0.2.0"
 
 logger = init_logger(__name__)
-# Ensure all vllm_metal loggers have INFO level by setting the root logger level
-# This is needed because vllm's logging config only configures "vllm" logger,
-# and "vllm_metal" loggers would inherit root's WARNING level otherwise.
-logging.getLogger("vllm_metal").setLevel(logging.INFO)
+
+
+def _configure_logging() -> None:
+    """Configure vllm_metal logging to match vLLM settings.
+
+    This ensures:
+    1. vllm_metal respects VLLM_LOGGING_LEVEL environment variable
+    2. vllm_metal shares vLLM's handler for actual log emission
+    3. vllm_metal does not propagate to root logger (avoids duplicate logs)
+    """
+    from vllm.envs import VLLM_LOGGING_LEVEL
+
+    vllm_logger = logging.getLogger("vllm")
+    metal_logger = logging.getLogger("vllm_metal")
+
+    # Honor VLLM_LOGGING_LEVEL environment variable
+    metal_logger.setLevel(getattr(logging, VLLM_LOGGING_LEVEL))
+
+    # Share vLLM's handler to ensure logs are actually emitted
+    # Only configure if vllm has handlers and metal doesn't already have them
+    if vllm_logger.handlers and not metal_logger.handlers:
+        metal_logger.handlers = list(vllm_logger.handlers)
+        metal_logger.propagate = False
 
 
 def _apply_macos_defaults() -> None:
@@ -89,6 +108,7 @@ def _register() -> str | None:
     Returns:
         Fully qualified class name if platform is available, None otherwise
     """
+    _configure_logging()  # Configure logging before any metal code runs
     _apply_macos_defaults()
 
     from vllm_metal.compat import apply_compat_patches
