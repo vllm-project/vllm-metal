@@ -37,3 +37,10 @@ Please delete the directory that was installed by the installation script.
 ```bash
 rm -rf ~/.venv-vllm-metal
 ```
+
+## Building Documentation
+
+```bash
+uv pip install -r docs/requirements-docs.txt
+mkdocs serve
+```
