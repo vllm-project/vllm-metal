@@ -64,15 +64,25 @@ run_smoke_test() {
 
   echo "Smoke test passed! Output matches golden."
 
-  kill $vllm_pid
-  wait $vllm_pid 2>/dev/null || true
-  # Wait for port 8000 to be released before next test
+  # Graceful shutdown with SIGKILL fallback
+  kill $vllm_pid 2>/dev/null
   local i=0
+  for _ in $(seq 1 10); do
+    if ! kill -0 $vllm_pid 2>/dev/null; then break; fi
+    sleep 1
+  done
+  if kill -0 $vllm_pid 2>/dev/null; then
+    echo "Warning: vLLM did not terminate after 10s, sending SIGKILL"
+    kill -9 $vllm_pid 2>/dev/null
+  fi
+  wait $vllm_pid 2>/dev/null || true
+  # Wait for port to be released before next test
+  i=0
   while lsof -i :8000 -sTCP:LISTEN >/dev/null 2>&1; do
     sleep 1
     i=$((i + 1))
-    if [ $i -ge 30 ]; then
-      echo "Warning: port 8000 still in use after 30s"
+    if [ $i -ge 15 ]; then
+      echo "Warning: port 8000 still in use after 15s"
       break
     fi
   done
