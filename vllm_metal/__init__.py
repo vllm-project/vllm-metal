@@ -14,6 +14,20 @@ __version__ = "0.2.0"
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging() -> None:
+    """Configure vllm_metal logging to mirror vLLM settings."""
+    from vllm.envs import VLLM_LOGGING_LEVEL
+
+    vllm_logger = logging.getLogger("vllm")
+    metal_logger = logging.getLogger("vllm_metal")
+    metal_logger.setLevel(logging.getLevelName(VLLM_LOGGING_LEVEL))
+
+    if vllm_logger.handlers and not metal_logger.handlers:
+        for handler in vllm_logger.handlers:
+            metal_logger.addHandler(handler)
+        metal_logger.propagate = False
+
+
 def _apply_macos_defaults() -> None:
     """Apply safe defaults for macOS when using the Metal plugin.
 
@@ -83,6 +97,7 @@ def _register() -> str | None:
     Returns:
         Fully qualified class name if platform is available, None otherwise
     """
+    _configure_logging()
     _apply_macos_defaults()
 
     from vllm_metal.compat import apply_compat_patches
