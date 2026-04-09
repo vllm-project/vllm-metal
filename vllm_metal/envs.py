@@ -31,34 +31,30 @@ def _parse_memory_fraction() -> float:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
     # plugin calculates the minimal amount needed at startup.
-    "VLLM_METAL_MEMORY_FRACTION":
-        _parse_memory_fraction,
+    "VLLM_METAL_MEMORY_FRACTION": _parse_memory_fraction,
     # Whether to use MLX as the compute backend (default True).
-    "VLLM_METAL_USE_MLX":
-        lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
+    "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
     # MLX device type: "gpu" (default) or "cpu".
-    "VLLM_MLX_DEVICE":
-        lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
+    "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Tokens per KV-cache block (default 16).
-    "VLLM_METAL_BLOCK_SIZE":
-        lambda: int(os.getenv("VLLM_METAL_BLOCK_SIZE", "16")),
+    "VLLM_METAL_BLOCK_SIZE": lambda: int(os.getenv("VLLM_METAL_BLOCK_SIZE", "16")),
     # Enable verbose debug logging (default False).
-    "VLLM_METAL_DEBUG":
-        lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
+    "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
-    "VLLM_METAL_USE_PAGED_ATTENTION":
-        lambda: os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1",
+    "VLLM_METAL_USE_PAGED_ATTENTION": lambda: os.getenv(
+        "VLLM_METAL_USE_PAGED_ATTENTION", "1"
+    )
+    == "1",
     # Enable content-hash prefix caching (presence-based: set to any
     # value to enable, unset to disable).
-    "VLLM_METAL_PREFIX_CACHE":
-        lambda: "VLLM_METAL_PREFIX_CACHE" in os.environ,
+    "VLLM_METAL_PREFIX_CACHE": lambda: "VLLM_METAL_PREFIX_CACHE" in os.environ,
     # Fraction of MLX working set for the prefix cache (raw string;
     # the consumer in model_runner.py validates and applies a default).
-    "VLLM_METAL_PREFIX_CACHE_FRACTION":
-        lambda: os.getenv("VLLM_METAL_PREFIX_CACHE_FRACTION", ""),
+    "VLLM_METAL_PREFIX_CACHE_FRACTION": lambda: os.getenv(
+        "VLLM_METAL_PREFIX_CACHE_FRACTION", ""
+    ),
     # Custom cache directory for ModelScope downloads (None if unset).
-    "VLLM_METAL_MODELSCOPE_CACHE":
-        lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
+    "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
 }
 
 
