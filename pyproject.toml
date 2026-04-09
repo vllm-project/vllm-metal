@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "vllm-metal"
-version = "0.1.0"
+version = "0.2.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}

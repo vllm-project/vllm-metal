@@ -29,7 +29,7 @@ class MetalConfig:
     mlx_device: Literal["gpu", "cpu"]
     block_size: int
     debug: bool
-    use_paged_attention: bool = False
+    use_paged_attention: bool = True
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
