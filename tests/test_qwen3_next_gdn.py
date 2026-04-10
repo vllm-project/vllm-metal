@@ -143,6 +143,201 @@ class TestGDNFreeSlotZeroing:
             assert sc.recurrent_states[layer_idx].dtype == mx.float32
 
 
+class TestGDNAllocSlotZeroing:
+    """Verify that _gdn_alloc_slot zeros state for reused slots."""
+
+    def _make_runner_stub(self, max_seqs: int = 2):
+        """Build a minimal stub with GDN slot management wired up."""
+        from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+
+        sc = GDNPagedStateCache(
+            num_layers=2,
+            max_seqs=max_seqs,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=16,
+            key_head_dim=16,
+            dtype=mx.float16,
+        )
+        backend = MagicMock()
+        backend._state_cache = sc
+
+        runner = MagicMock()
+        runner._gdn_req_to_slot = {}
+        runner._gdn_free_slots = []
+        runner._paged_attention_backend = backend
+        return runner, sc
+
+    def test_reused_slot_is_zeroed(self):
+        """A slot returned to the free list and re-allocated must have
+        zeroed conv and recurrent state."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub()
+
+        # Allocate slot 0 for req-A
+        slot = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        assert slot == 0
+
+        # Write non-zero data to slot 0
+        for layer_idx in range(sc.num_layers):
+            sc.conv_states[layer_idx] = mx.ones_like(sc.conv_states[layer_idx])
+            sc.recurrent_states[layer_idx] = mx.ones_like(
+                sc.recurrent_states[layer_idx]
+            )
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Free slot 0 (bare pop+append, no zeroing — matches early release path)
+        runner._gdn_req_to_slot.pop("req-A")
+        runner._gdn_free_slots.append(slot)
+
+        # Re-allocate — should trigger alloc-time zeroing
+        slot2 = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        assert slot2 == 0  # reused
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Slot 0 must be zeroed
+        for layer_idx in range(sc.num_layers):
+            assert mx.array_equal(
+                sc.conv_states[layer_idx][0],
+                mx.zeros_like(sc.conv_states[layer_idx][0]),
+            )
+            assert mx.array_equal(
+                sc.recurrent_states[layer_idx][0],
+                mx.zeros_like(sc.recurrent_states[layer_idx][0]),
+            )
+
+    def test_reused_slot_preserves_other_slots(self):
+        """Alloc-time zeroing of slot 0 must not affect slot 1."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub()
+
+        # Allocate slots 0 and 1
+        MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+
+        # Write ones everywhere
+        for layer_idx in range(sc.num_layers):
+            sc.conv_states[layer_idx] = mx.ones_like(sc.conv_states[layer_idx])
+            sc.recurrent_states[layer_idx] = mx.ones_like(
+                sc.recurrent_states[layer_idx]
+            )
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Free slot 0, re-allocate
+        runner._gdn_req_to_slot.pop("req-A")
+        runner._gdn_free_slots.append(0)
+        MetalModelRunner._gdn_alloc_slot(runner, "req-C")
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Slot 1 must still be ones
+        assert mx.allclose(sc.conv_states[0][1], mx.ones((3, 64), dtype=mx.float16))
+        assert mx.allclose(
+            sc.recurrent_states[0][1], mx.ones((4, 16, 16), dtype=mx.float32)
+        )
+
+    def test_new_slot_not_zeroed(self):
+        """A brand-new slot (not from free list) should not trigger zeroing."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub()
+        slot = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        assert slot == 0
+        # No crash, no zeroing needed — state was already initialized to zero
+
+    def test_double_free_is_safe(self):
+        """Calling _gdn_free_slot twice for the same req_id must not crash."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub()
+        MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+
+        MetalModelRunner._gdn_free_slot(runner, "req-A")
+        MetalModelRunner._gdn_free_slot(runner, "req-A")  # no-op, no crash
+
+    def test_slot_reuse_after_early_release(self):
+        """Slot freed via bare pop+append (early release) should be
+        available for immediate reallocation with zeroed state."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub(max_seqs=1)
+
+        slot0 = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        assert slot0 == 0
+
+        # Write non-zero data to slot 0
+        for layer_idx in range(sc.num_layers):
+            sc.conv_states[layer_idx] = mx.ones_like(sc.conv_states[layer_idx])
+            sc.recurrent_states[layer_idx] = mx.ones_like(
+                sc.recurrent_states[layer_idx]
+            )
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Early release (bare pop+append, as in execute_model)
+        runner._gdn_req_to_slot.pop("req-A")
+        runner._gdn_free_slots.append(slot0)
+
+        # Same-step allocation should reuse slot 0
+        slot1 = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        assert slot1 == 0
+
+        # Alloc-time zeroing must have cleared the state
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+        for layer_idx in range(sc.num_layers):
+            assert mx.array_equal(
+                sc.conv_states[layer_idx][0],
+                mx.zeros_like(sc.conv_states[layer_idx][0]),
+            ), f"conv_states[{layer_idx}][0] not zeroed after early-release reuse"
+            assert mx.array_equal(
+                sc.recurrent_states[layer_idx][0],
+                mx.zeros_like(sc.recurrent_states[layer_idx][0]),
+            ), f"recurrent_states[{layer_idx}][0] not zeroed after early-release reuse"
+
+    def test_early_release_then_alloc_full_cycle(self):
+        """Simulate the full execute_model early-release → alloc cycle
+        with 2 slots: finish req-A, start req-C while req-B still active."""
+        from vllm_metal.v1.model_runner import MetalModelRunner
+
+        runner, sc = self._make_runner_stub(max_seqs=2)
+
+        # Allocate 2 requests
+        slot_a = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        slot_b = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        assert slot_a == 0
+        assert slot_b == 1
+
+        # Write distinct data to each slot
+        for layer_idx in range(sc.num_layers):
+            sc.conv_states[layer_idx] = mx.ones_like(sc.conv_states[layer_idx]) * 5.0
+            sc.recurrent_states[layer_idx] = (
+                mx.ones_like(sc.recurrent_states[layer_idx]) * 3.0
+            )
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Early-release req-A (bare pop+append, no zeroing)
+        runner._gdn_req_to_slot.pop("req-A")
+        runner._gdn_free_slots.append(slot_a)
+
+        # Allocate req-C — should reuse slot 0 with zeroed state
+        slot_c = MetalModelRunner._gdn_alloc_slot(runner, "req-C")
+        assert slot_c == 0  # reused slot
+        mx.eval(*sc.conv_states, *sc.recurrent_states)
+
+        # Slot 0 (req-C) must be zeroed
+        assert mx.array_equal(sc.conv_states[0][0], mx.zeros_like(sc.conv_states[0][0]))
+        assert mx.array_equal(
+            sc.recurrent_states[0][0], mx.zeros_like(sc.recurrent_states[0][0])
+        )
+
+        # Slot 1 (req-B) must still have its data (5.0 / 3.0)
+        assert sc.conv_states[0][1].sum().item() != 0, "req-B conv state was corrupted"
+        assert sc.recurrent_states[0][1].sum().item() != 0, (
+            "req-B recurrent state was corrupted"
+        )
+
+
 class TestSyncMLXInTensorBridge:
     """Verify sync_mlx is called before MPS tensor transfer."""
 
