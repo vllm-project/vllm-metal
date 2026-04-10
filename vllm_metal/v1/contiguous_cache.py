@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Legacy mlx_lm KV cache utilities.
+"""Contiguous KV cache utilities (non-paged code path).
 
 Prefix caching (PrefixCacheManager) and batched KV cache merge/extract
-helpers used by the non-paged-attention code path.
+helpers for the contiguous KV cache path, used when paged attention is
+disabled. KV state is stored as contiguous mx.array tensors per request,
+in contrast to the fixed-block layout used by paged attention.
 """
 
 import hashlib

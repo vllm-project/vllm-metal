@@ -7,9 +7,9 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
-import vllm_metal.v1.legacy_cache as lc
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1 import contiguous_cache
 
 
 class StubArraysCache:
@@ -116,8 +116,12 @@ class TestPrefixCacheRestoreOffset:
         def fake_make_prompt_cache(_model):
             return [self._KVCacheWithoutOffsetSideEffect()]
 
-        monkeypatch.setattr(lc, "KVCache", self._KVCacheWithoutOffsetSideEffect)
-        monkeypatch.setattr(lc, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(
+            contiguous_cache, "KVCache", self._KVCacheWithoutOffsetSideEffect
+        )
+        monkeypatch.setattr(
+            contiguous_cache, "make_prompt_cache", fake_make_prompt_cache
+        )
 
         k = mx.zeros((1, 2, 7, 8), dtype=mx.float32)
         v = mx.zeros((1, 2, 7, 8), dtype=mx.float32)

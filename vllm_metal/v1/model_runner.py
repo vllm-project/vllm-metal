@@ -64,7 +64,7 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.legacy_cache import (  # noqa: F401 — re-exported for tests
+from vllm_metal.v1.contiguous_cache import (  # noqa: F401 — re-exported for tests
     _MIN_BATCH_SIZE_FOR_BATCHING,
     _PREFIX_CACHE_DEFAULT_FRACTION,
     _PREFIX_CACHE_ENABLED,
