@@ -298,6 +298,24 @@ class MetalModelRunner:
         return isinstance(fai, int) and fai > 0
 
     @property
+    def _forward_model(self) -> Any:
+        """The model object to use for forward passes.
+
+        For VLMs loaded via mlx-vlm, the top-level ``Model.__call__`` requires
+        ``pixel_values`` and ``mask`` arguments that are absent in text-only
+        requests.  Routing through ``model.language_model`` bypasses the vision
+        encoder and uses the standard ``(input_ids, cache=...)`` signature.
+
+        NOTE: This means multimodal (image) inputs are not supported — the
+        vision head is intentionally skipped.  Full multimodal inference would
+        require a decomposed encode → feature-fusion → forward pass, following
+        the upstream pattern, and is a separate future effort.
+        """
+        if self._is_vlm and hasattr(self.model, "language_model"):
+            return self.model.language_model
+        return self.model
+
+    @property
     def mla_latent_dim(self) -> int:
         """Combined latent dimension for MLA cache: kv_lora_rank + qk_rope_head_dim.
 
@@ -383,6 +401,16 @@ class MetalModelRunner:
         # Load model using appropriate backend
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
+            # NOTE: Only text-only (language-model) inference is supported.
+            # Image inputs are not processed — the vision encoder is bypassed
+            # by routing all forward passes through model.language_model.
+            # Full multimodal inference (encode → fuse → forward) would follow
+            # the upstream decomposed encode/forward pattern and is a separate
+            # future effort.
+            logger.warning(
+                "VLM loaded in text-only mode: multimodal (image) inputs are "
+                "not yet supported. Vision encoder will be bypassed."
+            )
             self.model, self.tokenizer = mlx_vlm_load(model_name)
             self._is_vlm = True
         else:
@@ -774,7 +802,7 @@ class MetalModelRunner:
         # Run a small dummy inference (standard MLX path)
         try:
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            output = self.model(dummy_tokens)
+            output = self._forward_model(dummy_tokens)
             logits = self._extract_logits(output)
             mx.eval(logits)
             logger.info("Model warm-up complete")
@@ -824,14 +852,9 @@ class MetalModelRunner:
 
         # Prefix caching: cache KV for tokens[:-1], always process last token
         prefix = token_ids[:-1] if len(token_ids) > 1 else []
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
 
         # Create cache to check if model supports prefix caching
-        cache = contiguous_cache.make_prompt_cache(cache_model)
+        cache = contiguous_cache.make_prompt_cache(self._forward_model)
         # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
         supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
 
@@ -847,14 +870,14 @@ class MetalModelRunner:
             else:
                 # Cache miss: process prefix first, cache it, then last token
                 prefix_ids = mx.array([prefix], dtype=mx.int32)
-                _ = self.model(prefix_ids, cache=cache)
+                _ = self._forward_model(prefix_ids, cache=cache)
                 self._prefix_cache.insert(prefix, cache)
                 cached_prefix_len = len(prefix)
 
         # Prefill: process remaining tokens (always at least the last token)
         tokens_to_process = token_ids[cached_prefix_len:]
         input_ids = mx.array([tokens_to_process], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
+        model_output = self._forward_model(input_ids, cache=cache)
 
         logits = self._extract_logits(model_output)
 
@@ -905,7 +928,7 @@ class MetalModelRunner:
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
         # === SINGLE FORWARD PASS FOR ALL REQUESTS ===
-        model_output = self.model(batched_input, cache=batch_cache)
+        model_output = self._forward_model(batched_input, cache=batch_cache)
         logits = self._extract_logits(model_output)
 
         # Extract next token logits
@@ -964,7 +987,7 @@ class MetalModelRunner:
             last_token = state.token_ids[-1] if state.token_ids else 0
             input_ids = mx.array([[last_token]], dtype=mx.int32)
 
-            model_output = self.model(input_ids, cache=state.cache)
+            model_output = self._forward_model(input_ids, cache=state.cache)
             logits = self._extract_logits(model_output)
             last_logits = logits[:, -1, :]
 
@@ -1052,7 +1075,7 @@ class MetalModelRunner:
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
         try:
-            model_output = self.model(input_ids, cache=offset_caches)
+            model_output = self._forward_model(input_ids, cache=offset_caches)
             logits = self._extract_logits(model_output)
             # MLX uses lazy evaluation — model_output holds the entire
             # computation graph.  Dropping it before mx.eval lets MLX
