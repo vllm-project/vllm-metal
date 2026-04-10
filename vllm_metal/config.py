@@ -68,13 +68,28 @@ class MetalConfig:
         if memory_fraction_str.lower() == "auto":
             memory_fraction = AUTO_MEMORY_FRACTION
         else:
-            memory_fraction = float(memory_fraction_str)
+            try:
+                memory_fraction = float(memory_fraction_str)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid VLLM_METAL_MEMORY_FRACTION={memory_fraction_str!r}. "
+                    "Must be 'auto' or a numeric value in (0, 1]."
+                ) from e
+
+        block_size_str = envs.VLLM_METAL_BLOCK_SIZE
+        try:
+            block_size = int(block_size_str)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid VLLM_METAL_BLOCK_SIZE={block_size_str!r}. "
+                "Must be a positive integer."
+            ) from e
 
         return cls(
             memory_fraction=memory_fraction,
             use_mlx=envs.VLLM_METAL_USE_MLX,
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
-            block_size=envs.VLLM_METAL_BLOCK_SIZE,
+            block_size=block_size,
             debug=envs.VLLM_METAL_DEBUG,
             use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
         )

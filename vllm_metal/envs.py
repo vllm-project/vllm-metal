@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MEMORY_FRACTION: str = "auto"
     VLLM_METAL_USE_MLX: bool = True
     VLLM_MLX_DEVICE: str = "gpu"
-    VLLM_METAL_BLOCK_SIZE: int = 16
+    VLLM_METAL_BLOCK_SIZE: str = "16"
     VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
     VLLM_METAL_PREFIX_CACHE: bool = False
@@ -41,7 +41,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Tokens per KV-cache block (default 16).
-    "VLLM_METAL_BLOCK_SIZE": lambda: int(os.getenv("VLLM_METAL_BLOCK_SIZE", "16")),
+    # Returns the raw string; config.py parses and validates.
+    "VLLM_METAL_BLOCK_SIZE": lambda: os.getenv("VLLM_METAL_BLOCK_SIZE", "16"),
     # Enable verbose debug logging (default False).
     "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
