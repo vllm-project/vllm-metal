@@ -16,7 +16,18 @@ environment variable" warnings.
 
 import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    VLLM_METAL_MEMORY_FRACTION: str = "auto"
+    VLLM_METAL_USE_MLX: bool = True
+    VLLM_MLX_DEVICE: str = "gpu"
+    VLLM_METAL_BLOCK_SIZE: int = 16
+    VLLM_METAL_DEBUG: bool = False
+    VLLM_METAL_USE_PAGED_ATTENTION: bool = True
+    VLLM_METAL_PREFIX_CACHE: bool = False
+    VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
+    VLLM_METAL_MODELSCOPE_CACHE: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
