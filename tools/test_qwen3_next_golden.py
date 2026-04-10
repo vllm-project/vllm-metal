@@ -17,7 +17,7 @@ import os
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.9")
+os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.55")
 
 from vllm import LLM, SamplingParams
 
@@ -26,7 +26,7 @@ MAX_TOKENS = 10
 
 PROMPTS = [
     "The capital of France is",
-    "The weather today is not",
+    "The speed of light is approximately",
     "One plus one equals",
     "The largest planet in our solar system is",
     "Water boils at a temperature of",
@@ -34,16 +34,30 @@ PROMPTS = [
 ]
 
 # fmt: off
-# Golden token IDs from mlx_lm greedy decoding (argmax sampler).
+# Golden token IDs from mlx_lm greedy decoding (generate_step + argmax).
 # Model: mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit
 # Environment: mlx 0.31.1, mlx-lm 0.31.1
+# Regenerated 2026-04-10 via mlx_lm generate_step + argmax sampler.
+#
+# History:
+# - Original golden values (PR #240) had incorrect leading-space
+#   tokenization (e.g. token 59604 'Paris' instead of 12095 ' Paris').
+#   These never matched actual mlx_lm generate_step output.
+# - "The weather today is not" was replaced with "The speed of light is
+#   approximately" because the Qwen3-Next-80B model produces a perfect
+#   logit tie at token position 7: tokens 15920 (' Which', logit -1.875)
+#   and 42344 (' （', logit -1.875) are bitwise-equal IEEE 754 floats
+#   (hex bff00000). The argmax tie-break is implementation-dependent,
+#   making this prompt unsuitable for deterministic exact-token regression
+#   testing. All replacement candidates were verified tie-free across
+#   the full 9-token generation window.
 GOLDEN_MLX = {
-    "The capital of France is": [59604, 13, 576, 6722, 315, 9856, 374, 19846, 13, 576],
-    "The weather today is not": [1661, 438, 432, 572, 13671, 13, 42344, 40916, 64559],
-    "One plus one equals": [267, 1126, 13, 9043, 5519, 1378, 16819, 3040, 13, 13322],
-    "The largest planet in our solar system is": [41, 19519, 11, 448, 264, 23033, 315, 220, 23, 23],
-    "Water boils at a temperature of": [16, 15, 15, 30937, 13, 1913, 279, 68723, 5452],
-    "Machine learning is": [25993, 315, 20443, 11229, 429, 23497, 389, 11220, 25185],
+    "The capital of France is": [12095, 13, 576, 6722, 315, 9856, 374, 19846, 13],
+    "The speed of light is approximately": [400, 18, 1124, 15136, 220, 16, 15, 61, 20],
+    "One plus one equals": [1378, 13, 9043, 5519, 1378, 16819, 3040, 13, 13322],
+    "The largest planet in our solar system is": [49689, 11, 448, 264, 23033, 315, 220, 23, 23],
+    "Water boils at a temperature of": [220, 16, 15, 15, 30937, 13, 1913, 279, 68723],
+    "Machine learning is": [264, 25993, 315, 20443, 11229, 429, 23497, 389, 11220],
 }
 # fmt: on
 
