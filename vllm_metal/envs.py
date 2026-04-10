@@ -70,14 +70,3 @@ def __getattr__(name: str) -> Any:
 def __dir__() -> list[str]:
     # Mirrors vllm/envs.py; enables tab-completion and introspection.
     return list(environment_variables.keys())
-
-
-def is_set(name: str) -> bool:
-    """Check if an environment variable is explicitly set in os.environ.
-
-    Mirrors ``vllm.envs.is_set``; not yet used but kept for parity
-    with upstream so plugin code can adopt it without a new PR.
-    """
-    if name in environment_variables:
-        return name in os.environ
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
