@@ -3,6 +3,7 @@
 
 import pytest
 
+import vllm_metal.envs as envs
 from vllm_metal.config import (
     AUTO_MEMORY_FRACTION,
     MetalConfig,
@@ -15,24 +16,16 @@ class TestMetalConfig:
     """Tests for MetalConfig class."""
 
     @pytest.fixture(autouse=True)
-    def _reset(self):
+    def _reset(self, monkeypatch):
         """Reset config singleton before and after each test."""
+        for var in envs.environment_variables:
+            monkeypatch.delenv(var, raising=False)
         reset_config()
         yield
         reset_config()
 
-    def test_default_config(self, monkeypatch) -> None:
+    def test_default_config(self) -> None:
         """Test default configuration values."""
-        for var in [
-            "VLLM_METAL_MEMORY_FRACTION",
-            "VLLM_METAL_USE_MLX",
-            "VLLM_MLX_DEVICE",
-            "VLLM_METAL_BLOCK_SIZE",
-            "VLLM_METAL_DEBUG",
-            "VLLM_METAL_USE_PAGED_ATTENTION",
-        ]:
-            monkeypatch.delenv(var, raising=False)
-
         config = MetalConfig.from_env()
 
         assert config.memory_fraction == AUTO_MEMORY_FRACTION
