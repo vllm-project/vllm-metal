@@ -77,6 +77,7 @@ from vllm_metal.v1.sampling_batch import (
     sample_from_logits,
     sample_prefill_tokens,
 )
+from vllm_metal.v1.vlm_utils import _vlm_text_model
 
 logger = init_logger(__name__)
 
@@ -311,8 +312,8 @@ class MetalModelRunner:
         require a decomposed encode → feature-fusion → forward pass, following
         the upstream pattern, and is a separate future effort.
         """
-        if self._is_vlm and hasattr(self.model, "language_model"):
-            return self.model.language_model
+        if self._is_vlm:
+            return _vlm_text_model(self.model)
         return self.model
 
     @property

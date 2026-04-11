@@ -28,6 +28,7 @@ def make_stub_runner(
     defaults: dict[str, Any] = {
         "model": object(),
         "_is_stt": False,
+        "_is_vlm": False,
         "_paged_attention_backend": None,
         "_request_states": {},
         "_paged_request_seq_lens": {},
