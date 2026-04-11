@@ -9,7 +9,6 @@ in contrast to the fixed-block layout used by paged attention.
 
 import hashlib
 import math
-import os
 from array import array
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -24,6 +23,8 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
 )
 from vllm.logger import init_logger
+
+import vllm_metal.envs as envs
 
 logger = init_logger(__name__)
 
@@ -46,7 +47,7 @@ AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
 
 def _prefix_cache_enabled() -> bool:
     """Check whether prefix caching is enabled via environment variable."""
-    return "VLLM_METAL_PREFIX_CACHE" in os.environ
+    return envs.VLLM_METAL_PREFIX_CACHE
 
 
 _PREFIX_CACHE_ENABLED = _prefix_cache_enabled()
@@ -55,7 +56,7 @@ _PREFIX_CACHE_DEFAULT_FRACTION = 0.05  # 5% of MLX working set
 
 def _get_prefix_cache_max_bytes() -> int:
     """Get prefix cache memory limit based on MLX recommended working set."""
-    fraction_str = os.environ.get("VLLM_METAL_PREFIX_CACHE_FRACTION", "")
+    fraction_str = envs.VLLM_METAL_PREFIX_CACHE_FRACTION
     if fraction_str:
         try:
             fraction = float(fraction_str)
