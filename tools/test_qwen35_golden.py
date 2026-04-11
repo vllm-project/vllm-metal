@@ -27,6 +27,8 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
+import vllm_metal.envs as envs  # noqa: E402
+
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-4B")
 MAX_TOKENS = 20
 
@@ -152,7 +154,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.gen_golden:
-        paged = os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1"
+        paged = envs.VLLM_METAL_USE_PAGED_ATTENTION
         label = "PAGED" if paged else "MLX"
         print(f"Generating golden tokens ({label} path, {args.model})")
         results = _run_in_subprocess(args.model, args.max_tokens, paged=paged)

@@ -28,6 +28,8 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
+import vllm_metal.envs as envs  # noqa: E402
+
 PROMPTS = [
     "The capital of France is",
     "The weather today is not",
@@ -66,7 +68,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    paged = os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1"
+    paged = envs.VLLM_METAL_USE_PAGED_ATTENTION
     label = "PAGED" if paged else "MLX"
     print(f"\n--- Generating golden values for {label} path ({args.model}) ---\n")
 
