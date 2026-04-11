@@ -25,10 +25,6 @@ import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
-from mlx_lm.models.cache import (
-    KVCache,
-    make_prompt_cache,
-)
 
 # mlx_vlm for vision-language models
 from mlx_vlm import load as mlx_vlm_load
@@ -64,21 +60,15 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.contiguous_cache import (  # noqa: F401 — re-exported for tests
+from vllm_metal.v1 import contiguous_cache
+from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
-    _PREFIX_CACHE_DEFAULT_FRACTION,
     _PREFIX_CACHE_ENABLED,
     AnyCache,
-    ArraysCache,
-    BatchKVCache,
-    BatchRotatingKVCache,
-    CachedPrefix,
+    KVCache,
     PrefixCacheManager,
-    RotatingKVCache,
     _extract_kv_cache,
-    _get_prefix_cache_max_bytes,
     _merge_kv_caches,
-    _prefix_cache_enabled,
 )
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
@@ -841,7 +831,7 @@ class MetalModelRunner:
         )
 
         # Create cache to check if model supports prefix caching
-        cache = make_prompt_cache(cache_model)
+        cache = contiguous_cache.make_prompt_cache(cache_model)
         # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
         supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
 

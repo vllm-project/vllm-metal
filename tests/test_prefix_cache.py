@@ -24,7 +24,7 @@ class TestPrefixCacheHybridGuard:
             model_args={"vocab_size": 100},
             model=MagicMock(),
             _is_vlm=False,
-            _prefix_cache=mr.PrefixCacheManager(max_bytes=1024 * 1024),
+            _prefix_cache=contiguous_cache.PrefixCacheManager(max_bytes=1024 * 1024),
             _sampler=MagicMock(),
         )
 
@@ -33,13 +33,15 @@ class TestPrefixCacheHybridGuard:
         insert_spy = MagicMock()
 
         def fake_make_prompt_cache(model):
-            kv = mr.KVCache()
+            kv = contiguous_cache.KVCache()
             kv.keys = mx.zeros((1, 8, 0, 64))
             kv.values = mx.zeros((1, 8, 0, 64))
             kv.offset = 0
             return [kv, StubArraysCache(), kv]
 
-        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(
+            contiguous_cache, "make_prompt_cache", fake_make_prompt_cache
+        )
 
         runner = self._make_runner()
         monkeypatch.setattr(runner._prefix_cache, "lookup", lookup_spy)
@@ -68,11 +70,13 @@ class TestPrefixCacheHybridGuard:
         insert_spy = MagicMock()
 
         def fake_make_prompt_cache(model):
-            kv = mr.KVCache()
+            kv = contiguous_cache.KVCache()
             kv.state = [mx.zeros((1, 4, 8, 64)), mx.zeros((1, 4, 8, 64))]
             return [kv, kv]
 
-        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(
+            contiguous_cache, "make_prompt_cache", fake_make_prompt_cache
+        )
 
         runner = self._make_runner()
         monkeypatch.setattr(runner._prefix_cache, "lookup", lookup_spy)
@@ -125,9 +129,11 @@ class TestPrefixCacheRestoreOffset:
 
         k = mx.zeros((1, 2, 7, 8), dtype=mx.float32)
         v = mx.zeros((1, 2, 7, 8), dtype=mx.float32)
-        cached = mr.CachedPrefix(token_ids=[1, 2, 3], cache_state=[(k, v)])
+        cached = contiguous_cache.CachedPrefix(
+            token_ids=[1, 2, 3], cache_state=[(k, v)]
+        )
 
-        manager = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        manager = contiguous_cache.PrefixCacheManager(max_bytes=1024 * 1024)
         restored = manager.restore_cache(cached, model=MagicMock(), is_vlm=False)
 
         restored_layer = restored[0]
@@ -155,16 +161,18 @@ class TestHybridCacheMergeExtract:
     _KV_NUM_HEADS = 1
     _KV_HEAD_DIM = 2
 
-    def _make_arrays_cache(self, v0: float | None, v1: float | None) -> mr.ArraysCache:
-        cache = mr.ArraysCache(self._ARRAYS_CACHE_ENTRIES)
+    def _make_arrays_cache(
+        self, v0: float | None, v1: float | None
+    ) -> contiguous_cache.ArraysCache:
+        cache = contiguous_cache.ArraysCache(self._ARRAYS_CACHE_ENTRIES)
         if v0 is not None:
             cache[0] = mx.full((1, self._ARRAYS_CACHE_FEATURES), v0, dtype=mx.float32)
         if v1 is not None:
             cache[1] = mx.full((1, self._ARRAYS_CACHE_FEATURES), v1, dtype=mx.float32)
         return cache
 
-    def _make_kv_cache(self, seq_len: int, value: float) -> mr.KVCache:
-        kv = mr.KVCache()
+    def _make_kv_cache(self, seq_len: int, value: float) -> contiguous_cache.KVCache:
+        kv = contiguous_cache.KVCache()
         kv.keys = mx.full(
             (1, self._KV_NUM_HEADS, seq_len, self._KV_HEAD_DIM),
             value,
@@ -180,8 +188,8 @@ class TestHybridCacheMergeExtract:
 
     def _make_rotating_kv_cache(
         self, *, max_size: int, total_tokens: int, value: float
-    ) -> mr.RotatingKVCache:
-        cache = mr.RotatingKVCache(max_size=max_size)
+    ) -> contiguous_cache.RotatingKVCache:
+        cache = contiguous_cache.RotatingKVCache(max_size=max_size)
         keys = mx.full(
             (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM),
             value,
@@ -201,13 +209,15 @@ class TestHybridCacheMergeExtract:
         arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
         arrays_cache_req1 = self._make_arrays_cache(2.0, 22.0)
 
-        merged = mr._merge_kv_caches([[arrays_cache_req0], [arrays_cache_req1]])
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
-        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+        merged = contiguous_cache._merge_kv_caches(
+            [[arrays_cache_req0], [arrays_cache_req1]]
+        )
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)[0]
 
-        assert isinstance(merged[0], mr.ArraysCache)
-        assert isinstance(extracted_req0, mr.ArraysCache)
-        assert isinstance(extracted_req1, mr.ArraysCache)
+        assert isinstance(merged[0], contiguous_cache.ArraysCache)
+        assert isinstance(extracted_req0, contiguous_cache.ArraysCache)
+        assert isinstance(extracted_req1, contiguous_cache.ArraysCache)
         assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
         assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
         assert bool(mx.allclose(extracted_req1.state[0], arrays_cache_req1.state[0]))
@@ -223,13 +233,15 @@ class TestHybridCacheMergeExtract:
         arrays_cache_req0 = self._make_arrays_cache(1.0, 11.0)
         arrays_cache_req1 = self._make_arrays_cache(2.0, None)
 
-        merged = mr._merge_kv_caches([[arrays_cache_req0], [arrays_cache_req1]])
+        merged = contiguous_cache._merge_kv_caches(
+            [[arrays_cache_req0], [arrays_cache_req1]]
+        )
 
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
-        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)[0]
 
-        assert isinstance(extracted_req0, mr.ArraysCache)
-        assert isinstance(extracted_req1, mr.ArraysCache)
+        assert isinstance(extracted_req0, contiguous_cache.ArraysCache)
+        assert isinstance(extracted_req1, contiguous_cache.ArraysCache)
 
         assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
         assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
@@ -247,22 +259,22 @@ class TestHybridCacheMergeExtract:
         arrays_cache_req0 = self._make_arrays_cache(3.0, 33.0)
         arrays_cache_req1 = self._make_arrays_cache(4.0, 44.0)
 
-        merged = mr._merge_kv_caches(
+        merged = contiguous_cache._merge_kv_caches(
             [[kv_cache_req0, arrays_cache_req0], [kv_cache_req1, arrays_cache_req1]]
         )
-        extracted_req0 = mr._extract_kv_cache(merged, 0)
-        extracted_req1 = mr._extract_kv_cache(merged, 1)
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)
 
-        assert isinstance(merged[0], mr.BatchKVCache)
-        assert isinstance(merged[1], mr.ArraysCache)
+        assert isinstance(merged[0], contiguous_cache.BatchKVCache)
+        assert isinstance(merged[1], contiguous_cache.ArraysCache)
 
         kv_req0_out, arrays_req0_out = extracted_req0
         kv_req1_out, arrays_req1_out = extracted_req1
 
-        assert isinstance(kv_req0_out, mr.KVCache)
-        assert isinstance(kv_req1_out, mr.KVCache)
-        assert isinstance(arrays_req0_out, mr.ArraysCache)
-        assert isinstance(arrays_req1_out, mr.ArraysCache)
+        assert isinstance(kv_req0_out, contiguous_cache.KVCache)
+        assert isinstance(kv_req1_out, contiguous_cache.KVCache)
+        assert isinstance(arrays_req0_out, contiguous_cache.ArraysCache)
+        assert isinstance(arrays_req1_out, contiguous_cache.ArraysCache)
 
         assert kv_req0_out.offset == kv_cache_req0.offset
         assert kv_req1_out.offset == kv_cache_req1.offset
@@ -282,13 +294,13 @@ class TestHybridCacheMergeExtract:
         )
         cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
 
-        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
-        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+        merged = contiguous_cache._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)[0]
 
-        assert isinstance(merged[0], mr.BatchRotatingKVCache)
-        assert isinstance(extracted_req0, mr.RotatingKVCache)
-        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert isinstance(merged[0], contiguous_cache.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, contiguous_cache.RotatingKVCache)
+        assert isinstance(extracted_req1, contiguous_cache.RotatingKVCache)
         assert extracted_req0.offset == cache_req0.offset
         assert extracted_req1.offset == cache_req1.offset
 
@@ -310,13 +322,13 @@ class TestHybridCacheMergeExtract:
         assert cache_req0.offset > cache_req0.max_size
         assert cache_req1.offset > cache_req1.max_size
 
-        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
-        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+        merged = contiguous_cache._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)[0]
 
-        assert isinstance(merged[0], mr.BatchRotatingKVCache)
-        assert isinstance(extracted_req0, mr.RotatingKVCache)
-        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert isinstance(merged[0], contiguous_cache.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, contiguous_cache.RotatingKVCache)
+        assert isinstance(extracted_req1, contiguous_cache.RotatingKVCache)
         assert extracted_req0.offset == cache_req0.offset
         assert extracted_req1.offset == cache_req1.offset
 
@@ -327,7 +339,7 @@ class TestHybridCacheMergeExtract:
         ``max_size``.  The merge must trim to the effective sliding-window length.
         """
         # Prefill 128 tokens into a cache with max_size=70
-        cache_req0 = mr.RotatingKVCache(max_size=70)
+        cache_req0 = contiguous_cache.RotatingKVCache(max_size=70)
         big_k = mx.full(
             (1, self._KV_NUM_HEADS, 128, self._KV_HEAD_DIM), 1.0, dtype=mx.float32
         )
@@ -340,13 +352,13 @@ class TestHybridCacheMergeExtract:
             max_size=70, total_tokens=30, value=2.0
         )
 
-        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
-        extracted_req1 = mr._extract_kv_cache(merged, 1)[0]
+        merged = contiguous_cache._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
+        extracted_req1 = contiguous_cache._extract_kv_cache(merged, 1)[0]
 
-        assert isinstance(merged[0], mr.BatchRotatingKVCache)
-        assert isinstance(extracted_req0, mr.RotatingKVCache)
-        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert isinstance(merged[0], contiguous_cache.BatchRotatingKVCache)
+        assert isinstance(extracted_req0, contiguous_cache.RotatingKVCache)
+        assert isinstance(extracted_req1, contiguous_cache.RotatingKVCache)
         assert extracted_req0.offset == cache_req0.offset
         assert extracted_req1.offset == cache_req1.offset
 
@@ -362,9 +374,9 @@ class TestHybridCacheMergeExtract:
         )
         cache_req1 = self._make_rotating_kv_cache(max_size=8, total_tokens=5, value=2.0)
 
-        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
+        merged = contiguous_cache._merge_kv_caches([[cache_req0], [cache_req1]])
         batch_cache = merged[0]
-        assert isinstance(batch_cache, mr.BatchRotatingKVCache)
+        assert isinstance(batch_cache, contiguous_cache.BatchRotatingKVCache)
 
         # Simulate one batched decode step (S=1)
         decode_k = mx.ones((2, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM))
@@ -375,8 +387,8 @@ class TestHybridCacheMergeExtract:
         extracted_req0 = batch_cache.extract(0)
         extracted_req1 = batch_cache.extract(1)
 
-        assert isinstance(extracted_req0, mr.RotatingKVCache)
-        assert isinstance(extracted_req1, mr.RotatingKVCache)
+        assert isinstance(extracted_req0, contiguous_cache.RotatingKVCache)
+        assert isinstance(extracted_req1, contiguous_cache.RotatingKVCache)
         assert extracted_req0.offset == cache_req0.offset + 1
         assert extracted_req1.offset == cache_req1.offset + 1
 
@@ -396,10 +408,10 @@ class TestHybridCacheMergeExtract:
             max_size=8, total_tokens=150, value=2.0
         )
 
-        merged = mr._merge_kv_caches([[cache_req0], [cache_req1]])
-        extracted_req0 = mr._extract_kv_cache(merged, 0)[0]
+        merged = contiguous_cache._merge_kv_caches([[cache_req0], [cache_req1]])
+        extracted_req0 = contiguous_cache._extract_kv_cache(merged, 0)[0]
 
-        assert isinstance(extracted_req0, mr.RotatingKVCache)
+        assert isinstance(extracted_req0, contiguous_cache.RotatingKVCache)
         assert extracted_req0.offset > extracted_req0.max_size
         assert extracted_req0.keys.shape[2] == extracted_req0.max_size
 
@@ -416,18 +428,18 @@ class TestHybridCacheMergeExtract:
 
     def test_merge_kv_caches_rejects_mixed_cache_types_within_layer(self) -> None:
         arrays_cache = self._make_arrays_cache(1.0, 2.0)
-        kv_cache = mr.KVCache()
+        kv_cache = contiguous_cache.KVCache()
         with pytest.raises(TypeError, match="Mixed cache types in a single layer"):
-            mr._merge_kv_caches([[arrays_cache], [kv_cache]])
+            contiguous_cache._merge_kv_caches([[arrays_cache], [kv_cache]])
 
 
 class TestPrefixCacheEviction:
     def test_eviction_under_max_bytes(self) -> None:
         # 1KB limit
-        mgr = mr.PrefixCacheManager(max_bytes=1024)
+        mgr = contiguous_cache.PrefixCacheManager(max_bytes=1024)
 
         # Create fake KVCache with known size
-        kv = mr.KVCache()
+        kv = contiguous_cache.KVCache()
         k = mx.zeros((1, 4, 8, 64))  # 8192 bytes (float32)
         v = mx.zeros((1, 4, 8, 64))
         kv.state = [k, v]
@@ -437,8 +449,8 @@ class TestPrefixCacheEviction:
         assert len(mgr._cache) == 0
         assert mgr._current_bytes == 0
 
-    def _make_kv(self, seq_len: int = 1) -> mr.KVCache:
-        kv = mr.KVCache()
+    def _make_kv(self, seq_len: int = 1) -> contiguous_cache.KVCache:
+        kv = contiguous_cache.KVCache()
         kv.state = [
             mx.zeros((1, 1, seq_len, 8)),
             mx.zeros((1, 1, seq_len, 8)),
@@ -448,7 +460,7 @@ class TestPrefixCacheEviction:
     def test_eviction_triggers_on_full(self) -> None:
         kv = self._make_kv()
         entry_bytes = kv.state[0].nbytes + kv.state[1].nbytes
-        mgr = mr.PrefixCacheManager(max_bytes=entry_bytes * 2 + 1)
+        mgr = contiguous_cache.PrefixCacheManager(max_bytes=entry_bytes * 2 + 1)
 
         mgr.insert([1], [self._make_kv()])
         mgr.insert([2], [self._make_kv()])
@@ -459,7 +471,7 @@ class TestPrefixCacheEviction:
         assert len(mgr._cache) == 2
 
     def test_duplicate_insert_skipped(self) -> None:
-        mgr = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        mgr = contiguous_cache.PrefixCacheManager(max_bytes=1024 * 1024)
 
         mgr.insert([1, 2], [self._make_kv()])
         bytes_after_first = mgr._current_bytes
@@ -473,11 +485,11 @@ class TestPrefixCacheEnableFlag:
 
     def test_enabled_when_env_set(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE", "1")
-        assert mr._prefix_cache_enabled() is True
+        assert contiguous_cache._prefix_cache_enabled() is True
 
     def test_disabled_when_env_unset(self, monkeypatch) -> None:
         monkeypatch.delenv("VLLM_METAL_PREFIX_CACHE", raising=False)
-        assert mr._prefix_cache_enabled() is False
+        assert contiguous_cache._prefix_cache_enabled() is False
 
 
 _TEN_GB = 10 * 1024**3
@@ -490,53 +502,53 @@ def _mock_device_info():
 class TestPrefixCacheFractionParsing:
     def test_valid_fraction(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "0.1")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
         assert result == int(_TEN_GB * 0.1)
 
     def test_default_fraction(self, monkeypatch) -> None:
         monkeypatch.delenv("VLLM_METAL_PREFIX_CACHE_FRACTION", raising=False)
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_invalid_string_uses_default(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "abc")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_out_of_range_zero_uses_default(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "0")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_out_of_range_above_one_uses_default(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "2")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_nan_uses_default(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "nan")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_inf_uses_default(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_PREFIX_CACHE_FRACTION", "inf")
-        monkeypatch.setattr(mr.mx, "device_info", _mock_device_info)
-        result = mr._get_prefix_cache_max_bytes()
-        assert result == int(_TEN_GB * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        monkeypatch.setattr(contiguous_cache.mx, "device_info", _mock_device_info)
+        result = contiguous_cache._get_prefix_cache_max_bytes()
+        assert result == int(_TEN_GB * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
 
     def test_device_info_fallback(self, monkeypatch) -> None:
         monkeypatch.delenv("VLLM_METAL_PREFIX_CACHE_FRACTION", raising=False)
         monkeypatch.setattr(
-            mr.mx,
+            contiguous_cache.mx,
             "device_info",
             lambda: {},
         )
-        result = mr._get_prefix_cache_max_bytes()
+        result = contiguous_cache._get_prefix_cache_max_bytes()
         fallback = 8 * 1024**3
-        assert result == int(fallback * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+        assert result == int(fallback * contiguous_cache._PREFIX_CACHE_DEFAULT_FRACTION)
