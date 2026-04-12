@@ -3,7 +3,7 @@
 
 import logging
 import platform as py_platform
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import psutil
 import torch
@@ -184,6 +184,17 @@ class MetalPlatform(Platform):
             torch.mps.synchronize()
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Set RNG seed across all devices for Metal platform.
+
+        Args:
+            seed: Random seed value
+        """
+        # MLX handles its own RNG seeding internally.
+        # PyTorch CPU/MPS RNG is handled by the base implementation.
+        pass
+
+    @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
         """Get the corresponding PyTorch device.
 
@@ -302,11 +313,47 @@ class MetalPlatform(Platform):
         return True
 
     @classmethod
+    def _find_non_ssm_backend(cls, vllm_config: "VllmConfig") -> "type[Any] | None":
+        """Return a Metal-specific backend for block_size calculation.
+
+        Since MLX models don't populate static_forward_context, we return
+        a synthetic backend that provides Metal-specific kernel block alignment.
+        """
+        from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+
+        class MetalBackend(AttentionBackend):
+            """Synthetic backend for Metal block_size calculation."""
+
+            @staticmethod
+            def get_name() -> str:
+                return "METAL_ATTN"
+
+            @staticmethod
+            def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+                # Metal paged attention kernels require block_size in {8, 16, 32}
+                return [MultipleOf(32)]
+
+            # Minimal required methods (not used for block_size calculation)
+            @staticmethod
+            def get_impl_cls():
+                raise NotImplementedError
+
+            @staticmethod
+            def get_builder_cls():
+                raise NotImplementedError
+
+            @staticmethod
+            def get_kv_cache_shape(*args, **kwargs):
+                raise NotImplementedError
+
+        return MetalBackend
+
+    @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Update block_size for Metal platform.
 
-        Delegates to vLLM's base implementation for standard block_size calculation,
-        then applies Metal-specific adjustments for paged attention on hybrid models.
+        Delegates to vLLM's base implementation, which uses our overridden
+        _find_non_ssm_backend to get Metal-specific kernel block alignment.
         """
         from vllm_metal.config import get_config
 
@@ -350,33 +397,29 @@ class MetalPlatform(Platform):
                 "for hybrid models as it has no translation overhead."
             )
 
-        # Call base implementation to handle:
-        # - Phase 1: Set preferred block_size (if user didn't specify)
-        # - Phase 2: For hybrid models, align block_size with mamba page sizes
+        # Call base implementation - it will use our _find_non_ssm_backend
+        # which returns MetalBackend with kernel_block_alignment_size=32
         super().update_block_size_for_backend(vllm_config)
 
         # Metal-specific adjustment: For hybrid models with paged attention,
-        # ensure kernel_block_alignment_size=32 is used for Metal GPU performance.
+        # ensure block_size is a multiple of 32 for Metal GPU performance.
         # The base class uses the backend's supported block sizes, but Metal
         # paged attention kernels require block_size in {8, 16, 32}.
         #
         # Note: This has no impact on MLX execution (MLX manages its own KV cache
         # via make_prompt_cache()). This adjustment is only for vLLM's validation.
         if (
-            model_config.is_hybrid
-            and metal_config.use_paged_attention
+            metal_config.use_paged_attention
             and cache_config.block_size > 0
+            and cache_config.block_size % 32 != 0
         ):
-            # Verify the block_size is a multiple of 32 (Metal kernel requirement)
-            # The base class already ensures this, but we double-check for safety
-            if cache_config.block_size % 32 != 0:
-                logger.warning(
-                    "Metal paged attention requires block_size to be a multiple "
-                    "of 32. Adjusting from %d to %d.",
-                    cache_config.block_size,
-                    ((cache_config.block_size + 31) // 32) * 32,
-                )
-                cache_config.block_size = ((cache_config.block_size + 31) // 32) * 32
+            logger.warning(
+                "Metal paged attention requires block_size to be a multiple "
+                "of 32. Adjusting from %d to %d.",
+                cache_config.block_size,
+                ((cache_config.block_size + 31) // 32) * 32,
+            )
+            cache_config.block_size = ((cache_config.block_size + 31) // 32) * 32
 
     @classmethod
     def get_attn_backend_cls(
