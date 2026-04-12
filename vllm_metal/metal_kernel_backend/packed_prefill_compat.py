@@ -39,6 +39,7 @@ def apply_packed_rope(
     keys: mx.array,
     cu_seqlens: list[int],
     offsets: list[int] | None = None,
+    apply_keys: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Apply per-request RoPE for packed sequences.
 
@@ -47,6 +48,9 @@ def apply_packed_rope(
     segment starts at position 0 (pure prefill).  For unified prefill+decode
     batches, decode segments carry ``offset=seq_len`` while prefill segments
     keep ``offset=0``.
+
+    When ``apply_keys`` is False, keys are returned unchanged (used by
+    YOCO KV sharing where keys arrive already RoPE'd from a prior layer).
 
     Supports both mlx_lm's ``rope(x, offset=)`` API and mlx_vlm's
     ``rotary_emb(x, position_ids)`` M-RoPE API (Qwen3.5).
@@ -61,16 +65,21 @@ def apply_packed_rope(
         end = cu_seqlens[i + 1]
         off = offsets[i] if offsets is not None else 0
         q_seg = queries[:, :, start:end, :]
-        k_seg = keys[:, :, start:end, :]
 
         if rope_fn is not None:
             # mlx_lm API: rope(x, offset=off) → rotated_x
             q_parts.append(rope_fn(q_seg, offset=off))
-            k_parts.append(rope_fn(k_seg, offset=off))
+            if apply_keys:
+                k_seg = keys[:, :, start:end, :]
+                k_parts.append(rope_fn(k_seg, offset=off))
         else:
             # mlx_vlm M-RoPE API: rotary_emb(x, position_ids) → (cos, sin)
+            k_seg = keys[:, :, start:end, :]
             q_rot, k_rot = _apply_mrope_segment(rotary_emb, q_seg, k_seg, off)
             q_parts.append(q_rot)
-            k_parts.append(k_rot)
+            if apply_keys:
+                k_parts.append(k_rot)
 
-    return mx.concatenate(q_parts, axis=2), mx.concatenate(k_parts, axis=2)
+    rotated_q = mx.concatenate(q_parts, axis=2) if q_parts else queries
+    rotated_k = mx.concatenate(k_parts, axis=2) if apply_keys and k_parts else keys
+    return rotated_q, rotated_k

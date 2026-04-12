@@ -70,6 +70,10 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
+from vllm_metal.v1.model_compat import (
+    resolve_max_head_dim,
+    should_force_text_backbone,
+)
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
@@ -363,7 +367,9 @@ class MetalModelRunner:
         Returns:
             True if the model is multimodal/VLM, False otherwise
         """
-        # Check vLLM's multimodal detection
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if hf_config is not None and should_force_text_backbone(hf_config):
+            return False
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
         return False
@@ -558,6 +564,7 @@ class MetalModelRunner:
             if hidden_size and num_attention_heads
             else None
         )
+        head_dim = resolve_max_head_dim(args, head_dim)
 
         # Fail fast if critical dims are missing
         missing = []

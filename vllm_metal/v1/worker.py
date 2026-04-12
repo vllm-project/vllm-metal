@@ -32,6 +32,7 @@ from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import set_wired_limit
+from vllm_metal.v1.model_compat import require_uniform_kv_heads
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import (
@@ -176,6 +177,8 @@ class MetalWorker(WorkerBase):
         max_model_len.
         """
         runner = self.model_runner
+        require_uniform_kv_heads(runner.model_args, runner.num_kv_heads)
+
         # Use cache_config.block_size (not metal_config) because vLLM's
         # hybrid alignment may have adjusted it to match mamba page size.
         block_size = self.vllm_config.cache_config.block_size

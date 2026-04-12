@@ -6,12 +6,21 @@ between ``n_heads`` (queries) and ``n_kv_heads`` (keys/values) is handled
 transparently by the Metal paged attention kernel.
 
 Handles models whose attention module exposes:
-- ``q_proj``, ``k_proj``, ``v_proj``, ``o_proj`` linear projections
-- ``rope`` for rotary position embeddings
+- ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
+  see K-eq-V variant below)
+- ``rope`` or ``rotary_emb`` for rotary position embeddings
 - ``n_heads``, ``n_kv_heads`` head counts
-- Optionally ``q_norm``, ``k_norm`` (Qwen3 per-head RMSNorm before RoPE)
+- Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
 
-Covers: Qwen3, Llama, Mistral, and other standard transformer architectures.
+Gemma4 variants (see :func:`prepare_sdpa_qkv`):
+- **YOCO**: later layers reuse K/V from a reference layer via ``shared_kv``.
+- **K-eq-V**: 26B/31B drop ``v_proj`` and reuse ``keys`` as ``values``.
+- **Variable head_dim**: sliding vs. full-attention layers use different
+  head_dim; Q/K/V are zero-padded up to the cache's allocated head_dim
+  via :func:`pad_qkv_to_cache_head_dim`.
+
+Covers: Qwen3, Qwen3.5, Llama, Mistral, Gemma, Gemma4, and other
+RoPE-based transformer architectures.
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 """
@@ -99,6 +108,209 @@ def _build_block_tables(
     return expanded, kernel_bs
 
 
+# === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
+
+
+def prepare_sdpa_qkv(
+    inner: nn.Module,
+    x: mx.array,
+    ctx: PagedAttentionContext,
+    n_heads: int,
+    n_kv_heads: int,
+    shared_kv: tuple[mx.array, mx.array] | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
+    """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
+
+    Handles three Gemma4-specific branches:
+
+    - **YOCO** (``shared_kv`` given): reuse K/V from a prior layer; skip
+      projection and only apply Q norm + RoPE.
+    - **K-eq-V** (no ``inner.v_proj``): 26B/31B checkpoints share the
+      projection so ``values`` references the same tensor as ``keys``.
+    - **v_norm** (``inner.v_norm`` present): apply per-head RMSNorm to
+      values alongside q_norm and k_norm.
+
+    Args:
+        inner: mlx_lm Attention module (or compatible).
+        x: Input hidden states shaped ``(B, L, D)``.
+        ctx: Paged attention context (supplies ``cu_seqlens`` / offsets
+            for per-request RoPE).
+        n_heads: Query head count.
+        n_kv_heads: K/V head count.
+        shared_kv: Optional ``(keys, values)`` from a reference layer,
+            already normed and RoPE'd, in ``(B, H, L, head_dim)`` layout.
+
+    Returns:
+        Tuple ``(queries, keys, values, gate, kv_for_sharing)``:
+
+        - ``queries``, ``keys``, ``values``: ``(B, H, L, head_dim)`` tensors
+          ready for the Metal kernel.
+        - ``gate``: optional gate tensor for gated attention (Qwen3.5
+          Qwen3Next style), else ``None``.
+        - ``kv_for_sharing``: the post-norm+RoPE ``(keys, values)`` pair so
+          the caller can forward them to the next YOCO layer.
+
+    Raises:
+        NotImplementedError: If ``inner`` has neither ``rope`` nor
+            ``rotary_emb`` (only RoPE-based models are supported).
+    """
+    B, L, _ = x.shape  # noqa: N806
+
+    # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
+    q_proj_out = inner.q_proj(x)
+    gate: mx.array | None = None
+    head_dim = inner.k_proj.weight.shape[0] // n_kv_heads
+    q_full_head = q_proj_out.shape[-1] // n_heads
+    if q_full_head == 2 * head_dim:
+        q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
+        queries, gate = mx.split(q_reshaped, 2, axis=-1)
+        gate = gate.reshape(B, L, -1)
+    else:
+        queries = q_proj_out.reshape(B, L, n_heads, -1)
+
+    if shared_kv is not None:
+        # YOCO: reuse K/V from a reference layer.  Q still needs norm + RoPE.
+        keys, values = shared_kv
+        if hasattr(inner, "q_norm"):
+            queries = inner.q_norm(queries)
+        queries = queries.transpose(0, 2, 1, 3)
+        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
+            raise NotImplementedError(
+                f"Attention module {type(inner).__name__} does not have a "
+                "'rope' or 'rotary_emb' attribute."
+            )
+        queries, _ = apply_packed_rope(
+            inner,
+            queries,
+            keys,
+            ctx.cu_seqlens,
+            offsets=ctx.offsets if ctx.offsets else None,
+            apply_keys=False,
+        )
+    else:
+        keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
+        # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
+        if hasattr(inner, "v_proj"):
+            values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
+        else:
+            values = keys
+
+        # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4).
+        if hasattr(inner, "q_norm"):
+            queries = inner.q_norm(queries)
+        if hasattr(inner, "k_norm"):
+            keys = inner.k_norm(keys)
+        if hasattr(inner, "v_norm"):
+            values = inner.v_norm(values)
+
+        # Transpose to (B, H, L, head_dim).
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
+        values = values.transpose(0, 2, 1, 3)
+
+        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
+            raise NotImplementedError(
+                f"Attention module {type(inner).__name__} does not have a "
+                "'rope' or 'rotary_emb' attribute."
+            )
+        queries, keys = apply_packed_rope(
+            inner,
+            queries,
+            keys,
+            ctx.cu_seqlens,
+            offsets=ctx.offsets if ctx.offsets else None,
+        )
+
+    kv_for_sharing = (keys, values)
+    return queries, keys, values, gate, kv_for_sharing
+
+
+# === Variable head_dim helpers (Gemma4) ===
+
+
+def pad_qkv_to_cache_head_dim(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    head_dim: int,
+    cache_head_dim: int,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Zero-pad Q/K/V on the last axis up to ``cache_head_dim``.
+
+    Variable head_dim models (e.g. Gemma4 sliding=256, full=512) allocate
+    the paged KV cache at the max head_dim.  Layers with smaller head_dim
+    are padded so scatter writes and the kernel both operate at the cache's
+    native head_dim.  Zero-padded positions do not affect QK dot products
+    or V aggregation.  No-op when ``head_dim == cache_head_dim``.
+
+    Args:
+        queries, keys, values: Tensors shaped ``(B, H, L, head_dim)``.
+        head_dim: Current layer's head_dim.
+        cache_head_dim: Cache's allocated head_dim (the target).
+
+    Returns:
+        Padded ``(queries, keys, values)``.
+
+    Raises:
+        ValueError: If ``head_dim > cache_head_dim`` (unsupported), or if
+            ``queries`` / ``keys`` / ``values`` do not share the same last
+            dimension (caller invariant).
+    """
+    if not (queries.shape[-1] == keys.shape[-1] == values.shape[-1] == head_dim):
+        raise ValueError(
+            "Q/K/V last-dim mismatch: "
+            f"q={queries.shape[-1]}, k={keys.shape[-1]}, "
+            f"v={values.shape[-1]}, head_dim={head_dim}"
+        )
+    if head_dim == cache_head_dim:
+        return queries, keys, values
+    if head_dim > cache_head_dim:
+        raise ValueError(
+            f"head_dim={head_dim} exceeds cache_head_dim={cache_head_dim}; "
+            f"cache must be sized for the largest per-layer head_dim."
+        )
+    pad_spec = [(0, 0), (0, 0), (0, 0), (0, cache_head_dim - head_dim)]
+    return (
+        mx.pad(queries, pad_spec),
+        mx.pad(keys, pad_spec),
+        mx.pad(values, pad_spec),
+    )
+
+
+def truncate_padded_output(
+    out: mx.array,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    cache_head_dim: int,
+    actual_head_dim: int,
+) -> mx.array:
+    """Reshape kernel output and strip padding back to ``actual_head_dim``.
+
+    Inverse of :func:`pad_qkv_to_cache_head_dim`: before the output goes to
+    ``o_proj``, we slice off the zero-padded tail so the trailing
+    projection sees the layer's real head_dim.  No-op when the layer was
+    never padded (``actual_head_dim == cache_head_dim``).
+
+    Args:
+        out: Kernel output shaped ``(seq_len, n_heads, cache_head_dim)``.
+        batch_size: Batch size (typically 1 for packed sequences).
+        seq_len: Total tokens in the packed sequence.
+        n_heads: Number of query heads.
+        cache_head_dim: Head_dim the kernel operated on.
+        actual_head_dim: Layer's original head_dim before padding.
+
+    Returns:
+        Flat output shaped ``(batch_size, seq_len, n_heads * actual_head_dim)``.
+    """
+    if actual_head_dim == cache_head_dim:
+        return out.reshape(batch_size, seq_len, n_heads * cache_head_dim)
+    out = out.reshape(batch_size, seq_len, n_heads, cache_head_dim)[
+        ..., :actual_head_dim
+    ]
+    return out.reshape(batch_size, seq_len, n_heads * actual_head_dim)
+
+
 # === SDPA forward ===
 
 
@@ -108,69 +320,42 @@ def sdpa_forward(
     ctx: PagedAttentionContext,
     kv_cache: MetalPagedKVCache,
     layer_idx: int,
-) -> mx.array:
+    shared_kv: tuple[mx.array, mx.array] | None = None,
+) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
     the broadcast internally.
+
+    Returns:
+        Tuple of (output, kv_pair) where kv_pair is (keys, values)
+        after norm + RoPE, for YOCO KV sharing across layers.
     """
-    B, L, D = x.shape  # noqa: N806
+    B, L, _ = x.shape  # noqa: N806
 
     # Resolve head counts — mlx_lm uses different attribute names:
-    #   Qwen3/Llama/Gemma: n_heads, n_kv_heads
-    #   Qwen3.5 (Qwen3Next): num_attention_heads, num_key_value_heads
+    #   Qwen3/Llama/Gemma/Gemma4: n_heads, n_kv_heads
+    #   Qwen3.5 (Qwen3Next):      num_attention_heads, num_key_value_heads
     n_heads = getattr(inner, "n_heads", None) or inner.num_attention_heads
     n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
 
-    # --- Projections + reshape ---
-    # Qwen3.5 (Qwen3Next) uses gated attention: q_proj outputs 2x head_dim,
-    # split into queries (for attention) + gate (applied after attention).
-    q_proj_out = inner.q_proj(x)
-    gate = None
-    head_dim = inner.k_proj.weight.shape[0] // n_kv_heads
-    q_full_head = q_proj_out.shape[-1] // n_heads
-    if q_full_head == 2 * head_dim:
-        # Gated: split into queries + gate
-        q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
-        queries, gate = mx.split(q_reshaped, 2, axis=-1)
-        gate = gate.reshape(B, L, -1)
-    else:
-        queries = q_proj_out.reshape(B, L, n_heads, -1)
-
-    keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
-    values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
-
-    # Per-head RMSNorm before RoPE (Qwen3, Qwen3.5)
-    if hasattr(inner, "q_norm"):
-        queries = inner.q_norm(queries)
-    if hasattr(inner, "k_norm"):
-        keys = inner.k_norm(keys)
-
-    # transpose → (B, heads, L, head_dim)
-    queries = queries.transpose(0, 2, 1, 3)
-    keys = keys.transpose(0, 2, 1, 3)
-    values = values.transpose(0, 2, 1, 3)
-
-    # --- RoPE (per-request position reset) ---
-    # mlx_lm uses "rope", mlx_vlm Qwen3.5 uses "rotary_emb"
-    if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-        raise NotImplementedError(
-            f"Attention module {type(inner).__name__} does not have a 'rope' "
-            "or 'rotary_emb' attribute. Only RoPE-based models are supported."
-        )
-
-    queries, keys = apply_packed_rope(
-        inner,
-        queries,
-        keys,
-        ctx.cu_seqlens,
-        offsets=ctx.offsets if ctx.offsets else None,
+    queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
+        inner, x, ctx, n_heads, n_kv_heads, shared_kv
     )
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]
     head_dim = queries.shape[3]
+
+    # Variable head_dim models (e.g. Gemma4): pad Q/K/V to the cache's
+    # allocated head_dim.  Output is truncated back before o_proj.
+    cache_head_dim = kv_cache.head_dim
+    actual_head_dim = head_dim
+    queries, keys, values = pad_qkv_to_cache_head_dim(
+        queries, keys, values, head_dim, cache_head_dim
+    )
+    head_dim = cache_head_dim
 
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(kv_cache.dtype))
@@ -255,8 +440,8 @@ def sdpa_forward(
         out,
     )
 
-    # output: (L, n_heads, head_dim) → (B, L, n_heads * head_dim)
-    out = out.reshape(B, L, n_heads * head_dim)
+    # Reshape + strip padding back to actual head_dim before o_proj.
+    out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
     if gate is not None:
         out = out * mx.sigmoid(gate)
-    return inner.o_proj(out)
+    return inner.o_proj(out), kv_for_sharing
