@@ -174,7 +174,7 @@ class TestUpdateBlockSizeForBackend:
 
     def test_paged_attention_logs_warning(self, vllm_config):
         """Test: Hybrid + paged attention logs warning about block-size translation.
-        
+
         Note: We verify the warning is logged by checking that the method completes
         without error when paged attention is enabled. The actual logging is verified
         manually or through integration tests since vllm's logging goes to stdout.
