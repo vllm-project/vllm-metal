@@ -7,8 +7,7 @@ Tests cover:
 3. Metal-specific adjustments (block_size multiple of 32 for paged attention)
 """
 
-import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
@@ -67,13 +66,11 @@ class TestUpdateBlockSizeForBackend:
     @pytest.fixture
     def base_cache_config(self):
         """Create a base CacheConfig mock for testing."""
-        cache_config = CacheConfig(
-            block_size=16,
-            gpu_memory_utilization=0.9,
-            cache_dtype="auto",
-        )
-        # Override user_specified_block_size to allow adjustments
+        cache_config = MagicMock(spec=CacheConfig)
+        cache_config.block_size = 16
         cache_config.user_specified_block_size = False
+        cache_config.gpu_memory_utilization = 0.9
+        cache_config.cache_dtype = "auto"
         cache_config.mamba_cache_mode = "none"
         cache_config.mamba_block_size = None
         cache_config.mamba_page_size_padded = None
@@ -84,46 +81,26 @@ class TestUpdateBlockSizeForBackend:
         """Create a base ModelConfig mock for testing."""
         import torch
 
-        model_config = ModelConfig(
-            model="test-model",
-            task="auto",
-            tokenizer="test-tokenizer",
-            tokenizer_mode="auto",
-            trust_remote_code=False,
-            dtype=torch.float16,
-            seed=0,
-            revision=None,
-            code_revision=None,
-            rope_scaling=None,
-            rope_theta=None,
-            tokenizer_revision=None,
-            max_model_len=512,
-            quantization=None,
-            quantization_param_path=None,
-            enforce_eager=False,
-            max_seq_len_to_capture=None,
-            max_logprobs=10,
-            disable_sliding_window=False,
-            top_p=1.0,
-            top_k=-1,
-        )
+        model_config = MagicMock(spec=ModelConfig)
         model_config.is_hybrid = True
         model_config.architecture = "Qwen3_5ForCausalLM"
+        model_config.dtype = torch.float16
+        model_config.max_model_len = 512
+        model_config.get_num_kv_heads.return_value = 8
+        model_config.get_head_size.return_value = 128
         return model_config
 
     @pytest.fixture
     def vllm_config(self, base_cache_config, base_model_config):
         """Create a complete VllmConfig for hybrid model testing."""
-        parallel_config = ParallelConfig(
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-        )
+        parallel_config = MagicMock(spec=ParallelConfig)
+        parallel_config.tensor_parallel_size = 1
+        parallel_config.pipeline_parallel_size = 1
 
-        config = VllmConfig(
-            model_config=base_model_config,
-            cache_config=base_cache_config,
-            parallel_config=parallel_config,
-        )
+        config = MagicMock(spec=VllmConfig)
+        config.model_config = base_model_config
+        config.cache_config = base_cache_config
+        config.parallel_config = parallel_config
         return config
 
     # ========================================================================
@@ -161,11 +138,10 @@ class TestUpdateBlockSizeForBackend:
 
     def test_model_config_none(self):
         """Test: None model_config returns early without error."""
-        config = VllmConfig(
-            model_config=None,  # type: ignore
-            cache_config=CacheConfig(block_size=16, gpu_memory_utilization=0.9),
-            parallel_config=ParallelConfig(),
-        )
+        cache_config = MagicMock(spec=CacheConfig)
+        config = MagicMock(spec=VllmConfig)
+        config.model_config = None
+        config.cache_config = cache_config
 
         # Execute (should not raise)
         MetalPlatform.update_block_size_for_backend(config)
@@ -182,15 +158,12 @@ class TestUpdateBlockSizeForBackend:
         When paged attention is enabled, block_size should be adjusted
         to be a multiple of 32 for Metal GPU kernel compatibility.
         """
-        from vllm_metal.config import MetalConfig
-
         # Set block_size to a value not divisible by 32
-        vllm_config.cache_config.block_size = 160  # 160 % 32 = 0, use 48
         vllm_config.cache_config.block_size = 48  # 48 % 32 = 16, should adjust to 64
 
         # Mock metal config with paged attention enabled
         with patch("vllm_metal.config.get_config") as mock_get_config:
-            mock_metal_config = MetalConfig()
+            mock_metal_config = MagicMock()
             mock_metal_config.use_paged_attention = True
             mock_get_config.return_value = mock_metal_config
 
@@ -201,37 +174,24 @@ class TestUpdateBlockSizeForBackend:
 
     def test_paged_attention_logs_warning(self, vllm_config, caplog):
         """Test: Hybrid + paged attention logs warning about block-size translation."""
-        from vllm_metal.config import MetalConfig
+        with patch("vllm_metal.config.get_config") as mock_get_config:
+            mock_metal_config = MagicMock()
+            mock_metal_config.use_paged_attention = True
+            mock_get_config.return_value = mock_metal_config
 
-        platform_logger = logging.getLogger("vllm_metal.platform")
-        original_level = platform_logger.level
-        platform_logger.addHandler(caplog.handler)
-        platform_logger.setLevel(logging.WARNING)
+            MetalPlatform.update_block_size_for_backend(vllm_config)
 
-        try:
-            with patch("vllm_metal.config.get_config") as mock_get_config:
-                mock_metal_config = MetalConfig()
-                mock_metal_config.use_paged_attention = True
-                mock_get_config.return_value = mock_metal_config
-
-                MetalPlatform.update_block_size_for_backend(vllm_config)
-
-                # Verify warning was logged
-                assert "block-size translation" in caplog.text
-                assert "PR #235" in caplog.text
-        finally:
-            platform_logger.removeHandler(caplog.handler)
-            platform_logger.setLevel(original_level)
+            # Verify warning was logged
+            assert "block-size translation" in caplog.text
+            assert "PR #235" in caplog.text
 
     def test_no_adjustment_when_already_multiple_of_32(self, vllm_config, caplog):
         """Test: No adjustment when block_size is already multiple of 32."""
-        from vllm_metal.config import MetalConfig
-
         # Set block_size to multiple of 32
         vllm_config.cache_config.block_size = 64
 
         with patch("vllm_metal.config.get_config") as mock_get_config:
-            mock_metal_config = MetalConfig()
+            mock_metal_config = MagicMock()
             mock_metal_config.use_paged_attention = True
             mock_get_config.return_value = mock_metal_config
 
