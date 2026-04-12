@@ -42,7 +42,7 @@ def _build_linear_layer_spec(
     key_head_dim: int,
     torch_dtype: torch.dtype,
     page_size_padded: int | None = None,
-    block_size: int = 1,
+    block_size: int,
 ) -> MambaSpec:
     """Build a MambaSpec for one GDN linear attention layer.
 
