@@ -302,58 +302,19 @@ class MetalPlatform(Platform):
         return True
 
     @classmethod
-    def update_block_size_for_backend(
-        cls,
-        vllm_config,
-    ) -> None:
-        """Update block_size to unify page sizes for hybrid models.
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        """Update block_size for Metal platform.
 
-        Hybrid models (e.g., Qwen3.5) have two types of layers:
-        - SDPA layers: page_size scales with block_size
-        - Mamba/linear layers: page_size is fixed
-
-        vLLM requires all layer page sizes to be divisible. This method adjusts
-        block_size and sets mamba_page_size_padded to satisfy vLLM's validation.
-
-        Note:
-            This is a "logical" fix for vLLM's scheduler validation only.
-            The Metal plugin manages KV cache internally via MLX's make_prompt_cache(),
-            independent of vLLM's block_size and page_size calculations.
-            These parameters are used only to pass vLLM's initialization checks.
-
-        Steps:
-        1. Compute attention page size per token (MLAAttentionSpec or FullAttentionSpec)
-        2. Get Mamba page size from model class
-        3. Calculate block_size so SDPA page_size >= Mamba page_size
-        4. Sync mamba_block_size if using align mode
-        5. Pad mamba_page_size to match SDPA page_size exactly
-
-        Args:
-            vllm_config: vLLM configuration (modified in-place for vLLM validation)
-
-        Raises:
-            ValueError: If hybrid model is used with paged attention on Metal,
-                        or if computed mamba_page_size is zero
-            Exception: Model class resolution or mamba state query failures
+        Delegates to vLLM's base implementation for standard block_size calculation,
+        then applies Metal-specific adjustments for paged attention on hybrid models.
         """
-        from vllm.model_executor.models import ModelRegistry
-        from vllm.utils.math_utils import cdiv
-        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-        from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
-            MambaSpec,
-            MLAAttentionSpec,
-        )
+        from vllm_metal.config import get_config
 
+        metal_config = get_config()
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
         if not model_config:
-            return
-
-        # Skip non-hybrid models
-        is_hybrid = getattr(model_config, "is_hybrid", False)
-        if not is_hybrid:
             return
 
         # For hybrid models with paged attention, log a warning explaining the
@@ -376,10 +337,7 @@ class MetalPlatform(Platform):
         #
         # This is a logical transformation only — the computation is identical, just
         # the kernel sees more, smaller blocks.
-        from vllm_metal.config import get_config
-
-        metal_config = get_config()
-        if metal_config.use_paged_attention:
+        if model_config.is_hybrid and metal_config.use_paged_attention:
             logger.warning(
                 "Hybrid model (e.g., Qwen3.5) with paged attention enabled. "
                 "Using block-size translation (PR #235) to convert vLLM's large "
@@ -392,100 +350,33 @@ class MetalPlatform(Platform):
                 "for hybrid models as it has no translation overhead."
             )
 
-        # Step 1: Compute attention page size per token
-        # Handle cache_dtype conversion
-        if cache_config.cache_dtype == "auto":
-            kv_cache_dtype = model_config.dtype
-        else:
-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        # Call base implementation to handle:
+        # - Phase 1: Set preferred block_size (if user didn't specify)
+        # - Phase 2: For hybrid models, align block_size with mamba page sizes
+        super().update_block_size_for_backend(vllm_config)
 
-        # Use MLAAttentionSpec for MLA models, FullAttentionSpec otherwise
-        spec_class = (
-            MLAAttentionSpec
-            if getattr(model_config, "use_mla", False)
-            else FullAttentionSpec
-        )
-        attn_page_size_1_token = spec_class(
-            block_size=1,
-            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
-            head_size=model_config.get_head_size(),
-            dtype=kv_cache_dtype,
-        ).page_size_bytes
-
-        # Step 2: Get Mamba page size (fixed, independent of block_size)
-        try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                model_config.architecture,
-                model_config=model_config,
-            )
-            mamba_state_shape = model_cls.get_mamba_state_shape_from_config(vllm_config)
-            mamba_state_dtype = model_cls.get_mamba_state_dtype_from_config(vllm_config)
-
-            mamba_page_size = MambaSpec(
-                shapes=mamba_state_shape,
-                dtypes=mamba_state_dtype,
-                block_size=-1,
-            ).page_size_bytes
-        except Exception as e:
-            # For hybrid models, re-raise exception instead of silently returning
-            logger.error(
-                "Failed to get mamba state for hybrid model %s: %s",
-                model_config.architecture,
-                e,
-            )
-            raise
-
-        if mamba_page_size == 0:
-            raise ValueError(
-                f"Computed mamba_page_size is zero for hybrid model "
-                f"{model_config.architecture}"
-            )
-
-        # Step 3: Calculate block_size so SDPA page_size >= Mamba page_size
-        # Use the same formula as vLLM's CPU platform for consistency
+        # Metal-specific adjustment: For hybrid models with paged attention,
+        # ensure kernel_block_alignment_size=32 is used for Metal GPU performance.
+        # The base class uses the backend's supported block sizes, but Metal
+        # paged attention kernels require block_size in {8, 16, 32}.
         #
-        # Note: kernel_block_alignment_size=32 is chosen for Metal GPU performance.
-        # Common Metal threadgroup sizes are multiples of 32 (e.g., 32, 64, 128, 256).
-        # However, this value has no actual impact on MLX execution because:
-        # - MLX manages its own KV cache via make_prompt_cache()
-        # - This block_size is only used to satisfy vLLM's validation logic
-        # - The actual Metal kernel uses MLX's native memory layout
-        #
-        # Using 32 provides a reasonable balance between:
-        # - GPU performance (aligned to Metal threadgroup preferences)
-        # - Memory efficiency (not excessively large)
-        # - Compatibility with vLLM's page size unification requirements
-        kernel_block_alignment_size = 32  # Metal GPU kernel alignment
-        attn_block_size = kernel_block_alignment_size * cdiv(
-            mamba_page_size,
-            kernel_block_alignment_size * attn_page_size_1_token,
-        )
-
-        if cache_config.block_size < attn_block_size:
-            cache_config.block_size = attn_block_size
-            logger.info(
-                "Setting attention block size to %d tokens "
-                "to ensure that attention page size is >= mamba page size.",
-                attn_block_size,
-            )
-
-        # Step 4: Sync mamba_block_size if using align mode
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
-
-        # Step 5: Pad Mamba page size to exactly match SDPA page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
-        if attn_page_size > mamba_page_size:
-            cache_config.mamba_page_size_padded = attn_page_size
-            mamba_padding_pct = (
-                100 * (attn_page_size - mamba_page_size) / mamba_page_size
-            )
-            logger.info(
-                "Padding mamba page size by %.2f%% to ensure "
-                "that mamba page size and attention page size are "
-                "exactly equal.",
-                mamba_padding_pct,
-            )
+        # Note: This has no impact on MLX execution (MLX manages its own KV cache
+        # via make_prompt_cache()). This adjustment is only for vLLM's validation.
+        if (
+            model_config.is_hybrid
+            and metal_config.use_paged_attention
+            and cache_config.block_size > 0
+        ):
+            # Verify the block_size is a multiple of 32 (Metal kernel requirement)
+            # The base class already ensures this, but we double-check for safety
+            if cache_config.block_size % 32 != 0:
+                logger.warning(
+                    "Metal paged attention requires block_size to be a multiple "
+                    "of 32. Adjusting from %d to %d.",
+                    cache_config.block_size,
+                    ((cache_config.block_size + 31) // 32) * 32,
+                )
+                cache_config.block_size = ((cache_config.block_size + 31) // 32) * 32
 
     @classmethod
     def get_attn_backend_cls(
