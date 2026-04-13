@@ -378,8 +378,17 @@ class MetalPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Update block_size for Metal platform.
 
-        Delegates to vLLM's base implementation, which uses our overridden
-        _find_non_ssm_backend to get Metal-specific kernel block alignment.
+        Compatibility note:
+        - vLLM 0.19.0 (currently supported): Block size is configured during
+          VllmConfig initialization, so this method is not strictly required.
+          However, we still implement it for forward compatibility.
+        - Latest vLLM: The block_size calculation logic was moved to use
+          Platform.update_block_size_for_backend() in the base class.
+
+        This implementation delegates to super().update_block_size_for_backend()
+        to support both versions. Our overridden _find_non_ssm_backend provides
+        the Metal-specific kernel block alignment (MultipleOf(32)) that the base
+        class uses for hybrid model block_size calculation.
         """
         from vllm_metal.config import get_config
 
