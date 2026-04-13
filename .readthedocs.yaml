@@ -14,6 +14,10 @@ build:
       - uv venv $READTHEDOCS_VIRTUALENV_PATH
     install:
       - uv pip install --python $READTHEDOCS_VIRTUALENV_PATH/bin/python --no-cache-dir -r docs/requirements-docs.txt
+    pre_build:
+      - mkdir -p docs/assets/logos
+      - curl -fsSL -o docs/assets/logos/vllm-logo-only-light.ico https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-only-light.ico
+      - curl -fsSL -o docs/assets/logos/vllm-logo-only-light.png https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-only-light.png
 
 mkdocs:
   configuration: mkdocs.yaml

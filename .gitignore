@@ -151,3 +151,6 @@ Cargo.lock
 *.bin
 *.safetensors
 *.gguf
+
+# Docs assets fetched at build time
+docs/assets/logos/
