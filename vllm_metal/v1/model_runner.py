@@ -647,10 +647,9 @@ class MetalModelRunner:
     def _gdn_free_slot(self, req_id: str, *, materialize_state: bool = True) -> None:
         """Release a GDN state pool slot.
 
-        Materializes conv/recurrent state arrays to detach them from the
-        previous request's lazy computation graph.  Actual zeroing is
-        deferred to ``_gdn_alloc_slot`` (alloc-time zeroing) so that
-        each slot is zeroed exactly once, right before reuse.
+        If ``materialize_state`` is True, detaches conv/recurrent state
+        arrays from the lazy computation graph. Zeroing is deferred to
+        ``_gdn_alloc_slot`` right before reuse.
         """
         slot = self._gdn_req_to_slot.pop(req_id, None)
         if slot is None:
@@ -660,7 +659,7 @@ class MetalModelRunner:
         self._gdn_free_slots.append(slot)
 
     def _gdn_materialize_state_cache(self) -> None:
-        """Materialize GDN state arrays to detach lazy graphs."""
+        """Detach GDN state arrays from the lazy graph."""
         backend = self._paged_attention_backend
         if backend is None or not hasattr(backend, "_state_cache"):
             return
