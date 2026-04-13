@@ -12,18 +12,13 @@ Key contracts:
 - Prefix-cache hits reconstruct full prompts for sampling metadata.
 """
 
-import time
 from dataclasses import dataclass, field
-from threading import Lock
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
 import torch
-from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
 
-# mlx_vlm for vision-language models
-from mlx_vlm import load as mlx_vlm_load
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -53,12 +48,9 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     prepare_unified,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
-from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
-from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1 import contiguous_cache
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
@@ -70,6 +62,7 @@ from vllm_metal.v1.contiguous_cache import (
     _merge_kv_caches,
 )
 from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
+from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
@@ -79,11 +72,6 @@ from vllm_metal.v1.sampling_batch import (
 )
 
 logger = init_logger(__name__)
-
-# Global model cache for fast repeated loads
-_model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
-_model_cache_lock = Lock()
-
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
@@ -217,6 +205,7 @@ class MetalModelRunner:
         self.device = device
         self.metal_config = get_config()
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
+        self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -322,7 +311,7 @@ class MetalModelRunner:
         """Combined latent dimension for MLA cache: kv_lora_rank + qk_rope_head_dim.
 
         Only valid when is_mla is True. Derived directly from model_args so
-        callers do not depend on the _resolve_model_dims head_dim override.
+        callers do not depend on resolved runtime head_dim overrides.
         """
         if not self.is_mla:
             raise AttributeError("mla_latent_dim is only valid for MLA models")
@@ -362,270 +351,9 @@ class MetalModelRunner:
             return ("transcription",)
         return ("generate",)
 
-    def _is_vlm_model(self) -> bool:
-        """Check if the model is a vision-language model (VLM).
-
-        Returns:
-            True if the model is multimodal/VLM, False otherwise
-        """
-        hf_config = getattr(self.model_config, "hf_config", None)
-        if hf_config is not None and self._model_adapter.should_force_text_backbone(
-            hf_config
-        ):
-            return False
-        if hasattr(self.model_config, "is_multimodal_model"):
-            return self.model_config.is_multimodal_model
-        return False
-
     def load_model(self) -> None:
-        """Load the model using MLX with caching for fast repeated loads.
-
-        Uses mlx_vlm for vision-language models and mlx_lm for text-only models.
-        """
-        model_name = get_model_download_path(self.model_config.model)
-
-        # STT models use their own loading path — skip VLM/LM logic entirely.
-        if is_stt_model(model_name):
-            self._load_stt_model(model_name)
-            return
-
-        is_vlm = self._is_vlm_model()
-
-        logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")
-        start_time = time.time()
-
-        # Check global cache first for fast repeated loads
-        with _model_cache_lock:
-            if model_name in _model_cache:
-                self.model, self.tokenizer = _model_cache[model_name]
-                self._is_vlm = is_vlm
-                load_time = time.time() - start_time
-                logger.info(
-                    f"Model loaded from cache in {load_time:.3f}s: {model_name}"
-                )
-                self._extract_model_args()
-                self._resolve_model_dims()
-                self._initialize_kv_cache_dtype()
-                return
-
-        # Load model using appropriate backend
-        if is_vlm:
-            logger.info("Using mlx-vlm for vision-language model")
-            # NOTE: Only text-only (language-model) inference is supported.
-            # Image inputs are not processed — the vision encoder is bypassed
-            # by routing all forward passes through model.language_model.
-            # Full multimodal inference (encode → fuse → forward) would follow
-            # the upstream decomposed encode/forward pattern and is a separate
-            # future effort.
-            logger.warning(
-                "VLM loaded in text-only mode: multimodal (image) inputs are "
-                "not yet supported. Vision encoder will be bypassed."
-            )
-            self.model, self.tokenizer = mlx_vlm_load(model_name)
-            self._is_vlm = True
-        else:
-            # Load model and tokenizer using mlx_lm for text-only models
-            self.model, self.tokenizer = mlx_lm_load(
-                model_name,
-                tokenizer_config={
-                    "trust_remote_code": self.model_config.trust_remote_code
-                },
-            )
-            self._is_vlm = False
-
-        # Cache for future loads
-        with _model_cache_lock:
-            _model_cache[model_name] = (self.model, self.tokenizer)
-
-        self._extract_model_args()
-        self._resolve_model_dims()
-        self._initialize_kv_cache_dtype()
-        load_time = time.time() - start_time
-        logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
-
-    def _load_stt_model(self, model_name: str) -> None:
-        """Load a Speech-to-Text model (e.g. Whisper) with caching."""
-        start_time = time.time()
-
-        with _model_cache_lock:
-            if model_name in _model_cache:
-                self.model, _ = _model_cache[model_name]
-                load_time = time.time() - start_time
-                logger.info(
-                    f"STT model loaded from cache in {load_time:.3f}s: {model_name}"
-                )
-                self.tokenizer = None  # Whisper manages its own tokenizer
-                self._is_stt = True
-                self._stt_runtime_adapter = self.model.create_runtime_adapter(
-                    model_name
-                )
-                return
-
-        # Local import: keep non-STT startup/import path light.
-        from vllm_metal.stt.loader import load_model as stt_load_model
-
-        logger.info(f"Loading STT model: {model_name}")
-        self.model = stt_load_model(model_name)
-        self.tokenizer = None  # Whisper manages its own tokenizer
-        self._is_stt = True
-        self._stt_runtime_adapter = self.model.create_runtime_adapter(model_name)
-
-        with _model_cache_lock:
-            _model_cache[model_name] = (self.model, None)
-
-        load_time = time.time() - start_time
-        logger.info(f"STT model loaded in {load_time:.2f}s: {model_name}")
-
-    def _initialize_kv_cache_dtype(self) -> None:
-        """Resolve the KV cache element dtype from model_config.dtype.
-
-        model_config.dtype is the authoritative compute dtype, set from
-        config.json torch_dtype at engine startup — the same source upstream
-        vLLM uses for kv_cache_dtype. Quantization changes weight storage
-        format but not compute precision, so this is correct for all model
-        families (dense, MoE, MLA) and quantisation levels.
-
-        torch_to_mlx on a zero-element probe tensor maps the torch.dtype to
-        its MLX equivalent without allocating memory.
-        """
-        self.kv_cache_dtype = torch_to_mlx(
-            torch.empty(0, dtype=self.model_config.dtype)
-        ).dtype
-
-    def _extract_model_args(self) -> None:
-        """Extract model configuration from loaded model.
-
-        Handles both text-only models and VLMs (which have nested text_config).
-        """
-        if hasattr(self.model, "args"):
-            # mlx-lm models (Qwen, Llama, etc.)
-            self.model_args = vars(self.model.args)
-        elif hasattr(self.model, "config"):
-            config = self.model.config
-            if self._is_vlm and hasattr(config, "text_config"):
-                # VLMs with nested text config (LLaVA, Pixtral via mlx-vlm)
-                text_config = config.text_config
-                if hasattr(text_config, "to_dict"):
-                    self.model_args = text_config.to_dict()
-                else:
-                    self.model_args = {
-                        k: getattr(text_config, k)
-                        for k in dir(text_config)
-                        if not k.startswith("_")
-                        and not callable(getattr(text_config, k))
-                    }
-            elif hasattr(config, "to_dict"):
-                # Standard HuggingFace config objects
-                self.model_args = config.to_dict()
-            else:
-                self.model_args = vars(config)
-        else:
-            raise ValueError(
-                "Cannot extract model config: model has neither .args nor "
-                ".config attribute."
-            )
-        # Merge nested text_config (Qwen3.5, VLMs) into top-level args.
-        # setdefault preserves any top-level keys that already exist.
-        tc = self.model_args.get("text_config")
-        if tc is not None:
-            if isinstance(tc, dict):
-                tc_dict = tc
-            elif hasattr(tc, "to_dict"):
-                tc_dict = tc.to_dict()
-            else:
-                tc_dict = vars(tc) if hasattr(tc, "__dict__") else {}
-            for k, v in tc_dict.items():
-                self.model_args.setdefault(k, v)
-
-        self._vocab_size: int = self.model_args["vocab_size"]
-
-        if self.metal_config.debug:
-            logger.info(f"Model args: {self.model_args}")
-
-    def _resolve_model_dims(self) -> None:
-        """Extract and validate model dimensions from ``self.model_args``.
-
-        Must be called after ``_extract_model_args()``.  Stores validated
-        dimensions as instance attributes so that every consumer reads from
-        one canonical source instead of repeating fallback chains.
-
-        Raises:
-            ValueError: If any critical dimension cannot be determined.
-        """
-        args = self.model_args
-
-        num_layers = args.get("num_hidden_layers") or args.get("n_layers")
-        num_attention_heads = args.get("num_attention_heads")
-        num_kv_heads = (
-            args.get("num_key_value_heads")
-            or args.get("n_kv_heads")
-            or num_attention_heads
-        )
-        hidden_size = args.get("hidden_size")
-        head_dim = args.get("head_dim") or (
-            hidden_size // num_attention_heads
-            if hidden_size and num_attention_heads
-            else None
-        )
-        head_dim = self._model_adapter.resolve_max_head_dim(args, head_dim)
-
-        # Fail fast if critical dims are missing
-        missing = []
-        if not num_layers:
-            missing.append("num_layers (num_hidden_layers / n_layers)")
-        if not num_kv_heads:
-            missing.append("num_kv_heads (num_key_value_heads / n_kv_heads)")
-        if not head_dim:
-            missing.append("head_dim")
-        if missing:
-            raise ValueError(
-                f"Cannot resolve model dimensions: {', '.join(missing)}. "
-                f"Available keys: {sorted(args.keys())}"
-            )
-
-        self.num_layers: int = int(num_layers)
-        self.num_attention_heads = num_attention_heads
-        self.num_kv_heads: int = int(num_kv_heads)
-        self.hidden_size = hidden_size
-        self.head_dim: int = int(head_dim)
-
-        # MLA (GLM/DeepSeek lineage): cache stores a joint latent vector per
-        # layer, not per-head K/V. Use one virtual head sized kv_lora_rank +
-        # qk_rope_head_dim so shared sizing paths can reuse head_dim/num_kv_heads
-        # while get_cache_block_size_bytes() applies an MLA-specific factor.
-        if self.is_mla:
-            self.num_kv_heads = 1
-            self.head_dim = int(args["kv_lora_rank"]) + int(
-                args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
-            )
-
-        # YOCO (Gemma4): shared layers reuse a reference layer's cache.
-        # Compute the mapping once here so get_cache_block_size_bytes()
-        # and worker._make_backend() both use the same layer count.
-        yoco = self._model_adapter.build_yoco_cache_mapping(args)
-        self._yoco_cache_mapping = yoco
-        self.num_kv_cache_layers: int = yoco[0] if yoco else self.num_layers
-
-        # Hybrid (Qwen3.5): mix of SDPA and GDN linear attention layers.
-        # Store per-type layer counts and GDN dimensions for cache allocation.
-        if self.is_hybrid:
-            fai = int(args["full_attention_interval"])
-            self.full_attention_interval: int = fai
-            self.sdpa_layer_indices: frozenset[int] = frozenset(
-                i for i in range(self.num_layers) if (i + 1) % fai == 0
-            )
-            self.num_sdpa_layers = len(self.sdpa_layer_indices)
-            self.num_linear_layers = self.num_layers - self.num_sdpa_layers
-            self.linear_num_k_heads: int = int(args["linear_num_key_heads"])
-            self.linear_num_v_heads: int = int(args["linear_num_value_heads"])
-            self.linear_key_head_dim: int = int(args["linear_key_head_dim"])
-            self.linear_value_head_dim: int = int(args["linear_value_head_dim"])
-            self.linear_conv_kernel_dim: int = int(args["linear_conv_kernel_dim"])
-            # Derived: total conv1d channel width (key_dim*2 + value_dim)
-            self.linear_conv_dim: int = (
-                self.linear_num_k_heads * self.linear_key_head_dim * 2
-                + self.linear_num_v_heads * self.linear_value_head_dim
-            )
+        """Load the configured model and derive runtime metadata."""
+        self._model_lifecycle.load()
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""

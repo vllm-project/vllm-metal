@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -158,56 +157,12 @@ class TestV1MetalModelRunnerExecuteModel:
         assert runner._pending_output is None
 
 
-class TestResolveModelDims:
+class TestRunnerMlaProperties:
     def _make_runner(self, args: dict) -> mr.MetalModelRunner:
         return make_stub_runner(model_args=args)
 
-    def test_standard_mha(self) -> None:
-        r = self._make_runner(
-            {
-                "num_hidden_layers": 32,
-                "num_attention_heads": 32,
-                "num_key_value_heads": 8,
-                "hidden_size": 4096,
-            }
-        )
-        r._resolve_model_dims()
-        assert r.num_layers == 32
-        assert r.num_kv_heads == 8
-        assert r.head_dim == 128  # 4096 // 32
-
-    def test_mla_overrides_kv_heads_and_head_dim(self) -> None:
-        # GLM-4.7-Flash: kv_lora_rank=512, qk_rope_head_dim=64
-        r = self._make_runner(
-            {
-                "num_hidden_layers": 47,
-                "num_attention_heads": 20,
-                "num_key_value_heads": 20,
-                "hidden_size": 2048,
-                "kv_lora_rank": 512,
-                "qk_rope_head_dim": 64,
-            }
-        )
-        r._resolve_model_dims()
-        assert r.num_kv_heads == 1
-        assert r.head_dim == 576  # 512 + 64
-        assert r.mla_latent_dim == 576
-
-    def test_mla_default_rope_head_dim(self) -> None:
-        r = self._make_runner(
-            {
-                "num_hidden_layers": 28,
-                "num_attention_heads": 16,
-                "hidden_size": 2048,
-                "kv_lora_rank": 256,
-            }
-        )
-        r._resolve_model_dims()
-        assert r.head_dim == 320  # 256 + default 64
-        assert r.mla_latent_dim == 320  # default qk_rope_head_dim applied
-
     def test_mla_latent_dim_does_not_require_resolve_model_dims(self) -> None:
-        r = self._make_runner(
+        runner = self._make_runner(
             {
                 "num_hidden_layers": 4,
                 "num_attention_heads": 8,
@@ -217,19 +172,14 @@ class TestResolveModelDims:
             }
         )
 
-        assert r.mla_latent_dim == 576
-
-    def test_missing_dims_raise(self) -> None:
-        r = self._make_runner({"num_hidden_layers": 32})
-        with pytest.raises(ValueError, match="Cannot resolve model dimensions"):
-            r._resolve_model_dims()
+        assert runner.mla_latent_dim == 576
 
     def test_is_mla_true_when_kv_lora_rank_present(self) -> None:
-        r = self._make_runner({"kv_lora_rank": 512})
-        assert r.is_mla is True
+        runner = self._make_runner({"kv_lora_rank": 512})
+        assert runner.is_mla is True
 
     def test_is_mla_false_for_standard_mha(self) -> None:
-        r = self._make_runner(
+        runner = self._make_runner(
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
-        assert r.is_mla is False
+        assert runner.is_mla is False
