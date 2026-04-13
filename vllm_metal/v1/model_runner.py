@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-NOTE: Coding style guide for this file:
-This model runner is shared by all models: text and multimodal, generative
-and embedding, public and private. As a result, this file must only contain
-code that is common to every model. Model-specific behavior belongs in the
-appropriate model-specific files.
+Metal vLLM v1 model runner.
 
-In other words:
-* Be paranoid about changing this file. It should remain stable.
-* Be even more paranoid about adding new lines. It should remain minimal.
+Orchestration only: coordinates scheduling, dispatch, and output assembly.
+Model-specific behavior belongs in adapters; backend-specific kernels live in
+backend modules. Keep this file thin and stable.
 
-Even for shared features (for example, different parallelism modes), keep the
-complexity out of this path. The less common the feature, the more it should be
-hidden. Prefer utility functions defined elsewhere and call them from here,
-instead of embedding feature-specific logic directly.
+Key contracts:
+- execute_model()/sample_tokens() handoff remains unchanged.
+- Outputs align with scheduler expectations for paged and non-paged paths.
+- Prefix-cache hits reconstruct full prompts for sampling metadata.
 """
 
 import time
