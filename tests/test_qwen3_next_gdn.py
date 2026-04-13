@@ -25,6 +25,12 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+
+
+class _HybridBackendStub(HybridPagedAttentionBackend):
+    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+        self._state_cache = state_cache
 
 
 class TestGDNProjectionDispatch:
@@ -160,8 +166,7 @@ class TestGDNAllocSlotZeroing:
             key_head_dim=16,
             dtype=mx.float16,
         )
-        backend = MagicMock()
-        backend._state_cache = sc
+        backend = _HybridBackendStub(sc)
 
         runner = MagicMock()
         runner._gdn_req_to_slot = {}
