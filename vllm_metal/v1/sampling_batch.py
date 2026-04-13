@@ -229,7 +229,7 @@ def sample_from_logits(
         mx.eval(tokens)
         if tokens.ndim == 0:
             return [int(tokens.item())]
-        return tokens.tolist()
+        return tokens.tolist()  # type: ignore[return-value]
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
