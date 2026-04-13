@@ -25,9 +25,10 @@ from mlx_lm.models.cache import (
 from vllm.logger import init_logger
 
 import vllm_metal.envs as envs
-from vllm_metal.v1.vlm_utils import _vlm_text_model
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 logger = init_logger(__name__)
+_MODEL_ADAPTER = DefaultModelAdapter()
 
 
 # Minimum requests to use BatchKVCache for batched decode
@@ -225,7 +226,7 @@ class PrefixCacheManager:
         Only KVCache layers are restored. RotatingKVCache / ArraysCache layers
         remain in their fresh state.
         """
-        cache_model = _vlm_text_model(model) if is_vlm else model
+        cache_model = _MODEL_ADAPTER.text_model(model) if is_vlm else model
         cache = make_prompt_cache(cache_model)
         for i, layer_cache in enumerate(cache):
             if i < len(cached.cache_state) and cached.cache_state[i] is not None:
