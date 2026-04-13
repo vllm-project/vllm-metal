@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for model-specific compatibility helpers."""
+"""Tests for model adapter behavior."""
 
 from types import SimpleNamespace
 
