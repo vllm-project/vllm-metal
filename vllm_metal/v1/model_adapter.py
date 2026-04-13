@@ -36,14 +36,18 @@ class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
-        """Return True for models that must load via mlx_lm (e.g. Gemma4)."""
+        """Return True for models that must load via mlx_lm (Gemma4).
+
+        mlx_vlm Gemma4 forward currently produces garbled output; remove this
+        override once mlx_vlm Gemma4 parity is fixed upstream.
+        """
         model_type = getattr(hf_config, "model_type", "")
         return model_type in _TEXT_BACKBONE_OVERRIDE_TYPES
 
     def resolve_max_head_dim(
         self, args: dict[str, Any], head_dim: int | None
     ) -> int | None:
-        """Handle models with larger full-attention head dims (Gemma4)."""
+        """Handle Gemma4 variable head dims (sliding vs full attention)."""
         global_head_dim = args.get("global_head_dim")
         if global_head_dim and head_dim:
             return max(int(head_dim), int(global_head_dim))
@@ -52,7 +56,11 @@ class DefaultModelAdapter(ModelAdapter):
     def require_uniform_kv_heads(
         self, args: dict[str, Any], num_kv_heads: int | None
     ) -> None:
-        """Reject models with variable KV head counts in paged attention."""
+        """Reject Gemma4 26B/31B variable KV head counts in paged attention.
+
+        Paged KV cache assumes uniform KV head counts across layers. Remove
+        once per-layer KV head allocation is supported.
+        """
         global_kv_heads = args.get("num_global_key_value_heads")
         if (
             global_kv_heads
