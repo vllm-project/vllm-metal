@@ -661,11 +661,11 @@ class MetalModelRunner:
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph."""
         backend = self._paged_attention_backend
-        if backend is None or not hasattr(backend, "_state_cache"):
+        if backend is None:
             return
         sc = backend._state_cache
         if sc is None:
-            return
+            raise RuntimeError("GDN state cache is not initialized")
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
