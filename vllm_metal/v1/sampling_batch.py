@@ -224,20 +224,18 @@ def sample_from_logits(
     Single entry point for all sampling paths.  Chooses native MLX greedy
     when possible, otherwise bridges to the vLLM torch sampler.
     """
-    n = logits_2d.shape[0]
-
     if batch.all_greedy and batch.no_top_k and batch.no_top_p and batch.no_penalties:
         tokens = _mlx_greedy_sample(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
             return [int(tokens.item())]
-        return [int(tokens[i].item()) for i in range(n)]
+        return tokens.tolist()
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
     metadata = batch.make_sampling_metadata()
     output = sampler.forward(logits_torch, metadata)
-    return [int(output.sampled_token_ids[i, 0].item()) for i in range(n)]
+    return output.sampled_token_ids[:, 0].tolist()
 
 
 def sample_decode_tokens(
