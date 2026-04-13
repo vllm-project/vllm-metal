@@ -27,10 +27,12 @@ class ModelAdapter(Protocol):
 
 
 # Models that vLLM flags as multimodal but must be loaded via mlx_lm.
+# gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
+# Remove once mlx_vlm gemma4 parity is fixed upstream.
 _TEXT_BACKBONE_OVERRIDE_TYPES: frozenset[str] = frozenset({"gemma4"})
 
 
-class DefaultModelAdapter:
+class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
