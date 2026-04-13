@@ -10,7 +10,7 @@ import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 
-from vllm_metal.config import PAGED_ATTENTION_OVERHEAD_BYTES, reset_config
+from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.worker import MetalWorker
 
@@ -518,33 +518,38 @@ class TestKvBudgetBytes:
 
     _METAL_LIMIT = int(22.9e9)
     _MODEL_MEM = int(16.85e9)
+    # Simulated measured overhead (matches what profile_run would return).
+    _OVERHEAD = 200 * 1024 * 1024  # 200 MB
 
     def test_normal_case(self) -> None:
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
+            overhead=self._OVERHEAD,
         )
 
-        assert (
-            budget
-            == int(self._METAL_LIMIT * 0.9)
-            - self._MODEL_MEM
-            - PAGED_ATTENTION_OVERHEAD_BYTES
-        )
+        assert budget == int(self._METAL_LIMIT * 0.9) - self._MODEL_MEM - self._OVERHEAD
         assert budget > 0
 
     def test_fraction_too_low_yields_negative_budget(self) -> None:
         # fraction=0.3 → usable=6.9 GB < model(16.85 GB) → negative
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.3
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.3,
+            overhead=self._OVERHEAD,
         )
 
         assert budget < 0
 
     def test_boundary_zero(self) -> None:
         # Craft inputs so budget lands exactly at zero.
-        limit = self._MODEL_MEM + PAGED_ATTENTION_OVERHEAD_BYTES
+        limit = self._MODEL_MEM + self._OVERHEAD
 
-        budget = MetalWorker._kv_budget_bytes(limit, self._MODEL_MEM, fraction=1.0)
+        budget = MetalWorker._kv_budget_bytes(
+            limit, self._MODEL_MEM, fraction=1.0, overhead=self._OVERHEAD
+        )
 
         assert budget == 0
 
@@ -552,16 +557,22 @@ class TestKvBudgetBytes:
         budget_zero_overhead = MetalWorker._kv_budget_bytes(
             self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9, overhead=0
         )
-        budget_default = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9
+        budget_with_overhead = MetalWorker._kv_budget_bytes(
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
+            overhead=self._OVERHEAD,
         )
 
-        assert budget_zero_overhead - budget_default == PAGED_ATTENTION_OVERHEAD_BYTES
+        assert budget_zero_overhead - budget_with_overhead == self._OVERHEAD
 
     def test_large_model_has_positive_budget_at_default_fraction(self) -> None:
         # GLM-4.7-Flash-4bit at fraction=0.9 must yield > 1 GB for KV cache.
         budget = MetalWorker._kv_budget_bytes(
-            self._METAL_LIMIT, self._MODEL_MEM, fraction=0.9
+            self._METAL_LIMIT,
+            self._MODEL_MEM,
+            fraction=0.9,
+            overhead=self._OVERHEAD,
         )
 
         assert budget > 1e9

@@ -24,7 +24,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
-    PAGED_ATTENTION_OVERHEAD_BYTES,
     get_config,
 )
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
@@ -141,25 +140,12 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # Boundary ownership:
-        # - Worker owns resource setup.
-        # - Runner owns STT/runtime capability decisions.
-        # Note: For hybrid models (Qwen3.5), we don't auto-enable paged attention
-        # because MLX's make_prompt_cache() handles hybrid KV cache natively.
-        # Paged attention for hybrid models requires splitting KV cache across
-        # multiple buffers to avoid Metal's max buffer size limit (~9.5GB).
-        if (
-            self.metal_config.use_paged_attention
-            and self.model_runner.should_setup_paged_attention()
-        ):
-            self._setup_paged_attention()
-
     @staticmethod
     def _kv_budget_bytes(
         metal_limit: int,
         model_memory: int,
         fraction: float,
-        overhead: int = PAGED_ATTENTION_OVERHEAD_BYTES,
+        overhead: int,
     ) -> int:
         """KV cache budget = fraction of Metal limit minus model and overhead.
 
@@ -169,12 +155,13 @@ class MetalWorker(WorkerBase):
         """
         return int(metal_limit * fraction) - model_memory - overhead
 
-    def _setup_paged_attention(self) -> None:
+    def _setup_paged_attention(self, overhead: int) -> None:
         """Allocate paged KV cache and patch model attention layers.
 
         Computes num_blocks from Metal memory headroom, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
-        max_model_len.
+        max_model_len.  ``overhead`` is the measured intermediate-buffer
+        footprint from :pymeth:`MetalModelRunner.profile_run`.
         """
         runner = self.model_runner
         require_uniform_kv_heads(runner.model_args, runner.num_kv_heads)
@@ -214,7 +201,7 @@ class MetalWorker(WorkerBase):
 
         # --- Compute KV budget ---
         usable_metal = int(metal_limit * fraction)
-        kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction)
+        kv_budget = self._kv_budget_bytes(metal_limit, model_memory, fraction, overhead)
 
         # For hybrid models, subtract the fixed linear state cost first.
         if runner.is_hybrid:
@@ -229,7 +216,7 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
-                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"overhead={overhead / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
                 "use a smaller or more quantized model."
@@ -245,7 +232,7 @@ class MetalWorker(WorkerBase):
                 f"fraction={fraction}, "
                 f"usable_metal={usable_metal / 1e9:.2f}GB, "
                 f"model_memory={model_memory / 1e9:.2f}GB, "
-                f"overhead={PAGED_ATTENTION_OVERHEAD_BYTES / 1e9:.2f}GB, "
+                f"overhead={overhead / 1e9:.2f}GB, "
                 f"kv_budget={kv_budget / 1e9:.2f}GB, "
                 f"per_block_bytes={per_block_bytes}. "
                 "Mitigations: increase VLLM_METAL_MEMORY_FRACTION, "
@@ -257,14 +244,14 @@ class MetalWorker(WorkerBase):
         logger.info(
             "Paged attention memory breakdown: "
             "metal_limit=%.2fGB, fraction=%.2f, usable_metal=%.2fGB, "
-            "model_memory=%.2fGB, overhead=%.2fGB, "
+            "model_memory=%.2fGB, overhead=%.2fGB (measured), "
             "kv_budget=%.2fGB, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
             metal_limit / 1e9,
             fraction,
             usable_metal / 1e9,
             model_memory / 1e9,
-            PAGED_ATTENTION_OVERHEAD_BYTES / 1e9,
+            overhead / 1e9,
             kv_budget / 1e9,
             per_block_bytes,
             num_blocks,
@@ -411,7 +398,10 @@ class MetalWorker(WorkerBase):
             return STT_SCHED_AVAILABLE_BYTES
 
         if mode == "paged_attention_capacity":
-            # Runner only reports this mode when paged cache is initialized.
+            # Profile intermediate-buffer footprint before sizing the cache, so
+            # the measured overhead drives KV budget math (issue #234).
+            overhead = self.model_runner.profile_run()
+            self._setup_paged_attention(overhead=overhead)
             backend = self.model_runner._paged_attention_backend
             assert backend is not None
             num_blocks = backend.num_blocks()

@@ -86,8 +86,8 @@ _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer
 _model_cache_lock = Lock()
 
 
-# Performance tuning
-_CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+# Prefix-cache stats log interval (finished requests between log lines).
+_STATS_LOG_INTERVAL = 50
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
@@ -347,7 +347,7 @@ class MetalModelRunner:
         """
         if self._is_stt:
             return "stt_nominal"
-        if paged_attention_enabled and self._paged_attention_backend is not None:
+        if paged_attention_enabled:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
@@ -795,6 +795,23 @@ class MetalModelRunner:
             * recurrent_dtype_size
         )
         return self.num_linear_layers * (conv_bytes + recurrent_bytes)
+
+    def profile_run(self) -> int:
+        """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
+
+        Called from ``MetalWorker.determine_available_memory`` before KV cache
+        sizing so the measured overhead replaces the historical 800 MB
+        placeholder. ``mx.set_cache_limit`` prevents unbounded buffer-cache
+        growth during serving (issue #234).
+        """
+        warmup_len = self.scheduler_config.max_num_batched_tokens
+        mx.clear_cache()
+        cache_before = mx.get_cache_memory()
+        dummy_tokens = mx.array([list(range(warmup_len))], dtype=mx.int32)
+        mx.eval(self._extract_logits(self._forward_model(dummy_tokens)))
+        overhead = max(0, mx.get_cache_memory() - cache_before)
+        mx.set_cache_limit(overhead)
+        return overhead
 
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
@@ -1511,7 +1528,7 @@ class MetalModelRunner:
         self,
         finished_req_ids: set[str],
     ) -> None:
-        """Evict finished request state and periodically clear MLX cache."""
+        """Evict finished request state and periodically log prefix cache stats."""
         if not finished_req_ids:
             return
 
@@ -1527,10 +1544,9 @@ class MetalModelRunner:
             self._gdn_free_slot(req_id)
 
         self._finished_request_count += len(finished_req_ids)
-        if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
+        if self._finished_request_count < _STATS_LOG_INTERVAL:
             return
 
-        mx.clear_cache()
         self._finished_request_count = 0
 
         if self._prefix_cache is None:
