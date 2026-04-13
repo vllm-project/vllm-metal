@@ -35,8 +35,7 @@ run_smoke_test() {
   # 3. Test completions endpoint with golden comparison
   echo "Testing completions with golden output..."
   local response
-  response=$(curl -s --connect-timeout 10 --max-time 600 \
-    -X POST "http://localhost:8000/v1/completions" \
+  response=$(curl -s -X POST "http://localhost:8000/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"$model\",
