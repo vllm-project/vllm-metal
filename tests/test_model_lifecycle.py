@@ -138,6 +138,36 @@ class TestModelLifecycle:
         assert runner.hidden_size == 4096
         assert runner.kv_cache_dtype is not None
 
+    def test_load_merges_nested_text_config_for_non_vlm_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(
+                vocab_size=32000,
+                text_config=SimpleNamespace(
+                    vocab_size=32000,
+                    num_hidden_layers=32,
+                    num_attention_heads=32,
+                    num_key_value_heads=8,
+                    hidden_size=4096,
+                ),
+            )
+        )
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {"stub-model": (fake_model, object())},
+        )
+        lifecycle, runner = _make_lifecycle(model=SimpleNamespace())
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+        assert runner.model_args["hidden_size"] == 4096
+        assert runner.num_layers == 32
+        assert runner.head_dim == 128
+
     def test_load_extracts_vlm_text_config_with_inherited_slots(
         self,
         monkeypatch: pytest.MonkeyPatch,

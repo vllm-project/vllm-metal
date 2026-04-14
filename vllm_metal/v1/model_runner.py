@@ -264,11 +264,6 @@ class MetalModelRunner:
         self._execute_model_state: _PagedForwardState | None = None
 
     @property
-    def is_stt(self) -> bool:
-        """Whether the loaded model is a Speech-to-Text model."""
-        return self._is_stt
-
-    @property
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).
 
