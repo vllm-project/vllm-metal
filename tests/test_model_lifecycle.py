@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for model lifecycle ownership and config normalization."""
+"""Tests for model lifecycle behavior."""
 
 from __future__ import annotations
 
@@ -14,11 +14,39 @@ from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 
-class _SlotConfig:
-    __slots__ = ("vocab_size", "hidden_size")
+class _BaseSlotTextConfig:
+    __slots__ = ("vocab_size", "num_hidden_layers", "num_attention_heads")
 
-    def __init__(self, *, vocab_size: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        num_hidden_layers: int,
+        num_attention_heads: int,
+    ) -> None:
         self.vocab_size = vocab_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+
+
+class _SlotTextConfig(_BaseSlotTextConfig):
+    __slots__ = ("num_key_value_heads", "hidden_size")
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        num_hidden_layers: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        hidden_size: int,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+        )
+        self.num_key_value_heads = num_key_value_heads
         self.hidden_size = hidden_size
 
 
@@ -48,63 +76,112 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
-    def test_is_vlm_model_defaults_false_when_flag_missing(self) -> None:
-        lifecycle, _ = _make_lifecycle(
+    def test_load_uses_adapter_override_for_text_only_multimodal_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(
+                vocab_size=32000,
+                num_hidden_layers=32,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                hidden_size=4096,
+            )
+        )
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {"stub-model": (fake_model, object())},
+        )
+        lifecycle, runner = _make_lifecycle(
             model=SimpleNamespace(),
             model_config=SimpleNamespace(
                 model="stub-model",
-                hf_config=None,
+                hf_config=SimpleNamespace(model_type="gemma4"),
+                is_multimodal_model=True,
                 trust_remote_code=False,
                 dtype=torch.float16,
             ),
         )
 
-        assert lifecycle.is_vlm_model() is False
+        lifecycle.load()
 
-    def test_text_model_args_falls_back_to_config(self) -> None:
-        lifecycle, _ = _make_lifecycle(
-            model=SimpleNamespace(
-                config=SimpleNamespace(vocab_size=32000, hidden_size=4096)
+        assert runner._is_vlm is False
+
+    def test_load_extracts_text_model_config_from_cached_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(
+                vocab_size=32000,
+                num_hidden_layers=32,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                hidden_size=4096,
             )
         )
-
-        model_args = lifecycle._text_model_args()
-
-        assert model_args["vocab_size"] == 32000
-        assert model_args["hidden_size"] == 4096
-
-    def test_vlm_model_args_accepts_slot_backed_text_config(self) -> None:
-        lifecycle, _ = _make_lifecycle(
-            model=SimpleNamespace(
-                config=SimpleNamespace(
-                    text_config=_SlotConfig(vocab_size=32000, hidden_size=4096)
-                )
-            ),
-            is_vlm=True,
+        fake_tokenizer = object()
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {"stub-model": (fake_model, fake_tokenizer)},
         )
+        lifecycle, runner = _make_lifecycle(model=SimpleNamespace())
 
-        model_args = lifecycle._vlm_model_args()
+        lifecycle.load()
 
-        assert model_args["vocab_size"] == 32000
-        assert model_args["hidden_size"] == 4096
+        assert runner.model is fake_model
+        assert runner.tokenizer is fake_tokenizer
+        assert runner.model_args["vocab_size"] == 32000
+        assert runner.hidden_size == 4096
+        assert runner.kv_cache_dtype is not None
 
-    def test_merge_text_config_accepts_namespace(self) -> None:
-        lifecycle, _ = _make_lifecycle(model=SimpleNamespace())
-
-        merged = lifecycle._merge_text_config(
-            {
-                "hidden_size": 1024,
-                "text_config": SimpleNamespace(
-                    hidden_size=4096,
+    def test_load_extracts_vlm_text_config_with_inherited_slots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_model = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=_SlotTextConfig(
                     vocab_size=32000,
-                ),
-            }
+                    num_hidden_layers=32,
+                    num_attention_heads=32,
+                    num_key_value_heads=8,
+                    hidden_size=4096,
+                )
+            )
+        )
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {"stub-model": (fake_model, object())},
+        )
+        lifecycle, runner = _make_lifecycle(
+            model=SimpleNamespace(),
+            is_vlm=True,
+            model_config=SimpleNamespace(
+                model="stub-model",
+                hf_config=None,
+                is_multimodal_model=True,
+                trust_remote_code=False,
+                dtype=torch.float16,
+            ),
         )
 
-        assert merged["hidden_size"] == 1024
-        assert merged["vocab_size"] == 32000
+        lifecycle.load()
 
-    def test_load_stt_reuses_cached_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert runner._is_vlm is True
+        assert runner.model_args["vocab_size"] == 32000
+        assert runner.model_args["hidden_size"] == 4096
+        assert runner.num_layers == 32
+        assert runner.head_dim == 128
+
+    def test_load_reuses_cached_stt_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         adapter = object()
         fake_model = SimpleNamespace(
             create_runtime_adapter=lambda model_name: (adapter, model_name)
@@ -112,12 +189,12 @@ class TestModelLifecycle:
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
-            {"openai/whisper-tiny": (fake_model, None)},
+            {"stub-model": (fake_model, None)},
         )
-
+        monkeypatch.setattr(model_lifecycle, "is_stt_model", lambda _model_name: True)
         lifecycle, runner = _make_lifecycle(model=object())
 
-        lifecycle.load_stt("openai/whisper-tiny")
+        lifecycle.load()
 
         assert runner.model is fake_model
         assert runner.tokenizer is None
@@ -125,7 +202,7 @@ class TestModelLifecycle:
         assert runner.kv_cache_dtype is None
         assert runner._is_vlm is False
         assert runner._is_stt is True
-        assert runner._stt_runtime_adapter == (adapter, "openai/whisper-tiny")
+        assert runner._stt_runtime_adapter == (adapter, "stub-model")
 
 
 class TestResolveModelDims:
