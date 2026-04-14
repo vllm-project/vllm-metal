@@ -82,9 +82,6 @@ _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer
 _model_cache_lock = Lock()
 
 
-# Prefix-cache stats log interval (finished requests between log lines).
-_STATS_LOG_INTERVAL = 50
-
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
     "paged_attention_capacity",
@@ -247,9 +244,6 @@ class MetalModelRunner:
             is_pooling_model,
             custom_logitsprocs,
         )
-
-        # Track finished requests for lazy cache clearing
-        self._finished_request_count = 0
 
         # vLLM v1 async scheduling calls sample_tokens after execute_model.
         # Keep the latest execution output so sample_tokens can return it.
@@ -1523,7 +1517,7 @@ class MetalModelRunner:
         self,
         finished_req_ids: set[str],
     ) -> None:
-        """Evict finished request state and periodically log prefix cache stats."""
+        """Evict runner-owned state for finished requests."""
         if not finished_req_ids:
             return
 
@@ -1537,28 +1531,6 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
             self._gdn_free_slot(req_id)
-
-        self._finished_request_count += len(finished_req_ids)
-        if self._finished_request_count < _STATS_LOG_INTERVAL:
-            return
-
-        self._finished_request_count = 0
-
-        if self._prefix_cache is None:
-            return
-
-        stats = self._prefix_cache.get_stats()
-        logger.info(
-            "Prefix cache: %.1f%% hit rate "
-            "(hits=%d, misses=%d, cached=%d, "
-            "%.1fMB/%.1fMB)",
-            stats["hit_rate"] * 100,
-            stats["hits"],
-            stats["misses"],
-            stats["cached_entries"],
-            stats["current_bytes"] / (1024 * 1024),
-            stats["max_bytes"] / (1024 * 1024),
-        )
 
     def execute_model(
         self, scheduler_output: SchedulerOutput

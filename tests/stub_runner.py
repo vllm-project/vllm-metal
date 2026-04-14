@@ -33,7 +33,6 @@ def make_stub_runner(
         "_paged_attention_backend": None,
         "_request_states": {},
         "_paged_request_seq_lens": {},
-        "_finished_request_count": 0,
         "_prefix_cache": None,
         "_pending_output": None,
         "_execute_model_state": None,
