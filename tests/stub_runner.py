@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 def make_stub_runner(
@@ -36,6 +37,7 @@ def make_stub_runner(
         "_prefix_cache": None,
         "_pending_output": None,
         "_execute_model_state": None,
+        "_model_adapter": DefaultModelAdapter(),
         "use_async_scheduling": True,
         "device": torch.device("cpu"),
         "_sampler": None,

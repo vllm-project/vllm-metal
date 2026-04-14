@@ -66,10 +66,7 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
-from vllm_metal.v1.model_compat import (
-    resolve_max_head_dim,
-    should_force_text_backbone,
-)
+from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
@@ -77,7 +74,6 @@ from vllm_metal.v1.sampling_batch import (
     sample_from_logits,
     sample_prefill_tokens,
 )
-from vllm_metal.v1.vlm_utils import _vlm_text_model
 
 logger = init_logger(__name__)
 
@@ -217,6 +213,7 @@ class MetalModelRunner:
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.device = device
         self.metal_config = get_config()
+        self._model_adapter: ModelAdapter = DefaultModelAdapter()
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -261,7 +258,7 @@ class MetalModelRunner:
         # Prefix cache for shared prompt reuse
         self._prefix_cache: PrefixCacheManager | None = None
         if _PREFIX_CACHE_ENABLED:
-            self._prefix_cache = PrefixCacheManager()
+            self._prefix_cache = PrefixCacheManager(model_adapter=self._model_adapter)
 
         # Paged attention state (set by worker when enabled)
         self._paged_attention_backend: PagedAttentionBackend | None = None
@@ -313,7 +310,7 @@ class MetalModelRunner:
         the upstream pattern, and is a separate future effort.
         """
         if self._is_vlm:
-            return _vlm_text_model(self.model)
+            return self._model_adapter.text_model(self.model)
         return self.model
 
     @property
@@ -328,6 +325,10 @@ class MetalModelRunner:
         return int(self.model_args["kv_lora_rank"]) + int(
             self.model_args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
         )
+
+    def validate_paged_attention_support(self) -> None:
+        """Validate that the loaded model can run on the paged-attention path."""
+        self._model_adapter.require_uniform_kv_heads(self.model_args, self.num_kv_heads)
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
@@ -356,7 +357,9 @@ class MetalModelRunner:
             True if the model is multimodal/VLM, False otherwise
         """
         hf_config = getattr(self.model_config, "hf_config", None)
-        if hf_config is not None and should_force_text_backbone(hf_config):
+        if hf_config is not None and self._model_adapter.should_force_text_backbone(
+            hf_config
+        ):
             return False
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
@@ -552,7 +555,7 @@ class MetalModelRunner:
             if hidden_size and num_attention_heads
             else None
         )
-        head_dim = resolve_max_head_dim(args, head_dim)
+        head_dim = self._model_adapter.resolve_max_head_dim(args, head_dim)
 
         # Fail fast if critical dims are missing
         missing = []

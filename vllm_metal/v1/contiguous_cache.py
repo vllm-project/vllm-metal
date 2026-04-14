@@ -25,7 +25,7 @@ from mlx_lm.models.cache import (
 from vllm.logger import init_logger
 
 import vllm_metal.envs as envs
-from vllm_metal.v1.vlm_utils import _vlm_text_model
+from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
 
 logger = init_logger(__name__)
 
@@ -134,7 +134,13 @@ class CachedPrefix:
 class PrefixCacheManager:
     """Manager for prefix KV cache reuse with memory-based eviction."""
 
-    def __init__(self, max_bytes: int | None = None):
+    def __init__(
+        self,
+        max_bytes: int | None = None,
+        *,
+        model_adapter: ModelAdapter | None = None,
+    ):
+        self._model_adapter = model_adapter or DefaultModelAdapter()
         self._cache: dict[bytes, CachedPrefix] = {}
         self._max_bytes = (
             max_bytes if max_bytes is not None else _get_prefix_cache_max_bytes()
@@ -225,7 +231,7 @@ class PrefixCacheManager:
         Only KVCache layers are restored. RotatingKVCache / ArraysCache layers
         remain in their fresh state.
         """
-        cache_model = _vlm_text_model(model) if is_vlm else model
+        cache_model = self._model_adapter.text_model(model) if is_vlm else model
         cache = make_prompt_cache(cache_model)
         for i, layer_cache in enumerate(cache):
             if i < len(cached.cache_state) and cached.cache_state[i] is not None:
