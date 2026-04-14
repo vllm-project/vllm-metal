@@ -329,14 +329,6 @@ class MetalModelRunner:
             self.model_args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
         )
 
-    def should_setup_paged_attention(self) -> bool:
-        """Whether worker-side paged-attention setup should run.
-
-        STT models own their runtime path and do not use the paged-attention
-        cache path that the text/VLM runner uses.
-        """
-        return not self._is_stt
-
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
     ) -> SchedulerMemoryReportingMode:
@@ -807,7 +799,7 @@ class MetalModelRunner:
         warmup_len = self.scheduler_config.max_num_batched_tokens
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
-        dummy_tokens = mx.array([list(range(warmup_len))], dtype=mx.int32)
+        dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
         mx.eval(self._extract_logits(self._forward_model(dummy_tokens)))
         overhead = max(0, mx.get_cache_memory() - cache_before)
         mx.set_cache_limit(overhead)
