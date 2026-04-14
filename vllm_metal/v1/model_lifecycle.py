@@ -45,6 +45,7 @@ class ModelLifecycle:
             return
 
         model_config = runner.model_config
+        # vLLM model_config shape varies across backends.
         hf_config = getattr(model_config, "hf_config", None)
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if hf_config is not None and self._model_adapter.should_force_text_backbone(

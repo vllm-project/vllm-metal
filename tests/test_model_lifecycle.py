@@ -246,7 +246,7 @@ class TestResolveModelDims:
                     "kv_lora_rank": 512,
                     "qk_rope_head_dim": 64,
                 },
-                576,
+                512 + 64,
             ),
             (
                 {
