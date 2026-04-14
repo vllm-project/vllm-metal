@@ -98,10 +98,12 @@ class TestYocoCacheIntegration:
     _NUM_UNIQUE = _NUM_HIDDEN - _NUM_SHARED
     _NUM_KV_HEADS = 2
     _HEAD_DIM = 4
+    _BLOCK_SIZE = 16
+    _VOCAB_SIZE = 100
 
     def _gemma4_args(self) -> dict:
         return {
-            "vocab_size": 100,
+            "vocab_size": self._VOCAB_SIZE,
             "num_hidden_layers": self._NUM_HIDDEN,
             "num_kv_shared_layers": self._NUM_SHARED,
             "layer_types": list(self._LAYER_TYPES),
@@ -137,17 +139,16 @@ class TestYocoCacheIntegration:
         runner.num_kv_heads = self._NUM_KV_HEADS
         runner.head_dim = self._HEAD_DIM
         runner.kv_cache_dtype = mx.float16
-        runner.cache_config = SimpleNamespace(block_size=16)
+        runner.cache_config = SimpleNamespace(block_size=self._BLOCK_SIZE)
 
         block_bytes = runner.get_cache_block_size_bytes()
 
         # 2 (K+V) * num_unique * block_size * kv_heads * head_dim * dtype
         dtype_size = mx.float16.size
-        block_size = 16
         expected = (
             2
             * self._NUM_UNIQUE
-            * block_size
+            * self._BLOCK_SIZE
             * self._NUM_KV_HEADS
             * self._HEAD_DIM
             * dtype_size
@@ -178,7 +179,7 @@ class TestYocoCacheIntegration:
             num_kv_cache_layers=yoco[0],
         )
 
-        backend = MetalWorker._make_backend(runner, block_size=16)
+        backend = MetalWorker._make_backend(runner, block_size=self._BLOCK_SIZE)
 
         assert backend._num_layers == self._NUM_UNIQUE
         assert backend._cache_idx_map is not None
