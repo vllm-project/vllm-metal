@@ -595,6 +595,13 @@ class MetalModelRunner:
                 args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
 
+        # YOCO (Gemma4): shared layers reuse a reference layer's cache.
+        # Compute the mapping once here so get_cache_block_size_bytes()
+        # and worker._make_backend() both use the same layer count.
+        yoco = self._model_adapter.build_yoco_cache_mapping(args)
+        self._yoco_cache_mapping = yoco
+        self.num_kv_cache_layers: int = yoco[0] if yoco else self.num_layers
+
         # Hybrid (Qwen3.5): mix of SDPA and GDN linear attention layers.
         # Store per-type layer counts and GDN dimensions for cache allocation.
         if self.is_hybrid:
@@ -768,7 +775,9 @@ class MetalModelRunner:
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
-        num_kv_layers = self.num_sdpa_layers if self.is_hybrid else self.num_layers
+        num_kv_layers = (
+            self.num_sdpa_layers if self.is_hybrid else self.num_kv_cache_layers
+        )
         kv_factor = 1 if self.is_mla else 2
         return (
             kv_factor

@@ -378,6 +378,9 @@ def sdpa_forward(
     )
 
     # --- Cache write: MLX-native scatter (pure functional, graph-tracked) ---
+    # YOCO shared layers (shared_kv is not None) skip the write — their K/V
+    # is already in the reference layer's cache.  Only unique layers scatter.
+    #
     # Flatten cache to [num_slots, num_kv_heads, head_dim], scatter new K/V
     # by slot_mapping, then reshape back.  This creates proper graph nodes
     # that MLX's evaluator can track for dependency ordering and buffer
@@ -388,19 +391,26 @@ def sdpa_forward(
     # must have use_count == 1 (only the graph) for MLX to donate its
     # buffer to the scatter output.  Do NOT insert mx.eval between the
     # scatter and the rebind, or hold extra references to the old cache.
-    flat_k = kv_cache.key_caches[layer_idx].reshape(-1, kv_cache.num_kv_heads, head_dim)
-    flat_k[slot_mapping] = k_3d
-    new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
+    if shared_kv is not None:
+        # YOCO shared layer: K/V already written by the reference layer.
+        new_k_cache = kv_cache.key_caches[layer_idx]
+        new_v_cache = kv_cache.value_caches[layer_idx]
+    else:
+        flat_k = kv_cache.key_caches[layer_idx].reshape(
+            -1, kv_cache.num_kv_heads, head_dim
+        )
+        flat_k[slot_mapping] = k_3d
+        new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
 
-    flat_v = kv_cache.value_caches[layer_idx].reshape(
-        -1, kv_cache.num_kv_heads, head_dim
-    )
-    flat_v[slot_mapping] = v_3d
-    new_v_cache = flat_v.reshape(kv_cache.value_caches[layer_idx].shape)
+        flat_v = kv_cache.value_caches[layer_idx].reshape(
+            -1, kv_cache.num_kv_heads, head_dim
+        )
+        flat_v[slot_mapping] = v_3d
+        new_v_cache = flat_v.reshape(kv_cache.value_caches[layer_idx].shape)
 
-    # Rebind so next layer / decode step uses the updated cache
-    kv_cache.key_caches[layer_idx] = new_k_cache
-    kv_cache.value_caches[layer_idx] = new_v_cache
+        # Rebind so next layer / decode step uses the updated cache
+        kv_cache.key_caches[layer_idx] = new_k_cache
+        kv_cache.value_caches[layer_idx] = new_v_cache
 
     # --- Attention: paged attention primitive (read-only, fully lazy) ---
     # No per-layer eval or sync.  The primitive participates in MLX's lazy

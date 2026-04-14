@@ -69,6 +69,7 @@ class MHAPagedAttentionBackend:
         head_dim: int,
         block_size: int,
         dtype: mx.Dtype,
+        cache_idx_map: dict[int, int] | None = None,
     ) -> None:
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -76,6 +77,7 @@ class MHAPagedAttentionBackend:
         self._block_size = block_size
         self._dtype = dtype
         self._cache: MetalPagedKVCache | None = None
+        self._cache_idx_map = cache_idx_map
 
     def _require_initialized(self, caller: str) -> MetalPagedKVCache:
         if self._cache is None:
@@ -101,7 +103,9 @@ class MHAPagedAttentionBackend:
             patch_model_attention_metal_kernel,
         )
 
-        return patch_model_attention_metal_kernel(model, cache, self._block_size)
+        return patch_model_attention_metal_kernel(
+            model, cache, self._block_size, cache_idx_map=self._cache_idx_map
+        )
 
     def warm_up(self) -> None:
         warm_up_paged_cache(self._require_initialized("warm_up"))

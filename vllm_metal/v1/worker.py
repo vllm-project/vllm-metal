@@ -318,12 +318,29 @@ class MetalWorker(WorkerBase):
                 block_size=block_size,
                 dtype=runner.kv_cache_dtype,
             )
+        # YOCO (Gemma4): only allocate cache for unique layers;
+        # shared layers reuse a reference layer's cache via cache_idx_map.
+        # Mapping is pre-computed by model_runner._resolve_model_dims so that
+        # get_cache_block_size_bytes() also uses the correct layer count.
+        yoco = runner._yoco_cache_mapping
+        if yoco is not None:
+            num_cache_layers, cache_idx_map = yoco
+            logger.info(
+                "YOCO KV sharing: %d unique cache layers (reduced from %d total)",
+                num_cache_layers,
+                runner.num_layers,
+            )
+        else:
+            num_cache_layers = runner.num_kv_cache_layers
+            cache_idx_map = None
+
         return MHAPagedAttentionBackend(
-            num_layers=runner.num_layers,
+            num_layers=num_cache_layers,
             num_kv_heads=runner.num_kv_heads,
             head_dim=runner.head_dim,
             block_size=block_size,
             dtype=runner.kv_cache_dtype,
+            cache_idx_map=cache_idx_map,
         )
 
     def _get_model_memory_usage(self) -> int:
