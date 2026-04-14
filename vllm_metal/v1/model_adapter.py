@@ -7,23 +7,23 @@ from typing import Any, Protocol
 
 
 class ModelAdapter(Protocol):
-    """Adapter interface for model-specific behavior."""
+    """Model-specific hooks used by runner and cache orchestration."""
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
-        """Return True if the model should load via mlx_lm despite multimodal flags."""
+        """Whether a multimodal config should run on the text-only path."""
 
     def resolve_max_head_dim(
         self, args: dict[str, Any], head_dim: int | None
     ) -> int | None:
-        """Return the maximum head_dim across attention layer types."""
+        """Resolve the head dimension used for cache sizing."""
 
     def require_uniform_kv_heads(
         self, args: dict[str, Any], num_kv_heads: int | None
     ) -> None:
-        """Validate that KV head count is uniform across layer types."""
+        """Raise when paged attention cannot support the model's KV layout."""
 
     def text_model(self, model: Any) -> Any:
-        """Return the text sub-model for a VLM, or the model itself."""
+        """Return the callable model used for text-only execution."""
 
 
 # Models that vLLM flags as multimodal but must be loaded via mlx_lm.

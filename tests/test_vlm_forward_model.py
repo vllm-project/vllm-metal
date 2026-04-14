@@ -1,41 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for VLM text-only forward dispatch.
-
-Covers:
-- DefaultModelAdapter.text_model()
-- MetalModelRunner._forward_model property
-- PrefixCacheManager.restore_cache routing
-"""
+"""Tests for VLM forward-model dispatch and prefix-cache restore routing."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.model_adapter import DefaultModelAdapter
-
-# ---------------------------------------------------------------------------
-# DefaultModelAdapter.text_model helper
-# ---------------------------------------------------------------------------
-
-
-class TestVlmTextModel:
-    def test_returns_language_model_when_present(self) -> None:
-        lang = object()
-        vlm = SimpleNamespace(language_model=lang)
-        adapter = DefaultModelAdapter()
-        assert adapter.text_model(vlm) is lang
-
-    def test_returns_model_when_no_language_model(self) -> None:
-        model = object()
-        adapter = DefaultModelAdapter()
-        assert adapter.text_model(model) is model
-
-
-# ---------------------------------------------------------------------------
-# MetalModelRunner._forward_model property
-# ---------------------------------------------------------------------------
 
 
 class TestForwardModelProperty:
@@ -45,30 +15,45 @@ class TestForwardModelProperty:
         assert runner._forward_model is model
 
     def test_vlm_with_language_model_returns_language_model(self) -> None:
-        lang = MagicMock()
+        language_model = MagicMock()
         vlm = MagicMock()
-        vlm.language_model = lang
+        vlm.language_model = language_model
         runner = make_stub_runner(model=vlm, _is_vlm=True)
-        assert runner._forward_model is lang
+        assert runner._forward_model is language_model
 
     def test_vlm_without_language_model_returns_model(self) -> None:
-        # Edge case: mlx-vlm model that doesn't have .language_model
-        model = MagicMock(spec=[])  # no attributes
+        model = MagicMock(spec=[])
         runner = make_stub_runner(model=model, _is_vlm=True)
         assert runner._forward_model is model
 
     def test_vlm_flag_false_bypasses_language_model(self) -> None:
-        # _is_vlm=False: language_model attribute is ignored even if present
-        lang = MagicMock()
+        language_model = MagicMock()
         model = MagicMock()
-        model.language_model = lang
+        model.language_model = language_model
         runner = make_stub_runner(model=model, _is_vlm=False)
         assert runner._forward_model is model
 
 
-# ---------------------------------------------------------------------------
-# PrefixCacheManager.restore_cache routing
-# ---------------------------------------------------------------------------
+class TestValidatePagedAttentionSupport:
+    def test_delegates_to_model_adapter(self) -> None:
+        calls: list[tuple[dict[str, int], int]] = []
+
+        class RecordingAdapter:
+            def require_uniform_kv_heads(
+                self, args: dict[str, int], num_kv_heads: int
+            ) -> None:
+                calls.append((args, num_kv_heads))
+
+        model_args = {"num_global_key_value_heads": 8}
+        runner = make_stub_runner(
+            model_args=model_args,
+            num_kv_heads=8,
+            _model_adapter=RecordingAdapter(),
+        )
+
+        runner.validate_paged_attention_support()
+
+        assert calls == [(model_args, 8)]
 
 
 class TestRestoreCacheRouting:

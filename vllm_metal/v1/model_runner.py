@@ -338,6 +338,12 @@ class MetalModelRunner:
         """
         return not self._is_stt
 
+    def validate_paged_attention_support(self) -> None:
+        """Validate that the loaded model can run on the paged-attention path."""
+        self._model_adapter.require_uniform_kv_heads(
+            self.model_args, self.num_kv_heads
+        )
+
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
     ) -> SchedulerMemoryReportingMode:

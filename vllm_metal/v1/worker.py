@@ -176,9 +176,7 @@ class MetalWorker(WorkerBase):
         max_model_len.
         """
         runner = self.model_runner
-        runner._model_adapter.require_uniform_kv_heads(
-            runner.model_args, runner.num_kv_heads
-        )
+        runner.validate_paged_attention_support()
 
         # Use cache_config.block_size (not metal_config) because vLLM's
         # hybrid alignment may have adjusted it to match mamba page size.
