@@ -13,6 +13,14 @@ from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
+_TEXT_MODEL_ARGS = {
+    "vocab_size": 32000,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "hidden_size": 4096,
+}
+
 
 class _BaseSlotTextConfig:
     __slots__ = ("vocab_size", "num_hidden_layers", "num_attention_heads")
@@ -50,26 +58,47 @@ class _SlotTextConfig(_BaseSlotTextConfig):
         self.hidden_size = hidden_size
 
 
+def _runner_model_config(**overrides: object) -> object:
+    values = {
+        "model": "stub-model",
+        "hf_config": None,
+        "is_multimodal_model": False,
+        "trust_remote_code": False,
+        "dtype": torch.float16,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _text_config(**overrides: object) -> SimpleNamespace:
+    return SimpleNamespace(**(_TEXT_MODEL_ARGS | overrides))
+
+
+def _cache_generation_model(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    config: object,
+    tokenizer: object | None = None,
+) -> tuple[object, object]:
+    fake_model = SimpleNamespace(config=config)
+    fake_tokenizer = object() if tokenizer is None else tokenizer
+    monkeypatch.setattr(
+        model_lifecycle,
+        "_MODEL_CACHE",
+        {"stub-model": (fake_model, fake_tokenizer)},
+    )
+    return fake_model, fake_tokenizer
+
+
 def _make_lifecycle(
     *,
-    model: object,
     model_args: dict[str, object] | None = None,
     model_config: object | None = None,
-    is_vlm: bool = False,
 ) -> tuple[ModelLifecycle, object]:
     runner = make_stub_runner(
-        model=model,
         model_args=model_args,
-        _is_vlm=is_vlm,
         metal_config=SimpleNamespace(debug=False),
-        model_config=model_config
-        or SimpleNamespace(
-            model="stub-model",
-            hf_config=None,
-            is_multimodal_model=False,
-            trust_remote_code=False,
-            dtype=torch.float16,
-        ),
+        model_config=model_config or _runner_model_config(),
     )
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
     return lifecycle, runner
@@ -80,29 +109,12 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        fake_model = SimpleNamespace(
-            config=SimpleNamespace(
-                vocab_size=32000,
-                num_hidden_layers=32,
-                num_attention_heads=32,
-                num_key_value_heads=8,
-                hidden_size=4096,
-            )
-        )
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {"stub-model": (fake_model, object())},
-        )
+        _cache_generation_model(monkeypatch, config=_text_config())
         lifecycle, runner = _make_lifecycle(
-            model=SimpleNamespace(),
-            model_config=SimpleNamespace(
-                model="stub-model",
+            model_config=_runner_model_config(
                 hf_config=SimpleNamespace(model_type="gemma4"),
                 is_multimodal_model=True,
-                trust_remote_code=False,
-                dtype=torch.float16,
-            ),
+            )
         )
 
         lifecycle.load()
@@ -113,22 +125,13 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        fake_model = SimpleNamespace(
-            config=SimpleNamespace(
-                vocab_size=32000,
-                num_hidden_layers=32,
-                num_attention_heads=32,
-                num_key_value_heads=8,
-                hidden_size=4096,
-            )
-        )
         fake_tokenizer = object()
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {"stub-model": (fake_model, fake_tokenizer)},
+        fake_model, _ = _cache_generation_model(
+            monkeypatch,
+            config=_text_config(),
+            tokenizer=fake_tokenizer,
         )
-        lifecycle, runner = _make_lifecycle(model=SimpleNamespace())
+        lifecycle, runner = _make_lifecycle()
 
         lifecycle.load()
 
@@ -142,24 +145,14 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        fake_model = SimpleNamespace(
+        _cache_generation_model(
+            monkeypatch,
             config=SimpleNamespace(
-                vocab_size=32000,
-                text_config=SimpleNamespace(
-                    vocab_size=32000,
-                    num_hidden_layers=32,
-                    num_attention_heads=32,
-                    num_key_value_heads=8,
-                    hidden_size=4096,
-                ),
-            )
+                vocab_size=_TEXT_MODEL_ARGS["vocab_size"],
+                text_config=_text_config(),
+            ),
         )
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {"stub-model": (fake_model, object())},
-        )
-        lifecycle, runner = _make_lifecycle(model=SimpleNamespace())
+        lifecycle, runner = _make_lifecycle()
 
         lifecycle.load()
 
@@ -172,32 +165,18 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        fake_model = SimpleNamespace(
+        _cache_generation_model(
+            monkeypatch,
             config=SimpleNamespace(
                 text_config=_SlotTextConfig(
-                    vocab_size=32000,
-                    num_hidden_layers=32,
-                    num_attention_heads=32,
-                    num_key_value_heads=8,
-                    hidden_size=4096,
+                    **_TEXT_MODEL_ARGS,
                 )
-            )
-        )
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {"stub-model": (fake_model, object())},
+            ),
         )
         lifecycle, runner = _make_lifecycle(
-            model=SimpleNamespace(),
-            is_vlm=True,
-            model_config=SimpleNamespace(
-                model="stub-model",
-                hf_config=None,
+            model_config=_runner_model_config(
                 is_multimodal_model=True,
-                trust_remote_code=False,
-                dtype=torch.float16,
-            ),
+            )
         )
 
         lifecycle.load()
@@ -222,7 +201,7 @@ class TestModelLifecycle:
             {"stub-model": (fake_model, None)},
         )
         monkeypatch.setattr(model_lifecycle, "is_stt_model", lambda _model_name: True)
-        lifecycle, runner = _make_lifecycle(model=object())
+        lifecycle, runner = _make_lifecycle()
 
         lifecycle.load()
 
@@ -236,11 +215,13 @@ class TestModelLifecycle:
 
 
 class TestResolveModelDims:
-    def _make_runner(self, args: dict[str, object]) -> tuple[ModelLifecycle, object]:
-        return _make_lifecycle(model=object(), model_args=args)
+    def _resolve(self, args: dict[str, object]) -> object:
+        lifecycle, runner = _make_lifecycle(model_args=args)
+        lifecycle.resolve_model_dims()
+        return runner
 
     def test_standard_mha(self) -> None:
-        lifecycle, runner = self._make_runner(
+        runner = self._resolve(
             {
                 "num_hidden_layers": 32,
                 "num_attention_heads": 32,
@@ -249,47 +230,48 @@ class TestResolveModelDims:
             }
         )
 
-        lifecycle.resolve_model_dims()
-
         assert runner.num_layers == 32
         assert runner.num_kv_heads == 8
         assert runner.head_dim == 128
 
-    def test_mla_overrides_kv_heads_and_head_dim(self) -> None:
-        lifecycle, runner = self._make_runner(
-            {
-                "num_hidden_layers": 47,
-                "num_attention_heads": 20,
-                "num_key_value_heads": 20,
-                "hidden_size": 2048,
-                "kv_lora_rank": 512,
-                "qk_rope_head_dim": 64,
-            }
-        )
-
-        lifecycle.resolve_model_dims()
+    @pytest.mark.parametrize(
+        ("args", "expected_head_dim"),
+        [
+            (
+                {
+                    "num_hidden_layers": 47,
+                    "num_attention_heads": 20,
+                    "num_key_value_heads": 20,
+                    "hidden_size": 2048,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 64,
+                },
+                576,
+            ),
+            (
+                {
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 16,
+                    "hidden_size": 2048,
+                    "kv_lora_rank": 256,
+                },
+                256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM,
+            ),
+        ],
+    )
+    def test_mla_sets_expected_head_dim(
+        self,
+        args: dict[str, object],
+        expected_head_dim: int,
+    ) -> None:
+        runner = self._resolve(args)
 
         assert runner.num_kv_heads == 1
-        assert runner.head_dim == 576
-        assert runner.mla_latent_dim == 576
-
-    def test_mla_default_rope_head_dim(self) -> None:
-        lifecycle, runner = self._make_runner(
-            {
-                "num_hidden_layers": 28,
-                "num_attention_heads": 16,
-                "hidden_size": 2048,
-                "kv_lora_rank": 256,
-            }
-        )
-
-        lifecycle.resolve_model_dims()
-
-        assert runner.head_dim == 256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM
-        assert runner.mla_latent_dim == 256 + MLA_DEFAULT_QK_ROPE_HEAD_DIM
+        assert runner.head_dim == expected_head_dim
+        assert runner.mla_latent_dim == expected_head_dim
 
     def test_missing_dims_raise(self) -> None:
-        lifecycle, _ = self._make_runner({"num_hidden_layers": 32})
+        lifecycle, _ = _make_lifecycle(model_args={"num_hidden_layers": 32})
 
         with pytest.raises(ValueError, match="Cannot resolve model dimensions"):
             lifecycle.resolve_model_dims()
