@@ -1533,6 +1533,7 @@ class MetalModelRunner:
     ) -> None:
         """Evict finished request state and periodically clear MLX cache."""
         if not finished_req_ids:
+            self._gdn_materialize_pending_state_cache()
             return
 
         for req_id in finished_req_ids:

@@ -281,9 +281,6 @@ class TestGDNSlotLifecycle:
         runner.model = object()
         runner.model_args = {"full_attention_interval": 2}
         runner._gdn_req_to_slot = {"req-A": 0}
-        runner._paged_attention_backend = _HybridBackendStub(
-            runner._paged_attention_backend._state_cache
-        )
         scheduler_output = SimpleNamespace(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=SimpleNamespace(
@@ -315,6 +312,20 @@ class TestGDNSlotLifecycle:
         assert runner._gdn_free_slots == [0]
         assert runner._gdn_needs_materialize is True
         mock_materialize.assert_not_called()
+
+    def test_cleanup_finished_requests_drains_pending_materialization(self):
+        runner, _ = self._make_runner_stub()
+        runner._gdn_needs_materialize = True
+
+        with patch.object(
+            runner,
+            "_gdn_materialize_state_cache",
+            wraps=runner._gdn_materialize_state_cache,
+        ) as mock_materialize:
+            runner._cleanup_finished_requests(set())
+
+        mock_materialize.assert_called_once()
+        assert runner._gdn_needs_materialize is False
 
     def test_slot_reuse_after_early_release(self):
         """Slot freed via _gdn_release_slots should be
