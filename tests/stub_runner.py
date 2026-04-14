@@ -33,6 +33,7 @@ def make_stub_runner(
         "_paged_attention_backend": None,
         "_gdn_req_to_slot": {},
         "_gdn_free_slots": [],
+        "_gdn_needs_materialize": False,
         "_request_states": {},
         "_paged_request_seq_lens": {},
         "_finished_request_count": 0,

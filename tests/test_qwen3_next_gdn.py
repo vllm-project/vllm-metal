@@ -20,6 +20,7 @@ Run golden token test (requires model download):
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -252,22 +253,68 @@ class TestGDNSlotLifecycle:
         runner._gdn_release_slots({"req-A"})
 
         assert runner._gdn_free_slots == [slot]
+        assert runner._gdn_needs_materialize is True
 
-    def test_release_slots_materializes_once_per_batch(self):
+    def test_materialize_pending_state_cache_clears_flag_once(self):
         runner, _ = self._make_runner_stub()
         runner._gdn_alloc_slot("req-A")
         runner._gdn_alloc_slot("req-B")
+        runner._gdn_release_slots({"req-A", "req-B", "req-C"})
 
         with patch.object(
             runner,
             "_gdn_materialize_state_cache",
             wraps=runner._gdn_materialize_state_cache,
         ) as mock_materialize:
-            runner._gdn_release_slots({"req-A", "req-B", "req-C"})
+            runner._gdn_materialize_pending_state_cache()
+            runner._gdn_materialize_pending_state_cache()
 
         assert runner._gdn_req_to_slot == {}
         assert sorted(runner._gdn_free_slots) == [0, 1]
         mock_materialize.assert_called_once()
+        assert runner._gdn_needs_materialize is False
+
+    def test_execute_model_recycles_slots_without_materializing(self):
+        from vllm_metal.v1.model_runner import _ExecutionBatch
+
+        runner, _ = self._make_runner_stub()
+        runner.model = object()
+        runner.model_args = {"full_attention_interval": 2}
+        runner._gdn_req_to_slot = {"req-A": 0}
+        runner._paged_attention_backend = _HybridBackendStub(
+            runner._paged_attention_backend._state_cache
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                new_block_ids=[],
+                resumed_req_ids=set(),
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            finished_req_ids={"req-A"},
+            preempted_req_ids=set(),
+            grammar_bitmask=None,
+        )
+
+        with (
+            patch.object(runner, "_handle_new_requests"),
+            patch.object(runner, "_update_cached_request_blocks"),
+            patch.object(runner, "_collect_cached_requests"),
+            patch.object(_ExecutionBatch, "has_paged_work", return_value=True),
+            patch.object(runner, "_build_prefill_pack", return_value=[]),
+            patch.object(runner, "_start_paged_forward"),
+            patch.object(runner, "_gdn_materialize_state_cache") as mock_materialize,
+        ):
+            result = runner.execute_model(scheduler_output)
+
+        assert result is None
+        assert runner._gdn_req_to_slot == {}
+        assert runner._gdn_free_slots == [0]
+        assert runner._gdn_needs_materialize is True
+        mock_materialize.assert_not_called()
 
     def test_slot_reuse_after_early_release(self):
         """Slot freed via _gdn_release_slots should be

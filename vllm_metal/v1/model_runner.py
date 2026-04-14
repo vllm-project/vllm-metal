@@ -234,6 +234,7 @@ class MetalModelRunner:
         # models so recurrent state survives request reordering/preemption.
         self._gdn_req_to_slot: dict[str, int] = {}
         self._gdn_free_slots: list[int] = []
+        self._gdn_needs_materialize = False
 
         # vLLM Sampler for token sampling with temperature, top_k, top_p support
         self._sampler = Sampler()
@@ -660,7 +661,7 @@ class MetalModelRunner:
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
     def _gdn_release_slots(self, req_ids: set[str]) -> None:
-        """Release finished GDN slots, materializing state once if needed."""
+        """Release finished GDN slots and defer state materialization."""
         freed_slots: list[int] = []
         for req_id in req_ids:
             slot = self._gdn_req_to_slot.pop(req_id, None)
@@ -670,8 +671,15 @@ class MetalModelRunner:
         if not freed_slots:
             return
 
-        self._gdn_materialize_state_cache()
+        self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
+
+    def _gdn_materialize_pending_state_cache(self) -> None:
+        """Materialize GDN state after slot recycling if the step needs it."""
+        if not self._gdn_needs_materialize:
+            return
+        self._gdn_materialize_state_cache()
+        self._gdn_needs_materialize = False
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1538,6 +1546,7 @@ class MetalModelRunner:
             self._paged_request_seq_lens.pop(req_id, None)
 
         self._gdn_release_slots(finished_req_ids)
+        self._gdn_materialize_pending_state_cache()
 
         self._finished_request_count += len(finished_req_ids)
         if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
