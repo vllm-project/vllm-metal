@@ -46,8 +46,8 @@ from vllm_metal.paged_attention_common import (
 )
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
-from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1 import contiguous_cache
+from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
     _PREFIX_CACHE_ENABLED,
@@ -462,6 +462,21 @@ class MetalModelRunner:
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
+
+    def build_paged_attention_backend(
+        self, *, block_size: int
+    ) -> PagedAttentionBackend:
+        """Build the paged-attention backend for the loaded model."""
+        return self._cache_policy.build_paged_attention_backend(block_size=block_size)
+
+    def estimate_one_sequence_kv_bytes(
+        self, *, max_model_len: int, block_size: int
+    ) -> int:
+        """Estimate bytes for one max-length sequence of cache state."""
+        return self._cache_policy.estimate_one_sequence_kv_bytes(
+            max_model_len=max_model_len,
+            block_size=block_size,
+        )
 
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.

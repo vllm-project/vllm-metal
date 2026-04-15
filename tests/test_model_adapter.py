@@ -159,21 +159,19 @@ class TestYocoCacheIntegration:
         """_make_backend should create MHA backend with reduced num_layers."""
         import mlx.core as mx
 
+        from tests.stub_runner import make_stub_runner
         from vllm_metal.v1.worker import MetalWorker
 
         adapter = DefaultModelAdapter()
         args = self._gemma4_args()
         yoco = adapter.build_yoco_cache_mapping(args)
 
-        # SimpleNamespace mock — avoids MetalModelRunner property issues
-        runner = SimpleNamespace(
+        runner = make_stub_runner(
             model_args=args,
             num_layers=self._NUM_HIDDEN,
             num_kv_heads=self._NUM_KV_HEADS,
             head_dim=self._HEAD_DIM,
             kv_cache_dtype=mx.float16,
-            is_hybrid=False,
-            is_mla=False,
             _model_adapter=adapter,
             _yoco_cache_mapping=yoco,
             num_kv_cache_layers=yoco[0],

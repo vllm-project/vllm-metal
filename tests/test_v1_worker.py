@@ -11,10 +11,11 @@ import pytest
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
+from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
+from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import ModelCachePolicy  # noqa: E402
 from vllm_metal.v1.model_adapter import DefaultModelAdapter  # noqa: E402
-from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
 
@@ -86,18 +87,15 @@ class TestWorkerRunnerBoundaryDelegation:
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
         """Test MLX path returns one max-length sequence estimate (PR #229)."""
-        import mlx.core as mx
-
-        model_runner = SimpleNamespace(
-            scheduler_memory_reporting_mode=MagicMock(
-                return_value="single_sequence_estimate"
-            ),
-            kv_cache_dtype=mx.float16,
-            is_hybrid=False,
-            is_mla=False,
+        model_runner = make_stub_runner(
             num_layers=16,
+            num_kv_cache_layers=16,
             num_kv_heads=8,
             head_dim=128,
+            kv_cache_dtype=mx.float16,
+        )
+        model_runner.scheduler_memory_reporting_mode = MagicMock(
+            return_value="single_sequence_estimate"
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -128,10 +126,9 @@ class TestOneSequenceKvBytes:
     """_one_sequence_kv_bytes must account for hybrid linear state and block alignment."""
 
     def test_non_hybrid_counts_all_layers(self) -> None:
-        model_runner = SimpleNamespace(
-            is_hybrid=False,
-            is_mla=False,
+        model_runner = make_stub_runner(
             num_layers=16,
+            num_kv_cache_layers=16,
             num_kv_heads=8,
             head_dim=64,
             kv_cache_dtype=mx.float16,
@@ -150,15 +147,18 @@ class TestOneSequenceKvBytes:
         assert result == 2 * 16 * 2048 * 8 * 64 * 2
 
     def test_hybrid_adds_linear_state(self) -> None:
-        linear_bytes = 1_000_000
-        model_runner = SimpleNamespace(
-            is_hybrid=True,
-            is_mla=False,
+        model_runner = make_stub_runner(
+            model_args={"full_attention_interval": 2},
             num_sdpa_layers=8,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
-            linear_cache_bytes_per_slot=MagicMock(return_value=linear_bytes),
+            linear_conv_kernel_dim=3,
+            linear_conv_dim=5,
+            linear_num_v_heads=2,
+            linear_value_head_dim=7,
+            linear_key_head_dim=11,
+            num_linear_layers=3,
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -171,6 +171,9 @@ class TestOneSequenceKvBytes:
 
         # Assert — SDPA bytes + linear state
         sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        conv_bytes = (3 - 1) * 5 * mx.float16.size
+        recurrent_bytes = 2 * 7 * 11 * mx.float32.size
+        linear_bytes = 3 * (conv_bytes + recurrent_bytes)
         assert result == sdpa_bytes + linear_bytes
 
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
@@ -210,10 +213,9 @@ class TestOneSequenceKvBytes:
         models (e.g. Granite 4.0-H) where the attention block_size is padded
         to 400 to match the mamba page size.
         """
-        model_runner = SimpleNamespace(
-            is_hybrid=False,
-            is_mla=False,
+        model_runner = make_stub_runner(
             num_layers=4,
+            num_kv_cache_layers=4,
             num_kv_heads=4,
             head_dim=64,
             kv_cache_dtype=mx.float16,
@@ -241,10 +243,10 @@ class TestOneSequenceKvBytes:
         head_dim=576 represents kv_lora_rank + qk_rope_head_dim (e.g. GLM-4).
         The 2x K/V factor must NOT be applied — kv_factor=1.
         """
-        model_runner = SimpleNamespace(
-            is_hybrid=False,
-            is_mla=True,
+        model_runner = make_stub_runner(
+            model_args={"kv_lora_rank": 512},
             num_layers=4,
+            num_kv_cache_layers=4,
             num_kv_heads=1,
             head_dim=576,
             kv_cache_dtype=mx.float16,
@@ -258,4 +260,23 @@ class TestOneSequenceKvBytes:
         result = MetalWorker._one_sequence_kv_bytes(worker)
 
         expected = 1 * 4 * 2048 * 1 * 576 * 2
+        assert result == expected
+
+    def test_yoco_uses_unique_cache_layers(self) -> None:
+        model_runner = make_stub_runner(
+            num_layers=28,
+            num_kv_cache_layers=24,
+            num_kv_heads=4,
+            head_dim=256,
+            kv_cache_dtype=mx.float16,
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
+
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        expected = 2 * 24 * 2048 * 4 * 256 * 2
         assert result == expected
