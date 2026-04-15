@@ -313,6 +313,7 @@ class MetalModelRunner:
         cache path that the text/VLM runner uses.
         """
         return self._cache_policy.should_setup_paged_attention()
+
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._cache_policy.validate_paged_attention_support()
