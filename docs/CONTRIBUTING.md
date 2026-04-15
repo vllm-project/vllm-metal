@@ -53,6 +53,8 @@ Two conditional checks apply depending on what your PR touches:
 **If your PR claims a performance improvement**, attach before/after benchmark results. For example, using `vllm bench serve` with the sonnet dataset:
 
 ```bash
+curl -O https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/sonnet.txt
+
 # 1. Start the server
 VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.8 \
   vllm serve Qwen/Qwen3-0.6B --port 8000 --max-model-len 2048
