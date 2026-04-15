@@ -93,7 +93,10 @@ class ModelCachePolicy:
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
-            if self._runner.is_hybrid and layer_idx not in self._runner.sdpa_layer_indices:
+            if (
+                self._runner.is_hybrid
+                and layer_idx not in self._runner.sdpa_layer_indices
+            ):
                 layer_name = f"layers.{layer_idx}.linear_attn"
                 specs[layer_name] = _build_linear_layer_spec(
                     conv_kernel_dim=self._runner.linear_conv_kernel_dim,
