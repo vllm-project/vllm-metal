@@ -25,6 +25,8 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
+from vllm_metal.v1.cache_policy import ModelCachePolicy
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_runner import MetalModelRunner
 
 
@@ -44,6 +46,8 @@ class _StubRunner:
         self._request_states: dict = {}
         self._pending_output = None
         self._stt_runtime_adapter = runtime_adapter
+        self._model_adapter = DefaultModelAdapter()
+        self._cache_policy = ModelCachePolicy(self, self._model_adapter)
 
 
 def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:

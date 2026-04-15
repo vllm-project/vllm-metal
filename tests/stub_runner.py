@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
@@ -51,6 +52,8 @@ def make_stub_runner(
         setattr(runner, k, v)
     for k, v in attrs.items():
         setattr(runner, k, v)
+
+    runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
 
     # Derive _vocab_size from model_args — single source of truth.
     if "vocab_size" in _model_args:

@@ -12,6 +12,8 @@ import pytest
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
+from vllm_metal.v1.cache_policy import ModelCachePolicy  # noqa: E402
+from vllm_metal.v1.model_adapter import DefaultModelAdapter  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
@@ -174,6 +176,8 @@ class TestOneSequenceKvBytes:
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner.model_args = {"full_attention_interval": 2}
+        runner._model_adapter = DefaultModelAdapter()
+        runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
         runner.kv_cache_dtype = mx.float16
         runner.linear_conv_kernel_dim = 3
         runner.linear_conv_dim = 5

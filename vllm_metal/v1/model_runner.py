@@ -29,17 +29,14 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
-from vllm_metal.paged_attention_backend.hybrid import (
-    HybridPagedAttentionBackend,
-    _build_linear_layer_spec,
-)
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
@@ -47,9 +44,9 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     prepare_unified,
 )
-from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
+from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1 import contiguous_cache
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
@@ -202,6 +199,7 @@ class MetalModelRunner:
         self.device = device
         self.metal_config = get_config()
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
+        self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
 
         self.model: Any = None
@@ -308,9 +306,16 @@ class MetalModelRunner:
             self.model_args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
         )
 
+    def should_setup_paged_attention(self) -> bool:
+        """Whether worker-side paged-attention setup should run.
+
+        STT models own their runtime path and do not use the paged-attention
+        cache path that the text/VLM runner uses.
+        """
+        return self._cache_policy.should_setup_paged_attention()
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
-        self._model_adapter.require_uniform_kv_heads(self.model_args, self.num_kv_heads)
+        self._cache_policy.validate_paged_attention_support()
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
@@ -320,11 +325,9 @@ class MetalModelRunner:
         Worker delegates this decision to the runner so STT-specific policy is
         not open-coded in `worker.py`.
         """
-        if self._is_stt:
-            return "stt_nominal"
-        if paged_attention_enabled:
-            return "paged_attention_capacity"
-        return "single_sequence_estimate"
+        return self._cache_policy.scheduler_memory_reporting_mode(
+            paged_attention_enabled=paged_attention_enabled
+        )
 
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
@@ -421,55 +424,7 @@ class MetalModelRunner:
         Returns:
             Dictionary mapping attention layer names to KV cache specs
         """
-        if self._is_stt:
-            # STT models manage their own KV cache internally.
-            # vLLM requires a non-empty spec for scheduler initialization,
-            # so we return a single minimal entry.
-            return {
-                "layers.0.self_attn": FullAttentionSpec(
-                    block_size=self.metal_config.block_size,
-                    num_kv_heads=1,
-                    head_size=64,
-                    dtype=torch.float16,
-                ),
-            }
-
-        # Use cache_config.block_size (not metal_config.block_size) because
-        # vLLM's hybrid alignment may have adjusted it to unify page sizes
-        # across SDPA and Mamba/GDN layers.
-        block_size = self.cache_config.block_size
-        if self.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-
-        # FullAttentionSpec (upstream vLLM) expects torch.dtype
-        from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
-
-        torch_dtype = MLX_TO_TORCH_DTYPE[self.kv_cache_dtype]
-
-        specs: dict[str, KVCacheSpec] = {}
-        for layer_idx in range(self.num_layers):
-            if self.is_hybrid and layer_idx not in self.sdpa_layer_indices:
-                layer_name = f"layers.{layer_idx}.linear_attn"
-                specs[layer_name] = _build_linear_layer_spec(
-                    conv_kernel_dim=self.linear_conv_kernel_dim,
-                    conv_dim=self.linear_conv_dim,
-                    num_v_heads=self.linear_num_v_heads,
-                    value_head_dim=self.linear_value_head_dim,
-                    key_head_dim=self.linear_key_head_dim,
-                    torch_dtype=torch_dtype,
-                    page_size_padded=self.cache_config.mamba_page_size_padded,
-                    block_size=block_size,
-                )
-            else:
-                layer_name = f"layers.{layer_idx}.self_attn"
-                specs[layer_name] = FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_size=self.head_dim,
-                    dtype=torch_dtype,
-                )
-
-        return specs
+        return self._cache_policy.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Accept KV cache config from engine (no-op for MLX path).
@@ -477,10 +432,7 @@ class MetalModelRunner:
         MLX manages its own KV cache via make_prompt_cache().
         This method exists to satisfy the engine's initialization protocol.
         """
-        logger.info(
-            "KV cache config received: %d blocks (MLX manages cache internally)",
-            kv_cache_config.num_blocks,
-        )
+        self._cache_policy.initialize_kv_cache(kv_cache_config)
 
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.
@@ -488,51 +440,11 @@ class MetalModelRunner:
         Returns:
             Block size in bytes
         """
-        if self._is_stt:
-            return STT_SCHED_BLOCK_BYTES
-
-        # Use cache_config.block_size (not metal_config) because vLLM's
-        # hybrid alignment may have adjusted it to match mamba page size.
-        block_size = self.cache_config.block_size
-
-        # Each block stores key and value for SDPA layers only.
-        # Hybrid models (Qwen3.5) have linear attention layers that use
-        # fixed-size recurrent state, not paged KV — exclude them.
-        if self.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = self.kv_cache_dtype.size
-        num_kv_layers = (
-            self.num_sdpa_layers if self.is_hybrid else self.num_kv_cache_layers
-        )
-        kv_factor = 1 if self.is_mla else 2
-        return (
-            kv_factor
-            * num_kv_layers
-            * block_size
-            * self.num_kv_heads
-            * self.head_dim
-            * dtype_size
-        )
+        return self._cache_policy.get_cache_block_size_bytes()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Bytes for one request's linear attention state across all GDN layers."""
-        if not self.is_hybrid:
-            raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
-        if self.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-        dtype_size = self.kv_cache_dtype.size
-        # GDN recurrent state is always float32 (see GDNPagedStateCache).
-        recurrent_dtype_size = mx.float32.size
-        conv_bytes = (
-            (self.linear_conv_kernel_dim - 1) * self.linear_conv_dim * dtype_size
-        )
-        recurrent_bytes = (
-            self.linear_num_v_heads
-            * self.linear_value_head_dim
-            * self.linear_key_head_dim
-            * recurrent_dtype_size
-        )
-        return self.num_linear_layers * (conv_bytes + recurrent_bytes)
+        return self._cache_policy.linear_cache_bytes_per_slot()
 
     def profile_run(self) -> int:
         """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
