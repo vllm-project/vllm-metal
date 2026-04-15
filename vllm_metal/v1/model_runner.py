@@ -16,7 +16,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
+
+try:
+    import xgrammar as xgr
+except ImportError:
+    xgr = None  # type: ignore[assignment]
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -44,6 +50,7 @@ from vllm_metal.paged_attention_common import (
     clear_context,
     prepare_unified,
 )
+from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1 import contiguous_cache
@@ -171,6 +178,184 @@ class _PagedForwardState(NamedTuple):
     logits: mx.array
     cu_seqlens: list[int]
     num_decode: int
+
+
+def _apply_grammar_bitmask_metal(
+    scheduler_output: SchedulerOutput,
+    grammar_output: GrammarOutput,
+    req_ids: list[str],
+    logits: mx.array,
+) -> mx.array:
+    """Apply grammar bitmask to logits for structured output on Metal.
+
+    Replicates the upstream GPU logic but bridges mx.array logits through
+    a CPU torch tensor so the xgrammar CPU kernel can apply the bitmask.
+    Non-fp32 logits are upcasted for the kernel and restored afterwards.
+
+    Args:
+        scheduler_output: Scheduler output containing spec-decode token counts.
+        grammar_output: Grammar bitmask and request IDs from the scheduler.
+        req_ids: Ordered list of request IDs in this batch.
+        logits: MLX logits array of shape (batch, vocab_size).
+
+    Returns:
+        Logits with forbidden tokens set to -inf, same dtype as input.
+    """
+    if xgr is None:
+        raise RuntimeError(
+            "xgrammar is required for structured output. "
+            "Install it with: pip install xgrammar"
+        )
+
+    grammar_bitmask: np.ndarray = grammar_output.grammar_bitmask
+    spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+    # Invariant: this helper operates on 2D logits (batch, vocab).
+    assert logits.ndim == 2, (
+        f"_apply_grammar_bitmask_metal expects 2D logits, got shape {logits.shape}"
+    )
+
+    # Map each structured-output request to its logit row index,
+    # accounting for any speculative-decode token offsets.
+    struct_out_req_batch_indices: dict[str, int] = {}
+    cumulative_offset = 0
+    struct_out_req_ids = set(grammar_output.structured_output_request_ids)
+    for batch_index, req_id in enumerate(req_ids):
+        logit_index = batch_index + cumulative_offset
+        cumulative_offset += len(spec_tokens.get(req_id, ()))
+        if req_id in struct_out_req_ids:
+            struct_out_req_batch_indices[req_id] = logit_index
+
+    # Re-order the bitmask rows to match this runner's batch order.
+    # fill_value=-1 means "all bits set" which xgrammar treats as unconstrained;
+    # only structured-output rows are overwritten with real bitmask data.
+    # cumulative_index tracks position in grammar_output.grammar_bitmask which
+    # is ordered by structured_output_request_ids (may differ from batch order).
+    out_indices: list[int] = []
+    sorted_bitmask = np.full(
+        shape=(logits.shape[0], grammar_bitmask.shape[1]),
+        fill_value=-1,
+        dtype=grammar_bitmask.dtype,
+    )
+    cumulative_index = 0
+    for req_id in grammar_output.structured_output_request_ids:
+        num_spec_tokens = len(spec_tokens.get(req_id, ()))
+        if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
+            for i in range(1 + num_spec_tokens):
+                bitmask_index = logit_idx + i
+                sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
+                out_indices.append(bitmask_index)
+        cumulative_index += 1 + num_spec_tokens
+
+    # No structured-output requests are present in this batch; return unchanged.
+    if not out_indices:
+        return logits
+
+    # xgrammar's CPU kernel requires a CPU torch tensor in float32.
+    # np.array() forces MLX evaluation and produces an independent owned copy —
+    # we explicitly avoid mlx_to_torch here because its output aliases MLX storage,
+    # so in-place xgrammar mutation would desync the MLX side.
+    original_dtype = logits.dtype
+    logits_np = np.array(logits.astype(mx.float32))  # always float32, always a copy
+    logits_torch = torch.from_numpy(logits_np)  # writable; shares np buffer (safe)
+    bitmask_torch = torch.from_numpy(sorted_bitmask)
+
+    # Pass indices=None when every row is constrained (cheaper xgrammar path).
+    # Use set equality — a length coincidence (e.g. with spec-decode offsets) must
+    # not trigger the all-rows shortcut when coverage is actually incomplete.
+    indices = None if set(out_indices) == set(range(logits.shape[0])) else out_indices
+    xgr.apply_token_bitmask_inplace(logits_torch, bitmask_torch, indices=indices)
+
+    result = torch_to_mlx(logits_torch)
+    return result.astype(original_dtype) if original_dtype != mx.float32 else result
+
+
+def _apply_grammar_bitmask_paged(
+    scheduler_output: SchedulerOutput,
+    grammar_output: GrammarOutput,
+    decode_reqs: list[tuple[str, Any]],
+    prefill_reqs: list[Any],
+    cu_seqlens: list[int],
+    num_decode: int,
+    logits: mx.array,  # shape (1, total_tokens, vocab)
+) -> mx.array:
+    """Apply grammar bitmask to paged-path logits of shape (1, total_tokens, vocab).
+
+    Applies constraints only to the sample positions:
+    - Decode request i  → row i of logits[0]
+    - Prefill request j → last-token row per sequence (from cu_seqlens)
+
+    Args:
+        scheduler_output: Used to guard against spec-decode requests, which are
+            not yet supported with grammar constraints on the paged path.
+        grammar_output: Grammar bitmask and structured-output request IDs.
+        decode_reqs: (req_id, RequestState) pairs in decode-batch order.
+        prefill_reqs: PrefillRequest objects in prefill order.
+        cu_seqlens: Cumulative token counts: [0, 1, …, num_decode,
+            num_decode+len(pr0), …].  Used to locate last-token rows.
+        num_decode: Number of decode requests (prefix of the token dimension).
+        logits: Full paged logits, shape (1, total_tokens, vocab).
+
+    Returns:
+        Logits with forbidden token positions set to -inf, same shape and dtype.
+    """
+    if xgr is None:
+        raise RuntimeError(
+            "xgrammar is required for structured output. "
+            "Install it with: pip install xgrammar"
+        )
+
+    assert logits.ndim == 3 and logits.shape[0] == 1, (
+        f"_apply_grammar_bitmask_paged expects shape (1, T, V), got {logits.shape}"
+    )
+
+    # Spec-decode expands the token dimension with verification positions that
+    # don't map 1:1 to grammar_bitmask rows — guard until that's implemented.
+    if any(scheduler_output.scheduled_spec_decode_tokens.values()):
+        raise NotImplementedError(
+            "Grammar/structured-output constraints are not yet supported "
+            "when speculative decoding is active on the paged Metal path."
+        )
+
+    grammar_bitmask: np.ndarray = grammar_output.grammar_bitmask
+
+    # Build req_id → sample row index in logits[0].
+    req_id_to_row: dict[str, int] = {}
+    for i, (req_id, _) in enumerate(decode_reqs):
+        req_id_to_row[req_id] = i
+    for j, pr in enumerate(prefill_reqs):
+        # cu_seqlens[num_decode + j + 1] - 1 is the last token of prefill seq j.
+        last_row = cu_seqlens[num_decode + j + 1] - 1
+        req_id_to_row[pr.req_id] = last_row
+
+    # Determine which structured-output requests are present in this batch.
+    constrained: list[tuple[int, int]] = []  # (logit_row, bitmask_row)
+    for bitmask_row, req_id in enumerate(grammar_output.structured_output_request_ids):
+        if req_id in req_id_to_row:
+            constrained.append((req_id_to_row[req_id], bitmask_row))
+
+    if not constrained:
+        return logits
+
+    # Convert the 2D token-logits slice to a CPU torch tensor for xgrammar.
+    # Explicit float32 cast before numpy: numpy has no bfloat16 dtype, and
+    # np.array() forces MLX evaluation, producing an independent writable copy.
+    original_dtype = logits.dtype
+    logits_np = np.array(logits[0].astype(mx.float32))  # (total_tokens, vocab)
+    logits_torch = torch.from_numpy(logits_np)
+
+    # Apply per constrained row. xgrammar's indices= parameter selects rows from
+    # a full-batch bitmask — it does not support a sub-sampled bitmask paired
+    # with target logit indices, so we apply row-by-row here.
+    for logit_row, bitmask_row in constrained:
+        row_bitmask = torch.from_numpy(grammar_bitmask[bitmask_row : bitmask_row + 1])
+        # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
+        xgr.apply_token_bitmask_inplace(
+            logits_torch[logit_row : logit_row + 1], row_bitmask, indices=None
+        )
+
+    result_2d = torch_to_mlx(logits_torch).astype(original_dtype)
+    return result_2d[None]  # Restore (1, total_tokens, vocab) shape
 
 
 class MetalModelRunner:
@@ -806,7 +991,10 @@ class MetalModelRunner:
             num_decode=num_decode,
         )
 
-    def _sample_paged_batch(self) -> tuple[_ExecutionBatch, SchedulerOutput]:
+    def _sample_paged_batch(
+        self,
+        grammar_output: GrammarOutput | None = None,
+    ) -> tuple[_ExecutionBatch, SchedulerOutput]:
         """Eval logits, sample tokens, and postprocess paged batch.
 
         Consumes state stashed by ``_start_paged_forward``.
@@ -823,8 +1011,20 @@ class MetalModelRunner:
         cu_seqlens = state.cu_seqlens
         num_decode = state.num_decode
 
-        # ---- wait for GPU forward to complete ----
+        # ---- wait for MLX forward to complete ----
         mx.eval(logits)
+
+        # ---- apply structured output bitmask if present ----
+        if grammar_output is not None:
+            logits = _apply_grammar_bitmask_paged(
+                scheduler_output,
+                grammar_output,
+                decode_reqs,
+                prefill_reqs,
+                cu_seqlens,
+                num_decode,
+                logits,
+            )
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
@@ -1272,14 +1472,24 @@ class MetalModelRunner:
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
         """
-        del grammar_output
-
-        # Paged path: eval + sample + postprocess
+        # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
-            batch, scheduler_output = self._sample_paged_batch()
+            batch, scheduler_output = self._sample_paged_batch(grammar_output)
             self._validate_scheduled_outputs(batch, scheduler_output)
             self._cleanup_finished_requests(scheduler_output.finished_req_ids)
             return self._build_output(batch)
+
+        # Non-paged path: sampling already happened inside execute_model, so
+        # grammar constraints cannot be applied here.  Raising is intentional:
+        # silently returning unconstrained tokens when the caller requested a
+        # grammar/JSON schema is a correctness violation, not a degraded mode.
+        if grammar_output is not None:
+            raise NotImplementedError(
+                "Grammar/structured-output constraints are not supported on "
+                "the non-paged (legacy) Metal path. "
+                "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
+                "to use structured output."
+            )
 
         # Non-paged path: return output built by execute_model
         if self._pending_output is not None:
