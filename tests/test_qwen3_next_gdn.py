@@ -3,7 +3,7 @@
 
 Covers:
   - GDNPagedAttentionWrapper projection dispatch (in_proj_qkvz vs in_proj_qkv)
-  - _gdn_free_slot state zeroing (slot-only, preserves other slots)
+  - GDN release and alloc-time slot reuse
   - sync_mlx insertion in mlx_to_torch for MPS safety
   - Golden token deterministic test for Qwen3-Next (slow, requires model)
 
@@ -20,11 +20,19 @@ Run golden token test (requires model download):
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
+from tests.stub_runner import make_stub_runner
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+
+
+class _HybridBackendStub(HybridPagedAttentionBackend):
+    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+        self._state_cache = state_cache
 
 
 class TestGDNProjectionDispatch:
@@ -45,8 +53,8 @@ class TestGDNProjectionDispatch:
         assert not hasattr(module, "in_proj_qkvz")
 
 
-class TestGDNFreeSlotZeroing:
-    """Verify that _gdn_free_slot zeros only the freed slot."""
+class TestGDNStateZeroing:
+    """Verify that slot zeroing only affects the released slot."""
 
     def _make_cache(self, num_layers: int = 2, max_seqs: int = 2) -> GDNPagedStateCache:
         return GDNPagedStateCache(
@@ -72,7 +80,7 @@ class TestGDNFreeSlotZeroing:
             )
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
-        # Simulate _gdn_free_slot for slot 0 only
+        # Zero slot 0 only.
         slot = 0
         mx.eval(*sc.conv_states, *sc.recurrent_states)
         for layer_idx in range(sc.num_layers):
@@ -143,8 +151,8 @@ class TestGDNFreeSlotZeroing:
             assert sc.recurrent_states[layer_idx].dtype == mx.float32
 
 
-class TestGDNAllocSlotZeroing:
-    """Verify that _gdn_alloc_slot zeros state for reused slots."""
+class TestGDNSlotLifecycle:
+    """Verify GDN slot release and alloc-time reuse behavior."""
 
     def _make_runner_stub(self, max_seqs: int = 2):
         """Build a minimal stub with GDN slot management wired up."""
@@ -160,24 +168,18 @@ class TestGDNAllocSlotZeroing:
             key_head_dim=16,
             dtype=mx.float16,
         )
-        backend = MagicMock()
-        backend._state_cache = sc
+        backend = _HybridBackendStub(sc)
 
-        runner = MagicMock()
-        runner._gdn_req_to_slot = {}
-        runner._gdn_free_slots = []
-        runner._paged_attention_backend = backend
+        runner = make_stub_runner(_paged_attention_backend=backend)
         return runner, sc
 
     def test_reused_slot_is_zeroed(self):
         """A slot returned to the free list and re-allocated must have
         zeroed conv and recurrent state."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner, sc = self._make_runner_stub()
 
         # Allocate slot 0 for req-A
-        slot = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        slot = runner._gdn_alloc_slot("req-A")
         assert slot == 0
 
         # Write non-zero data to slot 0
@@ -188,12 +190,12 @@ class TestGDNAllocSlotZeroing:
             )
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
-        # Free slot 0 (bare pop+append, no zeroing — matches early release path)
+        # Put slot 0 on the free list to isolate alloc-time zeroing.
         runner._gdn_req_to_slot.pop("req-A")
         runner._gdn_free_slots.append(slot)
 
         # Re-allocate — should trigger alloc-time zeroing
-        slot2 = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        slot2 = runner._gdn_alloc_slot("req-B")
         assert slot2 == 0  # reused
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
@@ -210,13 +212,11 @@ class TestGDNAllocSlotZeroing:
 
     def test_reused_slot_preserves_other_slots(self):
         """Alloc-time zeroing of slot 0 must not affect slot 1."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner, sc = self._make_runner_stub()
 
         # Allocate slots 0 and 1
-        MetalModelRunner._gdn_alloc_slot(runner, "req-A")
-        MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        runner._gdn_alloc_slot("req-A")
+        runner._gdn_alloc_slot("req-B")
 
         # Write ones everywhere
         for layer_idx in range(sc.num_layers):
@@ -226,10 +226,10 @@ class TestGDNAllocSlotZeroing:
             )
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
-        # Free slot 0, re-allocate
+        # Put slot 0 on the free list, then re-allocate.
         runner._gdn_req_to_slot.pop("req-A")
         runner._gdn_free_slots.append(0)
-        MetalModelRunner._gdn_alloc_slot(runner, "req-C")
+        runner._gdn_alloc_slot("req-C")
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
         # Slot 1 must still be ones
@@ -240,31 +240,99 @@ class TestGDNAllocSlotZeroing:
 
     def test_new_slot_not_zeroed(self):
         """A brand-new slot (not from free list) should not trigger zeroing."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner, sc = self._make_runner_stub()
-        slot = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        slot = runner._gdn_alloc_slot("req-A")
         assert slot == 0
         # No crash, no zeroing needed — state was already initialized to zero
 
-    def test_double_free_is_safe(self):
-        """Calling _gdn_free_slot twice for the same req_id must not crash."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
+    def test_release_slots_is_noop_when_already_released(self):
+        runner, _ = self._make_runner_stub()
+        slot = runner._gdn_alloc_slot("req-A")
 
-        runner, sc = self._make_runner_stub()
-        MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        runner._gdn_release_slots({"req-A"})
+        runner._gdn_release_slots({"req-A"})
 
-        MetalModelRunner._gdn_free_slot(runner, "req-A")
-        MetalModelRunner._gdn_free_slot(runner, "req-A")  # no-op, no crash
+        assert runner._gdn_free_slots == [slot]
+        assert runner._gdn_needs_materialize is True
+
+    def test_materialize_pending_state_cache_clears_flag_once(self):
+        runner, _ = self._make_runner_stub()
+        runner._gdn_alloc_slot("req-A")
+        runner._gdn_alloc_slot("req-B")
+        runner._gdn_release_slots({"req-A", "req-B", "req-C"})
+
+        with patch.object(
+            runner,
+            "_gdn_materialize_state_cache",
+            wraps=runner._gdn_materialize_state_cache,
+        ) as mock_materialize:
+            runner._gdn_materialize_pending_state_cache()
+            runner._gdn_materialize_pending_state_cache()
+
+        assert runner._gdn_req_to_slot == {}
+        assert sorted(runner._gdn_free_slots) == [0, 1]
+        mock_materialize.assert_called_once()
+        assert runner._gdn_needs_materialize is False
+
+    def test_execute_model_recycles_slots_without_materializing(self):
+        from vllm_metal.v1.model_runner import _ExecutionBatch
+
+        runner, _ = self._make_runner_stub()
+        runner.model = object()
+        runner.model_args = {"full_attention_interval": 2}
+        runner._gdn_req_to_slot = {"req-A": 0}
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                new_block_ids=[],
+                resumed_req_ids=set(),
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            finished_req_ids={"req-A"},
+            preempted_req_ids=set(),
+            grammar_bitmask=None,
+        )
+
+        with (
+            patch.object(runner, "_handle_new_requests"),
+            patch.object(runner, "_update_cached_request_blocks"),
+            patch.object(runner, "_collect_cached_requests"),
+            patch.object(_ExecutionBatch, "has_paged_work", return_value=True),
+            patch.object(runner, "_build_prefill_pack", return_value=[]),
+            patch.object(runner, "_start_paged_forward"),
+            patch.object(runner, "_gdn_materialize_state_cache") as mock_materialize,
+        ):
+            result = runner.execute_model(scheduler_output)
+
+        assert result is None
+        assert runner._gdn_req_to_slot == {}
+        assert runner._gdn_free_slots == [0]
+        assert runner._gdn_needs_materialize is True
+        mock_materialize.assert_not_called()
+
+    def test_cleanup_finished_requests_drains_pending_materialization(self):
+        runner, _ = self._make_runner_stub()
+        runner._gdn_needs_materialize = True
+
+        with patch.object(
+            runner,
+            "_gdn_materialize_state_cache",
+            wraps=runner._gdn_materialize_state_cache,
+        ) as mock_materialize:
+            runner._cleanup_finished_requests(set())
+
+        mock_materialize.assert_called_once()
+        assert runner._gdn_needs_materialize is False
 
     def test_slot_reuse_after_early_release(self):
-        """Slot freed via bare pop+append (early release) should be
+        """Slot freed via _gdn_release_slots should be
         available for immediate reallocation with zeroed state."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner, sc = self._make_runner_stub(max_seqs=1)
 
-        slot0 = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
+        slot0 = runner._gdn_alloc_slot("req-A")
         assert slot0 == 0
 
         # Write non-zero data to slot 0
@@ -275,12 +343,10 @@ class TestGDNAllocSlotZeroing:
             )
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
-        # Early release (bare pop+append, as in execute_model)
-        runner._gdn_req_to_slot.pop("req-A")
-        runner._gdn_free_slots.append(slot0)
+        runner._gdn_release_slots({"req-A"})
 
         # Same-step allocation should reuse slot 0
-        slot1 = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        slot1 = runner._gdn_alloc_slot("req-B")
         assert slot1 == 0
 
         # Alloc-time zeroing must have cleared the state
@@ -298,13 +364,11 @@ class TestGDNAllocSlotZeroing:
     def test_early_release_then_alloc_full_cycle(self):
         """Simulate the full execute_model early-release → alloc cycle
         with 2 slots: finish req-A, start req-C while req-B still active."""
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
         runner, sc = self._make_runner_stub(max_seqs=2)
 
         # Allocate 2 requests
-        slot_a = MetalModelRunner._gdn_alloc_slot(runner, "req-A")
-        slot_b = MetalModelRunner._gdn_alloc_slot(runner, "req-B")
+        slot_a = runner._gdn_alloc_slot("req-A")
+        slot_b = runner._gdn_alloc_slot("req-B")
         assert slot_a == 0
         assert slot_b == 1
 
@@ -316,12 +380,10 @@ class TestGDNAllocSlotZeroing:
             )
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
-        # Early-release req-A (bare pop+append, no zeroing)
-        runner._gdn_req_to_slot.pop("req-A")
-        runner._gdn_free_slots.append(slot_a)
+        runner._gdn_release_slots({"req-A"})
 
         # Allocate req-C — should reuse slot 0 with zeroed state
-        slot_c = MetalModelRunner._gdn_alloc_slot(runner, "req-C")
+        slot_c = runner._gdn_alloc_slot("req-C")
         assert slot_c == 0  # reused slot
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 

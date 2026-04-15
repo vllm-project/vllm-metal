@@ -45,10 +45,6 @@ class _StubRunner:
         self._pending_output = None
         self._stt_runtime_adapter = runtime_adapter
 
-    @property
-    def is_stt(self) -> bool:
-        return self._is_stt
-
 
 def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:
     model = MagicMock()
@@ -432,28 +428,6 @@ class TestWhisperRuntimeAdapterTranscriberCaching:
         t1 = adapter.transcriber
         t2 = adapter.transcriber
         assert t1 is t2
-
-
-class TestIsSTTProperty:
-    """Tests for the public is_stt property on MetalModelRunner."""
-
-    def test_is_stt_default_false(self) -> None:
-        """is_stt should be False before STT model loading."""
-        runner = MagicMock()
-        runner._is_stt = False
-
-        prop = MetalModelRunner.is_stt.fget(runner)  # type: ignore[attr-defined]
-
-        assert prop is False
-
-    def test_is_stt_true_after_loading(self) -> None:
-        """is_stt should be True after STT model loading."""
-        runner = MagicMock()
-        runner._is_stt = True
-
-        prop = MetalModelRunner.is_stt.fget(runner)  # type: ignore[attr-defined]
-
-        assert prop is True
 
 
 @pytest.mark.slow

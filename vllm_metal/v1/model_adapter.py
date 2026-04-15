@@ -25,6 +25,11 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
+    def build_yoco_cache_mapping(
+        self, args: dict[str, Any]
+    ) -> tuple[int, dict[int, int]] | None:
+        """Build YOCO layer→cache_idx mapping, or None if not applicable."""
+
 
 # Models that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
@@ -80,3 +85,46 @@ class DefaultModelAdapter(ModelAdapter):
         if hasattr(model, "language_model"):
             return model.language_model
         return model
+
+    def build_yoco_cache_mapping(
+        self, args: dict[str, Any]
+    ) -> tuple[int, dict[int, int]] | None:
+        """Build the layer→cache_idx mapping for YOCO KV sharing.
+
+        Gemma4's "You Only Cache Once" architecture only caches K/V for
+        the first ``N - num_kv_shared_layers`` layers.  Shared layers
+        reuse the cache of the most recent unique layer of the same
+        attention type (sliding or full).
+
+        Follows the same logic as mlx_lm's ``Gemma4TextModel.previous_kvs``
+        mapping.
+
+        Returns:
+            ``(num_unique_cache_layers, {layer_idx: cache_idx})`` or
+            ``None`` if the model does not use KV sharing.
+        """
+        num_layers = args.get("num_hidden_layers", 0)
+        num_shared = args.get("num_kv_shared_layers", 0)
+        if not num_shared or not num_layers:
+            return None
+
+        layer_types: list[str] = args.get("layer_types", [])
+        if len(layer_types) != num_layers:
+            return None
+
+        num_unique = num_layers - num_shared
+
+        # Map each attention type to the LAST unique layer of that type,
+        # matching mlx_lm's ``kvs_by_type`` logic.
+        type_to_cache_idx: dict[str, int] = {}
+        for i in range(num_unique):
+            type_to_cache_idx[layer_types[i]] = i
+
+        mapping: dict[int, int] = {}
+        for i in range(num_layers):
+            if i < num_unique:
+                mapping[i] = i
+            else:
+                mapping[i] = type_to_cache_idx[layer_types[i]]
+
+        return num_unique, mapping
