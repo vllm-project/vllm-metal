@@ -23,7 +23,11 @@ from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
-from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES, STT_SCHED_BLOCK_BYTES
+from vllm_metal.stt.policy import (
+    STT_SCHED_AVAILABLE_BYTES,
+    STT_SCHED_BLOCK_BYTES,
+    STT_SCHED_NOMINAL_HEAD_SIZE,
+)
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
@@ -80,7 +84,7 @@ class ModelCachePolicy:
                 "layers.0.self_attn": FullAttentionSpec(
                     block_size=self._runner.metal_config.block_size,
                     num_kv_heads=1,
-                    head_size=64,
+                    head_size=STT_SCHED_NOMINAL_HEAD_SIZE,
                     dtype=torch.float16,
                 ),
             }

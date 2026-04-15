@@ -12,6 +12,10 @@ STT_SCHED_AVAILABLE_BYTES = 1 << 30  # 1 GiB
 # Block size reported to vLLM for STT models (minimal, no real KV cache).
 STT_SCHED_BLOCK_BYTES = 1
 
+# Nominal head size for the placeholder KV spec used only to satisfy
+# vLLM scheduler initialization for STT models.
+STT_SCHED_NOMINAL_HEAD_SIZE = 64
+
 
 class _ModelConfigLike(Protocol):
     model: str
