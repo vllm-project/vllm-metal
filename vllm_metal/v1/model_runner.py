@@ -261,12 +261,16 @@ def _apply_grammar_bitmask_metal(
     bitmask_torch = torch.from_numpy(sorted_bitmask)
 
     # Pass indices=None when every row is constrained (cheaper xgrammar path).
-    # Use set equality — a length coincidence (e.g. with spec-decode offsets) must
-    # not trigger the all-rows shortcut when coverage is actually incomplete.
+    # Use set equality — out_indices may contain duplicates when spec-decode adds
+    # multiple rows per request (one per speculative token); set() deduplicates.
+    # A length coincidence must not trigger the shortcut when coverage is incomplete.
     indices = None if set(out_indices) == set(range(logits.shape[0])) else out_indices
     xgr.apply_token_bitmask_inplace(logits_torch, bitmask_torch, indices=indices)
 
-    result = torch_to_mlx(logits_torch)
+    # logits_np already reflects the in-place xgrammar mutation (shares torch buffer).
+    # logits_np is kept alive for the function scope — mx.array() copies the buffer
+    # eagerly, but this assumption must hold if MLX construction ever becomes lazy.
+    result = mx.array(logits_np)
     return result.astype(original_dtype) if original_dtype != mx.float32 else result
 
 
@@ -311,13 +315,27 @@ def _apply_grammar_bitmask_paged(
 
     # Spec-decode expands the token dimension with verification positions that
     # don't map 1:1 to grammar_bitmask rows — guard until that's implemented.
-    if any(scheduler_output.scheduled_spec_decode_tokens.values()):
+    # Only raise when a structured-output request overlaps with spec-decode;
+    # plain requests with spec tokens can co-exist in the same batch safely.
+    spec_req_ids = {
+        req_id
+        for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+        if tokens
+    }
+    if spec_req_ids & set(grammar_output.structured_output_request_ids):
         raise NotImplementedError(
             "Grammar/structured-output constraints are not yet supported "
             "when speculative decoding is active on the paged Metal path."
         )
 
     grammar_bitmask: np.ndarray = grammar_output.grammar_bitmask
+
+    # cu_seqlens must be exactly [0, 1*decode, ..., +prefill_lens...]: one entry
+    # per decode token plus one per prefill sequence, plus the leading zero.
+    assert len(cu_seqlens) == num_decode + len(prefill_reqs) + 1, (
+        f"cu_seqlens length {len(cu_seqlens)} != "
+        f"num_decode({num_decode}) + len(prefill_reqs)({len(prefill_reqs)}) + 1"
+    )
 
     # Build req_id → sample row index in logits[0].
     req_id_to_row: dict[str, int] = {}

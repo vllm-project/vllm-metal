@@ -316,6 +316,54 @@ class TestApplyGrammarBitmaskMetal:
         assert np.isfinite(result[3, allowed_spec1])
         assert result[3, (allowed_spec1 + 1) % VOCAB_SIZE] == float("-inf")
 
+    def test_empty_structured_output_request_ids_returns_unchanged(self) -> None:
+        """Empty structured_output_request_ids must return logits unchanged."""
+        data = np.random.randn(2, VOCAB_SIZE).astype(np.float32)
+        logits = mx.array(data)
+        sched = _make_scheduler_output(["r0", "r1"])
+        grammar = _make_grammar_output([], np.zeros((0, NUM_BITMASK_WORDS), dtype=np.int32))
+
+        result = _to_numpy(
+            _apply_grammar_bitmask_metal(sched, grammar, ["r0", "r1"], logits)
+        )
+
+        np.testing.assert_array_equal(result, data)
+
+    def test_absent_structured_output_req_cumulative_index_correct(self) -> None:
+        """A structured-output req absent from the batch must not desync cumulative_index.
+
+        r0 is absent (preempted), r1 is present. The bitmask has r0's row first,
+        then r1's row. cumulative_index must skip r0's row correctly so r1 gets
+        the right bitmask.
+        """
+        allowed_token = 42
+        logits = _uniform_logits_2d(1)  # only r1 is in this batch
+        sched = _make_scheduler_output(["r1"])
+        bitmask = np.vstack(
+            [
+                _make_single_token_bitmask(0),   # r0's bitmask (not in batch)
+                _make_single_token_bitmask(allowed_token),  # r1's bitmask
+            ]
+        )
+        grammar = _make_grammar_output(["r0", "r1"], bitmask)
+
+        result = _to_numpy(
+            _apply_grammar_bitmask_metal(sched, grammar, ["r1"], logits)
+        )
+
+        # r1's bitmask (row 1) allows only allowed_token — verify the full row.
+        # If cumulative_index were wrong and r0's bitmask (allows token 0) were
+        # applied instead, token 0 would be finite and allowed_token would be -inf.
+        assert np.isfinite(result[0, allowed_token]), (
+            f"allowed_token {allowed_token} should be finite"
+        )
+        assert np.all(result[0, :allowed_token] == float("-inf")), (
+            "all tokens before allowed_token must be forbidden"
+        )
+        assert np.all(result[0, allowed_token + 1:] == float("-inf")), (
+            "all tokens after allowed_token must be forbidden"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _apply_grammar_bitmask_paged — 3D paged-path helper
@@ -645,13 +693,14 @@ class TestApplyGrammarBitmaskPaged:
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
 
-    def test_spec_decode_raises_even_when_plain_req_has_spec_tokens(self) -> None:
-        """Guard is coarse: any spec-decode in the batch raises, not just on structured reqs.
+    def test_spec_decode_plain_req_does_not_block_structured_req(self) -> None:
+        """Plain req with spec tokens must not block a structured-output req.
 
-        Pins the intended conservative behavior: r1 (plain) has spec tokens, but
-        r0 (structured) does not — batch is still rejected.  Update this test if
-        the guard is ever tightened to per-request granularity.
+        r1 (plain) has spec tokens; r0 (structured) does not.
+        The guard must allow this batch — only raise when the structured-output
+        request itself overlaps with spec-decode.
         """
+        allowed_token = 5
         logits = _uniform_logits_3d(3)
         decode_reqs = [_make_decode_req("r0"), _make_decode_req("r1")]
         cu = _build_cu_seqlens(num_decode=2, prefill_lens=[])
@@ -661,10 +710,19 @@ class TestApplyGrammarBitmaskPaged:
             total_num_scheduled_tokens=3,
             finished_req_ids=set(),
         )
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(5))
+        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(allowed_token))
 
-        with pytest.raises(NotImplementedError, match="speculative decoding"):
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+        # Must not raise — r0 (structured) has no spec tokens.
+        result = _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+
+        result_np = _to_numpy(result)
+        # r0 (row 0) is constrained to allowed_token
+        assert np.isfinite(result_np[0, 0, allowed_token])
+        assert result_np[0, 0, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
+        # r1 (row 1) is unconstrained — all logits finite
+        assert np.all(np.isfinite(result_np[0, 1]))
+        # row 2 is r1's spec-token slot; it is outside grammar_output.structured_output_request_ids
+        # so it receives no masking — intentionally not asserted here.
 
 
 # ---------------------------------------------------------------------------
