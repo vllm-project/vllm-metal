@@ -4,6 +4,8 @@
 
 vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX as the primary compute backend. It unifies MLX and PyTorch under a single lowering path.
 
+**Documentation**: https://docs.vllm.ai/projects/vllm-metal/en/latest/
+
 ---
 *Latest News* 🔥
 
