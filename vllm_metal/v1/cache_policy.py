@@ -85,11 +85,8 @@ class ModelCachePolicy:
                 ),
             }
 
-        if self._runner.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-
         block_size = self._runner.cache_config.block_size
-        torch_dtype = MLX_TO_TORCH_DTYPE[self._runner.kv_cache_dtype]
+        torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
             if self._runner.is_hybrid and layer_idx not in self._runner.sdpa_layer_indices:
@@ -127,11 +124,8 @@ class ModelCachePolicy:
         if self._runner._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
-        if self._runner.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-
         block_size = self._runner.cache_config.block_size
-        dtype_size = self._runner.kv_cache_dtype.size
+        dtype_size = self._require_kv_cache_dtype().size
         num_kv_layers = (
             self._runner.num_sdpa_layers
             if self._runner.is_hybrid
@@ -151,10 +145,7 @@ class ModelCachePolicy:
         """Return bytes for one request's linear-attention state."""
         if not self._runner.is_hybrid:
             raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
-        if self._runner.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-
-        dtype_size = self._runner.kv_cache_dtype.size
+        dtype_size = self._require_kv_cache_dtype().size
         recurrent_dtype_size = mx.float32.size
         conv_bytes = (
             (self._runner.linear_conv_kernel_dim - 1)
@@ -183,10 +174,7 @@ class ModelCachePolicy:
         self, *, max_model_len: int, block_size: int
     ) -> int:
         """Estimate bytes for one max-length sequence of cache state."""
-        if self._runner.kv_cache_dtype is None:
-            raise RuntimeError("KV cache dtype not initialized; load_model() first")
-
-        dtype_size = self._runner.kv_cache_dtype.size
+        dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
         num_kv_layers = (
             self._runner.num_sdpa_layers
@@ -219,7 +207,7 @@ class ModelCachePolicy:
             linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
             linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
-            dtype=self._runner.kv_cache_dtype,
+            dtype=self._require_kv_cache_dtype(),
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionBackend:
@@ -227,7 +215,7 @@ class ModelCachePolicy:
             num_layers=self._runner.num_layers,
             latent_dim=self._runner.mla_latent_dim,
             block_size=block_size,
-            dtype=self._runner.kv_cache_dtype,
+            dtype=self._require_kv_cache_dtype(),
         )
 
     def _build_mha_backend(self, block_size: int) -> MHAPagedAttentionBackend:
@@ -237,7 +225,7 @@ class ModelCachePolicy:
             num_kv_heads=self._runner.num_kv_heads,
             head_dim=self._runner.head_dim,
             block_size=block_size,
-            dtype=self._runner.kv_cache_dtype,
+            dtype=self._require_kv_cache_dtype(),
             cache_idx_map=cache_idx_map,
         )
 
@@ -252,6 +240,11 @@ class ModelCachePolicy:
             self._runner.num_layers,
         )
         return num_cache_layers, cache_idx_map
+
+    def _require_kv_cache_dtype(self) -> mx.Dtype:
+        if self._runner.kv_cache_dtype is None:
+            raise RuntimeError("KV cache dtype not initialized; load_model() first")
+        return self._runner.kv_cache_dtype
 
 
 class WorkerCachePlanner:
@@ -311,16 +304,7 @@ class WorkerCachePlanner:
     def get_model_memory_usage(self) -> int:
         """Return current model memory usage in bytes."""
         mx.eval(mx.array([0]))
-
-        if hasattr(mx, "get_active_memory"):
-            return mx.get_active_memory()
-        if hasattr(mx, "metal") and hasattr(mx.metal, "get_active_memory"):
-            return mx.metal.get_active_memory()
-
-        hidden_size = getattr(self._worker.model_config, "hidden_size", 4096)
-        num_layers = getattr(self._worker.model_config, "num_hidden_layers", 32)
-        params = hidden_size * hidden_size * 4 * num_layers
-        return params * 2
+        return mx.get_active_memory()
 
     def determine_available_memory(self) -> int:
         """Return scheduler-visible available cache memory."""
@@ -337,7 +321,9 @@ class WorkerCachePlanner:
             self._worker._setup_paged_attention(overhead=overhead)
             backend = self._worker.model_runner._paged_attention_backend
             if backend is None:
-                raise RuntimeError("Paged attention backend not initialized")
+                raise RuntimeError(
+                    "Paged attention backend not initialized for capacity reporting"
+                )
             block_size_bytes = self._worker.get_cache_block_size_bytes()
             available = backend.num_blocks() * block_size_bytes
             logger.info(
