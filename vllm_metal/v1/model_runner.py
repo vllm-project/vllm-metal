@@ -798,7 +798,7 @@ class MetalModelRunner:
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
         mx.eval(self._extract_logits(self._forward_model(dummy_tokens)))
-        overhead = max(0, mx.get_cache_memory() - cache_before)
+        overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
 
