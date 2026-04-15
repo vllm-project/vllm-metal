@@ -161,6 +161,42 @@ class TestModelLifecycle:
         assert runner.num_layers == 32
         assert runner.head_dim == 128
 
+    def test_load_merges_nested_text_config_from_mlx_lm_args(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mlx-lm Gemma4 exposes .args with dims nested inside text_config.
+
+        Pin that model arg extraction flattens text_config onto the top level
+        on the .args path as well, so every dim key sits at the top level for
+        models whose mlx-lm ModelArgs only declares
+        ``{model_type, text_config, vocab_size}`` at the top level.
+        """
+        args = SimpleNamespace(
+            model_type="gemma4",
+            vocab_size=_TEXT_MODEL_ARGS["vocab_size"],
+            text_config=dict(_TEXT_MODEL_ARGS),
+        )
+        fake_model = SimpleNamespace(args=args)
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {"stub-model": (fake_model, object())},
+        )
+        lifecycle, runner = _make_lifecycle()
+
+        lifecycle.load()
+
+        assert runner.model is fake_model
+        assert runner.num_layers == _TEXT_MODEL_ARGS["num_hidden_layers"]
+        assert runner.num_kv_heads == _TEXT_MODEL_ARGS["num_key_value_heads"]
+        assert runner.hidden_size == _TEXT_MODEL_ARGS["hidden_size"]
+        assert runner.head_dim == (
+            _TEXT_MODEL_ARGS["hidden_size"] // _TEXT_MODEL_ARGS["num_attention_heads"]
+        )
+        assert runner.model_args["model_type"] == "gemma4"
+        assert runner.model_args["vocab_size"] == _TEXT_MODEL_ARGS["vocab_size"]
+
     def test_load_extracts_vlm_text_config_with_inherited_slots(
         self,
         monkeypatch: pytest.MonkeyPatch,

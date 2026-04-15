@@ -208,26 +208,28 @@ class ModelLifecycle:
             )
 
     def _extract_model_args(self, model: Any, is_vlm: bool) -> dict[str, Any]:
-        # mlx-lm exposes .args while HF-backed models expose .config.
+        # Both the .args (mlx-lm) and .config (HF) paths may expose a nested
+        # ``text_config`` (e.g. Gemma4 via mlx-lm); the merge below flattens
+        # its keys onto the top level so every key sits in one flat dict.
         model_args = getattr(model, "args", None)
         if model_args is not None:
-            return self._config_to_mapping(model_args, label="model.args")
-
-        config = getattr(model, "config", None)
-        if config is None:
-            raise ValueError(
-                "Cannot extract model config: model has neither .args nor .config "
-                "attribute."
-            )
-
-        config_values = self._config_to_mapping(config, label="config")
-        if is_vlm and "text_config" in config_values:
-            model_values = self._config_to_mapping(
-                config_values["text_config"],
-                label="text_config",
-            )
+            model_values = self._config_to_mapping(model_args, label="model.args")
         else:
-            model_values = config_values
+            config = getattr(model, "config", None)
+            if config is None:
+                raise ValueError(
+                    "Cannot extract model config: model has neither .args nor "
+                    ".config attribute."
+                )
+
+            config_values = self._config_to_mapping(config, label="config")
+            if is_vlm and "text_config" in config_values:
+                model_values = self._config_to_mapping(
+                    config_values["text_config"],
+                    label="text_config",
+                )
+            else:
+                model_values = config_values
 
         text_config = model_values.get("text_config")
         if text_config is None:
