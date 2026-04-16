@@ -251,7 +251,7 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
-        # Per-layer KV shapes (None = uniform; populated by model adapter)
+        # Per-layer KV shapes (None = uniform)
         self.kv_heads_per_layer: list[int] | None = None
         self.head_dim_per_layer: list[int] | None = None
 

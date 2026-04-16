@@ -235,10 +235,10 @@ class ModelCachePolicy:
     def _cache_layer_shapes(self, num_cache_layers: int) -> tuple[list[int], list[int]]:
         """Build per-cache-layer ``(kv_heads, head_dim)`` lists.
 
-        When the runner has per-layer shape lists (populated by the model
-        adapter in a later PR), extract the first ``num_cache_layers`` entries
-        (which correspond to the unique layers for YOCO models).  Otherwise
-        replicate the scalar values for backward-compat uniform allocation.
+        When the runner has per-layer shape lists, extract the first
+        ``num_cache_layers`` entries (which correspond to the unique
+        layers for YOCO models).  Otherwise replicate the scalar values
+        for backward-compat uniform allocation.
         """
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
