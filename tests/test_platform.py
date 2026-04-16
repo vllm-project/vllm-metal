@@ -192,6 +192,8 @@ class TestMetalPlatform:
                     disable_cascade_attn=False,
                     tokenizer=None,
                     max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -240,6 +242,8 @@ class TestMetalPlatform:
                     disable_cascade_attn=False,
                     tokenizer=None,
                     max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -282,6 +286,8 @@ class TestMetalPlatform:
                     disable_cascade_attn=False,
                     tokenizer=None,
                     max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -323,6 +329,8 @@ class TestMetalPlatform:
                     disable_cascade_attn=False,
                     tokenizer=None,
                     max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -368,6 +376,8 @@ class TestMetalPlatform:
                     disable_cascade_attn=False,
                     tokenizer=None,
                     max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -404,6 +414,8 @@ class TestMetalPlatform:
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="whisper"),
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=True,
@@ -432,6 +444,8 @@ class TestMetalPlatform:
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
                 tokenizer="custom-tokenizer",
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="whisper"),
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=True,
@@ -443,6 +457,96 @@ class TestMetalPlatform:
 
         assert vllm_config.model_config.tokenizer == "custom-tokenizer"
         assert vllm_config.scheduler_config.async_scheduling is False
+
+    def test_check_and_update_config_clears_multimodal_for_text_backbone_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gemma4-style multimodal configs must be cleared for the text-only path.
+
+        Gemma4 MLX checkpoints are flagged multimodal in the HF config but
+        ship without the vision/audio preprocessor files that vLLM's input
+        processor tries to load. Clearing ``multimodal_config`` at the
+        platform layer makes ``is_multimodal_model`` False so the input
+        processor skips feature-extractor loading.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            model_config = SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=SimpleNamespace(language_model_only=False),
+                hf_config=SimpleNamespace(model_type="gemma4"),
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=model_config,
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert model_config.multimodal_config is None
+
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_preserves_multimodal_for_non_gemma4_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-overridden multimodal models must keep multimodal_config set."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            sentinel = SimpleNamespace(language_model_only=False)
+            model_config = SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=sentinel,
+                hf_config=SimpleNamespace(model_type="qwen3_vl"),
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=model_config,
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert model_config.multimodal_config is sentinel
+
+        finally:
+            reset_config()
 
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch

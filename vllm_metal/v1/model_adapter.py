@@ -3,7 +3,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
+logger = init_logger(__name__)
 
 
 class ModelAdapter(Protocol):
@@ -11,6 +18,13 @@ class ModelAdapter(Protocol):
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether a multimodal config should run on the text-only path."""
+
+    def normalize_model_config(self, model_config: ModelConfig) -> None:
+        """Apply model-specific normalisations to ``model_config`` in place.
+
+        Called early during platform setup so the engine sees a consistent
+        view of the model before constructing input processors, etc.
+        """
 
     def resolve_max_head_dim(
         self, args: dict[str, Any], head_dim: int | None
@@ -48,6 +62,34 @@ class DefaultModelAdapter(ModelAdapter):
         """
         model_type = getattr(hf_config, "model_type", "")
         return model_type in _TEXT_BACKBONE_OVERRIDE_TYPES
+
+    def normalize_model_config(self, model_config: ModelConfig) -> None:
+        """Clear ``multimodal_config`` for models served on the text backbone.
+
+        For model types in :data:`_TEXT_BACKBONE_OVERRIDE_TYPES` the runner
+        executes the language-model forward via mlx_lm, even though the HF
+        config marks the architecture as multimodal. Leaving the engine's
+        ``multimodal_config`` populated triggers eager loading of the
+        multimodal feature extractor at engine startup, which crashes on MLX
+        checkpoints that ship neither ``preprocessor_config.json`` nor a
+        ``feature_extractor`` section in ``processor_config.json`` (e.g.
+        ``mlx-community/gemma-4-31b-8bit``).
+
+        Clearing it here makes ``is_multimodal_model`` ``False`` so the
+        input processor skips that path. The ``should_force_text_backbone``
+        predicate is the single source of truth for which model types apply.
+        """
+        if model_config.multimodal_config is None:
+            return
+        if not self.should_force_text_backbone(model_config.hf_config):
+            return
+
+        model_config.multimodal_config = None
+        logger.info(
+            "Metal: forcing text-only backbone for model_type=%s "
+            "(cleared multimodal_config)",
+            model_config.hf_config.model_type,
+        )
 
     def resolve_max_head_dim(
         self, args: dict[str, Any], head_dim: int | None
