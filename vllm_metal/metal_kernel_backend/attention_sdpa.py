@@ -45,11 +45,16 @@ _KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 
 def is_sdpa(module: nn.Module) -> bool:
-    """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA)."""
+    """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA).
+
+    ``v_proj`` is treated as optional because the K-eq-V Gemma4 variants
+    (26B/31B full-attention layers) share the K projection for values and
+    therefore never define one.  :func:`prepare_sdpa_qkv` handles the two
+    cases symmetrically.
+    """
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "v_proj")
         and hasattr(module, "o_proj")
     )
 
