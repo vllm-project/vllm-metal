@@ -262,6 +262,11 @@ class ModelCachePolicy:
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
         if kv_heads is not None and head_dims is not None:
+            if self._runner.is_hybrid:
+                raise NotImplementedError(
+                    "Per-layer KV shapes with hybrid models require "
+                    "SDPA-layer index remapping, which is not yet implemented."
+                )
             return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
         return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
 

@@ -51,6 +51,10 @@ class MetalPagedKVCache:
         self.kv_heads_per_layer = kv_heads_per_layer or [num_kv_heads] * num_layers
         self.head_dim_per_layer = head_dim_per_layer or [head_dim] * num_layers
 
+        # Canonical scalars for warm_up_paged_cache (layer-0 shape)
+        self.num_kv_heads = self.kv_heads_per_layer[0]
+        self.head_dim = self.head_dim_per_layer[0]
+
         if len(self.kv_heads_per_layer) != num_layers:
             raise ValueError(
                 f"kv_heads_per_layer length {len(self.kv_heads_per_layer)} "
