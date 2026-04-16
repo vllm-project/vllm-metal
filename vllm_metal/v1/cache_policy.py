@@ -91,6 +91,8 @@ class ModelCachePolicy:
 
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
+        kv_heads_list = self._runner.kv_heads_per_layer
+        head_dim_list = self._runner.head_dim_per_layer
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
             if (
@@ -109,11 +111,19 @@ class ModelCachePolicy:
                     block_size=block_size,
                 )
             else:
+                kv_h = (
+                    kv_heads_list[layer_idx]
+                    if kv_heads_list
+                    else self._runner.num_kv_heads
+                )
+                hd = (
+                    head_dim_list[layer_idx] if head_dim_list else self._runner.head_dim
+                )
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
                     block_size=block_size,
-                    num_kv_heads=self._runner.num_kv_heads,
-                    head_size=self._runner.head_dim,
+                    num_kv_heads=kv_h,
+                    head_size=hd,
                     dtype=torch_dtype,
                 )
 
@@ -127,26 +137,18 @@ class ModelCachePolicy:
         )
 
     def get_cache_block_size_bytes(self) -> int:
-        """Return the byte size of one cache block."""
+        """Return the byte size of one cache block.
+
+        For per-layer shapes, sums each layer's contribution individually.
+        For uniform shapes, reduces to the existing product formula.
+        """
         if self._runner._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
         kv_factor = 1 if self._runner.is_mla else 2
-        return (
-            kv_factor
-            * num_kv_layers
-            * block_size
-            * self._runner.num_kv_heads
-            * self._runner.head_dim
-            * dtype_size
-        )
+        return kv_factor * block_size * dtype_size * self._kv_layer_size_sum()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""
@@ -183,19 +185,9 @@ class ModelCachePolicy:
         """Estimate bytes for one max-length sequence of cache state."""
         dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
         kv_factor = 1 if self._runner.is_mla else 2
         sdpa_kv_bytes = (
-            kv_factor
-            * num_kv_layers
-            * aligned_tokens
-            * self._runner.num_kv_heads
-            * self._runner.head_dim
-            * dtype_size
+            kv_factor * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
         if self._runner.is_hybrid:
             return sdpa_kv_bytes + self.linear_cache_bytes_per_slot()
@@ -227,6 +219,7 @@ class ModelCachePolicy:
 
     def _build_mha_backend(self, block_size: int) -> MHAPagedAttentionBackend:
         num_layers, cache_idx_map = self._mha_cache_layout()
+        kv_heads, head_dims = self._cache_layer_shapes(num_layers)
         return MHAPagedAttentionBackend(
             num_layers=num_layers,
             num_kv_heads=self._runner.num_kv_heads,
@@ -234,7 +227,42 @@ class ModelCachePolicy:
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
             cache_idx_map=cache_idx_map,
+            kv_heads_per_layer=kv_heads,
+            head_dim_per_layer=head_dims,
         )
+
+    def _cache_layer_shapes(self, num_cache_layers: int) -> tuple[list[int], list[int]]:
+        """Build per-cache-layer ``(kv_heads, head_dim)`` lists.
+
+        When the runner has per-layer shape lists (populated by the model
+        adapter in a later PR), extract the first ``num_cache_layers`` entries
+        (which correspond to the unique layers for YOCO models).  Otherwise
+        replicate the scalar values for backward-compat uniform allocation.
+        """
+        kv_heads = self._runner.kv_heads_per_layer
+        head_dims = self._runner.head_dim_per_layer
+        if kv_heads is not None and head_dims is not None:
+            return kv_heads[:num_cache_layers], head_dims[:num_cache_layers]
+        return (
+            [self._runner.num_kv_heads] * num_cache_layers,
+            [self._runner.head_dim] * num_cache_layers,
+        )
+
+    def _kv_layer_size_sum(self) -> int:
+        """Sum of ``kv_heads × head_dim`` across KV cache layers.
+
+        For uniform models this equals ``num_kv_layers × kv_heads × head_dim``.
+        """
+        num_kv_layers = (
+            self._runner.num_sdpa_layers
+            if self._runner.is_hybrid
+            else self._runner.num_kv_cache_layers
+        )
+        kv_heads = self._runner.kv_heads_per_layer
+        head_dims = self._runner.head_dim_per_layer
+        if kv_heads is not None and head_dims is not None:
+            return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
+        return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
 
     def _mha_cache_layout(self) -> tuple[int, list[int] | None]:
         if self._runner._yoco_cache_mapping is None:

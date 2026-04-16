@@ -348,9 +348,9 @@ def sdpa_forward(
     n_heads = queries.shape[1]
     head_dim = queries.shape[3]
 
-    # Variable head_dim models (e.g. Gemma4): pad Q/K/V to the cache's
-    # allocated head_dim.  Output is truncated back before o_proj.
-    cache_head_dim = kv_cache.head_dim
+    # Per-layer cache shape: each layer may have its own (kv_heads, head_dim).
+    cache_kv_heads = kv_cache.kv_heads_per_layer[layer_idx]
+    cache_head_dim = kv_cache.head_dim_per_layer[layer_idx]
     actual_head_dim = head_dim
     queries, keys, values = pad_qkv_to_cache_head_dim(
         queries, keys, values, head_dim, cache_head_dim
@@ -396,15 +396,11 @@ def sdpa_forward(
         new_k_cache = kv_cache.key_caches[layer_idx]
         new_v_cache = kv_cache.value_caches[layer_idx]
     else:
-        flat_k = kv_cache.key_caches[layer_idx].reshape(
-            -1, kv_cache.num_kv_heads, head_dim
-        )
+        flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_k[slot_mapping] = k_3d
         new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
 
-        flat_v = kv_cache.value_caches[layer_idx].reshape(
-            -1, kv_cache.num_kv_heads, head_dim
-        )
+        flat_v = kv_cache.value_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_v[slot_mapping] = v_3d
         new_v_cache = flat_v.reshape(kv_cache.value_caches[layer_idx].shape)
 
@@ -426,10 +422,10 @@ def sdpa_forward(
     kernel_v_cache = new_v_cache
     if kernel_block_size != kv_cache.block_size:
         kernel_k_cache = new_k_cache.reshape(
-            -1, kernel_block_size, kv_cache.num_kv_heads, head_dim
+            -1, kernel_block_size, cache_kv_heads, head_dim
         )
         kernel_v_cache = new_v_cache.reshape(
-            -1, kernel_block_size, kv_cache.num_kv_heads, head_dim
+            -1, kernel_block_size, cache_kv_heads, head_dim
         )
 
     ops = get_ops()
@@ -438,7 +434,7 @@ def sdpa_forward(
         q_3d,
         kernel_k_cache,
         kernel_v_cache,
-        kv_cache.num_kv_heads,
+        cache_kv_heads,
         inner.scale,
         0.0,  # softcap (0 = disabled)
         block_tables,
