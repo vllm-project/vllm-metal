@@ -198,10 +198,19 @@ class ModelCachePolicy:
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
-        self._model_adapter.require_uniform_kv_heads(
-            self._runner.model_args,
-            self._runner.num_kv_heads,
-        )
+        # ``require_uniform_kv_heads`` is the fail-fast for configs whose
+        # ``num_global_key_value_heads`` differs from ``num_key_value_heads``
+        # and which would silently fall back to the scalar uniform cache
+        # path with wrong sizing.  Adapters that populate
+        # ``kv_heads_per_layer`` via ``build_per_layer_kv_shapes`` (Gemma4
+        # 26B/31B) have already opted into the heterogeneous cache and
+        # handle mismatched KV counts layer-by-layer, so the uniform
+        # guarantee does not apply and the check is skipped for them.
+        if self._runner.kv_heads_per_layer is None:
+            self._model_adapter.require_uniform_kv_heads(
+                self._runner.model_args,
+                self._runner.num_kv_heads,
+            )
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool

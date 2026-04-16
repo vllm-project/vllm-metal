@@ -93,6 +93,76 @@ def test_qwen35_linear_layer_detected():
     assert not is_sdpa(layer.linear_attn)
 
 
+def test_gemma4_k_eq_v_attention_detected_as_sdpa():
+    """Gemma4 K-eq-V full-attention layers omit v_proj but must still dispatch
+    through the SDPA backend — :func:`prepare_sdpa_qkv` handles the
+    ``values = keys`` branch internally.
+
+    Sliding layers pass ``is_sdpa`` via ``v_proj``.  Full K-eq-V layers
+    pass via ``use_k_eq_v=True``.  Modules missing both must NOT
+    classify as SDPA so the hybrid dispatcher does not misroute them.
+    """
+    from mlx_lm.models.gemma4_text import Attention, ModelArgs
+
+    args = ModelArgs(
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_size_per_layer_input=0,
+        layer_types=["sliding_attention", "full_attention"],
+        attention_k_eq_v=True,
+        vocab_size=100,
+    )
+    sliding_attn = Attention(args, layer_idx=0)
+    full_attn = Attention(args, layer_idx=1)
+
+    # Sliding layers keep v_proj; K-eq-V full layers drop it and set the opt-in.
+    assert hasattr(sliding_attn, "v_proj")
+    assert getattr(sliding_attn, "use_k_eq_v", False) is False
+    assert not hasattr(full_attn, "v_proj")
+    assert getattr(full_attn, "use_k_eq_v", False) is True
+
+    assert is_sdpa(sliding_attn)  # via v_proj
+    assert is_sdpa(full_attn)  # via use_k_eq_v
+    assert not is_linear_attention(sliding_attn)
+    assert not is_linear_attention(full_attn)
+
+
+def test_is_sdpa_rejects_modules_without_v_proj_or_use_k_eq_v():
+    """A module exposing only q_proj / k_proj / o_proj must NOT classify as
+    SDPA.  This is the case the hybrid dispatcher must not silently send
+    down the SDPA path — it would miss the values projection entirely.
+    """
+
+    class _QkoOnly:
+        q_proj = object()
+        k_proj = object()
+        o_proj = object()
+
+    assert not is_sdpa(_QkoOnly())
+
+    class _QkoWithUseKEqVFalse:
+        q_proj = object()
+        k_proj = object()
+        o_proj = object()
+        use_k_eq_v = False
+
+    assert not is_sdpa(_QkoWithUseKEqVFalse())
+
+    class _QkoWithUseKEqVTrue:
+        q_proj = object()
+        k_proj = object()
+        o_proj = object()
+        use_k_eq_v = True
+
+    assert is_sdpa(_QkoWithUseKEqVTrue())
+
+
 def test_find_layers_on_qwen3_model():
     """find_layers should return the layer list from a real Qwen3 Model."""
     from mlx_lm.models.qwen3 import Model, ModelArgs

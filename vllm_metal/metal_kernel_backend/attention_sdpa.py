@@ -46,12 +46,24 @@ _KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 
 def is_sdpa(module: nn.Module) -> bool:
-    """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA)."""
+    """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA).
+
+    Requires ``q_proj`` / ``k_proj`` / ``o_proj``, plus EITHER ``v_proj``
+    OR the explicit ``use_k_eq_v = True`` opt-in.  The latter admits
+    Gemma4 26B / 31B full-attention layers which share the K projection
+    for values and never define ``v_proj`` (``prepare_sdpa_qkv`` handles
+    that branch symmetrically).
+
+    Keeping this classifier tight matters because
+    :meth:`HybridPagedAttentionBackend.patch_model` uses ``is_sdpa`` as
+    the dispatch predicate — loose matching would send arbitrary Q/K/O
+    modules through the SDPA path.
+    """
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "v_proj")
         and hasattr(module, "o_proj")
+        and (hasattr(module, "v_proj") or getattr(module, "use_k_eq_v", False))
     )
 
 

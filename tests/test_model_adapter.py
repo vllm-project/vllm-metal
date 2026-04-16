@@ -245,7 +245,14 @@ class TestYocoCacheIntegration:
 
 
 class TestRequireUniformKvHeads:
-    """Tests for require_uniform_kv_heads()."""
+    """Tests for require_uniform_kv_heads().
+
+    The method still raises on mismatched KV head counts under the uniform
+    cache path.  For models whose adapter populates ``kv_heads_per_layer``
+    via :meth:`build_per_layer_kv_shapes` (Gemma4 26B/31B), the uniform
+    guard is gated out at the call-site in ``ModelCachePolicy`` — see
+    :class:`tests.test_model_lifecycle.TestResolveModelDims` for that path.
+    """
 
     def test_allows_uniform_heads(self) -> None:
         args = {"num_global_key_value_heads": 8}
@@ -254,7 +261,7 @@ class TestRequireUniformKvHeads:
         adapter.require_uniform_kv_heads(args, num_kv_heads)
 
     def test_allows_missing_global(self) -> None:
-        args = {}
+        args: dict[str, int] = {}
         num_kv_heads = 8
         adapter = DefaultModelAdapter()
         adapter.require_uniform_kv_heads(args, num_kv_heads)
@@ -272,6 +279,115 @@ class TestRequireUniformKvHeads:
         adapter = DefaultModelAdapter()
         with pytest.raises(ValueError, match="VLLM_METAL_USE_PAGED_ATTENTION=0"):
             adapter.require_uniform_kv_heads(args, num_kv_heads)
+
+
+class TestBuildPerLayerKVShapes:
+    """Tests for :meth:`DefaultModelAdapter.build_per_layer_kv_shapes`."""
+
+    def test_returns_none_for_uniform_model(self) -> None:
+        adapter = DefaultModelAdapter()
+        result = adapter.build_per_layer_kv_shapes(
+            args={},
+            num_layers=4,
+            num_kv_heads=8,
+            head_dim=128,
+        )
+        assert result is None
+
+    def test_returns_none_when_layer_types_length_mismatches(self) -> None:
+        adapter = DefaultModelAdapter()
+        args = {
+            "layer_types": ["sliding_attention", "full_attention"],
+            "global_head_dim": 512,
+            "num_global_key_value_heads": 4,
+        }
+        result = adapter.build_per_layer_kv_shapes(
+            args=args,
+            num_layers=4,
+            num_kv_heads=16,
+            head_dim=256,
+        )
+        assert result is None
+
+    def test_returns_none_without_global_head_dim(self) -> None:
+        """No ``global_head_dim`` → uniform path, even with layer_types present."""
+        adapter = DefaultModelAdapter()
+        args = {"layer_types": ["full_attention", "full_attention"]}
+        result = adapter.build_per_layer_kv_shapes(
+            args=args,
+            num_layers=2,
+            num_kv_heads=8,
+            head_dim=128,
+        )
+        assert result is None
+
+    def test_gemma4_31b_style_full_override(self) -> None:
+        """31B-style configs with distinct full-attention KV heads and head_dim."""
+        adapter = DefaultModelAdapter()
+        args = {
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "global_head_dim": 512,
+            "num_global_key_value_heads": 4,
+        }
+        result = adapter.build_per_layer_kv_shapes(
+            args=args,
+            num_layers=4,
+            num_kv_heads=16,
+            head_dim=256,
+        )
+
+        assert result == ([16, 4, 16, 4], [256, 512, 256, 512])
+
+    def test_gemma4_e2b_style_head_dim_only_override(self) -> None:
+        """E2B-style configs omit ``num_global_key_value_heads`` entirely.
+
+        Full-attention layers must fall back to the sliding-layer KV-head
+        count instead of collapsing to a uniform shape, which would cause
+        full-attention writes to overflow the allocated cache head_dim.
+        """
+        adapter = DefaultModelAdapter()
+        args = {
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "global_head_dim": 512,
+        }
+        result = adapter.build_per_layer_kv_shapes(
+            args=args,
+            num_layers=4,
+            num_kv_heads=1,
+            head_dim=256,
+        )
+
+        assert result == ([1, 1, 1, 1], [256, 512, 256, 512])
+
+    def test_unknown_layer_type_raises(self) -> None:
+        """Unknown layer_type surfaces as a ValueError pinpointing the index
+        rather than silently collapsing to full-attention shapes."""
+        adapter = DefaultModelAdapter()
+        args = {
+            "layer_types": ["sliding_attention", "linear_attention"],
+            "global_head_dim": 512,
+            "num_global_key_value_heads": 4,
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"Unsupported Gemma4 layer_type at index 1: 'linear_attention'",
+        ):
+            adapter.build_per_layer_kv_shapes(
+                args=args,
+                num_layers=2,
+                num_kv_heads=16,
+                head_dim=256,
+            )
 
 
 class TestBuildSlidingWindowPerLayer:

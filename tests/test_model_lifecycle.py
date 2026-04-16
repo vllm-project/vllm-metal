@@ -311,3 +311,67 @@ class TestResolveModelDims:
 
         with pytest.raises(ValueError, match="Cannot resolve model dimensions"):
             lifecycle.resolve_model_dims()
+
+    def test_uniform_model_leaves_per_layer_shapes_none(self) -> None:
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "hidden_size": 2048,
+            }
+        )
+
+        assert runner.kv_heads_per_layer is None
+        assert runner.head_dim_per_layer is None
+
+    def test_gemma4_31b_sets_heterogeneous_per_layer_shapes(self) -> None:
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 4,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 16,
+                "head_dim": 256,
+                "hidden_size": 5376,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "global_head_dim": 512,
+                "num_global_key_value_heads": 4,
+            }
+        )
+
+        # Cache allocation uses the max head_dim; per-layer lists carry
+        # the true sliding vs full shapes.
+        assert runner.head_dim == 512
+        assert runner.num_kv_heads == 16
+        assert runner.kv_heads_per_layer == [16, 4, 16, 4]
+        assert runner.head_dim_per_layer == [256, 512, 256, 512]
+
+    def test_gemma4_e2b_sets_heterogeneous_per_layer_shapes_without_global_kv(
+        self,
+    ) -> None:
+        """E2B-style configs omit ``num_global_key_value_heads`` entirely."""
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "hidden_size": 2048,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "global_head_dim": 512,
+            }
+        )
+
+        assert runner.head_dim == 512
+        assert runner.kv_heads_per_layer == [1, 1, 1, 1]
+        assert runner.head_dim_per_layer == [256, 512, 256, 512]
