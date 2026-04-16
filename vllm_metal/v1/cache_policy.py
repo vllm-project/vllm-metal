@@ -93,6 +93,7 @@ class ModelCachePolicy:
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         kv_heads_list = self._runner.kv_heads_per_layer
         head_dim_list = self._runner.head_dim_per_layer
+        has_per_layer = kv_heads_list is not None and head_dim_list is not None
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
             if (
@@ -113,11 +114,11 @@ class ModelCachePolicy:
             else:
                 kv_h = (
                     kv_heads_list[layer_idx]
-                    if kv_heads_list
+                    if has_per_layer
                     else self._runner.num_kv_heads
                 )
                 hd = (
-                    head_dim_list[layer_idx] if head_dim_list else self._runner.head_dim
+                    head_dim_list[layer_idx] if has_per_layer else self._runner.head_dim
                 )
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
