@@ -108,7 +108,9 @@ class TestMHABackendPerLayer:
         assert cache.key_caches[0].shape[-2:] == (16, 256)
         assert cache.key_caches[1].shape[-2:] == (4, 512)
 
-    def test_warm_up_uses_layer_zero_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_warm_up_uses_layer_zero_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Kernel warm-up should compile against the concrete layer-0 shape."""
         cache = MetalPagedKVCache(
             num_layers=2,
