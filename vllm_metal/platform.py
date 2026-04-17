@@ -281,9 +281,15 @@ class MetalPlatform(Platform):
         ):
             cache_config.block_size = config.block_size
 
-        # Disable cascade attention (not supported)
+        # Disable cascade attention (not supported), then let the adapter
+        # apply any model-specific normalisations (e.g. clearing
+        # ``multimodal_config`` for model types served on the text-only
+        # backbone — see ``DefaultModelAdapter.normalize_model_config``).
         if model_config is not None:
             model_config.disable_cascade_attn = True
+            from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+            DefaultModelAdapter().normalize_model_config(model_config)
 
         # STT model detection — set tokenizer fallback if not already configured.
         # Lazy imports to avoid circular import: platform.py is loaded during

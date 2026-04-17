@@ -30,6 +30,41 @@ class TestShouldForceTextBackbone:
         assert result is False
 
 
+class TestNormalizeModelConfig:
+    """Tests for normalize_model_config()."""
+
+    def test_clears_multimodal_config_for_gemma4(self) -> None:
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(model_type="gemma4"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_preserves_multimodal_config_for_other_models(self) -> None:
+        sentinel = SimpleNamespace(language_model_only=False)
+        model_config = SimpleNamespace(
+            multimodal_config=sentinel,
+            hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is sentinel
+
+    def test_noop_when_multimodal_config_already_none(self) -> None:
+        model_config = SimpleNamespace(
+            multimodal_config=None,
+            hf_config=SimpleNamespace(model_type="gemma4"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+
 class TestTextModel:
     def test_returns_language_model_when_present(self) -> None:
         language_model = object()
