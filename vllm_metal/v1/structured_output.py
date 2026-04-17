@@ -170,7 +170,7 @@ def _apply_grammar_bitmask_paged(
         # bitmask word (real_vocab % 32 != 0) get -inf, but the downstream
         # sampler clips to the real vocabulary so they are never sampled.
         xgr.apply_token_bitmask_inplace(
-            logits_torch[logit_row : logit_row + 1], row_bitmask, indices=None
+            logits_torch[logit_row : logit_row + 1], row_bitmask
         )
 
     # logits_torch is always CPU float32 (produced by torch.from_numpy above),

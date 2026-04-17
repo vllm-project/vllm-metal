@@ -1281,11 +1281,12 @@ class MetalModelRunner:
             )
             return None
 
-        # Defensive invariant: any active structured-output request on the paged
-        # path contributes a paged decode or prefill entry, so if the paged
-        # backend is present, has_paged_work() must be True whenever SO requests
-        # are scheduled. If this fires, the scheduler routed an SO request to the
-        # synchronous tail where no bitmask is applied.
+        # Defensive invariant: the vLLM scheduler sets has_structured_output_requests
+        # only when at least one SO request is present in the *current* scheduled
+        # batch (not the global queue). Any such request on the paged path must
+        # contribute a paged decode or prefill entry, so has_paged_work() must be
+        # True. If this fires, a scheduler change broke that contract and the
+        # bitmask would have been silently skipped on the synchronous tail.
         assert not (
             self._paged_attention_backend is not None
             and scheduler_output.has_structured_output_requests
