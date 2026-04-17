@@ -209,6 +209,19 @@ class MetalPlatform(Platform):
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
+        # Apply TurboQuant config from --additional-config
+        # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
+        add = getattr(vllm_config, "additional_config", None) or {}
+        if add.get("turboquant"):
+            config.turboquant = True
+            config.k_quant = add.get("k_quant", "q8_0")
+            config.v_quant = add.get("v_quant", "q3_0")
+            config._validate_turboquant()
+            logger.info(
+                f"TurboQuant enabled via --additional-config: "
+                f"k_quant={config.k_quant}, v_quant={config.v_quant}"
+            )
+
         if config.debug:
             logger.info(f"Metal config: {config}")
 

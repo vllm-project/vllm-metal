@@ -14,6 +14,15 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
+    get_config,
+)
+from vllm_metal.metal_kernel_backend.turboquant import (
+    BLOCK_SIZE as TQ_BLOCK_SIZE,
+)
+from vllm_metal.metal_kernel_backend.turboquant import (
+    QUANT_PARAMS,
+    V_QUANT_PARAMS,
+    packed_dim,
 )
 from vllm_metal.paged_attention_backend.hybrid import (
     HybridPagedAttentionBackend,
@@ -35,6 +44,132 @@ if TYPE_CHECKING:
     from vllm_metal.v1.worker import MetalWorker
 
 logger = init_logger(__name__)
+
+
+def _turboquant_page_size_bytes(
+    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
+) -> int:
+    """Calculate TurboQuant-compressed page size for one layer."""
+    k_bits = QUANT_PARAMS[k_quant]["bits"]
+    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
+    k_packed = packed_dim(head_dim, k_bits)
+    v_packed = packed_dim(head_dim, v_bits)
+    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
+    scale_groups = head_dim // TQ_BLOCK_SIZE
+    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
+    return kv_bytes + scale_bytes
+
+
+@dataclass(frozen=True, kw_only=True)
+class TurboQuantAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec for TurboQuant-compressed KV cache.
+
+    Reports the true packed byte count per page via an override of
+    ``real_page_size_bytes`` so vLLM's scheduler can budget more blocks
+    than the FP16 formula would allow — without lying about ``head_size``
+    (the ``head_size_v`` reverse-engineering trick the previous version
+    used produced negative values for aggressive 2-bit configs).
+
+    Mirrors the upstream pattern of :class:`MLAAttentionSpec` which
+    overrides ``real_page_size_bytes`` for its ``fp8_ds_mla`` cache layout.
+    """
+
+    k_quant: str
+    v_quant: str
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return _turboquant_page_size_bytes(
+            block_size=self.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+            k_quant=self.k_quant,
+            v_quant=self.v_quant,
+        )
+
+    @classmethod
+    def merge(cls, specs):
+        assert all(isinstance(s, TurboQuantAttentionSpec) for s in specs), (
+            "All attention layers in the same KV cache group must be "
+            "TurboQuantAttentionSpec."
+        )
+        k_set = {s.k_quant for s in specs}
+        v_set = {s.v_quant for s in specs}
+        assert len(k_set) == 1 and len(v_set) == 1, (
+            "All TurboQuant layers in the same cache group must share the "
+            "same (k_quant, v_quant); mixed-quant groups are not supported."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=cls.merge_window_sizes(
+                {s.sliding_window for s in specs if s.sliding_window is not None}
+            ),
+            attention_chunk_size=cls.merge_window_sizes(
+                {
+                    s.attention_chunk_size
+                    for s in specs
+                    if s.attention_chunk_size is not None
+                }
+            ),
+            k_quant=k_set.pop(),
+            v_quant=v_set.pop(),
+        )
+
+
+def _build_turboquant_attention_spec(
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    k_quant: str,
+    v_quant: str,
+) -> TurboQuantAttentionSpec:
+    """Build a TurboQuantAttentionSpec for a single attention layer.
+
+    Reports the real compressed page size via ``real_page_size_bytes``
+    override, so the scheduler allocates the right number of blocks and
+    ``head_size`` stays equal to the model's real head_dim.
+    """
+    return TurboQuantAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_dim,
+        dtype=torch.int8,
+        k_quant=k_quant,
+        v_quant=v_quant,
+    )
+
+
+def _register_turboquant_spec_manager() -> None:
+    """Register ``TurboQuantAttentionSpec`` in vLLM's spec→manager map.
+
+    vLLM's ``get_manager_for_kv_cache_spec`` uses strict-type lookup
+    (``spec_manager_map[type(spec)]``), not ``isinstance``, so the
+    ``FullAttentionSpec`` entry does not cover subclasses.  We reuse
+    ``FullAttentionManager`` because a TurboQuant cache is accessed
+    like a regular KV page from the scheduler's POV — block indexing,
+    no special slot math (per-element byte layout is handled entirely
+    inside the Metal kernel).
+
+    Mirrors the upstream registration for ``MLAAttentionSpec`` (which
+    vLLM also maps to ``FullAttentionManager``).
+    """
+    try:
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            spec_manager_map,
+        )
+    except ImportError:
+        # vLLM shape changed; let the scheduler raise its own clearer error.
+        return
+    spec_manager_map.setdefault(TurboQuantAttentionSpec, FullAttentionManager)
+
+
+_register_turboquant_spec_manager()
 
 
 @dataclass(frozen=True)
@@ -93,6 +228,11 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
+        config = get_config()
+        use_turboquant = (
+            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
+        )
+
         kv_heads_list = self._runner.kv_heads_per_layer
         head_dim_list = self._runner.head_dim_per_layer
         has_per_layer = kv_heads_list is not None and head_dim_list is not None
@@ -112,6 +252,15 @@ class ModelCachePolicy:
                     torch_dtype=torch_dtype,
                     page_size_padded=self._runner.cache_config.mamba_page_size_padded,
                     block_size=block_size,
+                )
+            elif use_turboquant:
+                layer_name = f"layers.{layer_idx}.self_attn"
+                specs[layer_name] = _build_turboquant_attention_spec(
+                    block_size=block_size,
+                    num_kv_heads=self._runner.num_kv_heads,
+                    head_dim=self._runner.head_dim,
+                    k_quant=config.k_quant,
+                    v_quant=config.v_quant,
                 )
             else:
                 kv_h = (
@@ -151,6 +300,23 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size
+        num_kv_layers = (
+            self._runner.num_sdpa_layers
+            if self._runner.is_hybrid
+            else self._runner.num_kv_cache_layers
+        )
+
+        # TurboQuant uses quantized KV cache with different byte layout
+        config = get_config()
+        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+            return num_kv_layers * _turboquant_page_size_bytes(
+                block_size=block_size,
+                num_kv_heads=self._runner.num_kv_heads,
+                head_dim=self._runner.head_dim,
+                k_quant=config.k_quant,
+                v_quant=config.v_quant,
+            )
+
         kv_factor = 1 if self._runner.is_mla else 2
         return kv_factor * block_size * dtype_size * self._kv_layer_size_sum()
 
@@ -191,6 +357,25 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
+        num_kv_layers = (
+            self._runner.num_sdpa_layers
+            if self._runner.is_hybrid
+            else self._runner.num_kv_cache_layers
+        )
+
+        # TurboQuant uses quantized KV cache with different byte layout
+        config = get_config()
+        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+            # _turboquant_page_size_bytes is parameterised by tokens (block_size);
+            # pass aligned_tokens to get the per-sequence byte total directly.
+            return num_kv_layers * _turboquant_page_size_bytes(
+                block_size=aligned_tokens,
+                num_kv_heads=self._runner.num_kv_heads,
+                head_dim=self._runner.head_dim,
+                k_quant=config.k_quant,
+                v_quant=config.v_quant,
+            )
+
         kv_factor = 1 if self._runner.is_mla else 2
         sdpa_kv_bytes = (
             kv_factor * aligned_tokens * dtype_size * self._kv_layer_size_sum()
@@ -200,6 +385,25 @@ class ModelCachePolicy:
         return sdpa_kv_bytes
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionBackend:
+        config = get_config()
+        if config.turboquant:
+            return HybridPagedAttentionBackend(
+                num_layers=self._runner.num_layers,
+                full_attention_interval=self._runner.full_attention_interval,
+                max_num_seqs=self._runner.scheduler_config.max_num_seqs,
+                num_kv_heads=self._runner.num_kv_heads,
+                head_dim=self._runner.head_dim,
+                linear_num_v_heads=self._runner.linear_num_v_heads,
+                linear_key_head_dim=self._runner.linear_key_head_dim,
+                linear_value_head_dim=self._runner.linear_value_head_dim,
+                linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
+                linear_conv_dim=self._runner.linear_conv_dim,
+                block_size=block_size,
+                dtype=self._require_kv_cache_dtype(),
+                turboquant=True,
+                k_quant=config.k_quant,
+                v_quant=config.v_quant,
+            )
         return HybridPagedAttentionBackend(
             num_layers=self._runner.num_layers,
             full_attention_interval=self._runner.full_attention_interval,
@@ -213,9 +417,19 @@ class ModelCachePolicy:
             linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
+            turboquant=False,
+            k_quant=None,
+            v_quant=None,
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionBackend:
+        config = get_config()
+        if config.turboquant:
+            raise NotImplementedError(
+                "TurboQuant is not supported for MLA models. "
+                "Disable `turboquant` in --additional-config or select a "
+                "non-MLA model."
+            )
         return MLAPagedAttentionBackend(
             num_layers=self._runner.num_layers,
             latent_dim=self._runner.mla_latent_dim,
@@ -225,6 +439,7 @@ class ModelCachePolicy:
 
     def _build_mha_backend(self, block_size: int) -> MHAPagedAttentionBackend:
         num_layers, cache_idx_map = self._mha_cache_layout()
+        config = get_config()
         kv_heads, head_dims = self._cache_layer_shapes(num_layers)
         return MHAPagedAttentionBackend(
             num_layers=num_layers,
@@ -232,6 +447,9 @@ class ModelCachePolicy:
             head_dim=self._runner.head_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
+            turboquant=config.turboquant,
+            k_quant=config.k_quant if config.turboquant else None,
+            v_quant=config.v_quant if config.turboquant else None,
             cache_idx_map=cache_idx_map,
             kv_heads_per_layer=kv_heads,
             head_dim_per_layer=head_dims,
@@ -346,13 +564,16 @@ class WorkerCachePlanner:
         )
         backend.initialize(plan.num_blocks)
         n_patched = backend.patch_model(self._worker.model_runner.model)
+        config = get_config()
         logger.info(
             "Paged attention enabled: %d layers patched, "
-            "%d blocks allocated (block_size=%d, mla=%s)",
+            "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",
             n_patched,
             plan.num_blocks,
             plan.block_size,
             self._worker.model_runner.is_mla,
+            config.turboquant,
+            config.k_quant if config.turboquant else "N/A",
         )
 
         self._worker.model_runner._paged_attention_backend = backend

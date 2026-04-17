@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
@@ -66,10 +67,26 @@ static std::string dtype_to_metal(Dtype dt) {
     case float16:   return "half";
     case bfloat16:  return "bfloat16_t";
     case float32:   return "float";
+    case int8:      return "char";
+    case uint8:     return "uchar";
     default:
       throw std::runtime_error(
           "Unsupported dtype for paged attention kernel");
   }
+}
+
+static int get_bits(const std::string& quant_type) {
+  static const std::unordered_map<std::string, int> BITS = {
+      {"q8_0", 8}, {"int8", 8}, {"uint8", 8},
+      {"q5_0", 5},
+      {"q4_0", 4}, {"int4", 4}, {"uint4", 4},
+      {"int2", 2}, {"uint2", 2},
+  };
+  auto it = BITS.find(quant_type);
+  if (it == BITS.end()) {
+    throw std::runtime_error("Unknown quant_type: " + quant_type);
+  }
+  return it->second;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +287,15 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, Stream s,
-    bool from_primitive = false) {
+    bool from_primitive = false,
+    // TurboQuant (optional, all nullptr when disabled):
+    const array* key_scale_cache = nullptr,
+    const array* value_scale_cache = nullptr,
+    const array* key_zero_cache = nullptr,
+    const array* v_centroids = nullptr,
+    bool use_turboquant = false,
+    int k_bits = 8,
+    int v_bits = 3) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -279,25 +304,42 @@ static void dispatch_paged_attention_v2_online(
   int max_blocks = static_cast<int>(block_tables.shape(1));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  auto dt = dtype_to_metal(query.dtype());
+  // 3-part kernel name: paged_attention_<T>_cache_<K>_<V>_hs...
+  auto dt        = dtype_to_metal(query.dtype());
+  auto k_cache_dt = dtype_to_metal(key_cache.dtype());
+  auto v_cache_dt = dtype_to_metal(value_cache.dtype());
   std::string kname =
-      "paged_attention_" + dt + "_cache_" + dt +
+      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
       "_nt256_nsl32_ps0";
 
-  bool use_partitioning = false;
-  bool use_alibi        = false;
-  bool use_fp8          = false;
-  bool use_sinks        = false;
+  bool use_partitioning  = false;
+  bool use_alibi         = false;
+  bool use_fp8           = false;
+  bool use_sinks         = false;
+  bool use_tq_fc         = use_turboquant;
+  int  k_bits_i          = k_bits;
+  int  v_bits_i          = v_bits;
+
+  // The hash name is MLX's cache key. It MUST encode every function-constant
+  // value that varies across calls — otherwise the first compilation wins and
+  // subsequent calls with different constants silently reuse the wrong kernel.
+  std::string hash_name = kname + "_v2"
+      + "_tq" + (use_tq_fc ? "1" : "0")
+      + "_kb" + std::to_string(k_bits_i)
+      + "_vb" + std::to_string(v_bits_i);
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(
-      kname, lib, kname + "_v2",
+      kname, lib, hash_name,
       {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
        {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
        {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
+       {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)},
+       {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)}});
 
   constexpr int NUM_THREADS    = 256;
   constexpr int NUM_SIMD_LANES = 32;
@@ -306,6 +348,10 @@ static void dispatch_paged_attention_v2_online(
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
+  // TurboQuant: add per-warp FWHT buffer (NUM_WARPS * head_size floats)
+  if (use_turboquant) {
+    warp_scores_bytes += NUM_WARPS * head_size * static_cast<int>(sizeof(float));
+  }
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
   auto& enc = d.get_command_encoder(s.index);
@@ -342,6 +388,19 @@ static void dispatch_paged_attention_v2_online(
   int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
   enc.set_bytes(sliding_window_i, 21);
 
+  // TurboQuant buffers (slots 22-27, only bound when use_turboquant)
+  if (use_turboquant) {
+    enc.set_input_array(*key_scale_cache,   22);
+    enc.set_input_array(*value_scale_cache, 23);
+    // v_block_stride = value_cache.strides()[0], v_head_stride = value_cache.strides()[2]
+    int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
+    int32_t v_head_stride_i  = static_cast<int32_t>(value_cache.strides()[2]);
+    enc.set_bytes(v_block_stride_i, 24);
+    enc.set_bytes(v_head_stride_i,  25);
+    enc.set_input_array(*key_zero_cache, 26);
+    enc.set_input_array(*v_centroids, 27);
+  }
+
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
@@ -354,6 +413,12 @@ static void dispatch_paged_attention_v2_online(
     d.add_temporary(block_tables, s.index);
     d.add_temporary(seq_lens, s.index);
     d.add_temporary(cu_seqlens_q, s.index);
+    if (use_turboquant) {
+      d.add_temporary(*key_scale_cache, s.index);
+      d.add_temporary(*value_scale_cache, s.index);
+      d.add_temporary(*key_zero_cache, s.index);
+      d.add_temporary(*v_centroids, s.index);
+    }
   }
 }
 
@@ -414,9 +479,11 @@ void paged_attention_v2_online_impl_common(
   bool use_partitioning =
       kPartitionSize % block_size == 0 && max_num_partitions > 1;
 
-  auto dt = dtype_to_metal(query.dtype());
+  auto dt        = dtype_to_metal(query.dtype());
+  auto k_cache_dt = dtype_to_metal(key_cache.dtype());
+  auto v_cache_dt = dtype_to_metal(value_cache.dtype());
   std::string kname =
-      "paged_attention_" + dt + "_cache_" + dt +
+      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
       "_nt256_nsl32_ps" +
@@ -425,14 +492,23 @@ void paged_attention_v2_online_impl_common(
   bool use_alibi        = false;
   bool use_fp8          = false;
   bool use_sinks        = sinks != nullptr;
+  bool use_tq_fc        = false;
+  int  k_bits_i         = 8;
+
+  // Same hash-name discipline as v2: encode every varying function constant
+  // (use_sinks here) so MLX doesn't reuse a stale specialization.
+  std::string hash_name = kname + "_v2"
+      + "_sinks" + (use_sinks ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(
-      kname, lib, kname + "_v2",
+      kname, lib, hash_name,
       {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
        {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
        {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
+       {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)}});
 
   constexpr int NUM_THREADS    = 256;
   constexpr int NUM_SIMD_LANES = 32;
@@ -553,11 +629,13 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
  public:
   PagedAttentionPrimitive(
       Stream stream, int num_kv_heads, float scale, float softcap,
-      int block_size, int max_seq_len, int sliding_window)
+      int block_size, int max_seq_len, int sliding_window,
+      bool use_turboquant = false, int k_bits = 8, int v_bits = 3)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
-        sliding_window_(sliding_window) {}
+        sliding_window_(sliding_window),
+        use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -565,9 +643,14 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   }
 
   void eval_gpu(const std::vector<array>& inputs, array& out) override {
-    // inputs: [query, key_cache, value_cache, block_tables, seq_lens,
-    //          cu_seqlens_q]
+    // Non-TQ inputs: [query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q]
+    // TQ inputs:     [query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
+    //                 key_scale_cache, value_scale_cache, key_zero_cache, v_centroids]
     out.set_data(allocator::malloc(out.nbytes()));
+    const array* ks = use_turboquant_ ? &inputs[6] : nullptr;
+    const array* vs = use_turboquant_ ? &inputs[7] : nullptr;
+    const array* kz = use_turboquant_ ? &inputs[8] : nullptr;
+    const array* vc = use_turboquant_ ? &inputs[9] : nullptr;
     dispatch_paged_attention_v2_online(
         out,
         inputs[0],               // query
@@ -576,7 +659,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_,
         stream(),
-        /*from_primitive=*/true);
+        /*from_primitive=*/true,
+        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -587,7 +671,10 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->scale_ == scale_ && rhs->softcap_ == softcap_
         && rhs->block_size_ == block_size_
         && rhs->max_seq_len_ == max_seq_len_
-        && rhs->sliding_window_ == sliding_window_;
+        && rhs->sliding_window_ == sliding_window_
+        && rhs->use_turboquant_ == use_turboquant_
+        && rhs->k_bits_ == k_bits_
+        && rhs->v_bits_ == v_bits_;
   }
 
  private:
@@ -597,6 +684,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int block_size_;
   int max_seq_len_;
   int sliding_window_;
+  bool use_turboquant_;
+  int k_bits_;
+  int v_bits_;
 };
 
 static array paged_attention_primitive_fn(
@@ -605,11 +695,25 @@ static array paged_attention_primitive_fn(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window) {
+    int block_size, int max_seq_len, int sliding_window,
+    bool use_turboquant = false, const std::string& quant_type = "",
+    const array* key_scale_cache = nullptr,
+    const array* value_scale_cache = nullptr,
+    const array* key_zero_cache = nullptr,
+    const array* v_centroids = nullptr,
+    int v_bits = 3) {
+  int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
-      block_size, max_seq_len, sliding_window);
+      block_size, max_seq_len, sliding_window,
+      use_turboquant, k_bits, v_bits);
+  if (use_turboquant) {
+    return array(
+        query.shape(), query.dtype(), std::move(prim),
+        {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
+         *key_scale_cache, *value_scale_cache, *key_zero_cache, *v_centroids});
+  }
   return array(
       query.shape(), query.dtype(), std::move(prim),
       {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
@@ -840,7 +944,22 @@ NB_MODULE(_paged_ops, m) {
            nb::handle block_tables_h, nb::handle seq_lens_h,
            nb::handle cu_seqlens_q_h,
            int block_size, int max_seq_len, int sliding_window,
-           nb::handle out_h) {
+           nb::handle out_h,
+           nb::object key_scale_cache_h,
+           nb::object value_scale_cache_h,
+           nb::object key_zero_cache_h,
+           nb::object v_centroids_h,
+           bool use_turboquant,
+           const std::string& quant_type,
+           int v_bits) {
+          const array* ks = use_turboquant
+              ? nb::inst_ptr<array>(key_scale_cache_h) : nullptr;
+          const array* vs = use_turboquant
+              ? nb::inst_ptr<array>(value_scale_cache_h) : nullptr;
+          const array* kz = use_turboquant
+              ? nb::inst_ptr<array>(key_zero_cache_h) : nullptr;
+          const array* vc = use_turboquant
+              ? nb::inst_ptr<array>(v_centroids_h) : nullptr;
           auto result = paged_attention_primitive_fn(
               *nb::inst_ptr<array>(query_h),
               *nb::inst_ptr<array>(key_cache_h),
@@ -849,7 +968,8 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(block_tables_h),
               *nb::inst_ptr<array>(seq_lens_h),
               *nb::inst_ptr<array>(cu_seqlens_q_h),
-              block_size, max_seq_len, sliding_window);
+              block_size, max_seq_len, sliding_window,
+              use_turboquant, quant_type, ks, vs, kz, vc, v_bits);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -860,6 +980,13 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("sliding_window"),
         nb::arg("out"),
+        nb::arg("key_scale_cache") = nb::none(),
+        nb::arg("value_scale_cache") = nb::none(),
+        nb::arg("key_zero_cache") = nb::none(),
+        nb::arg("v_centroids") = nb::none(),
+        nb::arg("use_turboquant") = false,
+        nb::arg("quant_type") = "",
+        nb::arg("v_bits") = 3,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.");
 

@@ -140,3 +140,53 @@ class TestMetalConfig:
                     debug=False,
                     use_paged_attention=True,
                 )
+
+    def test_turboquant_defaults(self) -> None:
+        """Test default TurboQuant config values."""
+        config = MetalConfig.from_env()
+        assert config.turboquant is False
+        assert config.k_quant == "q8_0"
+        assert config.v_quant == "q3_0"
+
+    def test_turboquant_requires_paged_attention(self) -> None:
+        """Test that turboquant=True without paged attention is rejected."""
+        with pytest.raises(ValueError, match="turboquant requires paged attention"):
+            MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=False,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=False,
+                turboquant=True,
+                k_quant="uint8",
+            )
+
+    def test_turboquant_invalid_k_quant_rejected(self) -> None:
+        """Test that invalid k_quant values are rejected."""
+        with pytest.raises(ValueError, match="Invalid k_quant"):
+            MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=False,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=True,
+                turboquant=True,
+                k_quant="fp16",
+            )
+
+    def test_turboquant_invalid_v_quant_rejected(self) -> None:
+        """Test that invalid v_quant values are rejected."""
+        with pytest.raises(ValueError, match="Invalid v_quant"):
+            MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=False,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=True,
+                turboquant=True,
+                k_quant="q8_0",
+                v_quant="fp16",
+            )

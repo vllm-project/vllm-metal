@@ -64,11 +64,12 @@ def _build_paged_attention_source() -> str:
 
 
 def _build_v2_paged_attention_source() -> str:
-    """Concatenate float8 + utils + v2 paged_attention (online softmax)."""
+    """Concatenate float8 + utils + turboquant + v2 paged_attention (online softmax)."""
     parts = [
         f"#define VLLM_METAL_PARTITION_SIZE {PARTITION_SIZE}",
         _read_metal_source(_KERNELS_V2_DIR / "float8.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
     ]
     return "\n".join(parts)

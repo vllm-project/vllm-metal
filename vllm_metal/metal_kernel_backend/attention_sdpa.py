@@ -35,6 +35,7 @@ from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
 )
+from vllm_metal.metal_kernel_backend.turboquant import turbo_quant_encode
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Metal kernel block-size support ===
@@ -377,24 +378,52 @@ def sdpa_forward(
         ctx.block_tables, kv_cache.block_size
     )
 
-    # --- Cache write: MLX-native scatter (pure functional, graph-tracked) ---
-    # YOCO shared layers (shared_kv is not None) skip the write — their K/V
-    # is already in the reference layer's cache.  Only unique layers scatter.
-    #
-    # Flatten cache to [num_slots, num_kv_heads, head_dim], scatter new K/V
-    # by slot_mapping, then reshape back.  This creates proper graph nodes
-    # that MLX's evaluator can track for dependency ordering and buffer
-    # donation — no in-place mutation, no copy_shared_buffer, no const_cast.
-    #
-    # DONATION INVARIANT: the rebind (below) must drop the list's reference
-    # to the old cache *before* mx.eval runs.  At eval time the old cache
-    # must have use_count == 1 (only the graph) for MLX to donate its
-    # buffer to the scatter output.  Do NOT insert mx.eval between the
-    # scatter and the rebind, or hold extra references to the old cache.
     if shared_kv is not None:
-        # YOCO shared layer: K/V already written by the reference layer.
+        # YOCO shared layer: the reference layer already scattered the
+        # authoritative K/V (and, under TurboQuant, the scale/zero caches
+        # too).  Skip the write to avoid (a) redundant compute and (b)
+        # silent byte-drift if this layer's raw K/V differs marginally
+        # from the reference's — re-encoding would produce non-identical
+        # packed bytes.
         new_k_cache = kv_cache.key_caches[layer_idx]
         new_v_cache = kv_cache.value_caches[layer_idx]
+        if kv_cache.turboquant:
+            new_key_scale_cache = kv_cache.key_scale_caches[layer_idx]
+            new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
+            new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
+    elif kv_cache.turboquant:
+        # --- TurboQuant cache write: Python quantize → MLX scatter ---
+        # Quantize K/V, then scatter each of the 5 caches independently.
+        (packed_k, k_scale, k_zero), (packed_v, v_scale) = turbo_quant_encode(
+            k_3d, v_3d, kv_cache.k_quant, value_bits=kv_cache.v_bits
+        )
+
+        def _scatter(cache_arr, data):
+            flat = cache_arr.reshape(-1, kv_cache.num_kv_heads, data.shape[-1])
+            flat[slot_mapping] = data
+            return flat.reshape(cache_arr.shape)
+
+        kv_cache.key_caches[layer_idx] = _scatter(
+            kv_cache.key_caches[layer_idx], packed_k
+        )
+        kv_cache.value_caches[layer_idx] = _scatter(
+            kv_cache.value_caches[layer_idx], packed_v
+        )
+        kv_cache.key_scale_caches[layer_idx] = _scatter(
+            kv_cache.key_scale_caches[layer_idx], k_scale
+        )
+        kv_cache.value_scale_caches[layer_idx] = _scatter(
+            kv_cache.value_scale_caches[layer_idx], v_scale
+        )
+        kv_cache.key_zero_caches[layer_idx] = _scatter(
+            kv_cache.key_zero_caches[layer_idx], k_zero
+        )
+
+        new_k_cache = kv_cache.key_caches[layer_idx]
+        new_v_cache = kv_cache.value_caches[layer_idx]
+        new_key_scale_cache = kv_cache.key_scale_caches[layer_idx]
+        new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
+        new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
     else:
         flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_k[slot_mapping] = k_3d
@@ -421,30 +450,79 @@ def sdpa_forward(
     kernel_k_cache = new_k_cache
     kernel_v_cache = new_v_cache
     if kernel_block_size != kv_cache.block_size:
+        # Use the cache's actual last-axis size rather than the logical
+        # ``head_dim``.  Under TurboQuant the K/V caches are stored in
+        # packed form (``packed_head_dim = packed_dim(head_dim, bits)``)
+        # which differs from ``head_dim`` for all bitwidths except 8-bit K.
+        # Mirrors the ``sg = ...shape[-1]`` idiom used for the scale/zero
+        # reshape below.
         kernel_k_cache = new_k_cache.reshape(
-            -1, kernel_block_size, cache_kv_heads, head_dim
+            -1, kernel_block_size, cache_kv_heads, new_k_cache.shape[-1]
         )
         kernel_v_cache = new_v_cache.reshape(
-            -1, kernel_block_size, cache_kv_heads, head_dim
+            -1, kernel_block_size, cache_kv_heads, new_v_cache.shape[-1]
         )
 
     ops = get_ops()
     out = mx.array(0)
-    ops.paged_attention_primitive(
-        q_3d,
-        kernel_k_cache,
-        kernel_v_cache,
-        cache_kv_heads,
-        inner.scale,
-        0.0,  # softcap (0 = disabled)
-        block_tables,
-        seq_lens,
-        cu_seqlens_q,
-        kernel_block_size,
-        max_seq_len,
-        -1,  # sliding_window (-1 = disabled)
-        out,
-    )
+    if kv_cache.turboquant:
+        # Reshape scale/zero caches for kernel block size
+        kernel_key_scale = new_key_scale_cache
+        kernel_value_scale = new_value_scale_cache
+        kernel_key_zero = new_key_zero_cache
+        if kernel_block_size != kv_cache.block_size:
+            sg = new_key_scale_cache.shape[-1]
+            kernel_key_scale = new_key_scale_cache.reshape(
+                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+            )
+            kernel_value_scale = new_value_scale_cache.reshape(
+                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+            )
+            kernel_key_zero = new_key_zero_cache.reshape(
+                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+            )
+        # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
+        from vllm_metal.metal_kernel_backend.turboquant import get_v_centroids
+
+        v_centroids = get_v_centroids(kv_cache.v_bits)
+        ops.paged_attention_primitive(
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+            out,
+            key_scale_cache=kernel_key_scale,
+            value_scale_cache=kernel_value_scale,
+            key_zero_cache=kernel_key_zero,
+            v_centroids=v_centroids,
+            use_turboquant=True,
+            quant_type=kv_cache.k_quant,
+            v_bits=kv_cache.v_bits,
+        )
+    else:
+        ops.paged_attention_primitive(
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            kv_cache.num_kv_heads,
+            inner.scale,
+            0.0,  # softcap (0 = disabled)
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            max_seq_len,
+            -1,  # sliding_window (-1 = disabled)
+            out,
+        )
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)

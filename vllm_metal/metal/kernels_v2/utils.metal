@@ -5,8 +5,14 @@
 
 #include "float8.metal"
 #include <metal_stdlib>
+#include <metal_simdgroup>
 
 using namespace metal;
+
+// ========================================== Generic vector types
+// Forward declaration for Vec template, specialized in pagedattention.metal
+// and turboquant.metal for various types.
+template <typename T, int VEC_SIZE> struct Vec {};
 
 #if defined(__HAVE_BFLOAT__)
 

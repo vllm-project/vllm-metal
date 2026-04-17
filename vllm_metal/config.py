@@ -16,6 +16,18 @@ PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
 # Minimum blocks required for paged attention to be usable.
 PAGED_ATTENTION_MIN_BLOCKS = 16
 
+# Valid key quantization types for TurboQuant (mirrors QUANT_PARAMS in turboquant.py).
+# Kept here as a plain set so config can be imported without MLX.
+TURBOQUANT_VALID_K_QUANTS: frozenset[str] = frozenset(
+    {"q8_0", "int8", "uint8", "q5_0", "q4_0", "int4", "uint4", "int2", "uint2"}
+)
+
+# Valid value quantization types for TurboQuant.
+# V uses Lloyd-Max quantization with FWHT rotation.
+TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
+    {"q2_0", "q3_0", "q4_0", "q5_0", "q8_0"}
+)
+
 
 @dataclass
 class MetalConfig:
@@ -27,6 +39,9 @@ class MetalConfig:
     block_size: int
     debug: bool
     use_paged_attention: bool = True
+    turboquant: bool = False  # Enable TurboQuant KV cache compression
+    k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
+    v_quant: str = "q3_0"  # Value quantization type: q2_0, q3_0, q4_0, q5_0 (Lloyd-Max)
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -50,6 +65,29 @@ class MetalConfig:
                 raise ValueError(
                     f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
                     "Must be a finite value in (0, 1] when paged attention is enabled."
+                )
+
+        self._validate_turboquant()
+
+    def _validate_turboquant(self) -> None:
+        """Validate TurboQuant configuration."""
+        if self.turboquant:
+            if not self.use_paged_attention:
+                raise ValueError(
+                    "turboquant requires paged attention. "
+                    "TurboQuant KV cache compression only works with paged attention."
+                )
+            if self.k_quant not in TURBOQUANT_VALID_K_QUANTS:
+                available = ", ".join(sorted(TURBOQUANT_VALID_K_QUANTS))
+                raise ValueError(
+                    f"Invalid k_quant={self.k_quant!r}. "
+                    f"Available quantization types: {available}"
+                )
+            if self.v_quant not in TURBOQUANT_VALID_V_QUANTS:
+                available = ", ".join(sorted(TURBOQUANT_VALID_V_QUANTS))
+                raise ValueError(
+                    f"Invalid v_quant={self.v_quant!r}. "
+                    f"Available quantization types: {available}"
                 )
 
     @property
@@ -81,6 +119,8 @@ class MetalConfig:
                 "Must be a positive integer."
             ) from e
 
+        # TurboQuant config is set via --additional-config, not env vars.
+        # See MetalPlatform.check_and_update_config() for how it's applied.
         return cls(
             memory_fraction=memory_fraction,
             use_mlx=envs.VLLM_METAL_USE_MLX,

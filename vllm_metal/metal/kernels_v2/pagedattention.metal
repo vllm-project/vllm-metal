@@ -15,9 +15,8 @@
 using namespace metal;
 
 // ========================================== Generic vector types
-
-// A vector type to store Q, K, V elements.
-template <typename T, int VEC_SIZE> struct Vec {};
+// NOTE: Vec<T, VEC_SIZE> is declared in utils.metal.
+// Specializations for char are in turboquant.metal.
 
 // A vector type to store FP32 accumulators.
 template <typename T> struct FloatVec {};
@@ -784,12 +783,19 @@ inline int find_seq_idx(const device int32_t *cu_seqlens_q,
   return lo;
 }
 
+// ========================================== Function constants
+// NOTE: TurboQuant helpers (Char8_, Vec<char>, is_char, tq_load_k_vec, etc.)
+// are in turboquant.metal, concatenated before this file by the build system.
+
 constant bool use_partitioning [[function_constant(10)]];
 constant bool use_alibi [[function_constant(20)]];
 constant bool use_fp8_scales [[function_constant(30)]];
 constant bool use_sinks [[function_constant(40)]];
+constant bool use_turboquant [[function_constant(50)]];
+constant int k_bits [[function_constant(60)]];
+constant int v_bits [[function_constant(70)]];  // V quantization bit width (default 3)
 
-template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention(
     device float *exp_sums
@@ -801,9 +807,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     device T *out
     [[buffer(2)]], // [num_seqs, num_heads, max_num_partitions, head_size]
     device const T *q [[buffer(3)]], // [num_seqs, num_heads, head_size]
-    device const CACHE_T *k_cache
+    device const K_CACHE_T *k_cache
     [[buffer(4)]], // [num_blocks, block_size, num_kv_heads, head_size]
-    device const CACHE_T *v_cache
+    device const V_CACHE_T *v_cache
     [[buffer(5)]], // [num_blocks, block_size, num_kv_heads, head_size]
     const device float *__restrict__ k_scale
     [[buffer(6), function_constant(use_fp8_scales)]], // [1]
@@ -826,6 +832,18 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],  // -1 = disabled
+    const device half *key_scale_cache
+    [[buffer(22), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const device half *value_scale_cache
+    [[buffer(23), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const constant int &v_block_stride
+    [[buffer(24), function_constant(use_turboquant)]],
+    const constant int &v_head_stride
+    [[buffer(25), function_constant(use_turboquant)]],
+    const device half *key_zero_cache
+    [[buffer(26), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
+    const device float *v_centroids
+    [[buffer(27), function_constant(use_turboquant)]], // [2^v_bits] Lloyd-Max centroids for V
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -899,7 +917,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
   using K_vec = typename Vec<T, VEC_SIZE>::Type;
   using Q_vec = typename Vec<T, VEC_SIZE>::Type;
-  using Quant_vec = typename Vec<CACHE_T, VEC_SIZE>::Type;
+  using Quant_vec = typename Vec<K_CACHE_T, VEC_SIZE>::Type;
 
   constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
   constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
@@ -928,8 +946,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // for the tree reduction of O accumulators.
   threadgroup float red_smem[2 * NUM_WARPS];
 
-  // Token stride within a block: num_kv_heads * HEAD_SIZE
-  const int kv_token_stride = num_kv_heads * HEAD_SIZE;
+  // Token stride within a block: num_kv_heads * (stride between adjacent KV heads).
+  // For non-TQ / 8-bit K, kv_head_stride == HEAD_SIZE.
+  // For sub-8-bit TQ K, kv_head_stride == k_packed_dim (head_size * k_bits / 8),
+  // so using kv_head_stride here keeps K pointer arithmetic correct in both cases.
+  const int kv_token_stride = num_kv_heads * kv_head_stride;
 
   // ========== Online softmax: per-warp state ==========
   // Each warp maintains its own running (m, l, O) across its KV blocks.
@@ -960,6 +981,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   threadgroup float *warp_scores =
       reinterpret_cast<threadgroup float *>(shared_mem) +
       warp_idx * BLOCK_SIZE;
+  // TurboQuant: per-warp FWHT workspace for V dequantization.
+  // Allocated after warp_scores. Host must provide the extra shmem when use_turboquant.
+  threadgroup float *fwht_buf =
+      reinterpret_cast<threadgroup float *>(shared_mem) +
+      NUM_WARPS * BLOCK_SIZE + warp_idx * HEAD_SIZE;
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
@@ -981,16 +1007,41 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const device CACHE_T *k_ptr =
+        const device K_CACHE_T *k_ptr =
             k_cache + physical_block_number * kv_block_stride +
             physical_block_offset * kv_token_stride +
             kv_head_idx * kv_head_stride;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
 
-        if constexpr (is_uchar<CACHE_T>()) {
-          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + vec_idx * VEC_SIZE);
-          k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+        if constexpr (is_uchar<K_CACHE_T>()) {
+          // uchar K: FP8 (non-TQ) or TurboQuant uint8 / sub-8-bit K path.
+          if (use_turboquant) {
+            constexpr int SCALE_GROUP_SIZE = 32;
+            constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
+            const int64_t k_scale_base_offset =
+                physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
+                physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
+                kv_head_idx * SCALE_GROUPS;
+            tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
+                k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
+                k_scale_base_offset, vec_idx, k_bits);
+          } else {
+            // FP8 path
+            Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
+                k_ptr + vec_idx * VEC_SIZE);
+            k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+          }
+        } else if constexpr (is_char<K_CACHE_T>()) {
+          // char K: TQ int8 K — always asymmetric dequant (no FP8 for char)
+          constexpr int SCALE_GROUP_SIZE = 32;
+          constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
+          const int64_t k_scale_base_offset =
+              physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
+              physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
+              kv_head_idx * SCALE_GROUPS;
+          tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
+              k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
+              k_scale_base_offset, vec_idx, k_bits);
         } else {
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
               k_ptr + vec_idx * VEC_SIZE);
@@ -1071,22 +1122,39 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
       warp_l += w;
 
       // Load V and accumulate: O += w * V
-      const device CACHE_T *v_ptr =
-          v_cache + physical_block_number * kv_block_stride +
-          tok * kv_token_stride +
-          kv_head_idx * kv_head_stride;
-
+      if (use_turboquant) {
+        // TurboQuant V: 3-bit Lloyd-Max + FWHT dequantization.
+        const device uchar *v_ptr =
+            reinterpret_cast<const device uchar *>(v_cache) +
+            (int64_t)physical_block_number * v_block_stride +
+            tok * (num_kv_heads * v_head_stride) +
+            kv_head_idx * v_head_stride;
+        constexpr int SCALE_GROUP_SIZE = 32;
+        constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
+        const int64_t v_scale_base_offset =
+            physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
+            tok * (num_kv_heads * SCALE_GROUPS) +
+            kv_head_idx * SCALE_GROUPS;
+        tq_load_and_accumulate_v<HEAD_SIZE, NUM_SIMD_LANES>(
+            v_accs, fwht_buf, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
+            v_centroids, v_bits);
+      } else {
+        const device V_CACHE_T *v_ptr =
+            v_cache + physical_block_number * kv_block_stride +
+            tok * kv_token_stride +
+            kv_head_idx * kv_head_stride;
 #pragma unroll
-      for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
-        const int d = lane + i * NUM_SIMD_LANES;
-        if (d < HEAD_SIZE) {
-          float v_val;
-          if constexpr (is_uchar<CACHE_T>()) {
-            v_val = fp8_e4m3_to_float(v_ptr[d]) * (*v_scale);
-          } else {
-            v_val = float(v_ptr[d]);
+        for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
+          const int d = lane + i * NUM_SIMD_LANES;
+          if (d < HEAD_SIZE) {
+            float v_val;
+            if constexpr (is_uchar<V_CACHE_T>()) {
+              v_val = fp8_e4m3_to_float(v_ptr[d]) * (*v_scale);
+            } else {
+              v_val = float(v_ptr[d]);
+            }
+            v_accs[i] += w * v_val;
           }
-          v_accs[i] += w * v_val;
         }
       }
     }
@@ -1340,22 +1408,23 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
-#define instantiate_paged_attention_inner(type, cache_type, head_size,         \
-                                          block_size, num_threads,             \
+#define instantiate_paged_attention_inner(type, k_cache_type, v_cache_type,    \
+                                          head_size, block_size, num_threads,  \
                                           num_simd_lanes, partition_size)      \
-  template [[host_name("paged_attention_" #type "_cache_" #cache_type          \
+  template [[host_name("paged_attention_" #type "_cache_" #k_cache_type        \
+                       "_" #v_cache_type                                       \
                        "_hs" #head_size "_bs" #block_size "_nt" #num_threads   \
                        "_nsl" #num_simd_lanes                                  \
                        "_ps" #partition_size)]] [[kernel]] void                \
-  paged_attention<type, cache_type, head_size, block_size, num_threads,        \
-                  num_simd_lanes, partition_size>(                             \
+  paged_attention<type, k_cache_type, v_cache_type, head_size, block_size,     \
+                  num_threads, num_simd_lanes, partition_size>(                \
       device float *exp_sums                                                   \
       [[buffer(0), function_constant(use_partitioning)]],                      \
       device float *max_logits                                                 \
       [[buffer(1), function_constant(use_partitioning)]],                      \
       device type *out [[buffer(2)]], device const type *q [[buffer(3)]],      \
-      device const cache_type *k_cache [[buffer(4)]],                          \
-      device const cache_type *v_cache [[buffer(5)]],                          \
+      device const k_cache_type *k_cache [[buffer(4)]],                        \
+      device const v_cache_type *v_cache [[buffer(5)]],                        \
       device const float *k_scale                                              \
       [[buffer(6), function_constant(use_fp8_scales)]],                        \
       device const float *v_scale                                              \
@@ -1375,6 +1444,18 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
       const constant int &num_seqs [[buffer(20)]],                             \
       const constant int &sliding_window [[buffer(21)]],                       \
+      const device half *key_scale_cache                                       \
+      [[buffer(22), function_constant(use_turboquant)]],                       \
+      const device half *value_scale_cache                                     \
+      [[buffer(23), function_constant(use_turboquant)]],                       \
+      const constant int &v_block_stride                                       \
+      [[buffer(24), function_constant(use_turboquant)]],                       \
+      const constant int &v_head_stride                                        \
+      [[buffer(25), function_constant(use_turboquant)]],                       \
+      const device half *key_zero_cache                                        \
+      [[buffer(26), function_constant(use_turboquant)]],                       \
+      const device float *v_centroids                                          \
+      [[buffer(27), function_constant(use_turboquant)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -1407,30 +1488,31 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       uint simd_lid [[thread_index_in_simdgroup]]);
 
 #define instantiate_paged_attention_heads(                                     \
-    type, cache_type, block_size, num_threads, num_simd_lanes, partition_size) \
-  instantiate_paged_attention_inner(type, cache_type, 64, block_size,          \
-                                    num_threads, num_simd_lanes,               \
+    type, k_cache_type, v_cache_type, block_size, num_threads,                 \
+    num_simd_lanes, partition_size)                                            \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 64,      \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 80, block_size,          \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 80,      \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 96, block_size,          \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 96,      \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 112, block_size,         \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 112,     \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 128, block_size,         \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 128,     \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 192, block_size,         \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 192,     \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 256, block_size,         \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 256,     \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);                           \
-  instantiate_paged_attention_inner(type, cache_type, 512, block_size,         \
-                                    num_threads, num_simd_lanes,               \
+  instantiate_paged_attention_inner(type, k_cache_type, v_cache_type, 512,     \
+                                    block_size, num_threads, num_simd_lanes,   \
                                     partition_size);
 
 #define instantiate_paged_attention_v2_reduce_heads(                           \
@@ -1452,26 +1534,32 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   instantiate_paged_attention_v2_reduce_inner(type, 512, num_threads,          \
                                               num_simd_lanes, partition_size);
 
-#define instantiate_paged_attention_block_size(type, cache_type, num_threads,  \
+#define instantiate_paged_attention_block_size(type, k_cache_type,             \
+                                               v_cache_type, num_threads,      \
                                                num_simd_lanes, partition_size) \
-  instantiate_paged_attention_heads(type, cache_type, 8, num_threads,          \
-                                    num_simd_lanes, partition_size);           \
-  instantiate_paged_attention_heads(type, cache_type, 16, num_threads,         \
-                                    num_simd_lanes, partition_size);           \
-  instantiate_paged_attention_heads(type, cache_type, 32, num_threads,         \
-                                    num_simd_lanes, partition_size);
+  instantiate_paged_attention_heads(type, k_cache_type, v_cache_type, 8,       \
+                                    num_threads, num_simd_lanes,               \
+                                    partition_size);                           \
+  instantiate_paged_attention_heads(type, k_cache_type, v_cache_type, 16,      \
+                                    num_threads, num_simd_lanes,               \
+                                    partition_size);                           \
+  instantiate_paged_attention_heads(type, k_cache_type, v_cache_type, 32,      \
+                                    num_threads, num_simd_lanes,               \
+                                    partition_size);
 
 // TODO: tune num_threads = 256
 // NOTE: partition_size = 0
-#define instantiate_paged_attention_v1(type, cache_type, num_simd_lanes)       \
-  instantiate_paged_attention_block_size(type, cache_type, 256,                \
-                                         num_simd_lanes, 0);
+#define instantiate_paged_attention_v1(type, k_cache_type, v_cache_type,       \
+                                       num_simd_lanes)                         \
+  instantiate_paged_attention_block_size(type, k_cache_type, v_cache_type,     \
+                                         256, num_simd_lanes, 0);
 
 // TODO: tune num_threads = 256
 // NOTE: partition_size = VLLM_METAL_PARTITION_SIZE
-#define instantiate_paged_attention_v2(type, cache_type, num_simd_lanes)       \
-  instantiate_paged_attention_block_size(type, cache_type, 256,                \
-                                         num_simd_lanes,                        \
+#define instantiate_paged_attention_v2(type, k_cache_type, v_cache_type,       \
+                                       num_simd_lanes)                         \
+  instantiate_paged_attention_block_size(type, k_cache_type, v_cache_type,     \
+                                         256, num_simd_lanes,                  \
                                          VLLM_METAL_PARTITION_SIZE);
 
 // TODO: tune num_threads = 256
@@ -1480,22 +1568,34 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   instantiate_paged_attention_v2_reduce_heads(                                  \
       type, 256, num_simd_lanes, VLLM_METAL_PARTITION_SIZE);
 
-instantiate_paged_attention_v1(float, float, 32);
-instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, 32);
-instantiate_paged_attention_v1(half, half, 32);
+// Non-TQ: same K/V cache type (kernel name: paged_attention_<T>_cache_<CT>_<CT>_hs...)
+instantiate_paged_attention_v1(float, float, float, 32);
+instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_v1(half, half, half, 32);
 
-instantiate_paged_attention_v1(float, uchar, 32);
-instantiate_paged_attention_v1(bfloat16_t, uchar, 32);
-instantiate_paged_attention_v1(half, uchar, 32);
+// FP8 non-TQ (uchar K + uchar V)
+instantiate_paged_attention_v1(float, uchar, uchar, 32);
+instantiate_paged_attention_v1(bfloat16_t, uchar, uchar, 32);
+instantiate_paged_attention_v1(half, uchar, uchar, 32);
 
 instantiate_paged_attention_v2_reduce(float, 32);
 instantiate_paged_attention_v2_reduce(bfloat16_t, 32);
 instantiate_paged_attention_v2_reduce(half, 32);
 
-instantiate_paged_attention_v2(float, float, 32);
-instantiate_paged_attention_v2(bfloat16_t, bfloat16_t, 32);
-instantiate_paged_attention_v2(half, half, 32);
+instantiate_paged_attention_v2(float, float, float, 32);
+instantiate_paged_attention_v2(bfloat16_t, bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_v2(half, half, half, 32);
 
-instantiate_paged_attention_v2(float, uchar, 32);
-instantiate_paged_attention_v2(bfloat16_t, uchar, 32);
-instantiate_paged_attention_v2(half, uchar, 32);
+// FP8 non-TQ (uchar K + uchar V) — also used for TQ uint8 K (differentiated by use_turboquant FC)
+instantiate_paged_attention_v2(float, uchar, uchar, 32);
+instantiate_paged_attention_v2(bfloat16_t, uchar, uchar, 32);
+instantiate_paged_attention_v2(half, uchar, uchar, 32);
+
+// TurboQuant: int8 K (char) + 3-bit V (uchar) — both non-partitioned (ps0) and partitioned
+instantiate_paged_attention_v1(float, char, uchar, 32);
+instantiate_paged_attention_v1(bfloat16_t, char, uchar, 32);
+instantiate_paged_attention_v1(half, char, uchar, 32);
+
+instantiate_paged_attention_v2(float, char, uchar, 32);
+instantiate_paged_attention_v2(bfloat16_t, char, uchar, 32);
+instantiate_paged_attention_v2(half, char, uchar, 32);

@@ -73,6 +73,9 @@ class MHAPagedAttentionBackend:
         head_dim: int,
         block_size: int,
         dtype: mx.Dtype,
+        turboquant: bool = False,
+        k_quant: str | None = None,
+        v_quant: str | None = None,
         cache_idx_map: dict[int, int] | None = None,
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
@@ -83,6 +86,9 @@ class MHAPagedAttentionBackend:
         self._block_size = block_size
         self._dtype = dtype
         self._cache: MetalPagedKVCache | None = None
+        self._turboquant = turboquant
+        self._k_quant = k_quant
+        self._v_quant = v_quant
         self._cache_idx_map = cache_idx_map
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
@@ -102,6 +108,9 @@ class MHAPagedAttentionBackend:
             num_blocks=num_blocks,
             block_size=self._block_size,
             dtype=self._dtype,
+            turboquant=self._turboquant,
+            k_quant=self._k_quant,
+            v_quant=self._v_quant,
             kv_heads_per_layer=self._kv_heads_per_layer,
             head_dim_per_layer=self._head_dim_per_layer,
         )

@@ -83,6 +83,16 @@ class MetalWorker(WorkerBase):
         )
         self.metal_config = get_config()
 
+        # Apply TurboQuant config from --additional-config (needed because worker
+        # runs in a separate process and doesn't inherit the config singleton
+        # state set in MetalPlatform.check_and_update_config).
+        add = vllm_config.additional_config
+        if isinstance(add, dict) and add.get("turboquant"):
+            self.metal_config.turboquant = True
+            self.metal_config.k_quant = add.get("k_quant", "q8_0")
+            self.metal_config.v_quant = add.get("v_quant", "q3_0")
+            self.metal_config._validate_turboquant()
+
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True
 
@@ -257,6 +267,10 @@ class MetalWorker(WorkerBase):
             The loaded model
         """
         return self.model_runner.model
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        """Update max_model_len after engine auto-fits context to GPU memory."""
+        self.model_config.max_model_len = max_model_len
 
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.

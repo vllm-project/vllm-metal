@@ -89,6 +89,10 @@ class HybridPagedAttentionBackend:
         # Common
         block_size: int,
         dtype: mx.Dtype,
+        # TurboQuant (SDPA layers only)
+        turboquant: bool = False,
+        k_quant: str | None = None,
+        v_quant: str | None = None,
     ) -> None:
         self._max_num_seqs = max_num_seqs
         self._block_size = block_size
@@ -104,6 +108,11 @@ class HybridPagedAttentionBackend:
         self._linear_value_head_dim = linear_value_head_dim
         self._linear_conv_kernel_dim = linear_conv_kernel_dim
         self._linear_conv_dim = linear_conv_dim
+
+        # TurboQuant params (only applies to SDPA layers)
+        self._turboquant = turboquant
+        self._k_quant = k_quant
+        self._v_quant = v_quant
 
         # Classify layers
         self._sdpa_indices: list[int] = []
@@ -130,6 +139,9 @@ class HybridPagedAttentionBackend:
             num_blocks=num_blocks,
             block_size=self._block_size,
             dtype=self._dtype,
+            turboquant=self._turboquant,
+            k_quant=self._k_quant,
+            v_quant=self._v_quant,
         )
 
         self._state_cache = GDNPagedStateCache(

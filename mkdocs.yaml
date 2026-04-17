@@ -67,4 +67,5 @@ nav:
     - Configuration: configuration.md
   - Features:
     - Speech-to-Text: stt.md
+    - Turboquant: turboquant.md
   - Contributing: CONTRIBUTING.md
