@@ -36,8 +36,12 @@ def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
         ) from e
 
     try:
-        dummy_k = mx.zeros((1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype)
-        dummy_v = mx.zeros((1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype)
+        # Warm up against the concrete layer-0 cache shape. Per-layer cache
+        # allocation may differ from the scalar constructor fallback.
+        warmup_kv_heads = cache.kv_heads_per_layer[0]
+        warmup_head_dim = cache.head_dim_per_layer[0]
+        dummy_k = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
+        dummy_v = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
         dummy_slot = mx.zeros((1,), dtype=mx.int64)
         mx.eval(dummy_k, dummy_v, dummy_slot)
         ops.reshape_and_cache(

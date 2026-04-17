@@ -62,6 +62,7 @@ class ModelCachePolicy:
 
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
+        self._require_supported_per_layer_shapes()
         self._model_adapter.require_uniform_kv_heads(
             self._runner.model_args,
             self._runner.num_kv_heads,
@@ -89,6 +90,7 @@ class ModelCachePolicy:
                 ),
             }
 
+        self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         kv_heads_list = self._runner.kv_heads_per_layer
@@ -146,6 +148,7 @@ class ModelCachePolicy:
         if self._runner._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
+        self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size
         kv_factor = 1 if self._runner.is_mla else 2
@@ -174,6 +177,7 @@ class ModelCachePolicy:
         self, *, block_size: int
     ) -> PagedAttentionBackend:
         """Create the paged-attention backend for the loaded model."""
+        self._require_supported_per_layer_shapes()
         if self._runner.is_hybrid:
             return self._build_hybrid_backend(block_size)
         if self._runner.is_mla:
@@ -184,6 +188,7 @@ class ModelCachePolicy:
         self, *, max_model_len: int, block_size: int
     ) -> int:
         """Estimate bytes for one max-length sequence of cache state."""
+        self._require_supported_per_layer_shapes()
         dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
         kv_factor = 1 if self._runner.is_mla else 2
@@ -249,6 +254,22 @@ class ModelCachePolicy:
             [self._runner.head_dim] * num_cache_layers,
         )
 
+    def _require_supported_per_layer_shapes(self) -> None:
+        """Reject unsupported per-layer KV shape combinations early."""
+        kv_heads = self._runner.kv_heads_per_layer
+        head_dims = self._runner.head_dim_per_layer
+        if (kv_heads is None) != (head_dims is None):
+            raise ValueError(
+                "kv_heads_per_layer and head_dim_per_layer must be set together."
+            )
+        if kv_heads is None:
+            return
+        if self._runner.is_hybrid:
+            raise NotImplementedError(
+                "Per-layer KV shapes with hybrid models require "
+                "SDPA-layer index remapping, which is not yet implemented."
+            )
+
     def _kv_layer_size_sum(self) -> int:
         """Sum of ``kv_heads × head_dim`` across KV cache layers.
 
@@ -262,11 +283,6 @@ class ModelCachePolicy:
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
         if kv_heads is not None and head_dims is not None:
-            if self._runner.is_hybrid:
-                raise NotImplementedError(
-                    "Per-layer KV shapes with hybrid models require "
-                    "SDPA-layer index remapping, which is not yet implemented."
-                )
             return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
         return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
 
