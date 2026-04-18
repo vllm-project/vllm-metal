@@ -43,6 +43,7 @@ def make_stub_runner(
         "_model_adapter": DefaultModelAdapter(),
         "kv_heads_per_layer": None,
         "head_dim_per_layer": None,
+        "sliding_window_per_layer": None,
         "use_async_scheduling": True,
         "device": torch.device("cpu"),
         "_sampler": None,

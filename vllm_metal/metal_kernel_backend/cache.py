@@ -53,6 +53,7 @@ class MetalPagedKVCache:
         *,
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
+        sliding_window_per_layer: list[int] | None = None,
     ) -> None:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -108,6 +109,7 @@ class MetalPagedKVCache:
 
         self.kv_heads_per_layer = kv_heads_per_layer or [num_kv_heads] * num_layers
         self.head_dim_per_layer = head_dim_per_layer or [head_dim] * num_layers
+        self.sliding_window_per_layer = sliding_window_per_layer or [-1] * num_layers
 
         if len(self.kv_heads_per_layer) != num_layers:
             raise ValueError(
@@ -118,6 +120,11 @@ class MetalPagedKVCache:
             raise ValueError(
                 f"head_dim_per_layer length {len(self.head_dim_per_layer)} "
                 f"!= num_layers {num_layers}"
+            )
+        if len(self.sliding_window_per_layer) != num_layers:
+            raise ValueError(
+                f"sliding_window_per_layer length "
+                f"{len(self.sliding_window_per_layer)} != num_layers {num_layers}"
             )
 
         if dtype not in (mx.float16, mx.bfloat16, mx.float32):

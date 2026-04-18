@@ -272,3 +272,41 @@ class TestRequireUniformKvHeads:
         adapter = DefaultModelAdapter()
         with pytest.raises(ValueError, match="VLLM_METAL_USE_PAGED_ATTENTION=0"):
             adapter.require_uniform_kv_heads(args, num_kv_heads)
+
+
+class TestBuildSlidingWindowPerLayer:
+    """Tests for build_sliding_window_per_layer()."""
+
+    def test_returns_none_for_model_without_layer_types(self) -> None:
+        adapter = DefaultModelAdapter()
+        result = adapter.build_sliding_window_per_layer({}, num_layers=4)
+        assert result is None
+
+    def test_returns_none_without_sliding_window_config(self) -> None:
+        args = {"layer_types": ["sliding_attention", "full_attention"]}
+        adapter = DefaultModelAdapter()
+        result = adapter.build_sliding_window_per_layer(args, num_layers=2)
+        assert result is None
+
+    def test_gemma4_sliding_layers_get_window_full_layers_disabled(self) -> None:
+        args = {
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            "sliding_window": 1024,
+        }
+        adapter = DefaultModelAdapter()
+        result = adapter.build_sliding_window_per_layer(args, num_layers=4)
+        assert result == [1024, 1024, -1, 1024]
+
+    def test_length_mismatch_returns_none(self) -> None:
+        args = {
+            "layer_types": ["sliding_attention"],
+            "sliding_window": 1024,
+        }
+        adapter = DefaultModelAdapter()
+        result = adapter.build_sliding_window_per_layer(args, num_layers=4)
+        assert result is None

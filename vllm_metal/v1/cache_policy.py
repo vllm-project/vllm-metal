@@ -441,6 +441,14 @@ class ModelCachePolicy:
         num_layers, cache_idx_map = self._mha_cache_layout()
         config = get_config()
         kv_heads, head_dims = self._cache_layer_shapes(num_layers)
+        # YOCO's ``build_yoco_cache_mapping`` assigns the first
+        # ``num_cache_layers`` model layers identity-style (``mapping[i] = i``),
+        # so slicing the first ``num_cache_layers`` entries of the full
+        # per-model-layer list yields the correct window for each cache slot.
+        # Shared layers then retrieve the right window via ``cache_idx_map``,
+        # which points back to a same-type unique layer by construction.
+        sw = self._runner.sliding_window_per_layer
+        sw_list = sw[:num_layers] if sw is not None else None
         return MHAPagedAttentionBackend(
             num_layers=num_layers,
             num_kv_heads=self._runner.num_kv_heads,
@@ -453,6 +461,7 @@ class ModelCachePolicy:
             cache_idx_map=cache_idx_map,
             kv_heads_per_layer=kv_heads,
             head_dim_per_layer=head_dims,
+            sliding_window_per_layer=sw_list,
         )
 
     def _cache_layer_shapes(self, num_cache_layers: int) -> tuple[list[int], list[int]]:

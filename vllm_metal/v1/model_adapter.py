@@ -44,6 +44,11 @@ class ModelAdapter(Protocol):
     ) -> tuple[int, dict[int, int]] | None:
         """Build YOCO layer→cache_idx mapping, or None if not applicable."""
 
+    def build_sliding_window_per_layer(
+        self, args: dict[str, Any], num_layers: int
+    ) -> list[int] | None:
+        """Return per-layer sliding window sizes, or None for no enforcement."""
+
 
 # Models that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
@@ -170,3 +175,22 @@ class DefaultModelAdapter(ModelAdapter):
                 mapping[i] = type_to_cache_idx[layer_types[i]]
 
         return num_unique, mapping
+
+    def build_sliding_window_per_layer(
+        self, args: dict[str, Any], num_layers: int
+    ) -> list[int] | None:
+        """Return per-layer sliding window sizes for Gemma4, else None.
+
+        Gemma4 sliding-attention layers enforce a local window
+        (``config.sliding_window``); full-attention layers attend to the
+        entire context (represented as ``-1``).  Models without
+        ``layer_types`` or ``sliding_window`` in their config return
+        ``None``, keeping the current disabled-everywhere behavior.
+        """
+        layer_types: list[str] = args.get("layer_types", [])
+        sliding_window = args.get("sliding_window")
+        if len(layer_types) != num_layers or not sliding_window:
+            return None
+
+        sw = int(sliding_window)
+        return [sw if lt == "sliding_attention" else -1 for lt in layer_types]

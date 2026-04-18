@@ -349,9 +349,10 @@ def sdpa_forward(
     n_heads = queries.shape[1]
     head_dim = queries.shape[3]
 
-    # Per-layer cache shape: each layer may have its own (kv_heads, head_dim).
+    # Per-layer cache properties: shape and sliding window.
     cache_kv_heads = kv_cache.kv_heads_per_layer[layer_idx]
     cache_head_dim = kv_cache.head_dim_per_layer[layer_idx]
+    layer_sliding_window = kv_cache.sliding_window_per_layer[layer_idx]
     actual_head_dim = head_dim
     queries, keys, values = pad_qkv_to_cache_head_dim(
         queries, keys, values, head_dim, cache_head_dim
@@ -497,7 +498,7 @@ def sdpa_forward(
             cu_seqlens_q,
             kernel_block_size,
             max_seq_len,
-            -1,  # sliding_window (-1 = disabled)
+            layer_sliding_window,
             out,
             key_scale_cache=kernel_key_scale,
             value_scale_cache=kernel_value_scale,
@@ -520,7 +521,7 @@ def sdpa_forward(
             cu_seqlens_q,
             kernel_block_size,
             max_seq_len,
-            -1,  # sliding_window (-1 = disabled)
+            layer_sliding_window,
             out,
         )
 

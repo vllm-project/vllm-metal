@@ -186,6 +186,12 @@ class ModelLifecycle:
             yoco[0] if yoco is not None else self._runner.num_layers
         )
 
+        self._runner.sliding_window_per_layer = (
+            self._model_adapter.build_sliding_window_per_layer(
+                args, self._runner.num_layers
+            )
+        )
+
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
