@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for _apply_grammar_bitmask_paged and grammar integration in
+"""Tests for MetalStructuredOutputApplier.apply_paged and grammar integration in
 execute_model / sample_tokens."""
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ from vllm.v1.sample.sampler import Sampler
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.structured_output import _apply_grammar_bitmask_paged
+from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+
+# Shared instance used by unit tests that call apply_paged directly.
+_applier = MetalStructuredOutputApplier()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -138,7 +141,7 @@ def _build_cu_seqlens(num_decode: int, prefill_lens: list[int]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# _apply_grammar_bitmask_paged — 3D paged-path helper
+# MetalStructuredOutputApplier.apply_paged — 3D paged-path helper
 # ---------------------------------------------------------------------------
 
 
@@ -156,7 +159,7 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
         )
 
         # Row 0 (r0): only allowed_token survives
@@ -177,7 +180,7 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
         )
 
         # Row 0 (r0): unconstrained
@@ -200,7 +203,7 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(
+            _applier.apply_paged(
                 sched, grammar, [], prefill_reqs, cu, 0, logits
             )
         )
@@ -232,7 +235,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["d0", "p0"], bitmask)
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(
+            _applier.apply_paged(
                 sched, grammar, decode_reqs, prefill_reqs, cu, 1, logits
             )
         )
@@ -258,7 +261,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["absent"], _make_single_token_bitmask(0))
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
         )
 
         np.testing.assert_allclose(result, data, rtol=1e-5)
@@ -276,7 +279,7 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
         )
 
         np.testing.assert_allclose(result, data, rtol=1e-5)
@@ -289,7 +292,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
-        result = _apply_grammar_bitmask_paged(
+        result = _applier.apply_paged(
             sched, grammar, decode_reqs, [], cu, 1, logits
         )
 
@@ -304,7 +307,7 @@ class TestApplyGrammarBitmaskPaged:
 
         with patch.object(so, "xgr", None):
             with pytest.raises(RuntimeError, match="xgrammar is required"):
-                _apply_grammar_bitmask_paged(
+                _applier.apply_paged(
                     sched, grammar, decode_reqs, [], cu, 1, logits
                 )
 
@@ -317,7 +320,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
         with pytest.raises(AssertionError):
-            _apply_grammar_bitmask_paged(
+            _applier.apply_paged(
                 sched, grammar, decode_reqs, [], cu, 1, logits_2d
             )
 
@@ -339,7 +342,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r1", "r0"], bitmask)
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
         )
 
         assert np.isfinite(result[0, 0, allowed_r0])
@@ -354,7 +357,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
-        result = _apply_grammar_bitmask_paged(
+        result = _applier.apply_paged(
             sched, grammar, decode_reqs, [], cu, 1, logits
         )
 
@@ -370,7 +373,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0", "r1"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(5))
 
-        _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+        _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
 
         np.testing.assert_array_equal(_to_numpy(logits), data)
 
@@ -386,7 +389,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(5))
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
         )
 
         np.testing.assert_array_equal(result[0, 1], data[0, 1])
@@ -401,7 +404,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0", "r1"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(5))
 
-        result = _apply_grammar_bitmask_paged(
+        result = _applier.apply_paged(
             sched, grammar, decode_reqs, [], cu, 2, logits
         )
 
@@ -432,7 +435,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["p0", "p1"], bitmask)
 
         result = _to_numpy(
-            _apply_grammar_bitmask_paged(
+            _applier.apply_paged(
                 sched, grammar, decode_reqs, prefill_reqs, cu, 1, logits
             )
         )
@@ -463,7 +466,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
         with pytest.raises(NotImplementedError, match="speculative decoding"):
-            _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
 
     def test_spec_decode_plain_req_does_not_block_structured_req(self) -> None:
         """Plain req with spec tokens must not block a structured-output req.
@@ -485,7 +488,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(allowed_token))
 
         # Must not raise — r0 (structured) has no spec tokens.
-        result = _apply_grammar_bitmask_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
+        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
 
         result_np = _to_numpy(result)
         # r0 (row 0) is constrained to allowed_token

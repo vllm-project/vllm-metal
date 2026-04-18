@@ -256,6 +256,9 @@ class MetalModelRunner:
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
 
+        # Structured-output bitmask applier for the paged path.
+        self._structured_output_applier = MetalStructuredOutputApplier()
+
     @property
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).
@@ -832,7 +835,7 @@ class MetalModelRunner:
 
         # ---- apply structured output bitmask if present ----
         if grammar_output is not None:
-            logits = MetalStructuredOutputApplier.apply_paged(
+            logits = self._structured_output_applier.apply_paged(
                 scheduler_output,
                 grammar_output,
                 decode_reqs,
