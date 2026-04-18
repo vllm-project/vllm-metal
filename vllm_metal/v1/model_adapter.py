@@ -44,6 +44,16 @@ class ModelAdapter(Protocol):
     ) -> tuple[int, dict[int, int]] | None:
         """Build YOCO layer→cache_idx mapping, or None if not applicable."""
 
+    def build_per_layer_kv_shapes(
+        self,
+        args: dict[str, Any],
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[list[int], list[int]] | None:
+        """Return per-layer ``(kv_heads, head_dim)`` lists, or None for uniform."""
+
 
 # Models that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
@@ -103,24 +113,14 @@ class DefaultModelAdapter(ModelAdapter):
     def require_uniform_kv_heads(
         self, args: dict[str, Any], num_kv_heads: int | None
     ) -> None:
-        """Reject Gemma4 26B/31B variable KV head counts in paged attention.
+        """Retained as a compatibility hook; heterogeneous KV is supported.
 
-        Paged KV cache assumes uniform KV head counts across layers. Remove
-        once per-layer KV head allocation is supported.
+        Kept as a no-op so existing worker/plugin code that calls this
+        method keeps working.  Heterogeneous KV layouts are now handled
+        via :meth:`build_per_layer_kv_shapes` and the runner's
+        ``kv_heads_per_layer`` / ``head_dim_per_layer`` lists.
         """
-        global_kv_heads = args.get("num_global_key_value_heads")
-        if (
-            global_kv_heads
-            and num_kv_heads
-            and int(global_kv_heads) != int(num_kv_heads)
-        ):
-            raise ValueError(
-                f"Paged attention does not support variable KV head count: "
-                f"num_key_value_heads={num_kv_heads}, "
-                f"num_global_key_value_heads={global_kv_heads}. "
-                f"Use VLLM_METAL_USE_PAGED_ATTENTION=0 to fall back to the "
-                f"non-paged path."
-            )
+        del args, num_kv_heads
 
     def text_model(self, model: Any) -> Any:
         """Return VLM text sub-model to avoid pixel_values/mask requirements."""
@@ -170,3 +170,65 @@ class DefaultModelAdapter(ModelAdapter):
                 mapping[i] = type_to_cache_idx[layer_types[i]]
 
         return num_unique, mapping
+
+    def build_per_layer_kv_shapes(
+        self,
+        args: dict[str, Any],
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[list[int], list[int]] | None:
+        """Return per-layer ``(kv_heads, head_dim)`` lists for Gemma4, else None.
+
+        Gemma4 26B/31B mix sliding attention (``num_key_value_heads``,
+        ``head_dim``) with full attention (``num_global_key_value_heads``,
+        ``global_head_dim``), exposed via ``layer_types``.  Other models use
+        a uniform KV shape across every layer, in which case this returns
+        ``None`` and the cache path falls back to the scalar
+        ``num_kv_heads`` / ``head_dim`` fields on the runner.
+
+        Edge case: some Gemma4 checkpoints (e.g. ``gemma-4-E2B``) override
+        only ``global_head_dim`` while reusing the sliding-layer KV-head
+        count for full-attention layers.  In that case
+        ``num_global_key_value_heads`` is absent and the full-attention
+        KV-head count falls back to ``num_kv_heads`` — collapsing to a
+        uniform layout would cause full-attention layers to write into
+        under-sized cache slots.
+
+        Args:
+            args: Flattened model-config mapping.
+            num_layers: Total number of transformer layers.
+            num_kv_heads: Resolved sliding-layer KV-head count.
+            head_dim: Resolved sliding-layer head_dim (pre max-with-global).
+
+        Returns:
+            ``(kv_heads_per_layer, head_dim_per_layer)`` of length
+            ``num_layers``, or ``None`` when the model is uniform.
+        """
+        layer_types = args.get("layer_types", [])
+        global_head_dim = args.get("global_head_dim")
+        if len(layer_types) != num_layers or not global_head_dim:
+            return None
+
+        global_kv_heads = args.get("num_global_key_value_heads")
+        full_kv_heads = (
+            int(global_kv_heads) if global_kv_heads is not None else int(num_kv_heads)
+        )
+        full_head_dim = int(global_head_dim)
+        sliding_kv_heads = int(num_kv_heads)
+        sliding_head_dim = int(head_dim)
+
+        def _is_sliding(layer_type: object) -> bool:
+            return isinstance(layer_type, str) and "sliding" in layer_type.lower()
+
+        kv_heads_per_layer: list[int] = []
+        head_dim_per_layer: list[int] = []
+        for layer_type in layer_types:
+            if _is_sliding(layer_type):
+                kv_heads_per_layer.append(sliding_kv_heads)
+                head_dim_per_layer.append(sliding_head_dim)
+            else:
+                kv_heads_per_layer.append(full_kv_heads)
+                head_dim_per_layer.append(full_head_dim)
+        return kv_heads_per_layer, head_dim_per_layer

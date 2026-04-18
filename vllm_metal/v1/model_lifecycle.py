@@ -146,12 +146,12 @@ class ModelLifecycle:
             or num_attention_heads
         )
         hidden_size = args.get("hidden_size")
-        head_dim = args.get("head_dim") or (
+        base_head_dim = args.get("head_dim") or (
             hidden_size // num_attention_heads
             if hidden_size and num_attention_heads
             else None
         )
-        head_dim = self._model_adapter.resolve_max_head_dim(args, head_dim)
+        head_dim = self._model_adapter.resolve_max_head_dim(args, base_head_dim)
 
         missing = []
         if not num_layers:
@@ -185,6 +185,31 @@ class ModelLifecycle:
         self._runner.num_kv_cache_layers = (
             yoco[0] if yoco is not None else self._runner.num_layers
         )
+
+        # Per-layer KV shapes for heterogeneous models (Gemma4 26B/31B).
+        # Uses the unresolved ``base_head_dim`` so sliding-attention layers
+        # get their true head_dim (256) rather than the max-with-global used
+        # for cache allocation (512).  Returns None for uniform models,
+        # leaving the scalar paths on the runner unchanged.
+        #
+        # ``base_head_dim`` is None only when neither ``head_dim`` nor
+        # ``hidden_size / num_attention_heads`` could be resolved — the
+        # missing-check above already raises in that case, but we guard
+        # here too so ``int()`` never receives None.
+        if base_head_dim is not None:
+            per_layer = self._model_adapter.build_per_layer_kv_shapes(
+                args,
+                num_layers=self._runner.num_layers,
+                num_kv_heads=self._runner.num_kv_heads,
+                head_dim=int(base_head_dim),
+            )
+        else:
+            per_layer = None
+        if per_layer is not None:
+            self._runner.kv_heads_per_layer, self._runner.head_dim_per_layer = per_layer
+        else:
+            self._runner.kv_heads_per_layer = None
+            self._runner.head_dim_per_layer = None
 
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])

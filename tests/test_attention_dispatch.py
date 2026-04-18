@@ -93,6 +93,39 @@ def test_qwen35_linear_layer_detected():
     assert not is_sdpa(layer.linear_attn)
 
 
+def test_gemma4_k_eq_v_attention_detected_as_sdpa():
+    """Gemma4 K-eq-V full-attention layers omit v_proj but must still dispatch
+    through the SDPA backend — :func:`prepare_sdpa_qkv` handles the
+    ``values = keys`` branch internally.
+    """
+    from mlx_lm.models.gemma4_text import Attention, ModelArgs
+
+    args = ModelArgs(
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_size_per_layer_input=0,
+        layer_types=["sliding_attention", "full_attention"],
+        attention_k_eq_v=True,
+        vocab_size=100,
+    )
+    sliding_attn = Attention(args, layer_idx=0)
+    full_attn = Attention(args, layer_idx=1)
+
+    assert hasattr(sliding_attn, "v_proj"), "sliding layer keeps v_proj"
+    assert not hasattr(full_attn, "v_proj"), "full K-eq-V layer drops v_proj"
+
+    assert is_sdpa(sliding_attn)
+    assert is_sdpa(full_attn)
+    assert not is_linear_attention(sliding_attn)
+    assert not is_linear_attention(full_attn)
+
+
 def test_find_layers_on_qwen3_model():
     """find_layers should return the layer list from a real Qwen3 Model."""
     from mlx_lm.models.qwen3 import Model, ModelArgs
