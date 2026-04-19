@@ -203,9 +203,7 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _applier.apply_paged(
-                sched, grammar, [], prefill_reqs, cu, 0, logits
-            )
+            _applier.apply_paged(sched, grammar, [], prefill_reqs, cu, 0, logits)
         )
 
         # Only the LAST row (row 3) should be constrained
@@ -292,9 +290,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
-        result = _applier.apply_paged(
-            sched, grammar, decode_reqs, [], cu, 1, logits
-        )
+        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
 
         assert result.dtype == mx.float16
 
@@ -307,9 +303,7 @@ class TestApplyGrammarBitmaskPaged:
 
         with patch.object(so, "xgr", None):
             with pytest.raises(RuntimeError, match="xgrammar is required"):
-                _applier.apply_paged(
-                    sched, grammar, decode_reqs, [], cu, 1, logits
-                )
+                _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
 
     def test_rejects_2d_logits(self) -> None:
         """The paged helper must reject 2D logits with a clear assertion."""
@@ -320,9 +314,7 @@ class TestApplyGrammarBitmaskPaged:
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
         with pytest.raises(AssertionError):
-            _applier.apply_paged(
-                sched, grammar, decode_reqs, [], cu, 1, logits_2d
-            )
+            _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits_2d)
 
     def test_batch_order_independent_of_grammar_output_order(self) -> None:
         """Bitmask must reach the correct row even when grammar_output order differs."""
@@ -357,9 +349,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
-        result = _applier.apply_paged(
-            sched, grammar, decode_reqs, [], cu, 1, logits
-        )
+        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
 
         assert result.dtype == mx.bfloat16
 
@@ -404,9 +394,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0", "r1"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(5))
 
-        result = _applier.apply_paged(
-            sched, grammar, decode_reqs, [], cu, 2, logits
-        )
+        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)
 
         # Row 1 (r1) is unconstrained — values must match the input row exactly.
         np.testing.assert_array_equal(
@@ -485,7 +473,9 @@ class TestApplyGrammarBitmaskPaged:
             total_num_scheduled_tokens=3,
             finished_req_ids=set(),
         )
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(allowed_token))
+        grammar = _make_grammar_output(
+            ["r0"], _make_single_token_bitmask(allowed_token)
+        )
 
         # Must not raise — r0 (structured) has no spec tokens.
         result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 2, logits)

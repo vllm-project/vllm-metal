@@ -95,13 +95,11 @@ class MetalStructuredOutputApplier:
 
         # Fast path: if none of the structured-output request IDs appear in this
         # batch, skip row-map construction and cu_seqlens validation entirely.
-        batch_req_ids = (
-            {req_id for req_id, _ in decode_reqs}
-            | {pr.req_id for pr in prefill_reqs}
-        )
+        batch_req_ids = {req_id for req_id, _ in decode_reqs} | {
+            pr.req_id for pr in prefill_reqs
+        }
         if not any(
-            rid in batch_req_ids
-            for rid in grammar_output.structured_output_request_ids
+            rid in batch_req_ids for rid in grammar_output.structured_output_request_ids
         ):
             return logits
 
@@ -123,7 +121,9 @@ class MetalStructuredOutputApplier:
 
         # Determine which structured-output requests are present in this batch.
         constrained: list[tuple[int, int]] = []  # (logit_row, bitmask_row)
-        for bitmask_row, req_id in enumerate(grammar_output.structured_output_request_ids):
+        for bitmask_row, req_id in enumerate(
+            grammar_output.structured_output_request_ids
+        ):
             if req_id in req_id_to_row:
                 constrained.append((req_id_to_row[req_id], bitmask_row))
 
@@ -137,7 +137,9 @@ class MetalStructuredOutputApplier:
         # forces MLX evaluation, producing an independent writable copy.
         original_dtype = logits.dtype
         logit_rows = [logit_row for logit_row, _ in constrained]
-        rows_np = np.array(logits[0, logit_rows, :].astype(mx.float32))  # (n_constrained, vocab)
+        rows_np = np.array(
+            logits[0, logit_rows, :].astype(mx.float32)
+        )  # (n_constrained, vocab)
         rows_torch = torch.from_numpy(rows_np)
 
         # Apply per constrained row. xgrammar's indices= parameter selects rows
@@ -145,7 +147,9 @@ class MetalStructuredOutputApplier:
         # paired with non-contiguous logit indices, so we apply row-by-row here.
         # TODO: batch via indices= once xgrammar supports non-contiguous bitmask selection.
         for i, (_, bitmask_row) in enumerate(constrained):
-            row_bitmask = torch.from_numpy(grammar_bitmask[bitmask_row : bitmask_row + 1])
+            row_bitmask = torch.from_numpy(
+                grammar_bitmask[bitmask_row : bitmask_row + 1]
+            )
             # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
             # vocab_size is intentionally omitted; xgrammar auto-detects it as
             # min(logits_width, bitmask_words * 32).  Phantom slots in the last
@@ -155,7 +159,9 @@ class MetalStructuredOutputApplier:
 
         # rows_torch is CPU float32 (from torch.from_numpy), so torch_to_mlx goes
         # through numpy — all xgrammar mutations are captured before the copy.
-        rows_mlx = torch_to_mlx(rows_torch).astype(original_dtype)  # (n_constrained, vocab)
+        rows_mlx = torch_to_mlx(rows_torch).astype(
+            original_dtype
+        )  # (n_constrained, vocab)
 
         # logits[0] produces a new lazy computation node (not a Python alias of
         # logits), so __setitem__ here does not mutate the caller-held logits array.

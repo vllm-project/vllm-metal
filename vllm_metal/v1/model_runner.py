@@ -1290,13 +1290,14 @@ class MetalModelRunner:
         # contribute a paged decode or prefill entry, so has_paged_work() must be
         # True. If this fires, a scheduler change broke that contract and the
         # bitmask would have been silently skipped on the synchronous tail.
-        assert not (
+        if (
             self._paged_attention_backend is not None
             and scheduler_output.has_structured_output_requests
-        ), (
-            "Structured-output request present but no paged work was scheduled — "
-            "invariant violated."
-        )
+        ):
+            raise RuntimeError(
+                "Structured-output request present but no paged work was scheduled — "
+                "invariant violated."
+            )
 
         if self._paged_attention_backend is None:
             self._run_non_paged_decode_batch(batch)
