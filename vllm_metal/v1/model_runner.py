@@ -66,6 +66,7 @@ from vllm_metal.v1.sampling_batch import (
     sample_from_logits,
     sample_prefill_tokens,
 )
+from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 logger = init_logger(__name__)
 
@@ -260,6 +261,9 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+
+        # Structured-output bitmask applier for the paged path.
+        self._structured_output_applier = MetalStructuredOutputApplier()
 
     @property
     def is_mla(self) -> bool:
@@ -812,7 +816,10 @@ class MetalModelRunner:
             num_decode=num_decode,
         )
 
-    def _sample_paged_batch(self) -> tuple[_ExecutionBatch, SchedulerOutput]:
+    def _sample_paged_batch(
+        self,
+        grammar_output: GrammarOutput | None = None,
+    ) -> tuple[_ExecutionBatch, SchedulerOutput]:
         """Eval logits, sample tokens, and postprocess paged batch.
 
         Consumes state stashed by ``_start_paged_forward``.
@@ -829,8 +836,20 @@ class MetalModelRunner:
         cu_seqlens = state.cu_seqlens
         num_decode = state.num_decode
 
-        # ---- wait for GPU forward to complete ----
+        # ---- wait for MLX forward to complete ----
         mx.eval(logits)
+
+        # ---- apply structured output bitmask if present ----
+        if grammar_output is not None:
+            logits = self._structured_output_applier.apply_paged(
+                scheduler_output,
+                grammar_output,
+                decode_reqs,
+                prefill_reqs,
+                cu_seqlens,
+                num_decode,
+                logits,
+            )
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
@@ -1233,6 +1252,20 @@ class MetalModelRunner:
         if self._is_stt:
             return self._execute_stt(scheduler_output)
 
+        # Fail fast before any model work runs.  On the non-paged path,
+        # _handle_new_requests immediately calls _prefill_single for new
+        # requests, so the guard must come before it — not after.
+        if (
+            self._paged_attention_backend is None
+            and scheduler_output.has_structured_output_requests
+        ):
+            raise NotImplementedError(
+                "Grammar/structured-output constraints are not supported on "
+                "the non-paged (legacy) Metal path. "
+                "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
+                "to use structured output."
+            )
+
         batch = _ExecutionBatch()
         self._handle_new_requests(
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
@@ -1257,6 +1290,21 @@ class MetalModelRunner:
             )
             return None
 
+        # Defensive invariant: the vLLM scheduler sets has_structured_output_requests
+        # only when at least one SO request is present in the *current* scheduled
+        # batch (not the global queue). Any such request on the paged path must
+        # contribute a paged decode or prefill entry, so has_paged_work() must be
+        # True. If this fires, a scheduler change broke that contract and the
+        # bitmask would have been silently skipped on the synchronous tail.
+        if (
+            self._paged_attention_backend is not None
+            and scheduler_output.has_structured_output_requests
+        ):
+            raise RuntimeError(
+                "Structured-output request present but no paged work was scheduled — "
+                "invariant violated."
+            )
+
         if self._paged_attention_backend is None:
             self._run_non_paged_decode_batch(batch)
 
@@ -1278,11 +1326,9 @@ class MetalModelRunner:
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
         """
-        del grammar_output
-
-        # Paged path: eval + sample + postprocess
+        # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
-            batch, scheduler_output = self._sample_paged_batch()
+            batch, scheduler_output = self._sample_paged_batch(grammar_output)
             self._validate_scheduled_outputs(batch, scheduler_output)
             self._cleanup_finished_requests(scheduler_output.finished_req_ids)
             return self._build_output(batch)

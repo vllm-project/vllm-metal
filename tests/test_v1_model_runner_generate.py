@@ -130,6 +130,7 @@ class TestV1MetalModelRunnerExecuteModel:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
+            has_structured_output_requests=False,
         )
 
     def test_returns_empty_output_directly_for_empty_batch(self) -> None:

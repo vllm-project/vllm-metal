@@ -10,6 +10,7 @@ import torch
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
+from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 
 def make_stub_runner(
@@ -48,6 +49,7 @@ def make_stub_runner(
         "device": torch.device("cpu"),
         "_sampler": None,
         "_logitsprocs": None,
+        "_structured_output_applier": MetalStructuredOutputApplier(),
         "model_args": _model_args,
     }
 
