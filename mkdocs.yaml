@@ -65,6 +65,8 @@ nav:
   - Getting Started:
     - Installation: installation.md
     - Configuration: configuration.md
+  - Models:
+    - Supported Models: supported_models.md
   - Features:
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
