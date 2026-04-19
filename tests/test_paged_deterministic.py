@@ -200,12 +200,19 @@ class TestPagedDeterministic:
 
 @pytest.fixture(scope="module")
 def vllm_prefix_cached_outputs(_paged_llm, vllm_outputs):
-    """Second pass — cache populated by ``vllm_outputs``, cache hits expected.
+    """Second pass — cache populated by the ``vllm_outputs`` priming pass.
 
-    Depends on ``vllm_outputs`` so pytest orders the priming pass first.
-    The upstream scheduler should report ``num_computed_tokens > 0`` here,
-    exercising the ``start_pos > 0`` path in the model_runner (issue #182).
+    ``vllm_outputs`` is declared as a dependency only so pytest orders the
+    priming pass first; its return value is intentionally unused.
+
+    Upstream invariant: a ``generate`` call repeating the same prompt
+    triggers the prefix-cache lookup (block hashes match), so the second
+    pass walks the ``start_pos > 0`` path inside the model_runner
+    (issue #182).  We do not assert ``num_computed_tokens > 0`` directly
+    — that contract belongs to upstream's own tests.  This fixture's job
+    is to confirm vllm-metal's cache-hit code path produces correct output.
     """
+    del vllm_outputs  # ordering-only dependency
     if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") != "1":
         pytest.skip("Prefix caching e2e test only meaningful on the paged path")
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
@@ -221,10 +228,30 @@ class TestPagedPrefixCacheCorrectness:
     def test_prefix_cached_matches_golden(self, vllm_prefix_cached_outputs, prompt):
         output = vllm_prefix_cached_outputs[prompt]
         token_ids = list(output.outputs[0].token_ids)
+        text = output.outputs[0].text
+
         mlx_expected = GOLDEN_MLX[prompt]
         paged_expected = GOLDEN_PAGED[prompt]
-        assert token_ids == mlx_expected or token_ids == paged_expected, (
-            f"Prefix-cached output for {prompt!r} matched neither golden set.\n"
+
+        mlx_match = token_ids == mlx_expected
+        paged_match = token_ids == paged_expected
+        print(
+            f"VLLM_METAL_USE_PAGED_ATTENTION: {os.environ.get('VLLM_METAL_USE_PAGED_ATTENTION')}"
+        )
+        print(f"\n  prompt: {prompt!r}  (prefix-cached)")
+        print(f"  output: {text!r}")
+        print(f"  ids:    {token_ids}")
+        if mlx_match:
+            print("  result: MATCHED mlx-cache golden")
+        elif paged_match:
+            print("  result: MATCHED paged-cache golden")
+        else:
+            print("  result: NO MATCH")
+            print(f"  expected (mlx):   {mlx_expected}")
+            print(f"  expected (paged): {paged_expected}")
+
+        assert mlx_match or paged_match, (
+            f"Output for {prompt!r} (prefix-cached) matched neither golden set.\n"
             f"Got:            {token_ids}\n"
             f"Expected (mlx): {mlx_expected}\n"
             f"Expected (pgd): {paged_expected}"
