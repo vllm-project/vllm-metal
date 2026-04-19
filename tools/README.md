@@ -65,8 +65,9 @@ python -m tools.benchmark.attention_benchmark --mode varlen --q-lens 1,4,16,64 -
 
 ## Prefix Caching Benchmark
 
-Measures TTFT with shared-prefix workloads using `prefix_repetition` dataset.
-Establishes a baseline before prefix caching is implemented (#159).
+Measures TTFT / TPOT / E2EL with shared-prefix workloads using the
+upstream `prefix_repetition` dataset.  Compare cache-off baseline vs
+cache-on by toggling `--enable-prefix-caching` / `--no-enable-prefix-caching`.
 
 **1. Start the server:**
 
@@ -74,7 +75,8 @@ Establishes a baseline before prefix caching is implemented (#159).
 # Adjust MEMORY_FRACTION based on available RAM (lower if OOM).
 VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
   vllm serve Qwen/Qwen3-0.6B \
-    --port 8000 --max-model-len 2048 --max-num-seqs 8
+    --port 8000 --max-model-len 2048 --max-num-seqs 8 \
+    --enable-prefix-caching
 ```
 
 **2. Run the benchmark:**
@@ -93,8 +95,8 @@ vllm bench serve \
   --request-rate inf \
   --percentile-metrics ttft,tpot,e2el \
   --metric-percentiles 50,99 \
-  --save-result --label baseline
+  --save-result --label cache-on
 ```
 
-Key metric is **TTFT** — with prefix caching enabled, requests sharing
-the same prefix should show lower TTFT on cache hits.
+For a cache-off baseline, restart the server with
+`--no-enable-prefix-caching` and re-run with `--label baseline`.

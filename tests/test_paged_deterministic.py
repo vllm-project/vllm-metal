@@ -121,11 +121,17 @@ def _set_env():
 def vllm_outputs():
     """Run vLLM offline inference once for all prompts.
 
-    Uses max_num_seqs=1 to avoid batch-invariance non-determinism on Metal.
+    Pinned to ``enable_prefix_caching=False`` so the golden token IDs
+    (cache-off reference) remain the invariant under test regardless of
+    upstream default changes.
     """
-    llm = LLM(model=MODEL_NAME, max_model_len=512, max_num_seqs=1)
+    llm = LLM(
+        model=MODEL_NAME,
+        max_model_len=512,
+        max_num_seqs=1,
+        enable_prefix_caching=False,
+    )
 
-    # Verify paged KV path is active when requested
     if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1":
         runner = llm.llm_engine.model_executor.driver_worker.model_runner
         assert runner._paged_attention_backend is not None, (

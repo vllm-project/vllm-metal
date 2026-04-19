@@ -275,15 +275,6 @@ class MetalPlatform(Platform):
                     scheduler_config.max_num_batched_tokens,
                 )
 
-        if config.use_paged_attention and getattr(
-            cache_config, "enable_prefix_caching", False
-        ):
-            # The unified paged path does not yet safely support vLLM core
-            # prefix-cache hits for new requests. Disable the feature at the
-            # platform layer until that path is fully supported.
-            cache_config.enable_prefix_caching = False
-            logger.info("Metal: disabled prefix caching")
-
         # Configure cache — ensure block_size is at least the Metal kernel
         # minimum.  With chunked prefill enabled, upstream may default to
         # block_size=1 for fine-grained scheduling, but our Metal paged
