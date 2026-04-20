@@ -23,6 +23,7 @@ Run:
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections import Counter
@@ -48,6 +49,8 @@ _NO_WINDOW = -1
 # must actually decide whether to enforce the window.
 _LONG_CONTEXT_TOKEN_MARGIN = 128
 _LONG_CONTEXT_MIN_TOKENS = _E2B_SLIDING_WINDOW + _LONG_CONTEXT_TOKEN_MARGIN
+_LONG_CONTEXT_TARGET_TOKENS = _LONG_CONTEXT_MIN_TOKENS + 1
+_FRAGMENT_REPEAT_SAMPLE_COUNT = 2
 _MAX_MODEL_LEN = 1024
 _MAX_TOKENS = 1
 _PROMPT_FRAGMENT = "The capital of France is Paris. "
@@ -103,15 +106,37 @@ def _get_call_arg(
 
 def _build_long_prompt(tokenizer) -> str:
     """Return a prompt whose tokenized length exceeds Gemma4's window size."""
-    fragments: list[str] = []
-    for _ in range(512):
-        fragments.append(_PROMPT_FRAGMENT)
-        prompt = "".join(fragments)
-        token_count = len(tokenizer.encode(text=prompt, add_special_tokens=False))
-        if token_count > _LONG_CONTEXT_MIN_TOKENS:
-            return prompt
+    first_fragment_token_count = len(
+        tokenizer.encode(text=_PROMPT_FRAGMENT, add_special_tokens=False)
+    )
+    if first_fragment_token_count <= 0:
+        raise AssertionError("prompt fragment must tokenize to at least one token")
+
+    repeated_fragment_sample = _PROMPT_FRAGMENT * _FRAGMENT_REPEAT_SAMPLE_COUNT
+    repeat_increment_token_count = (
+        len(tokenizer.encode(text=repeated_fragment_sample, add_special_tokens=False))
+        - first_fragment_token_count
+    )
+    if repeat_increment_token_count <= 0:
+        raise AssertionError(
+            "prompt fragment repeat must increase token count by at least one token"
+        )
+
+    additional_repeat_count = math.ceil(
+        max(0, _LONG_CONTEXT_TARGET_TOKENS - first_fragment_token_count)
+        / repeat_increment_token_count
+    )
+    repeat_count = 1 + additional_repeat_count
+    prompt = _PROMPT_FRAGMENT * repeat_count
+    token_count = len(tokenizer.encode(text=prompt, add_special_tokens=False))
+    if token_count > _LONG_CONTEXT_MIN_TOKENS:
+        return prompt
     raise AssertionError(
-        "failed to construct a prompt longer than Gemma4's sliding window"
+        "failed to construct a prompt longer than Gemma4's sliding window: "
+        f"repeat_count={repeat_count}, token_count={token_count}, "
+        f"first_fragment_token_count={first_fragment_token_count}, "
+        f"repeat_increment_token_count={repeat_increment_token_count}, "
+        f"target>{_LONG_CONTEXT_MIN_TOKENS}"
     )
 
 
