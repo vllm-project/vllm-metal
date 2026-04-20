@@ -175,10 +175,11 @@ class GDNPagedAttentionWrapper(nn.Module):
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(kernel_dtype))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(kernel_dtype))
 
-        cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
+        # Cached MLX views — built once per forward pass, reused across layers.
+        cu_seqlens_arr = ctx.cu_seqlens_mx
         # Stable request → slot mapping from model_runner's allocator.
         if ctx.gdn_slot_mapping is not None:
-            slot_mapping = mx.array(ctx.gdn_slot_mapping, dtype=mx.int32)
+            slot_mapping = ctx.gdn_slot_mapping_mx
         else:
             slot_mapping = mx.arange(num_requests, dtype=mx.int32)
 

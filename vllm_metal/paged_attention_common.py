@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,64 @@ class PagedAttentionContext:
     # GDN state pool slot mapping: request batch position → stable slot ID.
     # Populated by model_runner for hybrid models; None for non-hybrid.
     gdn_slot_mapping: list[int] | None = None
+
+    # Lazy MLX views — converted once per forward pass on first access, then
+    # reused across all attention layers. Eliminates the N-layer redundancy of
+    # re-converting the same Python lists on every attention wrapper call.
+    _slot_mapping_mx: mx.array | None = field(default=None, init=False, repr=False)
+    _block_tables_mx: mx.array | None = field(default=None, init=False, repr=False)
+    _context_lens_mx: mx.array | None = field(default=None, init=False, repr=False)
+    _cu_seqlens_mx: mx.array | None = field(default=None, init=False, repr=False)
+    _gdn_slot_mapping_mx: mx.array | None = field(
+        default=None, init=False, repr=False
+    )
+
+    @property
+    def slot_mapping_mx(self) -> mx.array:
+        if self._slot_mapping_mx is None:
+            self._slot_mapping_mx = mx.array(self.slot_mapping, dtype=mx.int64)
+        return self._slot_mapping_mx
+
+    @property
+    def block_tables_mx(self) -> mx.array:
+        """Dense padded [num_reqs, max_blocks] int32 tensor.
+
+        Rows shorter than max_blocks are right-padded with 0. Callers that need
+        a per-request length should read from ``context_lens`` or derive from
+        ``block_tables``.
+        """
+        if self._block_tables_mx is None:
+            if not self.block_tables:
+                self._block_tables_mx = mx.zeros((0, 0), dtype=mx.int32)
+            else:
+                max_blocks = max(len(bt) for bt in self.block_tables)
+                padded = [
+                    bt + [0] * (max_blocks - len(bt)) for bt in self.block_tables
+                ]
+                self._block_tables_mx = mx.array(padded, dtype=mx.int32)
+        return self._block_tables_mx
+
+    @property
+    def context_lens_mx(self) -> mx.array:
+        if self._context_lens_mx is None:
+            self._context_lens_mx = mx.array(self.context_lens, dtype=mx.int32)
+        return self._context_lens_mx
+
+    @property
+    def cu_seqlens_mx(self) -> mx.array:
+        if self._cu_seqlens_mx is None:
+            self._cu_seqlens_mx = mx.array(self.cu_seqlens, dtype=mx.int32)
+        return self._cu_seqlens_mx
+
+    @property
+    def gdn_slot_mapping_mx(self) -> mx.array | None:
+        if self.gdn_slot_mapping is None:
+            return None
+        if self._gdn_slot_mapping_mx is None:
+            self._gdn_slot_mapping_mx = mx.array(
+                self.gdn_slot_mapping, dtype=mx.int32
+            )
+        return self._gdn_slot_mapping_mx
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

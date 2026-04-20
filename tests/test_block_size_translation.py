@@ -8,6 +8,7 @@ kernel-compatible block sizes (8, 16, 32).
 
 from __future__ import annotations
 
+import mlx.core as mx
 import pytest
 
 from vllm_metal.metal_kernel_backend.attention_sdpa import (
@@ -15,6 +16,15 @@ from vllm_metal.metal_kernel_backend.attention_sdpa import (
     _build_block_tables,
     _pick_kernel_block_size,
 )
+
+
+def _pad_to_mx(raw: list[list[int]]) -> mx.array:
+    """Pad + convert to int32 MLX tensor — mirrors PagedAttentionContext.block_tables_mx."""
+    if not raw:
+        return mx.zeros((0, 0), dtype=mx.int32)
+    max_blocks = max(len(bt) for bt in raw)
+    padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw]
+    return mx.array(padded, dtype=mx.int32)
 
 
 class TestPickKernelBlockSize:
@@ -45,13 +55,13 @@ class TestBuildBlockTables:
     """Tests for _build_block_tables."""
 
     def test_no_translation_for_supported_sizes(self):
-        bt, kbs = _build_block_tables([[0, 1], [2]], 16)
+        bt, kbs = _build_block_tables(_pad_to_mx([[0, 1], [2]]), 16)
         assert kbs == 16
         assert bt.tolist() == [[0, 1], [2, 0]]
 
     def test_translation_single_block(self):
         # 544 -> 32, ratio=17
-        bt, kbs = _build_block_tables([[0], [1]], 544)
+        bt, kbs = _build_block_tables(_pad_to_mx([[0], [1]]), 544)
         assert kbs == 32
         ratio = 544 // 32  # 17
         # block 0 -> [0, 1, ..., 16]
@@ -60,7 +70,7 @@ class TestBuildBlockTables:
         assert bt[1].tolist() == list(range(ratio, 2 * ratio))
 
     def test_translation_multi_block(self):
-        bt, kbs = _build_block_tables([[0, 2]], 544)
+        bt, kbs = _build_block_tables(_pad_to_mx([[0, 2]]), 544)
         ratio = 544 // 32
         expected = list(range(0, ratio)) + list(range(2 * ratio, 3 * ratio))
         assert bt[0].tolist() == expected
@@ -69,7 +79,7 @@ class TestBuildBlockTables:
         # Unequal block table lengths — shorter rows are zero-padded before
         # expansion, so padding block_id=0 expands to [0, 1, …, ratio-1].
         # The kernel never reads these entries (bounded by context_len).
-        bt, kbs = _build_block_tables([[0, 1], [2]], 544)
+        bt, kbs = _build_block_tables(_pad_to_mx([[0, 1], [2]]), 544)
         ratio = 544 // 32
         assert bt.shape[0] == 2
         assert bt.shape[1] == 2 * ratio
@@ -79,16 +89,16 @@ class TestBuildBlockTables:
         assert row1[ratio:] == list(range(0, ratio))
 
     def test_output_shape(self):
-        bt, kbs = _build_block_tables([[0, 1, 2]], 544)
+        bt, kbs = _build_block_tables(_pad_to_mx([[0, 1, 2]]), 544)
         ratio = 544 // 32
         assert bt.shape == (1, 3 * ratio)
 
     def test_empty_block_tables(self):
-        bt, kbs = _build_block_tables([], 16)
+        bt, kbs = _build_block_tables(_pad_to_mx([]), 16)
         assert bt.shape == (0, 0)
         assert kbs == 16
 
     def test_empty_block_tables_hybrid(self):
-        bt, kbs = _build_block_tables([], 544)
+        bt, kbs = _build_block_tables(_pad_to_mx([]), 544)
         assert bt.shape == (0, 0)
         assert kbs == 544

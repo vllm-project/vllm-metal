@@ -71,10 +71,15 @@ def _pick_kernel_block_size(cache_block_size: int) -> int:
 
 
 def _build_block_tables(
-    raw_block_tables: list[list[int]],
+    padded_block_tables: mx.array,
     cache_block_size: int,
 ) -> tuple[mx.array, int]:
-    """Build kernel-compatible block tables, translating if necessary.
+    """Translate block tables to the kernel's block size, if needed.
+
+    Takes an already-padded ``[num_reqs, max_blocks]`` int32 MLX tensor built
+    once per forward pass (see ``PagedAttentionContext.block_tables_mx``).
+    When ``cache_block_size`` is already kernel-compatible this is a no-op
+    and returns the input unchanged.
 
     When ``cache_block_size`` exceeds the kernel's compiled block sizes,
     each vLLM block ``b`` is expanded into ``ratio`` kernel blocks
@@ -84,28 +89,22 @@ def _build_block_tables(
     Returns:
         (block_tables, kernel_block_size)
     """
-    if not raw_block_tables:
-        return mx.zeros((0, 0), dtype=mx.int32), cache_block_size
+    if padded_block_tables.size == 0:
+        return padded_block_tables, cache_block_size
 
     if cache_block_size in _KERNEL_BLOCK_SIZES:
         # Fast path — no translation needed.
-        max_blocks = max(len(bt) for bt in raw_block_tables)
-        padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
-        return mx.array(padded, dtype=mx.int32), cache_block_size
+        return padded_block_tables, cache_block_size
 
     # Hybrid path — translate large block_size to a kernel-compatible one.
     # Vectorized: each vLLM block b → [b*ratio, b*ratio+1, …, b*ratio+ratio-1].
     kernel_bs = _pick_kernel_block_size(cache_block_size)
     ratio = cache_block_size // kernel_bs
-
-    max_blocks = max(len(bt) for bt in raw_block_tables)
-    padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
-    bt_arr = mx.array(padded, dtype=mx.int32)  # [num_seqs, max_blocks]
     offsets = mx.arange(ratio, dtype=mx.int32)  # [ratio]
     # [num_seqs, max_blocks, 1] * ratio + [1, 1, ratio] → [num_seqs, max_blocks, ratio]
-    expanded = (bt_arr[:, :, None] * ratio + offsets[None, None, :]).reshape(
-        bt_arr.shape[0], -1
-    )
+    expanded = (
+        padded_block_tables[:, :, None] * ratio + offsets[None, None, :]
+    ).reshape(padded_block_tables.shape[0], -1)
     return expanded, kernel_bs
 
 
@@ -364,9 +363,10 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
-    seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
-    cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
+    # Cached MLX views — built once per forward pass, reused across all layers.
+    slot_mapping = ctx.slot_mapping_mx
+    seq_lens = ctx.context_lens_mx
+    cu_seqlens_q = ctx.cu_seqlens_mx
     max_seq_len = max(ctx.context_lens)
 
     # --- Block tables (with hybrid block-size translation) ---
@@ -376,7 +376,7 @@ def sdpa_forward(
     # it expands each vLLM block into multiple kernel blocks and returns the
     # kernel-compatible block_size.  The cache is reshaped to match (zero-copy).
     block_tables, kernel_block_size = _build_block_tables(
-        ctx.block_tables, kv_cache.block_size
+        ctx.block_tables_mx, kv_cache.block_size
     )
 
     if shared_kv is not None:
