@@ -112,6 +112,53 @@ class PagedAttentionContext:
             )
         return self._gdn_slot_mapping_mx
 
+    def _compute_slot_mapping_mx(self, block_size: int) -> None:
+        """Populate ``_slot_mapping_mx`` via vectorized MLX ops.
+
+        Upstream reference:
+        ``vllm/v1/worker/gpu/block_table.py::_compute_slot_mappings_kernel``
+        (Triton, ~line 213). Upstream runs the same math on-GPU per step;
+        we express it via MLX broadcast/indexing so MLX's scheduler runs
+        it on Metal. Avoids the per-token Python loop that
+        ``prepare_unified`` would otherwise execute for every prefill token.
+
+        MLX lacks ``searchsorted`` as of 0.31.x, so ``per_token_req`` is
+        derived via a broadcast compare + sum instead of the single
+        ``tl.load`` upstream does from ``idx_mapping``. Equivalent result.
+        """
+        if (
+            self.cu_seqlens is None
+            or not self.block_tables
+            or self.cu_seqlens[-1] == 0
+        ):
+            self._slot_mapping_mx = mx.zeros((0,), dtype=mx.int64)
+            return
+
+        total_tokens = self.cu_seqlens[-1]
+        cu = self.cu_seqlens_mx                         # [num_reqs + 1]
+        offs = mx.array(self.offsets, dtype=mx.int32)   # [num_reqs]
+        bt = self.block_tables_mx                       # [num_reqs, max_blocks]
+
+        positions = mx.arange(total_tokens, dtype=mx.int32)
+        cu_starts = cu[:-1]                             # [num_reqs]
+        # per_token_req: index of the request each packed token belongs to.
+        # Upstream reads this directly from idx_mapping; we count how many
+        # cu_seqlens boundaries each position has crossed.
+        per_token_req = (
+            (positions[:, None] >= cu_starts[None, :]).sum(axis=1) - 1
+        )
+        # Absolute sequence position within the request:
+        #   batch_pos − req_start + rope_offset
+        local_pos = (
+            positions - cu_starts[per_token_req] + offs[per_token_req]
+        )
+        block_indices = local_pos // block_size
+        block_offsets = local_pos % block_size
+        block_numbers = bt[per_token_req, block_indices]
+        self._slot_mapping_mx = (
+            block_numbers * block_size + block_offsets
+        ).astype(mx.int64)
+
 
 def set_context(ctx: PagedAttentionContext) -> None:
     _thread_local.paged_ctx = ctx
@@ -231,40 +278,35 @@ def prepare_unified(
             chunk (0 for a fresh prefill, >0 for continuation chunks).
         block_size: tokens per KV cache block.
     """
-    slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
     block_tables: list[list[int]] = []
     context_lens: list[int] = []
     offsets: list[int] = []
 
-    # Decode requests first (1 token each)
+    # Decode requests first (1 token each).
     for block_ids, seq_len in decode_requests:
-        new_pos = seq_len
-        block_idx = block_ids[new_pos // block_size]
-        slot = block_idx * block_size + (new_pos % block_size)
-        slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + 1)
         block_tables.append(block_ids)
         context_lens.append(seq_len + 1)  # including new token
         offsets.append(seq_len)  # RoPE position
 
-    # Prefill requests (variable tokens each, starting at start_pos)
+    # Prefill requests (variable tokens each, starting at start_pos).
     for block_ids, num_tokens, start_pos in prefill_requests:
-        for pos in range(start_pos, start_pos + num_tokens):
-            block_idx = block_ids[pos // block_size]
-            slot = block_idx * block_size + (pos % block_size)
-            slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
         block_tables.append(block_ids)
         context_lens.append(start_pos + num_tokens)
         offsets.append(start_pos)
 
-    set_context(
-        PagedAttentionContext(
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            cu_seqlens=cu_seqlens,
-            offsets=offsets,
-        )
+    # slot_mapping is computed via vectorized MLX ops in
+    # ``_compute_slot_mapping_mx`` — see upstream
+    # ``vllm/v1/worker/gpu/block_table.py::_compute_slot_mappings_kernel``.
+    # The Python list stays empty; consumers read ``ctx.slot_mapping_mx``.
+    ctx = PagedAttentionContext(
+        slot_mapping=[],
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens=cu_seqlens,
+        offsets=offsets,
     )
+    ctx._compute_slot_mapping_mx(block_size)
+    set_context(ctx)
