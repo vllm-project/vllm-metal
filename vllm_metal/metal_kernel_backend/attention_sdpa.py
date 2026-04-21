@@ -502,7 +502,7 @@ def sdpa_forward(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
-            kv_cache.num_kv_heads,
+            cache_kv_heads,
             inner.scale,
             0.0,  # softcap (0 = disabled)
             block_tables,
@@ -525,7 +525,7 @@ def sdpa_forward(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
-            kv_cache.num_kv_heads,
+            cache_kv_heads,
             inner.scale,
             0.0,  # softcap (0 = disabled)
             block_tables,

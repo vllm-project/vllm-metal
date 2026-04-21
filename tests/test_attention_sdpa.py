@@ -4,6 +4,7 @@
 Covers:
 - ``pad_qkv_to_cache_head_dim`` / ``truncate_padded_output`` pure helpers.
 - ``prepare_sdpa_qkv`` branches (K-eq-V fallback, v_norm, YOCO shared_kv).
+- ``sdpa_forward`` propagation of per-layer ``num_kv_heads`` to the kernel.
 
 The ``prepare_sdpa_qkv`` tests use minimal fake attention modules rather
 than real mlx_lm Attention modules so they stay fast and deterministic.
@@ -12,15 +13,19 @@ not here.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
 
+import vllm_metal.metal_kernel_backend.attention_sdpa as sdpa_mod
 from vllm_metal.metal_kernel_backend.attention_sdpa import (
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
+    sdpa_forward,
     truncate_padded_output,
 )
+from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Test fixtures (shared shapes) ===
@@ -317,3 +322,71 @@ class TestPrepareSDPAQKV:
                 _N_KV_HEADS,
                 shared_kv=(shared_k, shared_v),
             )
+
+
+class TestSDPAForward:
+    """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    def test_kernel_receives_per_layer_kv_heads(self) -> None:
+        """Heterogeneous layers must pass their concrete KV-head count.
+
+        Regression guard for Gemma4-style mixed KV layouts: ``sdpa_forward``
+        resolves the layer's actual cache shape from ``kv_heads_per_layer``
+        and must pass that same count to ``paged_attention_primitive``.
+        """
+        actual_kv_heads = 1
+        cache = MetalPagedKVCache(
+            num_layers=2,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+            kv_heads_per_layer=[_N_KV_HEADS, actual_kv_heads],
+            head_dim_per_layer=[_HEAD_DIM, _HEAD_DIM],
+        )
+
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=actual_kv_heads,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, actual_kv_heads, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, actual_kv_heads, _SEQ_LEN, _HEAD_DIM))
+        kv_for_sharing = (keys, values)
+
+        captured: dict[str, int] = {}
+
+        class _FakeOps:
+            def paged_attention_primitive(
+                self,
+                _query,
+                _key_cache,
+                _value_cache,
+                num_kv_heads,
+                *_args,
+                **_kwargs,
+            ) -> None:
+                captured["num_kv_heads"] = num_kv_heads
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, kv_for_sharing),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+
+        assert captured["num_kv_heads"] == actual_kv_heads
