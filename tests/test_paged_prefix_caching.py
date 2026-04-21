@@ -545,7 +545,7 @@ class TestPrepareUnifiedSlotMapping:
 
         assert len(captured) == 1
         ctx = captured[0]
-        assert ctx.slot_mapping_mx.tolist() == [0, 1, 2, 3]
+        assert ctx.slot_mapping == [0, 1, 2, 3]
         assert ctx.offsets == [0]
         assert ctx.context_lens == [4]
 
@@ -580,6 +580,6 @@ class TestPrepareUnifiedSlotMapping:
 
         assert len(captured) == 1
         ctx = captured[0]
-        assert ctx.slot_mapping_mx.tolist() == [2, 3]  # positions 2-3 in block 0
+        assert ctx.slot_mapping == [2, 3]  # positions 2-3 in block 0
         assert ctx.offsets == [2]
         assert ctx.context_lens == [4]  # start_pos + num_tokens = 2 + 2
