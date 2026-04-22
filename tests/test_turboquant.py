@@ -41,8 +41,8 @@ import torch
 from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.turboquant import (
-    _FWHT_SUPPORTED_DIMS,
     BLOCK_SIZE,
+    FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     fwht,
@@ -354,14 +354,14 @@ def section_python_roundtrip_mse() -> int:
 def _fill_cache(cache, k_packed, v_packed, k_scale, v_scale, k_zero, slot):
     """Scatter-write packed K/V/scales/zero into the paged cache at `slot`."""
     layer = 0
-    nkv = U_NUM_KV_HEADS
-    sg = U_HEAD_DIM // 32
+    num_kv_heads = k_packed.shape[1]
+    scale_group_count = k_scale.shape[-1]
 
-    flat_k = cache.key_caches[layer].reshape(-1, nkv, cache.k_packed_dim)
+    flat_k = cache.key_caches[layer].reshape(-1, num_kv_heads, cache.k_packed_dim)
     flat_k[slot] = k_packed
     cache.key_caches[layer] = flat_k.reshape(cache.key_caches[layer].shape)
 
-    flat_v = cache.value_caches[layer].reshape(-1, nkv, cache.v_packed_dim)
+    flat_v = cache.value_caches[layer].reshape(-1, num_kv_heads, cache.v_packed_dim)
     flat_v[slot] = v_packed
     cache.value_caches[layer] = flat_v.reshape(cache.value_caches[layer].shape)
 
@@ -371,7 +371,7 @@ def _fill_cache(cache, k_packed, v_packed, k_scale, v_scale, k_zero, slot):
         ("key_zero_caches", k_zero),
     ]:
         arr = getattr(cache, attr)[layer]
-        flat = arr.reshape(-1, nkv, sg)
+        flat = arr.reshape(-1, num_kv_heads, scale_group_count)
         flat[slot] = data
         getattr(cache, attr)[layer] = flat.reshape(arr.shape)
 
@@ -1770,7 +1770,7 @@ def main() -> int:
 # TurboQuant's FWHT rotation uses random signs generated Python-side via
 # ``mx.random.randint(0, 2, shape=(N,), key=mx.random.key(42))``. The Metal
 # kernel stores byte-identical copies as compile-time constants
-# (``FWHT_SIGNS_64`` / ``_128`` / ``_256`` in ``turboquant.metal``).  If
+# (``FWHT_SIGNS_64`` / ``_128`` / ``_256`` / ``_512`` in ``turboquant.metal``).  If
 # either side drifts — different RNG key, MLX PRNG change, or manual edits
 # to the Metal tables — encode/decode silently disagree and produce garbage.
 
@@ -1811,7 +1811,7 @@ def _python_signs(head_size: int) -> np.ndarray:
     return np.asarray(signs)
 
 
-@pytest.mark.parametrize("head_size", _FWHT_SUPPORTED_DIMS)
+@pytest.mark.parametrize("head_size", FWHT_SUPPORTED_HEAD_DIMS)
 def test_metal_sign_table_matches_python_rng(head_size: int) -> None:
     """Metal constant table must equal the Python-generated signs element-wise."""
     metal_signs = _parse_metal_sign_table(head_size)
@@ -1828,7 +1828,7 @@ def test_metal_sign_table_matches_python_rng(head_size: int) -> None:
     )
 
 
-@pytest.mark.parametrize("head_size", _FWHT_SUPPORTED_DIMS)
+@pytest.mark.parametrize("head_size", FWHT_SUPPORTED_HEAD_DIMS)
 def test_fwht_roundtrips_exactly_with_current_signs(head_size: int) -> None:
     """Sanity check: encode then decode recovers the input (signs cancel)."""
     rng = np.random.default_rng(seed=0)
@@ -1849,6 +1849,160 @@ def test_fwht_roundtrips_exactly_with_current_signs(head_size: int) -> None:
     )
 
 
+def test_turboquant_cache_accepts_head_dim_512() -> None:
+    """Regression: TurboQuant cache allocation should accept 512-dim heads."""
+    num_layers = 1
+    num_blocks = 2
+    block_size = 16
+    num_kv_heads = 2
+    head_dim = 512
+    k_quant = "q8_0"
+    v_quant = "q3_0"
+    key_bits = QUANT_PARAMS[k_quant]["bits"]
+    value_bits = V_QUANT_PARAMS[v_quant]["bits"]
+    scale_group_count = head_dim // BLOCK_SIZE
+    cache = MetalPagedKVCache(
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant=k_quant,
+        v_quant=v_quant,
+    )
+
+    assert cache.k_packed_dim == packed_dim(head_dim, key_bits)
+    assert cache.v_packed_dim == packed_dim(head_dim, value_bits)
+    assert cache.key_caches[0].shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        cache.k_packed_dim,
+    )
+    assert cache.value_caches[0].shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        cache.v_packed_dim,
+    )
+    assert cache.key_scale_caches[0].shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        scale_group_count,
+    )
+    assert cache.value_scale_caches[0].shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        scale_group_count,
+    )
+    assert cache.key_zero_caches[0].shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        scale_group_count,
+    )
+
+
+def test_turboquant_512_head_dim_matches_python_reference() -> None:
+    """The 512-dim TurboQuant kernel path should match Python dequant attention."""
+    num_blocks = 4
+    block_size = 16
+    num_tokens = block_size
+    num_kv_heads = 2
+    num_query_heads = 4
+    head_dim = 512
+    cache = MetalPagedKVCache(
+        num_layers=1,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant="q8_0",
+        v_quant="q3_0",
+    )
+    k = mx.random.normal(
+        shape=(num_tokens, num_kv_heads, head_dim), key=mx.random.key(11)
+    ).astype(mx.float16)
+    v = mx.random.normal(
+        shape=(num_tokens, num_kv_heads, head_dim), key=mx.random.key(12)
+    ).astype(mx.float16)
+    q = mx.random.normal(
+        shape=(1, num_query_heads, head_dim), key=mx.random.key(13)
+    ).astype(mx.float16)
+    mx.eval(k, v, q)
+
+    (k_packed, k_scale, k_zero), (v_packed, v_scale) = turbo_quant_encode(k, v, "q8_0")
+    mx.eval(k_packed, k_scale, k_zero, v_packed, v_scale)
+
+    k_ref, v_ref = turbo_quant_decode(
+        (k_packed, k_scale, k_zero),
+        (v_packed, v_scale),
+        output_dtype=mx.float16,
+        key_quant_type="q8_0",
+    )
+    mx.eval(k_ref, v_ref)
+
+    slot = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    mx.eval(slot)
+    _fill_cache(cache, k_packed, v_packed, k_scale, v_scale, k_zero, slot)
+    mx.eval(
+        cache.key_caches[0],
+        cache.value_caches[0],
+        cache.key_scale_caches[0],
+        cache.value_scale_caches[0],
+        cache.key_zero_caches[0],
+    )
+
+    block_tables = mx.array([[0]], dtype=mx.int32)
+    seq_lens = mx.array([num_tokens], dtype=mx.int32)
+    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
+    out_metal = mx.zeros((1, num_query_heads, head_dim), dtype=mx.float16)
+    mx.eval(block_tables, seq_lens, cu_seqlens_q, out_metal)
+
+    attn_scale = 1.0 / math.sqrt(head_dim)
+    v_centroids = get_v_centroids(cache.v_bits)
+    ops = get_ops()
+    ops.paged_attention_primitive(
+        q,
+        cache.key_caches[0],
+        cache.value_caches[0],
+        num_kv_heads,
+        attn_scale,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        block_size,
+        num_tokens,
+        -1,
+        out_metal,
+        key_scale_cache=cache.key_scale_caches[0],
+        value_scale_cache=cache.value_scale_caches[0],
+        key_zero_cache=cache.key_zero_caches[0],
+        v_centroids=v_centroids,
+        use_turboquant=True,
+        quant_type="q8_0",
+        v_bits=cache.v_bits,
+    )
+    mx.eval(out_metal)
+
+    out_ref = _python_attention_reference(q, k_ref, v_ref, attn_scale)
+    mx.eval(out_ref)
+
+    diff = out_metal.astype(mx.float32) - out_ref.astype(mx.float32)
+    mean_abs_diff = mx.mean(mx.abs(diff)).item()
+    ref_mean_abs = mx.mean(mx.abs(out_ref.astype(mx.float32))).item() + 1e-8
+    relative_error_percent = mean_abs_diff / ref_mean_abs * 100.0
+
+    assert relative_error_percent < 5.0
+
+
 # --- TurboQuantAttentionSpec (replacement for head_size_v hack) ------------
 #
 # ``TurboQuantAttentionSpec`` subclasses ``FullAttentionSpec`` and overrides
@@ -1863,6 +2017,7 @@ _TQ_SPEC_CONFIGS = [
     ("default_q8_q3", 16, 4, 128, "q8_0", "q3_0"),
     ("q4_q3_gqa", 16, 8, 128, "q4_0", "q3_0"),
     ("wide_head_256", 16, 2, 256, "q8_0", "q3_0"),
+    ("wide_head_512", 16, 2, 512, "q8_0", "q3_0"),
     ("narrow_head_64", 16, 8, 64, "q8_0", "q3_0"),
     ("aggressive_2b", 16, 8, 128, "int2", "q2_0"),
 ]
