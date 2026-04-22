@@ -363,7 +363,6 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    # Cached MLX views — built once per forward pass, reused across all layers.
     slot_mapping = ctx.slot_mapping_mx
     seq_lens = ctx.context_lens_mx
     cu_seqlens_q = ctx.cu_seqlens_mx

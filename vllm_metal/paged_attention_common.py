@@ -54,9 +54,6 @@ class PagedAttentionContext:
     # Populated by model_runner for hybrid models; None for non-hybrid.
     gdn_slot_mapping: list[int] | None = None
 
-    # Lazy MLX views — converted once per forward pass on first access, then
-    # reused across all attention layers. Eliminates the N-layer redundancy of
-    # re-converting the same Python lists on every attention wrapper call.
     _slot_mapping_mx: mx.array | None = field(default=None, init=False, repr=False)
     _block_tables_mx: mx.array | None = field(default=None, init=False, repr=False)
     _context_lens_mx: mx.array | None = field(default=None, init=False, repr=False)
@@ -75,9 +72,8 @@ class PagedAttentionContext:
     def block_tables_mx(self) -> mx.array:
         """Dense padded [num_reqs, max_blocks] int32 tensor.
 
-        Rows shorter than max_blocks are right-padded with 0. Callers that need
-        a per-request length should read from ``context_lens`` or derive from
-        ``block_tables``.
+        Rows shorter than max_blocks are right-padded with 0; kernels mask
+        off the tail via the per-request length array.
         """
         if self._block_tables_mx is None:
             if not self.block_tables:

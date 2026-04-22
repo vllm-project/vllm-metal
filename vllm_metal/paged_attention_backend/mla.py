@@ -112,8 +112,6 @@ class MLAPagedAttentionWrapper(nn.Module):
             latent_cache.num_blocks, latent_cache.block_size, latent_cache.latent_dim
         )
 
-        # Dense padded block tables, built once per forward pass and reused
-        # across layers (see PagedAttentionContext.block_tables_mx).
         block_tables_mx = ctx.block_tables_mx
 
         outputs = []
