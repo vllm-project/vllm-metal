@@ -35,6 +35,44 @@ static std::string paged_attention_source_;
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
+// MLX 0.31.2 moved stream-scoped encoder/temporary management from
+// ``metal::Device`` onto ``metal::CommandEncoder`` plus a free
+// ``metal::get_command_encoder(Stream)`` helper.  Keep a tiny shim here so the
+// paged-kernel bridge compiles against both 0.31.1 and 0.31.2.
+#if MLX_VERSION_NUMERIC >= 31002
+static metal::CommandEncoder& get_command_encoder_compat(
+    metal::Device& d,
+    Stream s) {
+  (void)d;
+  return metal::get_command_encoder(s);
+}
+
+static void add_temporary_compat(
+    metal::CommandEncoder& enc,
+    const array& arr,
+    metal::Device& d,
+    Stream s) {
+  (void)d;
+  (void)s;
+  enc.add_temporary(arr);
+}
+#else
+static metal::CommandEncoder& get_command_encoder_compat(
+    metal::Device& d,
+    Stream s) {
+  return d.get_command_encoder(s.index);
+}
+
+static void add_temporary_compat(
+    metal::CommandEncoder& enc,
+    const array& arr,
+    metal::Device& d,
+    Stream s) {
+  (void)enc;
+  d.add_temporary(arr, s.index);
+}
+#endif
+
 void init_libraries(
     const std::string& reshape_src,
     const std::string& paged_attn_src) {
@@ -127,7 +165,7 @@ static void dispatch_reshape_and_cache(
       kname, lib, kname,
       {{&use_fp8, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_input_array(key, 0);
   enc.set_input_array(value, 1);
@@ -146,11 +184,11 @@ static void dispatch_reshape_and_cache(
       MTL::Size::Make(tpg, 1, 1));
 
   if (!from_primitive) {
-    d.add_temporary(key, s.index);
-    d.add_temporary(value, s.index);
-    d.add_temporary(key_cache, s.index);
-    d.add_temporary(value_cache, s.index);
-    d.add_temporary(slot_mapping, s.index);
+    add_temporary_compat(enc, key, d, s);
+    add_temporary_compat(enc, value, d, s);
+    add_temporary_compat(enc, key_cache, d, s);
+    add_temporary_compat(enc, value_cache, d, s);
+    add_temporary_compat(enc, slot_mapping, d, s);
   }
 }
 
@@ -227,7 +265,7 @@ void paged_attention_v1_impl(
   size_t shmem = static_cast<size_t>(std::max(logits_bytes, outputs_bytes));
 
   // Dispatch
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
@@ -268,12 +306,12 @@ void paged_attention_v1_impl(
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   // Keep ALL referenced arrays alive until the command buffer completes
-  d.add_temporary(out, s.index);
-  d.add_temporary(query, s.index);
-  d.add_temporary(key_cache, s.index);
-  d.add_temporary(value_cache, s.index);
-  d.add_temporary(block_tables, s.index);
-  d.add_temporary(seq_lens, s.index);
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, query, d, s);
+  add_temporary_compat(enc, key_cache, d, s);
+  add_temporary_compat(enc, value_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, seq_lens, d, s);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +392,7 @@ static void dispatch_paged_attention_v2_online(
   }
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
@@ -406,18 +444,18 @@ static void dispatch_paged_attention_v2_online(
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   if (!from_primitive) {
-    d.add_temporary(out, s.index);
-    d.add_temporary(query, s.index);
-    d.add_temporary(key_cache, s.index);
-    d.add_temporary(value_cache, s.index);
-    d.add_temporary(block_tables, s.index);
-    d.add_temporary(seq_lens, s.index);
-    d.add_temporary(cu_seqlens_q, s.index);
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, query, d, s);
+    add_temporary_compat(enc, key_cache, d, s);
+    add_temporary_compat(enc, value_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, seq_lens, d, s);
+    add_temporary_compat(enc, cu_seqlens_q, d, s);
     if (use_turboquant) {
-      d.add_temporary(*key_scale_cache, s.index);
-      d.add_temporary(*value_scale_cache, s.index);
-      d.add_temporary(*key_zero_cache, s.index);
-      d.add_temporary(*v_centroids, s.index);
+      add_temporary_compat(enc, *key_scale_cache, d, s);
+      add_temporary_compat(enc, *value_scale_cache, d, s);
+      add_temporary_compat(enc, *key_zero_cache, d, s);
+      add_temporary_compat(enc, *v_centroids, d, s);
     }
   }
 }
@@ -519,7 +557,7 @@ void paged_attention_v2_online_impl_common(
                     * static_cast<int>(sizeof(float));
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
@@ -600,20 +638,20 @@ void paged_attention_v2_online_impl_common(
         MTL::Size::Make(NUM_THREADS, 1, 1));
   }
 
-  d.add_temporary(out, s.index);
-  d.add_temporary(query, s.index);
-  d.add_temporary(key_cache, s.index);
-  d.add_temporary(value_cache, s.index);
-  d.add_temporary(block_tables, s.index);
-  d.add_temporary(seq_lens, s.index);
-  d.add_temporary(cu_seqlens_q, s.index);
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, query, d, s);
+  add_temporary_compat(enc, key_cache, d, s);
+  add_temporary_compat(enc, value_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, seq_lens, d, s);
+  add_temporary_compat(enc, cu_seqlens_q, d, s);
   if (use_partitioning) {
-    d.add_temporary(*exp_sums, s.index);
-    d.add_temporary(*max_logits, s.index);
-    d.add_temporary(*tmp_out, s.index);
+    add_temporary_compat(enc, *exp_sums, d, s);
+    add_temporary_compat(enc, *max_logits, d, s);
+    add_temporary_compat(enc, *tmp_out, d, s);
   }
   if (use_sinks) {
-    d.add_temporary(*sinks, s.index);
+    add_temporary_compat(enc, *sinks, d, s);
   }
 }
 
@@ -841,7 +879,7 @@ void gdn_linear_attention_impl(
   auto* lib = d.get_library("gdn_kern");
   auto* kernel = d.get_kernel(kname, lib, kname, {});
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
 
   enc.set_input_array(q, 0);
@@ -865,15 +903,15 @@ void gdn_linear_attention_impl(
       MTL::Size::Make(Dv, 1, num_requests * Hv),
       MTL::Size::Make(32, 1, 1));
 
-  d.add_temporary(q, s.index);
-  d.add_temporary(k, s.index);
-  d.add_temporary(v, s.index);
-  d.add_temporary(g, s.index);
-  d.add_temporary(beta, s.index);
-  d.add_temporary(state_pool, s.index);
-  d.add_temporary(cu_seqlens, s.index);
-  d.add_temporary(slot_mapping, s.index);
-  d.add_temporary(y, s.index);
+  add_temporary_compat(enc, q, d, s);
+  add_temporary_compat(enc, k, d, s);
+  add_temporary_compat(enc, v, d, s);
+  add_temporary_compat(enc, g, d, s);
+  add_temporary_compat(enc, beta, d, s);
+  add_temporary_compat(enc, state_pool, d, s);
+  add_temporary_compat(enc, cu_seqlens, d, s);
+  add_temporary_compat(enc, slot_mapping, d, s);
+  add_temporary_compat(enc, y, d, s);
 }
 
 // ---------------------------------------------------------------------------
