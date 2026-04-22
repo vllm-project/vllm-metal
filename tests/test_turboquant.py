@@ -33,12 +33,15 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 import torch
 
+from tests.stub_runner import make_stub_runner
+from vllm_metal.config import get_config, reset_config
 from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.turboquant import (
@@ -2002,6 +2005,39 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     relative_error_percent = mean_abs_diff / ref_mean_abs * 100.0
 
     assert relative_error_percent < 5.0
+
+
+def test_turboquant_per_layer_shapes_raise_early() -> None:
+    """TurboQuant must keep rejecting per-layer KV shapes until PR2 lands."""
+    reset_config()
+    config = get_config()
+    config.turboquant = True
+    config.k_quant = "q8_0"
+    config.v_quant = "q3_0"
+
+    try:
+        runner = make_stub_runner(
+            num_layers=2,
+            num_kv_cache_layers=2,
+            num_kv_heads=16,
+            head_dim=256,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=SimpleNamespace(block_size=16),
+            kv_heads_per_layer=[16, 4],
+            head_dim_per_layer=[256, 512],
+        )
+
+        with pytest.raises(
+            NotImplementedError, match="TurboQuant with per-layer KV shapes"
+        ):
+            runner.get_kv_cache_spec()
+
+        with pytest.raises(
+            NotImplementedError, match="TurboQuant with per-layer KV shapes"
+        ):
+            runner.build_paged_attention_backend(block_size=16)
+    finally:
+        reset_config()
 
 
 # --- TurboQuantAttentionSpec (replacement for head_size_v hack) ------------
