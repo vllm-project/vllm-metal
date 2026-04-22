@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TurboQuant quantization helpers for Metal paged attention.
+
+Provides the Python-side encode/decode path for TurboQuant KV compression,
+including key/value quantization metadata, bit packing helpers, and the FWHT
+rotation/sign tables used by the Metal dequantization kernels.
+"""
+
 import mlx.core as mx
 from vllm.logger import init_logger
 
