@@ -500,6 +500,10 @@ class ModelCachePolicy:
             )
         if kv_heads is None:
             return
+        if get_config().turboquant:
+            raise NotImplementedError(
+                "TurboQuant with per-layer KV shapes is not yet supported."
+            )
         if self._runner.is_hybrid:
             raise NotImplementedError(
                 "Per-layer KV shapes with hybrid models require "

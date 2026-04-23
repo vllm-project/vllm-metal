@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TurboQuant quantization helpers for Metal paged attention.
+
+Provides the Python-side encode/decode path for TurboQuant KV compression,
+including key/value quantization metadata, bit packing helpers, and the FWHT
+rotation/sign tables used by the Metal dequantization kernels.
+"""
+
 import mlx.core as mx
 from vllm.logger import init_logger
 
@@ -78,14 +86,14 @@ def searchsorted(boundaries, x):
     return (x[..., None] > boundaries).sum(axis=-1)
 
 
-_FWHT_SUPPORTED_DIMS = (64, 128, 256)
+FWHT_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
 
 
 def fwht(x: mx.array, encode: bool) -> mx.array:
     dim = x.shape[-1]
-    if dim not in _FWHT_SUPPORTED_DIMS:
+    if dim not in FWHT_SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            f"FWHT only supports head_dim in {_FWHT_SUPPORTED_DIMS}, got {dim}. "
+            f"FWHT only supports head_dim in {FWHT_SUPPORTED_HEAD_DIMS}, got {dim}. "
             "The Metal kernel has hardcoded sign tables only for these sizes."
         )
     sign01 = mx.random.randint(0, 2, shape=(dim,), key=_RNG_KEY)

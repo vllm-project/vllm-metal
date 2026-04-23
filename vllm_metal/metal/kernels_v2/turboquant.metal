@@ -87,8 +87,8 @@ constant float FWHT_SIGNS_128[128] = {
 };
 
 constant float FWHT_SIGNS_256[256] = {
-     1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,
-     1.f, -1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,
+    1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,
+    1.f, -1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,
     -1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f,
     -1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
     -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
@@ -103,6 +103,41 @@ constant float FWHT_SIGNS_256[256] = {
      1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,
     -1.f, -1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,
     -1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f
+};
+
+constant float FWHT_SIGNS_512[512] = {
+    -1.f,  1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f,
+     1.f, -1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f,
+    -1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f, -1.f,
+    -1.f, -1.f,  1.f, -1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,
+    -1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,
+    -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f, -1.f,
+    -1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f,
+     1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,
+    -1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f, -1.f, -1.f,  1.f,
+    -1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f,
+    -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
+    -1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f, -1.f,
+     1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f,
+     1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,
+     1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f,
+     1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f,
+     1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f, -1.f, -1.f, -1.f,  1.f,  1.f,
+    -1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
+     1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
+     1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f,
+    -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,
+     1.f,  1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f,  1.f,  1.f,
+    -1.f, -1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f, -1.f, -1.f,  1.f,
+    -1.f,  1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,
+     1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f,
+     1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f,  1.f, -1.f,
+     1.f, -1.f,  1.f,  1.f,  1.f,  1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f,  1.f,  1.f, -1.f,
+    -1.f, -1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f, -1.f,
+    -1.f, -1.f, -1.f, -1.f,  1.f, -1.f, -1.f, -1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f,
+     1.f, -1.f, -1.f, -1.f,  1.f,  1.f,  1.f,  1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,
+    -1.f,  1.f, -1.f, -1.f,  1.f, -1.f, -1.f,  1.f, -1.f,  1.f, -1.f, -1.f, -1.f,  1.f,  1.f, -1.f,
+    -1.f, -1.f,  1.f, -1.f,  1.f, -1.f, -1.f,  1.f, -1.f,  1.f,  1.f, -1.f,  1.f, -1.f,  1.f,  1.f
 };
 
 // ========================================== K dequantization
@@ -135,7 +170,7 @@ inline float tq_dequant_v_centroid(uchar index, float scale, const device float*
 
 // ========================================== FWHT sign lookup
 
-// FWHT sign lookup by HEAD_SIZE — supported for 64, 128, and 256.
+// FWHT sign lookup by HEAD_SIZE — supported for 64, 128, 256, and 512.
 // The primary template returns 1.f and is never called for TQ-enabled kernels
 // (runtime guard in MetalPagedKVCache enforces valid sizes), but must exist
 // to satisfy the compiler for non-TQ specializations of other head sizes.
@@ -143,15 +178,29 @@ template<int HEAD_SIZE> inline float get_fwht_sign(uint idx) { return 1.f; }
 template<> inline float get_fwht_sign<64>(uint idx)  { return FWHT_SIGNS_64[idx]; }
 template<> inline float get_fwht_sign<128>(uint idx) { return FWHT_SIGNS_128[idx]; }
 template<> inline float get_fwht_sign<256>(uint idx) { return FWHT_SIGNS_256[idx]; }
+template<> inline float get_fwht_sign<512>(uint idx) { return FWHT_SIGNS_512[idx]; }
+
+template<int HEAD_SIZE> inline constexpr int fwht_num_stages() { return 0; }
+template<> inline constexpr int fwht_num_stages<64>() { return 6; }
+template<> inline constexpr int fwht_num_stages<128>() { return 7; }
+template<> inline constexpr int fwht_num_stages<256>() { return 8; }
+template<> inline constexpr int fwht_num_stages<512>() { return 9; }
+
+template<int HEAD_SIZE> inline constexpr float fwht_inv_sqrt_n() { return 1.f; }
+template<> inline constexpr float fwht_inv_sqrt_n<64>() { return 0.125f; }
+template<> inline constexpr float fwht_inv_sqrt_n<128>() { return 0.08838834764831843f; }
+template<> inline constexpr float fwht_inv_sqrt_n<256>() { return 0.0625f; }
+template<> inline constexpr float fwht_inv_sqrt_n<512>() { return 0.04419417382415922f; }
 
 // ========================================== Inverse FWHT
 
 // In-place inverse FWHT for HEAD_SIZE elements using threadgroup memory.
-// Supports HEAD_SIZE = 64 (6 stages), 128 (7 stages), or 256 (8 stages).
+// Supports HEAD_SIZE = 64 (6 stages), 128 (7 stages), 256 (8 stages),
+// or 512 (9 stages).
 // Each SIMD lane owns HEAD_SIZE/32 elements (lane i → indices i, i+32, i+64, ...).
 template<int HEAD_SIZE>
 inline void threadgroup_inverse_fwht(threadgroup float* fwht_buf, uint lane) {
-    constexpr int NUM_STAGES = (HEAD_SIZE == 64) ? 6 : (HEAD_SIZE == 128) ? 7 : 8;
+    constexpr int NUM_STAGES = fwht_num_stages<HEAD_SIZE>();
     constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
     float vals[ELEMS_PER_LANE];
 
@@ -189,7 +238,7 @@ inline void threadgroup_inverse_fwht(threadgroup float* fwht_buf, uint lane) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     // Normalisation: 1/sqrt(HEAD_SIZE) + random sign flip
-    constexpr float INV_SQRT_N = (HEAD_SIZE == 64) ? 0.125f : (HEAD_SIZE == 128) ? 0.08838834764831843f : 0.0625f;
+    constexpr float INV_SQRT_N = fwht_inv_sqrt_n<HEAD_SIZE>();
     #pragma unroll
     for (int e = 0; e < ELEMS_PER_LANE; e++) {
         uint idx = lane + e * 32;

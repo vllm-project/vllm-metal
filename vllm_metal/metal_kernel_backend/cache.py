@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.metal_kernel_backend.turboquant import (
     BLOCK_SIZE,
+    FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     packed_dim,
@@ -86,9 +87,13 @@ class MetalPagedKVCache:
                 raise ValueError(
                     f"TurboQuant requires head_dim divisible by 32, got {head_dim}"
                 )
-            if head_dim not in (64, 128, 256):
+            if head_dim not in FWHT_SUPPORTED_HEAD_DIMS:
+                supported_head_dims = ", ".join(
+                    str(dim) for dim in FWHT_SUPPORTED_HEAD_DIMS
+                )
                 raise ValueError(
-                    f"TurboQuant V FWHT only supports head_dim 64, 128, or 256, got {head_dim}"
+                    "TurboQuant V FWHT only supports "
+                    f"head_dim in ({supported_head_dims}), got {head_dim}"
                 )
 
         self.k_size = QUANT_PARAMS[k_quant]["dtype"] if turboquant else None
