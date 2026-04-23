@@ -87,7 +87,6 @@ def searchsorted(boundaries, x):
 
 
 FWHT_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
-_FWHT_SUPPORTED_DIMS = FWHT_SUPPORTED_HEAD_DIMS
 
 
 def fwht(x: mx.array, encode: bool) -> mx.array:
