@@ -11,11 +11,11 @@ import pytest
 import torch
 
 import vllm_metal.envs as envs
+from tests.stub_runner import make_stub_runner
 from vllm_metal.config import reset_config
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
-from tests.stub_runner import make_stub_runner
 
 _TEXT_MODEL_ARGS = {
     "vocab_size": 32000,
