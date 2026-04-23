@@ -394,6 +394,7 @@ class TestModelLifecycle:
                     **_TEXT_MODEL_ARGS,
                 )
             ),
+            is_vlm=True,
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
