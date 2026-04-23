@@ -62,7 +62,7 @@ class _RaisingLinear:
 
 def _make_ctx(seq_len: int) -> PagedAttentionContext:
     """Return a minimal paged context sufficient for apply_packed_rope."""
-    return PagedAttentionContext(
+    return PagedAttentionContext.from_lists(
         slot_mapping=list(range(seq_len)),
         block_tables=[[0]],
         context_lens=[seq_len],

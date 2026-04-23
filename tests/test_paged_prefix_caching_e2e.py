@@ -76,10 +76,10 @@ def _run_prefix_cache_correctness() -> None:
     seen_start_pos: list[int] = []
     orig_prepare = pac.prepare_unified
 
-    def patched_prepare(decode_requests, prefill_requests, block_size):
+    def patched_prepare(decode_requests, prefill_requests, block_size, buffers=None):
         for _, _, start_pos in prefill_requests:
             seen_start_pos.append(start_pos)
-        return orig_prepare(decode_requests, prefill_requests, block_size)
+        return orig_prepare(decode_requests, prefill_requests, block_size, buffers)
 
     pac.prepare_unified = patched_prepare
 

@@ -183,8 +183,8 @@ def prepare_sdpa_qkv(
             inner,
             queries,
             keys,
-            ctx.cu_seqlens,
-            offsets=ctx.offsets if ctx.offsets else None,
+            ctx.cu_seqlens_list,
+            offsets=ctx.offsets_list if len(ctx.offsets) > 0 else None,
             apply_keys=False,
         )
     else:
@@ -217,8 +217,8 @@ def prepare_sdpa_qkv(
             inner,
             queries,
             keys,
-            ctx.cu_seqlens,
-            offsets=ctx.offsets if ctx.offsets else None,
+            ctx.cu_seqlens_list,
+            offsets=ctx.offsets_list if len(ctx.offsets) > 0 else None,
         )
 
     kv_for_sharing = (keys, values)
@@ -366,7 +366,8 @@ def sdpa_forward(
     slot_mapping = ctx.slot_mapping_mx
     seq_lens = ctx.context_lens_mx
     cu_seqlens_q = ctx.cu_seqlens_mx
-    max_seq_len = max(ctx.context_lens)
+    # int() so downstream nanobind primitives don't see a numpy scalar.
+    max_seq_len = int(ctx.context_lens.max())
 
     # --- Block tables (with hybrid block-size translation) ---
     # vLLM may inflate block_size (e.g. 544) to align attention pages with

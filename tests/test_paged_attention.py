@@ -40,11 +40,11 @@ class TestPrepare:
 
         # block 10: slots 40,41,42,43; block 11: slot 44
         assert ctx is not None
-        assert ctx.slot_mapping == [40, 41, 42, 43, 44]
-        assert ctx.block_tables == [[10, 11]]
-        assert ctx.context_lens == [5]
-        assert ctx.cu_seqlens == [0, 5]
-        assert ctx.offsets == [0]
+        assert ctx.slot_mapping.tolist() == [40, 41, 42, 43, 44]
+        assert ctx.block_tables.tolist() == [[10, 11]]
+        assert ctx.context_lens.tolist() == [5]
+        assert ctx.cu_seqlens.tolist() == [0, 5]
+        assert ctx.offsets.tolist() == [0]
 
     def test_prepare_unified_prefill_packed(self):
         # Two prefill requests packed together
@@ -54,11 +54,11 @@ class TestPrepare:
         assert ctx is not None
         # Request 0: block 10, slots 40,41,42
         # Request 1: block 20, slots 80,81
-        assert ctx.slot_mapping == [40, 41, 42, 80, 81]
-        assert ctx.cu_seqlens == [0, 3, 5]
-        assert ctx.block_tables == [[10], [20]]
-        assert ctx.context_lens == [3, 2]
-        assert ctx.offsets == [0, 0]
+        assert ctx.slot_mapping.tolist() == [40, 41, 42, 80, 81]
+        assert ctx.cu_seqlens.tolist() == [0, 3, 5]
+        assert ctx.block_tables.tolist() == [[10], [20]]
+        assert ctx.context_lens.tolist() == [3, 2]
+        assert ctx.offsets.tolist() == [0, 0]
 
     def test_prepare_unified_prefill_multiblock(self):
         # Single prefill spanning two blocks
@@ -66,11 +66,11 @@ class TestPrepare:
         ctx = get_context()
 
         assert ctx is not None
-        assert ctx.cu_seqlens == [0, 5]
+        assert ctx.cu_seqlens.tolist() == [0, 5]
         # block 5: slots 20,21,22,23; block 6: slot 24
-        assert ctx.slot_mapping == [20, 21, 22, 23, 24]
-        assert ctx.block_tables == [[5, 6]]
-        assert ctx.context_lens == [5]
+        assert ctx.slot_mapping.tolist() == [20, 21, 22, 23, 24]
+        assert ctx.block_tables.tolist() == [[5, 6]]
+        assert ctx.context_lens.tolist() == [5]
 
     def test_prepare_unified_continuation_chunk(self):
         # Continuation chunk: 3 new tokens starting at position 4
@@ -81,14 +81,14 @@ class TestPrepare:
 
         assert ctx is not None
         # Only 3 tokens in the query (positions 4, 5, 6)
-        assert ctx.cu_seqlens == [0, 3]
+        assert ctx.cu_seqlens.tolist() == [0, 3]
         # Slots for positions 4, 5, 6: block 11 slots 44, 45, 46
-        assert ctx.slot_mapping == [44, 45, 46]
-        assert ctx.block_tables == [[10, 11]]
+        assert ctx.slot_mapping.tolist() == [44, 45, 46]
+        assert ctx.block_tables.tolist() == [[10, 11]]
         # Total context = start_pos + num_tokens = 4 + 3 = 7
-        assert ctx.context_lens == [7]
+        assert ctx.context_lens.tolist() == [7]
         # RoPE offset = start_pos
-        assert ctx.offsets == [4]
+        assert ctx.offsets.tolist() == [4]
 
     def test_prepare_unified_decode_only(self):
         # Single decode request via prepare_unified
@@ -98,10 +98,10 @@ class TestPrepare:
 
         # new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
         assert ctx is not None
-        assert ctx.slot_mapping == [27]
-        assert ctx.context_lens == [8]
-        assert ctx.offsets == [7]
-        assert ctx.cu_seqlens == [0, 1]
+        assert ctx.slot_mapping.tolist() == [27]
+        assert ctx.context_lens.tolist() == [8]
+        assert ctx.offsets.tolist() == [7]
+        assert ctx.cu_seqlens.tolist() == [0, 1]
 
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill
@@ -114,11 +114,13 @@ class TestPrepare:
         assert ctx is not None
         # Decode slot: pos=7, block 6, slot=6*4+3=27
         # Prefill slots: block 10 slots 40,41,42,43; block 11 slot 44
-        assert ctx.slot_mapping == [27, 40, 41, 42, 43, 44]
-        assert ctx.cu_seqlens == [0, 1, 6]
-        assert ctx.offsets == [7, 0]
-        assert ctx.context_lens == [8, 5]
-        assert ctx.block_tables == [[5, 6], [10, 11]]
+        assert ctx.slot_mapping.tolist() == [27, 40, 41, 42, 43, 44]
+        assert ctx.cu_seqlens.tolist() == [0, 1, 6]
+        assert ctx.offsets.tolist() == [7, 0]
+        assert ctx.context_lens.tolist() == [8, 5]
+        # Block tables are dense-padded to max blocks across requests (=2 here);
+        # the shorter row gets a trailing zero. Kernels mask via context_lens.
+        assert ctx.block_tables.tolist() == [[5, 6], [10, 11]]
 
 
 class TestPackedRoPE:

@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -41,6 +42,7 @@ from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
     OffsetCache,
+    PagedPrepBuffers,
     clear_context,
     prepare_unified,
 )
@@ -250,6 +252,9 @@ class MetalModelRunner:
         self._paged_attention_backend: PagedAttentionBackend | None = None
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
+        # Persistent host-side buffers for prepare_unified — allocated lazily
+        # after _paged_block_size is known (worker-side init).
+        self._paged_prep_buffers: PagedPrepBuffers | None = None
         self.kv_cache_dtype: mx.Dtype | None = None
 
         # Per-layer KV cache shapes (None = uniform across layers)
@@ -479,6 +484,20 @@ class MetalModelRunner:
     ) -> PagedAttentionBackend:
         """Build the paged-attention backend for the loaded model."""
         return self._cache_policy.build_paged_attention_backend(block_size=block_size)
+
+    def _build_prep_buffers(self) -> PagedPrepBuffers:
+        """Allocate the persistent host-side buffers for ``prepare_unified``.
+
+        Sized to the worst-case batch shape that the scheduler can hand us.
+        Lazy because ``_paged_block_size`` is only known after the worker
+        has built the paged attention backend.
+        """
+        block_size = self._paged_block_size or 1
+        return PagedPrepBuffers(
+            max_num_reqs=self.scheduler_config.max_num_seqs,
+            max_num_blocks_per_req=cdiv(self.model_config.max_model_len, block_size),
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
 
     def estimate_one_sequence_kv_bytes(
         self, *, max_model_len: int, block_size: int
@@ -766,7 +785,16 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
+        if self._paged_prep_buffers is None and hasattr(self, "scheduler_config"):
+            # Stub runners bypass __init__ and lack scheduler_config; in that
+            # case prepare_unified will allocate an ad-hoc per-call buffer.
+            self._paged_prep_buffers = self._build_prep_buffers()
+        prepare_unified(
+            decode_info,
+            prefill_info,
+            self._paged_block_size,
+            self._paged_prep_buffers,
+        )
 
         # ---- GDN slot mapping (hybrid models) ----
         if self.is_hybrid:

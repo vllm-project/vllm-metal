@@ -18,6 +18,9 @@ from vllm_metal.paged_attention_backend.mla import (
 )
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 
+_np_ctx = pac.PagedAttentionContext.from_lists
+
+
 # Fixture dimensions matching GLM/DeepSeek-V2 defaults
 _KV_LORA_RANK = 512
 _QK_ROPE_HEAD_DIM = 64
@@ -280,7 +283,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
 
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[3],
                 block_tables=[[0]],
                 context_lens=[4],
@@ -303,7 +306,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
 
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[0, 1, 2, 3],
                 block_tables=[[0]],
                 context_lens=[4],
@@ -326,7 +329,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
 
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[2],
                 block_tables=[[0]],
                 context_lens=[3],
@@ -355,7 +358,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         # Request A: 2 past tokens, decode token at slot 2 in block 0
         # Request B: 1 past token,  decode token at slot 5 in block 1
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[2, 5],
                 block_tables=[[0], [1]],
                 context_lens=[3, 2],
@@ -379,7 +382,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         cache_a = self._make_cache()
         wrapper_a = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache_a)
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[0, 1, 2, 3],
                 block_tables=[[0]],
                 context_lens=[4],
@@ -400,7 +403,7 @@ class TestMLAPagedAttentionWrapperPagedPath:
         cache_b = self._make_cache()
         wrapper_b = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache_b)
         pac.set_context(
-            pac.PagedAttentionContext(
+            _np_ctx(
                 slot_mapping=[0, 1, 2, 3],
                 block_tables=[[0]],
                 context_lens=[4],

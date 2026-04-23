@@ -545,9 +545,9 @@ class TestPrepareUnifiedSlotMapping:
 
         assert len(captured) == 1
         ctx = captured[0]
-        assert ctx.slot_mapping == [0, 1, 2, 3]
-        assert ctx.offsets == [0]
-        assert ctx.context_lens == [4]
+        assert ctx.slot_mapping.tolist() == [0, 1, 2, 3]
+        assert ctx.offsets.tolist() == [0]
+        assert ctx.context_lens.tolist() == [4]
 
     def test_prefix_hit_slot_mapping_starts_at_start_pos(self):
         """start_pos == 2: slots cover positions 2-3, RoPE offset is 2."""
@@ -580,6 +580,6 @@ class TestPrepareUnifiedSlotMapping:
 
         assert len(captured) == 1
         ctx = captured[0]
-        assert ctx.slot_mapping == [2, 3]  # positions 2-3 in block 0
-        assert ctx.offsets == [2]
-        assert ctx.context_lens == [4]  # start_pos + num_tokens = 2 + 2
+        assert ctx.slot_mapping.tolist() == [2, 3]  # positions 2-3 in block 0
+        assert ctx.offsets.tolist() == [2]
+        assert ctx.context_lens.tolist() == [4]  # start_pos + num_tokens = 2 + 2

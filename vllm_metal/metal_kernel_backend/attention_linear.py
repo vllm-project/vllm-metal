@@ -75,7 +75,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         cache_idx: int = self._gdn_cache_idx
         state_cache: GDNPagedStateCache = self._gdn_state_cache
 
-        cu_seqlens = ctx.cu_seqlens
+        cu_seqlens = ctx.cu_seqlens_list
         if cu_seqlens is None or len(cu_seqlens) < 2:
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 

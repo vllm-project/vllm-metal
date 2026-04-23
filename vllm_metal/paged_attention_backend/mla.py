@@ -54,7 +54,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         ctx = get_context()
         if ctx is None:
             return self._inner(x, mask=mask, cache=cache)
-        if not ctx.block_tables:
+        if ctx.block_tables.shape[0] == 0:
             raise RuntimeError(
                 "MLAPagedAttentionWrapper called with empty block_tables"
             )
@@ -88,8 +88,8 @@ class MLAPagedAttentionWrapper(nn.Module):
             inner,
             q_pe,
             k_pe,
-            ctx.cu_seqlens,
-            offsets=ctx.offsets or None,
+            ctx.cu_seqlens_list,
+            offsets=ctx.offsets_list if len(ctx.offsets) > 0 else None,
         )
 
         # Concatenate kv_norm and the roped k_pe into a single per-token latent,
@@ -114,10 +114,12 @@ class MLAPagedAttentionWrapper(nn.Module):
 
         block_tables_mx = ctx.block_tables_mx
 
+        cu_list = ctx.cu_seqlens_list
+        ctx_lens_list = ctx.context_lens.tolist()
         outputs = []
-        for req_idx, ctx_len in enumerate(ctx.context_lens):
-            req_start = ctx.cu_seqlens[req_idx]
-            req_end = ctx.cu_seqlens[req_idx + 1]
+        for req_idx, ctx_len in enumerate(ctx_lens_list):
+            req_start = cu_list[req_idx]
+            req_end = cu_list[req_idx + 1]
             num_new = req_end - req_start
             past_len = ctx_len - num_new  # tokens cached before this step
 
