@@ -9,6 +9,7 @@ import mlx.core as mx
 import pytest
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_backend.mha import (
     MHAPagedAttentionBackend,
@@ -246,3 +247,38 @@ class TestCachePolicyPerLayerBytes:
             NotImplementedError, match="Per-layer KV shapes with hybrid models"
         ):
             runner.build_paged_attention_backend(block_size=self._BLOCK_SIZE)
+
+    def test_turboquant_per_layer_shapes_raise_early(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unsupported TurboQuant + per-layer combos should fail at public APIs."""
+        runner = self._make_runner(
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=256,
+            kv_heads_per_layer=[4, 2],
+            head_dim_per_layer=[256, 512],
+        )
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=True,
+                mlx_device="gpu",
+                block_size=self._BLOCK_SIZE,
+                debug=False,
+                turboquant=True,
+            ),
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Per-layer KV shapes with TurboQuant are not yet implemented",
+        ):
+            runner.validate_paged_attention_support()
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Per-layer KV shapes with TurboQuant are not yet implemented",
+        ):
+            runner.get_kv_cache_spec()

@@ -505,6 +505,10 @@ class ModelCachePolicy:
                 "Per-layer KV shapes with hybrid models require "
                 "SDPA-layer index remapping, which is not yet implemented."
             )
+        if get_config().turboquant:
+            raise NotImplementedError(
+                "Per-layer KV shapes with TurboQuant are not yet implemented."
+            )
 
     def _kv_layer_size_sum(self) -> int:
         """Sum of ``kv_heads × head_dim`` across KV cache layers.
