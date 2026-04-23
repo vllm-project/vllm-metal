@@ -82,6 +82,11 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
 
+    def test_none_hf_config_is_not_forced_in_auto_mode(self) -> None:
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(None)
+        assert result is False
+
 
 class TestNormalizeModelConfig:
     """Tests for normalize_model_config()."""
@@ -160,6 +165,19 @@ class TestNormalizeModelConfig:
         model_config = SimpleNamespace(
             multimodal_config=None,
             hf_config=SimpleNamespace(model_type="gemma4"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_text_only_compat_mode_handles_missing_hf_config(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=None,
         )
 
         DefaultModelAdapter().normalize_model_config(model_config)

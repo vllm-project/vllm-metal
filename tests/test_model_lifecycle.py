@@ -362,7 +362,12 @@ class TestModelLifecycle:
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
-            {"stub-model": (fake_model, object())},
+            {
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
+                    fake_model,
+                    object(),
+                )
+            },
         )
         lifecycle, runner = _make_lifecycle()
 
@@ -415,7 +420,7 @@ class TestModelLifecycle:
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
-            {"stub-model": (fake_model, None)},
+            {model_lifecycle._stt_cache_key("stub-model"): (fake_model, None)},
         )
         monkeypatch.setattr(model_lifecycle, "is_stt_model", lambda _model_name: True)
         lifecycle, runner = _make_lifecycle()

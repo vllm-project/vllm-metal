@@ -94,6 +94,9 @@ class DefaultModelAdapter(ModelAdapter):
         mlx_lm's qwen3_5 text loader so FP8 `*_weight_scale_inv` tensors are
         consumed correctly instead of failing inside mlx_vlm.load().
         """
+        if hf_config is None:
+            return False
+
         model_type = getattr(hf_config, "model_type", "")
         if model_type in _TEXT_BACKBONE_OVERRIDE_TYPES:
             return True
@@ -141,7 +144,8 @@ class DefaultModelAdapter(ModelAdapter):
         """
         if model_config.multimodal_config is None:
             return
-        if not self.should_force_text_backbone(model_config.hf_config):
+        hf_config = getattr(model_config, "hf_config", None)
+        if not self.should_force_text_backbone(hf_config):
             return
 
         multimodal_mode = self._multimodal_mode()
@@ -149,7 +153,7 @@ class DefaultModelAdapter(ModelAdapter):
         logger.info(
             "Metal: forcing text-only backbone for model_type=%s "
             "(multimodal_mode=%s, cleared multimodal_config)",
-            model_config.hf_config.model_type,
+            getattr(hf_config, "model_type", "unknown"),
             multimodal_mode,
         )
 
