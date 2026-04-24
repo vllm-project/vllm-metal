@@ -28,6 +28,11 @@ TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
     {"q2_0", "q3_0", "q4_0", "q5_0", "q8_0"}
 )
 
+MultimodalMode = Literal["auto", "text-only-compat", "multimodal-native"]
+VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
+    {"auto", "text-only-compat", "multimodal-native"}
+)
+
 
 @dataclass
 class MetalConfig:
@@ -39,6 +44,7 @@ class MetalConfig:
     block_size: int
     debug: bool
     use_paged_attention: bool = True
+    multimodal_mode: MultimodalMode = "auto"
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
     v_quant: str = "q3_0"  # Value quantization type: q2_0, q3_0, q4_0, q5_0 (Lloyd-Max)
@@ -66,6 +72,13 @@ class MetalConfig:
                     f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
                     "Must be a finite value in (0, 1] when paged attention is enabled."
                 )
+
+        if self.multimodal_mode not in VALID_MULTIMODAL_MODES:
+            available = ", ".join(sorted(VALID_MULTIMODAL_MODES))
+            raise ValueError(
+                f"Invalid VLLM_METAL_MULTIMODAL_MODE={self.multimodal_mode!r}. "
+                f"Available modes: {available}."
+            )
 
         self._validate_turboquant()
 
@@ -128,6 +141,7 @@ class MetalConfig:
             block_size=block_size,
             debug=envs.VLLM_METAL_DEBUG,
             use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
+            multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
         )
 
 

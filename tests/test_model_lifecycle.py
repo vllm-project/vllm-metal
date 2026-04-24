@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
+from vllm_metal.config import reset_config
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
@@ -20,6 +25,15 @@ _TEXT_MODEL_ARGS = {
     "num_key_value_heads": 8,
     "hidden_size": 4096,
 }
+
+
+@pytest.fixture(autouse=True)
+def _reset_env(monkeypatch: pytest.MonkeyPatch):
+    for var in envs.environment_variables:
+        monkeypatch.delenv(var, raising=False)
+    reset_config()
+    yield
+    reset_config()
 
 
 class _BaseSlotTextConfig:
@@ -79,13 +93,15 @@ def _cache_generation_model(
     *,
     config: object,
     tokenizer: object | None = None,
+    is_vlm: bool = False,
 ) -> tuple[object, object]:
     fake_model = SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
+    cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
     monkeypatch.setattr(
         model_lifecycle,
         "_MODEL_CACHE",
-        {"stub-model": (fake_model, fake_tokenizer)},
+        {cache_key: (fake_model, fake_tokenizer)},
     )
     return fake_model, fake_tokenizer
 
@@ -105,6 +121,55 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
+        self, tmp_path: Path
+    ) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            (model_dir / name).write_text("{}", encoding="utf-8")
+
+        for name in ("layers-0.safetensors", "outside.safetensors", "mtp.safetensors"):
+            (model_dir / name).write_text("", encoding="utf-8")
+
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "outside.safetensors",
+                        "b": "layers-0.safetensors",
+                        "c": "mtp.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
+            compat_path = Path(compat)
+
+            assert compat_path != model_dir
+            assert (compat_path / "config.json").is_symlink()
+            assert (compat_path / "tokenizer.json").is_symlink()
+            compat_shards = sorted(
+                p.name for p in compat_path.glob("model*.safetensors")
+            )
+            assert compat_shards == [
+                "model-00001-of-00003.safetensors",
+                "model-00002-of-00003.safetensors",
+                "model-00003-of-00003.safetensors",
+            ]
+
+    def test_private_mlx_lm_compatible_model_path_keeps_standard_model_shards(
+        self, tmp_path: Path
+    ) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "model.safetensors").write_text("", encoding="utf-8")
+
+        with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
+            assert compat == str(model_dir)
+
     def test_load_uses_adapter_override_for_text_only_multimodal_model(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -120,6 +185,184 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner._is_vlm is False
+
+    def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _cache_generation_model(monkeypatch, config=_text_config())
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+
+    def test_load_uses_adapter_override_for_qwen36_fp8_conditional_generation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _cache_generation_model(monkeypatch, config=_text_config())
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_6",
+                    architectures=["Qwen3_6ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+
+    def test_load_multimodal_native_mode_keeps_qwen35_fp8_as_vlm(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        _cache_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(text_config=_text_config()),
+            is_vlm=True,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+
+    def test_generation_cache_separates_text_and_vlm_variants(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        text_model = SimpleNamespace(config=_text_config())
+        text_tokenizer = object()
+        vlm_model = SimpleNamespace(config=SimpleNamespace(text_config=_text_config()))
+        vlm_tokenizer = object()
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_MODEL_CACHE",
+            {
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
+                    text_model,
+                    text_tokenizer,
+                ),
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=True): (
+                    vlm_model,
+                    vlm_tokenizer,
+                ),
+            },
+        )
+
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="gemma4"),
+                is_multimodal_model=True,
+            )
+        )
+        lifecycle.load()
+
+        assert runner.model is text_model
+        assert runner.tokenizer is text_tokenizer
+        assert runner._is_vlm is False
+
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+        lifecycle.load()
+
+        assert runner.model is vlm_model
+        assert runner.tokenizer is vlm_tokenizer
+        assert runner._is_vlm is True
+
+    def test_load_text_only_compat_mode_keeps_generic_vlm_native(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+        _cache_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(text_config=_text_config()),
+            is_vlm=True,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="phi3_v"),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+
+    @pytest.mark.slow
+    def test_load_text_only_compat_real_qwen_fp8_checkpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = os.environ.get("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH")
+        if not model_path:
+            pytest.skip("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH not set")
+        if not Path(model_path).exists():
+            pytest.skip(f"Model path does not exist: {model_path}")
+
+        from transformers import AutoConfig
+
+        from vllm_metal.compat import _patch_mlx_lm_qwen35_fp8_sanitize
+
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+        model_lifecycle.reset_model_cache()
+        _patch_mlx_lm_qwen35_fp8_sanitize()
+
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                model=model_path,
+                hf_config=hf_config,
+                is_multimodal_model=True,
+            )
+        )
+        try:
+            lifecycle.load()
+
+            assert runner._is_vlm is False
+            assert runner.model is not None
+            assert int(runner.model_args["vocab_size"]) > 0
+        finally:
+            model_lifecycle.reset_model_cache()
 
     def test_load_extracts_text_model_config_from_cached_model(
         self,
@@ -181,7 +424,12 @@ class TestModelLifecycle:
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
-            {"stub-model": (fake_model, object())},
+            {
+                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
+                    fake_model,
+                    object(),
+                )
+            },
         )
         lifecycle, runner = _make_lifecycle()
 
@@ -208,6 +456,7 @@ class TestModelLifecycle:
                     **_TEXT_MODEL_ARGS,
                 )
             ),
+            is_vlm=True,
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
@@ -234,7 +483,7 @@ class TestModelLifecycle:
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
-            {"stub-model": (fake_model, None)},
+            {model_lifecycle._stt_cache_key("stub-model"): (fake_model, None)},
         )
         monkeypatch.setattr(model_lifecycle, "is_stt_model", lambda _model_name: True)
         lifecycle, runner = _make_lifecycle()

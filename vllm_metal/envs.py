@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     VLLM_METAL_BLOCK_SIZE: str = "16"
     VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
+    VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_PREFIX_CACHE: bool = False
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
@@ -48,6 +49,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use native Metal paged attention (default True).
     "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
         os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
+    ),
+    # Multimodal serving mode:
+    # - "auto": known-incompatible multimodal checkpoints fall back to the
+    #   text-only compatibility path.
+    # - "text-only-compat": force known-safe multimodal checkpoints onto the
+    #   text-only compatibility path.
+    # - "multimodal-native": keep native multimodal loading enabled.
+    "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
+        "VLLM_METAL_MULTIMODAL_MODE", "auto"
     ),
     # Enable content-hash prefix caching (presence-based: set to any
     # value to enable, unset to disable).

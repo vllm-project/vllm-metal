@@ -35,6 +35,7 @@ class TestMetalConfig:
         assert config.block_size == 16
         assert config.debug is False
         assert config.use_paged_attention is True
+        assert config.multimodal_mode == "auto"
 
     def test_custom_config_from_env(self, monkeypatch) -> None:
         """Test configuration from environment variables."""
@@ -44,6 +45,7 @@ class TestMetalConfig:
         monkeypatch.setenv("VLLM_METAL_BLOCK_SIZE", "32")
         monkeypatch.setenv("VLLM_METAL_DEBUG", "1")
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
 
         config = MetalConfig.from_env()
 
@@ -52,6 +54,7 @@ class TestMetalConfig:
         assert config.mlx_device == "cpu"
         assert config.block_size == 32
         assert config.debug is True
+        assert config.multimodal_mode == "multimodal-native"
 
     def test_get_config_singleton(self) -> None:
         """Test that get_config returns a singleton."""
@@ -147,6 +150,30 @@ class TestMetalConfig:
         assert config.turboquant is False
         assert config.k_quant == "q8_0"
         assert config.v_quant == "q3_0"
+
+    def test_text_only_compat_mode_is_accepted(self) -> None:
+        config = MetalConfig(
+            memory_fraction=AUTO_MEMORY_FRACTION,
+            use_mlx=True,
+            mlx_device="gpu",
+            block_size=16,
+            debug=False,
+            use_paged_attention=True,
+            multimodal_mode="text-only-compat",
+        )
+        assert config.multimodal_mode == "text-only-compat"
+
+    def test_invalid_multimodal_mode_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Invalid VLLM_METAL_MULTIMODAL_MODE"):
+            MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=True,
+                mlx_device="gpu",
+                block_size=16,
+                debug=False,
+                use_paged_attention=True,
+                multimodal_mode="vlm",  # type: ignore[arg-type]
+            )
 
     def test_turboquant_requires_paged_attention(self) -> None:
         """Test that turboquant=True without paged attention is rejected."""

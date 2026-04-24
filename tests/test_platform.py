@@ -506,6 +506,50 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    def test_check_and_update_config_auto_mode_clears_qwen35_fp8_wrapper(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            model_config = SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=SimpleNamespace(language_model_only=False),
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=model_config,
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert model_config.multimodal_config is None
+
+        finally:
+            reset_config()
+
     def test_check_and_update_config_preserves_multimodal_for_non_gemma4_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -522,6 +566,94 @@ class TestMetalPlatform:
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(model_type="qwen3_vl"),
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=model_config,
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert model_config.multimodal_config is sentinel
+
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_multimodal_native_preserves_qwen35_fp8(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        try:
+            sentinel = SimpleNamespace(language_model_only=False)
+            model_config = SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=sentinel,
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None, enable_prefix_caching=False
+                ),
+                model_config=model_config,
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert model_config.multimodal_config is sentinel
+
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_text_only_compat_preserves_generic_vlm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+        try:
+            sentinel = SimpleNamespace(language_model_only=False)
+            model_config = SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=128,
+                multimodal_config=sentinel,
+                hf_config=SimpleNamespace(model_type="phi3_v"),
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(

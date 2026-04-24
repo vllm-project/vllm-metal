@@ -8,12 +8,19 @@
 | `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute (1=yes, 0=no) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_BLOCK_SIZE` | `16` | KV cache block size |
-| `VLLM_METAL_USE_PAGED_ATTENTION` | `0` | Enable experimental paged KV cache |
+| `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
+| `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto`, `text-only-compat`, or `multimodal-native` |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_PREFIX_CACHE` | (unset) | Set to enable prefix caching for shared prompt reuse |
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
+
+## Multimodal Serve Modes
+
+- `auto`: use native multimodal loading by default, but fall back to the text-only compatibility path for known-incompatible checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.
+- `text-only-compat`: force the text-only compatibility path only for known-safe checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers. Other multimodal checkpoints stay on the native multimodal loader.
+- `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 
 ## Paged KV vs MLX KV Memory Settings
 
@@ -23,7 +30,7 @@
 
 | `VLLM_METAL_MEMORY_FRACTION` | `VLLM_METAL_USE_PAGED_ATTENTION` | Valid? | Notes |
 |--|--|--|--|
-| `auto` | `0` | Yes | MLX path (default) |
-| `auto` | `1` | Yes | Paged KV path; defaults to 0.9 internally |
+| `auto` | `0` | Yes | MLX path |
+| `auto` | `1` | Yes | Paged KV path (default); defaults to 0.9 internally |
 | `0.7` | `1` | Yes | Paged KV path with explicit memory budget |
 | `0.7` | `0` | No | Explicit fraction without paged KV is invalid |

@@ -60,50 +60,104 @@ class ModelAdapter(Protocol):
         """Return per-layer sliding window sizes, or None for no enforcement."""
 
 
-# Models that vLLM flags as multimodal but must be loaded via mlx_lm.
+# Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
-# Remove once mlx_vlm gemma4 parity is fixed upstream.
 _TEXT_BACKBONE_OVERRIDE_TYPES: frozenset[str] = frozenset({"gemma4"})
+# Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
+# but vllm-metal only serves them in text-only mode. Their FP8 checkpoints ship
+# `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5 loader does not
+# currently sanitize, while mlx_lm's qwen3_5 text loader handles them.
+_TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_6ForConditionalGeneration",
+        "Qwen3_6MoeForConditionalGeneration",
+    }
+)
 
 
 class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
 
-    def should_force_text_backbone(self, hf_config: Any) -> bool:
-        """Return True for models that must load via mlx_lm (Gemma4).
+    def _multimodal_mode(self) -> str:
+        from vllm_metal.config import get_config
 
-        mlx_vlm Gemma4 forward currently produces garbled output; remove this
+        return get_config().multimodal_mode
+
+    def _matches_auto_text_backbone_override(self, hf_config: Any) -> bool:
+        """Return True for known multimodal checkpoints that need mlx_lm.
+
+        Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
+
+        Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
+        marked multimodal even when served text-only. Route them through
+        mlx_lm's qwen3_5 text loader so FP8 `*_weight_scale_inv` tensors are
+        consumed correctly instead of failing inside mlx_vlm.load().
         """
+        if hf_config is None:
+            return False
+
         model_type = getattr(hf_config, "model_type", "")
-        return model_type in _TEXT_BACKBONE_OVERRIDE_TYPES
+        if model_type in _TEXT_BACKBONE_OVERRIDE_TYPES:
+            return True
+
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if not any(
+            arch in _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES for arch in architectures
+        ):
+            return False
+
+        quantization_config = getattr(hf_config, "quantization_config", None)
+        if isinstance(quantization_config, dict):
+            quant_method = quantization_config.get("quant_method")
+        else:
+            quant_method = getattr(quantization_config, "quant_method", None)
+        return quant_method == "fp8"
+
+    def should_force_text_backbone(self, hf_config: Any) -> bool:
+        """Whether the current serve mode should use the text-only path.
+
+        Modes:
+        - ``multimodal-native``: never force compatibility; keep native VLM
+          loading active so multimodal support can be developed/tested.
+        - ``text-only-compat``: force the text-only path only for the
+          known-safe compatibility allowlist.
+        - ``auto``: apply the compatibility path only for known-incompatible
+          checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 wrappers.
+        """
+        multimodal_mode = self._multimodal_mode()
+        if multimodal_mode == "multimodal-native":
+            return False
+        if multimodal_mode == "text-only-compat":
+            return self._matches_auto_text_backbone_override(hf_config)
+        return self._matches_auto_text_backbone_override(hf_config)
 
     def normalize_model_config(self, model_config: ModelConfig) -> None:
         """Clear ``multimodal_config`` for models served on the text backbone.
 
-        For model types in :data:`_TEXT_BACKBONE_OVERRIDE_TYPES` the runner
-        executes the language-model forward via mlx_lm, even though the HF
-        config marks the architecture as multimodal. Leaving the engine's
-        ``multimodal_config`` populated triggers eager loading of the
-        multimodal feature extractor at engine startup, which crashes on MLX
-        checkpoints that ship neither ``preprocessor_config.json`` nor a
-        ``feature_extractor`` section in ``processor_config.json`` (e.g.
-        ``mlx-community/gemma-4-31b-8bit``).
-
-        Clearing it here makes ``is_multimodal_model`` ``False`` so the
-        input processor skips that path. The ``should_force_text_backbone``
-        predicate is the single source of truth for which model types apply.
+        When the active serve mode routes a multimodal checkpoint through the
+        text-only compatibility path, leaving ``multimodal_config`` populated
+        causes vLLM to eagerly initialize multimodal processors that the
+        compatibility path intentionally bypasses. Clearing it here makes
+        ``is_multimodal_model`` ``False`` so the input processor skips that
+        setup. The ``should_force_text_backbone`` predicate is the single
+        source of truth for whether the compatibility path applies.
         """
         if model_config.multimodal_config is None:
             return
-        if not self.should_force_text_backbone(model_config.hf_config):
+        hf_config = getattr(model_config, "hf_config", None)
+        if not self.should_force_text_backbone(hf_config):
             return
 
+        multimodal_mode = self._multimodal_mode()
         model_config.multimodal_config = None
         logger.info(
             "Metal: forcing text-only backbone for model_type=%s "
-            "(cleared multimodal_config)",
-            model_config.hf_config.model_type,
+            "(multimodal_mode=%s, cleared multimodal_config)",
+            getattr(hf_config, "model_type", "unknown"),
+            multimodal_mode,
         )
 
     def resolve_max_head_dim(

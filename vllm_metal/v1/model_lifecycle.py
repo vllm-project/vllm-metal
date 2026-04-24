@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_MODEL_CACHE: dict[str, tuple[Any, Any]] = {}
+_MODEL_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
 _MODEL_CACHE_LOCK = Lock()
 
 
@@ -40,6 +44,83 @@ def reset_model_cache() -> None:
     """
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
+
+
+def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:
+    loader = "mlx_vlm" if is_vlm else "mlx_lm"
+    return (model_name, loader)
+
+
+def _stt_cache_key(model_name: str) -> tuple[str, str]:
+    return (model_name, "stt")
+
+
+@contextmanager
+def _mlx_lm_compatible_model_path(model_name: str):
+    """Yield a model path compatible with ``mlx_lm.load`` shard discovery.
+
+    Some local checkpoints ship valid ``.safetensors`` shards and a
+    ``model.safetensors.index.json`` file, but use custom shard names such as
+    ``layers-*.safetensors`` or ``outside.safetensors``. ``mlx_lm.load`` only
+    discovers shards whose basename matches ``model*.safetensors``.
+
+    For those checkpoints, create a temporary directory that mirrors the
+    original config/tokenizer files and exposes the indexed shard files via
+    ``model-xxxxx-of-yyyyy.safetensors`` symlinks. The actual weight bytes stay
+    in place; only the filenames are adapted for ``mlx_lm``.
+    """
+    model_path = Path(model_name)
+    if not model_path.is_dir():
+        yield model_name
+        return
+
+    if any(model_path.glob("model*.safetensors")):
+        yield model_name
+        return
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.is_file():
+        yield model_name
+        return
+
+    with index_path.open("r") as fid:
+        weight_map = json.load(fid).get("weight_map", {})
+
+    shard_names = sorted(
+        {
+            shard_name
+            for shard_name in weight_map.values()
+            if isinstance(shard_name, str) and shard_name.endswith(".safetensors")
+        }
+    )
+    if not shard_names:
+        yield model_name
+        return
+
+    with TemporaryDirectory(prefix="vllm-metal-mlx-lm-") as tmpdir:
+        compat_path = Path(tmpdir)
+
+        for src in model_path.iterdir():
+            if not src.is_file() or src.name.endswith(".safetensors"):
+                continue
+            (compat_path / src.name).symlink_to(src)
+
+        total_shards = len(shard_names)
+        for shard_index, shard_name in enumerate(shard_names, start=1):
+            shard_path = model_path / shard_name
+            compat_name = (
+                "model.safetensors"
+                if total_shards == 1
+                else f"model-{shard_index:05d}-of-{total_shards:05d}.safetensors"
+            )
+            (compat_path / compat_name).symlink_to(shard_path)
+
+        logger.info(
+            "Using mlx_lm shard compatibility view for %s (%d shard files)",
+            model_name,
+            total_shards,
+        )
+        yield str(compat_path)
 
 
 class ModelLifecycle:
@@ -62,9 +143,7 @@ class ModelLifecycle:
         # vLLM model_config shape varies across backends.
         hf_config = getattr(model_config, "hf_config", None)
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
-        if hf_config is not None and self._model_adapter.should_force_text_backbone(
-            hf_config
-        ):
+        if self._model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
 
         model, tokenizer = self._load_generation_model(model_name, is_vlm)
@@ -88,9 +167,10 @@ class ModelLifecycle:
     def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
+        cache_key = _generation_cache_key(model_name, is_vlm=is_vlm)
 
         with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(model_name)
+            cached = _MODEL_CACHE.get(cache_key)
         if cached is not None:
             logger.info(
                 "Model loaded from cache in %.3fs: %s",
@@ -107,23 +187,25 @@ class ModelLifecycle:
             )
             model, tokenizer = mlx_vlm_load(model_name)
         else:
-            model, tokenizer = mlx_lm_load(
-                model_name,
-                tokenizer_config={
-                    "trust_remote_code": self._runner.model_config.trust_remote_code
-                },
-            )
+            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+                model, tokenizer = mlx_lm_load(
+                    compatible_model_name,
+                    tokenizer_config={
+                        "trust_remote_code": self._runner.model_config.trust_remote_code
+                    },
+                )
 
         with _MODEL_CACHE_LOCK:
-            _MODEL_CACHE[model_name] = (model, tokenizer)
+            _MODEL_CACHE[cache_key] = (model, tokenizer)
         logger.info("Model loaded in %.2fs: %s", time.time() - start_time, model_name)
         return model, tokenizer
 
     def _load_stt(self, model_name: str) -> None:
         start_time = time.time()
+        cache_key = _stt_cache_key(model_name)
 
         with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(model_name)
+            cached = _MODEL_CACHE.get(cache_key)
         if cached is not None:
             model, _ = cached
             load_time = time.time() - start_time
@@ -138,7 +220,7 @@ class ModelLifecycle:
             logger.info("Loading STT model: %s", model_name)
             model = stt_load_model(model_name)
             with _MODEL_CACHE_LOCK:
-                _MODEL_CACHE[model_name] = (model, None)
+                _MODEL_CACHE[cache_key] = (model, None)
             load_time = time.time() - start_time
             logger.info("STT model loaded in %.2fs: %s", load_time, model_name)
 

@@ -5,7 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm_metal.envs as envs
+from vllm_metal.config import reset_config
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+
+@pytest.fixture(autouse=True)
+def _reset_env(monkeypatch: pytest.MonkeyPatch):
+    for var in envs.environment_variables:
+        monkeypatch.delenv(var, raising=False)
+    reset_config()
+    yield
+    reset_config()
 
 
 class TestShouldForceTextBackbone:
@@ -17,8 +28,77 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is True
 
-    def test_non_overridden_model_type_is_not_forced(self) -> None:
+    def test_qwen35_fp8_conditional_generation_uses_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            quantization_config={"quant_method": "fp8"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    def test_qwen36_fp8_conditional_generation_uses_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+            quantization_config={"quant_method": "fp8"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    def test_qwen35_non_fp8_conditional_generation_skips_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            quantization_config={"quant_method": "mxfp4"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_non_overridden_model_type_is_not_forced_in_auto_mode(self) -> None:
         hf_config = SimpleNamespace(model_type="qwen3_5")
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_text_only_compat_mode_forces_allowlisted_text_backbone(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6MoeForConditionalGeneration"],
+            quantization_config={"quant_method": "fp8"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    def test_text_only_compat_mode_does_not_force_generic_vlm(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        hf_config = SimpleNamespace(model_type="phi3_v")
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_multimodal_native_mode_disables_auto_override(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            quantization_config={"quant_method": "fp8"},
+        )
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
@@ -27,6 +107,11 @@ class TestShouldForceTextBackbone:
         hf_config = SimpleNamespace()
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_none_hf_config_is_not_forced_in_auto_mode(self) -> None:
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(None)
         assert result is False
 
 
@@ -43,11 +128,78 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
+    def test_clears_multimodal_config_for_qwen35_fp8_in_auto_mode(self) -> None:
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                quantization_config={"quant_method": "fp8"},
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_text_only_compat_mode_clears_multimodal_for_allowlisted_vlm(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(
+                model_type="qwen3_6",
+                architectures=["Qwen3_6ForConditionalGeneration"],
+                quantization_config={"quant_method": "fp8"},
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_text_only_compat_mode_preserves_generic_vlm(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        sentinel = SimpleNamespace(language_model_only=False)
+        model_config = SimpleNamespace(
+            multimodal_config=sentinel,
+            hf_config=SimpleNamespace(model_type="phi3_v"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is sentinel
+
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is sentinel
+
+    def test_multimodal_native_mode_preserves_qwen35_fp8_multimodal_config(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        sentinel = SimpleNamespace(language_model_only=False)
+        model_config = SimpleNamespace(
+            multimodal_config=sentinel,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                quantization_config={"quant_method": "fp8"},
+            ),
         )
 
         DefaultModelAdapter().normalize_model_config(model_config)
@@ -63,6 +215,22 @@ class TestNormalizeModelConfig:
         DefaultModelAdapter().normalize_model_config(model_config)
 
         assert model_config.multimodal_config is None
+
+    def test_text_only_compat_mode_preserves_missing_hf_config(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+
+        sentinel = SimpleNamespace(language_model_only=False)
+        model_config = SimpleNamespace(
+            multimodal_config=sentinel,
+            hf_config=None,
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is sentinel
 
 
 class TestTextModel:
