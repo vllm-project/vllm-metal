@@ -19,7 +19,7 @@
 ## Multimodal Serve Modes
 
 - `auto`: use native multimodal loading by default, but fall back to the text-only compatibility path for known-incompatible checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.
-- `text-only-compat`: force multimodal models onto the text-only path when a checkpoint should still serve text generations but native multimodal loading is not ready.
+- `text-only-compat`: force the text-only compatibility path only for known-safe checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers. Other multimodal checkpoints stay on the native multimodal loader.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 
 ## Paged KV vs MLX KV Memory Settings

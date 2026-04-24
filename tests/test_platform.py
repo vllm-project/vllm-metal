@@ -638,7 +638,7 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_check_and_update_config_text_only_compat_forces_generic_vlm(
+    def test_check_and_update_config_text_only_compat_preserves_generic_vlm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
@@ -646,13 +646,14 @@ class TestMetalPlatform:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
         reset_config()
         try:
+            sentinel = SimpleNamespace(language_model_only=False)
             model_config = SimpleNamespace(
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
                 max_model_len=128,
-                multimodal_config=SimpleNamespace(language_model_only=False),
-                hf_config=SimpleNamespace(model_type="qwen3_vl"),
+                multimodal_config=sentinel,
+                hf_config=SimpleNamespace(model_type="phi3_v"),
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -674,7 +675,7 @@ class TestMetalPlatform:
 
             MetalPlatform.check_and_update_config(vllm_config)
 
-            assert model_config.multimodal_config is None
+            assert model_config.multimodal_config is sentinel
 
         finally:
             reset_config()

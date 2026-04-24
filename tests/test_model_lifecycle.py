@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,7 +121,7 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
-    def test_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
+    def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
     ) -> None:
         model_dir = tmp_path / "model"
@@ -144,7 +145,7 @@ class TestModelLifecycle:
             encoding="utf-8",
         )
 
-        with model_lifecycle.mlx_lm_compatible_model_path(str(model_dir)) as compat:
+        with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
             compat_path = Path(compat)
 
             assert compat_path != model_dir
@@ -159,14 +160,14 @@ class TestModelLifecycle:
                 "model-00003-of-00003.safetensors",
             ]
 
-    def test_mlx_lm_compatible_model_path_keeps_standard_model_shards(
+    def test_private_mlx_lm_compatible_model_path_keeps_standard_model_shards(
         self, tmp_path: Path
     ) -> None:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         (model_dir / "model.safetensors").write_text("", encoding="utf-8")
 
-        with model_lifecycle.mlx_lm_compatible_model_path(str(model_dir)) as compat:
+        with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
             assert compat == str(model_dir)
 
     def test_load_uses_adapter_override_for_text_only_multimodal_model(
@@ -195,6 +196,26 @@ class TestModelLifecycle:
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
                     architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+
+    def test_load_uses_adapter_override_for_qwen36_fp8_conditional_generation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _cache_generation_model(monkeypatch, config=_text_config())
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_6",
+                    architectures=["Qwen3_6ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
                 is_multimodal_model=True,
@@ -284,23 +305,64 @@ class TestModelLifecycle:
         assert runner.tokenizer is vlm_tokenizer
         assert runner._is_vlm is True
 
-    def test_load_text_only_compat_mode_forces_generic_vlm_to_text_path(
+    def test_load_text_only_compat_mode_keeps_generic_vlm_native(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
         reset_config()
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _cache_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(text_config=_text_config()),
+            is_vlm=True,
+        )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
-                hf_config=SimpleNamespace(model_type="qwen3_vl"),
+                hf_config=SimpleNamespace(model_type="phi3_v"),
                 is_multimodal_model=True,
             )
         )
 
         lifecycle.load()
 
-        assert runner._is_vlm is False
+        assert runner._is_vlm is True
+
+    @pytest.mark.slow
+    def test_load_text_only_compat_real_qwen_fp8_checkpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = os.environ.get("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH")
+        if not model_path:
+            pytest.skip("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH not set")
+        if not Path(model_path).exists():
+            pytest.skip(f"Model path does not exist: {model_path}")
+
+        from transformers import AutoConfig
+
+        from vllm_metal.compat import _patch_mlx_lm_qwen35_fp8_sanitize
+
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
+        reset_config()
+        model_lifecycle.reset_model_cache()
+        _patch_mlx_lm_qwen35_fp8_sanitize()
+
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                model=model_path,
+                hf_config=hf_config,
+                is_multimodal_model=True,
+            )
+        )
+        try:
+            lifecycle.load()
+
+            assert runner._is_vlm is False
+            assert runner.model is not None
+            assert int(runner.model_args["vocab_size"]) > 0
+        finally:
+            model_lifecycle.reset_model_cache()
 
     def test_load_extracts_text_model_config_from_cached_model(
         self,

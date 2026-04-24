@@ -56,7 +56,7 @@ def _stt_cache_key(model_name: str) -> tuple[str, str]:
 
 
 @contextmanager
-def mlx_lm_compatible_model_path(model_name: str):
+def _mlx_lm_compatible_model_path(model_name: str):
     """Yield a model path compatible with ``mlx_lm.load`` shard discovery.
 
     Some local checkpoints ship valid ``.safetensors`` shards and a
@@ -187,7 +187,7 @@ class ModelLifecycle:
             )
             model, tokenizer = mlx_vlm_load(model_name)
         else:
-            with mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
                 model, tokenizer = mlx_lm_load(
                     compatible_model_name,
                     tokenizer_config={

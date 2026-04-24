@@ -71,6 +71,8 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_6ForConditionalGeneration",
+        "Qwen3_6MoeForConditionalGeneration",
     }
 )
 
@@ -120,7 +122,8 @@ class DefaultModelAdapter(ModelAdapter):
         Modes:
         - ``multimodal-native``: never force compatibility; keep native VLM
           loading active so multimodal support can be developed/tested.
-        - ``text-only-compat``: force the text-only path for multimodal models.
+        - ``text-only-compat``: force the text-only path only for the
+          known-safe compatibility allowlist.
         - ``auto``: apply the compatibility path only for known-incompatible
           checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 wrappers.
         """
@@ -128,7 +131,7 @@ class DefaultModelAdapter(ModelAdapter):
         if multimodal_mode == "multimodal-native":
             return False
         if multimodal_mode == "text-only-compat":
-            return True
+            return self._matches_auto_text_backbone_override(hf_config)
         return self._matches_auto_text_backbone_override(hf_config)
 
     def normalize_model_config(self, model_config: ModelConfig) -> None:

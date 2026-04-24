@@ -53,7 +53,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
     #   text-only compatibility path.
-    # - "text-only-compat": force multimodal models onto the text-only path.
+    # - "text-only-compat": force known-safe multimodal checkpoints onto the
+    #   text-only compatibility path.
     # - "multimodal-native": keep native multimodal loading enabled.
     "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
         "VLLM_METAL_MULTIMODAL_MODE", "auto"
