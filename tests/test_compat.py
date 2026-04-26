@@ -247,8 +247,7 @@ class TestGemma4KvSharedCompatPatch:
                 "o_proj",
             ):
                 assert (
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
-                    in out
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
                 )
         for i in range(24, 42):
             for suffix in ("k_proj", "v_proj", "k_norm"):
@@ -258,8 +257,7 @@ class TestGemma4KvSharedCompatPatch:
                 )
             for suffix in ("q_proj", "q_norm", "o_proj"):
                 assert (
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
-                    in out
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
                 )
 
     def test_drop_helper_is_noop_without_sharing(self) -> None:
