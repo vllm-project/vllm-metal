@@ -27,6 +27,7 @@ from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 if TYPE_CHECKING:
+    from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
 
 logger = init_logger(__name__)
@@ -95,6 +96,10 @@ class MetalWorker(WorkerBase):
 
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True
+
+        # Metal frame-capture profiler — created lazily on the first
+        # profile(is_start=True) call so we pay zero cost when unused.
+        self._metal_profiler: MetalProfilerWrapper | None = None
 
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
@@ -354,8 +359,46 @@ class MetalWorker(WorkerBase):
         except Exception as e:
             raise RuntimeError(f"Metal worker health check failed: {e}") from e
 
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        """Start or stop a Metal frame capture.
+
+        Routed via the engine's ``collective_rpc("profile", ...)``, which is
+        triggered by ``LLM.start_profile`` / ``LLM.stop_profile`` and by the
+        ``POST /start_profile`` / ``POST /stop_profile`` HTTP endpoints. We
+        get all of those for free — only this method needs to exist.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        if profiler_config is None:
+            raise RuntimeError(
+                "Profiling is not enabled. Pass --profiler-config to enable; "
+                "e.g. --profiler-config.profiler=torch "
+                "--profiler-config.torch_profiler_dir=/tmp/metal-trace"
+            )
+
+        if is_start:
+            if self._metal_profiler is None:
+                from vllm.distributed.utils import get_worker_rank_suffix
+
+                from vllm_metal.profiler.wrapper import MetalProfilerWrapper
+
+                rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+                trace_name = (
+                    f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+                )
+                self._metal_profiler = MetalProfilerWrapper(profiler_config, trace_name)
+            self._metal_profiler.start()
+        else:
+            if self._metal_profiler is None:
+                logger.warning("Profiler was not started; nothing to stop.")
+                return
+            self._metal_profiler.stop()
+
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        if self._metal_profiler is not None:
+            self._metal_profiler.shutdown()
+            self._metal_profiler = None
+
         if hasattr(self, "model_runner") and self.model_runner is not None:
             del self.model_runner
             self.model_runner = None

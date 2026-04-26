@@ -70,4 +70,5 @@ nav:
   - Features:
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
+    - GPU Profiling: profiling.md
   - Contributing: CONTRIBUTING.md
