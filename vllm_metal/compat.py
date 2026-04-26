@@ -290,30 +290,34 @@ def _wrap_model_sanitize(
     sentinel_attr: str,
     transform: Callable[[Any, Mapping[str, Any]], Mapping[str, Any]],
 ) -> bool:
-    """Wrap ``model_cls.sanitize`` with a pre-transform, idempotent via sentinel.
+    """Install ``transform`` as a pre-step in ``model_cls.sanitize``.
 
-    ``transform(self, weights) -> weights`` runs before the original ``sanitize``.
-    Returns True on patch, False if already patched or ``sanitize`` is missing.
+    If ``sanitize`` already exists, wrap it: ``transform`` runs first,
+    then the original. If it doesn't exist (mlx_lm treats sanitize as
+    optional — loader uses ``hasattr`` gate), install a fresh sanitize
+    that just runs ``transform``. Either way, the patch's transform is
+    guaranteed to run at load time.
+
+    Idempotent via ``sentinel_attr``. Returns True on first patch, False
+    if the sentinel says we already patched this class.
     """
     sanitize = getattr(model_cls, "sanitize", None)
-    if sanitize is None or getattr(sanitize, sentinel_attr, False):
+    if sanitize is not None and getattr(sanitize, sentinel_attr, False):
         return False
 
-    original_sanitize = sanitize
+    if sanitize is None:
 
-    def _patched_sanitize(self, weights):
-        return original_sanitize(self, transform(self, weights))
+        def _patched_sanitize(self, weights):
+            return transform(self, weights)
+    else:
+        original_sanitize = sanitize
+
+        def _patched_sanitize(self, weights):
+            return original_sanitize(self, transform(self, weights))
 
     setattr(_patched_sanitize, sentinel_attr, True)
     model_cls.sanitize = _patched_sanitize
     return True
-
-
-_GEMMA4_KV_SHARED_DROP_SUFFIXES = (
-    "self_attn.k_proj.weight",
-    "self_attn.v_proj.weight",
-    "self_attn.k_norm.weight",
-)
 
 
 def _drop_gemma4_kv_shared_phantom_weights(
@@ -331,17 +335,16 @@ def _drop_gemma4_kv_shared_phantom_weights(
         return dict(weights)
 
     first_shared = num_hidden_layers - num_kv_shared_layers
-    out: dict[str, Any] = {}
-    for key, value in weights.items():
-        if key.endswith(_GEMMA4_KV_SHARED_DROP_SUFFIXES):
-            try:
-                layer_idx = int(key.split(".layers.", 1)[1].split(".", 1)[0])
-            except (IndexError, ValueError):
-                layer_idx = -1
-            if layer_idx >= first_shared:
-                continue
-        out[key] = value
-    return out
+    # Generate the exact tails for every (shared_layer, suffix) pair.
+    # A key is dropped iff it ends with one of these — no parsing, no
+    # fallback, no ambiguity. Unrelated keys (e.g. "model.weird.self_attn
+    # .k_proj.weight") cannot match because the tail mandates ".layers.<N>.".
+    drop_tails = tuple(
+        f".layers.{i}.self_attn.{suffix}.weight"
+        for i in range(first_shared, num_hidden_layers)
+        for suffix in ("k_proj", "v_proj", "k_norm")
+    )
+    return {k: v for k, v in weights.items() if not k.endswith(drop_tails)}
 
 
 def _patch_mlx_lm_gemma4_kv_shared_sanitize() -> None:

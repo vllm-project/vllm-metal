@@ -172,11 +172,22 @@ def prepare_sdpa_qkv(
     # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
     q_proj_out = inner.q_proj(x)
     gate: mx.array | None = None
-    head_dim = (
-        inner.head_dim
-        if hasattr(inner, "head_dim")
-        else inner.k_proj.weight.shape[0] // n_kv_heads
-    )
+    # head_dim has two architectural sources in our supported models:
+    #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+)
+    #   - k_proj.weight.shape (qwen3, qwen3_moe never set self.head_dim)
+    # KV-shared Gemma 4 layers have head_dim but no k_proj. If neither
+    # is present, raise — silently propagating a wrong head_dim would
+    # corrupt downstream kernel shapes.
+    if hasattr(inner, "head_dim"):
+        head_dim = inner.head_dim
+    elif hasattr(inner, "k_proj"):
+        head_dim = inner.k_proj.weight.shape[0] // n_kv_heads
+    else:
+        raise AttributeError(
+            f"Cannot determine head_dim for "
+            f"{type(inner).__module__}.{type(inner).__name__}: "
+            "neither 'head_dim' nor 'k_proj' attribute present"
+        )
     q_full_head = q_proj_out.shape[-1] // n_heads
     if q_full_head == 2 * head_dim:
         q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
