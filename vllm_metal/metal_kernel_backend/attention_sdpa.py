@@ -172,7 +172,11 @@ def prepare_sdpa_qkv(
     # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
     q_proj_out = inner.q_proj(x)
     gate: mx.array | None = None
-    head_dim = inner.k_proj.weight.shape[0] // n_kv_heads
+    head_dim = (
+        inner.head_dim
+        if hasattr(inner, "head_dim")
+        else inner.k_proj.weight.shape[0] // n_kv_heads
+    )
     q_full_head = q_proj_out.shape[-1] // n_heads
     if q_full_head == 2 * head_dim:
         q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
