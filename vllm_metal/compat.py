@@ -211,30 +211,28 @@ def _wrap_model_sanitize(
     sentinel_attr: str,
     transform: Callable[[Any, Mapping[str, Any]], Mapping[str, Any]],
 ) -> bool:
-    """Install ``transform`` as a pre-step in ``model_cls.sanitize``.
+    """Wrap an existing ``model_cls.sanitize`` with a pre-step ``transform``.
 
-    If ``sanitize`` already exists, wrap it: ``transform`` runs first,
-    then the original. If it doesn't exist (mlx_lm treats sanitize as
-    optional — loader uses ``hasattr`` gate), install a fresh sanitize
-    that just runs ``transform``. Either way, the patch's transform is
-    guaranteed to run at load time.
+    Trusts upstream's ``Model.sanitize`` contract: if the class does not
+    already define ``sanitize``, returns False instead of synthesizing a
+    new method. All current targets (qwen3_5, qwen3_5_moe, gemma4_text)
+    define ``sanitize`` upstream, so synthesizing one would be a
+    speculative API rather than a real compatibility shim.
 
     Idempotent via ``sentinel_attr``. Returns True on first patch, False
-    if the sentinel says we already patched this class.
+    if there is no ``sanitize`` to wrap or the sentinel says we already
+    patched this class.
     """
     sanitize = getattr(model_cls, "sanitize", None)
-    if sanitize is not None and getattr(sanitize, sentinel_attr, False):
+    if sanitize is None:
+        return False
+    if getattr(sanitize, sentinel_attr, False):
         return False
 
-    if sanitize is None:
+    original_sanitize = sanitize
 
-        def _patched_sanitize(self, weights):
-            return transform(self, weights)
-    else:
-        original_sanitize = sanitize
-
-        def _patched_sanitize(self, weights):
-            return original_sanitize(self, transform(self, weights))
+    def _patched_sanitize(self, weights):
+        return original_sanitize(self, transform(self, weights))
 
     setattr(_patched_sanitize, sentinel_attr, True)
     model_cls.sanitize = _patched_sanitize

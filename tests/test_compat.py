@@ -317,3 +317,18 @@ class TestGemma4KvSharedCompatPatch:
 
         assert once is twice
         assert getattr(twice, "_vllm_metal_gemma4_kv_shared_patch", False) is True
+
+
+class TestWrapModelSanitize:
+    def test_returns_false_when_class_has_no_sanitize(self) -> None:
+        class ModelWithoutSanitize:
+            pass
+
+        applied = compat._wrap_model_sanitize(
+            ModelWithoutSanitize,
+            "_vllm_metal_test_patch",
+            lambda _self, weights: weights,
+        )
+
+        assert applied is False
+        assert not hasattr(ModelWithoutSanitize, "sanitize")
