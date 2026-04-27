@@ -43,6 +43,7 @@ class MetalConfig:
     mlx_device: Literal["gpu", "cpu"]
     debug: bool
     use_paged_attention: bool = True
+    kv_sharing_fast_prefill: bool = False
     multimodal_mode: MultimodalMode = "auto"
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
@@ -55,6 +56,12 @@ class MetalConfig:
                 "supported with paged attention (the default). "
                 "The MLX KV cache path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
                 "requires VLLM_METAL_MEMORY_FRACTION=auto."
+            )
+
+        if self.kv_sharing_fast_prefill and not self.use_paged_attention:
+            raise ValueError(
+                "VLLM_METAL_KV_SHARING_FAST_PREFILL requires paged attention. "
+                "Enable VLLM_METAL_USE_PAGED_ATTENTION=1 or leave fast prefill off."
             )
 
         if self.use_paged_attention and not self.is_auto_memory:
@@ -122,6 +129,7 @@ class MetalConfig:
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
             debug=envs.VLLM_METAL_DEBUG,
             use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
+            kv_sharing_fast_prefill=envs.VLLM_METAL_KV_SHARING_FAST_PREFILL,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
         )
 

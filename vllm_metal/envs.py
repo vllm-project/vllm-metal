@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
+    VLLM_METAL_KV_SHARING_FAST_PREFILL: bool = False
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_PREFIX_CACHE: bool = False
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
@@ -45,6 +46,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use native Metal paged attention (default True).
     "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
         os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
+    ),
+    # Experimental YOCO/KV-sharing fast prefill. Default off.
+    "VLLM_METAL_KV_SHARING_FAST_PREFILL": lambda: (
+        os.getenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "0") == "1"
     ),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
