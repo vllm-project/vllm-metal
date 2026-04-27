@@ -174,3 +174,146 @@ class TestQwen35Fp8CompatPatch:
         assert f"{gate_up_proj_prefix}.weight_scale_inv" not in sanitized
         assert f"{gate_up_proj_prefix}.activation_scale" not in sanitized
         assert sanitized[f"{gate_up_proj_prefix}.weight"].shape == (2, 256, 128)
+
+
+def _install_fake_gemma4_text_module(
+    monkeypatch,
+    *,
+    num_hidden_layers: int,
+    num_kv_shared_layers: int,
+):
+    mlx_lm_pkg = ModuleType("mlx_lm")
+    mlx_lm_models = ModuleType("mlx_lm.models")
+    mlx_lm_pkg.models = mlx_lm_models
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", mlx_lm_models)
+
+    module = ModuleType("mlx_lm.models.gemma4_text")
+
+    class FakeArgs:
+        def __init__(self) -> None:
+            self.num_hidden_layers = num_hidden_layers
+            self.num_kv_shared_layers = num_kv_shared_layers
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.args = FakeArgs()
+
+        def sanitize(self, weights):
+            return dict(weights)
+
+    module.Model = FakeModel
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gemma4_text", module)
+    mlx_lm_models.gemma4_text = module
+
+    def _fake_find_spec(name: str):
+        if name == "mlx_lm.models.gemma4_text":
+            return object()
+        return None
+
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+    return module
+
+
+class TestGemma4KvSharedCompatPatch:
+    def test_drop_helper_removes_54_phantom_keys_for_e4b_layout(self) -> None:
+        # E4B: 42 layers total, last 18 are KV-shared.
+        weights = {}
+        for i in range(42):
+            for suffix in (
+                "k_proj",
+                "v_proj",
+                "k_norm",
+                "q_proj",
+                "q_norm",
+                "o_proj",
+            ):
+                weights[
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
+                ] = f"T{i}_{suffix}"
+
+        out = compat._drop_gemma4_kv_shared_phantom_weights(
+            weights, num_hidden_layers=42, num_kv_shared_layers=18
+        )
+
+        assert len(weights) - len(out) == 54
+        for i in range(24):
+            for suffix in (
+                "k_proj",
+                "v_proj",
+                "k_norm",
+                "q_proj",
+                "q_norm",
+                "o_proj",
+            ):
+                assert (
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
+                )
+        for i in range(24, 42):
+            for suffix in ("k_proj", "v_proj", "k_norm"):
+                assert (
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
+                    not in out
+                )
+            for suffix in ("q_proj", "q_norm", "o_proj"):
+                assert (
+                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
+                )
+
+    def test_drop_helper_is_noop_without_sharing(self) -> None:
+        weights = {
+            "language_model.model.layers.0.self_attn.k_proj.weight": "T",
+            "language_model.model.layers.41.self_attn.k_proj.weight": "T",
+        }
+        out = compat._drop_gemma4_kv_shared_phantom_weights(
+            weights, num_hidden_layers=42, num_kv_shared_layers=0
+        )
+        assert out == weights
+
+    def test_drop_helper_ignores_unrelated_or_malformed_keys(self) -> None:
+        weights = {
+            "language_model.model.layers.30.self_attn.q_proj.weight": "keep",
+            "language_model.model.weird.self_attn.k_proj.weight": "keep",
+            "language_model.model.layers.5.self_attn.k_proj.weight": "keep",
+            "language_model.model.layers.30.self_attn.k_proj.weight": "drop",
+        }
+        out = compat._drop_gemma4_kv_shared_phantom_weights(
+            weights, num_hidden_layers=42, num_kv_shared_layers=18
+        )
+        assert "language_model.model.layers.30.self_attn.k_proj.weight" not in out
+        assert "language_model.model.layers.30.self_attn.q_proj.weight" in out
+        assert "language_model.model.weird.self_attn.k_proj.weight" in out
+        assert "language_model.model.layers.5.self_attn.k_proj.weight" in out
+
+    def test_patch_wraps_gemma4_text_sanitize_and_drops_phantom_keys(
+        self, monkeypatch
+    ) -> None:
+        module = _install_fake_gemma4_text_module(
+            monkeypatch, num_hidden_layers=42, num_kv_shared_layers=18
+        )
+
+        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
+
+        weights = {
+            "language_model.model.layers.0.self_attn.k_proj.weight": "T",
+            "language_model.model.layers.30.self_attn.k_proj.weight": "phantom",
+            "language_model.model.layers.30.self_attn.q_proj.weight": "real",
+        }
+        sanitized = module.Model().sanitize(weights)
+
+        assert "language_model.model.layers.30.self_attn.k_proj.weight" not in sanitized
+        assert "language_model.model.layers.0.self_attn.k_proj.weight" in sanitized
+        assert "language_model.model.layers.30.self_attn.q_proj.weight" in sanitized
+
+    def test_patch_is_idempotent(self, monkeypatch) -> None:
+        module = _install_fake_gemma4_text_module(
+            monkeypatch, num_hidden_layers=42, num_kv_shared_layers=18
+        )
+
+        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
+        once = module.Model.sanitize
+        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
+        twice = module.Model.sanitize
+
+        assert once is twice
+        assert getattr(twice, "_vllm_metal_gemma4_kv_shared_patch", False) is True

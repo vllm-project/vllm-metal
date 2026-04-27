@@ -17,11 +17,18 @@ from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
+from vllm_metal.compat import apply_compat_patches
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.model_adapter import ModelAdapter
+
+# Engine-core subprocesses don't always re-invoke `vllm_metal._register()`,
+# so the compat patches applied there may be missing here. Reapply on import
+# (idempotent via the `_APPLIED` guard in compat.py) to ensure mlx_lm sanitize
+# patches are in place before any model load.
+apply_compat_patches()
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
