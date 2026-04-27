@@ -98,7 +98,7 @@ Profiler behavior is controlled via vLLM's `--profiler-config` flags (or the `pr
 |-------|---------|-------------|
 | `torch_profiler_dir` | (required) | Output directory for the `.gputrace` bundle |
 
-Other `ProfilerConfig` fields (`torch_profiler_with_stack`, `torch_profiler_record_shapes`, `delay_iterations`, `max_iterations`, etc.) are torch-profiler-specific and **have no effect** on Metal frame capture in the current implementation. To bound the captured work, control it from the request side (small `max_tokens`, short prompts) rather than via profiler config.
+The `delay_iterations` and `max_iterations` scheduling fields are **rejected** at `start_profile` time — Metal frame capture is manual start/stop only. To bound captured work, use small `max_tokens` and short prompts. Other torch-profiler-specific fields (`torch_profiler_with_stack`, `torch_profiler_record_shapes`, etc.) have no effect on the `.gputrace` output.
 
 ### Recommended starting recipe
 

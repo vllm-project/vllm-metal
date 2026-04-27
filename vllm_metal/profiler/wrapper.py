@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal frame-capture wrapper for vLLM's WorkerProfiler abstraction.
 
-Subclasses ``vllm.profiler.wrapper.WorkerProfiler`` so that the entire
-upstream profiling surface — ``LLM.start_profile`` / ``LLM.stop_profile``,
-the ``/start_profile`` and ``/stop_profile`` HTTP endpoints, the engine's
-``collective_rpc("profile", ...)`` plumbing, and the ``delay_iterations`` /
-``max_iterations`` state machine — routes through unchanged.
+Subclasses ``vllm.profiler.wrapper.WorkerProfiler`` so that the manual
+start/stop surface — ``LLM.start_profile`` / ``LLM.stop_profile``, the
+``/start_profile`` and ``/stop_profile`` HTTP endpoints, and the engine's
+``collective_rpc("profile", ...)`` plumbing — routes through unchanged.
 
 Only the two abstract methods need bodies: ``_start`` calls
 ``mlx.metal.start_capture`` and ``_stop`` calls ``mlx.metal.stop_capture``.
 The output is a ``.gputrace`` bundle that opens directly in Xcode (the same
 artifact Xcode's "Capture GPU Frame" produces).
+
+The ``delay_iterations`` / ``max_iterations`` scheduling fields are
+**rejected** at construction time: they are advanced by
+``WorkerProfiler.step()``, which the metal worker never calls.
 
 Apple gates frame capture behind ``MTL_CAPTURE_ENABLED=1`` in the process
 environment.  We check that up front and raise with an actionable message;
@@ -38,6 +41,19 @@ class MetalProfilerWrapper(WorkerProfiler):
     """
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
+        # delay_iterations / max_iterations are advanced by
+        # WorkerProfiler.step(), which the metal worker never calls. Reject
+        # up front rather than letting them silently no-op.
+        if profiler_config.delay_iterations > 0 or profiler_config.max_iterations > 0:
+            raise ValueError(
+                "Metal frame capture does not support delay_iterations or "
+                "max_iterations — the metal worker does not pump "
+                "WorkerProfiler.step(), so those scheduling knobs are inert. "
+                "Use start_profile / stop_profile to bracket the work "
+                "manually, and bound capture via short prompts and small "
+                "max_tokens."
+            )
+
         super().__init__(profiler_config)
 
         if os.environ.get("MTL_CAPTURE_ENABLED") != "1":
