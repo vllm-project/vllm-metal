@@ -7,15 +7,9 @@ vllm-metal supports two complementary profiling paths on Apple Silicon. **Pick t
 | Per-kernel **timing**, GPU utilization, CPU/GPU correlation | `xctrace record --template "Metal System Trace"` | `.trace` bundle, opens in **Instruments.app** |
 | Captured **command list**, kernel dependencies, buffer state inspection (correctness debugging) | The plugin's `MetalProfilerWrapper` (start/stop frame capture) | `.gputrace` bundle, opens in **Xcode** |
 
-**In short: for "how fast?" use xctrace. For "what ran, in what order, on what state?" use frame capture.** The two tools are not interchangeable — frame capture's per-kernel timing requires a *replay pass* that does not scale to LLM workloads (replaying 30,000 dispatches with 20+ GiB of buffer state will lock up your machine). Performance-counter analysis on Apple Silicon for inference-scale workloads should always go through `xctrace`, not frame-capture replay.
+Frame capture is in-process (the plugin's `MetalProfilerWrapper` plugs into vLLM's `LLM.start_profile` / `/start_profile` endpoints and calls `mlx.metal.start_capture` underneath). `xctrace` is a system tool that wraps the whole process from outside, so it needs no plugin support — see [System-wide tracing](#system-wide-tracing-with-instruments) for that recipe.
 
-The plugin only ships an in-process driver for the **frame capture** path — `xctrace` is a system tool that wraps the whole process from outside, so it needs no plugin support. See [System-wide tracing](#system-wide-tracing-with-instruments) for the recommended xctrace recipe.
-
-## Frame capture (in-process)
-
-The plugin's `MetalProfilerWrapper` plugs into vLLM's existing profiler abstraction, so the standard `LLM.start_profile()` / `LLM.stop_profile()` API and the `POST /start_profile` / `POST /stop_profile` HTTP endpoints both route through it without modification. Underneath, it calls `mlx.metal.start_capture` / `stop_capture` (Apple's `MTLCaptureManager`).
-
-**Use this for correctness debugging**, not timing. See [When frame capture's replay hits a wall](#when-frame-captures-replay-hits-a-wall) below for the size-limit caveat.
+Frame capture produces a richer artifact (full state, per-dispatch counters via Profile replay) but requires bounded captures — see the [recommended recipe](#recommended-starting-recipe) for sizing. `xctrace` is lower-overhead and handles long-running workloads but only gives you wall-clock timing.
 
 ## Prerequisites
 
@@ -83,20 +77,15 @@ This launches Xcode and loads the **GPU Frame Debugger**. Useful views (in the l
 |------|--------------|---------------------|
 | **Summary** | Command-buffer counts, total command count, high-level workload overview | No |
 | **Dependencies** | Graph view of buffer-to-buffer dependencies. MLX's docs recommend this view for understanding kernel ordering. | No |
-| **Performance** | Per-dispatch GPU time, memory bandwidth, occupancy. | **Yes — see below** |
+| **Performance** | Per-dispatch GPU time, memory bandwidth, occupancy. Click **Profile…** once to populate; replays the trace (a few minutes). Safe on traces from the [recommended recipe](#recommended-starting-recipe); see warning below. | **Yes** |
 | **Memory** | Buffer contents and Metal heap allocations at any point in the trace. Useful for debugging numerical issues and inspecting KV cache layout. | No |
 | **Frame Navigator** (the API call list) | Hierarchical list of `MTLCommandBuffer` → `MTLComputeCommandEncoder` → individual `dispatchThreadgroups` calls. The compute dispatches are nested inside the encoders — not at the top level. | No |
 
-### When frame capture's replay hits a wall
+### Don't click Profile on default-config traces
 
-When you click **Performance** on a freshly opened `.gputrace`, Xcode shows *"Performance data not available"* with a **Profile…** button. The button **replays** the captured commands on your GPU with performance counters on. For game-style frames (a few hundred dispatches, ~100 MB of buffer state) this completes in seconds. **For LLM inference, it will not complete.** A typical capture from this plugin is 30,000+ dispatches and 20+ GiB of buffer state — replay has to re-allocate all of that on the GPU and re-execute every kernel sequentially with counter sampling. Your machine will run out of memory and lock up before the replay finishes.
+The **Profile…** button replays the captured commands with counters enabled — fine for traces produced by the [recommended recipe](#recommended-starting-recipe) (~2 GB, replay takes a few minutes). It will lock up your machine on a default-config trace, where the engine has 20+ GiB of paged-attention KV state captured: replay tries to re-allocate all of that on the GPU at once. If Xcode beachballs after Profile, force-quit and re-run with `VLLM_METAL_MEMORY_FRACTION=0.1`.
 
-**Don't click Profile… on full-engine traces.** Either:
-
-- Use the [system-wide xctrace path](#system-wide-tracing-with-instruments) for timing — that's what it's for.
-- Or, if you specifically need replay, [shrink the trace first](#shrinking-the-frame-capture-window) so it fits.
-
-The non-replay panes (**Summary**, **Dependencies**, **Memory**, and the Frame Navigator) all work without ever clicking Profile…. They give you the captured command graph, kernel order, and buffer state immediately.
+The non-replay panes (Summary, Dependencies, Memory, Frame Navigator) work on any trace size without clicking Profile.
 
 ### Finding specific kernels
 
@@ -154,17 +143,7 @@ What this recipe gets you (measured numbers, Qwen3-0.6B, M-series, 10 tokens gen
 | **Resulting trace size** | **~2.2 GB on disk** |
 | **Capture wall-clock** | **~49 s** |
 
-That trace is fully usable for static analysis (Summary, Dependencies, kernel ordering, buffer inspection). It is **still too large for Xcode's Profile (replay) button** — see [When frame capture's replay hits a wall](#when-frame-captures-replay-hits-a-wall). For per-kernel timing, use `xctrace` instead (next section).
-
-### Pushing further
-
-If you specifically need an Xcode replay (i.e. you really want the Performance pane populated), you need to push trace size below ~500 MB. Combine all three of:
-
-- `VLLM_METAL_MEMORY_FRACTION=0.05` (or smaller) — further KV shrink
-- `--max-model-len=128` — caps the per-request KV allocation independent of `MEMORY_FRACTION`
-- `max_tokens=1` from the API — single decode step
-
-Even with all three, expect a few hundred MB. There is no realistic path to making full-engine captures replay-able; that's an Apple-tool scaling limit, not a config-tuning problem.
+This trace is small enough for **all** of Xcode's panes — including Profile/replay for per-kernel timing. The KV-cache shrink (22 GB → 0.58 GB) is what makes replay feasible: the captured GPU heap state has to fit when replay re-allocates it. Without `VLLM_METAL_MEMORY_FRACTION=0.1`, Profile will lock up your machine.
 
 ## Caveats
 
@@ -172,7 +151,7 @@ Even with all three, expect a few hundred MB. There is no realistic path to maki
 
 **Traces are large.** A single forward pass through Qwen3-0.6B (28 layers) produces a ~2.6 GB `.gputrace` bundle on disk (the logical size, summed across the 30k+ captured buffers, is much higher — Metal uses sparse files). Larger models and longer captures grow accordingly. Make sure your trace dir has space.
 
-**Xcode load time scales with trace size.** Bundles over a few GB take noticeably longer to open. The static panes (Summary, Dependencies, Memory) load fine on multi-GB traces; the **Profile / replay pass does not** — see [When frame capture's replay hits a wall](#when-frame-captures-replay-hits-a-wall). If Xcode beachballs after you click Profile, force-quit and re-run with a smaller `max_tokens` and/or lower `VLLM_METAL_MEMORY_FRACTION`.
+**Xcode replay needs the KV cache shrunk.** The Profile/replay pass re-allocates all captured GPU heap state. Without `VLLM_METAL_MEMORY_FRACTION=0.1` (or smaller), the replay will try to re-allocate the engine's full ~22 GiB paged-attention cache and lock up your machine. The recommended recipe avoids this. Static panes (Summary, Dependencies, Memory) work regardless.
 
 **`MTL_CAPTURE_ENABLED` cannot be set lazily.** Apple's framework reads it once at process startup. Our wrapper checks for it in the worker subprocess and raises a clear error if missing. If you forget to set it, you'll see:
 
@@ -196,11 +175,3 @@ xctrace record --template "Metal System Trace" --launch -- \
 
 This produces a `.trace` file (different format from `.gputrace`) that opens in **Instruments.app** (ships with Xcode), giving timeline tracks for both Metal commands and surrounding CPU work.
 
-## Architecture Notes
-
-For contributors:
-
-- The Metal-specific code lives entirely in `vllm_metal/profiler/wrapper.py` (~65 lines). It subclasses `vllm.profiler.wrapper.WorkerProfiler` and implements only `_start` (calls `mx.metal.start_capture`) and `_stop` (calls `mx.metal.stop_capture`).
-- `MetalWorker.profile()` in `vllm_metal/v1/worker.py` is the entry point reached by the engine's `collective_rpc("profile", ...)`. It lazily constructs the wrapper on first `start_profile` and reuses it on subsequent starts.
-- The state machine for `delay_iterations` / `max_iterations` is inherited from `WorkerProfiler` but **not yet wired** — these fields are no-ops in the current implementation because `MetalWorker` doesn't yet expose `annotate_profile()`, so the engine never calls `WorkerProfiler.step()`. To bound the captured work, callers should use `max_tokens` on `SamplingParams` (offline) or send shorter requests during the start/stop window (server). Wiring `step()` is straightforward future work.
-- After editing any source file, run `maturin develop` to relink. Engine workers run in a separate subprocess and load from `site-packages`, so non-editable installs cause stale code to be loaded silently.
