@@ -22,6 +22,13 @@ _WARNED_FALLBACK_ATTR = "_vllm_metal_yoco_fast_prefill_warned_fallback"
 logger = logging.getLogger(__name__)
 
 
+def _get_int_model_arg(model_args: Mapping[str, object], key: str) -> int | None:
+    value = model_args.get(key, 0)
+    if not isinstance(value, int):
+        return None
+    return value
+
+
 @dataclass(frozen=True)
 class YocoReducedContextMetadata:
     """Reduced-query metadata for YOCO cross-decoder fast prefill.
@@ -59,10 +66,9 @@ def is_yoco_fast_prefill_eligible(
     if model_type not in _GEMMA4_MODEL_TYPES:
         return False
 
-    try:
-        num_layers = int(model_args.get("num_hidden_layers", 0))
-        num_shared = int(model_args.get("num_kv_shared_layers", 0))
-    except (TypeError, ValueError):
+    num_layers = _get_int_model_arg(model_args, "num_hidden_layers")
+    num_shared = _get_int_model_arg(model_args, "num_kv_shared_layers")
+    if num_layers is None or num_shared is None:
         return False
 
     return 0 < num_shared < num_layers
