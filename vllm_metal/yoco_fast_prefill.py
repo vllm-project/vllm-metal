@@ -23,10 +23,41 @@ logger = logging.getLogger(__name__)
 
 
 def _get_int_model_arg(model_args: Mapping[str, object], key: str) -> int | None:
-    value = model_args.get(key, 0)
+    value = model_args.get(key)
     if not isinstance(value, int):
         return None
     return value
+
+
+def get_yoco_fast_prefill_ineligibility_reason(
+    model_args: Mapping[str, object],
+    *,
+    use_paged_attention: bool,
+) -> str | None:
+    """Return a human-readable reason why Gemma4 YOCO fast prefill is disabled."""
+    if not use_paged_attention:
+        return "paged attention is disabled"
+
+    model_type = model_args.get("model_type")
+    if model_type not in _GEMMA4_MODEL_TYPES:
+        return f"model_type={model_type!r} is not Gemma4"
+
+    num_layers = _get_int_model_arg(model_args, "num_hidden_layers")
+    if num_layers is None:
+        return "num_hidden_layers is missing or not an int"
+
+    num_shared = _get_int_model_arg(model_args, "num_kv_shared_layers")
+    if num_shared is None:
+        return "num_kv_shared_layers is missing or not an int"
+
+    if num_shared <= 0:
+        return "num_kv_shared_layers must be positive"
+    if num_shared >= num_layers:
+        return (
+            "num_kv_shared_layers must be smaller than num_hidden_layers "
+            f"({num_shared} >= {num_layers})"
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -59,19 +90,13 @@ def is_yoco_fast_prefill_eligible(
     attention.  Keep this predicate intentionally narrow until runtime
     correctness is proven and benchmarked.
     """
-    if not use_paged_attention:
-        return False
-
-    model_type = model_args.get("model_type")
-    if model_type not in _GEMMA4_MODEL_TYPES:
-        return False
-
-    num_layers = _get_int_model_arg(model_args, "num_hidden_layers")
-    num_shared = _get_int_model_arg(model_args, "num_kv_shared_layers")
-    if num_layers is None or num_shared is None:
-        return False
-
-    return 0 < num_shared < num_layers
+    return (
+        get_yoco_fast_prefill_ineligibility_reason(
+            model_args,
+            use_paged_attention=use_paged_attention,
+        )
+        is None
+    )
 
 
 def build_yoco_reduced_context_from_full_metadata(
@@ -394,7 +419,6 @@ def _gemma4_text_fast_prefill_call(
         context_lens=meta.context_lens,
         offsets=meta.offsets,
         cu_seqlens=meta.cu_seqlens,
-        gdn_slot_mapping=ctx.gdn_slot_mapping,
     )
 
     set_context(reduced_ctx)

@@ -588,23 +588,23 @@ class WorkerCachePlanner:
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
         if config.kv_sharing_fast_prefill:
-            from vllm_metal.yoco_fast_prefill import patch_gemma4_yoco_fast_prefill
+            from vllm_metal.yoco_fast_prefill import (
+                get_yoco_fast_prefill_ineligibility_reason,
+                patch_gemma4_yoco_fast_prefill,
+            )
 
-            try:
-                expected_layers = int(
-                    self._worker.model_runner.model_args.get("num_hidden_layers", 0)
-                )
-            except (TypeError, ValueError):
-                expected_layers = 0
+            reason = get_yoco_fast_prefill_ineligibility_reason(
+                self._worker.model_runner.model_args,
+                use_paged_attention=config.use_paged_attention,
+            )
 
             fast_prefill_patched = False
-            if expected_layers and n_patched < expected_layers:
+            if reason is not None:
                 logger.warning(
                     "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-                    "but only %d/%d layers use paged attention; "
+                    "but fast prefill is ineligible for this model (%s); "
                     "continuing without fast prefill",
-                    n_patched,
-                    expected_layers,
+                    reason,
                 )
             else:
                 fast_prefill_patched = patch_gemma4_yoco_fast_prefill(
@@ -617,7 +617,7 @@ class WorkerCachePlanner:
                     "Gemma4 YOCO fast prefill enabled "
                     "(VLLM_METAL_KV_SHARING_FAST_PREFILL=1)"
                 )
-            elif not (expected_layers and n_patched < expected_layers):
+            elif reason is None:
                 logger.warning(
                     "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
                     "but this model is not eligible; continuing without fast prefill"

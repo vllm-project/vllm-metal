@@ -7,6 +7,7 @@ import pytest
 
 from vllm_metal.yoco_fast_prefill import (
     build_yoco_reduced_context_from_full_metadata,
+    get_yoco_fast_prefill_ineligibility_reason,
     is_yoco_fast_prefill_eligible,
     patch_gemma4_yoco_fast_prefill,
 )
@@ -53,6 +54,19 @@ def test_ineligible_without_paged_attention() -> None:
     )
 
 
+def test_ineligibility_reason_reports_missing_num_hidden_layers() -> None:
+    assert (
+        get_yoco_fast_prefill_ineligibility_reason(
+            {
+                "model_type": "gemma4",
+                "num_kv_shared_layers": 18,
+            },
+            use_paged_attention=True,
+        )
+        == "num_hidden_layers is missing or not an int"
+    )
+
+
 def test_reduced_context_from_full_paged_metadata() -> None:
     meta = build_yoco_reduced_context_from_full_metadata(
         slot_mapping=[
@@ -84,6 +98,21 @@ def test_reduced_context_from_full_paged_metadata() -> None:
     assert meta.context_lens == [7, 2, 5, 8]
     assert meta.offsets == [6, 1, 4, 7]
     assert meta.cu_seqlens == [0, 1, 2, 3, 4]
+
+
+def test_mlx_slice_assignment_writes_in_place() -> None:
+    import mlx.core as mx
+
+    h = mx.zeros((1, 5, 2), dtype=mx.float32)
+    selected = mx.array([1, 3], dtype=mx.int32)
+    cross_h = mx.array([[[7.0, 8.0], [9.0, 10.0]]], dtype=mx.float32)
+
+    h[:, selected, :] = cross_h
+    mx.eval(h)
+
+    assert h[0, 0, 0].item() == 0.0
+    assert h[0, 1, 0].item() == 7.0
+    assert h[0, 3, 0].item() == 9.0
 
 
 def test_reduced_context_from_empty_full_paged_metadata() -> None:
@@ -138,6 +167,7 @@ def test_patch_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
                     "tokens": h.shape[1],
                     "cu_seqlens": tuple(ctx.cu_seqlens),
                     "offsets": tuple(ctx.offsets),
+                    "gdn_slot_mapping": ctx.gdn_slot_mapping,
                 }
             )
             return h + (self.layer_idx + 1), (f"k{self.layer_idx}", "v"), offset
@@ -195,6 +225,7 @@ def test_patch_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
         context_lens=[5],
         offsets=[0],
         cu_seqlens=[0, 5],
+        gdn_slot_mapping=[17],
     )
     set_context(ctx)
     try:
@@ -207,6 +238,9 @@ def test_patch_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
     assert [layer.calls[0]["tokens"] for layer in text_model.layers] == [5, 5, 1, 1]
     assert text_model.layers[2].calls[0]["cu_seqlens"] == (0, 1)
     assert text_model.layers[2].calls[0]["offsets"] == (4,)
+    assert text_model.layers[0].calls[0]["gdn_slot_mapping"] == [17]
+    assert text_model.layers[2].calls[0]["gdn_slot_mapping"] is None
+    assert text_model.layers[3].calls[0]["gdn_slot_mapping"] is None
     assert out[0, 0, 0].item() == 3
     assert out[0, 4, 0].item() == 10
 
