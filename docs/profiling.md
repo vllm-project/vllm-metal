@@ -1,15 +1,10 @@
 # GPU Profiling on Apple Silicon
 
-vllm-metal supports two complementary profiling paths on Apple Silicon. **Pick the right one for your goal:**
+vllm-metal ships an in-process **frame-capture profiler** that records every Metal command issued during inference. Captures open in Xcode's GPU Frame Debugger and give you per-kernel GPU timing (via the **Profile** button), command ordering, and full buffer state — everything you typically want for both performance and correctness debugging on Apple Silicon. **This is the recommended path.**
 
-| If you want… | Use | Output |
-|---|---|---|
-| Per-kernel **timing**, GPU utilization, CPU/GPU correlation | `xctrace record --template "Metal System Trace"` | `.trace` bundle, opens in **Instruments.app** |
-| Captured **command list**, kernel dependencies, buffer state inspection (correctness debugging) | The plugin's `MetalProfilerWrapper` (start/stop frame capture) | `.gputrace` bundle, opens in **Xcode** |
+The profiler plugs into vLLM's standard profiler API — `LLM.start_profile()`, the `POST /start_profile` HTTP endpoint, etc. — and calls `mlx.metal.start_capture` underneath. Captures must be bounded (see the [recommended recipe](#recommended-starting-recipe)).
 
-Frame capture is in-process (the plugin's `MetalProfilerWrapper` plugs into vLLM's `LLM.start_profile` / `/start_profile` endpoints and calls `mlx.metal.start_capture` underneath). `xctrace` is a system tool that wraps the whole process from outside, so it needs no plugin support — see [System-wide tracing](#system-wide-tracing-with-instruments) for that recipe.
-
-Frame capture produces a richer artifact (full state, per-dispatch counters via Profile replay) but requires bounded captures — see the [recommended recipe](#recommended-starting-recipe) for sizing. `xctrace` is lower-overhead and handles long-running workloads but only gives you wall-clock timing.
+For users already familiar with Apple's Instruments.app, Apple's `xctrace` is available as a lower-overhead, whole-process alternative for wall-clock and GPU-utilization views — see [Advanced: xctrace](#advanced-xctrace) at the end. It's a different mental model and doesn't surface MLX kernel names; reach for it only if you already know how to read Metal System Trace.
 
 ## Prerequisites
 
@@ -95,8 +90,6 @@ The top-level entries in Frame Navigator are MLX's heap-buffer operations (`Buff
 - Or change the **"Group by API Call"** dropdown above the Frame Navigator to a different grouping (e.g. by encoder) if you find the default too verbose.
 - Compute dispatches always live inside an `MTLComputeCommandEncoder` — expand those to see the kernels they issued.
 
-For a system-wide picture (CPU side + GPU side together, MLX scheduling, dispatch latency), use Instruments instead — see [System-wide tracing](#system-wide-tracing-with-instruments) below.
-
 ## Configuration
 
 Profiler behavior is controlled via vLLM's `--profiler-config` flags (or the `profiler_config=` kwarg on `LLM`). The field vllm-metal honors:
@@ -162,16 +155,16 @@ process environment. Restart the engine with that variable set, then retry.
 
 **No semantic range markers.** Unlike CUDA's NVTX or torch.profiler's `record_function`, Metal frame capture has no API for inserting named ranges. Kernel-level granularity (each MLX op shows up as a labeled Metal dispatch) is what you get; if you need per-layer or per-stage labels, those would require adding `os_signpost` calls in the C++ extension — not currently supported.
 
-## System-wide Tracing with Instruments
+## Advanced: xctrace
 
-Frame capture only sees the GPU side. For CPU+GPU together (MLX dispatch latency, Python overhead, scheduler timing), use Apple's `xctrace` to record an Instruments trace — no vllm-metal changes needed:
+For users already familiar with **Instruments.app**, Apple's `xctrace` CLI can record a whole-process trace — useful for a high-level "is the engine running healthily?" view (GPU utilization, CPU stalls, thermal state) without bounding the workload:
 
 ```bash
-xctrace record --template "Metal System Trace" --launch -- \
-  /usr/bin/env MTL_CAPTURE_ENABLED=0 vllm serve Qwen/Qwen3-0.6B
-# Send requests, then Ctrl-C the xctrace command.
-# Open the resulting Launch_*.trace bundle in Instruments.app.
+xctrace record --template "Metal System Trace" --output /tmp/run.trace \
+  --launch -- vllm serve Qwen/Qwen3-0.6B
+# Ctrl-C when done, then:
+open /tmp/run.trace
 ```
 
-This produces a `.trace` file (different format from `.gputrace`) that opens in **Instruments.app** (ships with Xcode), giving timeline tracks for both Metal commands and surrounding CPU work.
+Trace size is typically 50–150 MB regardless of run length. **Caveat**: Apple's Metal System Trace template was designed for graphics workloads, so MLX's compute kernels don't surface as named encoders in the Metal Application track. You get GPU utilization and CPU sampling, **not per-kernel timing** — for that, use frame capture's Profile pane.
 
