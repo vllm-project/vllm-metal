@@ -103,22 +103,29 @@ class TestUpdateBlockSizeForBackend:
         config.parallel_config = parallel_config
         return config
 
+    @pytest.fixture
+    def stub_super_update(self):
+        """Stub vLLM's ``Platform.update_block_size_for_backend`` (the base
+        method ``super()`` resolves to). Tests in this suite assert *Metal's*
+        wrapping behavior — the warning, the post-super multiple-of-32
+        adjustment, and the delegation itself — not vLLM's internal
+        ``_align_hybrid_block_size`` math, which has its own coverage upstream
+        and reads ``ModelConfig`` attributes our mocks deliberately don't carry.
+        """
+        with patch(
+            "vllm.platforms.interface.Platform.update_block_size_for_backend"
+        ) as m:
+            yield m
+
     # ========================================================================
     # Core Functionality Tests
     # ========================================================================
 
-    def test_calls_super_implementation(self, vllm_config, caplog):
-        """Test: update_block_size_for_backend calls super() implementation.
-
-        Since we delegate to vLLM's base implementation via super(),
-        the method should complete without errors for valid configs.
-        """
-        # Note: This test verifies the method completes without crashing
-        # Actual block_size calculation is handled by vLLM base class
+    def test_calls_super_implementation(self, vllm_config, stub_super_update):
+        """Test: update_block_size_for_backend delegates to vLLM's base."""
         MetalPlatform.update_block_size_for_backend(vllm_config)
 
-        # Should complete without errors
-        assert vllm_config.cache_config.block_size >= 16
+        stub_super_update.assert_called_once_with(vllm_config)
 
     def test_non_hybrid_model_skipped(self, vllm_config):
         """Test: Non-hybrid model skips Metal-specific adjustments.
@@ -151,52 +158,15 @@ class TestUpdateBlockSizeForBackend:
     # ========================================================================
 
     def test_paged_attention_adjusts_block_size_to_multiple_of_32(
-        self, vllm_config, caplog
+        self, vllm_config, stub_super_update
     ):
-        """Test: Paged attention adjusts block_size to multiple of 32.
+        """Test: Paged attention rounds block_size up to a multiple of 32.
 
-        When paged attention is enabled, block_size should be adjusted
-        to be a multiple of 32 for Metal GPU kernel compatibility.
+        With ``super()`` stubbed, ``cache_config.block_size`` after super-call
+        equals whatever the test sets here, so the post-super Metal adjustment
+        is the only thing that can change it.
         """
-        # Set block_size to a value not divisible by 32
-        vllm_config.cache_config.block_size = 48  # 48 % 32 = 16, should adjust to 64
-
-        # Mock metal config with paged attention enabled
-        with patch("vllm_metal.config.get_config") as mock_get_config:
-            mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
-            mock_get_config.return_value = mock_metal_config
-
-            MetalPlatform.update_block_size_for_backend(vllm_config)
-
-            # block_size should be adjusted to multiple of 32
-            assert vllm_config.cache_config.block_size % 32 == 0
-
-    def test_paged_attention_logs_warning(self, vllm_config):
-        """Test: Hybrid + paged attention logs warning about block-size translation.
-
-        Note: We verify the warning is logged by checking that the method completes
-        without error when paged attention is enabled. The actual logging is verified
-        manually or through integration tests since vllm's logging goes to stdout.
-        """
-        with patch("vllm_metal.config.get_config") as mock_get_config:
-            mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
-            mock_get_config.return_value = mock_metal_config
-
-            # Should complete without error
-            MetalPlatform.update_block_size_for_backend(vllm_config)
-
-    def test_no_adjustment_when_already_multiple_of_32(self, vllm_config, caplog):
-        """Test: No Metal-specific adjustment when block_size is already multiple of 32.
-
-        Note: vLLM base implementation may still adjust block_size for hybrid models.
-        This test verifies that Metal's paged attention adjustment doesn't add
-        additional changes when block_size is already a multiple of 32.
-        """
-        # Set block_size to multiple of 32
-        original_block_size = 64
-        vllm_config.cache_config.block_size = original_block_size
+        vllm_config.cache_config.block_size = 48  # 48 → 64
 
         with patch("vllm_metal.config.get_config") as mock_get_config:
             mock_metal_config = MagicMock()
@@ -205,9 +175,48 @@ class TestUpdateBlockSizeForBackend:
 
             MetalPlatform.update_block_size_for_backend(vllm_config)
 
-            # block_size should remain a multiple of 32 (may be adjusted by base impl)
-            assert vllm_config.cache_config.block_size % 32 == 0
+            assert vllm_config.cache_config.block_size == 64
 
-            # Metal-specific adjustment warning should not be logged
-            # (base implementation may log other warnings)
+    def test_paged_attention_logs_warning(
+        self, vllm_config, stub_super_update, caplog, monkeypatch
+    ):
+        """Test: Hybrid + paged attention emits the block-size-translation warning.
+
+        ``vllm_metal/__init__.py`` sets ``propagate=False`` on the
+        ``vllm_metal`` logger so its messages don't double-print through
+        vLLM's handler. caplog hooks the root logger via propagation, so we
+        re-enable it for this test only (monkeypatch auto-restores after).
+        """
+        import logging
+
+        # _configure_logging() sets propagate=False on the parent logger so
+        # vllm_metal messages don't double-print through vLLM's handler.
+        # caplog captures via root propagation, so re-enable for this test.
+        monkeypatch.setattr(logging.getLogger("vllm_metal"), "propagate", True)
+
+        with patch("vllm_metal.config.get_config") as mock_get_config:
+            mock_metal_config = MagicMock()
+            mock_metal_config.use_paged_attention = True
+            mock_get_config.return_value = mock_metal_config
+
+            with caplog.at_level(logging.WARNING, logger="vllm_metal.platform"):
+                MetalPlatform.update_block_size_for_backend(vllm_config)
+
+            assert "Hybrid model" in caplog.text
+            assert "paged attention" in caplog.text
+
+    def test_no_adjustment_when_already_multiple_of_32(
+        self, vllm_config, stub_super_update, caplog
+    ):
+        """Test: block_size already aligned → post-super Metal adjustment is a no-op."""
+        vllm_config.cache_config.block_size = 64
+
+        with patch("vllm_metal.config.get_config") as mock_get_config:
+            mock_metal_config = MagicMock()
+            mock_metal_config.use_paged_attention = True
+            mock_get_config.return_value = mock_metal_config
+
+            MetalPlatform.update_block_size_for_backend(vllm_config)
+
+            assert vllm_config.cache_config.block_size == 64
             assert "Metal paged attention requires block_size" not in caplog.text

@@ -8,50 +8,16 @@ from typing import TYPE_CHECKING
 import psutil
 import torch
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
-from vllm.v1.attention.backend import AttentionBackend, MultipleOf
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_metal.config import get_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionBackend
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
 logger = logging.getLogger(__name__)
-
-
-class MetalBackend(AttentionBackend):
-    """Synthetic backend that advertises Metal kernel block alignment.
-
-    This class exists solely so the framework's hybrid-block-size math
-    (Platform._align_hybrid_block_size) can read Metal's MultipleOf(32)
-    alignment constraint. It is never dispatched to as a real attention
-    backend — the actual Metal paged attention lives in
-    metal_kernel_backend/paged_attention.py. The unimplemented methods
-    below intentionally raise: a loud failure is the correct behavior if
-    upstream ever tries to use this as a real backend.
-    """
-
-    @staticmethod
-    def get_name() -> str:
-        return "METAL_ATTN"
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # Metal paged attention kernels require block_size in {8, 16, 32}.
-        return [MultipleOf(32)]
-
-    @staticmethod
-    def get_impl_cls():
-        raise NotImplementedError
-
-    @staticmethod
-    def get_builder_cls():
-        raise NotImplementedError
-
-    @staticmethod
-    def get_kv_cache_shape(*args, **kwargs):
-        raise NotImplementedError
 
 
 class MetalPlatform(Platform):
@@ -385,6 +351,8 @@ class MetalPlatform(Platform):
         the synthetic MetalBackend, which advertises Metal's MultipleOf(32)
         kernel alignment to the framework's hybrid-block-size math.
         """
+        from vllm_metal.metal_backend import MetalBackend
+
         return MetalBackend
 
     @classmethod
@@ -476,6 +444,8 @@ class MetalPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
     ) -> str:
         """Get the attention backend class for Metal."""
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info(f"Cannot use {selected_backend} backend on Metal/MLX.")
         if attn_selector_config.use_mla:
