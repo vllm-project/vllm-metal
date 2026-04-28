@@ -981,11 +981,11 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   threadgroup float *warp_scores =
       reinterpret_cast<threadgroup float *>(shared_mem) +
       warp_idx * BLOCK_SIZE;
-  // TurboQuant: per-warp FWHT workspace for V dequantization.
-  // Allocated after warp_scores. Host must provide the extra shmem when use_turboquant.
-  threadgroup float *fwht_buf =
-      reinterpret_cast<threadgroup float *>(shared_mem) +
-      NUM_WARPS * BLOCK_SIZE + warp_idx * HEAD_SIZE;
+  // NOTE: the previous fwht_buf per-warp workspace (NUM_WARPS * HEAD_SIZE
+  // floats) has been removed — the TurboQuant V dequant path now runs
+  // register-only via `tq_load_and_accumulate_v` + `inverse_fwht_in_place`,
+  // so no threadgroup memory is needed for V reconstruction.  The host-side
+  // shmem-size calculation in paged_ops.cpp no longer adds the TQ bonus.
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
@@ -1136,7 +1136,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             tok * (num_kv_heads * SCALE_GROUPS) +
             kv_head_idx * SCALE_GROUPS;
         tq_load_and_accumulate_v<HEAD_SIZE, NUM_SIMD_LANES>(
-            v_accs, fwht_buf, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
+            v_accs, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
             v_centroids, v_bits);
       } else {
         const device V_CACHE_T *v_ptr =
@@ -1258,6 +1258,45 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       *exp_sums_ptr = warp_l;
     }
 
+    // TurboQuant V: we've been accumulating in the rotated (FWHT) domain
+    // the whole block loop.
+    //
+    // Non-partitioned path (USE_PARTITIONING == false): apply inverse FWHT
+    // ONCE here to the merged per-head output, before the final normalise +
+    // write to `out`.  Replaces O(ctx) per-token FWHTs with exactly one FWHT
+    // per head per kernel dispatch.
+    //
+    // Partitioned path (USE_PARTITIONING == true): SKIP the FWHT here and
+    // write the rotated, un-FWHT'd partial sum to `tmp_out`.  The reduce
+    // kernel then combines partitions in fp32 and applies a single inverse
+    // FWHT on the merged result (see `paged_attention_v2_reduce`).  This is
+    // exact by linearity of FWHT —
+    //   InverseFWHT(Σ_j w_j · V_rot_j) = Σ_j w_j · InverseFWHT(V_rot_j)
+    // — but numerically superior: the weighted sum across partitions is
+    // accumulated in fp32 *before* any FWHT rounding, and the single FWHT
+    // at the end absorbs all fp16 casting once.  The old code applied the
+    // FWHT per partition and stored the fp16-cast post-FWHT result in
+    // tmp_out, compounding rounding error across partitions.  At long
+    // contexts with many partitions the drift was measurable.
+    //
+    // Both branches are constexpr on USE_PARTITIONING so exactly one survives
+    // per instantiation; the non-TQ specialisation dead-strips the entire
+    // block via the `use_turboquant` function constant.
+    //
+    // Compile-time guard: paged_attention is templated for non-power-of-2
+    // head sizes too (80, 112, 192, ...) for non-TQ workloads.  For those,
+    // V_ELEMS_PER_THREAD = ceil(HEAD_SIZE/32) > HEAD_SIZE/32, which would
+    // trip inverse_fwht_in_place's `static_assert(ELEMS_PER_LANE == HEAD_SIZE/32)`
+    // at template instantiation time even though the runtime branch is dead
+    // (use_turboquant=false for those sizes).  `if constexpr` blocks the
+    // template instantiation entirely.  TQ requires HEAD_SIZE ∈ {64,128,256,512},
+    // all multiples of 32, so this never blocks a real TQ dispatch.
+    if constexpr (HEAD_SIZE % 32 == 0) {
+      if (use_turboquant && !USE_PARTITIONING) {
+        inverse_fwht_in_place<HEAD_SIZE, V_ELEMS_PER_THREAD>(v_accs, lane);
+      }
+    }
+
     // Final normalization: O = O / l
     const float inv_l = 1.f / (warp_l + 1e-6f);
 
@@ -1304,27 +1343,69 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const uint32_t context_len = context_lens[seq_idx];
   const int effective_context_len = (int)context_len - q_len + q_pos_in_seq + 1;
   const int num_partitions = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
+
+  // ========================================================================
+  // Workspace declarations (function scope — Metal requires threadgroup
+  // allocations at function scope, not inside conditional branches).  These
+  // are hoisted above the early-out so the TQ deferred-FWHT path can share
+  // the same buffers whether we early-out or run the full reduce.
+  // ========================================================================
+  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
+  const int warp_idx = simd_tid;
+  const int lane = simd_lid;
+
+  // Reduction workspace (main path only).
+  threadgroup float red_smem[2 * NUM_WARPS];
+
+  // TQ deferred-FWHT staging: warp 0 applies a single inverse FWHT to the
+  // cross-partition weighted sum, which lives here in fp32 before the final
+  // fp16 cast to `out`.  Declared unconditionally; dead in non-TQ kernels.
+  // Size: HEAD_SIZE * 4 bytes = at most 2 KB at HEAD_SIZE=512.
+  threadgroup float combined[HEAD_SIZE];
+
+  // ========================================================================
+  // Early-out: only one partition actually contributed.  We still need to
+  // apply the deferred inverse FWHT on the TQ path because paged_attention
+  // writes tmp_out in the rotated (un-FWHT'd) domain for PARTITION_SIZE>0.
+  // ========================================================================
   if (num_partitions == 1 && !use_sinks) {
-    // No need to reduce. Only copy tmp_out to out.
     device T *out_ptr =
         out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
     const device T *tmp_out_ptr =
         tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE;
-    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-         i += threads_per_threadgroup.x) {
-      out_ptr[i] = tmp_out_ptr[i];
+
+    if (use_turboquant) {
+      // Warp 0 owns the entire HEAD_SIZE vector as a lane-strided register
+      // slice: lane `l` holds indices { l, l+32, l+64, ... }.  Load,
+      // InverseFWHT once, write — no cross-warp sync needed since only
+      // warp 0 participates.
+      if (warp_idx == 0) {
+        constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
+        float v_accs[ELEMS_PER_LANE];
+        #pragma unroll
+        for (int e = 0; e < ELEMS_PER_LANE; e++) {
+          const int d = lane + e * 32;
+          v_accs[e] = (d < HEAD_SIZE) ? float(tmp_out_ptr[d]) : 0.0f;
+        }
+        inverse_fwht_in_place<HEAD_SIZE, ELEMS_PER_LANE>(v_accs, lane);
+        #pragma unroll
+        for (int e = 0; e < ELEMS_PER_LANE; e++) {
+          const int d = lane + e * 32;
+          if (d < HEAD_SIZE) {
+            out_ptr[d] = T(v_accs[e]);
+          }
+        }
+      }
+    } else {
+      // Non-TQ: plain copy from partition 0.
+      for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
+           i += threads_per_threadgroup.x) {
+        out_ptr[i] = tmp_out_ptr[i];
+      }
     }
-    // Terminate the thread block.
     return;
   }
-
-  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
-  const int warp_idx = simd_tid;
-  const int lane = simd_lid;
-
-  // Workspace for reduction.
-  threadgroup float red_smem[2 * NUM_WARPS];
 
   // Load max logits to shared memory.
   threadgroup float *shared_max_logits =
@@ -1390,21 +1471,73 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
 
   const float inv_global_exp_sum = 1.0f / (global_exp_sum + 1e-6f);
 
+  // ========================================================================
   // Aggregate tmp_out to out.
+  //
+  // Non-TQ path: weighted sum of per-partition outputs, cast to T, done.
+  //
+  // TQ path: per-partition tmp_out entries are in the ROTATED (un-FWHT'd)
+  // domain (paged_attention skips the FWHT when PARTITION_SIZE>0).  We
+  // accumulate the fp32 weighted sum into shared `combined[HEAD_SIZE]`, then
+  // warp 0 applies the deferred inverse FWHT once on the merged vector and
+  // writes the final fp16 output.  This is exact by linearity of FWHT —
+  //   InverseFWHT(Σ_j w_j · V_rot_j) = Σ_j w_j · InverseFWHT(V_rot_j)
+  // — and numerically strictly better than applying the FWHT per partition
+  // because (a) cross-partition sums happen in fp32 with no intermediate
+  // fp16 round-trip, (b) the 1/sqrt(N) normalisation that squeezes values
+  // near fp16's ULP boundary is applied exactly once on the final merged
+  // vector, and (c) the number of FWHTs per kernel drops from
+  // O(num_partitions) to 1.
+  // ========================================================================
   const device T *tmp_out_ptr =
       tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE;
   device T *out_ptr =
       out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-#pragma unroll
-  for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
-       i += NUM_THREADS) {
-    float acc = 0.0f;
-    for (int j = 0; j < num_partitions; ++j) {
-      acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
-             inv_global_exp_sum;
+
+  if (use_turboquant) {
+    // Stage weighted partial sums into `combined[]` in fp32.
+    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
+         i += NUM_THREADS) {
+      float acc = 0.0f;
+      for (int j = 0; j < num_partitions; ++j) {
+        acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
+               inv_global_exp_sum;
+      }
+      combined[i] = acc;
     }
-    out_ptr[i] = T(acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Warp 0 applies the single inverse FWHT and writes out.
+    if (warp_idx == 0) {
+      constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
+      float v_accs[ELEMS_PER_LANE];
+      #pragma unroll
+      for (int e = 0; e < ELEMS_PER_LANE; e++) {
+        const int d = lane + e * 32;
+        v_accs[e] = (d < HEAD_SIZE) ? combined[d] : 0.0f;
+      }
+      inverse_fwht_in_place<HEAD_SIZE, ELEMS_PER_LANE>(v_accs, lane);
+      #pragma unroll
+      for (int e = 0; e < ELEMS_PER_LANE; e++) {
+        const int d = lane + e * 32;
+        if (d < HEAD_SIZE) {
+          out_ptr[d] = T(v_accs[e]);
+        }
+      }
+    }
+  } else {
+    // Non-TQ: direct weighted sum + write.
+#pragma unroll
+    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
+         i += NUM_THREADS) {
+      float acc = 0.0f;
+      for (int j = 0; j < num_partitions; ++j) {
+        acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
+               inv_global_exp_sum;
+      }
+      out_ptr[i] = T(acc);
+    }
   }
 }
 

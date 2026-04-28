@@ -35,7 +35,6 @@ from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
 )
-from vllm_metal.metal_kernel_backend.turboquant import turbo_quant_encode
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Metal kernel block-size support ===
@@ -420,38 +419,53 @@ def sdpa_forward(
             new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
             new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
     elif kv_cache.turboquant:
-        # --- TurboQuant cache write: Python quantize → MLX scatter ---
-        # Quantize K/V, then scatter each of the 5 caches independently.
-        (packed_k, k_scale, k_zero), (packed_v, v_scale) = turbo_quant_encode(
-            k_3d, v_3d, kv_cache.k_quant, value_bits=kv_cache.v_bits
+        # --- TurboQuant cache write: fused Metal encode + scatter ---
+        # Single dispatch replaces Python turbo_quant_encode + 5 MLX scatters.
+        # Supports the full QUANT_PARAMS matrix: signed q8_0/int8 at k_bits=8
+        # and unsigned uint8/q5_0/q4_0/int4/uint4/int2/uint2 at k_bits in
+        # {2, 3, 4, 5, 8}.
+        from vllm_metal.metal_kernel_backend.turboquant import (
+            QUANT_PARAMS,
+            get_v_centroids,
         )
 
-        def _scatter(cache_arr, data):
-            flat = cache_arr.reshape(-1, kv_cache.num_kv_heads, data.shape[-1])
-            flat[slot_mapping] = data
-            return flat.reshape(cache_arr.shape)
-
-        kv_cache.key_caches[layer_idx] = _scatter(
-            kv_cache.key_caches[layer_idx], packed_k
+        v_centroids = get_v_centroids(kv_cache.v_bits)
+        k_signed = bool(QUANT_PARAMS[kv_cache.k_quant]["signed"])
+        # tq_encode is a proper MLX Primitive: it returns five NEW array
+        # objects that alias the input cache buffers in place but carry
+        # fresh graph provenance pointing at the primitive.  The subsequent
+        # paged_attention_primitive (separate command buffer) depends on
+        # these outputs through the lazy graph, which is what lets MLX
+        # insert the fence that serialises reader-after-writer.  Using the
+        # original cache arrays here instead would silently race on the
+        # first real forward pass (EngineCore crash).  We must also rebind
+        # kv_cache.<cache>[layer_idx] to the new arrays so the next decode
+        # step's tq_encode input reads through this primitive's output.
+        (
+            new_k_cache,
+            new_v_cache,
+            new_key_scale_cache,
+            new_value_scale_cache,
+            new_key_zero_cache,
+        ) = get_ops().tq_encode(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.key_scale_caches[layer_idx],
+            kv_cache.value_scale_caches[layer_idx],
+            kv_cache.key_zero_caches[layer_idx],
+            slot_mapping,
+            v_centroids,
+            kv_cache.v_bits,
+            kv_cache.k_bits,
+            k_signed,
         )
-        kv_cache.value_caches[layer_idx] = _scatter(
-            kv_cache.value_caches[layer_idx], packed_v
-        )
-        kv_cache.key_scale_caches[layer_idx] = _scatter(
-            kv_cache.key_scale_caches[layer_idx], k_scale
-        )
-        kv_cache.value_scale_caches[layer_idx] = _scatter(
-            kv_cache.value_scale_caches[layer_idx], v_scale
-        )
-        kv_cache.key_zero_caches[layer_idx] = _scatter(
-            kv_cache.key_zero_caches[layer_idx], k_zero
-        )
-
-        new_k_cache = kv_cache.key_caches[layer_idx]
-        new_v_cache = kv_cache.value_caches[layer_idx]
-        new_key_scale_cache = kv_cache.key_scale_caches[layer_idx]
-        new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
-        new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
+        kv_cache.key_caches[layer_idx] = new_k_cache
+        kv_cache.value_caches[layer_idx] = new_v_cache
+        kv_cache.key_scale_caches[layer_idx] = new_key_scale_cache
+        kv_cache.value_scale_caches[layer_idx] = new_value_scale_cache
+        kv_cache.key_zero_caches[layer_idx] = new_key_zero_cache
     else:
         flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_k[slot_mapping] = k_3d

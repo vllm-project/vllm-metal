@@ -15,8 +15,9 @@ Sections (all run by default unless noted):
   9. Serve Benchmark           — bf16 vs q8_0 via live vllm serve (opt-in: --serve)
 
 Run:
-    uv run python tests/test_turboquant.py           # sections 0-8
-    uv run python tests/test_turboquant.py --serve   # all sections including 9
+    uv run python tests/test_turboquant.py                # sections 0-8
+    uv run python tests/test_turboquant.py --serve        # all sections including 9
+    uv run python tests/test_turboquant.py --fast-serve   # skip 0-8, one TQ serve run
 """
 
 import gc
@@ -535,6 +536,254 @@ def _scatter_fp16(cache, layer, k, v, slot, head_dim):
     cache.value_caches[layer] = flat_v.reshape(cache.value_caches[layer].shape)
 
 
+def section_metal_encode_parity() -> int:
+    """Fused Metal encode (tq_encode) vs Python encode + scatter.
+
+    Verifies the Metal kernel implements the exact same spec as the Python
+    ``turbo_quant_encode`` → 5-scatter pipeline.  This is the hot-path
+    replacement, so any drift here silently corrupts KV cache state at
+    runtime.  Compares all five caches after a single write pass:
+
+      * ``key_caches``        — int8 quantized K (q8_0)
+      * ``value_caches``      — packed uint8 V (e.g. q3_0 → 3 bytes / 8 vals)
+      * ``key_scale_caches``  — fp16 per-32-elem scale
+      * ``value_scale_caches``— fp16 per-32-elem scale
+      * ``key_zero_caches``   — fp16 per-32-elem zero-point
+
+    Tolerances (calibrated to fp16-hardware rounding noise, since Metal
+    and MLX both do fp16 arithmetic but with slightly different rounding
+    at the LSB when fast-math is in play):
+      * K indices:     ±2 on the int8 grid, ≥95% exact.
+      * K scales:      ``allclose(rtol=1e-3, atol=1e-3)``.
+      * K zero-points: ±1 atol (stored as fp16-rounded integer).
+      * V scales:      ``allclose(rtol=1e-2, atol=1e-3)``.
+      * V packed:      byte-exact not required; dequant cos_sim ≥ 0.999.
+    """
+    sep("Section 3.5: Metal Encode vs Python Encode Parity")
+    ops = get_ops()
+    failures = 0
+
+    np.random.seed(7)
+    num_tokens = 32
+    num_blocks = max(4, (num_tokens + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE + 1)
+
+    # Sweep covers (a) every K-quant category: signed 8-bit, unsigned 8-bit,
+    # sub-8-bit {5,4,2}, and (b) the V-bit spectrum {3,4,8}.  Q3_0 V is the
+    # cheap, representative default; the extra V rows on q8_0 K exercise the
+    # V packing path at 4-bit and 8-bit widths.
+    configs = [
+        ("q8_0", "q3_0"),  # signed 8-bit K, 3-bit V
+        ("q8_0", "q4_0"),
+        ("q8_0", "q8_0"),
+        ("uint8", "q3_0"),  # unsigned 8-bit K
+        ("q5_0", "q3_0"),  # sub-8-bit K (5)
+        ("q4_0", "q3_0"),  # sub-8-bit K (4)
+        ("int4", "q3_0"),  # sub-8-bit K (4, alias)
+        ("uint2", "q3_0"),  # sub-8-bit K (2)
+    ]
+
+    for k_quant, v_quant in configs:
+        v_bits = V_QUANT_PARAMS[v_quant]["bits"]
+        k_bits = QUANT_PARAMS[k_quant]["bits"]
+        k_signed = bool(QUANT_PARAMS[k_quant]["signed"])
+        print(
+            f"\n  k_quant={k_quant:5s} (kb={k_bits}, {'signed' if k_signed else 'unsigned'})  "
+            f"v_quant={v_quant} (vb={v_bits})"
+        )
+
+        def _mk_cache(_kq: str = k_quant, _vq: str = v_quant) -> MetalPagedKVCache:
+            return MetalPagedKVCache(
+                num_layers=1,
+                num_kv_heads=Q_NUM_KV_HEADS,
+                head_dim=Q_HEAD_DIM,
+                num_blocks=num_blocks,
+                block_size=Q_BLOCK_SIZE,
+                dtype=mx.float16,
+                turboquant=True,
+                k_quant=_kq,
+                v_quant=_vq,
+            )
+
+        cache_py = _mk_cache()
+        cache_mx = _mk_cache()
+
+        # Deterministic inputs — same K/V fed to both paths.
+        k = mx.array(
+            np.random.randn(num_tokens, Q_NUM_KV_HEADS, Q_HEAD_DIM).astype(np.float16)
+        )
+        v = mx.array(
+            np.random.randn(num_tokens, Q_NUM_KV_HEADS, Q_HEAD_DIM).astype(np.float16)
+        )
+        slot_mapping = mx.array(list(range(num_tokens)), dtype=mx.int64)
+        mx.eval(k, v, slot_mapping)
+
+        # ---- Python reference ----
+        (packed_k, k_scale, k_zero), (packed_v, v_scale) = turbo_quant_encode(
+            k, v, k_quant, value_bits=v_bits
+        )
+        mx.eval(packed_k, k_scale, k_zero, packed_v, v_scale)
+        _scatter_tq(
+            cache_py,
+            0,
+            packed_k,
+            k_scale,
+            k_zero,
+            packed_v,
+            v_scale,
+            slot_mapping,
+        )
+        mx.eval(
+            cache_py.key_caches[0],
+            cache_py.value_caches[0],
+            cache_py.key_scale_caches[0],
+            cache_py.value_scale_caches[0],
+            cache_py.key_zero_caches[0],
+        )
+
+        # ---- Fused Metal path ----
+        v_centroids = get_v_centroids(v_bits)
+        (
+            new_k,
+            new_v,
+            new_ks,
+            new_vs,
+            new_kz,
+        ) = ops.tq_encode(
+            k,
+            v,
+            cache_mx.key_caches[0],
+            cache_mx.value_caches[0],
+            cache_mx.key_scale_caches[0],
+            cache_mx.value_scale_caches[0],
+            cache_mx.key_zero_caches[0],
+            slot_mapping,
+            v_centroids,
+            v_bits,
+            k_bits,
+            k_signed,
+        )
+        # Rebind to the primitive's outputs so subsequent reads flow through
+        # the MLX graph (otherwise the reads would hit stale provenance on
+        # the original mx.zeros caches and race the kernel's writes).
+        cache_mx.key_caches[0] = new_k
+        cache_mx.value_caches[0] = new_v
+        cache_mx.key_scale_caches[0] = new_ks
+        cache_mx.value_scale_caches[0] = new_vs
+        cache_mx.key_zero_caches[0] = new_kz
+        mx.eval(new_k, new_v, new_ks, new_vs, new_kz)
+
+        # ---- Compare K indices, allow ±2 on <5% of elements ----
+        # For sub-8-bit K the cache stores packed bytes; unpack to the
+        # underlying index grid before diffing so we measure actual index
+        # drift, not scrambled bit positions.
+        k_cache_py = cache_py.key_caches[0]
+        k_cache_mx = cache_mx.key_caches[0]
+        if k_bits < 8:
+            k_idx_py = unpack_bits(k_cache_py, k_bits, Q_HEAD_DIM)
+            k_idx_mx = unpack_bits(k_cache_mx, k_bits, Q_HEAD_DIM)
+            k_py = np.asarray(k_idx_py.astype(mx.int32))
+            k_mx = np.asarray(k_idx_mx.astype(mx.int32))
+        else:
+            # 8-bit path: one byte == one index (signed cast for q8_0/int8).
+            k_py = np.asarray(k_cache_py.astype(mx.int32))
+            k_mx = np.asarray(k_cache_mx.astype(mx.int32))
+        k_diff = np.abs(k_py - k_mx)
+        k_exact = float((k_diff == 0).mean())
+        k_within_two = float((k_diff <= 2).mean())
+        k_ok = k_exact >= 0.95 and k_within_two == 1.0
+        print(
+            f"    K indices: exact={k_exact * 100:.2f}%  ±2={k_within_two * 100:.2f}%  "
+            f"max|diff|={int(k_diff.max())}  [{'OK' if k_ok else 'FAIL'}]"
+        )
+        if not k_ok:
+            failures += 1
+
+        # ---- Compare K scales / zero_points (fp16) ----
+        k_scale_py = np.asarray(cache_py.key_scale_caches[0].astype(mx.float32))
+        k_scale_mx = np.asarray(cache_mx.key_scale_caches[0].astype(mx.float32))
+        k_scale_ok = np.allclose(k_scale_py, k_scale_mx, rtol=1e-3, atol=1e-3)
+        print(
+            f"    K scales:  max|abs diff|={np.abs(k_scale_py - k_scale_mx).max():.2e}  "
+            f"[{'OK' if k_scale_ok else 'FAIL'}]"
+        )
+        if not k_scale_ok:
+            failures += 1
+
+        k_zp_py = np.asarray(cache_py.key_zero_caches[0].astype(mx.float32))
+        k_zp_mx = np.asarray(cache_mx.key_zero_caches[0].astype(mx.float32))
+        k_zp_diff = np.abs(k_zp_py - k_zp_mx)
+        k_zp_ok = bool((k_zp_diff <= 1.0).all())
+        print(
+            f"    K zero-pt: max|abs diff|={k_zp_diff.max():.2e}  "
+            f"[{'OK' if k_zp_ok else 'FAIL'}]"
+        )
+        if not k_zp_ok:
+            failures += 1
+
+        # ---- Compare V scales ----
+        v_scale_py = np.asarray(cache_py.value_scale_caches[0].astype(mx.float32))
+        v_scale_mx = np.asarray(cache_mx.value_scale_caches[0].astype(mx.float32))
+        v_scale_ok = np.allclose(v_scale_py, v_scale_mx, rtol=1e-2, atol=1e-3)
+        print(
+            f"    V scales:  max|abs diff|={np.abs(v_scale_py - v_scale_mx).max():.2e}  "
+            f"[{'OK' if v_scale_ok else 'FAIL'}]"
+        )
+        if not v_scale_ok:
+            failures += 1
+
+        # ---- Compare dequantized V (FWHT fp32 vs fp16 → boundary flips OK) ----
+        # Unpack V indices from both caches, dequant via centroids, compare.
+        from vllm_metal.metal_kernel_backend.turboquant import lloyd_max_centroids
+
+        centroids, _ = lloyd_max_centroids(v_bits)
+        v_packed_dim = cache_py.value_caches[0].shape[-1]
+        # Only the filled slots are populated; take the first num_tokens.
+        flat_py = cache_py.value_caches[0].reshape(-1, Q_NUM_KV_HEADS, v_packed_dim)[
+            :num_tokens
+        ]
+        flat_mx = cache_mx.value_caches[0].reshape(-1, Q_NUM_KV_HEADS, v_packed_dim)[
+            :num_tokens
+        ]
+        v_idx_py = unpack_bits(flat_py, v_bits, Q_HEAD_DIM)
+        v_idx_mx = unpack_bits(flat_mx, v_bits, Q_HEAD_DIM)
+        # Dequantize: idx → centroid * scale, then inverse FWHT
+        vs_py = cache_py.value_scale_caches[0].reshape(
+            -1, Q_NUM_KV_HEADS, Q_HEAD_DIM // BLOCK_SIZE
+        )[:num_tokens]
+        vs_mx = cache_mx.value_scale_caches[0].reshape(
+            -1, Q_NUM_KV_HEADS, Q_HEAD_DIM // BLOCK_SIZE
+        )[:num_tokens]
+        v_dq_py = (
+            centroids[v_idx_py.astype(mx.int32)].reshape(
+                num_tokens, Q_NUM_KV_HEADS, -1, BLOCK_SIZE
+            )
+            * vs_py[..., None]
+        ).reshape(num_tokens, Q_NUM_KV_HEADS, Q_HEAD_DIM)
+        v_dq_mx = (
+            centroids[v_idx_mx.astype(mx.int32)].reshape(
+                num_tokens, Q_NUM_KV_HEADS, -1, BLOCK_SIZE
+            )
+            * vs_mx[..., None]
+        ).reshape(num_tokens, Q_NUM_KV_HEADS, Q_HEAD_DIM)
+        # Inverse FWHT on both to reconstruct original V
+        v_rec_py = fwht(v_dq_py.astype(mx.float32), encode=False)
+        v_rec_mx = fwht(v_dq_mx.astype(mx.float32), encode=False)
+        mx.eval(v_rec_py, v_rec_mx)
+        cos = cos_sim(v_rec_py, v_rec_mx)
+        v_ok = cos >= 0.999
+        v_byte_exact = float((np.asarray(flat_py) == np.asarray(flat_mx)).mean())
+        print(
+            f"    V packed:  byte-exact={v_byte_exact * 100:.2f}%  "
+            f"dequant cos_sim={cos:.6f}  [{'OK' if v_ok else 'FAIL'}]"
+        )
+        if not v_ok:
+            failures += 1
+
+    if failures == 0:
+        print("\n  All encode-parity checks passed.")
+    return failures
+
+
 def section_metal_e2e() -> int:
     """Cache write → paged attention correctness at multiple sequence lengths."""
     sep("Section 4: Metal E2E Correctness (Qwen3-0.6B shape)")
@@ -907,14 +1156,32 @@ def section_published_comparison() -> int:
 
 
 def section_latency() -> int:
-    """Encode + cache-write overhead per decode token."""
+    """Encode + cache-write overhead per decode token.
+
+    Benchmarks the fused Metal kernel ``ops.tq_encode`` against:
+      * the legacy Python encode + 5-scatter path (for speedup A/B), and
+      * a plain fp16 cache scatter (the uncompressed baseline).
+    The fused kernel is the hot-path substitute wired into
+    ``attention_sdpa.py``; this section is the place to measure its cost.
+    """
     sep("Section 7: Quantization Latency")
+    ops = get_ops()
 
     k = mx.random.normal(shape=(1, Q_NUM_KV_HEADS, Q_HEAD_DIM)).astype(mx.float16)
     v = mx.random.normal(shape=(1, Q_NUM_KV_HEADS, Q_HEAD_DIM)).astype(mx.float16)
     mx.eval(k, v)
 
     cache_tq = MetalPagedKVCache(
+        num_layers=1,
+        num_kv_heads=Q_NUM_KV_HEADS,
+        head_dim=Q_HEAD_DIM,
+        num_blocks=10,
+        block_size=Q_BLOCK_SIZE,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant="q8_0",
+    )
+    cache_tq_py = MetalPagedKVCache(
         num_layers=1,
         num_kv_heads=Q_NUM_KV_HEADS,
         head_dim=Q_HEAD_DIM,
@@ -934,51 +1201,76 @@ def section_latency() -> int:
         turboquant=False,
     )
     slot = mx.array([0], dtype=mx.int64)
-    mx.eval(slot)
-
-    # Warm up
-    for _ in range(10):
-        kq, vq = turbo_quant_encode(k, v, "q8_0")
-        mx.eval(*kq, *vq)
+    v_centroids = get_v_centroids(cache_tq.v_bits)
+    mx.eval(slot, v_centroids)
 
     n = 200
 
-    # Benchmark encode
-    t0 = time.perf_counter()
-    for _ in range(n):
-        kq, vq = turbo_quant_encode(k, v, "q8_0")
-        mx.eval(*kq, *vq)
-    encode_us = (time.perf_counter() - t0) / n * 1e6
+    # ──────────────────────────────────────────────────────────────────────
+    # Benchmark 1: fused Metal kernel — single dispatch replaces encode + 5
+    # scatters.  This is the production hot path.
+    # ──────────────────────────────────────────────────────────────────────
+    def _run_metal_fused():
+        (
+            new_k,
+            new_v,
+            new_ks,
+            new_vs,
+            new_kz,
+        ) = ops.tq_encode(
+            k,
+            v,
+            cache_tq.key_caches[0],
+            cache_tq.value_caches[0],
+            cache_tq.key_scale_caches[0],
+            cache_tq.value_scale_caches[0],
+            cache_tq.key_zero_caches[0],
+            slot,
+            v_centroids,
+            cache_tq.v_bits,
+            cache_tq.k_bits,
+        )
+        cache_tq.key_caches[0] = new_k
+        cache_tq.value_caches[0] = new_v
+        cache_tq.key_scale_caches[0] = new_ks
+        cache_tq.value_scale_caches[0] = new_vs
+        cache_tq.key_zero_caches[0] = new_kz
+        mx.eval(new_k, new_v, new_ks, new_vs, new_kz)
 
-    # Pre-encode once for write benchmarks
-    (pk, ks, kz), (pv, vs) = turbo_quant_encode(
-        k, v, "q8_0", value_bits=cache_tq.v_bits
-    )
-    mx.eval(pk, ks, kz, pv, vs)
-
-    # Benchmark TQ cache write (scatter 5 arrays)
     for _ in range(10):
-        _scatter_tq(cache_tq, 0, pk, ks, kz, pv, vs, slot)
-        mx.eval(
-            cache_tq.key_caches[0],
-            cache_tq.value_caches[0],
-            cache_tq.key_scale_caches[0],
-            cache_tq.value_scale_caches[0],
-            cache_tq.key_zero_caches[0],
-        )
+        _run_metal_fused()
     t0 = time.perf_counter()
     for _ in range(n):
-        _scatter_tq(cache_tq, 0, pk, ks, kz, pv, vs, slot)
-        mx.eval(
-            cache_tq.key_caches[0],
-            cache_tq.value_caches[0],
-            cache_tq.key_scale_caches[0],
-            cache_tq.value_scale_caches[0],
-            cache_tq.key_zero_caches[0],
-        )
-    tq_write_us = (time.perf_counter() - t0) / n * 1e6
+        _run_metal_fused()
+    tq_fused_us = (time.perf_counter() - t0) / n * 1e6
 
-    # Benchmark FP16 cache write (scatter K+V)
+    # ──────────────────────────────────────────────────────────────────────
+    # Benchmark 2: legacy Python encode + 5-scatter path, for reference.
+    # Exactly what the fused kernel replaced.
+    # ──────────────────────────────────────────────────────────────────────
+    def _run_python_path():
+        (pk, ks, kz), (pv, vs) = turbo_quant_encode(
+            k, v, "q8_0", value_bits=cache_tq_py.v_bits
+        )
+        _scatter_tq(cache_tq_py, 0, pk, ks, kz, pv, vs, slot)
+        mx.eval(
+            cache_tq_py.key_caches[0],
+            cache_tq_py.value_caches[0],
+            cache_tq_py.key_scale_caches[0],
+            cache_tq_py.value_scale_caches[0],
+            cache_tq_py.key_zero_caches[0],
+        )
+
+    for _ in range(10):
+        _run_python_path()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        _run_python_path()
+    tq_python_us = (time.perf_counter() - t0) / n * 1e6
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Benchmark 3: FP16 baseline — plain scatter of unquantized K/V.
+    # ──────────────────────────────────────────────────────────────────────
     for _ in range(10):
         _scatter_fp16(cache_fp, 0, k, v, slot, Q_HEAD_DIM)
         mx.eval(cache_fp.key_caches[0], cache_fp.value_caches[0])
@@ -988,16 +1280,126 @@ def section_latency() -> int:
         mx.eval(cache_fp.key_caches[0], cache_fp.value_caches[0])
     fp16_write_us = (time.perf_counter() - t0) / n * 1e6
 
-    overhead_us = encode_us + tq_write_us - fp16_write_us
+    overhead_us = tq_fused_us - fp16_write_us
+    speedup = tq_python_us / tq_fused_us if tq_fused_us > 0 else float("inf")
     tok_budget = 1e6 / 60  # ~16,700 µs at 60 tok/s
     print(f"\n  Single-token ({Q_NUM_KV_HEADS} KV heads, hd={Q_HEAD_DIM}):")
-    print(f"    TQ encode (Python):    {encode_us:>8.1f} µs")
-    print(f"    TQ cache write:        {tq_write_us:>8.1f} µs")
-    print(f"    FP16 cache write:      {fp16_write_us:>8.1f} µs")
+    print(f"    TQ fused Metal kernel:  {tq_fused_us:>8.1f} µs   <-- hot path")
+    print(f"    TQ Python encode+scat:  {tq_python_us:>8.1f} µs   (reference)")
+    print(f"    FP16 cache write:       {fp16_write_us:>8.1f} µs   (baseline)")
+    print(f"    Fused speedup vs Py:    {speedup:>8.2f}x")
     print(
-        f"    TQ overhead:           {overhead_us:>8.1f} µs  "
+        f"    TQ overhead vs fp16:    {overhead_us:>8.1f} µs  "
         f"({overhead_us / tok_budget * 100:.1f}% of 60tok/s budget)"
     )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Benchmark 4: prefill sweep.
+    #
+    # The single-token number above is almost entirely Metal dispatch
+    # overhead — we only fill `num_kv_heads` threadgroups, nowhere near GPU
+    # saturation.  This sweep pushes the grid size up by ~4 orders of
+    # magnitude so we can see the dispatch-bound → compute-bound transition
+    # and verify that optimizations don't regress large batches.
+    #
+    # For each N we measure:
+    #   * total µs per dispatch (absolute wall time)
+    #   * µs/token (derived throughput — should plateau once compute-bound)
+    #   * the FP16-scatter baseline at the same N for overhead accounting
+    #
+    # Steady-state µs/token ≈ steady-state FP16 µs/token  ⇒  the TQ kernel
+    # is roughly memory-bound at parity with a plain scatter, which is the
+    # best we can hope for given we emit similar byte volume.
+    # ──────────────────────────────────────────────────────────────────────
+    bulk_sizes = [256, 1024, 4096]
+    print(f"\n  Prefill sweep ({Q_NUM_KV_HEADS} KV heads, hd={Q_HEAD_DIM}):")
+    print("    ───────────────────────────────────────────────────────────────────────")
+    print("       N    TQ fused (total / per-tok)    FP16 scatter (total / per-tok)")
+    print("    ───────────────────────────────────────────────────────────────────────")
+    for n_tok in bulk_sizes:
+        blocks_needed = (n_tok + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE + 2
+        k_bulk = mx.random.normal(shape=(n_tok, Q_NUM_KV_HEADS, Q_HEAD_DIM)).astype(
+            mx.float16
+        )
+        v_bulk = mx.random.normal(shape=(n_tok, Q_NUM_KV_HEADS, Q_HEAD_DIM)).astype(
+            mx.float16
+        )
+        slot_bulk = mx.arange(n_tok, dtype=mx.int64)
+        cache_tq_bulk = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=Q_NUM_KV_HEADS,
+            head_dim=Q_HEAD_DIM,
+            num_blocks=blocks_needed,
+            block_size=Q_BLOCK_SIZE,
+            dtype=mx.float16,
+            turboquant=True,
+            k_quant="q8_0",
+        )
+        cache_fp_bulk = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=Q_NUM_KV_HEADS,
+            head_dim=Q_HEAD_DIM,
+            num_blocks=blocks_needed,
+            block_size=Q_BLOCK_SIZE,
+            dtype=mx.float16,
+            turboquant=False,
+        )
+        mx.eval(k_bulk, v_bulk, slot_bulk)
+
+        # Fewer iters at large N to keep total bench time reasonable.
+        n_iter = 50 if n_tok <= 1024 else 20
+
+        def _run_tq(kb=k_bulk, vb=v_bulk, sb=slot_bulk, ctb=cache_tq_bulk):
+            (
+                new_k,
+                new_v,
+                new_ks,
+                new_vs,
+                new_kz,
+            ) = ops.tq_encode(
+                kb,
+                vb,
+                ctb.key_caches[0],
+                ctb.value_caches[0],
+                ctb.key_scale_caches[0],
+                ctb.value_scale_caches[0],
+                ctb.key_zero_caches[0],
+                sb,
+                v_centroids,
+                ctb.v_bits,
+                ctb.k_bits,
+            )
+            ctb.key_caches[0] = new_k
+            ctb.value_caches[0] = new_v
+            ctb.key_scale_caches[0] = new_ks
+            ctb.value_scale_caches[0] = new_vs
+            ctb.key_zero_caches[0] = new_kz
+            mx.eval(new_k, new_v, new_ks, new_vs, new_kz)
+
+        def _run_fp(kb=k_bulk, vb=v_bulk, sb=slot_bulk, cfb=cache_fp_bulk):
+            _scatter_fp16(cfb, 0, kb, vb, sb, Q_HEAD_DIM)
+            mx.eval(cfb.key_caches[0], cfb.value_caches[0])
+
+        for _ in range(5):
+            _run_tq()
+        t0 = time.perf_counter()
+        for _ in range(n_iter):
+            _run_tq()
+        tq_total = (time.perf_counter() - t0) / n_iter * 1e6
+        tq_per_tok = tq_total / n_tok
+
+        for _ in range(5):
+            _run_fp()
+        t0 = time.perf_counter()
+        for _ in range(n_iter):
+            _run_fp()
+        fp_total = (time.perf_counter() - t0) / n_iter * 1e6
+        fp_per_tok = fp_total / n_tok
+
+        print(
+            f"    {n_tok:>5}    {tq_total:>7.1f} µs / {tq_per_tok:>5.3f} µs    "
+            f"{fp_total:>7.1f} µs / {fp_per_tok:>5.3f} µs"
+        )
     return 0
 
 
@@ -1691,6 +2093,45 @@ def _run_serve_config(label: str, additional_config: dict | None, log_dir: str) 
     return result
 
 
+FAST_SERVE_LABEL = "q8q3"
+FAST_SERVE_CONFIG = {"turboquant": True, "k_quant": "q8_0", "v_quant": "q3_0"}
+
+
+def section_fast_serve() -> int:
+    """Boot a single TurboQuant-enabled vllm serve run — smoke test only.
+
+    Skips parity/memory/latency sections entirely and jumps straight to
+    ``_run_serve_config`` with the production TQ config (q8_0 K, q3_0 V).
+    Intended for quickly verifying that the TQ hot path doesn't crash the
+    engine core on a real request — the exact scenario the eager-tq_encode
+    race used to miss.  Returns non-zero if serve fails to come up or the
+    chat completion errors out.
+    """
+    sep(
+        f"Fast Serve ({FAST_SERVE_LABEL}: k={FAST_SERVE_CONFIG['k_quant']}, "
+        f"v={FAST_SERVE_CONFIG['v_quant']})"
+    )
+    print(f"  Model: {SERVE_MODEL}")
+    log_dir = "/tmp/tq-fast-serve"
+    os.makedirs(log_dir, exist_ok=True)
+
+    result = _run_serve_config(FAST_SERVE_LABEL, FAST_SERVE_CONFIG, log_dir)
+
+    print()
+    sep("Fast Serve Result")
+    if not result["ready"]:
+        print("  FAIL: server never became ready")
+        return 1
+    chat = result.get("chat", {})
+    if not chat.get("ok"):
+        print(f"  FAIL: chat completion errored — {chat.get('error', '?')}")
+        return 1
+    print(
+        f"  OK    tok/s={chat['tok_per_s']:.1f}  peak RSS={result['peak_rss']:.0f} MB"
+    )
+    return 0
+
+
 def section_serve_benchmark() -> int:
     """Compare bf16 against the TQ (k_quant, v_quant) sweep via live vllm serve."""
     tq_labels = ", ".join(label for label, cfg in SERVE_CONFIGS if cfg is not None)
@@ -1735,16 +2176,31 @@ def section_serve_benchmark() -> int:
 
 def main() -> int:
     run_serve = "--serve" in sys.argv
+    run_fast_serve = "--fast-serve" in sys.argv
 
     print("╔══════════════════════════════════════════════════════════════════════╗")
     print("║         TurboQuant KV Cache — Comprehensive Test Suite              ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    # --fast-serve bypasses the entire parity/memory/latency battery and
+    # jumps straight to a single TQ-enabled live serve run.  Useful for
+    # verifying the TQ hot path survives a real request without waiting
+    # through the full ~1-minute test suite.
+    if run_fast_serve:
+        rc = section_fast_serve()
+        sep("DONE")
+        if rc:
+            print("  fast-serve FAILED.\n")
+        else:
+            print("  fast-serve OK.\n")
+        return rc
 
     failures = 0
     failures += section_quant_type_validation()
     failures += section_pack_unpack_roundtrip()
     failures += section_python_roundtrip_mse()
     failures += section_metal_kernel_dequant()
+    failures += section_metal_encode_parity()
     failures += section_metal_e2e()
     failures += section_memory_capacity()
     failures += section_published_comparison()
@@ -2007,6 +2463,111 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     assert relative_error_percent < 5.0
 
 
+def test_tq_encode_kernel_supports_head_dim_512() -> None:
+    """The fused ``ops.tq_encode`` Metal kernel must accept head_dim=512.
+
+    Regression for the kernel-side 512 gap: ``MetalPagedKVCache`` and the
+    decode kernel already supported 512-dim, but the fused encode primitive
+    only had instantiations for {64, 128, 256} and rejected 512 with a
+    runtime guard — breaking Gemma-style models with full-attn head_dim=512
+    on the first forward pass after the Python encode fallback was removed.
+
+    This test goes through ``ops.tq_encode`` directly (not the Python
+    ``_fill_cache`` path used by ``test_turboquant_512_head_dim_matches_
+    python_reference``) and verifies its outputs match the Python encode.
+    """
+    head_dim = 512
+    num_tokens = 16
+    num_kv_heads = 2
+    num_blocks = 4
+    block_size = 16
+    k_quant, v_quant = "q8_0", "q3_0"
+    k_bits = QUANT_PARAMS[k_quant]["bits"]
+    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
+    k_signed = bool(QUANT_PARAMS[k_quant]["signed"])
+
+    cache = MetalPagedKVCache(
+        num_layers=1,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant=k_quant,
+        v_quant=v_quant,
+    )
+
+    np.random.seed(512)
+    k = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
+    v = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
+    slot_mapping = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    mx.eval(k, v, slot_mapping)
+
+    ops = get_ops()
+    v_centroids = get_v_centroids(v_bits)
+    new_k, new_v, new_ks, new_vs, new_kz = ops.tq_encode(
+        k,
+        v,
+        cache.key_caches[0],
+        cache.value_caches[0],
+        cache.key_scale_caches[0],
+        cache.value_scale_caches[0],
+        cache.key_zero_caches[0],
+        slot_mapping,
+        v_centroids,
+        v_bits,
+        k_bits,
+        k_signed,
+    )
+    mx.eval(new_k, new_v, new_ks, new_vs, new_kz)
+
+    (
+        (packed_k_ref, k_scale_ref, k_zero_ref),
+        (
+            packed_v_ref,
+            v_scale_ref,
+        ),
+    ) = turbo_quant_encode(k, v, k_quant, value_bits=v_bits)
+    mx.eval(packed_k_ref, k_scale_ref, k_zero_ref, packed_v_ref, v_scale_ref)
+
+    # K indices: ±2 on the int8 grid, ≥95% exact (same tolerance the
+    # encode-parity sweep uses for the 128-dim case).
+    flat_k_kernel = new_k.reshape(-1, num_kv_heads, head_dim)[:num_tokens]
+    k_kernel = np.asarray(flat_k_kernel.astype(mx.int32))
+    k_ref = np.asarray(packed_k_ref.astype(mx.int32))
+    k_diff = np.abs(k_kernel - k_ref)
+    assert (k_diff <= 2).all(), f"K indices drift > 2: max={int(k_diff.max())}"
+    assert (k_diff == 0).mean() >= 0.99, (
+        f"K exact-match rate {(k_diff == 0).mean():.4f} below 0.99"
+    )
+
+    # K scales / zero-points (fp16).
+    scale_groups = head_dim // BLOCK_SIZE
+    flat_ks = new_ks.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    flat_kz = new_kz.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    assert np.allclose(
+        np.asarray(flat_ks.astype(mx.float32)),
+        np.asarray(k_scale_ref.astype(mx.float32)),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    kz_diff = np.abs(
+        np.asarray(flat_kz.astype(mx.float32))
+        - np.asarray(k_zero_ref.astype(mx.float32))
+    )
+    assert (kz_diff <= 1.0).all(), f"K zero-point drift > 1: max={kz_diff.max():.2e}"
+
+    # V scales (fp16).
+    flat_vs = new_vs.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    assert np.allclose(
+        np.asarray(flat_vs.astype(mx.float32)),
+        np.asarray(v_scale_ref.astype(mx.float32)),
+        rtol=1e-2,
+        atol=1e-3,
+    )
+
+
 def test_turboquant_per_layer_shapes_raise_early() -> None:
     """TurboQuant must keep rejecting per-layer KV shapes until PR2 lands."""
     reset_config()
@@ -2192,6 +2753,157 @@ def test_tq_spec_merge_rejects_mixed_quant():
     )
     with pytest.raises(AssertionError, match="same .k_quant, v_quant."):
         TurboQuantAttentionSpec.merge([a, b])
+
+
+@pytest.mark.parametrize(
+    "head_dim,k_quant,v_bits",
+    [
+        (64, "q8_0", 3),
+        (128, "q8_0", 3),
+        (128, "q4_0", 3),
+        (128, "q8_0", 4),
+        (256, "q8_0", 3),
+        (512, "q8_0", 3),
+    ],
+    ids=[
+        "hs64-q80-v3",
+        "hs128-q80-v3",
+        "hs128-q40-v3",
+        "hs128-q80-v4",
+        "hs256-q80-v3",
+        "hs512-q80-v3",
+    ],
+)
+def test_metal_encode_python_decode_roundtrip(
+    head_dim: int, k_quant: str, v_bits: int
+) -> None:
+    """End-to-end: Metal `ops.tq_encode` → Python `turbo_quant_decode` → fp16 K/V.
+
+    The encode-parity test (`test_tq_encode_kernel_supports_head_dim_512` and
+    `section_metal_encode_parity`) only checks that the Metal kernel produces
+    the same packed bytes as Python `turbo_quant_encode`.  That's necessary
+    but not sufficient: a bug in the bit-packing layout, scale-group stride,
+    or signed-vs-unsigned interpretation could produce parity-matching but
+    semantically wrong cache contents that decode to garbage.
+
+    This test goes the other direction: feed random fp16 K/V through the
+    Metal encode kernel, then read the packed cache bytes and dequantise
+    via the Python decode helpers (which the production decode kernel
+    must agree with by parity guarantees).  If the round-trip K/V have
+    abnormally high error vs the original, the bug is in the Metal encode
+    layout regardless of which path consumes it.
+
+    Tolerances are calibrated from the published quantisation MSE numbers:
+    q8_0 K → MSE ≲ 4e-4, 3-bit V → cos_sim ≥ 0.97.  4-bit V is tighter
+    (≥ 0.99); we use the same threshold across V widths since the centroid
+    table compensates.
+    """
+    num_tokens = 16
+    num_kv_heads = 2
+    num_blocks = 4
+    block_size = 16
+    k_bits = QUANT_PARAMS[k_quant]["bits"]
+    k_signed = bool(QUANT_PARAMS[k_quant]["signed"])
+
+    # The cache infra requires v_quant to be a registered name; pick the one
+    # that matches v_bits.  We only run the kernel through `ops.tq_encode`
+    # which takes v_bits directly, so the cache's v_quant is just for shape.
+    v_quant = {3: "q3_0", 4: "q4_0", 8: "uint8"}.get(v_bits, "q3_0")
+
+    cache = MetalPagedKVCache(
+        num_layers=1,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=mx.float16,
+        turboquant=True,
+        k_quant=k_quant,
+        v_quant=v_quant,
+    )
+
+    np.random.seed(hash((head_dim, k_quant, v_bits)) & 0xFFFF)
+    k = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
+    v = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
+    slot_mapping = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    mx.eval(k, v, slot_mapping)
+
+    # ---- Metal encode ----
+    ops = get_ops()
+    v_centroids = get_v_centroids(v_bits)
+    new_k, new_v, new_ks, new_vs, new_kz = ops.tq_encode(
+        k,
+        v,
+        cache.key_caches[0],
+        cache.value_caches[0],
+        cache.key_scale_caches[0],
+        cache.value_scale_caches[0],
+        cache.key_zero_caches[0],
+        slot_mapping,
+        v_centroids,
+        v_bits,
+        k_bits,
+        k_signed,
+    )
+    mx.eval(new_k, new_v, new_ks, new_vs, new_kz)
+
+    # ---- Slice the populated rows out of the paged cache ----
+    scale_groups = head_dim // BLOCK_SIZE
+    k_packed_dim = cache.k_packed_dim
+    v_packed_dim = cache.v_packed_dim
+
+    k_pkt = new_k.reshape(-1, num_kv_heads, k_packed_dim)[:num_tokens]
+    v_pkt = new_v.reshape(-1, num_kv_heads, v_packed_dim)[:num_tokens]
+    ks_pkt = new_ks.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    vs_pkt = new_vs.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    kz_pkt = new_kz.reshape(-1, num_kv_heads, scale_groups)[:num_tokens]
+    mx.eval(k_pkt, v_pkt, ks_pkt, vs_pkt, kz_pkt)
+
+    # ---- Python decode on Metal-encoded bytes ----
+    k_hat, v_hat = turbo_quant_decode(
+        (k_pkt, ks_pkt, kz_pkt),
+        (v_pkt, vs_pkt),
+        output_dtype=mx.float16,
+        key_quant_type=k_quant,
+        value_bits=v_bits,
+    )
+    mx.eval(k_hat, v_hat)
+
+    # ---- Compare to original ----
+    k_mse = mx.mean((k.astype(mx.float32) - k_hat.astype(mx.float32)) ** 2).item()
+    v_mse = mx.mean((v.astype(mx.float32) - v_hat.astype(mx.float32)) ** 2).item()
+    k_cos = cos_sim(k, k_hat)
+    v_cos = cos_sim(v, v_hat)
+
+    # K tolerance: q8_0 random-input MSE ≈ 1e-4, q4_0 ≈ 5e-3 to 1e-2.  We
+    # set thresholds at ~5x the typical observed value so a bit-layout bug
+    # (which would give MSE ≥ 0.1, often ≥ 0.5) trips the assertion while
+    # benign quant noise doesn't.
+    k_mse_threshold = 1e-3 if k_bits >= 8 else (3e-2 if k_bits >= 4 else 1e-1)
+    assert k_mse < k_mse_threshold, (
+        f"K roundtrip MSE {k_mse:.6f} ≥ {k_mse_threshold} "
+        f"(k_quant={k_quant}, head_dim={head_dim}) — Metal encode bytes do "
+        f"not decode back to the input via Python; suspect bit-packing or "
+        f"scale-group layout mismatch."
+    )
+    assert k_cos >= 0.99, (
+        f"K roundtrip cos_sim {k_cos:.4f} < 0.99 "
+        f"(k_quant={k_quant}, head_dim={head_dim})"
+    )
+
+    # V tolerance: 3-bit FWHT+Lloyd-Max gives cos_sim ≥ 0.97 typically.
+    v_cos_threshold = 0.95 if v_bits <= 3 else 0.98
+    assert v_cos >= v_cos_threshold, (
+        f"V roundtrip cos_sim {v_cos:.4f} < {v_cos_threshold} "
+        f"(v_bits={v_bits}, head_dim={head_dim}) — Metal V encode bytes do "
+        f"not decode back to the input via Python; suspect FWHT sign-table "
+        f"mismatch, centroid lookup, or sub-8-bit packing layout."
+    )
+    # V MSE is bounded loosely by 1.0 (3-bit is intrinsically lossy);
+    # finite + reasonable is the real check.
+    assert math.isfinite(v_mse) and v_mse < 2.0, (
+        f"V roundtrip MSE {v_mse} not finite/reasonable"
+    )
 
 
 if __name__ == "__main__":

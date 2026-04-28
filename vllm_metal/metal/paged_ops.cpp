@@ -386,10 +386,11 @@ static void dispatch_paged_attention_v2_online(
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
-  // TurboQuant: add per-warp FWHT buffer (NUM_WARPS * head_size floats)
-  if (use_turboquant) {
-    warp_scores_bytes += NUM_WARPS * head_size * static_cast<int>(sizeof(float));
-  }
+  // TurboQuant V path is now register-only (inverse FWHT runs entirely on
+  // the simdgroup register file via simd_shuffle_xor).  The previous
+  // per-warp NUM_WARPS * head_size FWHT workspace in shared_mem has been
+  // removed from the kernel, so no TQ bonus is needed here.
+  (void)use_turboquant;
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
   auto& enc = get_command_encoder_compat(d, s);
@@ -611,11 +612,18 @@ void paged_attention_v2_online_impl_common(
         "paged_attention_v2_reduce_" + dt +
         "_hs" + std::to_string(head_size) +
         "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
+    // The reduce kernel now references function_constant(50) (use_turboquant)
+    // to gate the deferred-FWHT path.  Reaching this dispatch from the
+    // non-TQ wrapper means use_turboquant is always false here; encode it
+    // in the hash name anyway so a future TQ-partitioned dispatch picks up
+    // its own specialisation instead of reusing the non-TQ one.
+    bool reduce_use_tq = false;
     auto* reduce_kernel = d.get_kernel(
         reduce_kname,
         lib,
-        reduce_kname + "_v2_reduce",
-        {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+        reduce_kname + "_v2_reduce_tq" + (reduce_use_tq ? "1" : "0"),
+        {{&use_sinks,       MTL::DataType::DataTypeBool, NS::UInteger(40)},
+         {&reduce_use_tq,   MTL::DataType::DataTypeBool, NS::UInteger(50)}});
     size_t reduce_shmem =
         static_cast<size_t>(2 * max_num_partitions * sizeof(float));
     enc.set_compute_pipeline_state(reduce_kernel);
@@ -834,6 +842,189 @@ void paged_attention_v2_online_partitioned_impl(
 }
 
 // ---------------------------------------------------------------------------
+// tq_encode — fused TurboQuant encode + paged scatter
+//
+// Replaces the Python turbo_quant_encode() + 5 MLX scatters on the hot path.
+// Lives in the v2 library because turboquant.metal is concatenated there.
+// Supports all K quants in QUANT_PARAMS: signed 8-bit (q8_0/int8) and
+// unsigned {8,5,4,2}-bit (uint8/q5_0/q4_0/int4/uint4/int2/uint2).  V supports
+// any v_bits in [1, 8] via the v_centroids buffer.
+//
+// Wrapped in a proper MLX Primitive so that the five cache writes become
+// new MLX-graph nodes with provenance pointing at this primitive.  This is
+// critical: paged_attention_primitive runs on a separate command buffer and
+// reads the same cache arrays, and the downstream decode step re-reads
+// them too.  Without a real graph edge, MLX's scheduler has no idea this
+// op must complete before those readers — the primitives submit to their
+// encoders out of order and the reader sees uninitialised / in-flight
+// bytes (silent GPU fault → EngineCore crash on first real request).
+//
+// Each of the five outputs aliases the corresponding input cache buffer
+// via copy_shared_buffer, so the kernel writes in place (no extra
+// allocation) while MLX still gets clean graph provenance.  The caller
+// rebinds kv_cache.key_caches[layer_idx] = new_k_cache so the next decode
+// step's tq_encode input reads through this primitive's output.
+// ---------------------------------------------------------------------------
+
+class TQEncodePrimitive : public Primitive {
+ public:
+  TQEncodePrimitive(Stream stream, int v_bits, int k_bits, bool k_signed)
+      : Primitive(stream),
+        v_bits_(v_bits),
+        k_bits_(k_bits),
+        k_signed_(k_signed) {}
+
+  void eval_cpu(
+      const std::vector<array>&,
+      std::vector<array>&) override {
+    throw std::runtime_error("TQEncodePrimitive only supports GPU");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // inputs:  0=key, 1=value,
+    //          2=key_cache_in, 3=value_cache_in,
+    //          4=key_scale_in, 5=value_scale_in, 6=key_zero_in,
+    //          7=slot_mapping, 8=v_centroids
+    // outputs: 0=new_key_cache, 1=new_value_cache,
+    //          2=new_key_scale, 3=new_value_scale, 4=new_key_zero
+
+    // Alias each output onto the corresponding input cache buffer.  The
+    // kernel writes in place — the aliasing simply gives the output a
+    // distinct graph identity (new ArrayDesc with primitive = this) while
+    // sharing the underlying Metal buffer.  After eval, Python rebinds
+    // kv_cache.<cache>[layer_idx] = outputs[i], so subsequent ops naturally
+    // depend on this primitive via the MLX graph.
+    outputs[0].copy_shared_buffer(inputs[2]);
+    outputs[1].copy_shared_buffer(inputs[3]);
+    outputs[2].copy_shared_buffer(inputs[4]);
+    outputs[3].copy_shared_buffer(inputs[5]);
+    outputs[4].copy_shared_buffer(inputs[6]);
+
+    const array& key          = inputs[0];
+    const array& value        = inputs[1];
+    const array& slot_mapping = inputs[7];
+    const array& v_centroids  = inputs[8];
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+
+    // key shape: [num_tokens, num_kv_heads, head_size]
+    int num_tokens   = static_cast<int>(key.shape(0));
+    int num_kv_heads = static_cast<int>(key.shape(1));
+    int head_size    = static_cast<int>(key.shape(2));
+    int block_size   = static_cast<int>(inputs[2].shape(1));
+
+    auto kv_dt = dtype_to_metal(key.dtype());
+    std::string kname = "tq_encode_" + kv_dt +
+                        "_hs" + std::to_string(head_size);
+
+    // Function constants control bit widths + signedness used inside the
+    // kernel.  The hash name MUST encode them so MLX caches the right
+    // specialization per (k_bits, k_signed, v_bits) tuple.
+    int  k_bits_i   = k_bits_;
+    int  v_bits_i   = v_bits_;
+    bool k_signed_b = k_signed_;
+    std::string hash_name = kname +
+        "_kb" + std::to_string(k_bits_i) +
+        "_ks" + (k_signed_b ? "1" : "0") +
+        "_vb" + std::to_string(v_bits_i);
+
+    auto* lib = d.get_library("paged_attention_v2_kern");
+    auto* kernel = d.get_kernel(
+        kname, lib, hash_name,
+        {{&k_bits_i,   MTL::DataType::DataTypeInt,  NS::UInteger(80)},
+         {&k_signed_b, MTL::DataType::DataTypeBool, NS::UInteger(81)},
+         {&v_bits_i,   MTL::DataType::DataTypeInt,  NS::UInteger(90)}});
+
+    int32_t num_kv_heads_i = static_cast<int32_t>(num_kv_heads);
+    int32_t block_size_i   = static_cast<int32_t>(block_size);
+
+    auto& enc = get_command_encoder_compat(d, s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(key,                0);
+    enc.set_input_array(value,              1);
+    enc.set_output_array(outputs[0],        2);
+    enc.set_output_array(outputs[1],        3);
+    enc.set_output_array(outputs[2],        4);
+    enc.set_output_array(outputs[3],        5);
+    enc.set_output_array(outputs[4],        6);
+    enc.set_input_array(slot_mapping,       7);
+    enc.set_input_array(v_centroids,        8);
+    enc.set_bytes(num_kv_heads_i,           9);
+    enc.set_bytes(block_size_i,             10);
+
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_tokens, num_kv_heads, 1),
+        MTL::Size::Make(head_size, 1, 1));
+
+    // Intentionally no add_temporary: inside a primitive, MLX's evaluator
+    // manages array lifetimes via the completion handler.  add_temporary
+    // here would strip outputs[0..4] from the encoder's tracking and
+    // silently defeat the fence for downstream primitives.
+  }
+
+  const char* name() const override { return "TQEncode"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const TQEncodePrimitive*>(&other);
+    return rhs && rhs->v_bits_   == v_bits_
+               && rhs->k_bits_   == k_bits_
+               && rhs->k_signed_ == k_signed_;
+  }
+
+ private:
+  int  v_bits_;
+  int  k_bits_;
+  bool k_signed_;
+};
+
+static std::vector<array> tq_encode_primitive_fn(
+    const array& key, const array& value,
+    const array& key_cache, const array& value_cache,
+    const array& key_scale_cache, const array& value_scale_cache,
+    const array& key_zero_cache,
+    const array& slot_mapping, const array& v_centroids,
+    int v_bits, int k_bits, bool k_signed) {
+  // Accept every bit width present in QUANT_PARAMS (2/3/4/5/8).  Signed is
+  // only legal at bits=8 because Python stores signed sub-8-bit types as
+  // unsigned for packability (e.g. int4 is signed:False in QUANT_PARAMS).
+  if (k_bits != 2 && k_bits != 3 && k_bits != 4 && k_bits != 5 && k_bits != 8) {
+    throw std::runtime_error(
+        "tq_encode: k_bits must be 2, 3, 4, 5, or 8 (got " +
+        std::to_string(k_bits) + ")");
+  }
+  if (k_signed && k_bits != 8) {
+    throw std::runtime_error(
+        "tq_encode: signed K is only supported at k_bits=8 "
+        "(matches QUANT_PARAMS in turboquant.py).");
+  }
+  int head_size = static_cast<int>(key.shape(2));
+  if (head_size != 64 && head_size != 128 && head_size != 256 && head_size != 512) {
+    throw std::runtime_error(
+        "tq_encode: head_size must be 64, 128, 256, or 512 (got " +
+        std::to_string(head_size) + ")");
+  }
+
+  auto prim = std::make_shared<TQEncodePrimitive>(
+      default_stream(Device::gpu), v_bits, k_bits, k_signed);
+
+  return array::make_arrays(
+      {key_cache.shape(), value_cache.shape(),
+       key_scale_cache.shape(), value_scale_cache.shape(),
+       key_zero_cache.shape()},
+      {key_cache.dtype(), value_cache.dtype(),
+       key_scale_cache.dtype(), value_scale_cache.dtype(),
+       key_zero_cache.dtype()},
+      prim,
+      {key, value,
+       key_cache, value_cache,
+       key_scale_cache, value_scale_cache, key_zero_cache,
+       slot_mapping, v_centroids});
+}
+
+// ---------------------------------------------------------------------------
 // GDN linear attention — in-place paged state
 // ---------------------------------------------------------------------------
 
@@ -938,6 +1129,70 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("slot_mapping"),
         "Write projected K/V into the paged cache.");
+
+  m.def("tq_encode",
+        [](nb::handle key_h, nb::handle value_h,
+           nb::handle key_cache_h, nb::handle value_cache_h,
+           nb::handle key_scale_cache_h, nb::handle value_scale_cache_h,
+           nb::handle key_zero_cache_h,
+           nb::handle slot_mapping_h,
+           nb::handle v_centroids_h,
+           int v_bits, int k_bits, bool k_signed) {
+          auto results = tq_encode_primitive_fn(
+              *nb::inst_ptr<array>(key_h),
+              *nb::inst_ptr<array>(value_h),
+              *nb::inst_ptr<array>(key_cache_h),
+              *nb::inst_ptr<array>(value_cache_h),
+              *nb::inst_ptr<array>(key_scale_cache_h),
+              *nb::inst_ptr<array>(value_scale_cache_h),
+              *nb::inst_ptr<array>(key_zero_cache_h),
+              *nb::inst_ptr<array>(slot_mapping_h),
+              *nb::inst_ptr<array>(v_centroids_h),
+              v_bits, k_bits, k_signed);
+
+          // Mint five Python mx.core.array placeholders inside the binding
+          // (callers never see the placeholder dance).  We go through the
+          // Python-side mlx.core.array constructor because cross-module
+          // nanobind RTTI for nb::class_<array> from libmlx is broken under
+          // hidden symbol visibility; overwrite_descriptor is the same
+          // escape hatch used by paged_attention_primitive below.
+          nb::object mx_core  = nb::module_::import_("mlx.core");
+          nb::object arr_cls  = mx_core.attr("array");
+          nb::object zero_arg = nb::int_(0);
+          nb::object out_k    = arr_cls(zero_arg);
+          nb::object out_v    = arr_cls(zero_arg);
+          nb::object out_ks   = arr_cls(zero_arg);
+          nb::object out_vs   = arr_cls(zero_arg);
+          nb::object out_kz   = arr_cls(zero_arg);
+          nb::inst_ptr<array>(out_k)->overwrite_descriptor(results[0]);
+          nb::inst_ptr<array>(out_v)->overwrite_descriptor(results[1]);
+          nb::inst_ptr<array>(out_ks)->overwrite_descriptor(results[2]);
+          nb::inst_ptr<array>(out_vs)->overwrite_descriptor(results[3]);
+          nb::inst_ptr<array>(out_kz)->overwrite_descriptor(results[4]);
+          return nb::make_tuple(out_k, out_v, out_ks, out_vs, out_kz);
+        },
+        nb::arg("key"), nb::arg("value"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("key_scale_cache"), nb::arg("value_scale_cache"),
+        nb::arg("key_zero_cache"),
+        nb::arg("slot_mapping"),
+        nb::arg("v_centroids"),
+        nb::arg("v_bits"),
+        nb::arg("k_bits"),
+        nb::arg("k_signed"),
+        "Fused TurboQuant encode + paged scatter.  Wraps a real MLX "
+        "Primitive so its five cache writes carry graph provenance — "
+        "downstream paged_attention_primitive and the next decode step's "
+        "tq_encode depend on this op through the lazy graph instead of "
+        "racing it on a separate command buffer.  Returns a 5-tuple "
+        "(new_key_cache, new_value_cache, new_key_scale_cache, "
+        "new_value_scale_cache, new_key_zero_cache); each aliases the "
+        "corresponding input buffer in place and the caller MUST rebind "
+        "kv_cache.<cache>[layer_idx] to the returned value so subsequent "
+        "ops see the post-write provenance.  Supports all K quants in "
+        "QUANT_PARAMS (signed q8_0/int8 at k_bits=8; unsigned uint8/q5_0/"
+        "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
+        "any v_bits in [1, 8] via the v_centroids buffer.");
 
   m.def("paged_attention_v1", &paged_attention_v1_impl,
         nb::arg("out"), nb::arg("query"),
