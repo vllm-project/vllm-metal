@@ -2,6 +2,7 @@
 """Metal Platform implementation for vLLM."""
 
 import logging
+import os
 import platform as py_platform
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
 logger = logging.getLogger(__name__)
+
+# Smallest entry in ``_KERNEL_BLOCK_SIZES`` from
+# ``metal_kernel_backend.attention_sdpa``: ``cache_block_size`` must be a
+# multiple of one of {8, 16, 32}, so anything below 8 is unsalvageable.
+_METAL_KERNEL_MIN_BLOCK_SIZE = 8
 
 
 class MetalPlatform(Platform):
@@ -287,15 +293,27 @@ class MetalPlatform(Platform):
                     scheduler_config.max_num_batched_tokens,
                 )
 
-        # Configure cache — ensure block_size is at least the Metal kernel
-        # minimum.  With chunked prefill enabled, upstream may default to
-        # block_size=1 for fine-grained scheduling, but our Metal paged
-        # attention kernel requires multiples of 8.
+        # With chunked prefill enabled, upstream may default to ``block_size=1``
+        # for fine-grained scheduling.  Floor at the kernel minimum so
+        # ``_pick_kernel_block_size`` always has a valid divisor at request
+        # time.
         if (
             cache_config.block_size is None
-            or cache_config.block_size < config.block_size
+            or cache_config.block_size < _METAL_KERNEL_MIN_BLOCK_SIZE
         ):
-            cache_config.block_size = config.block_size
+            cache_config.block_size = _METAL_KERNEL_MIN_BLOCK_SIZE
+
+        # ``VLLM_METAL_BLOCK_SIZE`` predates vLLM 0.20's ``--block-size`` /
+        # ``Platform._align_hybrid_block_size`` contract.  It now competes with
+        # both and is silently overridden by upstream's Phase 1 for non-hybrid
+        # models, so it cannot deliver on its name.  Warn once if a user set it
+        # explicitly; remove in a future release.
+        if "VLLM_METAL_BLOCK_SIZE" in os.environ:
+            logger.warning(
+                "VLLM_METAL_BLOCK_SIZE is deprecated and ignored as of the "
+                "vLLM 0.20 bump; upstream's --block-size is the canonical "
+                "knob. Will be removed in a future release."
+            )
 
         # Disable cascade attention (not supported), then let the adapter
         # apply any model-specific normalisations (e.g. clearing
@@ -359,22 +377,15 @@ class MetalPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Update block_size for Metal platform.
 
-        Compatibility note:
-        - vLLM 0.19.0 (currently supported): Block size is configured during
-          VllmConfig initialization, so this method is not strictly required.
-          However, we still implement it for forward compatibility.
-        - Latest vLLM: The block_size calculation logic was moved to use
-          Platform.update_block_size_for_backend() in the base class.
-
-        This implementation delegates to super().update_block_size_for_backend()
-        to support both versions. Our overridden _find_non_ssm_backend provides
-        the Metal-specific kernel block alignment (MultipleOf(32)) that the base
-        class uses for hybrid model block_size calculation.
+        Delegates to vLLM's base implementation, which reads the Metal kernel
+        alignment (MultipleOf(32)) from our :meth:`_find_non_ssm_backend`
+        override. Adds a one-time warning when paged attention is enabled for
+        a hybrid model, explaining the cache-block-size translation mechanism
+        (PR #235).
         """
         from vllm_metal.config import get_config
 
         metal_config = get_config()
-        cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
         if not model_config:
@@ -386,7 +397,6 @@ class MetalPlatform(Platform):
         # Background:
         # - vLLM requires block_size=160 (or larger) for hybrid models to satisfy
         #   page size divisibility validation between SDPA and Mamba layers.
-        # - Metal paged attention kernels only support block_size in {8, 16, 32}.
         #
         # Solution (PR #235):
         # - vLLM sees a large block_size (e.g., 160) for its scheduler validation.
@@ -408,34 +418,16 @@ class MetalPlatform(Platform):
                 "  Mechanism: Each vLLM block is split into multiple kernel blocks.\n"
                 "  Example: vLLM block_size=160 → kernel block_size=32 (ratio=5).\n"
                 "  The KV cache is reshaped (zero-copy) and block tables are expanded.\n"
-                "  This is a logical transformation — physical memory is unchanged.\n"
-                "  Note: The default MLX path (without paged attention) is recommended "
-                "for hybrid models as it has no translation overhead."
+                "  This is a logical transformation — physical memory is unchanged."
             )
 
-        # Call base implementation - it will use our _find_non_ssm_backend
-        # which returns MetalBackend with kernel_block_alignment_size=32
+        # Delegate the rest to upstream. With our ``_find_non_ssm_backend``
+        # returning :class:`MetalBackend` (which advertises ``MultipleOf(32)``),
+        # vLLM's Phase 1 picks a kernel-aligned default for non-hybrid models,
+        # and Phase 2 (``_align_hybrid_block_size``) handles hybrid alignment.
+        # The kernel layer (``_pick_kernel_block_size``) validates the final
+        # ``block_size`` at request time.
         super().update_block_size_for_backend(vllm_config)
-
-        # Metal-specific adjustment: For hybrid models with paged attention,
-        # ensure block_size is a multiple of 32 for Metal GPU performance.
-        # The base class uses the backend's supported block sizes, but Metal
-        # paged attention kernels require block_size in {8, 16, 32}.
-        #
-        # Note: This has no impact on MLX execution (MLX manages its own KV cache
-        # via make_prompt_cache()). This adjustment is only for vLLM's validation.
-        if (
-            metal_config.use_paged_attention
-            and cache_config.block_size > 0
-            and cache_config.block_size % 32 != 0
-        ):
-            logger.warning(
-                "Metal paged attention requires block_size to be a multiple "
-                "of 32. Adjusting from %d to %d.",
-                cache_config.block_size,
-                ((cache_config.block_size + 31) // 32) * 32,
-            )
-            cache_config.block_size = ((cache_config.block_size + 31) // 32) * 32
 
     @classmethod
     def get_attn_backend_cls(

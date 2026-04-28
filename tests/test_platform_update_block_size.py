@@ -157,26 +157,6 @@ class TestUpdateBlockSizeForBackend:
     # Metal-Specific Adjustments
     # ========================================================================
 
-    def test_paged_attention_adjusts_block_size_to_multiple_of_32(
-        self, vllm_config, stub_super_update
-    ):
-        """Test: Paged attention rounds block_size up to a multiple of 32.
-
-        With ``super()`` stubbed, ``cache_config.block_size`` after super-call
-        equals whatever the test sets here, so the post-super Metal adjustment
-        is the only thing that can change it.
-        """
-        vllm_config.cache_config.block_size = 48  # 48 → 64
-
-        with patch("vllm_metal.config.get_config") as mock_get_config:
-            mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
-            mock_get_config.return_value = mock_metal_config
-
-            MetalPlatform.update_block_size_for_backend(vllm_config)
-
-            assert vllm_config.cache_config.block_size == 64
-
     def test_paged_attention_logs_warning(
         self, vllm_config, stub_super_update, caplog, monkeypatch
     ):
@@ -205,10 +185,10 @@ class TestUpdateBlockSizeForBackend:
             assert "Hybrid model" in caplog.text
             assert "paged attention" in caplog.text
 
-    def test_no_adjustment_when_already_multiple_of_32(
+    def test_wrapper_preserves_super_block_size(
         self, vllm_config, stub_super_update, caplog
     ):
-        """Test: block_size already aligned → post-super Metal adjustment is a no-op."""
+        """Test: wrapper does not mutate block_size set by base implementation."""
         vllm_config.cache_config.block_size = 64
 
         with patch("vllm_metal.config.get_config") as mock_get_config:

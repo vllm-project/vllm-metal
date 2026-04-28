@@ -78,7 +78,7 @@ def _pick_kernel_block_size(cache_block_size: int) -> int:
     raise ValueError(
         f"Cache block_size={cache_block_size} is not divisible by any "
         f"supported kernel block size {_KERNEL_BLOCK_SIZES}. "
-        "Adjust VLLM_METAL_BLOCK_SIZE or the hybrid page alignment."
+        "Adjust --block-size (must be a multiple of 8)."
     )
 
 
