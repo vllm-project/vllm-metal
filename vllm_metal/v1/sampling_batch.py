@@ -13,6 +13,7 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
@@ -302,6 +303,7 @@ def sample_prefill_tokens(
     *,
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
+    spec_metadata: SpecDecodeMetadata | None = None,
 ) -> list[int]:
     """Sample one token per prefill request from the last logit position.
 
@@ -314,6 +316,7 @@ def sample_prefill_tokens(
         device: PyTorch device for the torch bridge path.
         vocab_size: Model vocabulary size.
         logitsprocs: Optional logits processors.
+        spec_metadata: Optional speculative decoding metadata.
 
     Returns:
         List of sampled token IDs, one per prefill request.
@@ -321,6 +324,9 @@ def sample_prefill_tokens(
     prefill_next_tokens: list[int] = []
     for j, pr in enumerate(prefill_reqs):
         last_idx = cu_seqlens[num_decode + j + 1] - 1
+        
+        # Speculative decoding: return logits for all verification positions.
+        # TODO: Implement multi-logit extraction for speculative requests.
         last_logits = logits[0, last_idx : last_idx + 1, :]  # (1, vocab)
 
         if pr.full_prompt_token_ids is not None:

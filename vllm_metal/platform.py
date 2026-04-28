@@ -227,7 +227,12 @@ class MetalPlatform(Platform):
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
+            if vllm_config.speculative_config:
+                parallel_config.worker_cls = (
+                    "vllm_metal.v1.spec_decode.worker.MetalSpecDecodeWorker"
+                )
+            else:
+                parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
         # Set executor backend (use uniproc for single device)
         if parallel_config.distributed_executor_backend in ("auto", None):

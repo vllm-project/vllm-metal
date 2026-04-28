@@ -34,6 +34,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_metal.config import get_config
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
@@ -172,6 +173,7 @@ class _PagedForwardState(NamedTuple):
     logits: mx.array
     cu_seqlens: list[int]
     num_decode: int
+    spec_metadata: SpecDecodeMetadata | None
 
 
 class MetalModelRunner:
@@ -735,6 +737,7 @@ class MetalModelRunner:
         prefill_reqs: list[PrefillRequest],
         decode_reqs: list[tuple[str, RequestState]],
         scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> None:
         """Build graph and submit forward pass to GPU (async).
 
@@ -814,6 +817,7 @@ class MetalModelRunner:
             logits=logits,
             cu_seqlens=cu_seqlens,
             num_decode=num_decode,
+            spec_metadata=spec_metadata,
         )
 
     def _sample_paged_batch(
@@ -835,6 +839,7 @@ class MetalModelRunner:
         logits = state.logits
         cu_seqlens = state.cu_seqlens
         num_decode = state.num_decode
+        spec_metadata = state.spec_metadata
 
         # ---- wait for MLX forward to complete ----
         mx.eval(logits)
@@ -872,6 +877,7 @@ class MetalModelRunner:
             self.device,
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
+            spec_metadata=spec_metadata,
         )
 
         # ---- update decode state ----
@@ -1238,7 +1244,9 @@ class MetalModelRunner:
         self._gdn_materialize_pending_state_cache()
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> ModelRunnerOutput | None:
         """Execute model forward pass and submit to GPU.
 
@@ -1287,6 +1295,7 @@ class MetalModelRunner:
                 prefill_pack,
                 batch.paged_decode_reqs,
                 scheduler_output,
+                spec_metadata,
             )
             return None
 

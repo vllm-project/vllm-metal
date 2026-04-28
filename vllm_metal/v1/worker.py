@@ -27,6 +27,7 @@ from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
 
@@ -247,17 +248,20 @@ class MetalWorker(WorkerBase):
         self.model_runner.warm_up()
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> ModelRunnerOutput | None:
         """Execute model inference.
 
         Args:
             scheduler_output: Scheduler output with batch information
+            spec_metadata: Optional speculative decoding metadata
 
         Returns:
             Model runner output with generated tokens
         """
-        return self.model_runner.execute_model(scheduler_output)
+        return self.model_runner.execute_model(scheduler_output, spec_metadata)
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
