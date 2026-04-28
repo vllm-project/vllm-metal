@@ -34,7 +34,7 @@ dependencies = [
     "mlx-lm>=0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.4.0; platform_system == 'Darwin' and platform_machine == 'arm64'",  # Vision-language model support
     # Model loading and weights
-    # Lower bound aligned with vllm 0.19.1's exclude list in requirements/common.txt
+    # Lower bound aligned with vllm 0.20.0's exclude list in requirements/common.txt
     "transformers>=5.5.1",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
