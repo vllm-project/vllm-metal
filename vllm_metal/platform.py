@@ -442,6 +442,7 @@ class MetalPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """Get the attention backend class for Metal."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
