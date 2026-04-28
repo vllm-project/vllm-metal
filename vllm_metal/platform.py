@@ -19,11 +19,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Smallest entry in ``_KERNEL_BLOCK_SIZES`` from
-# ``metal_kernel_backend.attention_sdpa``: ``cache_block_size`` must be a
-# multiple of one of {8, 16, 32}, so anything below 8 is unsalvageable.
-_METAL_KERNEL_MIN_BLOCK_SIZE = 8
-
 
 class MetalPlatform(Platform):
     """Platform implementation for Apple Silicon Metal/MLX.
@@ -223,7 +218,6 @@ class MetalPlatform(Platform):
         """
         config = get_config()
         parallel_config = vllm_config.parallel_config
-        cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
         # Apply TurboQuant config from --additional-config
@@ -291,16 +285,6 @@ class MetalPlatform(Platform):
                     "max_num_batched_tokens=%d",
                     scheduler_config.max_num_batched_tokens,
                 )
-
-        # With chunked prefill enabled, upstream may default to ``block_size=1``
-        # for fine-grained scheduling.  Floor at the kernel minimum so
-        # ``_pick_kernel_block_size`` always has a valid divisor at request
-        # time.
-        if (
-            cache_config.block_size is None
-            or cache_config.block_size < _METAL_KERNEL_MIN_BLOCK_SIZE
-        ):
-            cache_config.block_size = _METAL_KERNEL_MIN_BLOCK_SIZE
 
         # Disable cascade attention (not supported), then let the adapter
         # apply any model-specific normalisations (e.g. clearing
