@@ -35,3 +35,4 @@ Metal. Qwen3 is explicitly covered by the paged prefix-cache e2e test.
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#221](https://github.com/vllm-project/vllm-metal/pull/221), [#212](https://github.com/vllm-project/vllm-metal/issues/212), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | [#213](https://github.com/vllm-project/vllm-metal/pull/213), [#233](https://github.com/vllm-project/vllm-metal/pull/233) | Automatic prefix caching is not yet verified on the MLX MLA path |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
+| DeepSeek-R1-Distill-Qwen-1.5B | ✅ | GQA (paged) | ✅ | | Validated on M4 Mac (16GB) |
