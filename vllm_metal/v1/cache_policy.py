@@ -588,40 +588,14 @@ class WorkerCachePlanner:
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
         if config.kv_sharing_fast_prefill:
-            from vllm_metal.yoco_fast_prefill import (
-                get_yoco_fast_prefill_ineligibility_reason,
-                patch_gemma4_yoco_fast_prefill,
-            )
+            from vllm_metal.yoco_fast_prefill import try_enable_gemma4_yoco_fast_prefill
 
-            reason = get_yoco_fast_prefill_ineligibility_reason(
+            try_enable_gemma4_yoco_fast_prefill(
+                self._worker.model_runner.model,
                 self._worker.model_runner.model_args,
                 use_paged_attention=config.use_paged_attention,
+                num_paged_layers=n_patched,
             )
-
-            fast_prefill_patched = False
-            if reason is not None:
-                logger.warning(
-                    "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-                    "but fast prefill is ineligible for this model (%s); "
-                    "continuing without fast prefill",
-                    reason,
-                )
-            else:
-                fast_prefill_patched = patch_gemma4_yoco_fast_prefill(
-                    self._worker.model_runner.model,
-                    self._worker.model_runner.model_args,
-                    use_paged_attention=config.use_paged_attention,
-                )
-            if fast_prefill_patched:
-                logger.info(
-                    "Gemma4 YOCO fast prefill enabled "
-                    "(VLLM_METAL_KV_SHARING_FAST_PREFILL=1)"
-                )
-            elif reason is None:
-                logger.warning(
-                    "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-                    "but this model is not eligible; continuing without fast prefill"
-                )
         logger.info(
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",

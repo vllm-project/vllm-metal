@@ -29,7 +29,61 @@ def _get_int_model_arg(model_args: Mapping[str, object], key: str) -> int | None
     return value
 
 
-def get_yoco_fast_prefill_ineligibility_reason(
+def try_enable_gemma4_yoco_fast_prefill(
+    model: Any,
+    model_args: Mapping[str, object],
+    *,
+    use_paged_attention: bool,
+    num_paged_layers: int | None = None,
+) -> bool:
+    """Enable Gemma4 YOCO fast prefill when the loaded model is eligible."""
+    reason = _get_yoco_fast_prefill_ineligibility_reason(
+        model_args,
+        use_paged_attention=use_paged_attention,
+    )
+    if reason is not None:
+        logger.warning(
+            "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
+            "but fast prefill is ineligible for this model (%s); "
+            "continuing without fast prefill",
+            reason,
+        )
+        return False
+
+    expected_layers = _get_int_model_arg(model_args, "num_hidden_layers")
+    if (
+        num_paged_layers is not None
+        and expected_layers is not None
+        and num_paged_layers < expected_layers
+    ):
+        logger.warning(
+            "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
+            "but only %d/%d layers use paged attention; "
+            "continuing without fast prefill",
+            num_paged_layers,
+            expected_layers,
+        )
+        return False
+
+    if _patch_gemma4_yoco_fast_prefill(
+        model,
+        model_args,
+        use_paged_attention=use_paged_attention,
+    ):
+        logger.info(
+            "Gemma4 YOCO fast prefill enabled (VLLM_METAL_KV_SHARING_FAST_PREFILL=1)"
+        )
+        return True
+
+    logger.warning(
+        "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
+        "but the Gemma4 text-model patch could not be installed; "
+        "continuing without fast prefill"
+    )
+    return False
+
+
+def _get_yoco_fast_prefill_ineligibility_reason(
     model_args: Mapping[str, object],
     *,
     use_paged_attention: bool,
@@ -79,7 +133,7 @@ class YocoReducedContextMetadata:
     cu_seqlens: list[int]
 
 
-def is_yoco_fast_prefill_eligible(
+def _is_yoco_fast_prefill_eligible(
     model_args: Mapping[str, object],
     *,
     use_paged_attention: bool,
@@ -91,7 +145,7 @@ def is_yoco_fast_prefill_eligible(
     correctness is proven and benchmarked.
     """
     return (
-        get_yoco_fast_prefill_ineligibility_reason(
+        _get_yoco_fast_prefill_ineligibility_reason(
             model_args,
             use_paged_attention=use_paged_attention,
         )
@@ -166,7 +220,7 @@ def build_yoco_reduced_context_from_full_metadata(
     )
 
 
-def find_gemma4_text_model(model: Any) -> Any | None:
+def _find_gemma4_text_model(model: Any) -> Any | None:
     """Return the mlx-lm Gemma4 text-model object if it matches our contract."""
     candidates = [
         model,
@@ -182,7 +236,7 @@ def find_gemma4_text_model(model: Any) -> Any | None:
     return None
 
 
-def patch_gemma4_yoco_fast_prefill(
+def _patch_gemma4_yoco_fast_prefill(
     model: Any,
     model_args: Mapping[str, object],
     *,
@@ -194,13 +248,13 @@ def patch_gemma4_yoco_fast_prefill(
     enable flag. This avoids changing behavior for other Gemma4 instances in
     the same process unless this function is called for them.
     """
-    if not is_yoco_fast_prefill_eligible(
+    if not _is_yoco_fast_prefill_eligible(
         model_args,
         use_paged_attention=use_paged_attention,
     ):
         return False
 
-    text_model = find_gemma4_text_model(model)
+    text_model = _find_gemma4_text_model(model)
     if text_model is None:
         return False
 
