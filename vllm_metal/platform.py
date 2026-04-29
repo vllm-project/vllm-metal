@@ -186,14 +186,17 @@ class MetalPlatform(Platform):
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
-        """Set RNG seed across all devices for Metal platform.
+        """Seed the Metal-side RNG (MLX) for this platform.
 
-        Args:
-            seed: Random seed value
+        Called from ``vllm.utils.torch_utils.set_random_seed`` after Python
+        ``random``, NumPy, and PyTorch (which reaches MPS via its default
+        generator) have all been seeded.  MLX maintains its own global PRNG
+        that does not auto-seed and is not reached by ``torch.manual_seed``,
+        so we seed it explicitly here.
         """
-        # MLX handles its own RNG seeding internally.
-        # PyTorch CPU/MPS RNG is handled by the base implementation.
-        pass
+        import mlx.core as mx
+
+        mx.random.seed(seed)
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
