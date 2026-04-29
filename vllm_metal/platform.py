@@ -340,7 +340,7 @@ class MetalPlatform(Platform):
         Since MLX models don't populate static_forward_context, the default
         Platform._find_non_ssm_backend (which walks attention layers via
         get_layers_from_vllm_config) returns nothing. We override to return
-        the synthetic MetalBackend, which advertises Metal's MultipleOf(32)
+        the synthetic MetalBackend, which advertises Metal's MultipleOf(16)
         kernel alignment to the framework's hybrid-block-size math.
         """
         from vllm_metal.metal_backend import MetalBackend
@@ -352,7 +352,7 @@ class MetalPlatform(Platform):
         """Update block_size for Metal platform.
 
         Delegates to vLLM's base implementation, which reads the Metal kernel
-        alignment (MultipleOf(32)) from our :meth:`_find_non_ssm_backend`
+        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backend`
         override. Adds a one-time warning when paged attention is enabled for
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
@@ -396,10 +396,11 @@ class MetalPlatform(Platform):
             )
 
         # Delegate the rest to upstream. With our ``_find_non_ssm_backend``
-        # returning :class:`MetalBackend` (which advertises ``MultipleOf(32)``),
-        # vLLM's Phase 1 picks a kernel-aligned default for non-hybrid models,
-        # and Phase 2 (``_align_hybrid_block_size``) handles hybrid alignment.
-        # The kernel layer (``_pick_kernel_block_size``) validates the final
+        # returning :class:`MetalBackend` (which advertises ``MultipleOf(16)``),
+        # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
+        # models (matching the kernel sweet spot), and Phase 2
+        # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
+        # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
         super().update_block_size_for_backend(vllm_config)
 

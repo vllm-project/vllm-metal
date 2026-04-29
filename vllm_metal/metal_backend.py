@@ -13,13 +13,17 @@ from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 class MetalBackend(AttentionBackend):
     """Synthetic backend that advertises Metal kernel block alignment.
 
-    This class exists solely so the framework's hybrid-block-size math
-    (Platform._align_hybrid_block_size) can read Metal's MultipleOf(32)
-    alignment constraint. It is never dispatched to as a real attention
-    backend — the actual Metal paged attention lives in
-    metal_kernel_backend/paged_attention.py. The unimplemented methods
-    below intentionally raise: a loud failure is the correct behavior if
-    upstream ever tries to use this as a real backend.
+    This class exists solely so the framework's block-size selection
+    (Platform.update_block_size_for_backend → backend_cls.get_preferred_
+    block_size, and the hybrid-block-size math via
+    Platform._align_hybrid_block_size) can read Metal's MultipleOf(16)
+    alignment constraint. The Metal paged-attention kernels are tuned for
+    block_size=16; advertising MultipleOf(16) makes vLLM's selector default
+    to 16 and lets hybrid models align to multiples of 16. It is never
+    dispatched to as a real attention backend — the actual Metal paged
+    attention lives in metal_kernel_backend/paged_attention.py. The
+    unimplemented methods below intentionally raise: a loud failure is the
+    correct behavior if upstream ever tries to use this as a real backend.
     """
 
     @staticmethod
@@ -28,7 +32,7 @@ class MetalBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(32)]
+        return [MultipleOf(16)]
 
     @staticmethod
     def get_impl_cls():

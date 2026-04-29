@@ -4,7 +4,7 @@
 Tests cover:
 1. _find_non_ssm_backend returns MetalBackend with correct kernel block alignment
 2. update_block_size_for_backend delegates to vLLM base implementation
-3. Metal-specific adjustments (block_size multiple of 32 for paged attention)
+3. Metal-specific adjustments (block_size multiple of 16 for paged attention)
 """
 
 from unittest.mock import MagicMock, patch
@@ -26,7 +26,13 @@ class TestFindNonSsmBackend:
         assert backend_cls.get_name() == "METAL_ATTN"
 
     def test_metal_backend_kernel_block_sizes(self):
-        """Test: MetalBackend returns MultipleOf(32) for kernel block sizes."""
+        """Test: MetalBackend returns MultipleOf(16) for kernel block sizes.
+
+        16 is the Metal paged-attention kernel sweet spot: bs=8 gives no
+        speedup, bs=32 is ~46% slower TPOT. Advertising MultipleOf(16) makes
+        vLLM's selector default to 16 for non-hybrid models and lets hybrid
+        alignment compute multiples-of-16 for SSM/Mamba page sizes.
+        """
         from vllm.v1.attention.backend import MultipleOf
 
         backend_cls = MetalPlatform._find_non_ssm_backend(None)  # type: ignore
@@ -34,7 +40,7 @@ class TestFindNonSsmBackend:
 
         assert len(sizes) == 1
         assert isinstance(sizes[0], MultipleOf)
-        assert sizes[0].base == 32
+        assert sizes[0].base == 16
 
     def test_metal_backend_required_methods(self):
         """Test: MetalBackend has all required AttentionBackend methods."""
