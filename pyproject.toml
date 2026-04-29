@@ -31,7 +31,7 @@ dependencies = [
     # Upper-bound: paged_ops.cpp uses mlx/backend/metal/device.h (private API).
     # Bump after verifying the JIT build against the new MLX minor release.
     "mlx>=0.31.0,<0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "mlx-lm>=0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.4.0; platform_system == 'Darwin' and platform_machine == 'arm64'",  # Vision-language model support
     # Model loading and weights
     # Lower bound aligned with vllm 0.19.1's exclude list in requirements/common.txt
