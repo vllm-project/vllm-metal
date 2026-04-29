@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -27,6 +27,16 @@ _REAL_GEMMA4_MAX_MODEL_LEN = 1024
 _REAL_GEMMA4_MAX_TOKENS = 8
 _FAST_PREFILL_ENABLED_ATTR = "_vllm_metal_yoco_fast_prefill_enabled"
 _REAL_RESULT_MARKER = "VLLM_METAL_YOCO_FAST_PREFILL_RESULT="
+
+
+def _logged_warning_text(warning: Mock) -> str:
+    rendered = []
+    for call in warning.call_args_list:
+        if not call.args:
+            continue
+        fmt = str(call.args[0])
+        rendered.append(fmt % call.args[1:] if len(call.args) > 1 else fmt)
+    return "\n".join(rendered)
 
 
 def _run_real_gemma4_paged_path(
@@ -165,67 +175,71 @@ if callable(shutdown):
 def test_try_enable_logs_ineligible_gemma4_yoco_shape(
     model_args,
     expected_reason: str,
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="vllm_metal.yoco_fast_prefill"):
-        assert not try_enable_gemma4_yoco_fast_prefill(
-            object(),
-            model_args,
-            use_paged_attention=True,
-        )
+    warning = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
 
-    assert expected_reason in caplog.text
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        model_args,
+        use_paged_attention=True,
+    )
+    assert expected_reason in _logged_warning_text(warning)
 
 
 def test_try_enable_logs_without_paged_attention(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="vllm_metal.yoco_fast_prefill"):
-        assert not try_enable_gemma4_yoco_fast_prefill(
-            object(),
-            {
-                "model_type": "gemma4",
-                "num_hidden_layers": 42,
-                "num_kv_shared_layers": 18,
-            },
-            use_paged_attention=False,
-        )
+    warning = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
 
-    assert "paged attention is disabled" in caplog.text
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        {
+            "model_type": "gemma4",
+            "num_hidden_layers": 42,
+            "num_kv_shared_layers": 18,
+        },
+        use_paged_attention=False,
+    )
+    assert "paged attention is disabled" in _logged_warning_text(warning)
 
 
 def test_try_enable_logs_when_not_all_layers_are_paged(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="vllm_metal.yoco_fast_prefill"):
-        assert not try_enable_gemma4_yoco_fast_prefill(
-            object(),
-            {
-                "model_type": "gemma4",
-                "num_hidden_layers": 4,
-                "num_kv_shared_layers": 2,
-            },
-            use_paged_attention=True,
-            num_paged_layers=3,
-        )
+    warning = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
 
-    assert "only 3/4 layers use paged attention" in caplog.text
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        {
+            "model_type": "gemma4",
+            "num_hidden_layers": 4,
+            "num_kv_shared_layers": 2,
+        },
+        use_paged_attention=True,
+        num_paged_layers=3,
+    )
+    assert "only 3/4 layers use paged attention" in _logged_warning_text(warning)
 
 
 def test_try_enable_logs_missing_num_hidden_layers(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="vllm_metal.yoco_fast_prefill"):
-        assert not try_enable_gemma4_yoco_fast_prefill(
-            object(),
-            {
-                "model_type": "gemma4",
-                "num_kv_shared_layers": 18,
-            },
-            use_paged_attention=True,
-        )
+    warning = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
 
-    assert "num_hidden_layers is missing or not an int" in caplog.text
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        {
+            "model_type": "gemma4",
+            "num_kv_shared_layers": 18,
+        },
+        use_paged_attention=True,
+    )
+    assert "num_hidden_layers is missing or not an int" in _logged_warning_text(warning)
 
 
 def test_reduced_context_from_full_paged_metadata() -> None:
