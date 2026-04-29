@@ -8,7 +8,7 @@
 | `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute (1=yes, 0=no) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
-| `VLLM_METAL_KV_SHARING_FAST_PREFILL` | `0` | Enable experimental Gemma4 YOCO fast prefill on the paged KV path |
+| `VLLM_METAL_KV_SHARING_FAST_PREFILL` | `1` | Enable Gemma4 YOCO fast prefill for eligible Gemma4 models on the paged KV path |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto`, `text-only-compat`, or `multimodal-native` |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
@@ -24,9 +24,9 @@
 
 ## Gemma4 YOCO Fast Prefill
 
-`VLLM_METAL_KV_SHARING_FAST_PREFILL=1` enables an experimental default-off optimization for eligible Gemma4 text models on the paged KV path. It runs the YOCO KV-shared decoder layers only on the selected logits positions during prefill, then scatters those hidden states back before the final norm and LM head.
+Gemma4 YOCO fast prefill is enabled by default for eligible Gemma4 text models on the paged KV path. It runs the YOCO KV-shared decoder layers only on the selected logits positions during prefill, then scatters those hidden states back before the final norm and LM head. Set `VLLM_METAL_KV_SHARING_FAST_PREFILL=0` to disable it.
 
-This path requires `VLLM_METAL_USE_PAGED_ATTENTION=1` and is currently limited to Gemma4/Gemma4 text models with KV-shared layers. If the loaded model is not eligible, vllm-metal logs a warning and continues without fast prefill.
+This path requires `VLLM_METAL_USE_PAGED_ATTENTION=1` and is currently limited to Gemma4/Gemma4 text models with KV-shared layers. Ineligible models continue without fast prefill; if `VLLM_METAL_KV_SHARING_FAST_PREFILL=1` was explicitly set, vllm-metal logs a warning for the skipped enablement.
 
 ## Paged KV vs MLX KV Memory Settings
 

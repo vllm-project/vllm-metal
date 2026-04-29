@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gemma4 YOCO fast-prefill helpers.
 
-This module owns the reduced-query metadata contract and the default-off
+This module owns the reduced-query metadata contract and the default-on
 Gemma4 runtime patch. The metadata helpers intentionally avoid importing MLX or
 mlx-lm internals so the indexing contract can be tested in fast CI.
 """
@@ -35,6 +35,7 @@ def try_enable_gemma4_yoco_fast_prefill(
     *,
     use_paged_attention: bool,
     num_paged_layers: int | None = None,
+    warn_on_skip: bool = True,
 ) -> bool:
     """Enable Gemma4 YOCO fast prefill when the loaded model is eligible."""
     reason = _get_yoco_fast_prefill_ineligibility_reason(
@@ -42,12 +43,15 @@ def try_enable_gemma4_yoco_fast_prefill(
         use_paged_attention=use_paged_attention,
     )
     if reason is not None:
-        logger.warning(
-            "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-            "but fast prefill is ineligible for this model (%s); "
-            "continuing without fast prefill",
-            reason,
-        )
+        if warn_on_skip:
+            logger.warning(
+                "Gemma4 YOCO fast prefill is enabled, "
+                "but this model is ineligible (%s); "
+                "continuing without fast prefill",
+                reason,
+            )
+        else:
+            logger.debug("Gemma4 YOCO fast prefill skipped: %s", reason)
         return False
 
     expected_layers = _get_int_model_arg(model_args, "num_hidden_layers")
@@ -56,13 +60,21 @@ def try_enable_gemma4_yoco_fast_prefill(
         and expected_layers is not None
         and num_paged_layers < expected_layers
     ):
-        logger.warning(
-            "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-            "but only %d/%d layers use paged attention; "
-            "continuing without fast prefill",
-            num_paged_layers,
-            expected_layers,
-        )
+        if warn_on_skip:
+            logger.warning(
+                "Gemma4 YOCO fast prefill is enabled, "
+                "but only %d/%d layers use paged attention; "
+                "continuing without fast prefill",
+                num_paged_layers,
+                expected_layers,
+            )
+        else:
+            logger.debug(
+                "Gemma4 YOCO fast prefill skipped: only %d/%d layers use paged "
+                "attention",
+                num_paged_layers,
+                expected_layers,
+            )
         return False
 
     if _patch_gemma4_yoco_fast_prefill(
@@ -70,16 +82,19 @@ def try_enable_gemma4_yoco_fast_prefill(
         model_args,
         use_paged_attention=use_paged_attention,
     ):
-        logger.info(
-            "Gemma4 YOCO fast prefill enabled (VLLM_METAL_KV_SHARING_FAST_PREFILL=1)"
-        )
+        logger.info("Gemma4 YOCO fast prefill enabled")
         return True
 
-    logger.warning(
-        "VLLM_METAL_KV_SHARING_FAST_PREFILL=1 was requested, "
-        "but the Gemma4 text-model patch could not be installed; "
-        "continuing without fast prefill"
-    )
+    if warn_on_skip:
+        logger.warning(
+            "Gemma4 YOCO fast prefill is enabled, "
+            "but the Gemma4 text-model patch could not be installed; "
+            "continuing without fast prefill"
+        )
+    else:
+        logger.debug(
+            "Gemma4 YOCO fast prefill skipped: text-model patch could not be installed"
+        )
     return False
 
 

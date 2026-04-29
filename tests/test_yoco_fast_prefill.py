@@ -188,6 +188,28 @@ def test_try_enable_logs_ineligible_gemma4_yoco_shape(
     assert expected_reason in _logged_warning_text(warning)
 
 
+def test_try_enable_can_skip_ineligible_model_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning = Mock()
+    debug = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.debug", debug)
+
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        {
+            "model_type": "qwen3",
+            "num_hidden_layers": 32,
+            "num_kv_shared_layers": 8,
+        },
+        use_paged_attention=True,
+        warn_on_skip=False,
+    )
+    warning.assert_not_called()
+    debug.assert_called_once()
+
+
 def test_try_enable_logs_without_paged_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -595,6 +596,7 @@ class WorkerCachePlanner:
                 self._worker.model_runner.model_args,
                 use_paged_attention=config.use_paged_attention,
                 num_paged_layers=n_patched,
+                warn_on_skip="VLLM_METAL_KV_SHARING_FAST_PREFILL" in os.environ,
             )
         logger.info(
             "Paged attention enabled: %d layers patched, "
