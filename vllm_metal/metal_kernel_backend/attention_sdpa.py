@@ -45,20 +45,42 @@ from vllm_metal.paged_attention_common import PagedAttentionContext
 _KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 
+def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
+    """Return True when *module* exposes the packed Phi-style SDPA contract."""
+    has_rotary = hasattr(module, "rope") or hasattr(module, "rotary_emb")
+    return (
+        hasattr(module, "qkv_proj")
+        and hasattr(module, "o_proj")
+        and hasattr(module, "n_heads")
+        and hasattr(module, "n_kv_heads")
+        and hasattr(module, "head_dim")
+        and hasattr(module, "scale")
+        and has_rotary
+    )
+
+
 def is_sdpa(module: nn.Module) -> bool:
     """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA).
 
-    Requires ``q_proj`` / ``k_proj`` / ``o_proj``, plus EITHER ``v_proj``
-    OR the explicit ``use_k_eq_v = True`` opt-in.  The latter admits
-    Gemma4 26B / 31B full-attention layers which share the K projection
-    for values and never define ``v_proj`` (``prepare_sdpa_qkv`` handles
-    that branch symmetrically).
+    Accepts two contracts:
+
+    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / ``o_proj``, plus
+      EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
+      The latter admits Gemma4 26B / 31B full-attention layers which
+      share the K projection for values and never define ``v_proj``
+      (``prepare_sdpa_qkv`` handles that branch symmetrically).
+    - Packed Phi-style SDPA: ``qkv_proj`` / ``o_proj`` plus the runtime
+      metadata ``n_heads`` / ``n_kv_heads`` / ``head_dim`` / ``scale``
+      and RoPE exposure via ``rope`` or ``rotary_emb``.
 
     Keeping this classifier tight matters because
     :meth:`HybridPagedAttentionBackend.patch_model` uses ``is_sdpa`` as
     the dispatch predicate — loose matching would send arbitrary Q/K/O
     modules through the SDPA path.
     """
+    if _has_packed_qkv_sdpa_contract(module):
+        return True
+
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
@@ -169,11 +191,10 @@ def prepare_sdpa_qkv(
     """
     B, L, _ = x.shape  # noqa: N806
 
-    # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
-    q_proj_out = inner.q_proj(x)
     gate: mx.array | None = None
+    packed_qkv = _has_packed_qkv_sdpa_contract(inner)
     # head_dim has two architectural sources in our supported models:
-    #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+)
+    #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+, phi3)
     #   - k_proj.weight.shape (qwen3, qwen3_moe never set self.head_dim)
     # KV-shared Gemma 4 layers have head_dim but no k_proj. If neither
     # is present, raise — silently propagating a wrong head_dim would
@@ -188,13 +209,25 @@ def prepare_sdpa_qkv(
             f"{type(inner).__module__}.{type(inner).__name__}: "
             "neither 'head_dim' nor 'k_proj' attribute present"
         )
-    q_full_head = q_proj_out.shape[-1] // n_heads
-    if q_full_head == 2 * head_dim:
-        q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
-        queries, gate = mx.split(q_reshaped, 2, axis=-1)
-        gate = gate.reshape(B, L, -1)
+
+    if packed_qkv:
+        qkv = inner.qkv_proj(x)
+        q_width = n_heads * head_dim
+        kv_width = n_kv_heads * head_dim
+        queries, keys, values = mx.split(qkv, [q_width, q_width + kv_width], axis=-1)
+        queries = queries.reshape(B, L, n_heads, head_dim)
+        keys = keys.reshape(B, L, n_kv_heads, head_dim)
+        values = values.reshape(B, L, n_kv_heads, head_dim)
     else:
-        queries = q_proj_out.reshape(B, L, n_heads, -1)
+        # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
+        q_proj_out = inner.q_proj(x)
+        q_full_head = q_proj_out.shape[-1] // n_heads
+        if q_full_head == 2 * head_dim:
+            q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
+            queries, gate = mx.split(q_reshaped, 2, axis=-1)
+            gate = gate.reshape(B, L, -1)
+        else:
+            queries = q_proj_out.reshape(B, L, n_heads, -1)
 
     if shared_kv is not None:
         # YOCO: reuse K/V from a reference layer.  Q still needs norm + RoPE.
@@ -216,14 +249,15 @@ def prepare_sdpa_qkv(
             apply_keys=False,
         )
     else:
-        keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
-        # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
-        if hasattr(inner, "v_proj"):
-            values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
-        else:
-            values = keys
+        if not packed_qkv:
+            keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
+            # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
+            if hasattr(inner, "v_proj"):
+                values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
+            else:
+                values = keys
 
-        # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4).
+        # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         if hasattr(inner, "k_norm"):
