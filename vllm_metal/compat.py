@@ -153,44 +153,69 @@ def _stack_qwen36_moe_per_expert_weights(
     stacked MoE checkpoints).
     """
     experts_marker = ".mlp.experts."
-    gate_suffix = ".gate_proj.weight"
-    # Scan: discover per-layer experts prefixes and their expert-index sets.
-    layer_indices: dict[str, set[int]] = {}
+    proj_suffixes = (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+    # Scan: discover per-layer experts prefixes and per-projection index sets
+    # for all three projection families, so a checkpoint missing one family
+    # (or with a mismatched index set across families) fails validation
+    # cleanly instead of leaking a KeyError during the walk.
+    layer_proj_indices: dict[str, dict[str, set[int]]] = {}
     for key in weights:
         marker_pos = key.find(experts_marker)
-        if marker_pos == -1 or not key.endswith(gate_suffix):
+        if marker_pos == -1:
+            continue
+        suffix = next((s for s in proj_suffixes if key.endswith(s)), None)
+        if suffix is None:
             continue
         index_start = marker_pos + len(experts_marker)
-        index_end = len(key) - len(gate_suffix)
+        index_end = len(key) - len(suffix)
         tail = key[index_start:index_end]
         if not tail.isdigit():
             continue
         prefix = key[: marker_pos + len(".mlp.experts")]
-        layer_indices.setdefault(prefix, set()).add(int(tail))
+        proj = suffix[1 : -len(".weight")]  # ".gate_proj.weight" -> "gate_proj"
+        layer_proj_indices.setdefault(prefix, {}).setdefault(proj, set()).add(int(tail))
 
-    if not layer_indices:
+    if not layer_proj_indices:
         return weights
 
     logger.debug(
         "Stacking per-expert MoE tensors at %d prefixes",
-        len(layer_indices),
+        len(layer_proj_indices),
     )
+    required_projs = ("gate_proj", "up_proj", "down_proj")
     new_weights = dict(weights)
-    for prefix, indices in layer_indices.items():
-        # Validate: indices must be a contiguous range starting at 0.
-        expected = set(range(len(indices)))
-        if indices != expected:
-            missing = sorted(expected - indices)
-            extra = sorted(indices - expected)
+    for prefix, proj_to_indices in layer_proj_indices.items():
+        # Validate: every prefix must have all three projection families, and
+        # all three must share the same contiguous {0..N-1} index set.
+        missing_projs = [p for p in required_projs if p not in proj_to_indices]
+        if missing_projs:
+            raise ValueError(
+                f"Per-expert MoE weights at {prefix!r} are missing "
+                f"projection families: {missing_projs}."
+            )
+        gate_indices = proj_to_indices["gate_proj"]
+        expected = set(range(len(gate_indices)))
+        if gate_indices != expected:
+            missing = sorted(expected - gate_indices)
+            extra = sorted(gate_indices - expected)
             raise ValueError(
                 f"Per-expert MoE weights at {prefix!r} have "
-                f"non-contiguous indices: missing={missing}, "
+                f"non-contiguous gate_proj indices: missing={missing}, "
                 f"unexpected={extra}."
             )
+        for proj in ("up_proj", "down_proj"):
+            if proj_to_indices[proj] != gate_indices:
+                missing = sorted(gate_indices - proj_to_indices[proj])
+                extra = sorted(proj_to_indices[proj] - gate_indices)
+                raise ValueError(
+                    f"Per-expert MoE weights at {prefix!r} have "
+                    f"mismatched {proj} indices vs gate_proj: "
+                    f"missing={missing}, unexpected={extra}."
+                )
         # Walk: pop per-expert tensors in order, stack, and emit the combined
         # form upstream sanitize already handles.
         gates, ups, downs = [], [], []
-        for e in range(len(indices)):
+        for e in range(len(gate_indices)):
             gates.append(new_weights.pop(f"{prefix}.{e}.gate_proj.weight"))
             ups.append(new_weights.pop(f"{prefix}.{e}.up_proj.weight"))
             downs.append(new_weights.pop(f"{prefix}.{e}.down_proj.weight"))

@@ -269,6 +269,40 @@ class TestQwen35Fp8CompatPatch:
         with pytest.raises(ValueError, match="non-contiguous"):
             moe_module.Model().sanitize(gapped)
 
+    def test_missing_projection_family_raises(self, monkeypatch) -> None:
+        # Defensive: a malformed checkpoint missing one entire projection
+        # family (e.g., no down_proj at all) must surface as a clear
+        # ValueError naming the missing family, rather than a raw KeyError
+        # leaking from the walk step. The same path also covers the case
+        # where only some experts have a given projection (mismatched index
+        # sets across families).
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+        prefix = "model.language_model.layers.0.mlp.experts"
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        # 1) Entire down_proj family absent.
+        no_down = {
+            f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": np.zeros((6, 4)),
+        }
+        with pytest.raises(ValueError, match="missing projection families"):
+            moe_module.Model().sanitize(no_down)
+
+        # 2) down_proj missing for one expert (mismatched index sets).
+        partial_down = {
+            f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.down_proj.weight": np.zeros((4, 6)),
+            f"{prefix}.1.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": np.zeros((6, 4)),
+            # missing f"{prefix}.1.down_proj.weight"
+        }
+        with pytest.raises(ValueError, match="mismatched down_proj"):
+            moe_module.Model().sanitize(partial_down)
+
     def test_per_expert_helper_does_not_run_on_dense_qwen35(self, monkeypatch) -> None:
         # The dense qwen3_5 patch wraps sanitize with FP8 dequant only — the
         # per-expert stacking helper must NOT run on dense Qwen3.5/3.6
