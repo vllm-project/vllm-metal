@@ -21,6 +21,8 @@ def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_core.bfloat16 = np.float32
     mlx_core.from_fp8 = lambda weight, dtype=None: np.asarray(weight, dtype=np.float32)
     mlx_core.pad = lambda weight, pad_width: np.pad(weight, pad_width)
+    mlx_core.stack = lambda arrays, axis=0: np.stack(arrays, axis=axis)
+    mlx_core.concatenate = lambda arrays, axis=0: np.concatenate(arrays, axis=axis)
     mlx_pkg.core = mlx_core
     monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
     monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
@@ -174,6 +176,161 @@ class TestQwen35Fp8CompatPatch:
         assert f"{gate_up_proj_prefix}.weight_scale_inv" not in sanitized
         assert f"{gate_up_proj_prefix}.activation_scale" not in sanitized
         assert sanitized[f"{gate_up_proj_prefix}.weight"].shape == (2, 256, 128)
+
+    def test_per_expert_moe_tensors_stack_to_combined(self, monkeypatch) -> None:
+        # Qwen/Qwen3.6-35B-A3B-FP8 ships expert MLPs per-expert. The MoE
+        # sanitize wrapper must stack them along axis 0 and concatenate
+        # gate+up along the intermediate-dim axis, producing the combined
+        # form upstream sanitize already handles.
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+        prefix = "model.language_model.layers.0.mlp.experts"
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        per_expert = {
+            f"{prefix}.0.gate_proj.weight": np.full((6, 4), 1.0),
+            f"{prefix}.0.up_proj.weight": np.full((6, 4), 2.0),
+            f"{prefix}.0.down_proj.weight": np.full((4, 6), 3.0),
+            f"{prefix}.1.gate_proj.weight": np.full((6, 4), 4.0),
+            f"{prefix}.1.up_proj.weight": np.full((6, 4), 5.0),
+            f"{prefix}.1.down_proj.weight": np.full((4, 6), 6.0),
+        }
+        sanitized = moe_module.Model().sanitize(per_expert)
+
+        gate_up_key = f"{prefix}.gate_up_proj"
+        down_key = f"{prefix}.down_proj"
+        assert gate_up_key in sanitized
+        assert down_key in sanitized
+        # gate_up: (num_experts, 2*intermediate, hidden); down: (num_experts, hidden, intermediate)
+        assert sanitized[gate_up_key].shape == (2, 12, 4)
+        assert sanitized[down_key].shape == (2, 4, 6)
+        # Per-expert keys must not leak through after stacking.
+        assert all(".experts.0." not in k for k in sanitized)
+        assert all(".experts.1." not in k for k in sanitized)
+        # Stacking preserves per-expert content along axis 0; gate occupies
+        # the first half of axis -2, up occupies the second half.
+        np.testing.assert_array_equal(
+            sanitized[gate_up_key][0, :6, :], np.full((6, 4), 1.0)
+        )
+        np.testing.assert_array_equal(
+            sanitized[gate_up_key][0, 6:, :], np.full((6, 4), 2.0)
+        )
+        np.testing.assert_array_equal(
+            sanitized[down_key][1, :, :], np.full((4, 6), 6.0)
+        )
+
+    def test_pre_stacked_moe_is_noop_for_per_expert_helper(self, monkeypatch) -> None:
+        # Pre-stacked checkpoints (mlx-community redistributions, Qwen3.6 bf16
+        # master) ship `experts.gate_up_proj` / `experts.down_proj` already
+        # combined. The per-expert helper must short-circuit and pass them
+        # through unchanged, leaving the combined-format branch in upstream
+        # sanitize free to do its split.
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+        prefix = "model.language_model.layers.0.mlp.experts"
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        gate_up = np.arange(2 * 12 * 4, dtype=np.float32).reshape(2, 12, 4)
+        down = np.arange(2 * 4 * 6, dtype=np.float32).reshape(2, 4, 6)
+        weights = {
+            f"{prefix}.gate_up_proj": gate_up,
+            f"{prefix}.down_proj": down,
+        }
+        sanitized = moe_module.Model().sanitize(weights)
+
+        # Helper is a no-op: combined keys present unchanged, no per-expert
+        # keys appear.
+        np.testing.assert_array_equal(sanitized[f"{prefix}.gate_up_proj"], gate_up)
+        np.testing.assert_array_equal(sanitized[f"{prefix}.down_proj"], down)
+        assert not any(f"{prefix}.0." in k for k in sanitized)
+
+    def test_non_contiguous_per_expert_indices_raise(self, monkeypatch) -> None:
+        # Defensive: a malformed checkpoint shipping experts {0, 1, 3} (skipping
+        # 2) would silently drop expert 3 if the stacker walked indices in
+        # order. Helper must raise loudly so the user diagnoses the missing
+        # tensor instead of getting subtly wrong output.
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+        prefix = "model.language_model.layers.0.mlp.experts"
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        gapped = {
+            f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.down_proj.weight": np.zeros((4, 6)),
+            f"{prefix}.1.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.down_proj.weight": np.zeros((4, 6)),
+            f"{prefix}.3.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.3.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.3.down_proj.weight": np.zeros((4, 6)),
+        }
+
+        with pytest.raises(ValueError, match="non-contiguous"):
+            moe_module.Model().sanitize(gapped)
+
+    def test_missing_projection_family_raises(self, monkeypatch) -> None:
+        # Defensive: a malformed checkpoint missing one entire projection
+        # family (e.g., no down_proj at all) must surface as a clear
+        # ValueError naming the missing family, rather than a raw KeyError
+        # leaking from the walk step. The same path also covers the case
+        # where only some experts have a given projection (mismatched index
+        # sets across families).
+        _, moe_module = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+        prefix = "model.language_model.layers.0.mlp.experts"
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        # 1) Entire down_proj family absent.
+        no_down = {
+            f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": np.zeros((6, 4)),
+        }
+        with pytest.raises(ValueError, match="missing projection families"):
+            moe_module.Model().sanitize(no_down)
+
+        # 2) down_proj missing for one expert (mismatched index sets).
+        partial_down = {
+            f"{prefix}.0.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.up_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.0.down_proj.weight": np.zeros((4, 6)),
+            f"{prefix}.1.gate_proj.weight": np.zeros((6, 4)),
+            f"{prefix}.1.up_proj.weight": np.zeros((6, 4)),
+            # missing f"{prefix}.1.down_proj.weight"
+        }
+        with pytest.raises(ValueError, match="mismatched down_proj"):
+            moe_module.Model().sanitize(partial_down)
+
+    def test_per_expert_helper_does_not_run_on_dense_qwen35(self, monkeypatch) -> None:
+        # The dense qwen3_5 patch wraps sanitize with FP8 dequant only — the
+        # per-expert stacking helper must NOT run on dense Qwen3.5/3.6
+        # checkpoints (no expert tensors exist in dense models, so even an
+        # accidental call would be a no-op, but the patch architecture
+        # makes the MoE-only nature explicit).
+        dense_module, _ = _install_fake_qwen35_modules(monkeypatch, include_moe=True)
+
+        compat._patch_mlx_lm_qwen35_fp8_sanitize()
+
+        # Dense weights with FP8 quant; no expert tensors anywhere.
+        sanitized = dense_module.Model().sanitize(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (128, 128)
+                ),
+                "model.language_model.layers.0.self_attn.q_proj.weight_scale_inv": np.ones(
+                    (1, 1)
+                ),
+            }
+        )
+        assert (
+            "model.language_model.layers.0.self_attn.q_proj.weight_scale_inv"
+            not in sanitized
+        )
+        assert sanitized[
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        ].shape == (128, 128)
 
 
 def _install_fake_gemma4_text_module(
