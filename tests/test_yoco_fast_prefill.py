@@ -132,49 +132,30 @@ if callable(shutdown):
 
 
 @pytest.mark.parametrize(
-    ("model_args", "expected_reason"),
+    "model_args",
     [
-        (
-            {"model_type": "qwen3", "num_hidden_layers": 32, "num_kv_shared_layers": 8},
-            "model_type='qwen3' is not Gemma4",
-        ),
-        (
-            {
-                "model_type": "gemma4",
-                "num_hidden_layers": 42,
-                "num_kv_shared_layers": 0,
-            },
-            "num_kv_shared_layers must be positive",
-        ),
-        (
-            {"model_type": "gemma4", "num_hidden_layers": 42},
-            "num_kv_shared_layers is missing or not an int",
-        ),
-        (
-            {
-                "model_type": "gemma4",
-                "num_hidden_layers": 18,
-                "num_kv_shared_layers": 18,
-            },
-            "num_kv_shared_layers must be smaller than num_hidden_layers (18 >= 18)",
-        ),
-        (
-            {
-                "model_type": "gemma4",
-                "num_hidden_layers": "bad",
-                "num_kv_shared_layers": 1,
-            },
-            "num_hidden_layers is missing or not an int",
-        ),
-        (
-            {"num_hidden_layers": 42, "num_kv_shared_layers": 18},
-            "model_type=None is not Gemma4",
-        ),
+        {"model_type": "qwen3", "num_hidden_layers": 32, "num_kv_shared_layers": 8},
+        {
+            "model_type": "gemma4",
+            "num_hidden_layers": 42,
+            "num_kv_shared_layers": 0,
+        },
+        {"model_type": "gemma4", "num_hidden_layers": 42},
+        {
+            "model_type": "gemma4",
+            "num_hidden_layers": 18,
+            "num_kv_shared_layers": 18,
+        },
+        {
+            "model_type": "gemma4",
+            "num_hidden_layers": "bad",
+            "num_kv_shared_layers": 1,
+        },
+        {"num_hidden_layers": 42, "num_kv_shared_layers": 18},
     ],
 )
-def test_try_enable_logs_ineligible_gemma4_yoco_shape(
+def test_try_enable_skips_ineligible_gemma4_yoco_shape(
     model_args,
-    expected_reason: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = Mock()
@@ -184,8 +165,11 @@ def test_try_enable_logs_ineligible_gemma4_yoco_shape(
         object(),
         model_args,
         use_paged_attention=True,
+        warn_on_skip=True,
     )
-    assert expected_reason in _logged_warning_text(warning)
+    warning_text = _logged_warning_text(warning)
+    assert "Gemma4 YOCO fast prefill is enabled" in warning_text
+    assert "continuing without fast prefill" in warning_text
 
 
 def test_try_enable_can_skip_ineligible_model_without_warning(
@@ -224,8 +208,30 @@ def test_try_enable_logs_without_paged_attention(
             "num_kv_shared_layers": 18,
         },
         use_paged_attention=False,
+        warn_on_skip=True,
     )
-    assert "paged attention is disabled" in _logged_warning_text(warning)
+    warning_text = _logged_warning_text(warning)
+    assert "Gemma4 YOCO fast prefill is enabled" in warning_text
+    assert "paged attention is disabled" in warning_text
+    assert "continuing without fast prefill" in warning_text
+
+
+def test_try_enable_logs_missing_num_hidden_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning = Mock()
+    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+
+    assert not try_enable_gemma4_yoco_fast_prefill(
+        object(),
+        {
+            "model_type": "gemma4",
+            "num_kv_shared_layers": 18,
+        },
+        use_paged_attention=True,
+        warn_on_skip=True,
+    )
+    assert "num_hidden_layers is missing or not an int" in _logged_warning_text(warning)
 
 
 def test_try_enable_logs_when_not_all_layers_are_paged(
@@ -243,25 +249,9 @@ def test_try_enable_logs_when_not_all_layers_are_paged(
         },
         use_paged_attention=True,
         num_paged_layers=3,
+        warn_on_skip=True,
     )
     assert "only 3/4 layers use paged attention" in _logged_warning_text(warning)
-
-
-def test_try_enable_logs_missing_num_hidden_layers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    warning = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
-
-    assert not try_enable_gemma4_yoco_fast_prefill(
-        object(),
-        {
-            "model_type": "gemma4",
-            "num_kv_shared_layers": 18,
-        },
-        use_paged_attention=True,
-    )
-    assert "num_hidden_layers is missing or not an int" in _logged_warning_text(warning)
 
 
 def test_reduced_context_from_full_paged_metadata() -> None:
