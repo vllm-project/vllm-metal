@@ -71,4 +71,5 @@ nav:
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
     - GPU Profiling: profiling.md
+    - Rust Frontend: rust_frontend.md
   - Contributing: CONTRIBUTING.md

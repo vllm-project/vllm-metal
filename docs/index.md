@@ -11,5 +11,6 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 - **vLLM compatibility**: Full integration with vLLM's engine, scheduler, and OpenAI-compatible API
 - **Paged attention** *(experimental)*: Efficient KV cache management for long sequences
 - **GQA support**: Grouped-Query Attention for efficient inference
+- **Rust frontend** *(experimental)*: Optional drop-in [`vllm-frontend-rs`](rust_frontend.md) replaces the Python serving layer while keeping vllm-metal's MLX/Metal engine
 
 Check the sidebar for guides on installation, configuration, and supported features.
