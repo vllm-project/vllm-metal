@@ -37,5 +37,5 @@ Metal. Qwen3 is explicitly covered by the paged prefix-cache e2e test.
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
 | DeepSeek-R1-Distill-Qwen-1.5B | ✅ | GQA (paged) | ✅ | [#316](https://github.com/vllm-project/vllm-metal/pull/316) | Validated on M4 Mac (16GB) and M1 Mac (16GB) |
 | Phi-4-mini-instruct | ✅ | GQA packed qkv (paged) | ✅ | [#314](https://github.com/vllm-project/vllm-metal/pull/314) | Validated on MacBook Pro (Apple M4 Pro, 24 GB) |
-| Qwen2.5-7B-Instruct | ✅ | GQA (paged) | ✅ |  | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-7B-Instruct-4bit` |
-| Qwen2.5-3B-Instruct | ✅ | GQA (paged) | ✅ |  | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-3B-Instruct-4bit` |
+| Qwen2.5-7B-Instruct | ✅ | GQA (paged) | ✅ | [#324](https://github.com/vllm-project/vllm-metal/pull/324) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-7B-Instruct-4bit` |
+| Qwen2.5-3B-Instruct | ✅ | GQA (paged) | ✅ | [#323](https://github.com/vllm-project/vllm-metal/pull/323) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-3B-Instruct-4bit` |
