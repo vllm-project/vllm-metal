@@ -289,46 +289,20 @@ class MetalWorker(WorkerBase):
         return self.model_runner.get_cache_block_size_bytes()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Add a LoRA adapter.
-
-        Args:
-            lora_request: LoRA request
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        logger.warning("LoRA is not supported on Metal platform")
-        return False
+        """Add a LoRA/QLoRA adapter."""
+        return self.model_runner.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        """Remove a LoRA adapter.
-
-        Args:
-            lora_id: LoRA adapter ID
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        return False
+        """Remove a LoRA adapter."""
+        return self.model_runner.remove_lora(lora_id)
 
     def pin_lora(self, lora_id: int) -> bool:
-        """Pin a LoRA adapter.
-
-        Args:
-            lora_id: LoRA adapter ID
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        return False
+        """Pin a LoRA adapter."""
+        return self.model_runner.pin_lora(lora_id)
 
     def list_loras(self) -> set[int]:
-        """List loaded LoRA adapters.
-
-        Returns:
-            Empty set (LoRA not supported)
-        """
-        return set()
+        """List loaded LoRA adapter IDs."""
+        return self.model_runner.list_loras()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks for this worker.
