@@ -1075,9 +1075,19 @@ static void dispatch_paged_attention_mma(
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(kname, lib);
 
-  // Threadgroup memory: Q tile = BLOCK_M × head_size × sizeof(T).
-  // For C1 we only need the Q tile; KV staging buffers come in C2.
-  size_t shmem = static_cast<size_t>(BLOCK_M) * head_size * query.itemsize();
+  // Threadgroup memory layout (C2):
+  //   Q_tile  : T[BLOCK_M][head_size]
+  //   K_stage : T[block_size][head_size]
+  //   V_stage : T[block_size][head_size]
+  //   S_buf   : float[BLOCK_M][block_size]   (Q@K^T scores; aliased as P)
+  //   O_stage : float[BLOCK_M][head_size]    (P@V output before cast)
+  size_t T_size  = query.itemsize();
+  size_t Q_bytes = BLOCK_M * head_size * T_size;
+  size_t K_bytes = block_size * head_size * T_size;
+  size_t V_bytes = block_size * head_size * T_size;
+  size_t S_bytes = BLOCK_M * block_size * sizeof(float);
+  size_t O_bytes = BLOCK_M * head_size * sizeof(float);
+  size_t shmem = Q_bytes + K_bytes + V_bytes + S_bytes + O_bytes;
 
   auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
