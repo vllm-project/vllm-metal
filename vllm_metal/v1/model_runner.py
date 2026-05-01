@@ -149,6 +149,7 @@ class _ExecutionBatch:
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
+    verification_logits: dict[str, mx.array] = field(default_factory=dict)
 
     def add_output(self, req_id: str, token_ids: list[int]) -> int:
         """Append one output slot and return its index."""
@@ -868,7 +869,7 @@ class MetalModelRunner:
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
         )
-        prefill_next_tokens = sample_prefill_tokens(
+        prefill_next_tokens, verification_logits = sample_prefill_tokens(
             logits,
             prefill_reqs,
             cu_seqlens,
@@ -879,6 +880,9 @@ class MetalModelRunner:
             logitsprocs=logitsprocs,
             spec_metadata=spec_metadata,
         )
+
+        # store the verification logits
+        batch.verification_logits = verification_logits
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
@@ -1140,9 +1144,12 @@ class MetalModelRunner:
         return prefill_pack
 
     @staticmethod
-    def _build_output(batch: _ExecutionBatch) -> ModelRunnerOutput:
+    def _build_output(
+        batch: _ExecutionBatch, sample_tokens: list[int]
+    ) -> ModelRunnerOutput:
         """Build ``ModelRunnerOutput`` from a completed batch."""
-        return ModelRunnerOutput(
+
+        output = ModelRunnerOutput(
             req_ids=batch.req_ids,
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
@@ -1150,6 +1157,11 @@ class MetalModelRunner:
             prompt_logprobs_dict={},
             pooler_output=[None] * len(batch.req_ids),
         )
+
+        if hasattr(batch, "verification_logits") and batch.verification_logits:
+            setattr(output, "verification_logits", batch.verification_logits)
+
+        return output
 
     def _run_non_paged_decode_batch(
         self,
