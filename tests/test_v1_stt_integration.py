@@ -386,8 +386,8 @@ class TestKVCacheSTT:
     def test_get_kv_cache_spec_returns_dummy(self) -> None:
         """STT should return a single-entry dummy spec for scheduler init."""
         runner = _make_runner()
-        runner.metal_config = MagicMock()
-        runner.metal_config.block_size = 16
+        runner.cache_config = MagicMock()
+        runner.cache_config.block_size = 16
 
         runner.get_kv_cache_spec = MetalModelRunner.get_kv_cache_spec.__get__(runner)
         spec = runner.get_kv_cache_spec()

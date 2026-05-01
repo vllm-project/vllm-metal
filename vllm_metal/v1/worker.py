@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import time
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -19,7 +20,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
@@ -241,11 +242,13 @@ class MetalWorker(WorkerBase):
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
         # Reset seed for reproducibility
         set_random_seed(self.model_config.seed)
+        start = time.perf_counter()
         self.model_runner.warm_up()
+        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
 
     def execute_model(
         self,

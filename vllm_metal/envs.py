@@ -22,9 +22,9 @@ if TYPE_CHECKING:
     VLLM_METAL_MEMORY_FRACTION: str = "auto"
     VLLM_METAL_USE_MLX: bool = True
     VLLM_MLX_DEVICE: str = "gpu"
-    VLLM_METAL_BLOCK_SIZE: str = "16"
     VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
+    VLLM_METAL_KV_SHARING_FAST_PREFILL: bool = True
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_PREFIX_CACHE: bool = False
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
@@ -41,14 +41,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
-    # Tokens per KV-cache block (default 16).
-    # Returns the raw string; config.py parses and validates.
-    "VLLM_METAL_BLOCK_SIZE": lambda: os.getenv("VLLM_METAL_BLOCK_SIZE", "16"),
     # Enable verbose debug logging (default False).
     "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
     "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
         os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
+    ),
+    # Experimental YOCO/KV-sharing fast prefill. Default on for eligible
+    # paged-attention models.
+    "VLLM_METAL_KV_SHARING_FAST_PREFILL": lambda: (
+        os.getenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "1") == "1"
     ),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the

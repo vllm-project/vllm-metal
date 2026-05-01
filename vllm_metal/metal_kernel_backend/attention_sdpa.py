@@ -35,7 +35,6 @@ from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
     apply_packed_rope,
 )
-from vllm_metal.metal_kernel_backend.turboquant import turbo_quant_encode
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Metal kernel block-size support ===
@@ -45,20 +44,42 @@ from vllm_metal.paged_attention_common import PagedAttentionContext
 _KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 
+def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
+    """Return True when *module* exposes the packed Phi-style SDPA contract."""
+    has_rotary = hasattr(module, "rope") or hasattr(module, "rotary_emb")
+    return (
+        hasattr(module, "qkv_proj")
+        and hasattr(module, "o_proj")
+        and hasattr(module, "n_heads")
+        and hasattr(module, "n_kv_heads")
+        and hasattr(module, "head_dim")
+        and hasattr(module, "scale")
+        and has_rotary
+    )
+
+
 def is_sdpa(module: nn.Module) -> bool:
     """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA).
 
-    Requires ``q_proj`` / ``k_proj`` / ``o_proj``, plus EITHER ``v_proj``
-    OR the explicit ``use_k_eq_v = True`` opt-in.  The latter admits
-    Gemma4 26B / 31B full-attention layers which share the K projection
-    for values and never define ``v_proj`` (``prepare_sdpa_qkv`` handles
-    that branch symmetrically).
+    Accepts two contracts:
+
+    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / ``o_proj``, plus
+      EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
+      The latter admits Gemma4 26B / 31B full-attention layers which
+      share the K projection for values and never define ``v_proj``
+      (``prepare_sdpa_qkv`` handles that branch symmetrically).
+    - Packed Phi-style SDPA: ``qkv_proj`` / ``o_proj`` plus the runtime
+      metadata ``n_heads`` / ``n_kv_heads`` / ``head_dim`` / ``scale``
+      and RoPE exposure via ``rope`` or ``rotary_emb``.
 
     Keeping this classifier tight matters because
     :meth:`HybridPagedAttentionBackend.patch_model` uses ``is_sdpa`` as
     the dispatch predicate — loose matching would send arbitrary Q/K/O
     modules through the SDPA path.
     """
+    if _has_packed_qkv_sdpa_contract(module):
+        return True
+
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
@@ -78,7 +99,7 @@ def _pick_kernel_block_size(cache_block_size: int) -> int:
     raise ValueError(
         f"Cache block_size={cache_block_size} is not divisible by any "
         f"supported kernel block size {_KERNEL_BLOCK_SIZES}. "
-        "Adjust VLLM_METAL_BLOCK_SIZE or the hybrid page alignment."
+        "Adjust --block-size (must be a multiple of 8)."
     )
 
 
@@ -169,11 +190,10 @@ def prepare_sdpa_qkv(
     """
     B, L, _ = x.shape  # noqa: N806
 
-    # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
-    q_proj_out = inner.q_proj(x)
     gate: mx.array | None = None
+    packed_qkv = _has_packed_qkv_sdpa_contract(inner)
     # head_dim has two architectural sources in our supported models:
-    #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+)
+    #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+, phi3)
     #   - k_proj.weight.shape (qwen3, qwen3_moe never set self.head_dim)
     # KV-shared Gemma 4 layers have head_dim but no k_proj. If neither
     # is present, raise — silently propagating a wrong head_dim would
@@ -188,13 +208,25 @@ def prepare_sdpa_qkv(
             f"{type(inner).__module__}.{type(inner).__name__}: "
             "neither 'head_dim' nor 'k_proj' attribute present"
         )
-    q_full_head = q_proj_out.shape[-1] // n_heads
-    if q_full_head == 2 * head_dim:
-        q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
-        queries, gate = mx.split(q_reshaped, 2, axis=-1)
-        gate = gate.reshape(B, L, -1)
+
+    if packed_qkv:
+        qkv = inner.qkv_proj(x)
+        q_width = n_heads * head_dim
+        kv_width = n_kv_heads * head_dim
+        queries, keys, values = mx.split(qkv, [q_width, q_width + kv_width], axis=-1)
+        queries = queries.reshape(B, L, n_heads, head_dim)
+        keys = keys.reshape(B, L, n_kv_heads, head_dim)
+        values = values.reshape(B, L, n_kv_heads, head_dim)
     else:
-        queries = q_proj_out.reshape(B, L, n_heads, -1)
+        # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
+        q_proj_out = inner.q_proj(x)
+        q_full_head = q_proj_out.shape[-1] // n_heads
+        if q_full_head == 2 * head_dim:
+            q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
+            queries, gate = mx.split(q_reshaped, 2, axis=-1)
+            gate = gate.reshape(B, L, -1)
+        else:
+            queries = q_proj_out.reshape(B, L, n_heads, -1)
 
     if shared_kv is not None:
         # YOCO: reuse K/V from a reference layer.  Q still needs norm + RoPE.
@@ -216,14 +248,15 @@ def prepare_sdpa_qkv(
             apply_keys=False,
         )
     else:
-        keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
-        # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
-        if hasattr(inner, "v_proj"):
-            values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
-        else:
-            values = keys
+        if not packed_qkv:
+            keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
+            # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
+            if hasattr(inner, "v_proj"):
+                values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
+            else:
+                values = keys
 
-        # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4).
+        # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         if hasattr(inner, "k_norm"):
@@ -420,38 +453,53 @@ def sdpa_forward(
             new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
             new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
     elif kv_cache.turboquant:
-        # --- TurboQuant cache write: Python quantize → MLX scatter ---
-        # Quantize K/V, then scatter each of the 5 caches independently.
-        (packed_k, k_scale, k_zero), (packed_v, v_scale) = turbo_quant_encode(
-            k_3d, v_3d, kv_cache.k_quant, value_bits=kv_cache.v_bits
+        # --- TurboQuant cache write: fused Metal encode + scatter ---
+        # Single dispatch replaces Python turbo_quant_encode + 5 MLX scatters.
+        # Supports the full QUANT_PARAMS matrix: signed q8_0/int8 at k_bits=8
+        # and unsigned uint8/q5_0/q4_0/int4/uint4/int2/uint2 at k_bits in
+        # {2, 3, 4, 5, 8}.
+        from vllm_metal.metal_kernel_backend.turboquant import (
+            QUANT_PARAMS,
+            get_v_centroids,
         )
 
-        def _scatter(cache_arr, data):
-            flat = cache_arr.reshape(-1, kv_cache.num_kv_heads, data.shape[-1])
-            flat[slot_mapping] = data
-            return flat.reshape(cache_arr.shape)
-
-        kv_cache.key_caches[layer_idx] = _scatter(
-            kv_cache.key_caches[layer_idx], packed_k
+        v_centroids = get_v_centroids(kv_cache.v_bits)
+        k_signed = bool(QUANT_PARAMS[kv_cache.k_quant]["signed"])
+        # tq_encode is a proper MLX Primitive: it returns five NEW array
+        # objects that alias the input cache buffers in place but carry
+        # fresh graph provenance pointing at the primitive.  The subsequent
+        # paged_attention_primitive (separate command buffer) depends on
+        # these outputs through the lazy graph, which is what lets MLX
+        # insert the fence that serialises reader-after-writer.  Using the
+        # original cache arrays here instead would silently race on the
+        # first real forward pass (EngineCore crash).  We must also rebind
+        # kv_cache.<cache>[layer_idx] to the new arrays so the next decode
+        # step's tq_encode input reads through this primitive's output.
+        (
+            new_k_cache,
+            new_v_cache,
+            new_key_scale_cache,
+            new_value_scale_cache,
+            new_key_zero_cache,
+        ) = get_ops().tq_encode(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            kv_cache.key_scale_caches[layer_idx],
+            kv_cache.value_scale_caches[layer_idx],
+            kv_cache.key_zero_caches[layer_idx],
+            slot_mapping,
+            v_centroids,
+            kv_cache.v_bits,
+            kv_cache.k_bits,
+            k_signed,
         )
-        kv_cache.value_caches[layer_idx] = _scatter(
-            kv_cache.value_caches[layer_idx], packed_v
-        )
-        kv_cache.key_scale_caches[layer_idx] = _scatter(
-            kv_cache.key_scale_caches[layer_idx], k_scale
-        )
-        kv_cache.value_scale_caches[layer_idx] = _scatter(
-            kv_cache.value_scale_caches[layer_idx], v_scale
-        )
-        kv_cache.key_zero_caches[layer_idx] = _scatter(
-            kv_cache.key_zero_caches[layer_idx], k_zero
-        )
-
-        new_k_cache = kv_cache.key_caches[layer_idx]
-        new_v_cache = kv_cache.value_caches[layer_idx]
-        new_key_scale_cache = kv_cache.key_scale_caches[layer_idx]
-        new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
-        new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
+        kv_cache.key_caches[layer_idx] = new_k_cache
+        kv_cache.value_caches[layer_idx] = new_v_cache
+        kv_cache.key_scale_caches[layer_idx] = new_key_scale_cache
+        kv_cache.value_scale_caches[layer_idx] = new_value_scale_cache
+        kv_cache.key_zero_caches[layer_idx] = new_key_zero_cache
     else:
         flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_k[slot_mapping] = k_3d

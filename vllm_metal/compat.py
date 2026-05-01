@@ -131,6 +131,101 @@ def _dequantize_qwen35_fp8_weights(
     return new_weights
 
 
+def _stack_qwen36_moe_per_expert_weights(
+    weights: Mapping[str, Any], mx: Any
+) -> Mapping[str, Any]:
+    """Combine per-expert MoE tensors into the stacked layout mlx_lm expects.
+
+    ``Qwen/Qwen3.6-35B-A3B-FP8`` ships expert MLPs as one tensor per expert
+    per projection: ``...mlp.experts.{E}.{gate,up,down}_proj.weight``. The
+    bf16 master ``Qwen/Qwen3.6-35B-A3B`` is already pre-stacked and falls
+    through to the existing combined-format branch in
+    ``mlx_lm.qwen3_5_moe.sanitize`` unchanged. ``mlx_lm.qwen3_5_moe``'s
+    ``sanitize`` expects experts concatenated as
+    ``...mlp.experts.gate_up_proj`` (gate then up along the intermediate axis)
+    and ``...mlp.experts.down_proj``, both stacked along axis 0 over experts.
+
+    Mirrors the (scan -> validate -> walk) structure of upstream
+    ml-explore/mlx-lm#1224. Removable once vllm-metal's mlx-lm pin bumps
+    past that merge.
+
+    No-op when no per-expert keys are present (dense Qwen3.5/3.6 or already-
+    stacked MoE checkpoints).
+    """
+    experts_marker = ".mlp.experts."
+    proj_suffixes = (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+    # Scan: discover per-layer experts prefixes and per-projection index sets
+    # for all three projection families, so a checkpoint missing one family
+    # (or with a mismatched index set across families) fails validation
+    # cleanly instead of leaking a KeyError during the walk.
+    layer_proj_indices: dict[str, dict[str, set[int]]] = {}
+    for key in weights:
+        marker_pos = key.find(experts_marker)
+        if marker_pos == -1:
+            continue
+        suffix = next((s for s in proj_suffixes if key.endswith(s)), None)
+        if suffix is None:
+            continue
+        index_start = marker_pos + len(experts_marker)
+        index_end = len(key) - len(suffix)
+        tail = key[index_start:index_end]
+        if not tail.isdigit():
+            continue
+        prefix = key[: marker_pos + len(".mlp.experts")]
+        proj = suffix[1 : -len(".weight")]  # ".gate_proj.weight" -> "gate_proj"
+        layer_proj_indices.setdefault(prefix, {}).setdefault(proj, set()).add(int(tail))
+
+    if not layer_proj_indices:
+        return weights
+
+    logger.debug(
+        "Stacking per-expert MoE tensors at %d prefixes",
+        len(layer_proj_indices),
+    )
+    required_projs = ("gate_proj", "up_proj", "down_proj")
+    new_weights = dict(weights)
+    for prefix, proj_to_indices in layer_proj_indices.items():
+        # Validate: every prefix must have all three projection families, and
+        # all three must share the same contiguous {0..N-1} index set.
+        missing_projs = [p for p in required_projs if p not in proj_to_indices]
+        if missing_projs:
+            raise ValueError(
+                f"Per-expert MoE weights at {prefix!r} are missing "
+                f"projection families: {missing_projs}."
+            )
+        gate_indices = proj_to_indices["gate_proj"]
+        expected = set(range(len(gate_indices)))
+        if gate_indices != expected:
+            missing = sorted(expected - gate_indices)
+            extra = sorted(gate_indices - expected)
+            raise ValueError(
+                f"Per-expert MoE weights at {prefix!r} have "
+                f"non-contiguous gate_proj indices: missing={missing}, "
+                f"unexpected={extra}."
+            )
+        for proj in ("up_proj", "down_proj"):
+            if proj_to_indices[proj] != gate_indices:
+                missing = sorted(gate_indices - proj_to_indices[proj])
+                extra = sorted(proj_to_indices[proj] - gate_indices)
+                raise ValueError(
+                    f"Per-expert MoE weights at {prefix!r} have "
+                    f"mismatched {proj} indices vs gate_proj: "
+                    f"missing={missing}, unexpected={extra}."
+                )
+        # Walk: pop per-expert tensors in order, stack, and emit the combined
+        # form upstream sanitize already handles.
+        gates, ups, downs = [], [], []
+        for e in range(len(gate_indices)):
+            gates.append(new_weights.pop(f"{prefix}.{e}.gate_proj.weight"))
+            ups.append(new_weights.pop(f"{prefix}.{e}.up_proj.weight"))
+            downs.append(new_weights.pop(f"{prefix}.{e}.down_proj.weight"))
+        new_weights[f"{prefix}.gate_up_proj"] = mx.concatenate(
+            [mx.stack(gates), mx.stack(ups)], axis=-2
+        )
+        new_weights[f"{prefix}.down_proj"] = mx.stack(downs)
+    return new_weights
+
+
 def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
     """Teach mlx_lm's Qwen3.5 loaders to consume local FP8 ``weight_scale_inv``.
 
@@ -177,22 +272,43 @@ def _patch_mlx_lm_qwen35_fp8_sanitize() -> None:
         )
         return
 
-    def _patch_model_sanitize(model_cls) -> bool:
-        return _wrap_model_sanitize(
-            model_cls,
-            "_vllm_metal_qwen35_fp8_patch",
-            lambda _self, weights: _dequantize_qwen35_fp8_weights(weights, mx),
-        )
+    # qwen3_5 (dense) checkpoints only need FP8 dequant — they have no expert
+    # tensors to stack. Keep the dense patch narrow.
+    def _transform_dense(_self, weights):
+        return _dequantize_qwen35_fp8_weights(weights, mx)
+
+    # qwen3_5_moe (Qwen-org Qwen3.6-MoE FP8) needs FP8 dequant followed by
+    # per-expert stacking. The stacking step is the temporary downstream
+    # complement to ml-explore/mlx-lm#1224 and short-circuits when no
+    # per-expert keys are present.
+    def _transform_moe(_self, weights):
+        weights = _dequantize_qwen35_fp8_weights(weights, mx)
+        weights = _stack_qwen36_moe_per_expert_weights(weights, mx)
+        return weights
+
+    transforms_by_module: dict[str, Any] = {
+        "mlx_lm.models.qwen3_5": _transform_dense,
+        "mlx_lm.models.qwen3_5_moe": _transform_moe,
+    }
 
     patched_modules = []
     unpatchable_modules = []
     for module in model_modules:
+        short_name = module.__name__.rsplit(".", maxsplit=1)[-1]
         model_cls = getattr(module, "Model", None)
         if model_cls is None:
-            unpatchable_modules.append(module.__name__.rsplit(".", maxsplit=1)[-1])
+            unpatchable_modules.append(short_name)
             continue
-        if _patch_model_sanitize(model_cls):
-            patched_modules.append(module.__name__.rsplit(".", maxsplit=1)[-1])
+        transform = transforms_by_module.get(module.__name__)
+        if transform is None:
+            unpatchable_modules.append(short_name)
+            continue
+        if _wrap_model_sanitize(
+            model_cls,
+            "_vllm_metal_qwen35_fp8_patch",
+            transform,
+        ):
+            patched_modules.append(short_name)
     if patched_modules:
         logger.debug(
             "Patched mlx_lm %s FP8 sanitize compatibility",

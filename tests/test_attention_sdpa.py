@@ -65,6 +65,16 @@ class _RaisingLinear:
         raise AssertionError(self._message)
 
 
+class _ExplodingPackedLinear:
+    """Packed projection stub that must not be used on split fallback paths."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __call__(self, x: mx.array) -> mx.array:
+        raise AssertionError(self._message)
+
+
 def _make_ctx(seq_len: int) -> PagedAttentionContext:
     """Return a minimal paged context sufficient for apply_packed_rope."""
     return PagedAttentionContext(
@@ -113,6 +123,29 @@ def _make_inner(
 
         inner.v_norm = v_norm
     return inner
+
+
+def _make_qkv_inner(
+    *,
+    n_heads: int = _N_HEADS,
+    n_kv_heads: int = _N_KV_HEADS,
+    head_dim: int = _HEAD_DIM,
+) -> SimpleNamespace:
+    """Build a Phi3/Phi4-like Attention module with packed qkv_proj."""
+    q_weight = mx.ones((n_heads * head_dim, _HIDDEN))
+    k_weight = mx.full((n_kv_heads * head_dim, _HIDDEN), 2.0)
+    v_weight = mx.full((n_kv_heads * head_dim, _HIDDEN), 3.0)
+    qkv_weight = mx.concatenate([q_weight, k_weight, v_weight], axis=0)
+
+    return SimpleNamespace(
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        scale=head_dim**-0.5,
+        qkv_proj=_FakeLinear(qkv_weight),
+        o_proj=lambda out: out,
+        rope=_identity_rope,
+    )
 
 
 # === pad_qkv_to_cache_head_dim ===
@@ -256,6 +289,77 @@ class TestPrepareSDPAQKV:
         # After transpose they must be element-equal (same weights, same x).
         mx.eval(keys, values)
         assert bool(mx.all(keys == values).item())
+
+    def test_qkv_proj_path_splits_phi_style_packed_projection(self) -> None:
+        # Arrange — Phi3/Phi4-style attention uses a single qkv_proj linear.
+        inner = _make_qkv_inner()
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+
+        # Assert — packed projection splits into canonical (B, H, L, D).
+        mx.eval(queries, keys, values)
+        assert queries.shape == (_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert keys.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert bool(mx.all(queries == 8.0).item())
+        assert bool(mx.all(keys == 16.0).item())
+        assert bool(mx.all(values == 24.0).item())
+        assert gate is None
+        assert kv_for_sharing == (keys, values)
+
+    def test_qkv_proj_path_supports_phi_style_gqa_head_ratio(self) -> None:
+        # Arrange — real Phi checkpoints use more query heads than KV heads.
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = _HEAD_DIM
+        inner = _make_qkv_inner(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        queries, keys, values, gate, _ = prepare_sdpa_qkv(
+            inner, x, ctx, n_heads, n_kv_heads, shared_kv=None
+        )
+
+        # Assert — packed qkv must preserve the GQA head ratio after split.
+        mx.eval(queries, keys, values)
+        assert queries.shape == (_BATCH, n_heads, _SEQ_LEN, head_dim)
+        assert keys.shape == (_BATCH, n_kv_heads, _SEQ_LEN, head_dim)
+        assert values.shape == (_BATCH, n_kv_heads, _SEQ_LEN, head_dim)
+        assert bool(mx.all(queries == 8.0).item())
+        assert bool(mx.all(keys == 16.0).item())
+        assert bool(mx.all(values == 24.0).item())
+        assert gate is None
+
+    def test_mixed_module_falls_back_to_split_projection_path(self) -> None:
+        # Arrange — dispatch may accept mixed modules via the split contract.
+        inner = _make_inner(with_v_proj=True)
+        inner.qkv_proj = _ExplodingPackedLinear(
+            "qkv_proj must not be used when packed metadata is incomplete"
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        queries, keys, values, gate, _ = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+
+        # Assert — split q_proj/k_proj/v_proj path still works.
+        mx.eval(queries, keys, values)
+        assert queries.shape == (_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert keys.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert gate is None
 
     def test_v_norm_is_applied_when_present(self) -> None:
         # Arrange

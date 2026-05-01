@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -227,7 +228,7 @@ class ModelCachePolicy:
         if self._runner._is_stt:
             return {
                 "layers.0.self_attn": FullAttentionSpec(
-                    block_size=self._runner.metal_config.block_size,
+                    block_size=self._runner.cache_config.block_size,
                     num_kv_heads=1,
                     head_size=STT_SCHED_NOMINAL_HEAD_SIZE,
                     dtype=torch.float16,
@@ -587,6 +588,16 @@ class WorkerCachePlanner:
         backend.initialize(plan.num_blocks)
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
+        if config.kv_sharing_fast_prefill:
+            from vllm_metal.yoco_fast_prefill import try_enable_gemma4_yoco_fast_prefill
+
+            try_enable_gemma4_yoco_fast_prefill(
+                self._worker.model_runner.model,
+                self._worker.model_runner.model_args,
+                use_paged_attention=config.use_paged_attention,
+                num_paged_layers=n_patched,
+                warn_on_skip="VLLM_METAL_KV_SHARING_FAST_PREFILL" in os.environ,
+            )
         logger.info(
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",

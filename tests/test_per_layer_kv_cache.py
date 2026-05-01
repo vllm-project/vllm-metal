@@ -265,7 +265,6 @@ class TestCachePolicyPerLayerBytes:
                 memory_fraction=AUTO_MEMORY_FRACTION,
                 use_mlx=True,
                 mlx_device="gpu",
-                block_size=self._BLOCK_SIZE,
                 debug=False,
                 turboquant=True,
             ),

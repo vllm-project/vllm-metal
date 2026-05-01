@@ -158,6 +158,73 @@ def test_is_sdpa_rejects_modules_without_v_proj_or_use_k_eq_v():
     assert is_sdpa(_QkoWithUseKEqVTrue())
 
 
+def test_is_sdpa_rejects_packed_qkv_modules_missing_runtime_contract():
+    """Packed-qkv modules must expose the runtime contract SDPA needs."""
+
+    class _PackedQKVOnly:
+        qkv_proj = object()
+        o_proj = object()
+
+    assert not is_sdpa(_PackedQKVOnly())
+
+    class _PackedQKVWithoutRope:
+        qkv_proj = object()
+        o_proj = object()
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = 16
+        scale = 0.25
+
+    assert not is_sdpa(_PackedQKVWithoutRope())
+
+    class _PackedQKVWithRotaryEmb:
+        qkv_proj = object()
+        o_proj = object()
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = 16
+        scale = 0.25
+        rotary_emb = object()
+
+    assert is_sdpa(_PackedQKVWithRotaryEmb())
+
+
+def test_is_sdpa_falls_back_to_split_contract_when_packed_fields_incomplete():
+    """Mixed modules should still classify as SDPA via the split contract."""
+
+    class _MixedAttention:
+        qkv_proj = object()
+        q_proj = object()
+        k_proj = object()
+        v_proj = object()
+        o_proj = object()
+
+    assert is_sdpa(_MixedAttention())
+
+
+def test_phi3_attention_detected_as_sdpa():
+    """Real Phi3/Phi4-style packed-projection attention should be SDPA."""
+    from mlx_lm.models.phi3 import Attention, ModelArgs
+
+    args = ModelArgs(
+        model_type="phi3",
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=100,
+        max_position_embeddings=512,
+        original_max_position_embeddings=512,
+        tie_word_embeddings=False,
+    )
+    attn = Attention(args)
+
+    assert is_sdpa(attn)
+    assert not is_linear_attention(attn)
+
+
 def test_find_layers_on_qwen3_model():
     """find_layers should return the layer list from a real Qwen3 Model."""
     from mlx_lm.models.qwen3 import Model, ModelArgs

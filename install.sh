@@ -77,12 +77,68 @@ download_and_install_wheel() {
   success "Installed ${package_name}"
 }
 
+install_vllm_rs() {
+  section "Installing vllm-rs (experimental Rust frontend)"
+
+  if ! command -v cargo &> /dev/null || ! command -v rustup &> /dev/null; then
+    error "cargo/rustup not found on PATH; install Rust from https://rustup.rs first."
+    exit 1
+  fi
+
+  local repo_url="https://github.com/inferact/vllm-frontend-rs"
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" RETURN
+
+  echo "Cloning $repo_url ..."
+  if ! git clone --depth 1 "$repo_url" "$tmp_dir/vllm-frontend-rs"; then
+    error "Failed to clone vllm-frontend-rs."
+    exit 1
+  fi
+
+  # Run cargo from inside the tree so rustup honors rust-toolchain.toml;
+  # `cargo install --git` would ignore it and use the system default toolchain.
+  if ! ( cd "$tmp_dir/vllm-frontend-rs" && cargo install --path src/cmd --bin vllm-rs ); then
+    error "Failed to install vllm-rs."
+    exit 1
+  fi
+
+  success "Installed vllm-rs to ~/.cargo/bin"
+}
+
 main() {
   set -eu -o pipefail
 
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"
   local package_name="vllm-metal"
+  local with_vllm_rs=0
+
+  for arg in "$@"; do
+    case "$arg" in
+      --with-vllm-rs)
+        with_vllm_rs=1
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: install.sh [--with-vllm-rs]
+
+Options:
+  --with-vllm-rs    Also install vllm-rs (experimental Rust frontend) via
+                    cargo from https://github.com/inferact/vllm-frontend-rs.
+                    Requires the Rust toolchain on PATH (https://rustup.rs).
+  -h, --help        Show this help.
+EOF
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $arg" >&2
+        echo "Run with --help for usage." >&2
+        exit 1
+        ;;
+    esac
+  done
 
   # Source shared library functions
   # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
@@ -123,7 +179,7 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.19.1"
+  local vllm_v="0.20.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
   curl -OL $url_base/v$vllm_v/$filename
@@ -131,9 +187,6 @@ main() {
   cd vllm-$vllm_v
 
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  # TODO: remove -Wno-parentheses once vllm-project/vllm#38801 is in a release.
-  # Clang 21+ (Apple Clang 21 / Xcode 26) promotes -Wparentheses to an error
-  # for chained comparisons like `0 < M <= 8` in vllm's CPU attention headers.
   CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
   rm -rf vllm-$vllm_v*
@@ -155,6 +208,10 @@ main() {
     download_and_install_wheel "$wheel_url" "$package_name"
   fi
 
+  if [[ "$with_vllm_rs" == "1" ]]; then
+    install_vllm_rs
+  fi
+
   echo ""
   success "Installation complete!"
   echo ""
@@ -163,6 +220,12 @@ main() {
   echo ""
   echo "Or add the venv to your PATH:"
   echo "  export PATH=\"$venv/bin:\$PATH\""
+
+  if [[ "$with_vllm_rs" == "1" ]]; then
+    echo ""
+    echo "vllm-rs is installed to ~/.cargo/bin. Make sure that directory is on your PATH."
+    echo "Activate the venv, then run: vllm-rs serve <MODEL>"
+  fi
 }
 
 main "$@"
