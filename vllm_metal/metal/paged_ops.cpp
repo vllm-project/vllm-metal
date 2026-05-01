@@ -1041,7 +1041,8 @@ static void dispatch_paged_attention_mma(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len,
-    Stream s
+    Stream s,
+    bool from_primitive = false
 ) {
   auto& d = metal::device(s.device);
 
@@ -1129,18 +1130,20 @@ static void dispatch_paged_attention_mma(
       MTL::Size::Make(num_kv_heads, total_q_blocks, 1),
       MTL::Size::Make(32, 1, 1));
 
-  add_temporary_compat(enc, out, d, s);
-  add_temporary_compat(enc, query, d, s);
-  add_temporary_compat(enc, key_cache, d, s);
-  add_temporary_compat(enc, value_cache, d, s);
-  add_temporary_compat(enc, block_tables, d, s);
-  add_temporary_compat(enc, seq_lens, d, s);
-  add_temporary_compat(enc, cu_seqlens_q, d, s);
+  if (!from_primitive) {
+    add_temporary_compat(enc, out, d, s);
+    add_temporary_compat(enc, query, d, s);
+    add_temporary_compat(enc, key_cache, d, s);
+    add_temporary_compat(enc, value_cache, d, s);
+    add_temporary_compat(enc, block_tables, d, s);
+    add_temporary_compat(enc, seq_lens, d, s);
+    add_temporary_compat(enc, cu_seqlens_q, d, s);
+  }
 
-  (void)max_seq_len;  // not used in C1 (kernel reads kv_seq_len from seq_lens)
+  (void)max_seq_len;  // kernel reads kv_seq_len from seq_lens
 }
 
-// Eager wrapper for paged_attention_mma — Python-callable.
+// Eager wrapper for paged_attention_mma — Python-callable, used by tests.
 void paged_attention_mma_impl(
     nb::handle out_h,
     nb::handle query_h,
@@ -1168,6 +1171,68 @@ void paged_attention_mma_impl(
       block_tables, seq_lens, cu_seqlens_q,
       block_size, max_seq_len,
       default_stream(Device::gpu));
+}
+
+// MLX primitive — lets paged_attention_mma participate in the lazy graph,
+// matching the contract of paged_attention_primitive (vector path).
+class PagedAttentionMmaPrimitive : public UnaryPrimitive {
+ public:
+  PagedAttentionMmaPrimitive(
+      Stream stream, int num_kv_heads, float scale,
+      int block_size, int max_seq_len)
+      : UnaryPrimitive(stream),
+        num_kv_heads_(num_kv_heads), scale_(scale),
+        block_size_(block_size), max_seq_len_(max_seq_len) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "PagedAttentionMmaPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    // Inputs: [query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q]
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_paged_attention_mma(
+        out,
+        inputs[0],                       // query
+        inputs[1], inputs[2],            // key_cache, value_cache
+        num_kv_heads_, scale_,
+        inputs[3], inputs[4], inputs[5], // block_tables, seq_lens, cu_seqlens_q
+        block_size_, max_seq_len_,
+        stream(),
+        /*from_primitive=*/true);
+  }
+
+  const char* name() const override { return "PagedAttentionMma"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const PagedAttentionMmaPrimitive*>(&other);
+    return rhs && rhs->num_kv_heads_ == num_kv_heads_
+        && rhs->scale_ == scale_
+        && rhs->block_size_ == block_size_
+        && rhs->max_seq_len_ == max_seq_len_;
+  }
+
+ private:
+  int num_kv_heads_;
+  float scale_;
+  int block_size_;
+  int max_seq_len_;
+};
+
+static array paged_attention_mma_primitive_fn(
+    const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int max_seq_len) {
+  auto prim = std::make_shared<PagedAttentionMmaPrimitive>(
+      default_stream(Device::gpu),
+      num_kv_heads, scale, block_size, max_seq_len);
+  return array(
+      query.shape(), query.dtype(), std::move(prim),
+      {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,9 +1501,39 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("cu_seqlens_q"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
-        "Paged attention via simdgroup_matrix MMA (C1 skeleton — Q load + "
-        "zero output write, no MMA yet). MVP shape: bf16, head_size=128, "
-        "block_size=16, BLOCK_M=8.");
+        "Paged attention via simdgroup_matrix MMA (eager). MVP shape: bf16, "
+        "head_size=128, block_size=16, BLOCK_M=8. Used by tests; production "
+        "code paths should use paged_attention_mma_primitive.");
+
+  m.def("paged_attention_mma_primitive",
+        [](nb::handle query_h,
+           nb::handle key_cache_h, nb::handle value_cache_h,
+           int num_kv_heads, float scale,
+           nb::handle block_tables_h, nb::handle seq_lens_h,
+           nb::handle cu_seqlens_q_h,
+           int block_size, int max_seq_len,
+           nb::handle out_h) {
+          auto result = paged_attention_mma_primitive_fn(
+              *nb::inst_ptr<array>(query_h),
+              *nb::inst_ptr<array>(key_cache_h),
+              *nb::inst_ptr<array>(value_cache_h),
+              num_kv_heads, scale,
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(seq_lens_h),
+              *nb::inst_ptr<array>(cu_seqlens_q_h),
+              block_size, max_seq_len);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        nb::arg("out"),
+        "Paged attention via simdgroup_matrix MMA (lazy primitive). "
+        "Participates in MLX's graph; matches paged_attention_primitive's "
+        "contract. Eligibility-gated by attention_sdpa.py.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),

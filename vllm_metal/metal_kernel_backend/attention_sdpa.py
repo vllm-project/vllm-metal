@@ -375,6 +375,57 @@ def truncate_padded_output(
 # === SDPA forward ===
 
 
+_MMA_SUPPORTED_GQA_RATIOS = (1, 2, 4, 8)
+_MMA_HEAD_SIZE = 128
+_MMA_BLOCK_SIZE = 16
+_MMA_MIN_PREFILL_Q_LEN = 8
+
+
+def _is_mma_eligible(
+    q_3d: mx.array,
+    kv_cache: MetalPagedKVCache,
+    layer_idx: int,
+    ctx: PagedAttentionContext,
+    layer_sliding_window: int,
+    kernel_block_size: int,
+) -> bool:
+    """Return True iff the MMA paged-attention kernel can correctly handle this call.
+
+    Conservative — any case we haven't tested numerically against the vector
+    kernel falls back to the vector path.  Relax this filter incrementally as
+    the MMA kernel gains feature coverage.
+    """
+    # Query and KV cache must both be bf16.
+    if q_3d.dtype != mx.bfloat16 or kv_cache.dtype != mx.bfloat16:
+        return False
+    # Quantized KV (TurboQuant / FP8) is handled separately upstream.
+    if kv_cache.turboquant:
+        return False
+    # Head size must be exactly 128 (MMA tile alignment requires divisibility by 8;
+    # we've only validated 128 so far).
+    if q_3d.shape[-1] != _MMA_HEAD_SIZE:
+        return False
+    # Block size must match the kernel's compiled assumption.
+    if kernel_block_size != _MMA_BLOCK_SIZE:
+        return False
+    # GQA ratio must be a supported power of 2.
+    n_q_heads = q_3d.shape[1]
+    n_kv_heads = kv_cache.kv_heads_per_layer[layer_idx]
+    ratio = n_q_heads // n_kv_heads
+    if ratio not in _MMA_SUPPORTED_GQA_RATIOS:
+        return False
+    # No sliding window (kernel doesn't yet implement SWA masking).
+    if layer_sliding_window != -1:
+        return False
+    # MMA only worth dispatching when at least one sequence has q_len > 8;
+    # otherwise the vector kernel is faster (no MMA-tile padding cost).
+    cu = ctx.cu_seqlens
+    max_q_len = max(cu[i + 1] - cu[i] for i in range(len(cu) - 1))
+    if max_q_len <= _MMA_MIN_PREFILL_Q_LEN:
+        return False
+    return True
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -582,6 +633,25 @@ def sdpa_forward(
             use_turboquant=True,
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
+        )
+    elif _is_mma_eligible(
+        q_3d, kv_cache, layer_idx, ctx, layer_sliding_window, kernel_block_size
+    ):
+        # MMA path: simdgroup_matrix-based prefill kernel. Eligibility check
+        # above guarantees bf16, head_size=128, block_size=16, GQA ratio in
+        # {1,2,4,8}, no sliding window, no TQ, and at least one prefill q_len > 8.
+        ops.paged_attention_mma_primitive(
+            query=q_3d,
+            key_cache=kernel_k_cache,
+            value_cache=kernel_v_cache,
+            num_kv_heads=cache_kv_heads,
+            scale=inner.scale,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            block_size=kernel_block_size,
+            max_seq_len=max_seq_len,
+            out=out,
         )
     else:
         ops.paged_attention_primitive(
