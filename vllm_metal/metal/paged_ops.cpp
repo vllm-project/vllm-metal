@@ -1025,6 +1025,138 @@ static std::vector<array> tq_encode_primitive_fn(
 }
 
 // ---------------------------------------------------------------------------
+// paged_attention_mma — MMA-based paged attention (C1 skeleton)
+//
+// Status: skeleton only — Q load + zero output write.  C2 will add MMAs.
+// MVP shape: bfloat16, head_size=128, block_size=16, BLOCK_M=8.
+//
+// The kernel lives in kernels_v3/paged_attention_mma.metal and shares the
+// "paged_attention_v2_kern" MLX library slot with the vector kernel.
+// ---------------------------------------------------------------------------
+
+static void dispatch_paged_attention_mma(
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int max_seq_len,
+    Stream s
+) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int num_q_heads    = static_cast<int>(query.shape(1));
+  int head_size      = static_cast<int>(query.shape(2));
+  int max_blocks     = static_cast<int>(block_tables.shape(1));
+  int num_seqs       = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  // BLOCK_M is fixed at 8 for the MVP MMA kernel.
+  constexpr int BLOCK_M = 8;
+  // BLOCK_Q derived from BLOCK_M / num_queries_per_kv (kernel computes its
+  // own copy from grid info; we need it here to size the launch grid).
+  int num_queries_per_kv = num_q_heads / num_kv_heads;
+  int block_q = BLOCK_M / num_queries_per_kv;
+  // Upper bound on the number of q-blocks (matches the launcher trick used by
+  // vLLM's Triton unified kernel: total_q_tokens / BLOCK_Q + num_seqs).
+  int total_q_blocks = total_q_tokens / block_q + num_seqs;
+
+  // Kernel host_name encoding must match the instantiation in
+  // paged_attention_mma.metal: paged_attention_mma_<dtype>_hs<H>_bs<B>_bm<M>.
+  auto dt = dtype_to_metal(query.dtype());
+  std::string kname =
+      "paged_attention_mma_" + dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size) +
+      "_bm" + std::to_string(BLOCK_M);
+
+  // Same MLX library slot as the vector kernel — they're concatenated into
+  // one source string in _build_v3_paged_attention_source().
+  auto* lib = d.get_library("paged_attention_v2_kern");
+  auto* kernel = d.get_kernel(kname, lib);
+
+  // Threadgroup memory: Q tile = BLOCK_M × head_size × sizeof(T).
+  // For C1 we only need the Q tile; KV staging buffers come in C2.
+  size_t shmem = static_cast<size_t>(BLOCK_M) * head_size * query.itemsize();
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(query,        1);
+  enc.set_input_array(key_cache,    2);
+  enc.set_input_array(value_cache,  3);
+
+  int32_t nkv = static_cast<int32_t>(num_kv_heads);
+  enc.set_bytes(nkv, 4);
+  enc.set_bytes(scale, 5);
+
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(seq_lens,     7);
+
+  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
+  enc.set_bytes(max_blocks_i, 8);
+
+  int32_t q_stride        = static_cast<int32_t>(num_q_heads * head_size);
+  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
+  enc.set_bytes(q_stride,        9);
+  enc.set_bytes(kv_block_stride, 10);
+  enc.set_bytes(kv_head_stride,  11);
+
+  enc.set_input_array(cu_seqlens_q, 12);
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  enc.set_bytes(num_seqs_i, 13);
+
+  // Grid: (num_kv_heads, total_q_blocks, 1)
+  // Threadgroup: 32 threads (one simdgroup) for MVP.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_kv_heads, total_q_blocks, 1),
+      MTL::Size::Make(32, 1, 1));
+
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, query, d, s);
+  add_temporary_compat(enc, key_cache, d, s);
+  add_temporary_compat(enc, value_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, seq_lens, d, s);
+  add_temporary_compat(enc, cu_seqlens_q, d, s);
+
+  (void)max_seq_len;  // not used in C1 (kernel reads kv_seq_len from seq_lens)
+}
+
+// Eager wrapper for paged_attention_mma — Python-callable.
+void paged_attention_mma_impl(
+    nb::handle out_h,
+    nb::handle query_h,
+    nb::handle key_cache_h,
+    nb::handle value_cache_h,
+    int num_kv_heads,
+    float scale,
+    nb::handle block_tables_h,
+    nb::handle seq_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    int max_seq_len
+) {
+  auto& out          = *nb::inst_ptr<array>(out_h);
+  auto& query        = *nb::inst_ptr<array>(query_h);
+  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
+  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_paged_attention_mma(
+      out, query, key_cache, value_cache,
+      num_kv_heads, scale,
+      block_tables, seq_lens, cu_seqlens_q,
+      block_size, max_seq_len,
+      default_stream(Device::gpu));
+}
+
+// ---------------------------------------------------------------------------
 // GDN linear attention — in-place paged state
 // ---------------------------------------------------------------------------
 
@@ -1282,6 +1414,17 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("v_bits") = 3,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.");
+
+  m.def("paged_attention_mma", &paged_attention_mma_impl,
+        nb::arg("out"), nb::arg("query"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"),
+        nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        "Paged attention via simdgroup_matrix MMA (C1 skeleton — Q load + "
+        "zero output write, no MMA yet). MVP shape: bf16, head_size=128, "
+        "block_size=16, BLOCK_M=8.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),

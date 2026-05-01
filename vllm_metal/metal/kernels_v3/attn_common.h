@@ -795,6 +795,68 @@ inline int find_seq_idx(const device int32_t *cu_seqlens_q,
   return lo;
 }
 
+// Resolve (seq_idx, q_block_local_idx, q_seq_start, q_len, kv_seq_len) from
+// a global q-block index, for kernels that tile Q rows by BLOCK_Q.
+//
+// Mirrors Triton's resolve_seq_and_query_len pattern:
+//   - cu_seqlens_q[i] // BLOCK_Q + i  is an upper bound on the cumulative
+//     number of q-blocks before seq i.  Each prior seq might contribute one
+//     extra "partial" q-block, accounted for by the `+ i` term.
+//   - Binary-search for the largest seq_idx whose upper-bound start is
+//     <= q_block_global_idx.
+//   - q_block_local_idx = q_block_global_idx - q_block_start_for_seq.
+//
+// Caller MUST early-return when:
+//   * seq_idx >= num_seqs                    (past the last seq, padding)
+//   * q_block_local_idx * BLOCK_Q >= q_len   (within seq but past its end)
+//
+// `block_q` is passed as a runtime int (not constexpr) because it varies
+// with num_queries_per_kv, which is per-model.
+inline void resolve_seq_and_q_block(
+    const device int32_t *cu_seqlens_q,
+    const device uint32_t *seq_lens,
+    int q_block_global_idx,
+    int num_seqs,
+    int block_q,
+    thread int &seq_idx,
+    thread int &q_block_local_idx,
+    thread int &q_seq_start,
+    thread int &q_len,
+    thread int &kv_seq_len
+) {
+    // Binary search: find largest idx s.t.
+    //   (cu_seqlens_q[idx] / block_q) + idx <= q_block_global_idx.
+    // Loop invariant matches the existing find_seq_idx at attn_common.h above.
+    int lo = 0, hi = num_seqs;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        int mid_val = (int)cu_seqlens_q[mid] / block_q + mid;
+        if (mid_val <= q_block_global_idx) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    seq_idx = lo;
+
+    if (seq_idx >= num_seqs) {
+        // Caller checks; fill in dummy values to avoid OOB reads on the
+        // arrays below.
+        q_block_local_idx = 0;
+        q_seq_start = 0;
+        q_len = 0;
+        kv_seq_len = 0;
+        return;
+    }
+
+    q_seq_start = (int)cu_seqlens_q[seq_idx];
+    int q_seq_end = (int)cu_seqlens_q[seq_idx + 1];
+    q_len = q_seq_end - q_seq_start;
+    int q_block_start_for_seq = q_seq_start / block_q + seq_idx;
+    q_block_local_idx = q_block_global_idx - q_block_start_for_seq;
+    kv_seq_len = (int)seq_lens[seq_idx];
+}
+
 // ========================================== Function constants
 // NOTE: TurboQuant helpers (Char8_, Vec<char>, is_char, tq_load_k_vec, etc.)
 // are in turboquant.metal, concatenated before this file by the build system.
