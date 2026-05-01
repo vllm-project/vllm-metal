@@ -16,6 +16,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.model_runner import PrefillRequest
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 
@@ -295,7 +296,7 @@ def sample_decode_tokens(
 
 def sample_prefill_tokens(
     logits: mx.array,
-    prefill_reqs: list,
+    prefill_reqs: list[PrefillRequest],
     cu_seqlens: list[int],
     num_decode: int,
     sampler: Sampler,
@@ -304,47 +305,76 @@ def sample_prefill_tokens(
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
     spec_metadata: SpecDecodeMetadata | None = None,
-) -> list[int]:
-    """Sample one token per prefill request from the last logit position.
+) -> tuple[list[int], dict[str, mx.array]]:
+    """Sample one token per prefill request from the last logit position and extract widened verification logits
 
     Args:
-        logits: Full logits array, shape ``(1, total_tokens, vocab)``.
-        prefill_reqs: List of ``PrefillRequest`` objects.
-        cu_seqlens: Cumulative sequence lengths for logit position lookup.
-        num_decode: Number of decode requests (offset into cu_seqlens).
-        sampler: vLLM Sampler instance.
-        device: PyTorch device for the torch bridge path.
-        vocab_size: Model vocabulary size.
-        logitsprocs: Optional logits processors.
-        spec_metadata: Optional speculative decoding metadata.
+        `logits`: Full logits array, shape ``(1, total_tokens, vocab)``.
+        `prefill_reqs`: List of ``PrefillRequest`` objects.
+        `cu_seqlens`: Cumulative sequence lengths for logit position lookup.
+        `num_decode`: Number of decode requests (offset into ``cu_seqlens``).
+        `sampler`: vLLM Sampler instance.
+        `device`: PyTorch device for the torch bridge path.
+        `vocab_size`: Model vocabulary size.
+        `logitsprocs`: Optional logits processors.
+        `spec_metadata`: Optional speculative decoding metadata.
 
     Returns:
-        List of sampled token IDs, one per prefill request.
+        A tuple:
+            - List of sampled token IDs(int), one per prefill request.
+            - A dictionary mapping request IDs to their "Widened Pipe" verification logits. Each entry is a raw mlx array of shape `(k, vocab_size)`, where `k` is the number of tokens in the verification chunk.
     """
     prefill_next_tokens: list[int] = []
-    for j, pr in enumerate(prefill_reqs):
-        last_idx = cu_seqlens[num_decode + j + 1] - 1
-        
-        # Speculative decoding: return logits for all verification positions.
-        # TODO: Implement multi-logit extraction for speculative requests.
-        last_logits = logits[0, last_idx : last_idx + 1, :]  # (1, vocab)
 
-        if pr.full_prompt_token_ids is not None:
-            prompt_len = len(pr.full_prompt_token_ids)
-        elif pr.prompt_len is not None:
-            prompt_len = pr.prompt_len
+    # initialize outside the loop to collect all speculative hits
+    verification_logits: dict[str, mx.array] = {}
+
+    for j, prefill_req in enumerate(prefill_reqs):
+        start_idx = cu_seqlens[num_decode + j]
+        end_idx = cu_seqlens[num_decode + j + 1]
+        last_idx = end_idx - 1
+
+        # check if this specific request is part of the speculative window.
+        # Safer check: spec_metadata is present and chunk length > 1
+        is_spec = spec_metadata is not None and len(prefill_req.token_ids) > 1
+
+        if is_spec:
+            #####
+            # the system needs the big model's opinion on every token the drafter guessed
+            #####
+
+            # slice scorer's opinions on those k tokens.
+            # this captures the logits for the entire speculative window.
+            # shape: (k, vocab)
+            spec_logits_chunk = logits[0, start_idx:end_idx, :]
+
+            # store in mlx arr to maintain lazy evaluation (zero copy)
+            verification_logits[prefill_req.req_id] = spec_logits_chunk
+
+            # the sampler still only needs the very last logit for the 'bonus' token
+            sample_input_logits = spec_logits_chunk[-1:, :]
         else:
-            prompt_len = len(pr.token_ids)
+            # the system only cares about the next token
+            sample_input_logits = logits[0, last_idx : last_idx + 1, :]
+
+        # ensures that the SamplingBatch metadata remains accurate even if different request types are mixed.
+        if prefill_req.full_prompt_token_ids is not None:
+            prompt_len = len(prefill_req.full_prompt_token_ids)
+        elif prefill_req.prompt_len is not None:
+            prompt_len = prefill_req.prompt_len
+        else:
+            prompt_len = len(prefill_req.token_ids)
 
         prompt_for_meta = (
-            pr.full_prompt_token_ids
-            if pr.full_prompt_token_ids is not None
-            else pr.token_ids
+            prefill_req.full_prompt_token_ids
+            if prefill_req.full_prompt_token_ids is not None
+            else prefill_req.token_ids
         )
-        generators = {} if pr.generator is None else {0: pr.generator}
+
+        generators = {} if prefill_req.generator is None else {0: prefill_req.generator}
 
         batch = SamplingBatch(
-            [pr.sampling_params],
+            [prefill_req.sampling_params],
             [prompt_for_meta[:prompt_len]],
             [prompt_for_meta[prompt_len:]],
             vocab_size=vocab_size,
@@ -352,7 +382,9 @@ def sample_prefill_tokens(
             logitsprocs=logitsprocs,
             generators=generators,
         )
-        [next_token] = sample_from_logits(last_logits, batch, sampler, device)
+
+        # sample the bonus token
+        [next_token] = sample_from_logits(sample_input_logits, batch, sampler, device)
         prefill_next_tokens.append(next_token)
 
-    return prefill_next_tokens
+    return prefill_next_tokens, verification_logits
