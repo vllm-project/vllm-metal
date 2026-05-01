@@ -65,11 +65,18 @@ def _build_paged_attention_source() -> str:
 
 
 def _build_v3_paged_attention_source() -> str:
-    """Concatenate float8 + utils + turboquant + v3 paged_attention (online softmax)."""
+    """Concatenate float8 + utils + attn_common + turboquant + v3 paged_attention.
+
+    Order matters: attn_common.h provides Vec<float/bfloat/half/uchar>
+    specializations, FP8 helpers, Qk_dot, find_seq_idx, and function constants.
+    turboquant.metal extends with Vec<char>, is_char, and TQ-specific helpers.
+    pagedattention.metal contains only kernel definitions and instantiations.
+    """
     parts = [
         f"#define VLLM_METAL_PARTITION_SIZE {PARTITION_SIZE}",
         _read_metal_source(_KERNELS_V3_DIR / "float8.metal"),
         _read_metal_source(_KERNELS_V3_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V3_DIR / "attn_common.h"),
         _read_metal_source(_KERNELS_V3_DIR / "turboquant.metal"),
         _read_metal_source(_KERNELS_V3_DIR / "pagedattention.metal"),
     ]
