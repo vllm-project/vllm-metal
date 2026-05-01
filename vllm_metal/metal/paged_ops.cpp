@@ -1075,19 +1075,23 @@ static void dispatch_paged_attention_mma(
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(kname, lib);
 
-  // Threadgroup memory layout (C2):
-  //   Q_tile  : T[BLOCK_M][head_size]
-  //   K_stage : T[block_size][head_size]
-  //   V_stage : T[block_size][head_size]
-  //   S_buf   : float[BLOCK_M][block_size]   (Q@K^T scores; aliased as P)
-  //   O_stage : float[BLOCK_M][head_size]    (P@V output before cast)
-  size_t T_size  = query.itemsize();
-  size_t Q_bytes = BLOCK_M * head_size * T_size;
-  size_t K_bytes = block_size * head_size * T_size;
-  size_t V_bytes = block_size * head_size * T_size;
-  size_t S_bytes = BLOCK_M * block_size * sizeof(float);
-  size_t O_bytes = BLOCK_M * head_size * sizeof(float);
-  size_t shmem = Q_bytes + K_bytes + V_bytes + S_bytes + O_bytes;
+  // Threadgroup memory layout (C3):
+  //   Q_tile    : T[BLOCK_M][head_size]
+  //   K_stage   : T[block_size][head_size]
+  //   V_stage   : T[block_size][head_size]
+  //   S_buf     : float[BLOCK_M][block_size]   (Q@K^T scores; aliased as P)
+  //   O_stage   : float[BLOCK_M][head_size]    (running fp32 accumulator)
+  //   m_buf     : float[BLOCK_M]               (online softmax running max)
+  //   l_buf     : float[BLOCK_M]               (online softmax running sum)
+  //   alpha_buf : float[BLOCK_M]               (per-row rescale factor)
+  size_t T_size       = query.itemsize();
+  size_t Q_bytes      = BLOCK_M * head_size * T_size;
+  size_t K_bytes      = block_size * head_size * T_size;
+  size_t V_bytes      = block_size * head_size * T_size;
+  size_t S_bytes      = BLOCK_M * block_size * sizeof(float);
+  size_t O_bytes      = BLOCK_M * head_size * sizeof(float);
+  size_t state_bytes  = 3 * BLOCK_M * sizeof(float);  // m, l, alpha
+  size_t shmem = Q_bytes + K_bytes + V_bytes + S_bytes + O_bytes + state_bytes;
 
   auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
