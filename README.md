@@ -36,3 +36,13 @@ https://docs.vllm.ai/en/latest/cli/
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
+### Optional: Rust frontend (experimental)
+
+Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](https://github.com/Inferact/vllm-frontend-rs), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain (https://rustup.rs):
+
+```bash
+./install.sh --with-vllm-rs
+```
+
+See [docs/rust_frontend.md](docs/rust_frontend.md) for usage and architecture.
+
