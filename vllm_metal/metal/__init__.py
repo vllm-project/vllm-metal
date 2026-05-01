@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_DIR = _THIS_DIR / "kernels_v1"
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
+_KERNELS_V3_DIR = _THIS_DIR / "kernels_v3"
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
@@ -63,14 +64,14 @@ def _build_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
-def _build_v2_paged_attention_source() -> str:
-    """Concatenate float8 + utils + turboquant + v2 paged_attention (online softmax)."""
+def _build_v3_paged_attention_source() -> str:
+    """Concatenate float8 + utils + turboquant + v3 paged_attention (online softmax)."""
     parts = [
         f"#define VLLM_METAL_PARTITION_SIZE {PARTITION_SIZE}",
-        _read_metal_source(_KERNELS_V2_DIR / "float8.metal"),
-        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
-        _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
-        _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
+        _read_metal_source(_KERNELS_V3_DIR / "float8.metal"),
+        _read_metal_source(_KERNELS_V3_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V3_DIR / "turboquant.metal"),
+        _read_metal_source(_KERNELS_V3_DIR / "pagedattention.metal"),
     ]
     return "\n".join(parts)
 
@@ -219,8 +220,8 @@ def get_ops() -> ModuleType:
     mod.init_libraries(reshape_src, paged_attn_src)
 
     # 4. Initialise v2 library (online softmax kernel)
-    v2_src = _build_v2_paged_attention_source()
-    mod.init_v2_library(v2_src)
+    v3_src = _build_v3_paged_attention_source()
+    mod.init_v2_library(v3_src)
 
     # 5. Initialise GDN linear attention library
     gdn_src = _build_gdn_source()
