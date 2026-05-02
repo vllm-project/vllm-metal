@@ -6,7 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from vllm_metal.v1.multimodal import merge_multimodal_embeddings
+from vllm_metal.multimodal import merge_multimodal_embeddings
 
 
 def test_merge_no_multimodal_returns_input() -> None:

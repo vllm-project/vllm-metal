@@ -8,36 +8,12 @@ from collections.abc import Sequence
 import mlx.core as mx
 import numpy as np
 
-# === Flattening ===
-
-
-def _flatten_embeddings(
-    multimodal_embeddings: mx.array | Sequence[mx.array],
-) -> mx.array:
-    if isinstance(multimodal_embeddings, Sequence):
-        return mx.concatenate(multimodal_embeddings, axis=0)
-    return multimodal_embeddings
-
-
-def _normalize_mask(inputs_embeds: mx.array, is_multimodal: mx.array) -> mx.array:
-    # Packed prefill builds one embeddings batch at a time; promote its 1D
-    # placeholder mask to match the rank-3 embeddings layout.
-    if is_multimodal.ndim == 1 and inputs_embeds.ndim == 3:
-        if inputs_embeds.shape[0] == 1:
-            return is_multimodal[None, :]
-        raise ValueError(
-            "1D multimodal mask is only supported for packed batch size 1, "
-            f"got inputs_embeds batch size {inputs_embeds.shape[0]}."
-        )
-    return is_multimodal
-
-
 # === Public Helpers ===
 
 
 def merge_multimodal_embeddings(
     inputs_embeds: mx.array,
-    multimodal_embeddings: mx.array | list[mx.array],
+    multimodal_embeddings: mx.array | Sequence[mx.array],
     is_multimodal: mx.array,
 ) -> mx.array:
     """Splice multimodal embeddings into placeholder positions.
@@ -74,3 +50,27 @@ def merge_multimodal_embeddings(
     positions = mx.array(np.where(mask_np)[0], dtype=mx.uint32)
     flat[positions] = mm_embeds_flat.astype(input_dtype)
     return flat.reshape(inputs_embeds.shape)
+
+
+# === Internal Helpers ===
+
+
+def _flatten_embeddings(
+    multimodal_embeddings: mx.array | Sequence[mx.array],
+) -> mx.array:
+    if isinstance(multimodal_embeddings, Sequence):
+        return mx.concatenate(multimodal_embeddings, axis=0)
+    return multimodal_embeddings
+
+
+def _normalize_mask(inputs_embeds: mx.array, is_multimodal: mx.array) -> mx.array:
+    # Packed prefill builds one embeddings batch at a time; promote its 1D
+    # placeholder mask to match the rank-3 embeddings layout.
+    if is_multimodal.ndim == 1 and inputs_embeds.ndim == 3:
+        if inputs_embeds.shape[0] == 1:
+            return is_multimodal[None, :]
+        raise ValueError(
+            "1D multimodal mask is only supported for packed batch size 1, "
+            f"got inputs_embeds batch size {inputs_embeds.shape[0]}."
+        )
+    return is_multimodal

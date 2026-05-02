@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from vllm_metal.v1.multimodal import (
-    EncoderCache,
+from vllm_metal.multimodal import (
     MultiModalFeatureSpec,
     PlaceholderRange,
+)
+from vllm_metal.v1.mm import (
+    EncoderCache,
 )
 
 

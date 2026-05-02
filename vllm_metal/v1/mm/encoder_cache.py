@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from vllm_metal.v1.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
 
 class EncoderCache:

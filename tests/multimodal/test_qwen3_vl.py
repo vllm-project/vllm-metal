@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from vllm_metal.v1.multimodal import (
+from vllm_metal.multimodal import (
     MultiModalFeatureSpec,
     PlaceholderRange,
-    get_mrope_input_positions,
 )
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
 # Qwen3-VL's mm_features-driven helper reads image sequence length and media
 # offsets from mm_features; the concrete token ids are irrelevant in these
@@ -27,16 +27,22 @@ _IMAGE_TOKEN_COUNT_2X2 = 4
 # === Test Helpers ===
 
 
+def _adapter(spatial_merge_size: int = _SPATIAL_MERGE_SIZE) -> Qwen3VLMultimodalAdapter:
+    return Qwen3VLMultimodalAdapter(spatial_merge_size=spatial_merge_size)
+
+
 def _feature(
     *,
     offset: int,
     length: int,
-    grid_thw: tuple[int, int, int],
+    grid_thw: tuple[int, ...],
+    modality: str = "image",
 ) -> MultiModalFeatureSpec:
+    key = "video_grid_thw" if modality.startswith("video") else "image_grid_thw"
     return MultiModalFeatureSpec(
-        data={"image_grid_thw": SimpleNamespace(data=np.array(grid_thw))},
-        modality="image",
-        identifier=f"image-{offset}",
+        data={key: SimpleNamespace(data=np.array(grid_thw))},
+        modality=modality,
+        identifier=f"{modality}-{offset}",
         mm_position=PlaceholderRange(offset=offset, length=length),
     )
 
@@ -45,10 +51,9 @@ def _feature(
 
 
 def test_text_only_positions() -> None:
-    positions, delta = get_mrope_input_positions(
+    positions, delta = _adapter().get_mrope_input_positions(
         [_TEXT_TOKEN_ID] * 4,
         [],
-        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
     assert positions.tolist() == [[0, 1, 2, 3]] * 3
     assert delta == 0
@@ -56,10 +61,68 @@ def test_text_only_positions() -> None:
 
 def test_invalid_spatial_merge_size_raises() -> None:
     with pytest.raises(ValueError, match="spatial_merge_size must be positive"):
-        get_mrope_input_positions(
-            [_TEXT_TOKEN_ID],
-            [],
-            spatial_merge_size=0,
+        _adapter(spatial_merge_size=0)
+
+
+def test_bad_grid_shape_raises() -> None:
+    tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    feature = _feature(
+        offset=0,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=(1, 4),
+    )
+
+    with pytest.raises(ValueError, match="image_grid_thw must contain exactly 3"):
+        _adapter().get_mrope_input_positions(
+            tokens,
+            [feature],
+        )
+
+
+def test_embed_count_mismatch_raises() -> None:
+    tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    feature = _feature(
+        offset=0,
+        length=_IMAGE_TOKEN_COUNT_2X2 - 1,
+        grid_thw=_IMAGE_GRID_THW_2X2,
+    )
+
+    with pytest.raises(ValueError, match="image_grid_thw implies 4"):
+        _adapter().get_mrope_input_positions(
+            tokens,
+            [feature],
+        )
+
+
+def test_video_feature_raises() -> None:
+    tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    feature = _feature(
+        offset=0,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=_IMAGE_GRID_THW_2X2,
+        modality="video",
+    )
+
+    with pytest.raises(NotImplementedError, match="Video multimodal features"):
+        _adapter().get_mrope_input_positions(
+            tokens,
+            [feature],
+        )
+
+
+def test_unsupported_modality_raises() -> None:
+    tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    feature = _feature(
+        offset=0,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=_IMAGE_GRID_THW_2X2,
+        modality="image_embeds",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported modality: image_embeds"):
+        _adapter().get_mrope_input_positions(
+            tokens,
+            [feature],
         )
 
 
@@ -74,10 +137,9 @@ def test_single_image_positions_in_middle_of_sequence() -> None:
         length=_IMAGE_TOKEN_COUNT_2X2,
         grid_thw=_IMAGE_GRID_THW_2X2,
     )
-    positions, delta = get_mrope_input_positions(
+    positions, delta = _adapter().get_mrope_input_positions(
         tokens,
         [feature],
-        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
@@ -111,10 +173,9 @@ def test_multi_image_positions_preserve_feature_offsets() -> None:
         ),
     ]
 
-    positions, delta = get_mrope_input_positions(
+    positions, delta = _adapter().get_mrope_input_positions(
         tokens,
         features,
-        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
@@ -134,10 +195,9 @@ def test_image_at_start_of_sequence() -> None:
         grid_thw=_IMAGE_GRID_THW_2X2,
     )
 
-    positions, delta = get_mrope_input_positions(
+    positions, delta = _adapter().get_mrope_input_positions(
         tokens,
         [feature],
-        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
@@ -157,10 +217,9 @@ def test_image_at_end_of_sequence() -> None:
         grid_thw=_IMAGE_GRID_THW_2X2,
     )
 
-    positions, delta = get_mrope_input_positions(
+    positions, delta = _adapter().get_mrope_input_positions(
         tokens,
         [feature],
-        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
