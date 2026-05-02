@@ -90,6 +90,18 @@ class MetalDraftProposer:
     def propose(self, input_ids: mx.array, k: int) -> tuple[mx.array, mx.array]:
         """
         Generate k speculative tokens as a lazy computation graph.
+
+        This method builds a computation graph for k steps of drafting.
+        It use MLX's lazy evaluation to defer the actual GPU math until
+        the Scorer evaluates the combined 'Wide pipe' payload.
+
+        Args:
+            - `input_ids`: context tokens for prefill, shape (1, prompt_len)
+            - `k`: number of speculative tokens to generate
+
+        returns:
+            - `draft_tokens`: length k of draft token
+            - `draft_logits`: length k of draft logits
         """
 
         # 1. initialize draft cache
@@ -133,6 +145,6 @@ class MetalDraftProposer:
         # for Step 3 until the SpecWorker orchestrator explicitly asks for it.
         logger.info("Graph building complete. Returning to caller.")
         return (
-            mx.stack(draft_tokens, axis=1),
-            mx.concatenate(draft_logits, axis=1),
+            mx.stack(draft_tokens, axis=1),  # (batch, k)
+            mx.concatenate(draft_logits, axis=1),  # (batch, k, vocab)
         )
