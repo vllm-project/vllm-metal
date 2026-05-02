@@ -50,6 +50,27 @@ def test_merge_count_mismatch_raises() -> None:
         merge_multimodal_embeddings(inputs, mm_embeds, mask)
 
 
+def test_merge_rejects_ambiguous_1d_mask_for_multi_batch() -> None:
+    inputs = mx.zeros((2, 2, 2), dtype=mx.float32)
+    mm_embeds = mx.ones((1, 2), dtype=mx.float32)
+    mask = mx.array([False, True])
+
+    with pytest.raises(
+        ValueError,
+        match="1D multimodal mask is only supported for packed batch size 1",
+    ):
+        merge_multimodal_embeddings(inputs, mm_embeds, mask)
+
+
+def test_merge_rejects_mask_shape_mismatch() -> None:
+    inputs = mx.zeros((1, 2, 2), dtype=mx.float32)
+    mm_embeds = mx.ones((1, 2), dtype=mx.float32)
+    mask = mx.array([[False, True, False]])
+
+    with pytest.raises(ValueError, match="Multimodal mask shape"):
+        merge_multimodal_embeddings(inputs, mm_embeds, mask)
+
+
 def test_merge_dtype_preserved() -> None:
     inputs = mx.zeros((1, 2, 2), dtype=mx.bfloat16)
     mm_embeds = mx.ones((1, 2), dtype=mx.float32)

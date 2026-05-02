@@ -43,9 +43,8 @@ def iter_image_grid_thw(
 ) -> Iterator[tuple[int, int, int, int, float]]:
     """Yield ``(offset, llm_grid_t, llm_grid_h, llm_grid_w, t_factor)``.
 
-    Matches the image branch of
-    ``Qwen2_5_VLForConditionalGeneration.iter_mm_grid_thw`` for the initial
-    Qwen3.5-4B multimodal PR series.
+    Yields compact image-grid metadata for the initial Qwen3.5-4B multimodal PR
+    series.
 
     Video features raise ``NotImplementedError`` because video support is out
     of scope for this series.  Features are sorted by placeholder offset before

@@ -22,12 +22,13 @@ def _flatten_embeddings(
 def _normalize_mask(inputs_embeds: mx.array, is_multimodal: mx.array) -> mx.array:
     # Packed prefill builds one embeddings batch at a time; promote its 1D
     # placeholder mask to match the rank-3 embeddings layout.
-    if (
-        is_multimodal.ndim == 1
-        and inputs_embeds.ndim == 3
-        and inputs_embeds.shape[0] == 1
-    ):
-        return is_multimodal[None, :]
+    if is_multimodal.ndim == 1 and inputs_embeds.ndim == 3:
+        if inputs_embeds.shape[0] == 1:
+            return is_multimodal[None, :]
+        raise ValueError(
+            "1D multimodal mask is only supported for packed batch size 1, "
+            f"got inputs_embeds batch size {inputs_embeds.shape[0]}."
+        )
     return is_multimodal
 
 
@@ -51,6 +52,11 @@ def merge_multimodal_embeddings(
 
     mm_embeds_flat = _flatten_embeddings(multimodal_embeddings)
     mask = _normalize_mask(inputs_embeds, is_multimodal)
+    if mask.shape != inputs_embeds.shape[:-1]:
+        raise ValueError(
+            f"Multimodal mask shape {mask.shape} must match inputs_embeds "
+            f"leading shape {inputs_embeds.shape[:-1]}."
+        )
     mask_flat = mx.flatten(mask)
     num_actual_tokens = int(mm_embeds_flat.shape[0])
     num_expected_tokens = int(mask_flat.sum().item())
