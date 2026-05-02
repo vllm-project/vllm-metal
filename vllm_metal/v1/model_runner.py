@@ -440,6 +440,20 @@ class MetalModelRunner:
         """
         return self._cache_policy.get_kv_cache_spec()
 
+    def truncate_cache(self, request_id: str, num_to_remove: int) -> None:
+        """Rewind sequence length after a rejection."""
+        state = self._request_states.get(request_id)
+
+        if state is None or num_to_remove <= 0:
+            return
+
+        # truncate the token list
+        state.token_ids = state.token_ids[:-num_to_remove]
+
+        # update the tracking length
+        state.generated_tokens = len(state.token_ids) - state.prompt_len
+        self._paged_request_seq_lens[request_id] = len(state.token_ids)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Accept KV cache config from engine (no-op for MLX path).
 
