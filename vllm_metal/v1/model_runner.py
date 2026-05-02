@@ -30,7 +30,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -62,6 +62,8 @@ from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
+    SamplingResult,
+    merge_logprobs_rows,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -143,19 +145,36 @@ class _ExecutionBatch:
     req_ids: list[str] = field(default_factory=list)
     req_id_to_index: dict[str, int] = field(default_factory=dict)
     sampled_tokens: list[list[int]] = field(default_factory=list)
+    sample_logprobs: list[LogprobsLists | None] = field(default_factory=list)
     new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
 
-    def add_output(self, req_id: str, token_ids: list[int]) -> int:
+    def add_output(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        logprobs: LogprobsLists | None = None,
+    ) -> int:
         """Append one output slot and return its index."""
         self.req_ids.append(req_id)
         output_idx = len(self.req_ids) - 1
         self.req_id_to_index[req_id] = output_idx
         self.sampled_tokens.append(token_ids)
+        self.sample_logprobs.append(logprobs)
         return output_idx
+
+    def set_output(
+        self,
+        output_idx: int,
+        token_ids: list[int],
+        logprobs: LogprobsLists | None = None,
+    ) -> None:
+        """Set tokens and logprobs for an existing output slot."""
+        self.sampled_tokens[output_idx] = token_ids
+        self.sample_logprobs[output_idx] = logprobs
 
     def has_paged_work(self) -> bool:
         """Return whether this step has any paged execution work."""
@@ -547,7 +566,7 @@ class MetalModelRunner:
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
-    ) -> tuple[int, list[KVCache]]:
+    ) -> tuple[int, list[KVCache], LogprobsLists | None]:
         """Process a single prefill request.
 
         Args:
@@ -606,14 +625,15 @@ class MetalModelRunner:
             logitsprocs=self._logitsprocs,
             generators=generators,
         )
-        [next_token] = sample_from_logits(
-            last_logits, batch, self._sampler, self.device
-        )
+        result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+        [next_token] = result.token_ids
         mx.eval(*[c.state for c in cache])
 
-        return next_token, cache
+        return next_token, cache, result.logprobs
 
-    def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
+    def _batched_decode(
+        self, decode_reqs: list[tuple[str, RequestState]]
+    ) -> SamplingResult:
         """Process multiple decode requests in a single batched forward pass.
 
         Uses BatchKVCache to merge individual caches, run ONE forward pass,
@@ -623,7 +643,7 @@ class MetalModelRunner:
             decode_reqs: List of (req_id, state) tuples
 
         Returns:
-            List of next tokens for each request
+            Sampled token IDs and optional logprobs for each request.
         """
         last_tokens = [
             state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
@@ -667,9 +687,10 @@ class MetalModelRunner:
             logitsprocs=self._logitsprocs,
             generators=generators,
         )
-        next_tokens = sample_from_logits(
+        result = sample_from_logits(
             next_token_logits, batch, self._sampler, self.device
         )
+        next_tokens = result.token_ids
 
         # Extract updated caches back to individual requests
         for i, (_req_id, state) in enumerate(decode_reqs):
@@ -677,11 +698,11 @@ class MetalModelRunner:
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
 
-        return next_tokens
+        return result
 
     def _sequential_decode(
         self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> list[int]:
+    ) -> SamplingResult:
         """Fallback: process decode requests sequentially.
 
         Used when batch size is 1 (no benefit from batching).
@@ -690,9 +711,10 @@ class MetalModelRunner:
             decode_reqs: List of (req_id, state) tuples
 
         Returns:
-            List of next tokens for each request
+            Sampled token IDs and optional logprobs for each request.
         """
         next_tokens = []
+        logprobs_rows: list[LogprobsLists | None] = []
 
         for _req_id, state in decode_reqs:
             last_token = state.token_ids[-1] if state.token_ids else 0
@@ -713,17 +735,20 @@ class MetalModelRunner:
                 logitsprocs=self._logitsprocs,
                 generators=generators,
             )
-            [next_token] = sample_from_logits(
-                last_logits, batch, self._sampler, self.device
-            )
+            result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+            [next_token] = result.token_ids
 
             next_tokens.append(next_token)
+            logprobs_rows.append(result.logprobs)
 
             # Update state
             state.token_ids.append(next_token)
             state.generated_tokens += 1
 
-        return next_tokens
+        return SamplingResult(
+            next_tokens,
+            merge_logprobs_rows(logprobs_rows),
+        )
 
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)
@@ -854,7 +879,7 @@ class MetalModelRunner:
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
-        decode_next_tokens = sample_decode_tokens(
+        decode_result = sample_decode_tokens(
             logits,
             decode_reqs,
             num_decode,
@@ -863,7 +888,7 @@ class MetalModelRunner:
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
         )
-        prefill_next_tokens = sample_prefill_tokens(
+        prefill_result = sample_prefill_tokens(
             logits,
             prefill_reqs,
             cu_seqlens,
@@ -876,7 +901,7 @@ class MetalModelRunner:
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
-            state.token_ids.append(decode_next_tokens[i])
+            state.token_ids.append(decode_result.token_ids[i])
             state.generated_tokens += 1
             self._paged_request_seq_lens[req_id] = (
                 self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
@@ -888,14 +913,19 @@ class MetalModelRunner:
 
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
-            next_token = prefill_next_tokens[i]
+            next_token = prefill_result.token_ids[i]
+            logprobs = (
+                prefill_result.logprobs.slice_request(i, 1)
+                if prefill_result.logprobs is not None
+                else None
+            )
             prefill = prefill_reqs[i]
 
             if entry.result_mode == "intermediate":
-                batch.sampled_tokens[entry.output_idx] = []
+                batch.set_output(entry.output_idx, [], logprobs)
                 continue
 
-            batch.sampled_tokens[entry.output_idx] = [next_token]
+            batch.set_output(entry.output_idx, [next_token], logprobs)
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
@@ -920,7 +950,12 @@ class MetalModelRunner:
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
-            batch.add_output(req_id, [decode_next_tokens[i]])
+            logprobs = (
+                decode_result.logprobs.slice_request(i, 1)
+                if decode_result.logprobs is not None
+                else None
+            )
+            batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
 
         return batch, scheduler_output
 
@@ -984,13 +1019,13 @@ class MetalModelRunner:
                     )
                 continue
 
-            next_token, cache = self._prefill_single(
+            next_token, cache, logprobs = self._prefill_single(
                 req_id,
                 token_ids,
                 sampling_params,
                 generator=generator,
             )
-            batch.add_output(req_id, [next_token])
+            batch.add_output(req_id, [next_token], logprobs)
             self._request_states[req_id] = RequestState(
                 token_ids=list(token_ids) + [next_token],
                 prompt_len=len(token_ids),
@@ -1140,7 +1175,7 @@ class MetalModelRunner:
             req_ids=batch.req_ids,
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
-            logprobs=None,
+            logprobs=merge_logprobs_rows(batch.sample_logprobs),
             prompt_logprobs_dict={},
             pooler_output=[None] * len(batch.req_ids),
         )
@@ -1152,12 +1187,17 @@ class MetalModelRunner:
         """Run non-paged decode work and append placeholder outputs as needed."""
         if batch.valid_decode_reqs:
             if len(batch.valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
-                decode_tokens = self._batched_decode(batch.valid_decode_reqs)
+                decode_result = self._batched_decode(batch.valid_decode_reqs)
             else:
-                decode_tokens = self._sequential_decode(batch.valid_decode_reqs)
+                decode_result = self._sequential_decode(batch.valid_decode_reqs)
 
             for i, (req_id, _) in enumerate(batch.valid_decode_reqs):
-                batch.add_output(req_id, [decode_tokens[i]])
+                logprobs = (
+                    decode_result.logprobs.slice_request(i, 1)
+                    if decode_result.logprobs is not None
+                    else None
+                )
+                batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
 
         for req_id in batch.scheduled_cached_req_ids:
             if req_id not in batch.req_id_to_index:
