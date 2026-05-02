@@ -48,8 +48,8 @@ def iter_image_grid_thw(
     Qwen3.5-4B multimodal PR series.
 
     Video features raise ``NotImplementedError`` because video support is out
-    of scope for this series.  Features must arrive in placeholder order,
-    matching vLLM v1 scheduler/cache assumptions for ``mm_features``.
+    of scope for this series.  Features are sorted by placeholder offset to
+    match upstream Qwen2.5-VL behavior.
 
     The image branch validates ``mm_position.get_num_embeds()`` against the
     grid-derived token count.  Future placeholder formats that include
@@ -61,14 +61,8 @@ def iter_image_grid_thw(
         )
 
     def _iter() -> Iterator[tuple[int, int, int, int, float]]:
-        previous_offset = -1
-        for feature in features:
+        for feature in sorted(features, key=lambda feature: feature.mm_position.offset):
             offset = feature.mm_position.offset
-            if offset < previous_offset:
-                raise ValueError(
-                    "Image multimodal features must be ordered by mm_position.offset."
-                )
-            previous_offset = offset
 
             modality = feature.modality
             if modality.startswith("video"):

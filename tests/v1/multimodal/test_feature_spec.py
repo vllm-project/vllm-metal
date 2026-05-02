@@ -85,7 +85,7 @@ def test_iter_image_grid_thw_multiple_images_preserves_order() -> None:
     ]
 
 
-def test_iter_image_grid_thw_rejects_unordered_features() -> None:
+def test_iter_image_grid_thw_sorts_unordered_features() -> None:
     features = [
         _feature(
             offset=_SECOND_IMAGE_OFFSET,
@@ -99,8 +99,14 @@ def test_iter_image_grid_thw_rejects_unordered_features() -> None:
         ),
     ]
 
-    with pytest.raises(ValueError, match="ordered by mm_position.offset"):
-        list(iter_image_grid_thw(features, spatial_merge_size=_SPATIAL_MERGE_SIZE))
+    results = list(
+        iter_image_grid_thw(features, spatial_merge_size=_SPATIAL_MERGE_SIZE)
+    )
+
+    assert results == [
+        (_FIRST_IMAGE_OFFSET, 1, 5, 5, 1.0),
+        (_SECOND_IMAGE_OFFSET, 1, 2, 2, 1.0),
+    ]
 
 
 def test_iter_image_grid_thw_uses_spatial_merge_size() -> None:

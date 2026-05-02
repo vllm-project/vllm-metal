@@ -96,14 +96,16 @@ def test_multi_image_positions_preserve_feature_offsets() -> None:
         + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
         + [_TEXT_TOKEN_ID]
     )
+    # Intentionally reversed: the helper should mirror upstream Qwen2.5-VL and
+    # sort features by placeholder offset before computing M-RoPE positions.
     features = [
         _feature(
-            offset=1,
+            offset=6,
             length=_IMAGE_TOKEN_COUNT_2X2,
             grid_thw=_IMAGE_GRID_THW_2X2,
         ),
         _feature(
-            offset=6,
+            offset=1,
             length=_IMAGE_TOKEN_COUNT_2X2,
             grid_thw=_IMAGE_GRID_THW_2X2,
         ),
