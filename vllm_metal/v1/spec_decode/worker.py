@@ -80,17 +80,42 @@ class MetalSpecDecodeWorker(WorkerBase):
             return self.target_worker.execute_model(scheduler_output)
 
         # 2. Draft Phase
-        # req_id_to_draft_tokens = self.proposer.propose(scheduler_output)
+        # generate guesses using proposer
+        k = self.vllm_config.speculative_config.num_speculative_tokens
+        input_ids = self.target_worker._get_input_ids(scheduler_output)
+
+        draft_tokens_batch, draft_logits_batch = self.proposer.propose(input_ids, k=k)
 
         # 3. Create SpecDecodeMetadata
-        # spec_metadata = SpecDecodeMetadata.make_dummy(...)
+        #  TODO: Implement proper SpecDecodeMetadata.make_dummy(...) if required by scheduler
         spec_metadata: Optional[SpecDecodeMetadata] = None
 
         # 4. Verification Phase (Call target worker with widened logit extraction)
         output = self.target_worker.execute_model(scheduler_output, spec_metadata)
 
-        # 5. Rejection Phase
-        # m_accepted = self.sampler.sample(target_logits, draft_logits, draft_tokens)
+        # 5. Rejection & Verification Phase
+        if output is not None and hasattr(output, "verification_logits"):
+            # TODO: handle 1st request in the batch for simplicity for now
+            req_id = output.req_ids[0]
+            target_logits = output.verification_logits[req_id]  # (k+1, vocab)
+
+            # vectorized parallel sampling with residual fix
+            num_accepted, bonus_token = self.sampler.sample(
+                target_logits=target_logits,
+                draft_logits=draft_logits_batch[0],
+                draft_tokens=draft_tokens_batch[0],
+            )
+
+            # 6. Rewind phase: truncate kv cache if rejections occur
+            k = draft_tokens_batch.shape[1]
+            num_to_remove = k - num_accepted
+
+            if num_to_remove > 0:
+                # tell runner to forget the invalid tokens
+                self.target_worker.model_runner.truncate_cache(req_id, num_to_remove)
+
+            # 7. Update output with the verified next token
+            output.sampled_token_ids[0] = [bonus_token]
 
         return output
 
