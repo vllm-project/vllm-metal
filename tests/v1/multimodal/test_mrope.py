@@ -14,9 +14,9 @@ from vllm_metal.v1.multimodal import (
     get_mrope_input_positions,
 )
 
-# Qwen2.5-VL's mm_features-driven helper reads sequence length and media
+# Qwen3-VL's mm_features-driven helper reads image sequence length and media
 # offsets from mm_features; the concrete token ids are irrelevant in these
-# focused tests.
+# focused image-only tests.
 _TEXT_TOKEN_ID = 1
 _IMAGE_PLACEHOLDER_TOKEN_ID = 2
 _SPATIAL_MERGE_SIZE = 2
@@ -96,7 +96,7 @@ def test_multi_image_positions_preserve_feature_offsets() -> None:
         + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
         + [_TEXT_TOKEN_ID]
     )
-    # Intentionally reversed: the helper should mirror upstream Qwen2.5-VL and
+    # Intentionally reversed: the helper should mirror upstream Qwen3-VL and
     # sort features by placeholder offset before computing M-RoPE positions.
     features = [
         _feature(

@@ -48,8 +48,8 @@ def iter_image_grid_thw(
     Qwen3.5-4B multimodal PR series.
 
     Video features raise ``NotImplementedError`` because video support is out
-    of scope for this series.  Features are sorted by placeholder offset to
-    match upstream Qwen2.5-VL behavior.
+    of scope for this series.  Features are sorted by placeholder offset before
+    M-RoPE generation, matching upstream Qwen3-VL behavior.
 
     The image branch validates ``mm_position.get_num_embeds()`` against the
     grid-derived token count.  Future placeholder formats that include
