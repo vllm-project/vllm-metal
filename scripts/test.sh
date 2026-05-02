@@ -93,11 +93,13 @@ run_smoke_test() {
 
 smoke_tests() {
   # Qwen3-0.6B: standard GQA paged attention path
+  # Golden refreshed after the v2 softmax exp→exp2 fold; the paged path
+  # now matches the MLX inline-cache ground truth on this prompt.
   run_smoke_test \
     "Qwen/Qwen3-0.6B" \
     "c1899de289a04d12100db370d81485cdf75e47ca" \
     "The capital of France is" \
-    " Paris. The capital of Italy is Rome. The"
+    " Paris. The capital of France is also the capital"
 
   # Qwen3.5-0.8B: hybrid SDPA + GDN linear attention paged path
   # max-num-seqs=1: limits GDN linear state allocation (~10MB/slot × N slots)
