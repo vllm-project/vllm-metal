@@ -177,6 +177,34 @@ class MetalWorker(WorkerBase):
         """
         WorkerCachePlanner(self).setup_paged_attention(overhead=overhead)
 
+    def _get_input_ids(self, scheduler_output: SchedulerOutput) -> mx.array:
+        """
+        Helper method to extract the current token context from the scheduler output.
+        This provides the Proposer with the necessary history to generate draft tokens.
+        """
+
+        # check the new requests
+        if scheduler_output.scheduled_new_reqs:
+            # TODO: map all request ids to their repective token arrays instead of index 0
+            first_req = scheduler_output.scheduled_new_reqs[0]
+            return mx.array([first_req.prompt_token_ids])
+
+        # check cached/continuing requests
+        elif scheduler_output.scheduled_cached_reqs.req_ids:
+            # TODO: handle multiple cached requests by building a batch MLX array
+            first_req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
+
+            # access target runner state
+            state = self.model_runner._request_states.get(first_req_id)
+            if state is not None:
+                return mx.array([state.token_ids])
+
+        # TODO: add logic to handle cases where a batch contains both new and cached
+        # requests mixed together
+        raise ValueError(
+            "No valid requests found in SchedulerOutput to extract input IDs."
+        )
+
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
