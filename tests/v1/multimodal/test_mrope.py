@@ -3,11 +3,10 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm_metal.v1.multimodal import (
     MultiModalFeatureSpec,
@@ -15,11 +14,14 @@ from vllm_metal.v1.multimodal import (
     get_mrope_input_positions,
 )
 
-_FIXTURES = Path(__file__).parent / "fixtures"
-
-# Qwen3.5-4B config/tokenizer map <|image_pad|> to this token id.
-_QWEN35_VL_IMAGE_PAD_TOKEN_ID = 248056
-_QWEN35_VL_SPATIAL_MERGE_SIZE = 2
+# Qwen2.5-VL's mm_features-driven helper reads sequence length and media
+# offsets from mm_features; the concrete token ids are irrelevant in these
+# focused tests.
+_TEXT_TOKEN_ID = 1
+_IMAGE_PLACEHOLDER_TOKEN_ID = 2
+_SPATIAL_MERGE_SIZE = 2
+_IMAGE_GRID_THW_2X2 = (1, 4, 4)
+_IMAGE_TOKEN_COUNT_2X2 = 4
 
 
 # === Test Helpers ===
@@ -44,41 +46,96 @@ def _feature(
 
 def test_text_only_positions() -> None:
     positions, delta = get_mrope_input_positions(
-        [1, 2, 3, 4],
+        [_TEXT_TOKEN_ID] * 4,
         [],
-        spatial_merge_size=_QWEN35_VL_SPATIAL_MERGE_SIZE,
+        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
     assert positions.tolist() == [[0, 1, 2, 3]] * 3
     assert delta == 0
 
 
-def test_single_image_positions_match_fixture() -> None:
-    with (_FIXTURES / "mrope_qwen35_4b_single_image.json").open() as f:
-        fixture = json.load(f)
+def test_invalid_spatial_merge_size_raises() -> None:
+    with pytest.raises(ValueError, match="spatial_merge_size must be positive"):
+        get_mrope_input_positions(
+            [_TEXT_TOKEN_ID],
+            [],
+            spatial_merge_size=0,
+        )
 
+
+def test_single_image_positions_in_middle_of_sequence() -> None:
+    tokens = (
+        [_TEXT_TOKEN_ID] * 2
+        + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+        + [_TEXT_TOKEN_ID] * 2
+    )
     feature = _feature(
-        offset=fixture["image_offset"],
-        length=fixture["image_length"],
-        grid_thw=tuple(fixture["image_grid_thw"]),
+        offset=2,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=_IMAGE_GRID_THW_2X2,
     )
     positions, delta = get_mrope_input_positions(
-        fixture["input_tokens"],
+        tokens,
         [feature],
-        spatial_merge_size=_QWEN35_VL_SPATIAL_MERGE_SIZE,
+        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
-    assert positions.tolist() == fixture["llm_positions"]
-    assert delta == fixture["mrope_position_delta"]
+    assert positions.tolist() == [
+        [0, 1, 2, 2, 2, 2, 4, 5],
+        [0, 1, 2, 2, 3, 3, 4, 5],
+        [0, 1, 2, 3, 2, 3, 4, 5],
+    ]
+    assert delta == -2
+
+
+def test_multi_image_positions_preserve_feature_offsets() -> None:
+    tokens = (
+        [_TEXT_TOKEN_ID]
+        + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+        + [_TEXT_TOKEN_ID]
+        + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+        + [_TEXT_TOKEN_ID]
+    )
+    features = [
+        _feature(
+            offset=1,
+            length=_IMAGE_TOKEN_COUNT_2X2,
+            grid_thw=_IMAGE_GRID_THW_2X2,
+        ),
+        _feature(
+            offset=6,
+            length=_IMAGE_TOKEN_COUNT_2X2,
+            grid_thw=_IMAGE_GRID_THW_2X2,
+        ),
+    ]
+
+    positions, delta = get_mrope_input_positions(
+        tokens,
+        features,
+        spatial_merge_size=_SPATIAL_MERGE_SIZE,
+    )
+
+    assert positions.tolist() == [
+        [0, 1, 1, 1, 1, 3, 4, 4, 4, 4, 6],
+        [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6],
+        [0, 1, 2, 1, 2, 3, 4, 5, 4, 5, 6],
+    ]
+    assert delta == -4
 
 
 def test_image_at_start_of_sequence() -> None:
-    tokens = [_QWEN35_VL_IMAGE_PAD_TOKEN_ID] * 4 + [1, 2, 3, 4, 5, 6]
-    feature = _feature(offset=0, length=4, grid_thw=(1, 4, 4))
+    tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    tokens += [_TEXT_TOKEN_ID] * 6
+    feature = _feature(
+        offset=0,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=_IMAGE_GRID_THW_2X2,
+    )
 
     positions, delta = get_mrope_input_positions(
         tokens,
         [feature],
-        spatial_merge_size=_QWEN35_VL_SPATIAL_MERGE_SIZE,
+        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
@@ -90,13 +147,18 @@ def test_image_at_start_of_sequence() -> None:
 
 
 def test_image_at_end_of_sequence() -> None:
-    tokens = [1, 2, 3, 4] + [_QWEN35_VL_IMAGE_PAD_TOKEN_ID] * 4
-    feature = _feature(offset=4, length=4, grid_thw=(1, 4, 4))
+    tokens = [_TEXT_TOKEN_ID] * 4
+    tokens += [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+    feature = _feature(
+        offset=4,
+        length=_IMAGE_TOKEN_COUNT_2X2,
+        grid_thw=_IMAGE_GRID_THW_2X2,
+    )
 
     positions, delta = get_mrope_input_positions(
         tokens,
         [feature],
-        spatial_merge_size=_QWEN35_VL_SPATIAL_MERGE_SIZE,
+        spatial_merge_size=_SPATIAL_MERGE_SIZE,
     )
 
     assert positions.tolist() == [
@@ -105,16 +167,3 @@ def test_image_at_end_of_sequence() -> None:
         [0, 1, 2, 3, 4, 5, 4, 5],
     ]
     assert delta == -2
-
-
-def test_mrope_delta_negative_for_image() -> None:
-    tokens = [1] * 10 + [_QWEN35_VL_IMAGE_PAD_TOKEN_ID] * 25 + [2] * 15
-    feature = _feature(offset=10, length=25, grid_thw=(1, 10, 10))
-
-    _, delta = get_mrope_input_positions(
-        tokens,
-        [feature],
-        spatial_merge_size=_QWEN35_VL_SPATIAL_MERGE_SIZE,
-    )
-
-    assert delta < 0

@@ -3,15 +3,10 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import mlx.core as mx
 import pytest
 
 from vllm_metal.v1.multimodal import merge_multimodal_embeddings
-
-_FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_merge_no_multimodal_returns_input() -> None:
@@ -23,17 +18,24 @@ def test_merge_no_multimodal_returns_input() -> None:
     assert output.tolist() == inputs.tolist()
 
 
-def test_merge_single_image_block_matches_fixture() -> None:
-    with (_FIXTURES / "embeddings_simple.json").open() as f:
-        fixture = json.load(f)
+def test_merge_single_image_block() -> None:
+    inputs = mx.array(
+        [[[1.0, 2.0], [0.0, 0.0], [0.0, 0.0], [7.0, 8.0]]],
+        dtype=mx.float32,
+    )
+    image_embeddings = mx.array(
+        [[3.0, 4.0], [5.0, 6.0]],
+        dtype=mx.float32,
+    )
+    is_multimodal = mx.array([False, True, True, False])
 
     output = merge_multimodal_embeddings(
-        mx.array(fixture["inputs_embeds"], dtype=mx.float32),
-        mx.array(fixture["multimodal_embeddings"], dtype=mx.float32),
-        mx.array(fixture["is_multimodal"]),
+        inputs,
+        image_embeddings,
+        is_multimodal,
     )
 
-    assert output.tolist() == fixture["expected"]
+    assert output.tolist() == [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
 
 
 def test_merge_count_mismatch_raises() -> None:

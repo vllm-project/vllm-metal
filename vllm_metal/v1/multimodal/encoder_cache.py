@@ -11,8 +11,8 @@ from vllm_metal.v1.multimodal.feature_spec import MultiModalFeatureSpec
 class EncoderCache:
     """Store multimodal features and MLX encoder outputs by request/hash.
 
-    Lifted from ``vllm/v1/worker/gpu/mm/encoder_cache.py:8-40`` with the
-    tensor type changed from ``torch.Tensor`` to ``mlx.core.array``.
+    Mirrors upstream vLLM's v1 GPU ``EncoderCache`` with the tensor type
+    changed from ``torch.Tensor`` to ``mlx.core.array``.
     """
 
     def __init__(self) -> None:

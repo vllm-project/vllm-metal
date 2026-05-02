@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 import numpy as np
 
 # === Flattening ===
 
 
-def _flatten_embeddings(multimodal_embeddings: mx.array | list[mx.array]) -> mx.array:
-    if isinstance(multimodal_embeddings, list):
+def _flatten_embeddings(
+    multimodal_embeddings: mx.array | Sequence[mx.array],
+) -> mx.array:
+    if isinstance(multimodal_embeddings, Sequence):
         return mx.concatenate(multimodal_embeddings, axis=0)
     return multimodal_embeddings
 
@@ -37,9 +41,10 @@ def merge_multimodal_embeddings(
 ) -> mx.array:
     """Splice multimodal embeddings into placeholder positions.
 
-    Port of ``vllm/model_executor/models/utils.py:458-498``
-    ``_merge_multimodal_embeddings``.  This helper builds and returns the
-    merged tensor; callers should not rely on ``inputs_embeds`` being mutated.
+    Mirrors ``vllm/model_executor/models/utils.py``
+    ``_merge_multimodal_embeddings`` for MLX arrays.  This helper builds and
+    returns the merged tensor; callers should not rely on ``inputs_embeds``
+    being mutated.
     """
     if len(multimodal_embeddings) == 0:
         return inputs_embeds
@@ -59,6 +64,7 @@ def merge_multimodal_embeddings(
     input_dtype = inputs_embeds.dtype
     hidden_size = inputs_embeds.shape[-1]
     flat = inputs_embeds.reshape(-1, hidden_size)
-    positions = mx.array(np.where(mask_flat)[0], dtype=mx.uint32)
+    mask_np = np.asarray(mask_flat)
+    positions = mx.array(np.where(mask_np)[0], dtype=mx.uint32)
     flat[positions] = mm_embeds_flat.astype(input_dtype)
     return flat.reshape(inputs_embeds.shape)
