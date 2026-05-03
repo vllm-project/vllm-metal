@@ -111,8 +111,7 @@ class Qwen3VLMultimodalAdapter:
 
     @classmethod
     def _grid_thw(cls, data: MultiModalKwargsItem, key: str) -> tuple[int, int, int]:
-        raw_values = cls._feature_value(data, key)
-        values = raw_values.tolist() if hasattr(raw_values, "tolist") else raw_values
+        values = cls._feature_value(data, key).tolist()
         if len(values) != 3:
             raise ValueError(f"{key} must contain exactly 3 values, got {values}.")
         t, h, w = values
