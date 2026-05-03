@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import builtins
 import importlib.util
+import json
 import os
 import sys
 from types import ModuleType
@@ -13,6 +14,167 @@ import numpy as np
 import pytest
 
 import vllm_metal.compat as compat
+
+
+def _write_bytelevel_tokenizer_json(path) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPreTokenizer
+
+    tokenizer = Tokenizer(
+        WordLevel(
+            {
+                "\u0120Hello": 0,
+                "\u010a": 1,
+                "<unk>": 2,
+            },
+            unk_token="<unk>",
+        )
+    )
+    tokenizer.pre_tokenizer = ByteLevelPreTokenizer(
+        add_prefix_space=False,
+        use_regex=False,
+    )
+    tokenizer.decoder = ByteLevel(add_prefix_space=False, use_regex=False)
+    tokenizer.save(str(path / "tokenizer.json"))
+
+
+def _write_mismatched_bytelevel_tokenizer_repo(path) -> None:
+    _write_bytelevel_tokenizer_json(path)
+    tokenizer_config = {
+        "tokenizer_class": "LlamaTokenizer",
+        "model_max_length": 128,
+        "chat_template": "{{ messages[0]['content'] }}",
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+        "pad_token": "</s>",
+    }
+    special_tokens_map = {
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+        "pad_token": "</s>",
+    }
+    (path / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config),
+        encoding="utf-8",
+    )
+    (path / "special_tokens_map.json").write_text(
+        json.dumps(special_tokens_map),
+        encoding="utf-8",
+    )
+
+
+class _ByteLevelBackend:
+    decoder = "ByteLevel(add_prefix_space=False, trim_offsets=False, use_regex=False)"
+
+
+class _FakeTokenizer:
+    def __init__(self, path, backend) -> None:
+        self.backend_tokenizer = backend
+        self.init_kwargs = {
+            "clean_up_tokenization_spaces": False,
+            "model_max_length": 128,
+        }
+        self.name_or_path = str(path)
+        self.bos_token = None
+        self.eos_token = "<unk>"
+        self.unk_token = "<unk>"
+        self.pad_token = None
+        self.sep_token = None
+        self.cls_token = None
+        self.mask_token = None
+        self.additional_special_tokens = []
+        self.chat_template = None
+        self.model_max_length = 128
+        self.clean_up_tokenization_spaces = False
+
+
+class TestByteLevelTokenizerCompatPatch:
+    def test_serving_tokenizer_boundary_uses_tokenizers_backend_for_bytelevel_mismatch(
+        self, tmp_path
+    ) -> None:
+        import vllm.tokenizers.registry as tokenizer_registry
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        _write_mismatched_bytelevel_tokenizer_repo(tmp_path)
+        compat._patch_vllm_bytelevel_tokenizer_loading()
+
+        tokenizer = tokenizer_registry.get_tokenizer(tmp_path, tokenizer_mode="hf")
+        decoded = tokenizer.decode([0, 1])
+
+        assert isinstance(tokenizer, TokenizersBackend)
+        assert "\u0120" not in decoded
+        assert "\u010a" not in decoded
+        assert "Hello" in decoded
+        assert "\n" in decoded
+        assert tokenizer.chat_template == "{{ messages[0]['content'] }}"
+        assert tokenizer.bos_token == "<s>"
+        assert tokenizer.eos_token == "</s>"
+        assert tokenizer.pad_token == "</s>"
+        assert tokenizer.model_max_length == 128
+        assert compat._loaded_tokenizer_decoder_uses_bytelevel(tokenizer)
+
+    def test_keeps_loaded_tokenizer_when_decoder_is_already_bytelevel(
+        self, tmp_path
+    ) -> None:
+        _write_bytelevel_tokenizer_json(tmp_path)
+        tokenizer = _FakeTokenizer(tmp_path, _ByteLevelBackend())
+
+        fixed = compat._maybe_load_bytelevel_tokenizers_backend(
+            tokenizer,
+            tmp_path,
+            (),
+            {},
+        )
+
+        assert fixed is tokenizer
+
+    def test_cached_lookup_forwards_tokenizer_location_kwargs(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        tokenizer_json = tmp_path / "tokenizer.json"
+        tokenizer_json.write_text("{}", encoding="utf-8")
+        captured_kwargs = {}
+
+        def _fake_cached_file(path_or_repo_id, filename, **kwargs):
+            captured_kwargs.update(kwargs)
+            assert path_or_repo_id == "org/repo"
+            assert filename == "tokenizer.json"
+            return str(tokenizer_json)
+
+        monkeypatch.setattr("transformers.utils.cached_file", _fake_cached_file)
+
+        path = compat._cached_tokenizer_json_path(
+            "org/repo",
+            {
+                "cache_dir": "/tmp/hf-cache",
+                "force_download": True,
+                "proxies": {"https": "proxy"},
+                "revision": "refs/pr/1",
+                "local_files_only": True,
+                "subfolder": "tokenizer",
+                "download_dir": "/tmp/download-cache",
+                "repo_type": "model",
+                "user_agent": {"vllm-metal": "test"},
+                "use_auth_token": "secret",
+                "_commit_hash": "abc123",
+            },
+        )
+
+        assert path == tokenizer_json
+        assert captured_kwargs["cache_dir"] == "/tmp/hf-cache"
+        assert captured_kwargs["force_download"] is True
+        assert captured_kwargs["proxies"] == {"https": "proxy"}
+        assert captured_kwargs["revision"] == "refs/pr/1"
+        assert captured_kwargs["local_files_only"] is True
+        assert captured_kwargs["subfolder"] == "tokenizer"
+        assert captured_kwargs["repo_type"] == "model"
+        assert captured_kwargs["user_agent"] == {"vllm-metal": "test"}
+        assert captured_kwargs["token"] == "secret"
+        assert captured_kwargs["_commit_hash"] == "abc123"
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

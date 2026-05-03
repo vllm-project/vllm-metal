@@ -8,8 +8,11 @@ diagnosable.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -24,8 +27,277 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+
+
+def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("type") == decoder_type:
+            return True
+        return any(
+            _decoder_tree_contains_type(child, decoder_type) for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_decoder_tree_contains_type(child, decoder_type) for child in value)
+    return False
+
+
+def _tokenizer_json_decoder_uses_bytelevel(tokenizer_json: Path) -> bool:
+    try:
+        with tokenizer_json.open("r", encoding="utf-8") as handle:
+            tokenizer_data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return _decoder_tree_contains_type(tokenizer_data.get("decoder"), "ByteLevel")
+
+
+def _loaded_tokenizer_decoder_uses_bytelevel(tokenizer: Any) -> bool:
+    backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+    decoder = getattr(backend_tokenizer, "decoder", None)
+    return "ByteLevel" in repr(decoder)
+
+
+def _candidate_tokenizer_json_paths(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+) -> list[Path]:
+    paths: list[Path] = []
+
+    init_kwargs = getattr(tokenizer, "init_kwargs", {}) or {}
+    tokenizer_file = init_kwargs.get("tokenizer_file")
+    if tokenizer_file:
+        paths.append(Path(tokenizer_file))
+
+    path = Path(path_or_repo_id)
+    if path.is_dir():
+        paths.append(path / "tokenizer.json")
+
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if name_or_path:
+        name_path = Path(name_or_path)
+        if name_path.is_dir():
+            paths.append(name_path / "tokenizer.json")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in paths:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            deduped.append(candidate)
+    return deduped
+
+
+def _cached_tokenizer_json_path(
+    path_or_repo_id: str | Path,
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Path | None:
+    try:
+        from transformers.utils import cached_file
+    except ImportError:
+        return None
+
+    cached_kwargs: dict[str, Any] = {
+        "_raise_exceptions_for_connection_errors": False,
+        "_raise_exceptions_for_gated_repo": False,
+        "_raise_exceptions_for_missing_entries": False,
+    }
+    for key in (
+        "cache_dir",
+        "force_download",
+        "proxies",
+        "token",
+        "revision",
+        "local_files_only",
+        "subfolder",
+        "repo_type",
+        "user_agent",
+        "_commit_hash",
+    ):
+        value = from_pretrained_kwargs.get(key)
+        if value is not None:
+            cached_kwargs[key] = value
+    if "cache_dir" not in cached_kwargs:
+        download_dir = from_pretrained_kwargs.get("download_dir")
+        if download_dir is not None:
+            cached_kwargs["cache_dir"] = download_dir
+    if "token" not in cached_kwargs:
+        token = from_pretrained_kwargs.get("use_auth_token")
+        if token is not None:
+            cached_kwargs["token"] = token
+
+    try:
+        cached = cached_file(path_or_repo_id, "tokenizer.json", **cached_kwargs)
+    except TypeError:
+        # Older transformers releases have a narrower cached_file signature.
+        fallback_kwargs = {
+            key: value
+            for key, value in cached_kwargs.items()
+            if not key.startswith("_") and key != "token"
+        }
+        try:
+            cached = cached_file(
+                path_or_repo_id,
+                "tokenizer.json",
+                **fallback_kwargs,
+            )
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if not cached:
+        return None
+    path = Path(cached)
+    return path if path.is_file() else None
+
+
+def _find_bytelevel_tokenizer_json(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Path | None:
+    for tokenizer_json in _candidate_tokenizer_json_paths(tokenizer, path_or_repo_id):
+        if _tokenizer_json_decoder_uses_bytelevel(tokenizer_json):
+            return tokenizer_json
+
+    tokenizer_json = _cached_tokenizer_json_path(
+        path_or_repo_id,
+        from_pretrained_kwargs,
+    )
+    if tokenizer_json is None:
+        return None
+    if not _tokenizer_json_decoder_uses_bytelevel(tokenizer_json):
+        return None
+    return tokenizer_json
+
+
+def _tokenizers_backend_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    backend_kwargs = dict(kwargs)
+    download_dir = backend_kwargs.pop("download_dir", None)
+    if download_dir is not None and "cache_dir" not in backend_kwargs:
+        backend_kwargs["cache_dir"] = download_dir
+    return backend_kwargs
+
+
+def _load_bytelevel_tokenizers_backend(
+    path_or_repo_id: str | Path,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> Any:
+    from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+    return TokenizersBackend.from_pretrained(
+        path_or_repo_id,
+        *args,
+        **_tokenizers_backend_kwargs(kwargs),
+    )
+
+
+def _maybe_load_bytelevel_tokenizers_backend(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+    args: tuple[Any, ...],
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Any:
+    if _loaded_tokenizer_decoder_uses_bytelevel(tokenizer):
+        return tokenizer
+
+    tokenizer_json = _find_bytelevel_tokenizer_json(
+        tokenizer,
+        path_or_repo_id,
+        from_pretrained_kwargs,
+    )
+    if tokenizer_json is None:
+        return tokenizer
+
+    tokenizer = _load_bytelevel_tokenizers_backend(
+        path_or_repo_id,
+        args,
+        from_pretrained_kwargs,
+    )
+    logger.info(
+        "Loaded TokenizersBackend from ByteLevel tokenizer.json after the "
+        "serving tokenizer path loaded a non-ByteLevel decoder: %s",
+        tokenizer_json,
+    )
+    return tokenizer
+
+
+def _patch_vllm_bytelevel_tokenizer_loading() -> None:
+    """Use TokenizersBackend at vLLM's serving tokenizer boundary when needed.
+
+    Some MLX-community Qwen/DeepSeek redistributions ship a ByteLevel
+    `tokenizer.json` but a `tokenizer_config.json` that can make newer
+    transformers versions instantiate a Llama/SentencePiece-style decoder.
+    That decoder leaves ByteLevel token pieces such as "\u0120" and "\u010a"
+    in served text.
+    """
+    try:
+        import vllm.tokenizers.registry as tokenizer_registry
+        from vllm.tokenizers.protocol import TokenizerLike
+    except ImportError as exc:
+        logger.warning(
+            "Could not install vLLM ByteLevel tokenizer compatibility patch "
+            "because vLLM tokenizer registry is unavailable: %s",
+            exc,
+        )
+        return
+
+    sentinel = "_vllm_metal_bytelevel_decoder_patch"
+    if getattr(tokenizer_registry, sentinel, False):
+        return
+
+    original_get_tokenizer = tokenizer_registry.get_tokenizer
+
+    def _patched_get_tokenizer(
+        tokenizer_name,
+        *args,
+        tokenizer_cls=TokenizerLike,
+        trust_remote_code=False,
+        revision=None,
+        download_dir=None,
+        **kwargs,
+    ):
+        tokenizer_mode, resolved_name, resolved_args, resolved_kwargs = (
+            tokenizer_registry.cached_resolve_tokenizer_args(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                download_dir=download_dir,
+                **kwargs,
+            )
+        )
+        tokenizer = original_get_tokenizer(
+            tokenizer_name,
+            *args,
+            tokenizer_cls=tokenizer_cls,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            download_dir=download_dir,
+            **kwargs,
+        )
+
+        if tokenizer_cls is not TokenizerLike or tokenizer_mode != "hf":
+            return tokenizer
+
+        # TODO(#337, transformers#45739): remove this local compatibility path
+        # once vllm-metal's supported Transformers version handles ByteLevel
+        # tokenizer.json + incorrect tokenizer_class mismatches upstream.
+        return _maybe_load_bytelevel_tokenizers_backend(
+            tokenizer,
+            resolved_name,
+            resolved_args,
+            resolved_kwargs,
+        )
+
+    tokenizer_registry.get_tokenizer = _patched_get_tokenizer
+    tokenizer_registry.cached_get_tokenizer = lru_cache(_patched_get_tokenizer)
+    setattr(tokenizer_registry, sentinel, True)
 
 
 def _ceildiv(value: int, divisor: int) -> int:
