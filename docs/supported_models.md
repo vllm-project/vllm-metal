@@ -41,3 +41,4 @@ Metal. Qwen3 is explicitly covered by the paged prefix-cache e2e test.
 | Phi-4-mini-instruct | ✅ | GQA packed qkv (paged) | ✅ | [#314](https://github.com/vllm-project/vllm-metal/pull/314) | Validated on MacBook Pro (Apple M4 Pro, 24 GB) |
 | Qwen2.5-7B-Instruct | ✅ | GQA (paged) | ✅ | [#324](https://github.com/vllm-project/vllm-metal/pull/324) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-7B-Instruct-4bit` |
 | Qwen2.5-3B-Instruct | ✅ | GQA (paged) | ✅ | [#323](https://github.com/vllm-project/vllm-metal/pull/323) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-3B-Instruct-4bit` |
+| SmolLM3 | ✅ | GQA (paged) | ✅ |  | Validated on MacBook Air (Apple M2, 16 GB) with `mlx-community/SmolLM3-3B-4bit` |
