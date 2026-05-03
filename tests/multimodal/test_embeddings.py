@@ -38,6 +38,26 @@ def test_merge_single_image_block() -> None:
     assert output.tolist() == [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
 
 
+def test_merge_multiple_embedding_blocks() -> None:
+    inputs = mx.array(
+        [[[0.0, 0.0], [9.0, 9.0], [0.0, 0.0], [0.0, 0.0]]],
+        dtype=mx.float32,
+    )
+    image_embeddings = [
+        mx.array([[1.0, 2.0]], dtype=mx.float32),
+        mx.array([[3.0, 4.0], [5.0, 6.0]], dtype=mx.float32),
+    ]
+    is_multimodal = mx.array([True, False, True, True])
+
+    output = merge_multimodal_embeddings(
+        inputs,
+        image_embeddings,
+        is_multimodal,
+    )
+
+    assert output.tolist() == [[[1.0, 2.0], [9.0, 9.0], [3.0, 4.0], [5.0, 6.0]]]
+
+
 def test_merge_count_mismatch_raises() -> None:
     inputs = mx.zeros((1, 4, 2), dtype=mx.float32)
     mm_embeds = mx.zeros((3, 2), dtype=mx.float32)

@@ -28,7 +28,9 @@ class EncoderCache:
         self.mm_features.pop(req_id, None)
 
     def reset_mm_cache(self) -> None:
-        """Clear profiling-only multimodal cache state when needed."""
+        """Mirror upstream's profiling-cache reset hook."""
+        # TODO: Implement when vllm-metal adds profiling-time MM cache state.
+        pass
 
     def reset_encoder_cache(self) -> None:
         """Clear cached encoder outputs."""
