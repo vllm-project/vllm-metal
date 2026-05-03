@@ -1354,13 +1354,28 @@ class EncoderVarlenAttentionPrimitive : public UnaryPrimitive {
     enc.set_output_array(out, 4);
     enc.set_bytes(params, 5);
 
-    // Grid: (total_tokens, num_q_heads, 1).  One threadgroup per
-    // (query_token, q_head) output vector.  Threadgroup width 32 == one
-    // SIMD-group on Apple Silicon, so simd_max / simd_sum reduce across the
-    // whole threadgroup in a single instruction with no inter-SIMD barriers.
+    // Grid: segment-pitched Q-tile grid.  Each threadgroup owns one
+    // Q-tile (Q_TILE consecutive queries from a single segment, same
+    // q_head).  Tiles past seg_hi are over-launched and early-exit in
+    // the kernel — the pitch is `tiles_per_segment = ceil(max_seqlen /
+    // Q_TILE)` so every active threadgroup stays on exactly one segment
+    // and the kernel can decode (seg, tile_in_seg) from tg_id.x by
+    // simple division.  Per-dtype Q_TILE:
+    //   bf16/f16 → 32 (MMA path; 4 simdgroups × 8 queries = 8x8 MMA tile)
+    //   f32      →  8 (manual-SIMD fallback; smaller because fp32 elements
+    //                 double tg-memory pressure → 32×32 doesn't fit at hd128).
+    // Threadgroup width:
+    //   bf16/f16 (M3 MMA path) → 256 = 8 simdgroups, each owning 8 query
+    //                             rows; doubled Q_TILE amortises K-tile
+    //                             cooperative loads over twice the queries.
+    //   f32 (manual fallback) → 128 = 4 simdgroups, smaller tile.
+    const int q_tile             = (dtype_tag_ == 2) ? 8 : 64;
+    const int threadgroup_width  = (dtype_tag_ == 2) ? 128 : 256;
+    const int tiles_per_segment  = (max_seqlen_ + q_tile - 1) / q_tile;
+    const int x_dim              = num_segments * tiles_per_segment;
     enc.dispatch_threadgroups(
-        MTL::Size::Make(total_tokens, num_q_heads, 1),
-        MTL::Size::Make(32, 1, 1));
+        MTL::Size::Make(x_dim, num_q_heads, 1),
+        MTL::Size::Make(threadgroup_width, 1, 1));
 
     // No add_temporary calls: inside a primitive, MLX's evaluator manages
     // array lifetimes via the completion handler, and add_temporary would
@@ -1376,9 +1391,14 @@ class EncoderVarlenAttentionPrimitive : public UnaryPrimitive {
         && rhs->num_kv_heads_  == num_kv_heads_
         && rhs->softmax_scale_ == softmax_scale_
         && rhs->dtype_tag_     == dtype_tag_
-        && rhs->head_dim_      == head_dim_;
-    // max_seqlen_ is intentionally excluded: it is a launch hint only,
-    // never used to bound cu_seqlens indexing in-kernel.
+        && rhs->head_dim_      == head_dim_
+        && rhs->max_seqlen_    == max_seqlen_;
+    // max_seqlen_ IS part of the equivalence: the tiled kernel uses it
+    // as the segment-pitched grid pitch (tiles_per_segment =
+    // ceil(max_seqlen / Q_TILE)).  Two primitives with different
+    // max_seqlen_ would over-launch by different amounts and decode
+    // (seg, tile_in_seg) from tg_id.x differently, so they are NOT
+    // interchangeable for caching purposes.
   }
 
  private:
