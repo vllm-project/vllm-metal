@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
@@ -62,8 +63,7 @@ from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
-    SamplingResult,
-    merge_logprobs_rows,
+    _SamplingResult,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -175,6 +175,54 @@ class _ExecutionBatch:
         """Set tokens and logprobs for an existing output slot."""
         self.sampled_tokens[output_idx] = token_ids
         self.sample_logprobs[output_idx] = logprobs
+
+    def merged_logprobs(self) -> LogprobsLists | None:
+        """Merge per-output-slot logprobs for ``ModelRunnerOutput``."""
+        present_rows = [row for row in self.sample_logprobs if row is not None]
+        if not present_rows:
+            return None
+
+        max_width = max(row.logprob_token_ids.shape[1] for row in present_rows)
+        token_rows: list[np.ndarray] = []
+        logprob_rows: list[np.ndarray] = []
+        rank_rows: list[np.ndarray] = []
+
+        for row in self.sample_logprobs:
+            if row is None:
+                token_rows.append(np.zeros((1, max_width), dtype=np.int32))
+                logprob_rows.append(
+                    np.full((1, max_width), float("-inf"), dtype=np.float32)
+                )
+                rank_rows.append(np.zeros((1,), dtype=np.int32))
+                continue
+
+            token_ids = row.logprob_token_ids
+            logprobs = row.logprobs
+            if token_ids.shape[1] < max_width:
+                pad_width = max_width - token_ids.shape[1]
+                token_ids = np.pad(
+                    token_ids,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=0,
+                )
+                logprobs = np.pad(
+                    logprobs,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=float("-inf"),
+                )
+
+            token_rows.append(token_ids.astype(np.int32, copy=False))
+            logprob_rows.append(logprobs.astype(np.float32, copy=False))
+            rank_rows.append(row.sampled_token_ranks.astype(np.int32, copy=False))
+
+        return LogprobsLists(
+            logprob_token_ids=np.concatenate(token_rows, axis=0),
+            logprobs=np.concatenate(logprob_rows, axis=0),
+            sampled_token_ranks=np.concatenate(rank_rows, axis=0),
+            cu_num_generated_tokens=None,
+        )
 
     def has_paged_work(self) -> bool:
         """Return whether this step has any paged execution work."""
@@ -633,7 +681,7 @@ class MetalModelRunner:
 
     def _batched_decode(
         self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> SamplingResult:
+    ) -> _SamplingResult:
         """Process multiple decode requests in a single batched forward pass.
 
         Uses BatchKVCache to merge individual caches, run ONE forward pass,
@@ -702,7 +750,7 @@ class MetalModelRunner:
 
     def _sequential_decode(
         self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> SamplingResult:
+    ) -> _SamplingResult:
         """Fallback: process decode requests sequentially.
 
         Used when batch size is 1 (no benefit from batching).
@@ -745,9 +793,9 @@ class MetalModelRunner:
             state.token_ids.append(next_token)
             state.generated_tokens += 1
 
-        return SamplingResult(
+        return _SamplingResult(
             next_tokens,
-            merge_logprobs_rows(logprobs_rows),
+            SamplingBatch.merge_logprobs_rows(logprobs_rows),
         )
 
     # ------------------------------------------------------------------
@@ -1175,7 +1223,7 @@ class MetalModelRunner:
             req_ids=batch.req_ids,
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
-            logprobs=merge_logprobs_rows(batch.sample_logprobs),
+            logprobs=batch.merged_logprobs(),
             prompt_logprobs_dict={},
             pooler_output=[None] * len(batch.req_ids),
         )

@@ -22,22 +22,8 @@ from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 GREEDY_TEMPERATURE_EPS = 1e-5
 
 
-def _num_sample_logprobs(sampling_params: SamplingParams) -> int | None:
-    """Return requested sample logprobs across supported vLLM versions."""
-    num_logprobs = getattr(sampling_params, "num_logprobs", None)
-    if num_logprobs is not None:
-        return num_logprobs
-
-    logprobs = getattr(sampling_params, "logprobs", None)
-    if logprobs is not None:
-        return logprobs
-
-    logprob_token_ids = getattr(sampling_params, "logprob_token_ids", None)
-    return len(logprob_token_ids) if logprob_token_ids else None
-
-
 @dataclass(frozen=True)
-class SamplingResult:
+class _SamplingResult:
     """Sampled token ids plus optional vLLM logprobs rows."""
 
     token_ids: list[int]
@@ -115,30 +101,66 @@ class SamplingBatch:
     def max_num_logprobs(self) -> int | None:
         """Return the batch-wide sample-logprobs request, if any."""
         requested = [
-            num_logprobs
+            sampling_params.logprobs
             for sampling_params in self.sampling_params_list
-            if (num_logprobs := _num_sample_logprobs(sampling_params)) is not None
+            if sampling_params.logprobs is not None
         ]
-        if not requested:
-            return None
-        if any(num_logprobs == -1 for num_logprobs in requested):
-            # vLLM's generic Sampler returns full-vocab logprobs for -1
-            # without token ids/ranks. Ask for top-vocab instead so the engine
-            # receives the same token-id/rank shape as ordinary sample logprobs.
-            return self.vocab_size
-        return max(requested)
+        return max(requested) if requested else None
 
     @property
     def needs_logprobs(self) -> bool:
         return self.max_num_logprobs is not None
 
-    def _make_logprob_token_ids(self) -> dict[int, list[int]] | None:
-        logprob_token_ids: dict[int, list[int]] = {}
-        for i, sampling_params in enumerate(self.sampling_params_list):
-            token_ids = getattr(sampling_params, "logprob_token_ids", None)
-            if token_ids:
-                logprob_token_ids[i] = list(token_ids)
-        return logprob_token_ids or None
+    @staticmethod
+    def merge_logprobs_rows(
+        rows: Sequence[LogprobsLists | None],
+    ) -> LogprobsLists | None:
+        """Merge per-request sample logprobs from sampling calls."""
+        present_rows = [row for row in rows if row is not None]
+        if not present_rows:
+            return None
+
+        max_width = max(row.logprob_token_ids.shape[1] for row in present_rows)
+        token_rows: list[np.ndarray] = []
+        logprob_rows: list[np.ndarray] = []
+        rank_rows: list[np.ndarray] = []
+
+        for row in rows:
+            if row is None:
+                token_rows.append(np.zeros((1, max_width), dtype=np.int32))
+                logprob_rows.append(
+                    np.full((1, max_width), float("-inf"), dtype=np.float32)
+                )
+                rank_rows.append(np.zeros((1,), dtype=np.int32))
+                continue
+
+            token_ids = row.logprob_token_ids
+            logprobs = row.logprobs
+            if token_ids.shape[1] < max_width:
+                pad_width = max_width - token_ids.shape[1]
+                token_ids = np.pad(
+                    token_ids,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=0,
+                )
+                logprobs = np.pad(
+                    logprobs,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=float("-inf"),
+                )
+
+            token_rows.append(token_ids.astype(np.int32, copy=False))
+            logprob_rows.append(logprobs.astype(np.float32, copy=False))
+            rank_rows.append(row.sampled_token_ranks.astype(np.int32, copy=False))
+
+        return LogprobsLists(
+            logprob_token_ids=np.concatenate(token_rows, axis=0),
+            logprobs=np.concatenate(logprob_rows, axis=0),
+            sampled_token_ranks=np.concatenate(rank_rows, axis=0),
+            cu_num_generated_tokens=None,
+        )
 
     @staticmethod
     def can_use_native_greedy(
@@ -152,7 +174,7 @@ class SamplingBatch:
             and sampling_params.frequency_penalty == 0.0
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
-            and _num_sample_logprobs(sampling_params) is None
+            and sampling_params.logprobs is None
             for sampling_params in sampling_params_list
         )
 
@@ -255,7 +277,7 @@ class SamplingBatch:
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
             logitsprocs=self.logitsprocs,
-            logprob_token_ids=self._make_logprob_token_ids(),
+            logprob_token_ids=None,
         )
 
 
@@ -274,7 +296,7 @@ def sample_from_logits(
     batch: SamplingBatch,
     sampler: Sampler,
     device: torch.device,
-) -> SamplingResult:
+) -> _SamplingResult:
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
     Single entry point for all sampling paths.  Chooses native MLX greedy
@@ -292,8 +314,8 @@ def sample_from_logits(
         tokens = _mlx_greedy_sample(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
-            return SamplingResult([int(tokens.item())])
-        return SamplingResult(tokens.tolist())  # type: ignore[arg-type]
+            return _SamplingResult([int(tokens.item())])
+        return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
@@ -304,63 +326,7 @@ def sample_from_logits(
         if output.logprobs_tensors is not None
         else None
     )
-    return SamplingResult(output.sampled_token_ids[:, 0].tolist(), logprobs)
-
-
-def merge_logprobs_rows(
-    rows: Sequence[LogprobsLists | None],
-) -> LogprobsLists | None:
-    """Merge per-output-slot logprob rows into one ``LogprobsLists``.
-
-    ``ModelRunnerOutput.logprobs`` is indexed by request output index. When one
-    request in the step asks for logprobs, all earlier output slots still need a
-    row so later requests slice the correct position.
-    """
-    present_rows = [row for row in rows if row is not None]
-    if not present_rows:
-        return None
-
-    max_width = max(row.logprob_token_ids.shape[1] for row in present_rows)
-    token_rows: list[np.ndarray] = []
-    logprob_rows: list[np.ndarray] = []
-    rank_rows: list[np.ndarray] = []
-
-    for row in rows:
-        if row is None:
-            token_rows.append(np.zeros((1, max_width), dtype=np.int32))
-            logprob_rows.append(
-                np.full((1, max_width), float("-inf"), dtype=np.float32)
-            )
-            rank_rows.append(np.zeros((1,), dtype=np.int32))
-            continue
-
-        token_ids = row.logprob_token_ids
-        logprobs = row.logprobs
-        if token_ids.shape[1] < max_width:
-            pad_width = max_width - token_ids.shape[1]
-            token_ids = np.pad(
-                token_ids,
-                ((0, 0), (0, pad_width)),
-                mode="constant",
-                constant_values=0,
-            )
-            logprobs = np.pad(
-                logprobs,
-                ((0, 0), (0, pad_width)),
-                mode="constant",
-                constant_values=float("-inf"),
-            )
-
-        token_rows.append(token_ids.astype(np.int32, copy=False))
-        logprob_rows.append(logprobs.astype(np.float32, copy=False))
-        rank_rows.append(row.sampled_token_ranks.astype(np.int32, copy=False))
-
-    return LogprobsLists(
-        logprob_token_ids=np.concatenate(token_rows, axis=0),
-        logprobs=np.concatenate(logprob_rows, axis=0),
-        sampled_token_ranks=np.concatenate(rank_rows, axis=0),
-        cu_num_generated_tokens=None,
-    )
+    return _SamplingResult(output.sampled_token_ids[:, 0].tolist(), logprobs)
 
 
 def sample_decode_tokens(
@@ -372,7 +338,7 @@ def sample_decode_tokens(
     *,
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
-) -> SamplingResult:
+) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
     Args:
@@ -388,7 +354,7 @@ def sample_decode_tokens(
         Sampled token IDs and optional logprobs, one row per decode request.
     """
     if not decode_reqs:
-        return SamplingResult([])
+        return _SamplingResult([])
 
     decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
 
@@ -427,7 +393,7 @@ def sample_prefill_tokens(
     *,
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
-) -> SamplingResult:
+) -> _SamplingResult:
     """Sample one token per prefill request from the last logit position.
 
     Args:
@@ -477,7 +443,7 @@ def sample_prefill_tokens(
         prefill_next_tokens.append(next_token)
         logprobs_rows.append(result.logprobs)
 
-    return SamplingResult(
+    return _SamplingResult(
         prefill_next_tokens,
-        merge_logprobs_rows(logprobs_rows),
+        SamplingBatch.merge_logprobs_rows(logprobs_rows),
     )

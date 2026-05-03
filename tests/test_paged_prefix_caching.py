@@ -21,7 +21,7 @@ from vllm.sampling_params import SamplingParams
 import vllm_metal.paged_attention_common as pac
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.sampling_batch import SamplingResult
+from vllm_metal.v1.sampling_batch import _SamplingResult
 
 
 def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
@@ -230,7 +230,7 @@ class TestSamplingMetadataWithPenalties:
 
         def spy_sample(logits_2d, batch, sampler, device):
             captured_batches.append(batch)
-            return SamplingResult([99])
+            return _SamplingResult([99])
 
         with (
             patch.object(

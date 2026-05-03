@@ -5,8 +5,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -388,6 +391,52 @@ class TestV1SamplingBatch:
         assert output.logprobs is not None
         assert output.logprobs.logprob_token_ids.shape == (2, 3)
         assert output.logprobs.slice_request(1, 1).logprob_token_ids[0, 0] == 7
+
+    def test_logprobs_flow_through_request_output_processing(self) -> None:
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            logprobs=2,
+            max_tokens=1,
+            detokenize=False,
+        )
+        request = EngineCoreRequest(
+            request_id="req-1",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            external_req_id="req-1",
+        )
+        output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+        output_processor.add_request(request, prompt=None)
+
+        result = output_processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="req-1",
+                    new_token_ids=[7],
+                    new_logprobs=LogprobsLists(
+                        logprob_token_ids=np.array([[7, 5, 3]], dtype=np.int32),
+                        logprobs=np.array([[-0.1, -1.0, -2.0]], dtype=np.float32),
+                        sampled_token_ranks=np.array([1], dtype=np.int32),
+                    ),
+                    finish_reason=FinishReason.LENGTH,
+                )
+            ]
+        )
+
+        assert not result.reqs_to_abort
+        [request_output] = result.request_outputs
+        assert isinstance(request_output, RequestOutput)
+        [completion_output] = request_output.outputs
+        assert completion_output.token_ids == [7]
+        assert completion_output.logprobs is not None
+        assert completion_output.logprobs[0] is not None
+        assert completion_output.logprobs[0][7].logprob == pytest.approx(-0.1)
 
 
 class TestV1SamplingMetadataLogitsProcessors:
