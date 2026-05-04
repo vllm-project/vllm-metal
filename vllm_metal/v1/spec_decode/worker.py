@@ -102,9 +102,9 @@ class MetalSpecDecodeWorker(WorkerBase):
         }
 
         # Stash draft tokens for the engine core to consume via take_draft_token_ids
-        req_ids = [
-            req.req_id for req in scheduler_output.scheduled_new_reqs
-        ] + list(scheduler_output.scheduled_cached_reqs.req_ids)
+        req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs] + list(
+            scheduler_output.scheduled_cached_reqs.req_ids
+        )
         # TODO: handle 1st request for now, matching the current single-request focus
         if req_ids:
             self._last_draft_token_ids = DraftTokenIds(
