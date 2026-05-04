@@ -105,6 +105,8 @@ class SamplingBatch:
             for sampling_params in self.sampling_params_list
             if sampling_params.logprobs is not None
         ]
+        if any(num_logprobs == -1 for num_logprobs in requested):
+            raise NotImplementedError("Metal runner does not support logprobs=-1 yet")
         return max(requested) if requested else None
 
     @property

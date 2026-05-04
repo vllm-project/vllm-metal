@@ -355,6 +355,39 @@ class TestV1SamplingBatch:
 
         assert metadata.max_num_logprobs == 5
 
+    def test_sampling_metadata_rejects_full_vocab_logprobs(self) -> None:
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, logprobs=-1)],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Metal runner does not support logprobs=-1 yet",
+        ):
+            batch.make_sampling_metadata()
+
+    def test_sampling_metadata_rejects_mixed_full_vocab_logprobs(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprobs=-1),
+                SamplingParams(temperature=0.0, logprobs=2),
+            ],
+            [[1, 2, 3], [4, 5]],
+            [[], []],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Metal runner does not support logprobs=-1 yet",
+        ):
+            batch.make_sampling_metadata()
+
     def test_sample_from_logits_returns_logprobs_for_greedy_request(self) -> None:
         logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
         batch = SamplingBatch(
