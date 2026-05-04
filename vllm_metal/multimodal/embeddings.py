@@ -8,8 +8,6 @@ from collections.abc import Sequence
 import mlx.core as mx
 import numpy as np
 
-# === Public Helpers ===
-
 
 def merge_multimodal_embeddings(
     inputs_embeds: mx.array,
@@ -50,9 +48,6 @@ def merge_multimodal_embeddings(
     positions = mx.array(np.where(mask_np)[0], dtype=mx.uint32)
     flat[positions] = mm_embeds_flat.astype(input_dtype)
     return flat.reshape(inputs_embeds.shape)
-
-
-# === Internal Helpers ===
 
 
 def _flatten_embeddings(

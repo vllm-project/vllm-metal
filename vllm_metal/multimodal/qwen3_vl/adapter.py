@@ -119,7 +119,4 @@ class Qwen3VLMultimodalAdapter:
 
     @staticmethod
     def _feature_value(data: MultiModalKwargsItem, key: str) -> Any:
-        try:
-            return data[key].data
-        except KeyError as exc:
-            raise ValueError(f"Multimodal feature data is missing {key}.") from exc
+        return data[key].data
