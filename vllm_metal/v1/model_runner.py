@@ -34,6 +34,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_metal.config import get_config
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
@@ -61,6 +62,7 @@ from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
+    PrefillRequest,
     SamplingBatch,
     sample_decode_tokens,
     sample_from_logits,
@@ -114,19 +116,6 @@ class RequestState:
     )  # Scheduler-assigned paged KV blocks
 
 
-class PrefillRequest(NamedTuple):
-    """Packed prefill request passed to ``_start_paged_forward``."""
-
-    req_id: str
-    token_ids: list[int]  # suffix slice forwarded through the model
-    sampling_params: SamplingParams
-    block_ids: list[int]
-    generator: torch.Generator | None
-    prompt_len: int | None  # full prompt length (None for intermediate chunks)
-    start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
-    full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
-
-
 @dataclass
 class _PendingPrefillEntry:
     """Paged prefill work plus the metadata needed for post-processing."""
@@ -148,6 +137,7 @@ class _ExecutionBatch:
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
+    verification_logits: dict[str, mx.array] = field(default_factory=dict)
 
     def add_output(self, req_id: str, token_ids: list[int]) -> int:
         """Append one output slot and return its index."""
@@ -172,6 +162,7 @@ class _PagedForwardState(NamedTuple):
     logits: mx.array
     cu_seqlens: list[int]
     num_decode: int
+    spec_metadata: SpecDecodeMetadata | None
 
 
 class MetalModelRunner:
@@ -436,6 +427,36 @@ class MetalModelRunner:
             Dictionary mapping attention layer names to KV cache specs
         """
         return self._cache_policy.get_kv_cache_spec()
+
+    def truncate_cache(
+        self, request_id: str, num_to_remove: int, bonus_token: int | None = None
+    ) -> None:
+        """Rewind sequence length after a rejection."""
+        state = self._request_states.get(request_id)
+
+        if state is None or num_to_remove <= 0:
+            if state is not None and bonus_token is not None:
+                # Still handle bonus token even if no truncation needed
+                # (though in spec-decode we always have at least the scorer's token to remove)
+                state.token_ids[-1] = bonus_token
+            return
+
+        # truncate the token list
+        state.token_ids = state.token_ids[:-num_to_remove]
+
+        if bonus_token is not None:
+            state.token_ids.append(bonus_token)
+
+        # prevent negative generated_tokens if rewind into
+        # the "widened" speculative prompt
+        if len(state.token_ids) < state.prompt_len:
+            # we rejected draft tokens that runner originally thought were part
+            # of the prompt; adjuct the prompt len downward
+            state.prompt_len = len(state.token_ids) - 1
+
+        # update the tracking length
+        state.generated_tokens = len(state.token_ids) - state.prompt_len
+        self._paged_request_seq_lens[request_id] = len(state.token_ids)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Accept KV cache config from engine (no-op for MLX path).
@@ -735,6 +756,7 @@ class MetalModelRunner:
         prefill_reqs: list[PrefillRequest],
         decode_reqs: list[tuple[str, RequestState]],
         scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> None:
         """Build graph and submit forward pass to GPU (async).
 
@@ -814,6 +836,7 @@ class MetalModelRunner:
             logits=logits,
             cu_seqlens=cu_seqlens,
             num_decode=num_decode,
+            spec_metadata=spec_metadata,
         )
 
     def _sample_paged_batch(
@@ -835,6 +858,7 @@ class MetalModelRunner:
         logits = state.logits
         cu_seqlens = state.cu_seqlens
         num_decode = state.num_decode
+        spec_metadata = state.spec_metadata
 
         # ---- wait for MLX forward to complete ----
         mx.eval(logits)
@@ -854,6 +878,11 @@ class MetalModelRunner:
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
+        logger.debug(
+            "_sample_paged_batch: num_decode=%d, num_prefill=%d",
+            num_decode,
+            len(prefill_reqs),
+        )
         decode_next_tokens = sample_decode_tokens(
             logits,
             decode_reqs,
@@ -863,7 +892,7 @@ class MetalModelRunner:
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
         )
-        prefill_next_tokens = sample_prefill_tokens(
+        prefill_next_tokens, verification_logits = sample_prefill_tokens(
             logits,
             prefill_reqs,
             cu_seqlens,
@@ -872,7 +901,11 @@ class MetalModelRunner:
             self.device,
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
+            spec_metadata=spec_metadata,
         )
+
+        # store the verification logits
+        batch.verification_logits = verification_logits
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
@@ -899,18 +932,24 @@ class MetalModelRunner:
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
+
                 full_prompt = (
                     prefill.full_prompt_token_ids
                     if prefill.full_prompt_token_ids is not None
                     else prefill.token_ids
                 )
+
+                full_prompt_with_next_token = full_prompt + [next_token]
+
+                actual_gen_count = len(full_prompt_with_next_token) - prompt_len
+
                 self._request_states[prefill.req_id] = RequestState(
-                    token_ids=full_prompt + [next_token],
+                    token_ids=full_prompt_with_next_token,
                     prompt_len=prompt_len,
                     cache=[],
                     sampling_params=prefill.sampling_params,
                     generator=prefill.generator,
-                    generated_tokens=1,
+                    generated_tokens=actual_gen_count,
                     block_ids=prefill.block_ids,
                 )
                 continue
@@ -1136,7 +1175,8 @@ class MetalModelRunner:
     @staticmethod
     def _build_output(batch: _ExecutionBatch) -> ModelRunnerOutput:
         """Build ``ModelRunnerOutput`` from a completed batch."""
-        return ModelRunnerOutput(
+
+        output = ModelRunnerOutput(
             req_ids=batch.req_ids,
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
@@ -1144,6 +1184,11 @@ class MetalModelRunner:
             prompt_logprobs_dict={},
             pooler_output=[None] * len(batch.req_ids),
         )
+
+        if hasattr(batch, "verification_logits") and batch.verification_logits:
+            output.verification_logits = batch.verification_logits  # type: ignore[attr-defined]
+
+        return output
 
     def _run_non_paged_decode_batch(
         self,
@@ -1238,7 +1283,9 @@ class MetalModelRunner:
         self._gdn_materialize_pending_state_cache()
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> ModelRunnerOutput | None:
         """Execute model forward pass and submit to GPU.
 
@@ -1275,6 +1322,9 @@ class MetalModelRunner:
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
+        logger.debug(
+            f"MetalModelRunner.execute_model: has_paged_backend={self._paged_attention_backend is not None}, has_paged_work={batch.has_paged_work()}",
+        )
         if self._paged_attention_backend is not None and batch.has_paged_work():
             # Free GDN slots for finished requests BEFORE allocating new
             # ones, so slots can be reused within the same scheduling step.
@@ -1287,6 +1337,7 @@ class MetalModelRunner:
                 prefill_pack,
                 batch.paged_decode_reqs,
                 scheduler_output,
+                spec_metadata,
             )
             return None
 

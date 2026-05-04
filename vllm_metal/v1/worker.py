@@ -20,7 +20,18 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+
+try:
+    from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+except ImportError:
+    # Fallback for vLLM < 0.20.0
+    from typing import NamedTuple
+
+    class CompilationTimes(NamedTuple):  # type: ignore[no-redef]
+        language_model: float
+        encoder: float
+
+    from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
@@ -28,6 +39,8 @@ from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
 
@@ -176,6 +189,34 @@ class MetalWorker(WorkerBase):
         """
         WorkerCachePlanner(self).setup_paged_attention(overhead=overhead)
 
+    def _get_input_ids(self, scheduler_output: SchedulerOutput) -> mx.array:
+        """
+        Helper method to extract the current token context from the scheduler output.
+        This provides the Proposer with the necessary history to generate draft tokens.
+        """
+
+        # check the new requests
+        if scheduler_output.scheduled_new_reqs:
+            # TODO: map all request ids to their repective token arrays instead of index 0
+            first_req = scheduler_output.scheduled_new_reqs[0]
+            return mx.array([first_req.prompt_token_ids])
+
+        # check cached/continuing requests
+        elif scheduler_output.scheduled_cached_reqs.req_ids:
+            # TODO: handle multiple cached requests by building a batch MLX array
+            first_req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
+
+            # access target runner state
+            state = self.model_runner._request_states.get(first_req_id)
+            if state is not None:
+                return mx.array([state.token_ids])
+
+        # TODO: add logic to handle cases where a batch contains both new and cached
+        # requests mixed together
+        raise ValueError(
+            "No valid requests found in SchedulerOutput to extract input IDs."
+        )
+
     @staticmethod
     def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
         """Create the right paged attention backend for the model type."""
@@ -250,17 +291,20 @@ class MetalWorker(WorkerBase):
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_metadata: SpecDecodeMetadata | None = None,
     ) -> ModelRunnerOutput | None:
         """Execute model inference.
 
         Args:
             scheduler_output: Scheduler output with batch information
+            spec_metadata: Optional speculative decoding metadata
 
         Returns:
             Model runner output with generated tokens
         """
-        return self.model_runner.execute_model(scheduler_output)
+        return self.model_runner.execute_model(scheduler_output, spec_metadata)
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
