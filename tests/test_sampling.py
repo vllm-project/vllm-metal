@@ -5,8 +5,12 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor
+from vllm.v1.outputs import LogprobsLists
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -17,8 +21,9 @@ from vllm_metal.v1.model_runner import (
     MetalModelRunner,
     RequestState,
     _create_request_generator,
+    _ExecutionBatch,
 )
-from vllm_metal.v1.sampling_batch import SamplingBatch
+from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -322,6 +327,9 @@ class TestV1SamplingBatch:
         assert not SamplingBatch.can_use_native_greedy(
             [SamplingParams(temperature=0.0, repetition_penalty=1.1)]
         )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, logprobs=1)]
+        )
 
     def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
         assert SamplingBatch.can_use_native_greedy(
@@ -333,6 +341,102 @@ class TestV1SamplingBatch:
         assert not SamplingBatch.can_use_native_greedy(
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.8, top_k=4)]
         )
+
+    def test_sampling_metadata_uses_requested_logprobs(self) -> None:
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, logprobs=5)],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.max_num_logprobs == 5
+
+    def test_sample_from_logits_returns_logprobs_for_greedy_request(self) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, logprobs=2)],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+        )
+
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+
+        assert result.token_ids == [2]
+        assert result.logprobs is not None
+        assert result.logprobs.logprob_token_ids.shape == (1, 3)
+        assert result.logprobs.logprob_token_ids[0, 0] == 2
+        assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
+        batch = _ExecutionBatch()
+        batch.add_output("intermediate", [])
+        batch.add_output(
+            "decode",
+            [7],
+            LogprobsLists(
+                logprob_token_ids=np.array([[7, 7, 3]], dtype=np.int32),
+                logprobs=np.array([[-0.1, -0.1, -2.0]], dtype=np.float32),
+                sampled_token_ranks=np.array([1], dtype=np.int32),
+            ),
+        )
+
+        output = MetalModelRunner._build_output(batch)
+
+        assert output.logprobs is not None
+        assert output.logprobs.logprob_token_ids.shape == (2, 3)
+        assert output.logprobs.slice_request(1, 1).logprob_token_ids[0, 0] == 7
+
+    def test_logprobs_flow_through_request_output_processing(self) -> None:
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            logprobs=2,
+            max_tokens=1,
+            detokenize=False,
+        )
+        request = EngineCoreRequest(
+            request_id="req-1",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            external_req_id="req-1",
+        )
+        output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+        output_processor.add_request(request, prompt=None)
+
+        result = output_processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="req-1",
+                    new_token_ids=[7],
+                    new_logprobs=LogprobsLists(
+                        logprob_token_ids=np.array([[7, 5, 3]], dtype=np.int32),
+                        logprobs=np.array([[-0.1, -1.0, -2.0]], dtype=np.float32),
+                        sampled_token_ranks=np.array([1], dtype=np.int32),
+                    ),
+                    finish_reason=FinishReason.LENGTH,
+                )
+            ]
+        )
+
+        assert not result.reqs_to_abort
+        [request_output] = result.request_outputs
+        assert isinstance(request_output, RequestOutput)
+        [completion_output] = request_output.outputs
+        assert completion_output.token_ids == [7]
+        assert completion_output.logprobs is not None
+        assert completion_output.logprobs[0] is not None
+        assert completion_output.logprobs[0][7].logprob == pytest.approx(-0.1)
 
 
 class TestV1SamplingMetadataLogitsProcessors:
@@ -407,7 +511,7 @@ class TestV1PenaltyTokenAccounting:
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)])
+        next_tokens = runner._sequential_decode([("r1", state)]).token_ids
 
         assert next_tokens == [prompt_token]
 
@@ -437,7 +541,7 @@ class TestV1PenaltyTokenAccounting:
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)])
+        next_tokens = runner._sequential_decode([("r1", state)]).token_ids
 
         assert next_tokens == [prompt_token]
 

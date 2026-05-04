@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+from vllm.sampling_params import SamplingParams
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
@@ -51,14 +52,7 @@ class TestPrefixCacheHybridGuard:
         runner.model.return_value = MagicMock(logits=fake_logits)
 
         token_ids = [1, 2, 3, 4, 5]
-        sampling_params = MagicMock(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
-            frequency_penalty=0,
-            presence_penalty=0,
-            repetition_penalty=1.0,
-        )
+        sampling_params = SamplingParams(temperature=0.0)
 
         runner._prefill_single("req-1", token_ids, sampling_params)
 
@@ -86,14 +80,7 @@ class TestPrefixCacheHybridGuard:
         runner.model.return_value = MagicMock(logits=fake_logits)
 
         token_ids = [1, 2, 3, 4, 5]
-        sampling_params = MagicMock(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
-            frequency_penalty=0,
-            presence_penalty=0,
-            repetition_penalty=1.0,
-        )
+        sampling_params = SamplingParams(temperature=0.0)
 
         runner._prefill_single("req-1", token_ids, sampling_params)
 
