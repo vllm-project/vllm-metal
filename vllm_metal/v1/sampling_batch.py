@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import mlx.core as mx
 import torch
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -15,10 +16,26 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from typing import NamedTuple
+
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.model_runner import PrefillRequest
+
+logger = init_logger(__name__)
 
 GREEDY_TEMPERATURE_EPS = 1e-5
+
+
+class PrefillRequest(NamedTuple):
+    """Packed prefill request passed to ``_start_paged_forward``."""
+
+    req_id: str
+    token_ids: list[int]  # suffix slice forwarded through the model
+    sampling_params: SamplingParams
+    block_ids: list[int]
+    generator: torch.Generator | None
+    prompt_len: int | None  # full prompt length (None for intermediate chunks)
+    start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
+    full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
 
 
 class SamplingBatch:
@@ -329,6 +346,9 @@ def sample_prefill_tokens(
     # initialize outside the loop to collect all speculative hits
     verification_logits: dict[str, mx.array] = {}
 
+    logger.debug(
+        "sample_prefill_tokens started. num_prefill=%d, has_spec_metadata=%s",
+        len(prefill_reqs), spec_metadata is not None)
     for j, prefill_req in enumerate(prefill_reqs):
         start_idx = cu_seqlens[num_decode + j]
         end_idx = cu_seqlens[num_decode + j + 1]
@@ -337,6 +357,9 @@ def sample_prefill_tokens(
         # check if this specific request is part of the speculative window.
         # Safer check: spec_metadata is present and chunk length > 1
         is_spec = spec_metadata is not None and len(prefill_req.token_ids) > 1
+        logger.debug(
+            "sample_prefill_tokens loop: j=%d, req_id=%s, len(token_ids)=%d, is_spec=%s",
+            j, prefill_req.req_id, len(prefill_req.token_ids), is_spec)
 
         if is_spec:
             #####

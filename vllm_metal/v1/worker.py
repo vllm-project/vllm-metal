@@ -20,7 +20,17 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+try:
+    from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+except ImportError:
+    # Fallback for vLLM < 0.20.0
+    from typing import NamedTuple
+
+    class CompilationTimes(NamedTuple):
+        language_model: float
+        encoder: float
+
+    from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
