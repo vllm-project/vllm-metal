@@ -193,6 +193,7 @@ def test_proposer_functional(model_name):
         assert speedup > 0.5  # Safety margin for small models/jit
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("model_name", ["mlx-community/Qwen2.5-0.5B-4bit"])
 def test_spec_decode_worker_integration(model_name, monkeypatch):
     """

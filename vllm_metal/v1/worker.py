@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import gc
+import os
+import platform
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -19,7 +21,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 try:
     from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -55,6 +57,11 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize distributed environment for Metal worker."""
     parallel_config = vllm_config.parallel_config
+
+    # On macOS, Gloo often hangs if it tries to bind to the primary WiFi/Ethernet
+    # interface due to firewall or routing rules. Force it to use loopback if not set.
+    if platform.system() == "Darwin" and "GLOO_SOCKET_IFNAME" not in os.environ:
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
 
     init_distributed_environment(
         parallel_config.world_size,
@@ -439,6 +446,9 @@ class MetalWorker(WorkerBase):
                 logger.warning("Profiler was not started; nothing to stop.")
                 return
             self._metal_profiler.stop()
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        return None
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""

@@ -3,14 +3,15 @@ from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
+from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_metal.v1.spec_decode.proposer import MetalDraftProposer
 from vllm_metal.v1.spec_decode.rejection_sampler import MetalRejectionSampler
-from vllm_metal.v1.worker import MetalWorker
+from vllm_metal.v1.worker import CompilationTimes, MetalWorker, WorkerBase
 
 logger = init_logger(__name__)
 
@@ -56,6 +57,9 @@ class MetalSpecDecodeWorker(WorkerBase):
         # Stashed state for asynchronous speculative verification
         self._pending_spec_data: dict[str, Any] | None = None
 
+        # Last drafted tokens for the engine core to consume
+        self._last_draft_token_ids: DraftTokenIds | None = None
+
         logger.info("MetalSpecDecodeWorker initialized.")
 
     def init_device(self) -> None:
@@ -96,6 +100,19 @@ class MetalSpecDecodeWorker(WorkerBase):
             "draft_logits_batch": draft_logits_batch,
             "k": k,
         }
+
+        # Stash draft tokens for the engine core to consume via take_draft_token_ids
+        req_ids = [
+            req.req_id for req in scheduler_output.scheduled_new_reqs
+        ] + list(scheduler_output.scheduled_cached_reqs.req_ids)
+        # TODO: handle 1st request for now, matching the current single-request focus
+        if req_ids:
+            self._last_draft_token_ids = DraftTokenIds(
+                req_ids=[req_ids[0]],
+                draft_token_ids=[draft_tokens_batch[0].tolist()],
+            )
+        else:
+            self._last_draft_token_ids = None
 
         # widen the pipe
         if scheduler_output.scheduled_new_reqs:
@@ -203,8 +220,8 @@ class MetalSpecDecodeWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config) -> None:
         self.target_worker.initialize_from_config(kv_cache_config)
 
-    def compile_or_warm_up_model(self) -> None:
-        self.target_worker.compile_or_warm_up_model()
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        return self.target_worker.compile_or_warm_up_model()
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -228,3 +245,36 @@ class MetalSpecDecodeWorker(WorkerBase):
 
     def shutdown(self) -> None:
         self.target_worker.shutdown()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.target_worker.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.target_worker.remove_lora(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.target_worker.pin_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        return self.target_worker.list_loras()
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.target_worker.get_supported_tasks()
+
+    def sleep(self, level: int = 1) -> None:
+        self.target_worker.sleep(level)
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        self.target_worker.wake_up(tags)
+
+    def check_health(self) -> None:
+        self.target_worker.check_health()
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        self.target_worker.profile(is_start, profile_prefix)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """Retrieve and clear the last drafted tokens."""
+        ret = self._last_draft_token_ids
+        self._last_draft_token_ids = None
+        return ret
