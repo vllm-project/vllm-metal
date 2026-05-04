@@ -13,7 +13,7 @@ Key contracts:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, NamedTuple, TypeAlias
+from typing import Any, Literal, NamedTuple, Optional, TypeAlias
 
 import mlx.core as mx
 import torch
@@ -62,6 +62,7 @@ from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
+    PrefillRequest,
     SamplingBatch,
     sample_decode_tokens,
     sample_from_logits,
@@ -113,19 +114,6 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
-
-
-class PrefillRequest(NamedTuple):
-    """Packed prefill request passed to ``_start_paged_forward``."""
-
-    req_id: str
-    token_ids: list[int]  # suffix slice forwarded through the model
-    sampling_params: SamplingParams
-    block_ids: list[int]
-    generator: torch.Generator | None
-    prompt_len: int | None  # full prompt length (None for intermediate chunks)
-    start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
-    full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
 
 
 @dataclass
@@ -440,15 +428,31 @@ class MetalModelRunner:
         """
         return self._cache_policy.get_kv_cache_spec()
 
-    def truncate_cache(self, request_id: str, num_to_remove: int) -> None:
+    def truncate_cache(
+        self, request_id: str, num_to_remove: int, bonus_token: Optional[int] = None
+    ) -> None:
         """Rewind sequence length after a rejection."""
         state = self._request_states.get(request_id)
 
         if state is None or num_to_remove <= 0:
+            if state is not None and bonus_token is not None:
+                # Still handle bonus token even if no truncation needed
+                # (though in spec-decode we always have at least the scorer's token to remove)
+                state.token_ids[-1] = bonus_token
             return
 
         # truncate the token list
         state.token_ids = state.token_ids[:-num_to_remove]
+
+        if bonus_token is not None:
+            state.token_ids.append(bonus_token)
+
+        # prevent negative generated_tokens if rewind into
+        # the "widened" speculative prompt
+        if len(state.token_ids) < state.prompt_len:
+            # we rejected draft tokens that runner originally thought were part
+            # of the prompt; adjuct the prompt len downward
+            state.prompt_len = len(state.token_ids) - 1
 
         # update the tracking length
         state.generated_tokens = len(state.token_ids) - state.prompt_len
@@ -874,6 +878,11 @@ class MetalModelRunner:
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
+        logger.debug(
+            "_sample_paged_batch: num_decode=%d, num_prefill=%d",
+            num_decode,
+            len(prefill_reqs),
+        )
         decode_next_tokens = sample_decode_tokens(
             logits,
             decode_reqs,
@@ -923,18 +932,24 @@ class MetalModelRunner:
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
+
                 full_prompt = (
                     prefill.full_prompt_token_ids
                     if prefill.full_prompt_token_ids is not None
                     else prefill.token_ids
                 )
+
+                full_prompt_with_next_token = full_prompt + [next_token]
+
+                actual_gen_count = len(full_prompt_with_next_token) - prompt_len
+
                 self._request_states[prefill.req_id] = RequestState(
-                    token_ids=full_prompt + [next_token],
+                    token_ids=full_prompt_with_next_token,
                     prompt_len=prompt_len,
                     cache=[],
                     sampling_params=prefill.sampling_params,
                     generator=prefill.generator,
-                    generated_tokens=1,
+                    generated_tokens=actual_gen_count,
                     block_ids=prefill.block_ids,
                 )
                 continue
@@ -1158,9 +1173,7 @@ class MetalModelRunner:
         return prefill_pack
 
     @staticmethod
-    def _build_output(
-        batch: _ExecutionBatch, sample_tokens: list[int]
-    ) -> ModelRunnerOutput:
+    def _build_output(batch: _ExecutionBatch) -> ModelRunnerOutput:
         """Build ``ModelRunnerOutput`` from a completed batch."""
 
         output = ModelRunnerOutput(
@@ -1309,6 +1322,9 @@ class MetalModelRunner:
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
+        logger.debug(
+            f"MetalModelRunner.execute_model: has_paged_backend={self._paged_attention_backend is not None}, has_paged_work={batch.has_paged_work()}",
+        )
         if self._paged_attention_backend is not None and batch.has_paged_work():
             # Free GDN slots for finished requests BEFORE allocating new
             # ones, so slots can be reused within the same scheduling step.
