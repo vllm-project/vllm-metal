@@ -72,6 +72,7 @@ def _setup_spec_decode_config(model_name: str, num_spec_tokens: int = 5):
     return config, resolved_model
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("model_name", ["mlx-community/Qwen2.5-0.5B-4bit"])
 def test_proposer_functional(model_name):
     """
@@ -122,7 +123,8 @@ def test_proposer_functional(model_name):
         mx.eval(draft_tokens, draft_logits)
 
         # 6. Performance Showdown: Sequential vs. Widened Verification
-        logger.info("--- Scorer Verification Benchmark ---")
+        print("\n" + "=" * 40)
+        print("--- Scorer Verification Benchmark ---")
 
         # Baseline: Scorer generates 1 token sequentially
         # Warmup first
@@ -139,7 +141,7 @@ def test_proposer_functional(model_name):
             base_times.append((time.perf_counter() - start_base) * 1000)
 
         base_time = sum(base_times) / itls if (itls := len(base_times)) else 0
-        logger.info("Scorer Sequential (avg 1 token): %.2fms", base_time)
+        print(f"Scorer Sequential (avg 1 token): {base_time:.2f}ms")
 
         # Speculative: Scorer verifies k tokens in a single "Widened" pass
         # We concatenate prompt + draft tokens to create the widened input
@@ -158,12 +160,13 @@ def test_proposer_functional(model_name):
             spec_times.append((time.perf_counter() - start_spec) * 1000)
 
         spec_time = sum(spec_times) / itls if (itls := len(spec_times)) else 0
-        logger.info("Scorer Verification (avg %d tokens): %.2fms", k, spec_time)
+        print(f"Scorer Verification (avg {k} tokens): {spec_time:.2f}ms")
 
         # Speedup Verdict
         # Amortized cost: (Sequential * k) vs (Widened Pass)
         speedup = (base_time * k) / spec_time
-        logger.info("VERDICT: Scorer is %.1fx more efficient via Speculation!", speedup)
+        print(f"\nVERDICT: Scorer is {speedup:.1f}x more efficient via Speculation!")
+        print("=" * 40 + "\n")
 
         # 7. Verification & Assertions
         logger.info("Running assertions...")
