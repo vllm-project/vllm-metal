@@ -218,9 +218,6 @@ def test_spec_decode_worker_integration(model_name, monkeypatch):
         worker.determine_available_memory()
         worker.initialize_cache(num_gpu_blocks=1024, num_cpu_blocks=0)
 
-        # Explicitly load proposer to satisfy the orchestrator
-        worker.proposer.load_model()
-
         # 1. Create a mock SchedulerOutput with a new request
         logger.info("Mocking SchedulerOutput...")
         req_id = "test-request-0"

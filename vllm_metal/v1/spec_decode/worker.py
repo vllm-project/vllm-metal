@@ -68,6 +68,8 @@ class MetalSpecDecodeWorker(WorkerBase):
 
     def load_model(self) -> None:
         self.target_worker.load_model()
+        if self.proposer:
+            self.proposer.load_model()
 
     def execute_model(
         self,
