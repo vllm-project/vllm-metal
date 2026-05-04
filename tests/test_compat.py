@@ -15,6 +15,125 @@ import pytest
 import vllm_metal.compat as compat
 
 
+def _write_bytelevel_tokenizer_json(path) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel
+    from tokenizers.models import WordLevel
+
+    tokenizer = Tokenizer(
+        WordLevel(
+            {
+                "\u0120Hello": 0,
+                "\u010a": 1,
+                "<unk>": 2,
+            },
+            unk_token="<unk>",
+        )
+    )
+    tokenizer.decoder = ByteLevel(add_prefix_space=False, use_regex=False)
+    tokenizer.save(str(path / "tokenizer.json"))
+
+
+class _WrongDecoderBackend:
+    decoder = 'Sequence(decoders=[Replace(pattern=String("\\u2581"), content=" ")])'
+
+
+class _ByteLevelBackend:
+    decoder = "ByteLevel(add_prefix_space=False, trim_offsets=False, use_regex=False)"
+
+
+class _FakeTokenizer:
+    def __init__(self, path, backend) -> None:
+        self.backend_tokenizer = backend
+        self.init_kwargs = {
+            "clean_up_tokenization_spaces": False,
+            "model_max_length": 128,
+        }
+        self.name_or_path = str(path)
+        self.bos_token = None
+        self.eos_token = "<unk>"
+        self.unk_token = "<unk>"
+        self.pad_token = None
+        self.sep_token = None
+        self.cls_token = None
+        self.mask_token = None
+        self.additional_special_tokens = []
+        self.chat_template = None
+        self.model_max_length = 128
+        self.clean_up_tokenization_spaces = False
+
+
+class TestByteLevelTokenizerCompatPatch:
+    def test_rebuilds_when_tokenizer_json_is_bytelevel_but_loaded_decoder_is_not(
+        self, tmp_path
+    ) -> None:
+        _write_bytelevel_tokenizer_json(tmp_path)
+        broken = _FakeTokenizer(tmp_path, _WrongDecoderBackend())
+
+        fixed = compat._maybe_rebuild_bytelevel_tokenizer(broken, tmp_path, {})
+
+        decoded = fixed.decode([0, 1])
+        assert fixed is not broken
+        assert "\u0120" not in decoded
+        assert "\u010a" not in decoded
+        assert "Hello" in decoded
+        assert "\n" in decoded
+        assert compat._loaded_tokenizer_decoder_uses_bytelevel(fixed)
+
+    def test_keeps_loaded_tokenizer_when_decoder_is_already_bytelevel(
+        self, tmp_path
+    ) -> None:
+        _write_bytelevel_tokenizer_json(tmp_path)
+        tokenizer = _FakeTokenizer(tmp_path, _ByteLevelBackend())
+
+        fixed = compat._maybe_rebuild_bytelevel_tokenizer(tokenizer, tmp_path, {})
+
+        assert fixed is tokenizer
+
+    def test_cached_lookup_forwards_tokenizer_location_kwargs(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        tokenizer_json = tmp_path / "tokenizer.json"
+        tokenizer_json.write_text("{}", encoding="utf-8")
+        captured_kwargs = {}
+
+        def _fake_cached_file(path_or_repo_id, filename, **kwargs):
+            captured_kwargs.update(kwargs)
+            assert path_or_repo_id == "org/repo"
+            assert filename == "tokenizer.json"
+            return str(tokenizer_json)
+
+        monkeypatch.setattr("transformers.utils.cached_file", _fake_cached_file)
+
+        path = compat._cached_tokenizer_json_path(
+            "org/repo",
+            {
+                "cache_dir": "/tmp/hf-cache",
+                "force_download": True,
+                "proxies": {"https": "proxy"},
+                "revision": "refs/pr/1",
+                "local_files_only": True,
+                "subfolder": "tokenizer",
+                "repo_type": "model",
+                "user_agent": {"vllm-metal": "test"},
+                "use_auth_token": "secret",
+                "_commit_hash": "abc123",
+            },
+        )
+
+        assert path == tokenizer_json
+        assert captured_kwargs["cache_dir"] == "/tmp/hf-cache"
+        assert captured_kwargs["force_download"] is True
+        assert captured_kwargs["proxies"] == {"https": "proxy"}
+        assert captured_kwargs["revision"] == "refs/pr/1"
+        assert captured_kwargs["local_files_only"] is True
+        assert captured_kwargs["subfolder"] == "tokenizer"
+        assert captured_kwargs["repo_type"] == "model"
+        assert captured_kwargs["user_agent"] == {"vllm-metal": "test"}
+        assert captured_kwargs["token"] == "secret"
+        assert captured_kwargs["_commit_hash"] == "abc123"
+
+
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_pkg = ModuleType("mlx")
     mlx_core = ModuleType("mlx.core")

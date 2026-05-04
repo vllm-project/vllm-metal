@@ -8,8 +8,10 @@ diagnosable.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -24,8 +26,245 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_transformers_bytelevel_tokenizer_decoder()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+
+
+def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("type") == decoder_type:
+            return True
+        return any(
+            _decoder_tree_contains_type(child, decoder_type) for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_decoder_tree_contains_type(child, decoder_type) for child in value)
+    return False
+
+
+def _tokenizer_json_decoder_uses_bytelevel(tokenizer_json: Path) -> bool:
+    try:
+        with tokenizer_json.open("r", encoding="utf-8") as handle:
+            tokenizer_data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return _decoder_tree_contains_type(tokenizer_data.get("decoder"), "ByteLevel")
+
+
+def _loaded_tokenizer_decoder_uses_bytelevel(tokenizer: Any) -> bool:
+    backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+    decoder = getattr(backend_tokenizer, "decoder", None)
+    return "ByteLevel" in repr(decoder)
+
+
+def _candidate_tokenizer_json_paths(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+) -> list[Path]:
+    paths: list[Path] = []
+
+    init_kwargs = getattr(tokenizer, "init_kwargs", {}) or {}
+    tokenizer_file = init_kwargs.get("tokenizer_file")
+    if tokenizer_file:
+        paths.append(Path(tokenizer_file))
+
+    path = Path(path_or_repo_id)
+    if path.is_dir():
+        paths.append(path / "tokenizer.json")
+
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if name_or_path:
+        name_path = Path(name_or_path)
+        if name_path.is_dir():
+            paths.append(name_path / "tokenizer.json")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in paths:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            deduped.append(candidate)
+    return deduped
+
+
+def _cached_tokenizer_json_path(
+    path_or_repo_id: str | Path,
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Path | None:
+    try:
+        from transformers.utils import cached_file
+    except ImportError:
+        return None
+
+    cached_kwargs: dict[str, Any] = {
+        "_raise_exceptions_for_connection_errors": False,
+        "_raise_exceptions_for_gated_repo": False,
+        "_raise_exceptions_for_missing_entries": False,
+    }
+    for key in (
+        "cache_dir",
+        "force_download",
+        "proxies",
+        "token",
+        "revision",
+        "local_files_only",
+        "subfolder",
+        "repo_type",
+        "user_agent",
+        "_commit_hash",
+    ):
+        value = from_pretrained_kwargs.get(key)
+        if value is not None:
+            cached_kwargs[key] = value
+    if "token" not in cached_kwargs:
+        token = from_pretrained_kwargs.get("use_auth_token")
+        if token is not None:
+            cached_kwargs["token"] = token
+
+    try:
+        cached = cached_file(path_or_repo_id, "tokenizer.json", **cached_kwargs)
+    except TypeError:
+        # Older transformers releases have a narrower cached_file signature.
+        fallback_kwargs = {
+            key: value
+            for key, value in cached_kwargs.items()
+            if not key.startswith("_") and key != "token"
+        }
+        try:
+            cached = cached_file(
+                path_or_repo_id,
+                "tokenizer.json",
+                **fallback_kwargs,
+            )
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if not cached:
+        return None
+    path = Path(cached)
+    return path if path.is_file() else None
+
+
+def _find_bytelevel_tokenizer_json(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Path | None:
+    for tokenizer_json in _candidate_tokenizer_json_paths(tokenizer, path_or_repo_id):
+        if _tokenizer_json_decoder_uses_bytelevel(tokenizer_json):
+            return tokenizer_json
+
+    tokenizer_json = _cached_tokenizer_json_path(
+        path_or_repo_id,
+        from_pretrained_kwargs,
+    )
+    if tokenizer_json is None:
+        return None
+    if not _tokenizer_json_decoder_uses_bytelevel(tokenizer_json):
+        return None
+    return tokenizer_json
+
+
+def _rebuild_bytelevel_fast_tokenizer(tokenizer: Any, tokenizer_json: Path) -> Any:
+    from transformers import PreTrainedTokenizerFast
+
+    init_kwargs = dict(getattr(tokenizer, "init_kwargs", {}) or {})
+    for key in ("backend", "tokenizer_file", "vocab_file", "name_or_path"):
+        init_kwargs.pop(key, None)
+
+    for attr in (
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "pad_token",
+        "sep_token",
+        "cls_token",
+        "mask_token",
+        "additional_special_tokens",
+        "chat_template",
+        "model_max_length",
+        "clean_up_tokenization_spaces",
+    ):
+        value = getattr(tokenizer, attr, None)
+        if value is not None:
+            init_kwargs[attr] = value
+
+    rebuilt = PreTrainedTokenizerFast(
+        tokenizer_file=str(tokenizer_json),
+        **init_kwargs,
+    )
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if name_or_path:
+        rebuilt._name_or_path = name_or_path
+    return rebuilt
+
+
+def _maybe_rebuild_bytelevel_tokenizer(
+    tokenizer: Any,
+    path_or_repo_id: str | Path,
+    from_pretrained_kwargs: Mapping[str, Any],
+) -> Any:
+    if _loaded_tokenizer_decoder_uses_bytelevel(tokenizer):
+        return tokenizer
+
+    tokenizer_json = _find_bytelevel_tokenizer_json(
+        tokenizer,
+        path_or_repo_id,
+        from_pretrained_kwargs,
+    )
+    if tokenizer_json is None:
+        return tokenizer
+
+    rebuilt = _rebuild_bytelevel_fast_tokenizer(tokenizer, tokenizer_json)
+    logger.info(
+        "Rebuilt tokenizer from ByteLevel tokenizer.json after transformers "
+        "loaded a non-ByteLevel decoder: %s",
+        tokenizer_json,
+    )
+    return rebuilt
+
+
+def _patch_transformers_bytelevel_tokenizer_decoder() -> None:
+    """Use tokenizer.json's ByteLevel decoder when AutoTokenizer picks wrong.
+
+    Some MLX-community Qwen/DeepSeek redistributions ship a ByteLevel
+    `tokenizer.json` but a `tokenizer_config.json` that can make older
+    transformers versions instantiate a Llama/SentencePiece-style decoder.
+    That decoder leaves ByteLevel token pieces such as "\u0120" and "\u010a"
+    in served text. If the tokenizer JSON itself is ByteLevel, rebuild a fast
+    tokenizer from that file so vLLM's serving decoder matches the checkpoint.
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        logger.warning(
+            "Could not install transformers ByteLevel tokenizer compatibility "
+            "patch because transformers is unavailable: %s",
+            exc,
+        )
+        return
+
+    sentinel = "_vllm_metal_bytelevel_decoder_patch"
+    if getattr(AutoTokenizer, sentinel, False):
+        return
+
+    original_from_pretrained = AutoTokenizer.from_pretrained
+
+    def _patched_from_pretrained(cls, path_or_repo_id, *args, **kwargs):
+        tokenizer = original_from_pretrained(path_or_repo_id, *args, **kwargs)
+        return _maybe_rebuild_bytelevel_tokenizer(
+            tokenizer,
+            path_or_repo_id,
+            kwargs,
+        )
+
+    AutoTokenizer.from_pretrained = classmethod(_patched_from_pretrained)
+    setattr(AutoTokenizer, sentinel, True)
 
 
 def _ceildiv(value: int, divisor: int) -> int:
