@@ -581,6 +581,7 @@ class TestSampleTokensGrammarPagedPath:
             logits=logits,
             cu_seqlens=[0, 1],
             num_decode=1,
+            spec_metadata=None,
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)
