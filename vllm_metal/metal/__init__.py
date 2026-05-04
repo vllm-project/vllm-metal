@@ -84,6 +84,21 @@ def _build_gdn_source() -> str:
     return "\n".join(parts)
 
 
+def _build_encoder_varlen_source() -> str:
+    """Concatenate utils + encoder_varlen_attention into a single source.
+
+    utils.metal is mandatory ahead of the kernel: it defines bfloat16_t and
+    the shared simd / numeric helpers used by the kernel.  A single-file
+    read of encoder_varlen_attention.metal alone is fragile or fails to
+    compile for the bf16 specializations.
+    """
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "encoder_varlen_attention.metal"),
+    ]
+    return "\n".join(parts)
+
+
 def metal_unified_attention(
     q,  # [total_q_tokens, num_q_heads, head_size]
     k,  # [num_blocks, block_size, num_kv_heads, head_size]
@@ -226,6 +241,34 @@ def get_ops() -> ModuleType:
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
 
+    # The encoder-varlen library is compiled lazily on first call to
+    # encoder_varlen_attention() — see _ensure_encoder_varlen_library.
+    # Paged-only and text-only callers share this module and never invoke
+    # the encoder helper, so eager init here would charge them the encoder
+    # shader's compile cost on every cold start for no benefit.
+
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
     return mod
+
+
+# Tracks whether init_encoder_varlen_library has been called on the C++
+# extension yet.  The encoder shader is compiled lazily on first invocation
+# of encoder_varlen_attention() so paged-only and text-only consumers don't
+# pay its compile cost on cold start.
+_encoder_varlen_loaded: bool = False
+
+
+def _ensure_encoder_varlen_library() -> ModuleType:
+    """Return the ops module with the encoder-varlen Metal library compiled.
+
+    JIT-compiles the encoder-varlen shader on first call and caches the
+    result for the lifetime of the process.  Subsequent calls hit MLX's
+    library cache and are effectively free.
+    """
+    global _encoder_varlen_loaded
+    ops = get_ops()
+    if not _encoder_varlen_loaded:
+        ops.init_encoder_varlen_library(_build_encoder_varlen_source())
+        _encoder_varlen_loaded = True
+    return ops

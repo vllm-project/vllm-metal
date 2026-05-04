@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 
@@ -1106,6 +1107,355 @@ void gdn_linear_attention_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Encoder varlen attention — dense non-causal varlen attention.
+//
+// Wrapped as a real MLX UnaryPrimitive so the kernel dispatch carries graph
+// provenance through the lazy graph (mirroring the PagedAttentionPrimitive
+// class above).  The primitive is read-only: Q/K/V/cu_seqlens go in, a fresh
+// output array comes out.  Validation lives in two layers: the Python
+// helper at vllm_metal.metal.encoder_varlen_attention rejects bad shapes /
+// dtypes / cu_seqlens before launch; eval_gpu enforces row-contiguity on
+// every input array (the only layer that can — the Python mx.array surface
+// does not expose flags().row_contiguous).
+// ---------------------------------------------------------------------------
+
+static std::string encoder_varlen_source_;
+static bool encoder_varlen_library_initialized_ = false;
+
+void init_encoder_varlen_library(const std::string& src) {
+  // The MLX library cache (Device::library_map_) is name-keyed: a second
+  // get_library("encoder_varlen_kern", ...) call hits the cache and never
+  // re-reads the source.  The Python layer's _encoder_varlen_loaded flag
+  // gates Python callers, but this binding is part of the public C++ API
+  // and a direct caller bypasses that gate.  Guard explicitly here so the
+  // actual behavior is visible at the call site.
+  if (encoder_varlen_library_initialized_) {
+    if (src != encoder_varlen_source_) {
+      throw std::runtime_error(
+          "init_encoder_varlen_library called twice with different source; "
+          "MLX library cache is name-keyed and will not pick up the new "
+          "source. Restart the interpreter to recompile.");
+    }
+    return;
+  }
+  encoder_varlen_source_ = src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library(
+      "encoder_varlen_kern",
+      [&]() { return encoder_varlen_source_; });
+  // Set the flag only after get_library returns successfully so a Metal
+  // compile failure leaves the slot retryable rather than wedged.
+  encoder_varlen_library_initialized_ = true;
+}
+
+// Hand-mirrored on the .metal side at
+// kernels_v2/encoder_varlen_attention.metal.  Field order is part of the
+// ABI; do not reorder without updating both files in lockstep.  We do not
+// stuff this into a project-local header because needs_rebuild() in
+// build.py only stats paged_ops.cpp / build.py / constants.py — header-only
+// edits would silently fail to trigger an .so rebuild.
+struct EncoderVarlenParams {
+  int   num_q_heads;
+  int   num_kv_heads;
+  int   total_tokens;
+  int   num_segments;   // == cu_seqlens.shape[0] - 1; binary-search bound.
+  // Reserved ABI: launch hint only; not used to bound indexing in the
+  // current kernel.  Intentionally excluded from is_equivalent (see below).
+  // If a future kernel reads this in a way that affects output, dispatch
+  // shape, or scratch sizing, it MUST be added to is_equivalent — otherwise
+  // two calls with different max_seqlen values will alias in the lazy graph.
+  int   max_seqlen;
+  float softmax_scale;
+};
+
+// ABI tripwires for the .metal-side struct mirror.  Per-field offsetof is
+// stronger than size-only: a same-size reorder (e.g. swapping two int fields)
+// would slip past sizeof but break field decoding in-kernel.  needs_rebuild()
+// in build.py only stats the .cpp, so a struct edit here is the only way to
+// force an .so rebuild and surface this check at compile time.
+static_assert(offsetof(EncoderVarlenParams, num_q_heads)   ==  0,
+              "EncoderVarlenParams ABI drift: num_q_heads offset changed");
+static_assert(offsetof(EncoderVarlenParams, num_kv_heads)  ==  4,
+              "EncoderVarlenParams ABI drift: num_kv_heads offset changed");
+static_assert(offsetof(EncoderVarlenParams, total_tokens)  ==  8,
+              "EncoderVarlenParams ABI drift: total_tokens offset changed");
+static_assert(offsetof(EncoderVarlenParams, num_segments)  == 12,
+              "EncoderVarlenParams ABI drift: num_segments offset changed");
+static_assert(offsetof(EncoderVarlenParams, max_seqlen)    == 16,
+              "EncoderVarlenParams ABI drift: max_seqlen offset changed");
+static_assert(offsetof(EncoderVarlenParams, softmax_scale) == 20,
+              "EncoderVarlenParams ABI drift: softmax_scale offset changed");
+static_assert(sizeof(EncoderVarlenParams) == 24,
+              "EncoderVarlenParams ABI drift: struct size changed; "
+              "update kernels_v2/encoder_varlen_attention.metal in lockstep");
+
+class EncoderVarlenAttentionPrimitive : public UnaryPrimitive {
+ public:
+  EncoderVarlenAttentionPrimitive(
+      Stream stream,
+      int num_kv_heads,
+      float softmax_scale,
+      int dtype_tag,
+      int head_dim,
+      int max_seqlen)
+      : UnaryPrimitive(stream),
+        num_kv_heads_(num_kv_heads),
+        softmax_scale_(softmax_scale),
+        dtype_tag_(dtype_tag),
+        head_dim_(head_dim),
+        max_seqlen_(max_seqlen) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error(
+        "EncoderVarlenAttentionPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    const auto& q          = inputs[0];
+    const auto& k          = inputs[1];
+    const auto& v          = inputs[2];
+    const auto& cu_seqlens = inputs[3];
+
+    // Defense-in-depth: the Python helper does not (and cannot) check
+    // contiguity, so this is the only layer that catches non-row-contiguous
+    // inputs.  Run before set_data so a rejected call does not leak a
+    // freshly-allocated output buffer.
+    if (!q.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: q must be row-contiguous "
+          "(wrap upstream in mx.contiguous(...) before calling).");
+    }
+    if (!k.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: k must be row-contiguous.");
+    }
+    if (!v.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: v must be row-contiguous.");
+    }
+    if (!cu_seqlens.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: cu_seqlens must be row-contiguous.");
+    }
+
+    // Defense-in-depth: the Python helper validates shape / dtype /
+    // num_kv_heads, but a caller that drives the underscore-prefixed
+    // _encoder_varlen_attention_primitive binding directly bypasses that.
+    // Re-check the structural invariants the kernel relies on so a
+    // bypass surfaces as a clean throw rather than silent K/V misindexing
+    // in-kernel.  Value-level checks (cu_seqlens monotonicity /
+    // final-token-count) are intentionally not re-checked here — those
+    // belong in the helper, and the binding's docstring marks it internal.
+    // cu_seqlens dtype / ndim / shape and q/k/v dtype-match ARE re-checked
+    // below: all of them are load-fatal failure modes through the kernel's
+    // typed bindings (int* for cu_seqlens; a single template parameter T
+    // for q/k/v, selected from q.dtype() only — a mismatched k/v would
+    // mis-stride the load against the resource binding).
+    if (q.ndim() != 3 || k.ndim() != 3 || v.ndim() != 3) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: q, k, v must each be 3-D "
+          "[total_tokens, num_heads, head_dim].");
+    }
+    if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0) ||
+        k.shape(2) != q.shape(2) || v.shape(2) != q.shape(2) ||
+        k.shape(1) != q.shape(1) || v.shape(1) != q.shape(1)) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: q, k, v must share the same shape "
+          "(v1 requires num_q_heads == num_kv_heads).");
+    }
+    if (k.dtype() != q.dtype() || v.dtype() != q.dtype()) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: q, k, v must share dtype "
+          "(kernel template binds all three to the same T, selected from "
+          "q.dtype() only; a mismatched k/v dtype mis-strides the load "
+          "against the resource binding and may read past the K/V buffer).");
+    }
+    if (static_cast<int>(k.shape(1)) != num_kv_heads_) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: num_kv_heads parameter does not "
+          "match k.shape(1); kernel would silently misindex K/V.");
+    }
+    if (static_cast<int>(q.shape(2)) != head_dim_) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: head_dim parameter does not "
+          "match q.shape(2).");
+    }
+    // cu_seqlens dtype / shape / rank: the kernel binding is
+    // `device const int*`, and find_segment dereferences cu_seqlens[seg + 1]
+    // up through cu_seqlens[num_segments].  A non-int32 dtype mis-strides
+    // the load (4-byte stride read as 8 / 2 bytes); ndim != 1 silently
+    // mis-strides the load; shape(0) < 2 → num_segments <= 0 and the very
+    // first dereference is out-of-bounds.  The Python helper enforces all
+    // three on the raw and ValidatedSeqlens paths; these guards catch
+    // direct callers of the underscore binding that bypass those layers.
+    if (cu_seqlens.dtype() != int32) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: cu_seqlens must have dtype int32 "
+          "(kernel binding is device const int*; any other element width "
+          "would mis-stride the load).");
+    }
+    if (cu_seqlens.ndim() != 1) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: cu_seqlens must be 1-D "
+          "(kernel binding is device const int*; any other rank "
+          "would mis-stride the load).");
+    }
+    if (cu_seqlens.shape(0) < 2) {
+      throw std::invalid_argument(
+          "encoder_varlen_attention: cu_seqlens must have at least 2 "
+          "entries (num_segments + 1); the kernel reads cu_seqlens[seg + 1] "
+          "in find_segment and would dereference out of bounds.");
+    }
+
+    // Allocate output via the MLX allocator (mirroring
+    // PagedAttentionPrimitive::eval_gpu's set_data + allocator::malloc
+    // pattern).  This is the array whose descriptor the
+    // _encoder_varlen_attention_primitive binding's overwrite_descriptor
+    // call publishes back to Python — the cross-module RTTI bypass path
+    // documented at the top of this file.
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const int total_tokens = static_cast<int>(q.shape(0));
+    const int num_q_heads  = static_cast<int>(q.shape(1));
+    const int num_segments = static_cast<int>(cu_seqlens.shape(0)) - 1;
+
+    EncoderVarlenParams params{};
+    params.num_q_heads   = num_q_heads;
+    params.num_kv_heads  = num_kv_heads_;
+    params.total_tokens  = total_tokens;
+    params.num_segments  = num_segments;
+    params.max_seqlen    = max_seqlen_;
+    params.softmax_scale = softmax_scale_;
+
+    const char* dtype_tag = nullptr;
+    switch (dtype_tag_) {
+      case 0: dtype_tag = "f16";  break;
+      case 1: dtype_tag = "bf16"; break;
+      case 2: dtype_tag = "f32";  break;
+      default:
+        throw std::runtime_error(
+            "Unknown dtype_tag in EncoderVarlenAttentionPrimitive");
+    }
+    const std::string kname =
+        "encoder_varlen_attention_" + std::string(dtype_tag) + "_" +
+        std::to_string(head_dim_);
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+    auto* lib = d.get_library("encoder_varlen_kern");
+    auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+    auto& enc = get_command_encoder_compat(d, s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(q, 0);
+    enc.set_input_array(k, 1);
+    enc.set_input_array(v, 2);
+    enc.set_input_array(cu_seqlens, 3);
+    enc.set_output_array(out, 4);
+    enc.set_bytes(params, 5);
+
+    // Grid: segment-pitched Q-tile grid.  Each threadgroup owns one
+    // Q-tile (Q_TILE consecutive queries from a single segment, same
+    // q_head).  Tiles past seg_hi are over-launched and early-exit in
+    // the kernel — the pitch is `tiles_per_segment = ceil(max_seqlen /
+    // Q_TILE)` so every active threadgroup stays on exactly one segment
+    // and the kernel can decode (seg, tile_in_seg) from tg_id.x by
+    // simple division.  Per-dtype Q_TILE:
+    //   bf16/f16 → 32 (MMA path; 4 simdgroups × 8 queries = 8x8 MMA tile)
+    //   f32      →  8 (manual-SIMD fallback; smaller because fp32 elements
+    //                 double tg-memory pressure → 32×32 doesn't fit at hd128).
+    // Threadgroup width:
+    //   bf16/f16 (M3 MMA path) → 256 = 8 simdgroups, each owning 8 query
+    //                             rows; doubled Q_TILE amortises K-tile
+    //                             cooperative loads over twice the queries.
+    //   f32 (manual fallback) → 128 = 4 simdgroups, smaller tile.
+    const int q_tile             = (dtype_tag_ == 2) ? 8 : 64;
+    const int threadgroup_width  = (dtype_tag_ == 2) ? 128 : 256;
+    const int tiles_per_segment  = (max_seqlen_ + q_tile - 1) / q_tile;
+    const int x_dim              = num_segments * tiles_per_segment;
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(x_dim, num_q_heads, 1),
+        MTL::Size::Make(threadgroup_width, 1, 1));
+
+    // No add_temporary calls: inside a primitive, MLX's evaluator manages
+    // array lifetimes via the completion handler, and add_temporary would
+    // strip buffer pointers from the encoder's input/output tracking and
+    // silently defeat the fence for downstream primitives.
+  }
+
+  const char* name() const override { return "EncoderVarlenAttention"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const EncoderVarlenAttentionPrimitive*>(&other);
+    return rhs
+        && rhs->num_kv_heads_  == num_kv_heads_
+        && rhs->softmax_scale_ == softmax_scale_
+        && rhs->dtype_tag_     == dtype_tag_
+        && rhs->head_dim_      == head_dim_
+        && rhs->max_seqlen_    == max_seqlen_;
+    // max_seqlen_ IS part of the equivalence: the tiled kernel uses it
+    // as the segment-pitched grid pitch (tiles_per_segment =
+    // ceil(max_seqlen / Q_TILE)).  Two primitives with different
+    // max_seqlen_ would over-launch by different amounts and decode
+    // (seg, tile_in_seg) from tg_id.x differently, so they are NOT
+    // interchangeable for caching purposes.
+  }
+
+ private:
+  int   num_kv_heads_;
+  float softmax_scale_;
+  int   dtype_tag_;
+  int   head_dim_;
+  int   max_seqlen_;
+};
+
+static int encoder_varlen_dtype_to_tag(Dtype dt) {
+  switch (dt) {
+    case float16:  return 0;
+    case bfloat16: return 1;
+    case float32:  return 2;
+    default:
+      throw std::runtime_error(
+          "Unsupported dtype for encoder_varlen_attention "
+          "(supported: float16, bfloat16, float32)");
+  }
+}
+
+static array encoder_varlen_attention_primitive_fn(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& cu_seqlens,
+    int num_kv_heads,
+    float softmax_scale,
+    int max_seqlen) {
+  // Rank guard before q.shape(2): a direct underscore-binding caller with
+  // ndim < 3 would otherwise hit MLX's low-level out-of-range from shape()
+  // here, before eval_gpu's "must each be 3-D" check could fire.  Same
+  // message as eval_gpu so callers see one consistent error regardless of
+  // path.  k/v rank stays in eval_gpu since they aren't accessed here.
+  if (q.ndim() != 3) {
+    throw std::invalid_argument(
+        "encoder_varlen_attention: q, k, v must each be 3-D "
+        "[total_tokens, num_heads, head_dim].");
+  }
+  const int dtype_tag = encoder_varlen_dtype_to_tag(q.dtype());
+  const int head_dim  = static_cast<int>(q.shape(2));
+  auto prim = std::make_shared<EncoderVarlenAttentionPrimitive>(
+      default_stream(Device::gpu),
+      num_kv_heads,
+      softmax_scale,
+      dtype_tag,
+      head_dim,
+      max_seqlen);
+  return array(
+      q.shape(),
+      q.dtype(),
+      std::move(prim),
+      {q, k, v, cu_seqlens});
+}
+
+// ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
 
@@ -1123,6 +1473,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),
         "JIT-compile the GDN linear attention Metal shader.");
+
+  m.def("init_encoder_varlen_library", &init_encoder_varlen_library,
+        nb::arg("src"),
+        "JIT-compile the dense non-causal varlen encoder attention shader.");
 
   m.def("reshape_and_cache", &reshape_and_cache_impl,
         nb::arg("key"), nb::arg("value"),
@@ -1290,4 +1644,44 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("slot_mapping"), nb::arg("y"),
         nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
         "GDN linear attention with in-place paged state management.");
+
+  // Dense non-causal varlen encoder attention.  Caller supplies a
+  // placeholder mx.array(0); the binding publishes the result via
+  // overwrite_descriptor (mirroring the paged_attention_primitive binding
+  // above) so the returned array carries the kernel dependency through
+  // MLX's lazy graph.  Validation of shapes / dtypes / cu_seqlens lives
+  // in the Python helper (vllm_metal.metal.encoder_varlen_attention);
+  // contiguity is enforced inside eval_gpu.
+  m.def("_encoder_varlen_attention_primitive",
+        [](nb::handle q_h,
+           nb::handle k_h,
+           nb::handle v_h,
+           nb::handle cu_seqlens_h,
+           int num_kv_heads,
+           float softmax_scale,
+           int max_seqlen,
+           nb::handle out_h) {
+          auto result = encoder_varlen_attention_primitive_fn(
+              *nb::inst_ptr<array>(q_h),
+              *nb::inst_ptr<array>(k_h),
+              *nb::inst_ptr<array>(v_h),
+              *nb::inst_ptr<array>(cu_seqlens_h),
+              num_kv_heads,
+              softmax_scale,
+              max_seqlen);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q"),
+        nb::arg("k"),
+        nb::arg("v"),
+        nb::arg("cu_seqlens"),
+        nb::arg("num_kv_heads"),
+        nb::arg("softmax_scale"),
+        nb::arg("max_seqlen"),
+        nb::arg("out"),
+        "Internal: call via vllm_metal.metal.encoder_varlen_attention. "
+        "Direct calls bypass cu_seqlens monotonicity / final-token-count "
+        "validation; contiguity, basic Q/K/V shape / num_kv_heads / "
+        "head_dim invariants, q/k/v dtype-match, and cu_seqlens dtype / "
+        "ndim / shape are enforced inside eval_gpu.");
 }
