@@ -17,9 +17,8 @@ def merge_multimodal_embeddings(
     """Splice multimodal embeddings into placeholder positions.
 
     Mirrors ``vllm/model_executor/models/utils.py``
-    ``_merge_multimodal_embeddings`` for MLX arrays.  This helper builds and
-    returns the merged tensor; callers should not rely on ``inputs_embeds``
-    being mutated.
+    ``_merge_multimodal_embeddings`` for MLX arrays.  Returns a new array;
+    ``inputs_embeds`` is not mutated.
     """
     if len(multimodal_embeddings) == 0:
         return inputs_embeds
@@ -43,7 +42,11 @@ def merge_multimodal_embeddings(
 
     input_dtype = inputs_embeds.dtype
     hidden_size = inputs_embeds.shape[-1]
-    flat = inputs_embeds.reshape(-1, hidden_size)
+    # Materialize a fresh buffer before the in-place assignment so the
+    # non-mutation contract holds independent of MLX reshape/__setitem__
+    # aliasing semantics. Note ``mx.array(x)`` and ``x.reshape(...)`` both
+    # share storage with ``x`` in MLX 0.31; addition forces a new buffer.
+    flat = (inputs_embeds + mx.zeros((), dtype=input_dtype)).reshape(-1, hidden_size)
     mask_np = np.asarray(mask_flat)
     positions = mx.array(np.where(mask_np)[0], dtype=mx.uint32)
     flat[positions] = mm_embeds_flat.astype(input_dtype)
