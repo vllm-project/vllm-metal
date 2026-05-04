@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
-import os
+
 import mlx.core as mx
 import pytest
-from unittest.mock import MagicMock
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -15,16 +14,13 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput, NewRequestData, CachedRequestData
-from vllm.v1.outputs import ModelRunnerOutput
-
+from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.spec_decode.proposer import MetalDraftProposer, MinimalDraftRunner
 from vllm_metal.v1.spec_decode.worker import MetalSpecDecodeWorker
-from vllm_metal.v1.spec_decode.rejection_sampler import MetalRejectionSampler
-from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
 
@@ -104,8 +100,9 @@ def test_proposer_functional(model_name):
         scorer_runner = MinimalDraftRunner(config, resolved_model)
         start_load_scorer = time.perf_counter()
         scorer_runner.load_model()
-        logger.info("Scorer Model loaded in %.2fs",
-                    time.perf_counter() - start_load_scorer)
+        logger.info(
+            "Scorer Model loaded in %.2fs", time.perf_counter() - start_load_scorer
+        )
 
         # 5. Run Propose
         prompt = "The capital of France is"
@@ -256,16 +253,13 @@ def test_spec_decode_worker_integration(model_name, monkeypatch):
         # We force the sampler to accept only 2 out of 5 tokens
         forced_num_accepted = 2
         forced_bonus_token = 12345
-        logger.info("Mocking rejection: accepting %d/5 tokens",
-                    forced_num_accepted)
+        logger.info("Mocking rejection: accepting %d/5 tokens", forced_num_accepted)
 
         # Create dummy SpecDecodeMetadata to trigger speculative path in sampler
         spec_metadata = SpecDecodeMetadata.make_dummy(
             draft_token_ids=[[1, 2, 3, 4, 5]],
             device=worker.device,
         )
-
-        original_sample = worker.sampler.sample
 
         def mocked_sample(*args, **kwargs):
             return forced_num_accepted, forced_bonus_token
@@ -296,8 +290,9 @@ def test_spec_decode_worker_integration(model_name, monkeypatch):
         expected_len = original_prompt_len + forced_num_accepted + 1
         actual_len = worker.target_worker.model_runner._paged_request_seq_lens[req_id]
 
-        logger.info("Sequence Length Check: Expected=%d, Actual=%d",
-                    expected_len, actual_len)
+        logger.info(
+            "Sequence Length Check: Expected=%d, Actual=%d", expected_len, actual_len
+        )
         assert actual_len == expected_len
 
         # Verify RequestState matches

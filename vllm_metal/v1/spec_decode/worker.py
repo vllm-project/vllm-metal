@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any, List, Optional, Set, Tuple
-import torch
-import mlx.core as mx
+from typing import Any
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
-from vllm.logger import init_logger
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_metal.v1.worker import MetalWorker
 from vllm_metal.v1.spec_decode.proposer import MetalDraftProposer
 from vllm_metal.v1.spec_decode.rejection_sampler import MetalRejectionSampler
+from vllm_metal.v1.worker import MetalWorker
 
 logger = init_logger(__name__)
 
@@ -52,11 +50,11 @@ class MetalSpecDecodeWorker(WorkerBase):
             **kwargs,
         )
 
-        self.proposer: Optional[MetalDraftProposer] = None
-        self.sampler: Optional[MetalRejectionSampler] = None
+        self.proposer: MetalDraftProposer | None = None
+        self.sampler: MetalRejectionSampler | None = None
 
         # Stashed state for asynchronous speculative verification
-        self._pending_spec_data: Optional[dict[str, Any]] = None
+        self._pending_spec_data: dict[str, Any] | None = None
 
         logger.info("MetalSpecDecodeWorker initialized.")
 
@@ -75,7 +73,7 @@ class MetalSpecDecodeWorker(WorkerBase):
         self,
         scheduler_output: SchedulerOutput,
         spec_metadata: SpecDecodeMetadata | None = None,
-    ) -> Optional[ModelRunnerOutput]:
+    ) -> ModelRunnerOutput | None:
         """Intercepts execution to perform speculative decoding steps."""
 
         # 1. Check if we have any speculative work to do
@@ -85,9 +83,11 @@ class MetalSpecDecodeWorker(WorkerBase):
 
         # 2. Draft Phase
         # generate guesses using proposer
+        assert self.vllm_config.speculative_config is not None
         k = self.vllm_config.speculative_config.num_speculative_tokens
         input_ids = self.target_worker._get_input_ids(scheduler_output)
 
+        assert self.proposer is not None
         draft_tokens_batch, draft_logits_batch = self.proposer.propose(input_ids, k=k)
         self._pending_spec_data = {
             "draft_tokens_batch": draft_tokens_batch,
@@ -102,7 +102,8 @@ class MetalSpecDecodeWorker(WorkerBase):
             draft_list = draft_tokens_batch[0].tolist()
 
             # extend the prompt so the Scorer actually see the guesses
-            first_req.prompt_token_ids.extend(draft_list)
+            if first_req.prompt_token_ids is not None:
+                first_req.prompt_token_ids.extend(draft_list)
 
             # update the accounting so the runner knows the sequence grow
             scheduler_output.num_scheduled_tokens[req_id] += len(draft_list)
@@ -126,16 +127,19 @@ class MetalSpecDecodeWorker(WorkerBase):
 
     def _verify_and_correct(self, output: ModelRunnerOutput) -> ModelRunnerOutput:
         """Apply rejection sampling and KV cache rewind to the model output."""
-        logger.debug("_verify_and_correct called. pending_spec_data: %s",
-                     self._pending_spec_data is not None)
+        logger.debug(
+            "_verify_and_correct called. pending_spec_data: %s",
+            self._pending_spec_data is not None,
+        )
         if self._pending_spec_data is None:
             return output
 
         spec_data = self._pending_spec_data
         self._pending_spec_data = None
 
-        logger.debug("output has verification_logits: %s",
-                     hasattr(output, 'verification_logits'))
+        logger.debug(
+            "output has verification_logits: %s", hasattr(output, "verification_logits")
+        )
         if hasattr(output, "verification_logits"):
             # TODO: handle 1st request in the batch for simplicity for now
             req_id = output.req_ids[0]
@@ -144,6 +148,7 @@ class MetalSpecDecodeWorker(WorkerBase):
                 target_logits = output.verification_logits[req_id]  # (k+1, vocab)
                 logger.debug("target_logits shape: %s", target_logits.shape)
 
+                assert self.sampler is not None
                 # vectorized parallel sampling with residual fix
                 num_accepted, bonus_token = self.sampler.sample(
                     target_logits=target_logits,
@@ -152,28 +157,36 @@ class MetalSpecDecodeWorker(WorkerBase):
                 )
                 logger.debug(
                     "Sampler returned num_accepted: %d, bonus_token: %d",
-                    num_accepted, bonus_token)
+                    num_accepted,
+                    bonus_token,
+                )
 
                 # 6. Rewind phase: truncate kv cache and commit the bonus token
                 # We must remove:
                 # - The rejected draft tokens (k - num_accepted)
                 # - The extra token produced by the Scorer (+ 1)
                 num_to_remove = spec_data["k"] - num_accepted + 1
-                logger.debug("num_to_remove: %d, bonus_token: %d",
-                             num_to_remove, bonus_token)
+                logger.debug(
+                    "num_to_remove: %d, bonus_token: %d", num_to_remove, bonus_token
+                )
 
                 # tell runner to forget the invalid tokens and add the bonus token
                 self.target_worker.model_runner.truncate_cache(
-                    req_id, num_to_remove, bonus_token=bonus_token)
+                    req_id, num_to_remove, bonus_token=bonus_token
+                )
 
                 # 7. Update output with the verified next token
                 output.sampled_token_ids[0] = [bonus_token]
-                logger.debug("output.sampled_token_ids[0] updated to: %s",
-                             output.sampled_token_ids[0])
+                logger.debug(
+                    "output.sampled_token_ids[0] updated to: %s",
+                    output.sampled_token_ids[0],
+                )
             else:
                 logger.debug(
-                    "req_id %s not in verification_logits keys: %s", req_id,
-                    list(output.verification_logits.keys()))
+                    "req_id %s not in verification_logits keys: %s",
+                    req_id,
+                    list(output.verification_logits.keys()),
+                )
 
         return output
 
@@ -192,8 +205,8 @@ class MetalSpecDecodeWorker(WorkerBase):
         self.target_worker.compile_or_warm_up_model()
 
     def sample_tokens(
-        self, grammar_output: Optional[GrammarOutput]
-    ) -> Optional[ModelRunnerOutput]:
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | None:
         output = self.target_worker.sample_tokens(grammar_output)
         if output is not None:
             output = self._verify_and_correct(output)

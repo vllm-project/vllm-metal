@@ -13,7 +13,7 @@ Key contracts:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, NamedTuple, Optional, TypeAlias
+from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
 import torch
@@ -429,7 +429,7 @@ class MetalModelRunner:
         return self._cache_policy.get_kv_cache_spec()
 
     def truncate_cache(
-        self, request_id: str, num_to_remove: int, bonus_token: Optional[int] = None
+        self, request_id: str, num_to_remove: int, bonus_token: int | None = None
     ) -> None:
         """Rewind sequence length after a rejection."""
         state = self._request_states.get(request_id)
@@ -1186,7 +1186,7 @@ class MetalModelRunner:
         )
 
         if hasattr(batch, "verification_logits") and batch.verification_logits:
-            setattr(output, "verification_logits", batch.verification_logits)
+            output.verification_logits = batch.verification_logits  # type: ignore[attr-defined]
 
         return output
 

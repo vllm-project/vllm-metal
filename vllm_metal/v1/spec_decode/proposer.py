@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 from typing import Any
-from typing import List, Optional
-import torch
+
 import mlx.core as mx
+import torch
 from mlx_lm.models.cache import make_prompt_cache
 from vllm.config import VllmConfig
-from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_metal.config import get_config
-from vllm_metal.v1.model_lifecycle import ModelLifecycle
-from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
+from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 logger = init_logger(__name__)
 
@@ -68,8 +67,9 @@ class MetalDraftProposer:
     using a lazy autoregressive loop
     """
 
-    def __init__(self, vllm_config: VllmConfig, model_path: Optional[str] = None):
+    def __init__(self, vllm_config: VllmConfig, model_path: str | None = None):
         self.vllm_config = vllm_config
+        assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self.model_config = vllm_config.model_config
 

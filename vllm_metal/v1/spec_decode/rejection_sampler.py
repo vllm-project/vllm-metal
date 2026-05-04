@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 import mlx.core as mx
-from typing import Tuple
 
 
 class MetalRejectionSampler:
@@ -14,7 +13,7 @@ class MetalRejectionSampler:
         target_logits: mx.array,  # (k+1, vocab) from scorer
         draft_logits: mx.array,  # (k, vocab) from proposer
         draft_tokens: mx.array,  # (k,) tokens guessed by Drafter
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         Compares target and draft probabilities to find first rejection.
 

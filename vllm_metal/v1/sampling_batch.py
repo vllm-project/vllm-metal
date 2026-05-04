@@ -5,6 +5,7 @@ Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import mlx.core as mx
 import torch
@@ -15,8 +16,6 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-
-from typing import NamedTuple
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
@@ -348,7 +347,9 @@ def sample_prefill_tokens(
 
     logger.debug(
         "sample_prefill_tokens started. num_prefill=%d, has_spec_metadata=%s",
-        len(prefill_reqs), spec_metadata is not None)
+        len(prefill_reqs),
+        spec_metadata is not None,
+    )
     for j, prefill_req in enumerate(prefill_reqs):
         start_idx = cu_seqlens[num_decode + j]
         end_idx = cu_seqlens[num_decode + j + 1]
@@ -359,7 +360,11 @@ def sample_prefill_tokens(
         is_spec = spec_metadata is not None and len(prefill_req.token_ids) > 1
         logger.debug(
             "sample_prefill_tokens loop: j=%d, req_id=%s, len(token_ids)=%d, is_spec=%s",
-            j, prefill_req.req_id, len(prefill_req.token_ids), is_spec)
+            j,
+            prefill_req.req_id,
+            len(prefill_req.token_ids),
+            is_spec,
+        )
 
         if is_spec:
             #####
