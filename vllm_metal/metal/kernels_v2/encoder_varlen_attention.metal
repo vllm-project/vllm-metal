@@ -1,57 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
+
+// Portions of this file are adapted from Apple's MLX framework
+// (https://github.com/ml-explore/mlx)
+// Licensed under the Apache License 2.0
+// Copyright © 2023 Apple Inc.
+
+// ========================================== Encoder varlen attention kernel
 //
-// Dense non-causal varlen encoder attention kernel — flash-attention with
-// register-resident MMA fragments and in-register online softmax, mirroring
-// MLX's `steel_attention` kernel structure (BQ=32, BK=32, WM=4, WN=1).
+// Dense non-causal attention over a packed batch of variable-length
+// segments — the attention shape used by vision-tower models (Qwen2.5-VL
+// et al.), where each segment is one image's patch grid.
 //
-// M3 redesign vs. M2
-//   • All MMA tiles (Q, K, S, V, O) live as per-lane `vec<float,2>` fragments
-//     using Apple's simdgroup_matrix<float,8,8> lane layout (the same one
-//     MLX targets via BaseMMAFrag::get_coord).  Each lane holds 1 row × 2
-//     contiguous cols of every 8x8 frag it participates in.
-//   • Softmax row reductions run in registers via simd_shuffle_xor(1) +
-//     simd_shuffle_xor(8) — the two-shuffle butterfly that traverses the
-//     four lanes that share a row in the simdgroup_matrix layout.  No
-//     more s_buf round-trip via simdgroup_store / simdgroup_load.
-//   • α-rescale of the running O accumulator is now a per-lane scalar
-//     `o_frags[d] *= factor` instead of a `diag(α) @ O` 8x8 MMA.  At
-//     HEAD_DIM=128 that's TD=16 register-vec multiplies replacing 16 MMAs.
-//   • Threadgroup memory uses pad = 16/sizeof(T) on the inner stride
-//     (matches MLX's padQ / padK / padV) to avoid bank conflicts on
-//     simdgroup-cooperative loads.
-//   • V_smem is now row-major [K_TILE, HEAD_DIM]  (M2 had it transposed
-//     as a hold-over from the iter1 manual kernel).
+// Inputs are shaped [total_tokens, num_heads, head_dim], with cu_seqlens
+// recording segment boundaries.  Each threadgroup is bound to one
+// (segment, q_tile, head) triple via the launch grid; cross-segment
+// attention is skipped by construction.
 //
-// Per-lane state
-//   q_frag:       vec<float,2>      reloaded each `dd` (Q is dim-tiled)
-//   s_frags[TK]:  vec<float,2>[TK]  S = Q @ K^T accumulated across dd
-//   v_frag:       vec<float,2>      reloaded each (id, ik) MMA
-//   o_frags[TD]:  vec<float,2>[TD]  running unnormalised output (fp32)
-//   max_score:    float             online softmax row max
-//   sum_score:    float             online softmax row sum (= l)
+// Implementation mirrors Apple's MLX `steel_attention` kernel structure
+// (BQ=32, BK=32, WM=4, WN=1).  All MMA tiles (Q, K, S, V, O) live as
+// per-lane `vec<float, 2>` fragments using simdgroup_matrix<float, 8, 8>'s
+// BaseMMAFrag lane layout — each lane owns 1 row × 2 cols of every 8×8
+// frag it participates in.  Softmax row reductions run in registers via
+// the simd_shuffle_xor(1) + simd_shuffle_xor(8) butterfly that traverses
+// the four lanes that share a row in the simdgroup_matrix layout.
+// α-rescale of the running O accumulator is a per-lane scalar
+// `o_frags[d] *= factor`, not a `diag(α) @ O` 8×8 MMA.
 //
-// MMA dispatch identity
+// Per-lane register state.
+//   q_frag        vec<float, 2>      reloaded each `dd` (Q is dim-tiled)
+//   s_frags[TK]   vec<float, 2>[TK]  S = Q @ K^T accumulated across dd
+//   v_frag        vec<float, 2>      reloaded each (id, ik) MMA
+//   o_frags[TD]   vec<float, 2>[TD]  running unnormalised output (fp32)
+//   max_score     float              online softmax row max
+//   sum_score     float              online softmax row sum (= l)
+//
+// MMA dispatch identity.
 //   simdgroup_multiply_accumulate(D_mat, A_mat, B_mat, C_mat) requires
-//   simdgroup_matrix operands.  We marshal `vec<float,2>` ↔
-//   `simdgroup_float8x8::thread_elements()` via a reinterpret_cast.
-//   Apple's simdgroup_matrix<float,8,8> stores exactly two fp32 elements
-//   per lane in a `vec<float,2>` thread_elements slot, so the cast is a
+//   simdgroup_matrix operands.  We marshal `vec<float, 2>` ↔
+//   `simdgroup_float8x8::thread_elements()` via reinterpret_cast.  Apple's
+//   simdgroup_matrix<float, 8, 8> stores exactly two fp32 elements per
+//   lane in a `vec<float, 2>` thread_elements slot, so the cast is a
 //   bitwise no-op.
 //
-// Lane coord (MLX BaseMMAFrag::get_coord)
+// Lane coord (MLX BaseMMAFrag::get_coord).
 //   const ushort qid = simd_lane_id / 4;
 //   const ushort fm  = (qid & 4) + ((simd_lane_id / 2) % 4);   // 0..7 row
 //   const ushort fn  = (qid & 2) * 2 + (simd_lane_id % 2) * 2; // 0/2/4/6 col
-//   Lane owns frag[fm, fn..fn+1].  Four lanes per row are { l, l^1, l^8,
-//   l^9 } — confirming xor-1 + xor-8 as a 4-way row reduction butterfly.
+// Lane owns frag[fm, fn..fn+1].  The four lanes per row are { l, l^1,
+// l^8, l^9 } — confirming xor-1 + xor-8 as the 4-way row reduction.
 //
-// f32 path (`encoder_varlen_attention_manual_kernel`) is unchanged from
-// M2 — fp32 elements double tg-memory pressure and the 32×32 MMA tile
-// blows the 32 KB cap at HEAD_DIM=128, so f32 stays on the smaller-tile
-// manual-SIMD fallback (Q=8, K=16).
+// f32 path (`encoder_varlen_attention_manual_kernel`) uses smaller tiles
+// (Q_TILE=8, K_TILE=16) on a manual-SIMD fallback: fp32 doubles
+// tg-memory pressure and a 32×32 MMA tile blows the 32 KB cap at
+// HEAD_DIM=128, so the MMA path stays bf16/f16 only.
 //
-// utils.metal is concatenated ahead of this file by the source builder in
-// vllm_metal.metal.__init__, so bfloat16_t is available.
+// NOTE: utils.metal is concatenated ahead of this file by the source
+// builder in vllm_metal.metal.__init__, so bfloat16_t is available.
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -79,9 +83,7 @@ static_assert(sizeof(EncoderVarlenParams) == 24,
               "EncoderVarlenParams ABI drift: size diverges from "
               "paged_ops.cpp; update both files in lockstep.");
 
-// ---------------------------------------------------------------------------
-// MMA kernel — bf16 / f16
-// ---------------------------------------------------------------------------
+// ========================================== MMA kernel — bf16 / f16
 
 template <typename T, uint HEAD_DIM>
 [[kernel]] void encoder_varlen_attention_mma_kernel(
@@ -108,15 +110,14 @@ template <typename T, uint HEAD_DIM>
                   "HEAD_DIM must be a multiple of 8 for the 8x8 MMA path");
 
     // Padding in tg memory to avoid bank conflicts on Apple GPU.
-    // pad = 16/sizeof(T) matches MLX's steel_attention padQ/padK/padV
+    // pad = 16/sizeof(T) matches MLX steel_attention's padQ/padK/padV
     // and helps hd64/80/128 by 2–5%.  At HEAD_DIM=96 the padded inner
-    // stride (104 elements / 208 bytes for bf16) is empirically *worse*
-    // than the unpadded (96 / 192 bytes), losing ~8% on the bench —
-    // 96 is exactly 1.5 bank cycles wide so the unpadded layout already
-    // distributes lanes across banks evenly, and the +8 extra elements
-    // both inflate tg-memory pressure and shift the bank pattern in a
-    // way that re-introduces conflicts.  Disabling padding for hd96
-    // recovers that loss.  Verified by ablation 2026-05-03.
+    // stride (104 elements / 208 bytes for bf16) is empirically worse
+    // than the unpadded (96 / 192 bytes), losing ~8%: 96 is exactly 1.5
+    // bank cycles wide so the unpadded layout already distributes lanes
+    // across banks evenly, and the extra 8 elements both inflate tg
+    // pressure and shift the bank pattern in a way that re-introduces
+    // conflicts.  Disabling padding for hd96 recovers that loss.
     constexpr uint pad_default = 16 / sizeof(T);
     constexpr uint padQ    = (HEAD_DIM == 96) ? 0 : pad_default;
     constexpr uint padK    = pad_default;                  // K_TILE=32 always
@@ -218,10 +219,7 @@ template <typename T, uint HEAD_DIM>
     constexpr uint Vs_k_stride = kFragSize * LDV_tgp; // ik advances along k rows
     constexpr uint Vs_d_stride = kFragSize;           // id advances along d cols
 
-
-    // =====================================================================
-    // K-tile loop
-    // =====================================================================
+    // ========================================== K-tile loop
     for (int tile_lo = seg_lo; tile_lo < seg_hi; tile_lo += int(K_TILE)) {
         const int tile_hi = min(tile_lo + int(K_TILE), seg_hi);
         const int k_count = tile_hi - tile_lo;
@@ -384,11 +382,9 @@ template <typename T, uint HEAD_DIM>
         }
     }
 
-    // =====================================================================
-    // Final write: O / l → out (only valid query rows).
-    // Lane (fm, fn) owns query row (tm + fm) and d cols
-    // (id*8 + fn, id*8 + fn + 1) for each id frag.
-    // =====================================================================
+    // ========================================== Final write
+    // O / l → out, valid query rows only.  Lane (fm, fn) owns query row
+    // (tm + fm) and d cols (id*8 + fn, id*8 + fn + 1) for each id frag.
     const float inv_l = (sum_score > 0.0f) ? (1.0f / sum_score) : 0.0f;
     const int q_row_local = int(tm) + int(fm);
     if (q_row_local < q_count) {
@@ -401,9 +397,12 @@ template <typename T, uint HEAD_DIM>
     }
 }
 
-// ---------------------------------------------------------------------------
-// Manual SIMD kernel — f32 fallback (Q_TILE=8, K_TILE=16 to fit tg-mem)
-// ---------------------------------------------------------------------------
+// ========================================== Manual SIMD kernel — f32 fallback
+//
+// f32 elements double tg-memory pressure and a 32×32 MMA tile would blow
+// the 32 KB cap at HEAD_DIM=128, so the f32 path drops to manual SIMD
+// reductions on a smaller (Q_TILE=8, K_TILE=16) tile.  Same online-softmax
+// math as the MMA path, expressed without simdgroup_matrix.
 
 template <typename T, uint HEAD_DIM, uint Q_TILE, uint K_TILE>
 [[kernel]] void encoder_varlen_attention_manual_kernel(
@@ -546,15 +545,15 @@ template <typename T, uint HEAD_DIM, uint Q_TILE, uint K_TILE>
     }
 }
 
-// ---------------------------------------------------------------------------
-// Specialization macros — bf16/f16 dispatch to the MMA kernel; f32 dispatches
-// to the manual kernel.  All twelve [[host_name]] strings stay in the
+// ========================================== Specialization macros
+//
+// bf16/f16 dispatch to the MMA kernel; f32 dispatches to the manual
+// kernel.  All twelve [[host_name]] strings stay in the
 // `encoder_varlen_attention_<dtype>_<head_dim>` format that the C++
 // dispatcher in paged_ops.cpp builds.  The C++ launcher chooses the
 // appropriate (Q_TILE, threadgroup) per dtype:
 //   bf16/f16 → Q_TILE=32, threadgroup=128
 //   f32      → Q_TILE=8,  threadgroup=128
-// ---------------------------------------------------------------------------
 
 #define instantiate_encoder_varlen_mma(type, type_tag, head_dim) \
     template [[host_name("encoder_varlen_attention_" #type_tag "_" #head_dim)]] \
