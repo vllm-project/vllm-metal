@@ -15,8 +15,20 @@ import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.config import reset_config
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+
+
+def _default_target_dtype():
+    """Mirror production: `_load_generation_model` derives `target_dtype`
+    from `runner.model_config.dtype` via `torch_to_mlx`. Tests build their
+    runner mock with `dtype=torch.float16` (see `_runner_model_config`),
+    so the cache key the production path would produce uses the same MLX
+    dtype this helper returns.
+    """
+    return torch_to_mlx(torch.empty(0, dtype=torch.float16)).dtype
+
 
 _TEXT_MODEL_ARGS = {
     "vocab_size": 32000,
@@ -97,7 +109,9 @@ def _cache_generation_model(
 ) -> tuple[object, object]:
     fake_model = SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
-    cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
+    cache_key = model_lifecycle._generation_cache_key(
+        "stub-model", is_vlm=is_vlm, target_dtype=_default_target_dtype()
+    )
     monkeypatch.setattr(
         model_lifecycle,
         "_MODEL_CACHE",
@@ -264,14 +278,16 @@ class TestModelLifecycle:
             model_lifecycle,
             "_MODEL_CACHE",
             {
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
-                    text_model,
-                    text_tokenizer,
-                ),
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=True): (
-                    vlm_model,
-                    vlm_tokenizer,
-                ),
+                model_lifecycle._generation_cache_key(
+                    "stub-model",
+                    is_vlm=False,
+                    target_dtype=_default_target_dtype(),
+                ): (text_model, text_tokenizer),
+                model_lifecycle._generation_cache_key(
+                    "stub-model",
+                    is_vlm=True,
+                    target_dtype=_default_target_dtype(),
+                ): (vlm_model, vlm_tokenizer),
             },
         )
 
@@ -425,10 +441,11 @@ class TestModelLifecycle:
             model_lifecycle,
             "_MODEL_CACHE",
             {
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
-                    fake_model,
-                    object(),
-                )
+                model_lifecycle._generation_cache_key(
+                    "stub-model",
+                    is_vlm=False,
+                    target_dtype=_default_target_dtype(),
+                ): (fake_model, object())
             },
         )
         lifecycle, runner = _make_lifecycle()
