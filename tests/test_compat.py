@@ -115,6 +115,7 @@ class TestByteLevelTokenizerCompatPatch:
         assert tokenizer.eos_token == "</s>"
         assert tokenizer.pad_token == "</s>"
         assert tokenizer.model_max_length == 128
+        assert tokenizer.max_chars_per_token >= len("\u0120Hello")
         assert compat._loaded_tokenizer_decoder_uses_bytelevel(tokenizer)
 
     def test_keeps_loaded_tokenizer_when_decoder_is_already_bytelevel(

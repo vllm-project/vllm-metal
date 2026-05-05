@@ -189,12 +189,14 @@ def _load_bytelevel_tokenizers_backend(
     kwargs: Mapping[str, Any],
 ) -> Any:
     from transformers.tokenization_utils_tokenizers import TokenizersBackend
+    from vllm.tokenizers.hf import get_cached_tokenizer
 
-    return TokenizersBackend.from_pretrained(
+    tokenizer = TokenizersBackend.from_pretrained(
         path_or_repo_id,
         *args,
         **_tokenizers_backend_kwargs(kwargs),
     )
+    return get_cached_tokenizer(tokenizer)
 
 
 def _maybe_load_bytelevel_tokenizers_backend(
