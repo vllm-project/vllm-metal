@@ -26,6 +26,7 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+    _patch_mlx_lm_qwen2_awq_tied_lm_head()
 
 
 def _ceildiv(value: int, divisor: int) -> int:
@@ -428,3 +429,78 @@ def _patch_mlx_lm_gemma4_kv_shared_sanitize() -> None:
         model_cls, "_vllm_metal_gemma4_kv_shared_patch", _transform
     ):
         logger.debug("Patched mlx_lm gemma4_text KV-shared sanitize compatibility")
+
+
+_AWQ_LM_HEAD_QUANT_KEYS = (
+    "lm_head.qweight",
+    "lm_head.qzeros",
+    "lm_head.scales",
+)
+
+
+def _drop_awq_lm_head_quant_triple(
+    weights: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Drop the AWQ ``lm_head.{qweight,qzeros,scales}`` triple.
+
+    For tied-embedding architectures, ``Model.lm_head`` is not a real
+    parameter; AWQ checkpoints that quantize ``lm_head`` ship a redundant
+    triple that ``mlx_lm._transform_awq_weights`` would convert into
+    ``lm_head.weight/scales/biases`` and then fail strict weight load.
+    """
+    return {k: v for k, v in weights.items() if k not in _AWQ_LM_HEAD_QUANT_KEYS}
+
+
+def _patch_mlx_lm_qwen2_awq_tied_lm_head() -> None:
+    """Drop tied-`lm_head` AWQ quant triples for Qwen2 models.
+
+    mlx-lm 0.31.3 calls ``Model.sanitize(weights)`` and then
+    ``_transform_awq_weights(weights, quantization_config)`` inside
+    ``load_model``. ``Qwen2.sanitize`` only drops ``lm_head.weight`` when
+    ``tie_word_embeddings=True``; it does not know about
+    ``lm_head.qweight/qzeros/scales``. AWQ checkpoints that quantize
+    ``lm_head`` therefore survive sanitize, get transformed into
+    ``lm_head.weight/scales/biases``, and then fail strict load.
+
+    This patch wraps ``Qwen2.sanitize`` to first drop the AWQ ``lm_head``
+    quant triple when ``tie_word_embeddings`` is true, before delegating
+    to upstream sanitize. None of the publicly distributed Qwen2.5-AWQ
+    checkpoints currently quantize ``lm_head``; this is defense in depth
+    for third-party AWQ producers.
+
+    Remove this patch once mlx-lm sanitize knows about quantized
+    ``lm_head`` for tied embeddings and the ``mlx-lm`` pin in
+    ``pyproject.toml`` is bumped past it.
+    """
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    if find_spec("mlx_lm.models.qwen2") is None:
+        return
+    try:
+        module = import_module("mlx_lm.models.qwen2")
+    except ImportError as exc:
+        logger.warning(
+            "Could not install mlx_lm qwen2 AWQ tied-lm_head sanitize "
+            "compatibility patch: %s",
+            exc,
+        )
+        return
+
+    model_cls = getattr(module, "Model", None)
+    if model_cls is None:
+        logger.warning(
+            "Could not install mlx_lm qwen2 AWQ tied-lm_head sanitize "
+            "compatibility patch: Model class not found in qwen2."
+        )
+        return
+
+    def _transform(self, weights):
+        if not getattr(self.args, "tie_word_embeddings", False):
+            return weights
+        return _drop_awq_lm_head_quant_triple(weights)
+
+    if _wrap_model_sanitize(
+        model_cls, "_vllm_metal_qwen2_awq_tied_lm_head_patch", _transform
+    ):
+        logger.debug("Patched mlx_lm qwen2 AWQ tied-lm_head sanitize compatibility")
