@@ -32,6 +32,8 @@ def make_stub_runner(
         "model": object(),
         "_is_stt": False,
         "_is_vlm": False,
+        "_multimodal_adapter": None,
+        "encoder_cache": None,
         "_paged_attention_backend": None,
         "_gdn_req_to_slot": {},
         "_gdn_free_slots": [],

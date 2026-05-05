@@ -57,6 +57,7 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
+from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
@@ -211,6 +212,10 @@ class MetalModelRunner:
         self._stt_runtime_adapter: STTRuntimeAdapter | None = (
             None  # Set during STT loading
         )
+        self._multimodal_adapter: Any | None = None
+        self.encoder_cache: EncoderCache | None = (
+            EncoderCache() if self._supports_multimodal_inputs() else None
+        )
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -294,14 +299,16 @@ class MetalModelRunner:
         requests.  Routing through ``model.language_model`` bypasses the vision
         encoder and uses the standard ``(input_ids, cache=...)`` signature.
 
-        NOTE: This means multimodal (image) inputs are not supported — the
-        vision head is intentionally skipped.  Full multimodal inference would
-        require a decomposed encode → feature-fusion → forward pass, following
-        the upstream pattern, and is a separate future effort.
+        NOTE: scheduled multimodal encoder inputs fail fast until the runner
+        wires decomposed encode → feature-fusion → forward execution.
         """
         if self._is_vlm:
             return self._model_adapter.text_model(self.model)
         return self.model
+
+    def _supports_multimodal_inputs(self) -> bool:
+        """Return whether vLLM scheduled multimodal features for this model."""
+        return bool(getattr(self.model_config, "is_multimodal_model", False))
 
     @property
     def mla_latent_dim(self) -> int:
@@ -444,6 +451,16 @@ class MetalModelRunner:
         This method exists to satisfy the engine's initialization protocol.
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+
+    def reset_mm_cache(self) -> None:
+        """Reset profiling-time multimodal cache state when present."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.reset_mm_cache()
+
+    def reset_encoder_cache(self) -> None:
+        """Clear cached multimodal encoder outputs when present."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.reset_encoder_cache()
 
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.
@@ -924,6 +941,49 @@ class MetalModelRunner:
 
         return batch, scheduler_output
 
+    def _register_new_request_mm_features(
+        self, req_id: str, new_req: NewRequestData
+    ) -> None:
+        """Store scheduler-provided multimodal features for future encoder use."""
+        if self.encoder_cache is None:
+            return
+        self.encoder_cache.remove_request(req_id)
+        self.encoder_cache.add_request(req_id, new_req.mm_features)
+
+    def _remove_request_mm_features(self, req_id: str) -> None:
+        """Drop request-scoped multimodal feature metadata."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.remove_request(req_id)
+
+    def _free_encoder_outputs(self, mm_hashes: list[str]) -> None:
+        """Drop encoder outputs released by the scheduler."""
+        if self.encoder_cache is None:
+            return
+        for mm_hash in mm_hashes:
+            self.encoder_cache.free_encoder_cache(mm_hash)
+
+    @staticmethod
+    def _finished_or_preempted_req_ids(
+        scheduler_output: SchedulerOutput,
+    ) -> set[str]:
+        """Return request ids whose runner-owned state should be evicted."""
+        return scheduler_output.finished_req_ids.union(
+            scheduler_output.preempted_req_ids or set()
+        )
+
+    @staticmethod
+    def _reject_scheduled_encoder_inputs(
+        scheduled_encoder_inputs: dict[str, list[int]],
+    ) -> None:
+        """Fail fast until encoder execution and embedding splice are wired."""
+        if not scheduled_encoder_inputs:
+            return
+        raise NotImplementedError(
+            "Multimodal encoder execution is not wired on Metal yet. "
+            "Metal currently registers multimodal runtime state, but image "
+            "encoding and embedding splice are not connected to the runner."
+        )
+
     def _handle_new_requests(
         self,
         batch: _ExecutionBatch,
@@ -935,6 +995,7 @@ class MetalModelRunner:
 
         for new_req in new_reqs:
             req_id = new_req.req_id
+            self._register_new_request_mm_features(req_id, new_req)
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
 
@@ -1217,25 +1278,31 @@ class MetalModelRunner:
 
     def _cleanup_finished_requests(
         self,
-        finished_req_ids: set[str],
+        evicted_req_ids: set[str],
+        *,
+        materialize_gdn_state: bool = True,
     ) -> None:
-        """Evict runner-owned state for finished requests."""
-        if not finished_req_ids:
-            self._gdn_materialize_pending_state_cache()
+        """Evict runner-owned state for finished or preempted requests."""
+        if not evicted_req_ids:
+            if materialize_gdn_state:
+                self._gdn_materialize_pending_state_cache()
             return
 
-        for req_id in finished_req_ids:
+        for req_id in evicted_req_ids:
             state = self._request_states.pop(req_id, None)
             if state is not None:
                 if state.cache:
                     del state.cache
                 del state
 
+            self._remove_request_mm_features(req_id)
+
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
-        self._gdn_release_slots(finished_req_ids)
-        self._gdn_materialize_pending_state_cache()
+        self._gdn_release_slots(evicted_req_ids)
+        if materialize_gdn_state:
+            self._gdn_materialize_pending_state_cache()
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
@@ -1252,6 +1319,10 @@ class MetalModelRunner:
         if self._is_stt:
             return self._execute_stt(scheduler_output)
 
+        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
+        self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
+        evicted_req_ids = self._finished_or_preempted_req_ids(scheduler_output)
+
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new
         # requests, so the guard must come before it — not after.
@@ -1266,6 +1337,11 @@ class MetalModelRunner:
                 "to use structured output."
             )
 
+        self._cleanup_finished_requests(
+            evicted_req_ids,
+            materialize_gdn_state=False,
+        )
+
         batch = _ExecutionBatch()
         self._handle_new_requests(
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
@@ -1276,11 +1352,6 @@ class MetalModelRunner:
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
-            # Free GDN slots for finished requests BEFORE allocating new
-            # ones, so slots can be reused within the same scheduling step.
-            if self.is_hybrid and scheduler_output.finished_req_ids:
-                self._gdn_release_slots(scheduler_output.finished_req_ids)
-
             prefill_pack = self._build_prefill_pack(batch)
             self._start_paged_forward(
                 batch,
@@ -1309,8 +1380,8 @@ class MetalModelRunner:
             self._run_non_paged_decode_batch(batch)
 
         # Non-paged path: complete synchronously
+        self._gdn_materialize_pending_state_cache()
         self._validate_scheduled_outputs(batch, scheduler_output)
-        self._cleanup_finished_requests(scheduler_output.finished_req_ids)
         if not batch.req_ids:
             return self._build_output(batch)
         self._pending_output = self._build_output(batch)
@@ -1330,7 +1401,6 @@ class MetalModelRunner:
         if self._execute_model_state is not None:
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             self._validate_scheduled_outputs(batch, scheduler_output)
-            self._cleanup_finished_requests(scheduler_output.finished_req_ids)
             return self._build_output(batch)
 
         # Non-paged path: return output built by execute_model

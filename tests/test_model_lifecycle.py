@@ -14,6 +14,7 @@ import torch
 import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
@@ -88,14 +89,31 @@ def _text_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**(_TEXT_MODEL_ARGS | overrides))
 
 
+def _qwen35_vlm_model(
+    *,
+    vision_tower: object | None = None,
+    language_model: object | None = None,
+    spatial_merge_size: int = 2,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=_text_config(),
+            vision_config=SimpleNamespace(spatial_merge_size=spatial_merge_size),
+        ),
+        vision_tower=object() if vision_tower is None else vision_tower,
+        language_model=object() if language_model is None else language_model,
+    )
+
+
 def _cache_generation_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
     config: object,
     tokenizer: object | None = None,
     is_vlm: bool = False,
+    model: object | None = None,
 ) -> tuple[object, object]:
-    fake_model = SimpleNamespace(config=config)
+    fake_model = model or SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
     cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
     monkeypatch.setattr(
@@ -205,6 +223,7 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
 
     def test_load_uses_adapter_override_for_qwen36_fp8_conditional_generation(
         self,
@@ -232,10 +251,12 @@ class TestModelLifecycle:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
+        fake_model = _qwen35_vlm_model()
         _cache_generation_model(
             monkeypatch,
-            config=SimpleNamespace(text_config=_text_config()),
+            config=fake_model.config,
             is_vlm=True,
+            model=fake_model,
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
@@ -252,13 +273,70 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
 
+    def test_load_multimodal_native_qwen35_builds_model_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        vision_tower = object()
+        language_model = object()
+        fake_model = _qwen35_vlm_model(
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
+        _cache_generation_model(
+            monkeypatch,
+            config=fake_model.config,
+            is_vlm=True,
+            model=fake_model,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
+        assert runner._multimodal_adapter._vision_tower is vision_tower
+        assert runner._multimodal_adapter._language_model is language_model
+
+    def test_load_generic_vlm_leaves_model_adapter_unset(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _cache_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(text_config=_text_config()),
+            is_vlm=True,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="phi3_v"),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+        assert runner._multimodal_adapter is None
+
     def test_generation_cache_separates_text_and_vlm_variants(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         text_model = SimpleNamespace(config=_text_config())
         text_tokenizer = object()
-        vlm_model = SimpleNamespace(config=SimpleNamespace(text_config=_text_config()))
+        vlm_model = _qwen35_vlm_model()
         vlm_tokenizer = object()
         monkeypatch.setattr(
             model_lifecycle,

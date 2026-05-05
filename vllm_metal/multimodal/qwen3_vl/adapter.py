@@ -16,12 +16,32 @@ from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 class Qwen3VLMultimodalAdapter:
     """Model-owned multimodal helpers for the Qwen3-VL execution path."""
 
-    def __init__(self, *, spatial_merge_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        spatial_merge_size: int,
+        vision_tower: Any | None = None,
+        language_model: Any | None = None,
+    ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
                 f"spatial_merge_size must be positive, got {spatial_merge_size}"
             )
         self._spatial_merge_size = spatial_merge_size
+        self._vision_tower = vision_tower
+        self._language_model = language_model
+
+    @classmethod
+    def _from_loaded_model(cls, model: Any) -> Qwen3VLMultimodalAdapter:
+        """Create an adapter from an mlx-vlm Qwen3-VL/Qwen3.5 composite."""
+        vision_tower = model.vision_tower
+        language_model = model.language_model
+        spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
+        return cls(
+            spatial_merge_size=spatial_merge_size,
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
 
     def get_mrope_input_positions(
         self,

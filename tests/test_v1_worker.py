@@ -42,6 +42,22 @@ class TestWorkerRunnerBoundaryDelegation:
         model_runner.load_model.assert_called_once_with()
         worker._setup_paged_attention.assert_not_called()
 
+    def test_reset_mm_cache_delegates_to_runner(self) -> None:
+        model_runner = MagicMock()
+        worker = _make_worker(model_runner, use_paged_attention=True)
+
+        MetalWorker.reset_mm_cache(worker)
+
+        model_runner.reset_mm_cache.assert_called_once_with()
+
+    def test_reset_encoder_cache_delegates_to_runner(self) -> None:
+        model_runner = MagicMock()
+        worker = _make_worker(model_runner, use_paged_attention=True)
+
+        MetalWorker.reset_encoder_cache(worker)
+
+        model_runner.reset_encoder_cache.assert_called_once_with()
+
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(return_value="stt_nominal"),

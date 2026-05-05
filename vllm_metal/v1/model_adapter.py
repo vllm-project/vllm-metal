@@ -39,6 +39,9 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
+    def build_multimodal_adapter(self, model: Any, hf_config: Any) -> Any | None:
+        """Return a model-owned multimodal adapter for native VLM execution."""
+
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]
     ) -> tuple[int, dict[int, int]] | None:
@@ -73,6 +76,13 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_6ForConditionalGeneration",
         "Qwen3_6MoeForConditionalGeneration",
+    }
+)
+_QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
+_QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
     }
 )
 
@@ -203,6 +213,22 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         if hasattr(model, "language_model"):
             return model.language_model
         return model
+
+    def build_multimodal_adapter(self, model: Any, hf_config: Any) -> Any | None:
+        """Build the native multimodal adapter for supported model families."""
+        if hf_config is None:
+            return None
+
+        model_type = getattr(hf_config, "model_type", "")
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if model_type not in _QWEN3_VL_MODEL_TYPES and not any(
+            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
+        ):
+            return None
+
+        from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+
+        return Qwen3VLMultimodalAdapter._from_loaded_model(model)
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]
