@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     NewRequestData,
@@ -16,6 +17,7 @@ from vllm.v1.core.sched.output import (
 from tests.stub_runner import make_stub_runner
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.v1.mm import EncoderCache
+from vllm_metal.v1.model_runner import RequestState
 
 
 def _feature(identifier: str) -> MultiModalFeatureSpec:
@@ -118,15 +120,27 @@ def test_cleanup_finished_requests_removes_mm_features() -> None:
     assert "req-0" not in runner.encoder_cache.mm_features
 
 
-def test_cleanup_preempted_requests_removes_mm_features() -> None:
+def test_preempted_requests_keep_resume_state() -> None:
     runner = _runner_with_encoder_cache()
     features = [_feature("image-0")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
+    state = RequestState(
+        token_ids=[1, 2],
+        prompt_len=1,
+        cache=[],
+        sampling_params=SamplingParams(),
+    )
+    runner._request_states["req-0"] = state
+    runner._paged_request_seq_lens["req-0"] = 2
+    runner._gdn_req_to_slot["req-0"] = 0
 
     runner.execute_model(_scheduler_output(preempted_req_ids={"req-0"}))
 
-    assert "req-0" not in runner.encoder_cache.mm_features
+    assert runner.encoder_cache.mm_features["req-0"] == features
+    assert runner._request_states["req-0"] is state
+    assert runner._paged_request_seq_lens["req-0"] == 2
+    assert runner._gdn_req_to_slot["req-0"] == 0
 
 
 def test_resubmitted_request_keeps_new_mm_features() -> None:

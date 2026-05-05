@@ -963,13 +963,11 @@ class MetalModelRunner:
             self.encoder_cache.free_encoder_cache(mm_hash)
 
     @staticmethod
-    def _finished_or_preempted_req_ids(
+    def _finished_req_ids(
         scheduler_output: SchedulerOutput,
     ) -> set[str]:
         """Return request ids whose runner-owned state should be evicted."""
-        return scheduler_output.finished_req_ids.union(
-            scheduler_output.preempted_req_ids or set()
-        )
+        return scheduler_output.finished_req_ids
 
     @staticmethod
     def _reject_scheduled_encoder_inputs(
@@ -1282,7 +1280,7 @@ class MetalModelRunner:
         *,
         materialize_gdn_state: bool = True,
     ) -> None:
-        """Evict runner-owned state for finished or preempted requests."""
+        """Evict runner-owned state for finished requests."""
         if not evicted_req_ids:
             if materialize_gdn_state:
                 self._gdn_materialize_pending_state_cache()
@@ -1321,7 +1319,7 @@ class MetalModelRunner:
 
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
-        evicted_req_ids = self._finished_or_preempted_req_ids(scheduler_output)
+        evicted_req_ids = self._finished_req_ids(scheduler_output)
 
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new
@@ -1400,6 +1398,7 @@ class MetalModelRunner:
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
+            self._gdn_materialize_pending_state_cache()
             self._validate_scheduled_outputs(batch, scheduler_output)
             return self._build_output(batch)
 
