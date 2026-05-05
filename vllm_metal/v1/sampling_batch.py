@@ -5,13 +5,16 @@ Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import mlx.core as mx
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.v1.outputs import LogprobsLists
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -35,6 +38,14 @@ class PrefillRequest(NamedTuple):
     prompt_len: int | None  # full prompt length (None for intermediate chunks)
     start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
     full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
+
+
+@dataclass(frozen=True)
+class _SamplingResult:
+    """Sampled token ids plus optional vLLM logprobs rows."""
+
+    token_ids: list[int]
+    logprobs: LogprobsLists | None = None
 
 
 class SamplingBatch:
@@ -104,6 +115,73 @@ class SamplingBatch:
             for sampling_params in self.sampling_params_list
         )
 
+    @property
+    def max_num_logprobs(self) -> int | None:
+        """Return the batch-wide sample-logprobs request, if any."""
+        requested = [
+            sampling_params.logprobs
+            for sampling_params in self.sampling_params_list
+            if sampling_params.logprobs is not None
+        ]
+        if any(num_logprobs == -1 for num_logprobs in requested):
+            raise NotImplementedError("Metal runner does not support logprobs=-1 yet")
+        return max(requested) if requested else None
+
+    @property
+    def needs_logprobs(self) -> bool:
+        return self.max_num_logprobs is not None
+
+    @staticmethod
+    def merge_logprobs_rows(
+        rows: Sequence[LogprobsLists | None],
+    ) -> LogprobsLists | None:
+        """Merge per-request sample logprobs from sampling calls."""
+        present_rows = [row for row in rows if row is not None]
+        if not present_rows:
+            return None
+
+        max_width = max(row.logprob_token_ids.shape[1] for row in present_rows)
+        token_rows: list[np.ndarray] = []
+        logprob_rows: list[np.ndarray] = []
+        rank_rows: list[np.ndarray] = []
+
+        for row in rows:
+            if row is None:
+                token_rows.append(np.zeros((1, max_width), dtype=np.int32))
+                logprob_rows.append(
+                    np.full((1, max_width), float("-inf"), dtype=np.float32)
+                )
+                rank_rows.append(np.zeros((1,), dtype=np.int32))
+                continue
+
+            token_ids = row.logprob_token_ids
+            logprobs = row.logprobs
+            if token_ids.shape[1] < max_width:
+                pad_width = max_width - token_ids.shape[1]
+                token_ids = np.pad(
+                    token_ids,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=0,
+                )
+                logprobs = np.pad(
+                    logprobs,
+                    ((0, 0), (0, pad_width)),
+                    mode="constant",
+                    constant_values=float("-inf"),
+                )
+
+            token_rows.append(token_ids.astype(np.int32, copy=False))
+            logprob_rows.append(logprobs.astype(np.float32, copy=False))
+            rank_rows.append(row.sampled_token_ranks.astype(np.int32, copy=False))
+
+        return LogprobsLists(
+            logprob_token_ids=np.concatenate(token_rows, axis=0),
+            logprobs=np.concatenate(logprob_rows, axis=0),
+            sampled_token_ranks=np.concatenate(rank_rows, axis=0),
+            cu_num_generated_tokens=None,
+        )
+
     @staticmethod
     def can_use_native_greedy(
         sampling_params_list: Sequence[SamplingParams],
@@ -116,6 +194,7 @@ class SamplingBatch:
             and sampling_params.frequency_penalty == 0.0
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
+            and sampling_params.logprobs is None
             for sampling_params in sampling_params_list
         )
 
@@ -208,7 +287,7 @@ class SamplingBatch:
             top_p=self._make_top_p(),
             top_k=self._make_top_k(),
             generators=self.generators,
-            max_num_logprobs=None,
+            max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=self._make_prompt_token_ids(),
             output_token_ids=self.output_token_id_lists,
             frequency_penalties=frequency_penalties,
@@ -218,6 +297,7 @@ class SamplingBatch:
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
             logitsprocs=self.logitsprocs,
+            logprob_token_ids=None,
         )
 
 
@@ -236,24 +316,37 @@ def sample_from_logits(
     batch: SamplingBatch,
     sampler: Sampler,
     device: torch.device,
-) -> list[int]:
+) -> _SamplingResult:
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
     Single entry point for all sampling paths.  Chooses native MLX greedy
-    when possible, otherwise bridges to the vLLM torch sampler.
+    when possible, otherwise bridges to the vLLM torch sampler. Requests that
+    need sample logprobs must use the vLLM sampler so ``ModelRunnerOutput`` can
+    satisfy the OpenAI serving contract.
     """
-    if batch.all_greedy and batch.no_top_k and batch.no_top_p and batch.no_penalties:
+    if (
+        batch.all_greedy
+        and batch.no_top_k
+        and batch.no_top_p
+        and batch.no_penalties
+        and not batch.needs_logprobs
+    ):
         tokens = _mlx_greedy_sample(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
-            return [int(tokens.item())]
-        return tokens.tolist()  # type: ignore[return-value]
+            return _SamplingResult([int(tokens.item())])
+        return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
     metadata = batch.make_sampling_metadata()
     output = sampler.forward(logits_torch, metadata)
-    return output.sampled_token_ids[:, 0].tolist()
+    logprobs = (
+        output.logprobs_tensors.tolists()
+        if output.logprobs_tensors is not None
+        else None
+    )
+    return _SamplingResult(output.sampled_token_ids[:, 0].tolist(), logprobs)
 
 
 def sample_decode_tokens(
@@ -265,7 +358,7 @@ def sample_decode_tokens(
     *,
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
-) -> list[int]:
+) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
     Args:
@@ -278,10 +371,10 @@ def sample_decode_tokens(
         logitsprocs: Optional logits processors.
 
     Returns:
-        List of sampled token IDs, one per decode request.
+        Sampled token IDs and optional logprobs, one row per decode request.
     """
     if not decode_reqs:
-        return []
+        return _SamplingResult([])
 
     decode_logits = logits[0, :num_decode, :]  # (num_decode, vocab)
 
@@ -321,8 +414,8 @@ def sample_prefill_tokens(
     vocab_size: int,
     logitsprocs: LogitsProcessors | None = None,
     spec_metadata: SpecDecodeMetadata | None = None,
-) -> tuple[list[int], dict[str, mx.array]]:
-    """Sample one token per prefill request from the last logit position and extract widened verification logits
+) -> tuple[_SamplingResult, dict[str, mx.array]]:
+    """Sample one token per prefill request from the last logit position and extract widened verification logits.
 
     Args:
         `logits`: Full logits array, shape ``(1, total_tokens, vocab)``.
@@ -337,10 +430,12 @@ def sample_prefill_tokens(
 
     Returns:
         A tuple:
-            - List of sampled token IDs(int), one per prefill request.
-            - A dictionary mapping request IDs to their "Widened Pipe" verification logits. Each entry is a raw mlx array of shape `(k, vocab_size)`, where `k` is the number of tokens in the verification chunk.
+            - _SamplingResult with token IDs and optional logprobs.
+            - A dictionary mapping request IDs to their "Widened Pipe" verification logits.
     """
     prefill_next_tokens: list[int] = []
+    logprobs_rows: list[LogprobsLists | None] = []
+    verification_logits: dict[str, mx.array] = {}
 
     # initialize outside the loop to collect all speculative hits
     verification_logits: dict[str, mx.array] = {}
@@ -410,9 +505,13 @@ def sample_prefill_tokens(
             logitsprocs=logitsprocs,
             generators=generators,
         )
-
         # sample the bonus token
-        [next_token] = sample_from_logits(sample_input_logits, batch, sampler, device)
+        result = sample_from_logits(sample_input_logits, batch, sampler, device)
+        [next_token] = result.token_ids
         prefill_next_tokens.append(next_token)
+        logprobs_rows.append(result.logprobs)
 
-    return prefill_next_tokens, verification_logits
+    return _SamplingResult(
+        prefill_next_tokens,
+        SamplingBatch.merge_logprobs_rows(logprobs_rows),
+    ), verification_logits

@@ -1,27 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deterministic smoke test: vLLM offline inference with golden token comparison.
 
-Golden token IDs were generated on the main branch using vLLM offline inference
-with temperature=0 (greedy decoding) on Qwen/Qwen3-0.6B, running one sequence
+Golden token IDs were generated using vLLM offline inference with
+temperature=0 (greedy decoding) on Qwen/Qwen3-0.6B, running one sequence
 at a time (max_num_seqs=1) to avoid batch-invariance issues on Metal.
 
-Findings from golden generation (main branch, HF paged-attention kernel):
-- The HF kernel paged KV path produces correct, coherent output.
-- 4/5 prompts are identical to the MLX inline cache path.
-- 1/5 ("The capital of France is") diverges at token 5 — both continuations
-  are valid English ("France is also the capital" vs "Italy is Rome. The").
-  Likely caused by floating-point non-determinism in the attention kernel
-  where top-2 logits are very close.
+Ground truth: the MLX inline-cache path (full-precision MLX softmax).
+The paged-attention path is expected to converge on it numerically. After
+the v2 softmax exp→exp2/log2 fold landed, 5/6 prompts produce the same
+argmax tokens as MLX through 10 decode steps.
 
-The assert accepts EITHER golden set (mlx-cache or paged-cache) and prints
-which path matched.
+The remaining prompt ("One plus one equals") has top-2 logits at the
+divergence step within ULP (',' vs '.'). Either greedy answer is valid
+English; the split is inherent to model rounding behavior at that token,
+not a kernel bug. We keep a paged-specific fallback for that one prompt.
 
 Run (paged KV path, the default):
-    python -m pytest tests/test_paged_deterministic.py -v -s
+    python -m pytest tests/test_paged_deterministic.py -v -s -m slow
 
 To test the MLX inline cache path instead, pass env vars explicitly:
     VLLM_METAL_USE_PAGED_ATTENTION=0 VLLM_METAL_MEMORY_FRACTION=auto \
-        python -m pytest tests/test_paged_deterministic.py -v -s
+        python -m pytest tests/test_paged_deterministic.py -v -s -m slow
 
 Note: MLX requires VLLM_METAL_MEMORY_FRACTION=auto (numeric fractions are
 only valid for the paged attention path).
@@ -50,8 +49,9 @@ PROMPTS = [
 ]
 
 # fmt: off
-# Golden token IDs from MLX inline cache (default path), greedy decoding.
-# Generated via: VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
+# Ground truth: MLX inline cache (greedy, full precision). Regenerate via:
+#   VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+#     python tools/gen_golden_token_ids_for_deterministics.py
 # Environment: mlx 0.31.1, mlx-lm 0.31.1
 GOLDEN_MLX = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722],
@@ -62,17 +62,12 @@ GOLDEN_MLX = {
     "Machine learning is":                        [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 
-# Golden token IDs from paged KV cache (Metal kernel), greedy decoding.
-# Generated via: VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.2 \
-#                VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/gen_golden_token_ids_for_deterministics.py
-# Environment: mlx 0.31.1, mlx-lm 0.31.1
-GOLDEN_PAGED = {
-    "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
-    "The weather today is not":                   [1661, 13, 576, 9315, 374, 220, 17, 15, 12348, 13],
+# Per-prompt fallback for prompts whose top-2 logits at the divergence
+# step are within ULP. Paged-path rounding can legitimately pick a
+# different argmax than MLX for those prompts. Listed here as documented
+# exceptions; the test accepts either the MLX golden or this fallback.
+GOLDEN_PAGED_FALLBACK = {
     "One plus one equals":                        [825, 13, 3776, 5519, 825, 16819, 1378, 13, 3776, 5519],
-    "The largest planet in our solar system is":  [1112, 30, 362, 13, 43562, 425, 13, 48976, 356, 13],
-    "Water boils at a temperature of":            [220, 16, 15, 15, 30937, 518, 5297, 44375, 7262, 13],
-    "Machine learning is":                        [264, 7988, 5392, 429, 702, 13791, 1506, 279, 2070, 315],
 }
 # fmt: on
 
@@ -158,28 +153,33 @@ class TestPagedDeterministic:
         text = output.outputs[0].text
 
         mlx_expected = GOLDEN_MLX[prompt]
-        paged_expected = GOLDEN_PAGED[prompt]
+        fallback = GOLDEN_PAGED_FALLBACK.get(prompt)
 
-        mlx_match = token_ids == mlx_expected
-        paged_match = token_ids == paged_expected
         print(
             f"VLLM_METAL_USE_PAGED_ATTENTION: {os.environ.get('VLLM_METAL_USE_PAGED_ATTENTION')}"
         )
         print(f"\n  prompt: {prompt!r}")
         print(f"  output: {text!r}")
         print(f"  ids:    {token_ids}")
-        if mlx_match:
-            print("  result: MATCHED mlx-cache golden")
-        elif paged_match:
-            print("  result: MATCHED paged-cache golden")
-        else:
-            print("  result: NO MATCH")
-            print(f"  expected (mlx):   {mlx_expected}")
-            print(f"  expected (paged): {paged_expected}")
 
-        assert mlx_match or paged_match, (
-            f"Output for {prompt!r} matched neither golden set.\n"
-            f"Got:            {token_ids}\n"
-            f"Expected (mlx): {mlx_expected}\n"
-            f"Expected (pgd): {paged_expected}"
+        if token_ids == mlx_expected:
+            print("  result: MATCHED MLX ground truth")
+            return
+        if fallback is not None and token_ids == fallback:
+            print("  result: MATCHED paged fallback (documented divergence)")
+            return
+
+        print("  result: NO MATCH")
+        print(f"  expected (MLX):   {mlx_expected}")
+        if fallback is not None:
+            print(f"  fallback (paged): {fallback}")
+
+        msg = (
+            f"Output for {prompt!r} did not match the MLX ground truth"
+            f"{' or its paged fallback' if fallback is not None else ''}.\n"
+            f"Got:              {token_ids}\n"
+            f"Expected (MLX):   {mlx_expected}\n"
         )
+        if fallback is not None:
+            msg += f"Fallback (paged): {fallback}\n"
+        raise AssertionError(msg)
