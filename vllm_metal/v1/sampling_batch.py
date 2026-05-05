@@ -437,9 +437,6 @@ def sample_prefill_tokens(
     logprobs_rows: list[LogprobsLists | None] = []
     verification_logits: dict[str, mx.array] = {}
 
-    # initialize outside the loop to collect all speculative hits
-    verification_logits: dict[str, mx.array] = {}
-
     logger.debug(
         "sample_prefill_tokens started. num_prefill=%d, has_spec_metadata=%s",
         len(prefill_reqs),

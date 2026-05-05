@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any
+from typing import Any, cast
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -109,7 +109,7 @@ class MetalSpecDecodeWorker(WorkerBase):
         if req_ids:
             self._last_draft_token_ids = DraftTokenIds(
                 req_ids=[req_ids[0]],
-                draft_token_ids=[draft_tokens_batch[0].tolist()],
+                draft_token_ids=[cast(list[int], draft_tokens_batch[0].tolist())],
             )
         else:
             self._last_draft_token_ids = None
