@@ -42,6 +42,11 @@ def _read_metal_source(path: Path) -> str:
     return text
 
 
+def _read_v2_metal_source(filename: str) -> str:
+    """Read a kernels_v2 .metal source file."""
+    return _read_metal_source(_KERNELS_V2_DIR / filename)
+
+
 def _build_reshape_cache_source() -> str:
     """Concatenate float8 + utils + reshape_and_cache into a single source."""
     parts = [
