@@ -29,6 +29,10 @@ if TYPE_CHECKING:
     VLLM_METAL_PREFIX_CACHE: bool = False
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
+    VLLM_METAL_GDN_CONV_KERNEL: str = "2"
+    VLLM_METAL_GDN_RECURRENT_KERNEL: str = "2"
+    VLLM_GDN_CONV_KERNEL: str = "2"
+    VLLM_GDN_RECURRENT_KERNEL: str = "2"
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -71,6 +75,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
+    # GDN decode kernel selectors. Prefer the VLLM_METAL_GDN_* names;
+    # VLLM_GDN_* aliases remain for compatibility with existing local scripts.
+    "VLLM_METAL_GDN_CONV_KERNEL": lambda: os.getenv(
+        "VLLM_METAL_GDN_CONV_KERNEL", os.getenv("VLLM_GDN_CONV_KERNEL", "2")
+    ),
+    "VLLM_METAL_GDN_RECURRENT_KERNEL": lambda: os.getenv(
+        "VLLM_METAL_GDN_RECURRENT_KERNEL",
+        os.getenv("VLLM_GDN_RECURRENT_KERNEL", "2"),
+    ),
+    "VLLM_GDN_CONV_KERNEL": lambda: os.getenv("VLLM_GDN_CONV_KERNEL", "2"),
+    "VLLM_GDN_RECURRENT_KERNEL": lambda: os.getenv("VLLM_GDN_RECURRENT_KERNEL", "2"),
 }
 
 

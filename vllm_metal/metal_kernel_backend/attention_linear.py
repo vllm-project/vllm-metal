@@ -5,9 +5,9 @@ Decomposes the mlx_lm GDN module's forward pass and replaces the recurrent
 update step with an mx.fast.metal_kernel that operates on gathered state
 slices from a paged pool via slot_mapping.
 
-The kernel participates in MLX's lazy evaluation graph — no explicit mx.eval
-barriers are needed in the forward path.  State is gathered from the pool
-before the kernel and scattered back afterward, both as lazy MLX ops.
+The decode fast path participates in MLX's lazy evaluation graph — no
+explicit mx.eval barriers are needed there.  Prefill and unsupported decode
+shapes fall back to the original upstream paths.
 
 Conv1d remains per-request (stateful), but the expensive recurrent step is
 dispatched as a single batched Metal kernel call across all requests.
@@ -27,7 +27,7 @@ from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import get_context
 
 # ---------------------------------------------------------------------------
-# Phase 2: mx.fast.metal_kernel conv1d + SiLU decode (lazy graph integration)
+# mx.fast.metal_kernel conv1d + SiLU decode (lazy graph integration)
 # ---------------------------------------------------------------------------
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
@@ -55,14 +55,20 @@ def _make_conv1d_silu_decode_kernel():
 
 
 _conv1d_silu_decode_kernel = _make_conv1d_silu_decode_kernel()
-_conv_kernel_mode = os.environ.get("VLLM_GDN_CONV_KERNEL", "2")
+_conv_kernel_mode = os.environ.get(
+    "VLLM_METAL_GDN_CONV_KERNEL",
+    os.environ.get("VLLM_GDN_CONV_KERNEL", "2"),
+)
 
 # ---------------------------------------------------------------------------
 # Recurrent kernel modes: "1" = C++ eager, "2" = lazy (default)
 # ---------------------------------------------------------------------------
-_recurrent_kernel_mode = os.environ.get("VLLM_GDN_RECURRENT_KERNEL", "2")
+_recurrent_kernel_mode = os.environ.get(
+    "VLLM_METAL_GDN_RECURRENT_KERNEL",
+    os.environ.get("VLLM_GDN_RECURRENT_KERNEL", "2"),
+)
 
-# Phase 2.5: mx.fast.metal_kernel recurrent update (lazy graph integration)
+# mx.fast.metal_kernel recurrent update (lazy graph integration)
 # Ported from mlx_lm/models/gated_delta.py with slot_mapping for paged state.
 _GDN_RECURRENT_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
 
@@ -195,7 +201,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             and is_decode
         )
         if use_v2:
-            # --- Phase 2: mx.fast.metal_kernel (lazy, no sync) ---
+            # --- mx.fast.metal_kernel decode path (lazy, no sync) ---
             conv_dim = state_cache.conv_dim
             kernel_size = inner.conv_kernel_size
             max_seqs = state_cache.max_seqs
@@ -295,17 +301,23 @@ class GDNPagedAttentionWrapper(nn.Module):
         g = compute_g(inner.A_log, a, inner.dt_bias).astype(x.dtype)
         beta = mx.sigmoid(b).astype(x.dtype)
 
-        # === Step 5: Recurrent update — V2 lazy / noop / V1 eager ===
+        # === Step 5: Recurrent update — V2 lazy / V1 eager ===
         n_hk = inner.num_k_heads
         n_hv = inner.num_v_heads
         d_k = inner.head_k_dim
         d_v = inner.head_v_dim
 
         is_decode = total_tokens == num_requests
+        # The Metal source uses one 32-lane SIMD group across Dk and a
+        # fixed-size per-thread register array, matching the original C++
+        # kernel's practical Dk <= 256 envelope.  Fall back for unusual head
+        # dimensions rather than silently dropping remainder channels.
+        recurrent_shape_supported = d_k % 32 == 0 and d_k <= 256
         use_recurrent_v2 = (
             _recurrent_kernel_mode == "2"
             and _recurrent_v2_kernel is not None
             and is_decode
+            and recurrent_shape_supported
         )
         # Stable request → slot mapping from model_runner's allocator.
         if ctx.gdn_slot_mapping is not None:
@@ -314,7 +326,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             slot_ids = list(range(num_requests))
 
         if use_recurrent_v2:
-            # --- Phase 2.5: mx.fast.metal_kernel lazy dispatch ---
+            # --- mx.fast.metal_kernel lazy recurrent dispatch ---
             # No mx.eval — stays in lazy graph for downstream fusion.
             state_in = state_cache.recurrent_states[cache_idx]
             max_seqs = state_cache.max_seqs
