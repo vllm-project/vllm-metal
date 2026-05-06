@@ -18,10 +18,7 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
-    apply_lazy_gdn_conv_decode,
-    apply_lazy_gdn_recurrent_decode,
-)
+from vllm_metal.metal_kernel_backend.gdn_lazy_decode import GDNLazyDecodeKernels
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import get_context
 
@@ -61,6 +58,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
         object.__setattr__(self, "_gdn_state_cache", state_cache)
+        object.__setattr__(self, "_gdn_lazy_decode", GDNLazyDecodeKernels.from_env())
 
     def __call__(
         self,
@@ -117,7 +115,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             if ctx.gdn_slot_mapping is not None
             else list(range(num_requests))
         )
-        conv_packed = apply_lazy_gdn_conv_decode(
+        conv_packed = self._gdn_lazy_decode.try_conv_decode(
             mixed_qkv, inner, state_cache, cache_idx, slot_ids
         )
         conv_outputs = []
@@ -175,7 +173,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         d_k = inner.head_k_dim
         d_v = inner.head_v_dim
 
-        y_flat = apply_lazy_gdn_recurrent_decode(
+        y_flat = self._gdn_lazy_decode.try_recurrent_decode(
             q,
             k,
             v,
