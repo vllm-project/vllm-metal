@@ -18,7 +18,9 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.gdn_lazy_decode import GDNLazyDecodeKernels
+from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
+    get_gdn_lazy_decode_kernels,
+)
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import get_context
 
@@ -58,7 +60,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
         object.__setattr__(self, "_gdn_state_cache", state_cache)
-        object.__setattr__(self, "_gdn_lazy_decode", GDNLazyDecodeKernels.from_env())
+        object.__setattr__(self, "_gdn_lazy_decode", get_gdn_lazy_decode_kernels())
 
     def __call__(
         self,

@@ -14,13 +14,24 @@ import pytest
 import vllm_metal.metal_kernel_backend.attention_linear as attention_linear
 from vllm_metal.metal import get_ops
 from vllm_metal.metal_kernel_backend.attention_linear import GDNPagedAttentionWrapper
-from vllm_metal.metal_kernel_backend.gdn_lazy_decode import GDNLazyDecodeKernels
+from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
+    GDNLazyDecodeKernels,
+    get_gdn_lazy_decode_kernels,
+    reset_gdn_lazy_decode_kernels,
+)
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
     clear_context,
     set_context,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_lazy_decode_kernels() -> None:
+    reset_gdn_lazy_decode_kernels()
+    yield
+    reset_gdn_lazy_decode_kernels()
 
 
 class _DepthwiseConv1D:
@@ -368,6 +379,35 @@ def test_lazy_decode_kill_switch_disables_kernel_construction(
         )
         is None
     )
+
+
+def test_shared_lazy_decode_owner_reuses_kernel_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fake_make_kernel(name: str, *_: Any) -> object:
+        calls.append(name)
+        return object()
+
+    monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "1")
+    monkeypatch.setattr(
+        GDNLazyDecodeKernels,
+        "_make_kernel",
+        staticmethod(fake_make_kernel),
+    )
+
+    first = get_gdn_lazy_decode_kernels()
+    second = get_gdn_lazy_decode_kernels()
+
+    assert first is second
+    assert calls == ["gdn_conv1d_silu_decode_v2", "gdn_recurrent_v2"]
+
+    monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "0")
+    disabled = get_gdn_lazy_decode_kernels()
+
+    assert disabled is not first
+    assert calls == ["gdn_conv1d_silu_decode_v2", "gdn_recurrent_v2"]
 
 
 def test_wrapper_kill_switch_uses_recurrent_fallback(

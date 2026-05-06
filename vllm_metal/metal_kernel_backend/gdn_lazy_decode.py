@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from threading import Lock
 from typing import Any
 
 import mlx.core as mx
@@ -212,3 +213,33 @@ class GDNLazyDecodeKernels:
         )
         state_cache.recurrent_states[cache_idx] = state_out
         return y_out
+
+
+_gdn_lazy_decode_kernels: GDNLazyDecodeKernels | None = None
+_gdn_lazy_decode_enabled: bool | None = None
+_gdn_lazy_decode_lock = Lock()
+
+
+def get_gdn_lazy_decode_kernels() -> GDNLazyDecodeKernels:
+    """Get the process-level lazy GDN decode kernel owner.
+
+    The env kill switch is read when the shared owner is acquired; existing
+    wrappers keep the owner they stored at construction time.
+    """
+    global _gdn_lazy_decode_enabled, _gdn_lazy_decode_kernels
+
+    with _gdn_lazy_decode_lock:
+        enabled = envs.VLLM_METAL_GDN_LAZY_DECODE
+        if _gdn_lazy_decode_kernels is None or _gdn_lazy_decode_enabled != enabled:
+            _gdn_lazy_decode_kernels = GDNLazyDecodeKernels(enabled=enabled)
+            _gdn_lazy_decode_enabled = enabled
+        return _gdn_lazy_decode_kernels
+
+
+def reset_gdn_lazy_decode_kernels() -> None:
+    """Reset the shared lazy GDN decode kernel owner for tests."""
+    global _gdn_lazy_decode_enabled, _gdn_lazy_decode_kernels
+
+    with _gdn_lazy_decode_lock:
+        _gdn_lazy_decode_kernels = None
+        _gdn_lazy_decode_enabled = None
