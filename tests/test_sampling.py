@@ -330,6 +330,15 @@ class TestV1SamplingBatch:
         assert not SamplingBatch.can_use_native_greedy(
             [SamplingParams(temperature=0.0, logprobs=1)]
         )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, allowed_token_ids=[1, 2])]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, bad_words=["bad"])]
+        )
+        assert not SamplingBatch.can_use_native_greedy(
+            [SamplingParams(temperature=0.0, min_tokens=5, max_tokens=10)]
+        )
 
     def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
         assert SamplingBatch.can_use_native_greedy(

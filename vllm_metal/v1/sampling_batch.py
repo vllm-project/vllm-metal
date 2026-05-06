@@ -177,6 +177,11 @@ class SamplingBatch:
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
             and sampling_params.logprobs is None
+            and not sampling_params.logit_bias
+            and not sampling_params.allowed_token_ids
+            and not sampling_params.bad_words
+            and not sampling_params.min_tokens
+            and not getattr(sampling_params, "thinking_token_budget", None)
             for sampling_params in sampling_params_list
         )
 
@@ -254,6 +259,29 @@ class SamplingBatch:
         )
         return frequency_penalties, presence_penalties, repetition_penalties
 
+    def _make_allowed_token_ids_mask(self) -> torch.Tensor | None:
+        """Build allowed_token_ids_mask from SamplingParams."""
+        if not any(sp.allowed_token_ids for sp in self.sampling_params_list):
+            return None
+        mask = torch.ones(
+            len(self.sampling_params_list),
+            self.vocab_size,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        for i, sp in enumerate(self.sampling_params_list):
+            if sp.allowed_token_ids:
+                mask[i, sp.allowed_token_ids] = False
+        return mask
+
+    def _make_bad_words_token_ids(self) -> dict[int, list[list[int]]]:
+        """Build bad_words_token_ids from SamplingParams."""
+        result: dict[int, list[list[int]]] = {}
+        for i, sp in enumerate(self.sampling_params_list):
+            if sp.bad_words_token_ids:
+                result[i] = sp.bad_words_token_ids
+        return result
+
     def make_sampling_metadata(self) -> SamplingMetadata:
         """Create vLLM ``SamplingMetadata`` for this batch."""
         (
@@ -276,8 +304,8 @@ class SamplingBatch:
             presence_penalties=presence_penalties,
             repetition_penalties=repetition_penalties,
             no_penalties=self.no_penalties,
-            allowed_token_ids_mask=None,
-            bad_words_token_ids={},
+            allowed_token_ids_mask=self._make_allowed_token_ids_mask(),
+            bad_words_token_ids=self._make_bad_words_token_ids(),
             logitsprocs=self.logitsprocs,
             logprob_token_ids=None,
         )
@@ -307,10 +335,7 @@ def sample_from_logits(
     satisfy the OpenAI serving contract.
     """
     if (
-        batch.all_greedy
-        and batch.no_top_k
-        and batch.no_top_p
-        and batch.no_penalties
+        SamplingBatch.can_use_native_greedy(batch.sampling_params_list)
         and not batch.needs_logprobs
     ):
         tokens = _mlx_greedy_sample(logits_2d)
