@@ -17,11 +17,7 @@ import torch
 
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
-from vllm_metal.quant.awq_loader import (
-    AWQQuantLoader,
-    _align_non_quantized_dtypes,
-    _read_raw_quantization_config,
-)
+from vllm_metal.quant.awq_loader import AWQQuantLoader
 
 
 def _mlx_dtype(torch_dtype):
@@ -98,60 +94,6 @@ def test_cache_key_stable_for_same_inputs():
     )
 
 
-# ---- text_config.quantization_config fallback ------------------------------
-
-
-def test_read_quantization_config_top_level(tmp_path):
-    model_dir = _write_config(
-        tmp_path,
-        {"model_type": "qwen2", "quantization_config": _AWQ_INNER},
-    )
-    assert _read_raw_quantization_config(str(model_dir)) == _AWQ_INNER
-
-
-def test_read_quantization_config_nested_text_config(tmp_path):
-    """Multimodal wrapper configs nest the quant config under
-    ``text_config``. ``mlx_lm.utils.load_model`` falls back to it; the
-    AWQ owner must do the same so the alias normalization / reject logic
-    still runs.
-    """
-    model_dir = _write_config(
-        tmp_path,
-        {
-            "model_type": "wrapper_vlm",
-            "text_config": {
-                "model_type": "qwen2",
-                "quantization_config": _AWQ_INNER,
-            },
-        },
-    )
-    assert _read_raw_quantization_config(str(model_dir)) == _AWQ_INNER
-
-
-def test_read_quantization_config_top_level_wins_over_text_config(tmp_path):
-    """If both are present, top-level takes precedence (matches mlx-lm)."""
-    nested = {**_AWQ_INNER, "bits": 8}  # would normally reject
-    model_dir = _write_config(
-        tmp_path,
-        {
-            "model_type": "wrapper",
-            "quantization_config": _AWQ_INNER,
-            "text_config": {"quantization_config": nested},
-        },
-    )
-    assert _read_raw_quantization_config(str(model_dir)) == _AWQ_INNER
-
-
-def test_read_quantization_config_absent(tmp_path):
-    model_dir = _write_config(tmp_path, {"model_type": "qwen2"})
-    assert _read_raw_quantization_config(str(model_dir)) is None
-
-
-def test_read_quantization_config_missing_dir():
-    """Non-existent path / non-HF repo: silently inactive, returns None."""
-    assert _read_raw_quantization_config("/nonexistent/path/zzz") is None
-
-
 # ---- AWQQuantLoader.for_model ---------------------------------------------
 
 
@@ -170,6 +112,53 @@ def test_for_model_returns_none_for_non_awq(tmp_path):
 def test_for_model_returns_none_for_no_quant_config(tmp_path):
     model_dir = _write_config(tmp_path, {"model_type": "qwen2"})
     assert AWQQuantLoader.for_model(str(model_dir)) is None
+
+
+def test_for_model_returns_none_for_missing_dir():
+    """Non-existent path / non-HF repo: silently inactive, returns None.
+
+    The owner is consulted at every load and must not raise on plain
+    local paths that simply do not exist as Hub repos either.
+    """
+    assert AWQQuantLoader.for_model("/nonexistent/path/zzz") is None
+
+
+def test_for_model_picks_up_nested_text_config(tmp_path):
+    """Multimodal wrapper configs nest the quant config under
+    ``text_config``. ``mlx_lm.utils.load_model`` falls back to it; the
+    AWQ owner mirrors that fallback so the alias normalization / reject
+    logic still runs against the nested config.
+    """
+    model_dir = _write_config(
+        tmp_path,
+        {
+            "model_type": "wrapper_vlm",
+            "text_config": {
+                "model_type": "qwen2",
+                "quantization_config": _AWQ_INNER,
+            },
+        },
+    )
+    assert AWQQuantLoader.for_model(str(model_dir)) is not None
+
+
+def test_for_model_top_level_quant_config_wins_over_text_config(tmp_path):
+    """If both are present, top-level takes precedence (matches mlx-lm).
+
+    Pinned by giving ``text_config`` an invalid config (``bits=8``); if
+    the owner picked text_config instead of top-level,
+    ``normalize_quant_config`` would raise on the invalid bits.
+    """
+    nested = {**_AWQ_INNER, "bits": 8}
+    model_dir = _write_config(
+        tmp_path,
+        {
+            "model_type": "wrapper",
+            "quantization_config": _AWQ_INNER,
+            "text_config": {"quantization_config": nested},
+        },
+    )
+    assert AWQQuantLoader.for_model(str(model_dir)) is not None
 
 
 def test_for_model_raises_for_gptq(tmp_path):
@@ -298,7 +287,7 @@ def test_align_dtypes_casts_quantized_linear_regular_bias():
     qlinear = _make_quantized_linear(bias=True)
     wrapper = _SingleLeaf(qlinear)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     assert qlinear.scales.dtype == mx.float16
     assert qlinear.biases.dtype == mx.float16
@@ -313,7 +302,7 @@ def test_align_dtypes_leaves_quantized_linear_without_regular_bias():
     qlinear = _make_quantized_linear(bias=False)
     wrapper = _SingleLeaf(qlinear)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     assert qlinear.scales.dtype == mx.float16
     assert qlinear.biases.dtype == mx.float16
@@ -334,7 +323,7 @@ def test_align_dtypes_casts_non_quantized_floating_params():
     )
     wrapper = _SingleLeaf(plain)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     assert plain.weight.dtype == mx.bfloat16
     assert plain.bias.dtype == mx.bfloat16
@@ -357,7 +346,7 @@ def test_align_dtypes_treats_quantized_embedding_as_quantized():
     )
     wrapper = _SingleLeaf(qemb)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     assert qemb.scales.dtype == mx.float16
     assert qemb.biases.dtype == mx.float16
@@ -394,7 +383,7 @@ def test_align_dtypes_treats_duck_typed_protocol_module_as_quantized():
     fake = _DuckTypedQuantized()
     wrapper = _SingleLeaf(fake)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     # AWQ-transform buffers stay at the transform's dtype.
     assert fake.scales.dtype == mx.float16
@@ -429,7 +418,7 @@ def test_align_dtypes_distinguishes_biases_buffer_from_regular_bias(make_module)
     module = make_module()
     wrapper = _SingleLeaf(module)
 
-    n_cast = _align_non_quantized_dtypes(wrapper, mx.bfloat16)
+    n_cast = AWQQuantLoader._align_non_quantized_dtypes(wrapper, mx.bfloat16)
 
     assert module.biases.dtype == mx.float16, (
         "AWQ-transform `biases` (plural) must NOT be cast away from fp16"
