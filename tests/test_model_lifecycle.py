@@ -17,6 +17,7 @@ from vllm_metal.config import reset_config
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
+from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 _TEXT_MODEL_ARGS = {
@@ -306,8 +307,9 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
         assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
-        assert runner._multimodal_adapter._vision_tower is vision_tower
-        assert runner._multimodal_adapter._language_model is language_model
+        assert runner._multimodal_adapter.vision_tower is vision_tower
+        assert runner._multimodal_adapter.language_model is language_model
+        assert isinstance(runner.encoder_cache, EncoderCache)
 
     def test_load_generic_vlm_leaves_model_adapter_unset(
         self,
@@ -329,6 +331,7 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
         assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
 
     def test_generation_cache_separates_text_and_vlm_variants(
         self,

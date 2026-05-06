@@ -22,6 +22,7 @@ from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 # Engine-core subprocesses don't always re-invoke `vllm_metal._register()`,
@@ -160,10 +161,14 @@ class ModelLifecycle:
         runner._is_vlm = is_vlm
         runner._is_stt = False
         runner._stt_runtime_adapter = None
-        runner._multimodal_adapter = (
+        multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(model, hf_config)
             if is_vlm
             else None
+        )
+        runner._multimodal_adapter = multimodal_adapter
+        runner.encoder_cache = (
+            EncoderCache() if multimodal_adapter is not None else None
         )
 
         model_args = self._extract_model_args(model, is_vlm)
@@ -245,6 +250,7 @@ class ModelLifecycle:
         self._runner._is_stt = True
         self._runner._stt_runtime_adapter = model.create_runtime_adapter(model_name)
         self._runner._multimodal_adapter = None
+        self._runner.encoder_cache = None
 
     def resolve_model_dims(self) -> None:
         args = self._runner.model_args

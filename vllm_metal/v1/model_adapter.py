@@ -13,6 +13,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class MultimodalRuntimeAdapter(Protocol):
+    """Model-owned runtime state needed for native multimodal execution."""
+
+    forward_ready: bool
+
+    @property
+    def vision_tower(self) -> Any:
+        """Return the loaded vision encoder component."""
+
+    @property
+    def language_model(self) -> Any:
+        """Return the loaded language-model component."""
+
+
 class ModelAdapter(Protocol):
     """Model-specific hooks used by runner and cache orchestration."""
 
@@ -39,7 +53,9 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
-    def build_multimodal_adapter(self, model: Any, hf_config: Any) -> Any | None:
+    def build_multimodal_adapter(
+        self, model: Any, hf_config: Any
+    ) -> MultimodalRuntimeAdapter | None:
         """Return a model-owned multimodal adapter for native VLM execution."""
 
     def build_yoco_cache_mapping(
@@ -214,7 +230,9 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return model.language_model
         return model
 
-    def build_multimodal_adapter(self, model: Any, hf_config: Any) -> Any | None:
+    def build_multimodal_adapter(
+        self, model: Any, hf_config: Any
+    ) -> MultimodalRuntimeAdapter | None:
         """Build the native multimodal adapter for supported model families."""
         if hf_config is None:
             return None
@@ -228,7 +246,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
-        return Qwen3VLMultimodalAdapter._from_loaded_model(model)
+        return Qwen3VLMultimodalAdapter.from_loaded_model(model)
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]

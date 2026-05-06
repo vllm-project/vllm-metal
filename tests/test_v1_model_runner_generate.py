@@ -18,6 +18,7 @@ class TestV1MetalModelRunnerGenerate:
         captured: dict[str, object] = {}
 
         def fake_stream_generate(model, tokenizer, prompt, max_tokens=256, **kwargs):
+            captured["model"] = model
             captured["prompt"] = prompt
             captured["max_tokens"] = max_tokens
             captured["kwargs"] = kwargs
@@ -31,6 +32,7 @@ class TestV1MetalModelRunnerGenerate:
         out = runner.generate("p", max_tokens=3, temperature=0.0)
 
         assert out == "hello world"
+        assert captured["model"] is runner.model
         assert captured["prompt"] == "p"
         assert captured["max_tokens"] == 3
         kwargs = captured.get("kwargs")
@@ -58,6 +60,25 @@ class TestV1MetalModelRunnerGenerate:
         kwargs = captured.get("kwargs")
         assert isinstance(kwargs, dict)
         assert "sampler" in kwargs
+
+    def test_uses_forward_model_for_vlm_composite(self, monkeypatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_stream_generate(model, tokenizer, prompt, max_tokens=256, **kwargs):
+            captured["model"] = model
+            yield SimpleNamespace(text="ok")
+
+        monkeypatch.setattr(mr, "stream_generate", fake_stream_generate)
+
+        language_model = object()
+        runner = self._make_runner()
+        runner.model = SimpleNamespace(language_model=language_model)
+        runner._is_vlm = True
+
+        out = runner.generate("p", max_tokens=1)
+
+        assert out == "ok"
+        assert captured["model"] is language_model
 
 
 class TestV1MetalModelRunnerSampleTokens:

@@ -58,7 +58,11 @@ from vllm_metal.v1.contiguous_cache import (
     _merge_kv_caches,
 )
 from vllm_metal.v1.mm import EncoderCache
-from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
+from vllm_metal.v1.model_adapter import (
+    DefaultModelAdapter,
+    ModelAdapter,
+    MultimodalRuntimeAdapter,
+)
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
@@ -212,10 +216,8 @@ class MetalModelRunner:
         self._stt_runtime_adapter: STTRuntimeAdapter | None = (
             None  # Set during STT loading
         )
-        self._multimodal_adapter: Any | None = None
-        self.encoder_cache: EncoderCache | None = (
-            EncoderCache() if self._supports_multimodal_inputs() else None
-        )
+        self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
+        self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -305,10 +307,6 @@ class MetalModelRunner:
         if self._is_vlm:
             return self._model_adapter.text_model(self.model)
         return self.model
-
-    def _supports_multimodal_inputs(self) -> bool:
-        """Return whether vLLM scheduled multimodal features for this model."""
-        return bool(getattr(self.model_config, "is_multimodal_model", False))
 
     @property
     def mla_latent_dim(self) -> int:
@@ -969,12 +967,17 @@ class MetalModelRunner:
         """Return request ids whose runner-owned state should be evicted."""
         return scheduler_output.finished_req_ids
 
-    @staticmethod
     def _reject_scheduled_encoder_inputs(
+        self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
         """Fail fast until encoder execution and embedding splice are wired."""
         if not scheduled_encoder_inputs:
+            return
+        if (
+            self._multimodal_adapter is not None
+            and self._multimodal_adapter.forward_ready
+        ):
             return
         raise NotImplementedError(
             "Multimodal encoder execution is not wired on Metal yet. "
@@ -1317,8 +1320,8 @@ class MetalModelRunner:
         if self._is_stt:
             return self._execute_stt(scheduler_output)
 
-        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
+        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
 
         # Fail fast before any model work runs.  On the non-paged path,
@@ -1521,7 +1524,7 @@ class MetalModelRunner:
             return mx.random.categorical(logits / temperature)
 
         for response in stream_generate(
-            self.model,
+            self._forward_model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,

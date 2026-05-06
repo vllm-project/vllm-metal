@@ -263,8 +263,9 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, Qwen3VLMultimodalAdapter)
-        assert adapter._vision_tower is vision_tower
-        assert adapter._language_model is language_model
+        assert adapter.forward_ready is False
+        assert adapter.vision_tower is vision_tower
+        assert adapter.language_model is language_model
 
     def test_builds_qwen3_vl_adapter_from_architecture(self) -> None:
         model = SimpleNamespace(

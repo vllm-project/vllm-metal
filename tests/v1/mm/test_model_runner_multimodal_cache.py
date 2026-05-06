@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -190,7 +191,7 @@ def test_reset_mm_cache_delegates_to_encoder_cache() -> None:
     encoder_cache.reset_mm_cache.assert_called_once_with()
 
 
-def test_execute_model_rejects_scheduled_encoder_inputs_until_encoder_path() -> None:
+def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast() -> None:
     runner = _runner_with_encoder_cache()
     assert runner.encoder_cache is not None
     runner.encoder_cache.encoder_outputs["drop"] = mx.array([[1.0]])
@@ -203,4 +204,11 @@ def test_execute_model_rejects_scheduled_encoder_inputs_until_encoder_path() -> 
             )
         )
 
-    assert "drop" in runner.encoder_cache.encoder_outputs
+    assert "drop" not in runner.encoder_cache.encoder_outputs
+
+
+def test_execute_model_honors_forward_ready_multimodal_adapter() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = SimpleNamespace(forward_ready=True)
+
+    runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
