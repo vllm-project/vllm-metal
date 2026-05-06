@@ -8,10 +8,12 @@ floating params. ``ModelLifecycle`` delegates the entire AWQ branch to
 instances of this class so quantization policy stays cohesive in one
 place rather than leaking into the generic loader flow.
 
-GPTQ checkpoints currently flow through the same code path because
-mlx-lm's ``_transform_awq_weights`` accepts both ``quant_method`` values
-under the v1 supported subset. GPTQ is not part of the public support
-claim until a real GPTQ checkpoint is validated end-to-end.
+GPTQ checkpoints are explicitly rejected at the entry point. mlx-lm's
+``_transform_awq_weights`` accepts ``quant_method="gptq"`` at the
+transform level, but GPTQ is not part of the v1 support claim and is
+deferred to a follow-up PR once a real GPTQ checkpoint is validated
+end-to-end. Until then the loader does not silently take ownership of
+GPTQ checkpoints.
 """
 
 from __future__ import annotations
@@ -27,12 +29,12 @@ from huggingface_hub.utils import HFValidationError
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 
-from vllm_metal.quant.awq_config import normalize_quant_config
+from vllm_metal.quant.awq_config import (
+    UnsupportedQuantizationConfigError,
+    normalize_quant_config,
+)
 
 logger = init_logger(__name__)
-
-
-_QUANT_METHODS = ("awq", "gptq")
 
 
 def _read_raw_quantization_config(model_name: str) -> Mapping[str, Any] | None:
@@ -141,12 +143,12 @@ def _align_non_quantized_dtypes(model: Any, target_dtype: Any) -> int:
 
 
 class AWQQuantLoader:
-    """Owner for the AWQ (and internally also GPTQ) load flow.
+    """Owner for the AWQ load flow.
 
     Construct via :meth:`for_model`, which inspects the checkpoint's
-    ``config.json`` and returns ``None`` when the checkpoint is not
-    AWQ/GPTQ. Lifecycle dispatches the quantized branch to this owner so
-    the dtype-scoped cache key and the post-load alignment policy do not
+    ``config.json`` and returns ``None`` when the checkpoint is not AWQ.
+    Lifecycle dispatches the quantized branch to this owner so the
+    dtype-scoped cache key and the post-load alignment policy do not
     bleed into generic loader code paths.
     """
 
@@ -160,17 +162,32 @@ class AWQQuantLoader:
 
     @classmethod
     def for_model(cls, model_name: str) -> AWQQuantLoader | None:
-        """Detect AWQ/GPTQ in ``model_name``'s ``config.json`` (local dir or
-        HF Hub) and return a configured loader. Returns ``None`` when the
-        checkpoint is not AWQ/GPTQ.
+        """Detect AWQ in ``model_name``'s ``config.json`` (local dir or HF
+        Hub) and return a configured loader. Returns ``None`` when the
+        checkpoint has no quantization config or uses a quant method
+        unrelated to AWQ.
+
+        GPTQ checkpoints raise :class:`UnsupportedQuantizationConfigError`
+        rather than returning ``None``: the loader does not silently take
+        ownership of a quantized checkpoint that is outside the v1
+        support claim, and falling through to the generic loader would
+        bypass the dtype-alignment contract this owner enforces.
 
         Raises:
-            UnsupportedQuantizationConfigError: AWQ/GPTQ but outside v1 scope.
+            UnsupportedQuantizationConfigError: AWQ but outside v1 scope,
+                or GPTQ (not yet validated for vllm-metal).
         """
         raw_qc = _read_raw_quantization_config(model_name)
         if raw_qc is None:
             return None
-        if raw_qc.get("quant_method") not in _QUANT_METHODS:
+        quant_method = raw_qc.get("quant_method")
+        if quant_method == "gptq":
+            raise UnsupportedQuantizationConfigError(
+                "GPTQ checkpoints are not yet validated for vllm-metal; "
+                "v1 only supports AWQ. Use an AWQ release of this "
+                "checkpoint, or re-quantize with AWQ."
+            )
+        if quant_method != "awq":
             return None
         return cls(normalize_quant_config(raw_qc))
 

@@ -156,7 +156,7 @@ def test_read_quantization_config_missing_dir():
 
 
 def test_for_model_returns_none_for_non_awq(tmp_path):
-    """Non-AWQ/GPTQ checkpoints get None back, no exception."""
+    """Non-AWQ checkpoints get None back, no exception."""
     model_dir = _write_config(
         tmp_path,
         {
@@ -170,6 +170,30 @@ def test_for_model_returns_none_for_non_awq(tmp_path):
 def test_for_model_returns_none_for_no_quant_config(tmp_path):
     model_dir = _write_config(tmp_path, {"model_type": "qwen2"})
     assert AWQQuantLoader.for_model(str(model_dir)) is None
+
+
+def test_for_model_raises_for_gptq(tmp_path):
+    """GPTQ is rejected loudly at the loader entry point. Falling through
+    to the generic loader would bypass the dtype-alignment contract this
+    owner enforces, so the loader must not silently take ownership of a
+    quant_method it has not yet validated.
+    """
+    model_dir = _write_config(
+        tmp_path,
+        {
+            "model_type": "qwen2",
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": True,
+                "version": "gemm",
+            },
+        },
+    )
+    with pytest.raises(UnsupportedQuantizationConfigError) as excinfo:
+        AWQQuantLoader.for_model(str(model_dir))
+    assert "GPTQ" in str(excinfo.value)
 
 
 def test_for_model_returns_loader_for_awq(tmp_path):

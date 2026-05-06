@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AWQ / GPTQ quantization-config normalization for vllm-metal.
+"""AWQ quantization-config normalization for vllm-metal.
 
-mlx_lm 0.31.3+ ships an AWQ/GPTQ -> MLX-affine repack inside
+mlx_lm 0.31.3+ ships an AWQ -> MLX-affine repack inside
 ``_transform_awq_weights``. vllm-metal's ``model_lifecycle`` calls
-``mlx_lm.load`` for non-VLM checkpoints, so AWQ/GPTQ checkpoints already
+``mlx_lm.load`` for non-VLM checkpoints, so AWQ checkpoints already
 load. This module is the *entry-point preflight*: it normalizes alias
 fields the upstream transform does not know about, and rejects
 configurations that vllm-metal does not validate, before any model state is
 constructed.
 
-Supported configuration (AWQ and GPTQ share the same v1 scope):
+Supported configuration:
 
+  quant_method: "awq"
   bits        : 4
   group_size  : 128
-  zero_point  : true            (or AutoGPTQ alias ``sym: false``)
+  zero_point  : true
   version     : "gemm"   (case-insensitive on input)
 
 Rejected:
@@ -22,16 +23,12 @@ Rejected:
   bits != 4              (mlx_lm rejects too, but we want a clearer error
                           and to fail before mlx_lm.load constructs the model)
   group_size != 128
-  zero_point: false      (or AutoGPTQ alias ``sym: true`` — symmetric
-                          quantization is not in v1 scope)
-  GPTQ with ``desc_act: true``  (config-level act-order signal)
+  zero_point: false      (symmetric quantization is not in v1 scope)
 
-Out of scope for the v1 preflight: GPTQ checkpoints whose act-order is
-expressed as per-weight ``*.g_idx`` tensors rather than a config-level
-``desc_act`` flag. mlx_lm's ``_transform_awq_weights`` rejects per-weight
-``*.g_idx`` directly during load, but later than this preflight. A
-safetensors-key scan to bring that rejection forward is deferred to the
-PR that promotes GPTQ to first-class scope.
+GPTQ checkpoints are rejected upstream of this normalizer by
+``AWQQuantLoader.for_model``: GPTQ is not part of the v1 support claim
+and is deferred to a follow-up PR once a real GPTQ checkpoint is
+validated end-to-end.
 """
 
 from __future__ import annotations
@@ -41,16 +38,16 @@ from typing import Any
 
 
 class UnsupportedQuantizationConfigError(ValueError):
-    """Raised before model load when an AWQ/GPTQ config is outside v1 scope.
+    """Raised before model load when an AWQ config is outside v1 scope.
 
     The message names the offending field and value so users know exactly
     what to change (re-quantize, switch checkpoint, etc.).
     """
 
 
-# Aliases produced by raw AutoAWQ / older GPTQ tooling. Modern HF releases
-# already normalize these to canonical names, but third-party producers do
-# not always.
+# Aliases produced by raw AutoAWQ tooling. Modern HF releases already
+# normalize these to canonical names, but third-party producers do not
+# always.
 _BITS_ALIASES = ("bits", "w_bit")
 _GROUP_SIZE_ALIASES = ("group_size", "q_group_size")
 
@@ -64,20 +61,20 @@ def _pick_alias(raw: Mapping[str, Any], aliases: tuple[str, ...]) -> Any:
 
 
 def normalize_quant_config(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize an HF ``quantization_config`` dict for v1 AWQ/GPTQ support.
+    """Normalize an HF ``quantization_config`` dict for v1 AWQ support.
 
-    Returns a new dict with canonical keys (``bits``, ``group_size``,
-    ``zero_point``, ``version``, ``quant_method``) suitable for handing to
+    Returns a new dict with canonical keys (``quant_method``, ``bits``,
+    ``group_size``, ``zero_point``, ``version``) suitable for handing to
     ``mlx_lm.load`` via ``model_config={"quantization_config": ...}``.
 
     Raises:
         UnsupportedQuantizationConfigError: if any field is outside v1 scope.
     """
     quant_method = raw.get("quant_method")
-    if quant_method not in ("awq", "gptq"):
+    if quant_method != "awq":
         raise UnsupportedQuantizationConfigError(
-            f"quant_method={quant_method!r} is not handled by the AWQ/GPTQ "
-            "preflight; expected 'awq' or 'gptq'."
+            f"quant_method={quant_method!r} is not handled by the AWQ "
+            "preflight; expected 'awq'."
         )
 
     bits = _pick_alias(raw, _BITS_ALIASES)
@@ -101,41 +98,11 @@ def normalize_quant_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             "group_size=128"
         )
 
-    # Resolve the symmetry signal. ``zero_point`` (AWQ canonical) and
-    # ``sym`` (AutoGPTQ alias) express the same property inverted —
-    # ``zero_point=true`` <-> ``sym=false`` (asymmetric, v1-supported);
-    # ``zero_point=false`` <-> ``sym=true`` (symmetric, v1-rejected).
-    # AutoGPTQ checkpoints commonly omit ``zero_point`` and use ``sym``
-    # alone; defaulting ``zero_point`` to True without consulting ``sym``
-    # would silently accept symmetric GPTQ configs the rest of the
-    # preflight claims to reject.
-    zero_point_raw = raw.get("zero_point")
-    sym = raw.get("sym")
-    if sym is not None and not isinstance(sym, bool):
-        raise UnsupportedQuantizationConfigError(f"sym={sym!r} must be a boolean")
-    if sym is True:
-        if zero_point_raw is True:
-            raise UnsupportedQuantizationConfigError(
-                "conflicting symmetry signals: sym=true (symmetric) but "
-                "zero_point=true (asymmetric)"
-            )
-        zero_point = False
-    elif sym is False:
-        if zero_point_raw is False:
-            raise UnsupportedQuantizationConfigError(
-                "conflicting symmetry signals: sym=false (asymmetric) but "
-                "zero_point=false (symmetric)"
-            )
-        zero_point = True
-    elif zero_point_raw is None:
-        zero_point = True
-    else:
-        zero_point = zero_point_raw
+    zero_point = raw.get("zero_point", True)
     if zero_point is not True:
         raise UnsupportedQuantizationConfigError(
             "symmetric quantization is not supported; v1 requires "
-            "asymmetric (zero_point=true, or sym=false in AutoGPTQ "
-            f"convention). Got zero_point={zero_point_raw!r}, sym={sym!r}."
+            f"zero_point=true. Got zero_point={zero_point!r}."
         )
 
     version_raw = raw.get("version", "gemm")
@@ -155,16 +122,8 @@ def normalize_quant_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             "'gemm' (case-insensitive)"
         )
 
-    if quant_method == "gptq" and raw.get("desc_act") is True:
-        raise UnsupportedQuantizationConfigError(
-            "GPTQ desc_act=true is not supported; v1 requires "
-            "desc_act=false (no activation-order column permutation). "
-            "Per-weight `*.g_idx` tensors are rejected later by mlx-lm "
-            "during load."
-        )
-
     return {
-        "quant_method": quant_method,
+        "quant_method": "awq",
         "bits": bits,
         "group_size": group_size,
         "zero_point": True,

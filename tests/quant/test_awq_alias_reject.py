@@ -68,14 +68,6 @@ _CANONICAL = {
             "zero_point": True,
             "version": "GEMM",
         },
-        # GPTQ canonical (same v1 scope as AWQ).
-        {
-            "quant_method": "gptq",
-            "bits": 4,
-            "group_size": 128,
-            "zero_point": True,
-            "version": "gemm",
-        },
         # `version` defaults to "gemm" when omitted.
         {
             "quant_method": "awq",
@@ -90,25 +82,6 @@ _CANONICAL = {
             "group_size": 128,
             "version": "gemm",
         },
-        # AutoGPTQ asymmetric: ``sym=false`` is the AutoGPTQ alias for
-        # ``zero_point=true`` and is the typical realistic GPTQ config
-        # (no ``zero_point`` field).
-        {
-            "quant_method": "gptq",
-            "bits": 4,
-            "group_size": 128,
-            "sym": False,
-            "version": "gemm",
-        },
-        # AutoGPTQ asymmetric with both fields set consistently.
-        {
-            "quant_method": "gptq",
-            "bits": 4,
-            "group_size": 128,
-            "zero_point": True,
-            "sym": False,
-            "version": "gemm",
-        },
     ],
     ids=[
         "canonical-awq",
@@ -116,18 +89,13 @@ _CANONICAL = {
         "alias-q_group_size",
         "alias-uppercase-GEMM",
         "all-three-aliases",
-        "canonical-gptq",
         "default-version",
         "default-zero_point",
-        "gptq-sym-false",
-        "gptq-zero_point-and-sym-consistent",
     ],
 )
 def test_normalize_returns_canonical(raw):
     out = normalize_quant_config(raw)
-    # Result mirrors the original quant_method (awq vs gptq) but every
-    # other field is canonicalized.
-    assert out["quant_method"] == raw["quant_method"]
+    assert out["quant_method"] == "awq"
     assert out["bits"] == 4
     assert out["group_size"] == 128
     assert out["zero_point"] is True
@@ -143,6 +111,10 @@ def test_normalize_returns_canonical(raw):
         # Wrong/missing quant_method
         ({"quant_method": "fp8", "bits": 4, "group_size": 128}, "quant_method"),
         ({"bits": 4, "group_size": 128}, "quant_method"),
+        # GPTQ rejected at the normalizer level too (the loader rejects
+        # earlier at ``for_model``, but the normalizer itself only
+        # accepts ``quant_method='awq'``).
+        ({"quant_method": "gptq", "bits": 4, "group_size": 128}, "quant_method"),
         # Missing bits / group_size
         ({"quant_method": "awq", "group_size": 128}, "bits"),
         ({"quant_method": "awq", "bits": 4}, "group_size"),
@@ -180,74 +152,11 @@ def test_normalize_returns_canonical(raw):
             },
             "gemv",
         ),
-        # GPTQ desc_act=true
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "desc_act": True,
-            },
-            "desc_act",
-        ),
-        # AutoGPTQ symmetric (sym=true, no zero_point): the common
-        # AutoGPTQ default for symmetric checkpoints — must NOT be
-        # silently accepted as asymmetric.
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "sym": True,
-            },
-            "symmetric",
-        ),
-        # AutoGPTQ symmetric expressed via zero_point=false alone.
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "zero_point": False,
-            },
-            "symmetric",
-        ),
-        # Conflicting symmetry signals: sym=true with zero_point=true.
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "sym": True,
-                "zero_point": True,
-            },
-            "conflicting",
-        ),
-        # Conflicting symmetry signals: sym=false with zero_point=false.
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "sym": False,
-                "zero_point": False,
-            },
-            "conflicting",
-        ),
-        # Non-bool sym is malformed.
-        (
-            {
-                "quant_method": "gptq",
-                "bits": 4,
-                "group_size": 128,
-                "sym": "yes",
-            },
-            "sym=",
-        ),
     ],
     ids=[
         "wrong-quant_method-fp8",
         "missing-quant_method",
+        "wrong-quant_method-gptq",
         "missing-bits",
         "missing-group_size",
         "bits-8",
@@ -256,12 +165,6 @@ def test_normalize_returns_canonical(raw):
         "zero_point-false",
         "version-gemv",
         "version-uppercase-GEMV",
-        "gptq-desc_act-true",
-        "gptq-sym-true",
-        "gptq-zero_point-false",
-        "gptq-conflicting-sym-true-zp-true",
-        "gptq-conflicting-sym-false-zp-false",
-        "gptq-non-bool-sym",
     ],
 )
 def test_reject_paths(raw, needle):
