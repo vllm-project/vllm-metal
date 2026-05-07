@@ -20,8 +20,10 @@ from vllm.logger import init_logger
 from vllm_metal.compat import apply_compat_patches
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 # Engine-core subprocesses don't always re-invoke `vllm_metal._register()`,
@@ -160,6 +162,15 @@ class ModelLifecycle:
         runner._is_vlm = is_vlm
         runner._is_stt = False
         runner._stt_runtime_adapter = None
+        multimodal_adapter = (
+            self._model_adapter.build_multimodal_adapter(model, hf_config)
+            if is_vlm
+            else None
+        )
+        runner._multimodal_adapter = multimodal_adapter
+        runner.encoder_cache = (
+            EncoderCache() if multimodal_adapter is not None else None
+        )
 
         model_args = self._extract_model_args(model, is_vlm)
         runner.model_args = model_args
@@ -174,10 +185,28 @@ class ModelLifecycle:
     def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
-        cache_key = _generation_cache_key(model_name, is_vlm=is_vlm)
+
+        # AWQ checkpoints are owned end-to-end by AWQQuantLoader
+        # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
+        # cache key). Detection involves an HF Hub config fetch on cache
+        # miss, so first do a speculative cache lookup against both the
+        # AWQ and generic candidate keys; only invoke detection on miss.
+        # Probe the AWQ-specific key first so a previously cached AWQ load
+        # is served correctly even if the current detection call would
+        # have failed (e.g. transient Hub error after the cache was warmed).
+        generic_key = _generation_cache_key(model_name, is_vlm=is_vlm)
+        target_dtype: Any = None
+        awq_key: tuple[str, str] | None = None
+        if not is_vlm:
+            target_dtype = torch_to_mlx(
+                torch.empty(0, dtype=self._runner.model_config.dtype)
+            ).dtype
+            awq_key = AWQQuantLoader.cache_key(model_name, target_dtype=target_dtype)
 
         with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(cache_key)
+            cached = _MODEL_CACHE.get(awq_key) if awq_key is not None else None
+            if cached is None:
+                cached = _MODEL_CACHE.get(generic_key)
         if cached is not None:
             logger.info(
                 "Model loaded from cache in %.3fs: %s",
@@ -186,20 +215,31 @@ class ModelLifecycle:
             )
             return cached
 
+        awq_loader = None if is_vlm else AWQQuantLoader.for_model(model_name)
+        cache_key = awq_key if awq_loader is not None else generic_key
+        tokenizer_config = {
+            "trust_remote_code": self._runner.model_config.trust_remote_code
+        }
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
             logger.warning(
-                "VLM loaded in text-only mode: multimodal (image) inputs are "
-                "not yet supported. Vision encoder will be bypassed."
+                "VLM loaded via mlx-vlm; Metal multimodal encoder execution "
+                "is not wired yet. Text-only requests continue through the "
+                "language model."
             )
             model, tokenizer = mlx_vlm_load(model_name)
+        elif awq_loader is not None:
+            with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
+                model, tokenizer = awq_loader.load(
+                    compatible_model_name,
+                    target_dtype=target_dtype,
+                    tokenizer_config=tokenizer_config,
+                )
         else:
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
                 model, tokenizer = mlx_lm_load(
                     compatible_model_name,
-                    tokenizer_config={
-                        "trust_remote_code": self._runner.model_config.trust_remote_code
-                    },
+                    tokenizer_config=tokenizer_config,
                 )
 
         with _MODEL_CACHE_LOCK:
@@ -238,6 +278,8 @@ class ModelLifecycle:
         self._runner._is_vlm = False
         self._runner._is_stt = True
         self._runner._stt_runtime_adapter = model.create_runtime_adapter(model_name)
+        self._runner._multimodal_adapter = None
+        self._runner.encoder_cache = None
 
     def resolve_model_dims(self) -> None:
         args = self._runner.model_args

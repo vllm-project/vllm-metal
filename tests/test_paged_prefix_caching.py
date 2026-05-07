@@ -12,15 +12,20 @@ Run with:
 from __future__ import annotations
 
 from collections.abc import Callable
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 
 import vllm_metal.paged_attention_common as pac
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling_batch import _SamplingResult
 
 
 def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
@@ -42,10 +47,10 @@ def _greedy_sp() -> SamplingParams:
 
 
 def _make_scheduler_output(
-    new_reqs: list[SimpleNamespace],
+    new_reqs: list[NewRequestData],
     num_scheduled: dict[str, int] | None = None,
-) -> SimpleNamespace:
-    """Minimal SchedulerOutput stub."""
+) -> SchedulerOutput:
+    """Build a SchedulerOutput with new requests."""
     if num_scheduled is None:
         num_scheduled = {}
         for r in new_reqs:
@@ -53,19 +58,26 @@ def _make_scheduler_output(
             total = len(r.prompt_token_ids)
             num_scheduled[r.req_id] = total - computed
 
-    return SimpleNamespace(
+    return SchedulerOutput(
         scheduled_new_reqs=new_reqs,
-        scheduled_cached_reqs=SimpleNamespace(
+        scheduled_cached_reqs=CachedRequestData(
             req_ids=[],
             new_block_ids=[],
             resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
             num_computed_tokens=[],
+            num_output_tokens=[],
         ),
         num_scheduled_tokens=num_scheduled,
         total_num_scheduled_tokens=sum(num_scheduled.values()),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
         finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
-        grammar_bitmask=None,
+        has_structured_output_requests=False,
     )
 
 
@@ -74,16 +86,19 @@ def _make_new_req(
     prompt_token_ids: list[int],
     num_computed_tokens: int = 0,
     block_ids: list[int] | None = None,
-) -> SimpleNamespace:
+) -> NewRequestData:
     if block_ids is None:
         num_blocks = (len(prompt_token_ids) + 3) // 4 + 1
         block_ids = list(range(num_blocks))
-    return SimpleNamespace(
+    return NewRequestData(
         req_id=req_id,
         prompt_token_ids=prompt_token_ids,
+        mm_features=[],
         sampling_params=_greedy_sp(),
+        pooling_params=None,
         block_ids=(block_ids,),
         num_computed_tokens=num_computed_tokens,
+        lora_request=None,
     )
 
 
@@ -229,7 +244,7 @@ class TestSamplingMetadataWithPenalties:
 
         def spy_sample(logits_2d, batch, sampler, device):
             captured_batches.append(batch)
-            return [99]
+            return _SamplingResult([99])
 
         with (
             patch.object(
@@ -269,23 +284,30 @@ def _make_cached_scheduler_output(
     num_computed_tokens: list[int],
     num_scheduled: dict[str, int],
     new_block_ids: list | None = None,
-) -> SimpleNamespace:
-    """Minimal SchedulerOutput with cached requests only."""
+) -> SchedulerOutput:
+    """Build a SchedulerOutput with cached requests only."""
     if new_block_ids is None:
         new_block_ids = [None] * len(req_ids)
-    return SimpleNamespace(
+    return SchedulerOutput(
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(
+        scheduled_cached_reqs=CachedRequestData(
             req_ids=req_ids,
             new_block_ids=new_block_ids,
             resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
             num_computed_tokens=num_computed_tokens,
+            num_output_tokens=[0] * len(req_ids),
         ),
         num_scheduled_tokens=num_scheduled,
         total_num_scheduled_tokens=sum(num_scheduled.values()),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
         finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
-        grammar_bitmask=None,
+        has_structured_output_requests=False,
     )
 
 
@@ -303,11 +325,14 @@ class TestCachedRequestBlockUpdates:
         )
         runner._paged_request_seq_lens["req-1"] = 5
 
-        cached_reqs = SimpleNamespace(
+        cached_reqs = CachedRequestData(
             req_ids=["req-1"],
             new_block_ids=[([7, 8],)],
             resumed_req_ids={"req-1"},
+            new_token_ids=[],
+            all_token_ids={},
             num_computed_tokens=[4],
+            num_output_tokens=[0],
         )
 
         runner._update_cached_request_blocks(cached_reqs)
@@ -347,19 +372,26 @@ class TestMixedDecodeAndPrefixHitPrefill:
         greedy_tokens = [mx.array([decode_token]), mx.array([prefill_token])]
 
         new_req_b = _make_new_req("req-B", prompt_b, num_computed_tokens=num_computed_b)
-        sched_out = SimpleNamespace(
+        sched_out = SchedulerOutput(
             scheduled_new_reqs=[new_req_b],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=["req-A"],
                 new_block_ids=[None],
                 resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
                 num_computed_tokens=[len(prompt_a)],
+                num_output_tokens=[0],
             ),
             num_scheduled_tokens={"req-A": 1, "req-B": suffix_len_b},
             total_num_scheduled_tokens=1 + suffix_len_b,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
             finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
-            grammar_bitmask=None,
+            has_structured_output_requests=False,
         )
 
         with (

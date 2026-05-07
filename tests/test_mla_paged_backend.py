@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.base import scaled_dot_product_attention
 
 import vllm_metal.paged_attention_common as pac
 from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
@@ -228,6 +229,7 @@ _NOPE_DIM = 8  # qk_nope_head_dim
 _ROPE_DIM = 4  # qk_rope_head_dim
 _KV_RANK = 16  # kv_lora_rank
 _V_DIM = 8  # v_head_dim
+_Q_LORA_RANK = 12  # q_lora_rank
 
 
 class _MinimalMLAInner(nn.Module):
@@ -253,6 +255,83 @@ class _MinimalMLAInner(nn.Module):
     def rope(self, x: mx.array, offset: int = 0) -> mx.array:
         # Identity RoPE: preserves shape, sufficient for testing shape logic.
         return x
+
+
+class _MiniCPM3StyleInner(nn.Module):
+    """MLA stub shaped like MiniCPM3: softmax_scale and kv_b_proj only."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_lora_rank = _Q_LORA_RANK
+        self.num_heads = _NUM_HEADS
+        self.q_head_dim = _NOPE_DIM + _ROPE_DIM
+        self.qk_nope_head_dim = _NOPE_DIM
+        self.qk_rope_head_dim = _ROPE_DIM
+        self.kv_lora_rank = _KV_RANK
+        self.softmax_scale = 0.37
+
+        self.q_a_proj = nn.Linear(_HIDDEN, _Q_LORA_RANK, bias=False)
+        self.q_a_layernorm = nn.LayerNorm(_Q_LORA_RANK)
+        self.q_b_proj = nn.Linear(
+            _Q_LORA_RANK, _NUM_HEADS * self.q_head_dim, bias=False
+        )
+        self.kv_a_proj_with_mqa = nn.Linear(_HIDDEN, _KV_RANK + _ROPE_DIM, bias=False)
+        self.kv_a_layernorm = nn.LayerNorm(_KV_RANK)
+        self.kv_b_proj = nn.Linear(
+            _KV_RANK, _NUM_HEADS * (_NOPE_DIM + _V_DIM), bias=False
+        )
+        self.o_proj = nn.Linear(_NUM_HEADS * _V_DIM, _HIDDEN, bias=False)
+
+    def rope(self, x: mx.array, offset: int = 0) -> mx.array:
+        return x
+
+
+def _minicpm3_dense_reference(
+    inner: _MiniCPM3StyleInner,
+    x: mx.array,
+    *,
+    cache_dtype: mx.Dtype,
+) -> mx.array:
+    _, seq_len, _ = x.shape
+
+    q = inner.q_b_proj(inner.q_a_layernorm(inner.q_a_proj(x)))
+    q = q.reshape(1, seq_len, inner.num_heads, inner.q_head_dim).transpose(0, 2, 1, 3)
+    q_nope, q_pe = mx.split(q, [inner.qk_nope_head_dim], axis=-1)
+
+    kv_out = inner.kv_a_proj_with_mqa(x)
+    compressed_kv, k_pe = mx.split(kv_out, [inner.kv_lora_rank], axis=-1)
+    kv_norm = inner.kv_a_layernorm(compressed_kv).astype(cache_dtype)
+    k_pe = k_pe.reshape(1, seq_len, 1, inner.qk_rope_head_dim).transpose(0, 2, 1, 3)
+    k_pe = k_pe.astype(cache_dtype)
+
+    kv = inner.kv_b_proj(kv_norm)
+    kv = kv.reshape(1, seq_len, inner.num_heads, -1).transpose(0, 2, 1, 3)
+    k_nope, values = mx.split(kv, [inner.qk_nope_head_dim], axis=-1)
+    k_pe = mx.broadcast_to(
+        k_pe,
+        (1, inner.num_heads, seq_len, inner.qk_rope_head_dim),
+    )
+
+    queries = mx.concatenate([q_nope, q_pe], axis=-1)
+    keys = mx.concatenate([k_nope, k_pe], axis=-1)
+    attn_mask = None
+    if seq_len > 1:
+        rows = mx.arange(seq_len).reshape(-1, 1)
+        cols = mx.arange(seq_len).reshape(1, -1)
+        valid = (cols <= rows).reshape(1, 1, seq_len, seq_len)
+        fill = mx.array(mx.finfo(queries.dtype).min, queries.dtype)
+        attn_mask = mx.where(valid, mx.array(0, queries.dtype), fill)
+
+    out = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=inner.softmax_scale,
+        mask=attn_mask,
+    )
+    out = out.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
+    return inner.o_proj(out)
 
 
 class TestMLAPagedAttentionWrapperPagedPath:
@@ -416,3 +495,67 @@ class TestMLAPagedAttentionWrapperPagedPath:
 
         # Token 0 output must be identical — it attends only to position 0
         assert bool(mx.all(out_a[0, 0, :] == out_b[0, 0, :]))
+
+    def test_minicpm3_style_prefill_matches_dense_reference(self) -> None:
+        inner = _MiniCPM3StyleInner()
+        cache = self._make_cache()
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+
+        pac.set_context(
+            pac.PagedAttentionContext(
+                slot_mapping=[0, 1, 2, 3],
+                block_tables=[[0]],
+                context_lens=[4],
+                cu_seqlens=[0, 4],
+                offsets=[0],
+            )
+        )
+
+        mx.random.seed(7)
+        x = mx.random.normal((1, 4, _HIDDEN)).astype(mx.float16)
+        out = wrapper(x, mask=None, cache=None)
+        expected = _minicpm3_dense_reference(inner, x, cache_dtype=cache.dtype)
+        mx.eval(out, expected)
+
+        assert bool(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
+
+    def test_minicpm3_style_decode_matches_dense_reference(self) -> None:
+        inner = _MiniCPM3StyleInner()
+        cache = self._make_cache()
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+
+        mx.random.seed(11)
+        past = mx.random.normal((1, 3, _HIDDEN)).astype(mx.float16)
+        new = mx.random.normal((1, 1, _HIDDEN)).astype(mx.float16)
+
+        pac.set_context(
+            pac.PagedAttentionContext(
+                slot_mapping=[0, 1, 2],
+                block_tables=[[0]],
+                context_lens=[3],
+                cu_seqlens=[0, 3],
+                offsets=[0],
+            )
+        )
+        wrapper(past, mask=None, cache=None)
+        pac.clear_context()
+
+        pac.set_context(
+            pac.PagedAttentionContext(
+                slot_mapping=[3],
+                block_tables=[[0]],
+                context_lens=[4],
+                cu_seqlens=[0, 1],
+                offsets=[3],
+            )
+        )
+        out = wrapper(new, mask=None, cache=None)
+        dense = _minicpm3_dense_reference(
+            inner,
+            mx.concatenate([past, new], axis=1),
+            cache_dtype=cache.dtype,
+        )
+        expected = dense[:, -1:, :]
+        mx.eval(out, expected)
+
+        assert bool(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))

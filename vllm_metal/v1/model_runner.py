@@ -30,7 +30,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -58,11 +58,17 @@ from vllm_metal.v1.contiguous_cache import (
     _merge_kv_caches,
 )
 from vllm_metal.v1.lora import LoRAMappingBuilder, MetalWorkerLoRAManager
-from vllm_metal.v1.model_adapter import DefaultModelAdapter, ModelAdapter
+from vllm_metal.v1.mm import EncoderCache
+from vllm_metal.v1.model_adapter import (
+    DefaultModelAdapter,
+    ModelAdapter,
+    MultimodalRuntimeAdapter,
+)
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
+    _SamplingResult,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -154,19 +160,40 @@ class _ExecutionBatch:
     req_ids: list[str] = field(default_factory=list)
     req_id_to_index: dict[str, int] = field(default_factory=dict)
     sampled_tokens: list[list[int]] = field(default_factory=list)
+    sample_logprobs: list[LogprobsLists | None] = field(default_factory=list)
     new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
 
-    def add_output(self, req_id: str, token_ids: list[int]) -> int:
+    def add_output(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        logprobs: LogprobsLists | None = None,
+    ) -> int:
         """Append one output slot and return its index."""
         self.req_ids.append(req_id)
         output_idx = len(self.req_ids) - 1
         self.req_id_to_index[req_id] = output_idx
         self.sampled_tokens.append(token_ids)
+        self.sample_logprobs.append(logprobs)
         return output_idx
+
+    def set_output(
+        self,
+        output_idx: int,
+        token_ids: list[int],
+        logprobs: LogprobsLists | None = None,
+    ) -> None:
+        """Set tokens and logprobs for an existing output slot."""
+        self.sampled_tokens[output_idx] = token_ids
+        self.sample_logprobs[output_idx] = logprobs
+
+    def merged_logprobs(self) -> LogprobsLists | None:
+        """Merge per-output-slot logprobs for ``ModelRunnerOutput``."""
+        return SamplingBatch.merge_logprobs_rows(self.sample_logprobs)
 
     def has_paged_work(self) -> bool:
         """Return whether this step has any paged execution work."""
@@ -224,6 +251,8 @@ class MetalModelRunner:
         self._stt_runtime_adapter: STTRuntimeAdapter | None = (
             None  # Set during STT loading
         )
+        self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
+        self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -307,12 +336,12 @@ class MetalModelRunner:
         requests.  Routing through ``model.language_model`` bypasses the vision
         encoder and uses the standard ``(input_ids, cache=...)`` signature.
 
-        NOTE: This means multimodal (image) inputs are not supported — the
-        vision head is intentionally skipped.  Full multimodal inference would
-        require a decomposed encode → feature-fusion → forward pass, following
-        the upstream pattern, and is a separate future effort.
+        NOTE: scheduled multimodal encoder inputs fail fast until the runner
+        wires decomposed encode → feature-fusion → forward execution.
         """
         if self._is_vlm:
+            if self._multimodal_adapter is not None:
+                return self._multimodal_adapter.text_model()
             return self._model_adapter.text_model(self.model)
         return self.model
 
@@ -515,6 +544,16 @@ class MetalModelRunner:
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
 
+    def reset_mm_cache(self) -> None:
+        """Reset profiling-time multimodal cache state when present."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.reset_mm_cache()
+
+    def reset_encoder_cache(self) -> None:
+        """Clear cached multimodal encoder outputs when present."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.reset_encoder_cache()
+
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.
 
@@ -617,7 +656,7 @@ class MetalModelRunner:
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
-    ) -> tuple[int, list[KVCache]]:
+    ) -> tuple[int, list[KVCache], LogprobsLists | None]:
         """Process a single prefill request.
 
         Args:
@@ -676,14 +715,15 @@ class MetalModelRunner:
             logitsprocs=self._logitsprocs,
             generators=generators,
         )
-        [next_token] = sample_from_logits(
-            last_logits, batch, self._sampler, self.device
-        )
+        result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+        [next_token] = result.token_ids
         mx.eval(*[c.state for c in cache])
 
-        return next_token, cache
+        return next_token, cache, result.logprobs
 
-    def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
+    def _batched_decode(
+        self, decode_reqs: list[tuple[str, RequestState]]
+    ) -> _SamplingResult:
         """Process multiple decode requests in a single batched forward pass.
 
         Uses BatchKVCache to merge individual caches, run ONE forward pass,
@@ -693,7 +733,7 @@ class MetalModelRunner:
             decode_reqs: List of (req_id, state) tuples
 
         Returns:
-            List of next tokens for each request
+            Sampled token IDs and optional logprobs for each request.
         """
         last_tokens = [
             state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
@@ -737,9 +777,10 @@ class MetalModelRunner:
             logitsprocs=self._logitsprocs,
             generators=generators,
         )
-        next_tokens = sample_from_logits(
+        result = sample_from_logits(
             next_token_logits, batch, self._sampler, self.device
         )
+        next_tokens = result.token_ids
 
         # Extract updated caches back to individual requests
         for i, (_req_id, state) in enumerate(decode_reqs):
@@ -747,11 +788,11 @@ class MetalModelRunner:
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
 
-        return next_tokens
+        return result
 
     def _sequential_decode(
         self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> list[int]:
+    ) -> _SamplingResult:
         """Fallback: process decode requests sequentially.
 
         Used when batch size is 1 (no benefit from batching).
@@ -760,9 +801,10 @@ class MetalModelRunner:
             decode_reqs: List of (req_id, state) tuples
 
         Returns:
-            List of next tokens for each request
+            Sampled token IDs and optional logprobs for each request.
         """
         next_tokens = []
+        logprobs_rows: list[LogprobsLists | None] = []
 
         for _req_id, state in decode_reqs:
             last_token = state.token_ids[-1] if state.token_ids else 0
@@ -783,17 +825,20 @@ class MetalModelRunner:
                 logitsprocs=self._logitsprocs,
                 generators=generators,
             )
-            [next_token] = sample_from_logits(
-                last_logits, batch, self._sampler, self.device
-            )
+            result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+            [next_token] = result.token_ids
 
             next_tokens.append(next_token)
+            logprobs_rows.append(result.logprobs)
 
             # Update state
             state.token_ids.append(next_token)
             state.generated_tokens += 1
 
-        return next_tokens
+        return _SamplingResult(
+            next_tokens,
+            SamplingBatch.merge_logprobs_rows(logprobs_rows),
+        )
 
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)
@@ -924,7 +969,7 @@ class MetalModelRunner:
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
-        decode_next_tokens = sample_decode_tokens(
+        decode_result = sample_decode_tokens(
             logits,
             decode_reqs,
             num_decode,
@@ -933,7 +978,7 @@ class MetalModelRunner:
             vocab_size=vocab_size,
             logitsprocs=logitsprocs,
         )
-        prefill_next_tokens = sample_prefill_tokens(
+        prefill_result = sample_prefill_tokens(
             logits,
             prefill_reqs,
             cu_seqlens,
@@ -946,7 +991,7 @@ class MetalModelRunner:
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
-            state.token_ids.append(decode_next_tokens[i])
+            state.token_ids.append(decode_result.token_ids[i])
             state.generated_tokens += 1
             self._paged_request_seq_lens[req_id] = (
                 self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
@@ -958,14 +1003,19 @@ class MetalModelRunner:
 
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
-            next_token = prefill_next_tokens[i]
+            next_token = prefill_result.token_ids[i]
+            logprobs = (
+                prefill_result.logprobs.slice_request(i, 1)
+                if prefill_result.logprobs is not None
+                else None
+            )
             prefill = prefill_reqs[i]
 
             if entry.result_mode == "intermediate":
-                batch.sampled_tokens[entry.output_idx] = []
+                batch.set_output(entry.output_idx, [], logprobs)
                 continue
 
-            batch.sampled_tokens[entry.output_idx] = [next_token]
+            batch.set_output(entry.output_idx, [next_token], logprobs)
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
@@ -991,7 +1041,12 @@ class MetalModelRunner:
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
-            batch.add_output(req_id, [decode_next_tokens[i]])
+            logprobs = (
+                decode_result.logprobs.slice_request(i, 1)
+                if decode_result.logprobs is not None
+                else None
+            )
+            batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
 
         return batch, scheduler_output
 
@@ -1025,6 +1080,47 @@ class MetalModelRunner:
         mapping = builder.build() if not builder.is_empty() else None
         self._lora_manager.set_active_adapters(active_requests, mapping)
 
+    def _register_new_request_mm_features(
+        self, req_id: str, new_req: NewRequestData
+    ) -> None:
+        """Store scheduler-provided multimodal features for future encoder use."""
+        if self.encoder_cache is None:
+            return
+        self.encoder_cache.remove_request(req_id)
+        self.encoder_cache.add_request(req_id, new_req.mm_features)
+
+    def _remove_request_mm_features(self, req_id: str) -> None:
+        """Drop request-scoped multimodal feature metadata."""
+        if self.encoder_cache is not None:
+            self.encoder_cache.remove_request(req_id)
+
+    def _free_encoder_outputs(self, mm_hashes: list[str]) -> None:
+        """Drop encoder outputs released by the scheduler."""
+        if self.encoder_cache is None:
+            return
+        for mm_hash in mm_hashes:
+            self.encoder_cache.free_encoder_cache(mm_hash)
+
+    @staticmethod
+    def _finished_req_ids(
+        scheduler_output: SchedulerOutput,
+    ) -> set[str]:
+        """Return request ids whose runner-owned state should be evicted."""
+        return scheduler_output.finished_req_ids
+
+    def _reject_scheduled_encoder_inputs(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+    ) -> None:
+        """Fail fast until encoder execution and embedding splice are wired."""
+        if not scheduled_encoder_inputs:
+            return
+        raise NotImplementedError(
+            "Multimodal encoder execution is not wired on Metal yet. "
+            "Metal currently registers multimodal runtime state, but image "
+            "encoding and embedding splice are not connected to the runner."
+        )
+
     def _handle_new_requests(
         self,
         batch: _ExecutionBatch,
@@ -1036,6 +1132,7 @@ class MetalModelRunner:
 
         for new_req in new_reqs:
             req_id = new_req.req_id
+            self._register_new_request_mm_features(req_id, new_req)
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
 
@@ -1087,13 +1184,13 @@ class MetalModelRunner:
                     )
                 continue
 
-            next_token, cache = self._prefill_single(
+            next_token, cache, logprobs = self._prefill_single(
                 req_id,
                 token_ids,
                 sampling_params,
                 generator=generator,
             )
-            batch.add_output(req_id, [next_token])
+            batch.add_output(req_id, [next_token], logprobs)
             self._request_states[req_id] = RequestState(
                 token_ids=list(token_ids) + [next_token],
                 prompt_len=len(token_ids),
@@ -1246,7 +1343,7 @@ class MetalModelRunner:
             req_ids=batch.req_ids,
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
-            logprobs=None,
+            logprobs=batch.merged_logprobs(),
             prompt_logprobs_dict={},
             pooler_output=[None] * len(batch.req_ids),
         )
@@ -1258,12 +1355,17 @@ class MetalModelRunner:
         """Run non-paged decode work and append placeholder outputs as needed."""
         if batch.valid_decode_reqs:
             if len(batch.valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
-                decode_tokens = self._batched_decode(batch.valid_decode_reqs)
+                decode_result = self._batched_decode(batch.valid_decode_reqs)
             else:
-                decode_tokens = self._sequential_decode(batch.valid_decode_reqs)
+                decode_result = self._sequential_decode(batch.valid_decode_reqs)
 
             for i, (req_id, _) in enumerate(batch.valid_decode_reqs):
-                batch.add_output(req_id, [decode_tokens[i]])
+                logprobs = (
+                    decode_result.logprobs.slice_request(i, 1)
+                    if decode_result.logprobs is not None
+                    else None
+                )
+                batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
 
         for req_id in batch.scheduled_cached_req_ids:
             if req_id not in batch.req_id_to_index:
@@ -1323,25 +1425,31 @@ class MetalModelRunner:
 
     def _cleanup_finished_requests(
         self,
-        finished_req_ids: set[str],
+        evicted_req_ids: set[str],
+        *,
+        materialize_gdn_state: bool = True,
     ) -> None:
         """Evict runner-owned state for finished requests."""
-        if not finished_req_ids:
-            self._gdn_materialize_pending_state_cache()
+        if not evicted_req_ids:
+            if materialize_gdn_state:
+                self._gdn_materialize_pending_state_cache()
             return
 
-        for req_id in finished_req_ids:
+        for req_id in evicted_req_ids:
             state = self._request_states.pop(req_id, None)
             if state is not None:
                 if state.cache:
                     del state.cache
                 del state
 
+            self._remove_request_mm_features(req_id)
+
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
-        self._gdn_release_slots(finished_req_ids)
-        self._gdn_materialize_pending_state_cache()
+        self._gdn_release_slots(evicted_req_ids)
+        if materialize_gdn_state:
+            self._gdn_materialize_pending_state_cache()
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
@@ -1357,6 +1465,19 @@ class MetalModelRunner:
 
         if self._is_stt:
             return self._execute_stt(scheduler_output)
+
+        self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
+        evicted_req_ids = self._finished_req_ids(scheduler_output)
+        has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+
+        # Scheduler cleanup is independent of whether this step's work is
+        # supported. If the next check raises, old request state must still be
+        # evicted and any pending GDN release must be materialized now.
+        self._cleanup_finished_requests(
+            evicted_req_ids,
+            materialize_gdn_state=has_scheduled_encoder_inputs,
+        )
+        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
 
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new
@@ -1384,11 +1505,6 @@ class MetalModelRunner:
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
-            # Free GDN slots for finished requests BEFORE allocating new
-            # ones, so slots can be reused within the same scheduling step.
-            if self.is_hybrid and scheduler_output.finished_req_ids:
-                self._gdn_release_slots(scheduler_output.finished_req_ids)
-
             prefill_pack = self._build_prefill_pack(batch)
             self._start_paged_forward(
                 batch,
@@ -1417,8 +1533,8 @@ class MetalModelRunner:
             self._run_non_paged_decode_batch(batch)
 
         # Non-paged path: complete synchronously
+        self._gdn_materialize_pending_state_cache()
         self._validate_scheduled_outputs(batch, scheduler_output)
-        self._cleanup_finished_requests(scheduler_output.finished_req_ids)
         if not batch.req_ids:
             return self._build_output(batch)
         self._pending_output = self._build_output(batch)
@@ -1437,8 +1553,8 @@ class MetalModelRunner:
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
+            self._gdn_materialize_pending_state_cache()
             self._validate_scheduled_outputs(batch, scheduler_output)
-            self._cleanup_finished_requests(scheduler_output.finished_req_ids)
             return self._build_output(batch)
 
         # Non-paged path: return output built by execute_model
@@ -1560,7 +1676,7 @@ class MetalModelRunner:
             return mx.random.categorical(logits / temperature)
 
         for response in stream_generate(
-            self.model,
+            self._forward_model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,

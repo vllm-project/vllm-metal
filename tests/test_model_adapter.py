@@ -7,6 +7,7 @@ import pytest
 
 import vllm_metal.envs as envs
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
@@ -244,6 +245,50 @@ class TestTextModel:
         model = object()
         adapter = DefaultModelAdapter()
         assert adapter.text_model(model) is model
+
+
+class TestBuildMultimodalAdapter:
+    def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
+        vision_tower = object()
+        language_model = object()
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            ),
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
+        hf_config = SimpleNamespace(model_type="qwen3_5")
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Qwen3VLMultimodalAdapter)
+        assert adapter.text_model() is language_model
+
+    def test_builds_qwen3_vl_adapter_from_architecture(self) -> None:
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            ),
+            vision_tower=object(),
+            language_model=object(),
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["Qwen3VLForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, Qwen3VLMultimodalAdapter)
+
+    def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
+        model = SimpleNamespace()
+        hf_config = SimpleNamespace(model_type="phi3_v")
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert adapter is None
 
 
 class TestResolveMaxHeadDim:

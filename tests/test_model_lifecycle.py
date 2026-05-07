@@ -14,8 +14,10 @@ import torch
 import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
+from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 _TEXT_MODEL_ARGS = {
@@ -88,14 +90,31 @@ def _text_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**(_TEXT_MODEL_ARGS | overrides))
 
 
+def _qwen35_vlm_model(
+    *,
+    vision_tower: object | None = None,
+    language_model: object | None = None,
+    spatial_merge_size: int = 2,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=_text_config(),
+            vision_config=SimpleNamespace(spatial_merge_size=spatial_merge_size),
+        ),
+        vision_tower=object() if vision_tower is None else vision_tower,
+        language_model=object() if language_model is None else language_model,
+    )
+
+
 def _cache_generation_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
     config: object,
     tokenizer: object | None = None,
     is_vlm: bool = False,
+    model: object | None = None,
 ) -> tuple[object, object]:
-    fake_model = SimpleNamespace(config=config)
+    fake_model = model or SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
     cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
     monkeypatch.setattr(
@@ -205,6 +224,7 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
 
     def test_load_uses_adapter_override_for_qwen36_fp8_conditional_generation(
         self,
@@ -232,10 +252,12 @@ class TestModelLifecycle:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
+        fake_model = _qwen35_vlm_model()
         _cache_generation_model(
             monkeypatch,
-            config=SimpleNamespace(text_config=_text_config()),
+            config=fake_model.config,
             is_vlm=True,
+            model=fake_model,
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
@@ -252,13 +274,71 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
 
+    def test_load_multimodal_native_qwen35_builds_model_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        vision_tower = object()
+        language_model = object()
+        fake_model = _qwen35_vlm_model(
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
+        _cache_generation_model(
+            monkeypatch,
+            config=fake_model.config,
+            is_vlm=True,
+            model=fake_model,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization_config={"quant_method": "fp8"},
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
+        assert runner._multimodal_adapter.text_model() is language_model
+        assert isinstance(runner.encoder_cache, EncoderCache)
+
+    def test_load_generic_vlm_leaves_model_adapter_unset(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _cache_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(text_config=_text_config()),
+            is_vlm=True,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="phi3_v"),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is True
+        assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
+
     def test_generation_cache_separates_text_and_vlm_variants(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         text_model = SimpleNamespace(config=_text_config())
         text_tokenizer = object()
-        vlm_model = SimpleNamespace(config=SimpleNamespace(text_config=_text_config()))
+        vlm_model = _qwen35_vlm_model()
         vlm_tokenizer = object()
         monkeypatch.setattr(
             model_lifecycle,
@@ -497,6 +577,98 @@ class TestModelLifecycle:
         assert runner._is_vlm is False
         assert runner._is_stt is True
         assert runner._stt_runtime_adapter == (adapter, "stub-model")
+
+    @pytest.mark.parametrize(
+        "is_awq", [True, False], ids=["awq-checkpoint", "non-awq-checkpoint"]
+    )
+    def test_load_dispatches_by_awq_detection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        is_awq: bool,
+    ) -> None:
+        """Pin both sides of the lifecycle dispatch contract introduced
+        by the owner-shape refactor.
+
+        When ``AWQQuantLoader.for_model`` reports an AWQ checkpoint,
+        ``ModelLifecycle._load_generation_model`` delegates the actual
+        load to ``AWQQuantLoader.load`` and never falls back to the
+        generic ``mlx_lm.load``. When it returns ``None`` (non-AWQ),
+        lifecycle uses the generic ``mlx_lm.load`` and never passes
+        ``model_config`` (which is reserved for the AWQ owner's
+        normalized quant config kwargs). AWQ *detection* — not the
+        model-name string or any other heuristic — is what gates the
+        dispatch.
+        """
+        fake_model = SimpleNamespace(config=_text_config())
+        fake_tokenizer = object()
+        awq_load_calls: list[dict[str, object]] = []
+        mlx_lm_load_calls: list[dict[str, object]] = []
+
+        class _StubAWQLoader:
+            @classmethod
+            def for_model(cls, _model_name: str) -> _StubAWQLoader | None:
+                return cls() if is_awq else None
+
+            @staticmethod
+            def cache_key(model_name: str, *, target_dtype: object) -> tuple[str, str]:
+                return (model_name, f"mlx_lm-awq:{target_dtype}")
+
+            def load(
+                self,
+                model_path: str,
+                *,
+                target_dtype: object,
+                tokenizer_config: dict[str, object] | None,
+            ) -> tuple[object, object]:
+                awq_load_calls.append(
+                    {
+                        "model_path": model_path,
+                        "target_dtype": target_dtype,
+                        "tokenizer_config": (
+                            dict(tokenizer_config) if tokenizer_config else None
+                        ),
+                    }
+                )
+                return fake_model, fake_tokenizer
+
+        def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
+            mlx_lm_load_calls.append({"args": args, "kwargs": kwargs})
+            return fake_model, fake_tokenizer
+
+        monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
+        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+
+        lifecycle, runner = _make_lifecycle()
+        lifecycle.load()
+
+        assert runner.model is fake_model
+        assert runner.tokenizer is fake_tokenizer
+
+        if is_awq:
+            assert len(awq_load_calls) == 1, (
+                f"expected exactly one AWQQuantLoader.load() call, "
+                f"got {len(awq_load_calls)}"
+            )
+            assert mlx_lm_load_calls == [], (
+                "generic mlx_lm.load must NOT be called when AWQQuantLoader "
+                "owns the load path"
+            )
+            call = awq_load_calls[0]
+            assert call["model_path"] == "stub-model"
+            assert call["target_dtype"] is not None, (
+                "lifecycle must derive target_dtype from "
+                "runner.model_config.dtype and thread it to the loader"
+            )
+            assert call["tokenizer_config"] == {"trust_remote_code": False}
+        else:
+            assert awq_load_calls == [], (
+                "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"
+            )
+            assert len(mlx_lm_load_calls) == 1
+            # The generic path must NOT pass ``model_config`` (which is
+            # reserved for the AWQ owner's normalized quant config kwargs).
+            assert "model_config" not in mlx_lm_load_calls[0]["kwargs"]
 
 
 class TestResolveModelDims:

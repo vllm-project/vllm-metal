@@ -249,6 +249,14 @@ class MetalWorker(WorkerBase):
         self.model_runner.warm_up()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
 
+    def reset_mm_cache(self) -> None:
+        """Reset profiling-time multimodal cache state."""
+        self.model_runner.reset_mm_cache()
+
+    def reset_encoder_cache(self) -> None:
+        """Clear cached multimodal encoder outputs."""
+        self.model_runner.reset_encoder_cache()
+
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:

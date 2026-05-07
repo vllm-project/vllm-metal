@@ -19,6 +19,16 @@ For how to use the `vllm` CLI, please refer to the [official vLLM guide](https:/
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
+### Optional: Rust frontend
+
+Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](rust_frontend.md), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain on `PATH` (install from <https://rustup.rs>):
+
+```bash
+./install.sh --with-vllm-rs
+```
+
+The `vllm-rs` binary is installed to `~/.cargo/bin/`. See [Rust Frontend](rust_frontend.md) for usage.
+
 ## Reinstallation and Update
 
 If any issues occur, please use the following command to switch to the latest release version and check if the problem is resolved.

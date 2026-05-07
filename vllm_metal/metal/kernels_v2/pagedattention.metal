@@ -1065,7 +1065,11 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         if (sliding_window >= 0) {
           mask = mask || (token_idx < effective_context_len - sliding_window);
         }
-        warp_scores[physical_block_offset] = mask ? -FLT_MAX : qk;
+        // Fold the softmax base change into the score: storing qk * log2(e) lets
+        // every downstream `exp(s - m)` become `exp2(s - m)` (1-instruction on
+        // Apple GPUs). m, l, max_logits, exp_sums all live in log2 space from
+        // here on. Math identity: exp(x - y) == exp2((x - y) * log2e).
+        warp_scores[physical_block_offset] = mask ? -FLT_MAX : qk * M_LOG2E_F;
       }
     }
 
@@ -1100,7 +1104,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     // NaN-safe: if new_m is still -inf (all masked), clamp to 0.
     if (new_m == -FLT_MAX) new_m = 0.f;
 
-    float old_correction = exp(warp_m - new_m);
+    float old_correction = exp2(warp_m - new_m);
     // If warp_m was -FLT_MAX (first iteration), correction = 0, which
     // correctly zeroes out the (already zero) previous O and l.
     if (warp_m == -FLT_MAX) old_correction = 0.f;
@@ -1118,7 +1122,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     // (unnormalized) and accumulate into O.
     for (int tok = 0; tok < block_valid_tokens; tok++) {
       const float score = warp_scores[tok];
-      const float w = exp(score - warp_m);
+      const float w = exp2(score - warp_m);
       warp_l += w;
 
       // Load V and accumulate: O += w * V
@@ -1176,15 +1180,17 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // reached by all threads in the threadgroup).
 
   // For non-partitioned mode, include the sink in each warp's state.
+  // Sinks are raw linear-space bias values; lift to log2 space (matches the
+  // log2-space convention adopted at the warp_scores write above).
   if (!USE_PARTITIONING && use_sinks) {
-    float sink_val = sinks[head_idx];
+    float sink_val = sinks[head_idx] * M_LOG2E_F;
     float new_m = max(warp_m, sink_val);
-    float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp(warp_m - new_m);
+    float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
 #pragma unroll
     for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
       v_accs[i] *= old_corr;
     }
-    warp_l = warp_l * old_corr + exp(sink_val - new_m);
+    warp_l = warp_l * old_corr + exp2(sink_val - new_m);
     warp_m = new_m;
   }
 
@@ -1230,8 +1236,8 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       float new_m = max(warp_m, other_m);
       if (new_m == -FLT_MAX) new_m = 0.f;
 
-      float my_corr = (warp_m == -FLT_MAX) ? 0.f : exp(warp_m - new_m);
-      float other_corr = (other_m == -FLT_MAX) ? 0.f : exp(other_m - new_m);
+      float my_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
+      float other_corr = (other_m == -FLT_MAX) ? 0.f : exp2(other_m - new_m);
 
       const threadgroup float *other_O = &merge_O[w * HEAD_SIZE];
 #pragma unroll
@@ -1441,9 +1447,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // Broadcast the max value to all threads.
   max_logit = simd_shuffle(max_logit, 0);
 
-  // Include the sink in the global max before rescaling.
+  // Include the sink in the global max before rescaling. max_logits are
+  // stored in log2 space by paged_attention; lift the raw sink to match.
   if (use_sinks) {
-    max_logit = max(max_logit, sinks[head_idx]);
+    max_logit = max(max_logit, sinks[head_idx] * M_LOG2E_F);
   }
 
   // Load rescaled exp sums to shared memory.
@@ -1456,7 +1463,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   for (int i = thread_position_in_threadgroup.x; i < num_partitions;
        i += threads_per_threadgroup.x) {
     float l = shared_max_logits[i];
-    float rescaled_exp_sum = exp_sums_ptr[i] * exp(l - max_logit);
+    float rescaled_exp_sum = exp_sums_ptr[i] * exp2(l - max_logit);
     global_exp_sum += rescaled_exp_sum;
     shared_exp_sums[i] = rescaled_exp_sum;
   }
@@ -1464,9 +1471,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   global_exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(
       &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
 
-  // Include the sink in the global exp sum.
+  // Include the sink in the global exp sum (sinks lifted to log2 space).
   if (use_sinks) {
-    global_exp_sum += exp(sinks[head_idx] - max_logit);
+    global_exp_sum += exp2(sinks[head_idx] * M_LOG2E_F - max_logit);
   }
 
   const float inv_global_exp_sum = 1.0f / (global_exp_sum + 1e-6f);

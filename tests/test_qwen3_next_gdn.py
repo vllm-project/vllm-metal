@@ -20,10 +20,10 @@ Run golden token test (requires model download):
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
@@ -281,19 +281,26 @@ class TestGDNSlotLifecycle:
         runner.model = object()
         runner.model_args = {"full_attention_interval": 2}
         runner._gdn_req_to_slot = {"req-A": 0}
-        scheduler_output = SimpleNamespace(
+        scheduler_output = SchedulerOutput(
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=[],
                 new_block_ids=[],
                 resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
                 num_computed_tokens=[],
+                num_output_tokens=[],
             ),
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
             finished_req_ids={"req-A"},
+            free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
-            grammar_bitmask=None,
+            has_structured_output_requests=False,
         )
 
         with (
@@ -312,6 +319,53 @@ class TestGDNSlotLifecycle:
         assert runner._gdn_free_slots == [0]
         assert runner._gdn_needs_materialize is True
         mock_materialize.assert_not_called()
+
+    def test_sample_tokens_drains_paged_pending_materialization(self):
+        from vllm_metal.v1.model_runner import _ExecutionBatch
+
+        runner, _ = self._make_runner_stub()
+        runner._execute_model_state = object()
+        runner._gdn_needs_materialize = True
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[],
+                new_block_ids=[],
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                num_computed_tokens=[],
+                num_output_tokens=[],
+            ),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+
+        with (
+            patch.object(
+                runner,
+                "_sample_paged_batch",
+                return_value=(_ExecutionBatch(), scheduler_output),
+            ),
+            patch.object(
+                runner,
+                "_gdn_materialize_state_cache",
+                wraps=runner._gdn_materialize_state_cache,
+            ) as mock_materialize,
+        ):
+            output = runner.sample_tokens(None)
+
+        assert output is not None
+        assert output.req_ids == []
+        mock_materialize.assert_called_once()
+        assert runner._gdn_needs_materialize is False
 
     def test_cleanup_finished_requests_drains_pending_materialization(self):
         runner, _ = self._make_runner_stub()
