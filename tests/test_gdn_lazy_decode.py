@@ -250,6 +250,59 @@ class TestLazyConvDecode:
 
 
 class TestLazyRecurrentDecode:
+    def test_updates_only_active_recurrent_slots(self) -> None:
+        # Arrange
+        class FakeRecurrentKernel:
+            def __init__(self) -> None:
+                self.grid: tuple[int, int, int] | None = None
+                self.output_shapes: list[tuple[int, ...]] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.grid = kwargs["grid"]
+                self.output_shapes = kwargs["output_shapes"]
+                return (
+                    mx.ones((2, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+                )
+
+        fake_kernel = FakeRecurrentKernel()
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        slot_ids = [3, 1]
+        request = _recurrent_request(
+            q=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 2, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 2, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 2, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+        )
+
+        # Act
+        result = GDNLazyDecodeKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_kernel=fake_kernel,
+        ).try_recurrent_decode(request)
+
+        # Assert
+        assert result is not None
+        assert fake_kernel.grid == (32, 3, 4)
+        assert fake_kernel.output_shapes == [(2, 2, 3), (2, 2, 3, 32)]
+        mx.eval(cache.recurrent_states[0])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), expected_state
+        )
+
     def test_matches_cpp_recurrent_path(self) -> None:
         # Arrange
         _require_metal()
