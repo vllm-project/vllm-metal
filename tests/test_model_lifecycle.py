@@ -307,8 +307,7 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is True
         assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
-        assert runner._multimodal_adapter.vision_tower is vision_tower
-        assert runner._multimodal_adapter.language_model is language_model
+        assert runner._multimodal_adapter.text_model() is language_model
         assert isinstance(runner.encoder_cache, EncoderCache)
 
     def test_load_generic_vlm_leaves_model_adapter_unset(

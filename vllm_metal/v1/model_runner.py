@@ -305,6 +305,8 @@ class MetalModelRunner:
         wires decomposed encode → feature-fusion → forward execution.
         """
         if self._is_vlm:
+            if self._multimodal_adapter is not None:
+                return self._multimodal_adapter.text_model()
             return self._model_adapter.text_model(self.model)
         return self.model
 
@@ -974,11 +976,6 @@ class MetalModelRunner:
         """Fail fast until encoder execution and embedding splice are wired."""
         if not scheduled_encoder_inputs:
             return
-        if (
-            self._multimodal_adapter is not None
-            and self._multimodal_adapter.forward_ready
-        ):
-            return
         raise NotImplementedError(
             "Multimodal encoder execution is not wired on Metal yet. "
             "Metal currently registers multimodal runtime state, but image "
@@ -1324,9 +1321,9 @@ class MetalModelRunner:
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
 
-        # Scheduler cleanup is independent of whether this step is supported.
-        # If the next check raises, old request state must still be evicted and
-        # any pending GDN release must be materialized now.
+        # Scheduler cleanup is independent of whether this step's work is
+        # supported. If the next check raises, old request state must still be
+        # evicted and any pending GDN release must be materialized now.
         self._cleanup_finished_requests(
             evicted_req_ids,
             materialize_gdn_state=has_scheduled_encoder_inputs,

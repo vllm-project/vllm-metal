@@ -10,21 +10,23 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+
 logger = init_logger(__name__)
 
 
 class MultimodalRuntimeAdapter(Protocol):
-    """Model-owned runtime state needed for native multimodal execution."""
+    """Model-owned behavior needed for native multimodal execution."""
 
-    forward_ready: bool
+    def text_model(self) -> Any:
+        """Return the callable language model for text-only VLM execution."""
 
-    @property
-    def vision_tower(self) -> Any:
-        """Return the loaded vision encoder component."""
-
-    @property
-    def language_model(self) -> Any:
-        """Return the loaded language-model component."""
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[Any, int]:
+        """Return model-specific M-RoPE positions for multimodal inputs."""
 
 
 class ModelAdapter(Protocol):

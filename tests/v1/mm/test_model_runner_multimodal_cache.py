@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -17,6 +16,7 @@ from vllm.v1.core.sched.output import (
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import RequestState
 
@@ -231,8 +231,12 @@ def test_execute_model_cleans_finished_requests_before_encoder_fail_fast() -> No
     assert "done" not in runner._request_states
 
 
-def test_execute_model_honors_forward_ready_multimodal_adapter() -> None:
+def test_execute_model_rejects_encoder_inputs_until_forward_is_wired() -> None:
     runner = _runner_with_encoder_cache()
-    runner._multimodal_adapter = SimpleNamespace(forward_ready=True)
+    runner._multimodal_adapter = Qwen3VLMultimodalAdapter(
+        spatial_merge_size=2,
+        language_model=object(),
+    )
 
-    runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
+    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+        runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))

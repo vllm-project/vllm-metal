@@ -8,6 +8,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
+from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
 
 class TestV1MetalModelRunnerGenerate:
@@ -72,7 +73,11 @@ class TestV1MetalModelRunnerGenerate:
 
         language_model = object()
         runner = self._make_runner()
-        runner.model = SimpleNamespace(language_model=language_model)
+        runner.model = SimpleNamespace(language_model=object())
+        runner._multimodal_adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=2,
+            language_model=language_model,
+        )
         runner._is_vlm = True
 
         out = runner.generate("p", max_tokens=1)

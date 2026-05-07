@@ -16,8 +16,6 @@ from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 class Qwen3VLMultimodalAdapter:
     """Model-owned multimodal helpers for the Qwen3-VL execution path."""
 
-    forward_ready: bool = False
-
     def __init__(
         self,
         *,
@@ -33,13 +31,7 @@ class Qwen3VLMultimodalAdapter:
         self._vision_tower = vision_tower
         self._language_model = language_model
 
-    @property
-    def vision_tower(self) -> Any:
-        """Return the loaded Qwen3-VL vision tower."""
-        return self._vision_tower
-
-    @property
-    def language_model(self) -> Any:
+    def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
         return self._language_model
 
