@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from threading import Lock
-from typing import Any
+from typing import Any, ClassVar
 
 import mlx.core as mx
 
@@ -14,6 +15,41 @@ from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
 _GDN_RECURRENT_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
+
+
+@dataclass(frozen=True)
+class GDNRecurrentDecodeRequest:
+    """Inputs for one lazy GDN recurrent decode attempt."""
+
+    q: mx.array
+    k: mx.array
+    v: mx.array
+    g: mx.array
+    beta: mx.array
+    state_cache: GDNPagedStateCache
+    cache_idx: int
+    slot_ids: list[int]
+    output_dtype: mx.Dtype
+
+    @property
+    def total_tokens(self) -> int:
+        return self.q.shape[1]
+
+    @property
+    def num_key_heads(self) -> int:
+        return self.q.shape[2]
+
+    @property
+    def num_value_heads(self) -> int:
+        return self.v.shape[2]
+
+    @property
+    def key_head_dim(self) -> int:
+        return self.q.shape[3]
+
+    @property
+    def value_head_dim(self) -> int:
+        return self.v.shape[3]
 
 
 class GDNLazyDecodeKernels:
@@ -26,6 +62,10 @@ class GDNLazyDecodeKernels:
     decode-only path lazy and avoids the eager in-place synchronization cost;
     callers fall back to the legacy path when a request shape is ineligible.
     """
+
+    _shared: ClassVar[GDNLazyDecodeKernels | None] = None
+    _shared_enabled: ClassVar[bool | None] = None
+    _shared_lock: ClassVar[Lock] = Lock()
 
     def __init__(
         self,
@@ -73,6 +113,27 @@ class GDNLazyDecodeKernels:
     @classmethod
     def from_env(cls) -> GDNLazyDecodeKernels:
         return cls(enabled=envs.VLLM_METAL_GDN_LAZY_DECODE)
+
+    @classmethod
+    def shared(cls) -> GDNLazyDecodeKernels:
+        """Get the process-level lazy GDN decode kernel owner.
+
+        The env kill switch is read when the shared owner is acquired;
+        existing wrappers keep the owner they stored at construction time.
+        """
+        with cls._shared_lock:
+            enabled = envs.VLLM_METAL_GDN_LAZY_DECODE
+            if cls._shared is None or cls._shared_enabled != enabled:
+                cls._shared = cls(enabled=enabled)
+                cls._shared_enabled = enabled
+            return cls._shared
+
+    @classmethod
+    def reset_shared_for_tests(cls) -> None:
+        """Reset the shared lazy GDN decode kernel owner for tests."""
+        with cls._shared_lock:
+            cls._shared = None
+            cls._shared_enabled = None
 
     @staticmethod
     def _make_kernel(
@@ -150,23 +211,15 @@ class GDNLazyDecodeKernels:
 
     def try_recurrent_decode(
         self,
-        q: mx.array,
-        k: mx.array,
-        v: mx.array,
-        g: mx.array,
-        beta: mx.array,
-        state_cache: GDNPagedStateCache,
-        cache_idx: int,
-        slot_ids: list[int],
-        total_tokens: int,
-        n_hk: int,
-        n_hv: int,
-        d_k: int,
-        d_v: int,
-        output_dtype: mx.Dtype,
+        request: GDNRecurrentDecodeRequest,
     ) -> mx.array | None:
         """Run the lazy GDN recurrent decode fast path, or return None."""
-        num_requests = len(slot_ids)
+        total_tokens = request.total_tokens
+        n_hk = request.num_key_heads
+        n_hv = request.num_value_heads
+        d_k = request.key_head_dim
+        d_v = request.value_head_dim
+        num_requests = len(request.slot_ids)
         # The Metal source uses one 32-lane SIMD group across Dk and a
         # fixed-size per-thread register array, matching the original C++
         # kernel's practical Dk <= 256 envelope. Fall back for unusual head
@@ -180,22 +233,22 @@ class GDNLazyDecodeKernels:
         ):
             return None
 
-        state_in = state_cache.recurrent_states[cache_idx]
-        max_seqs = state_cache.max_seqs
-        slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
+        state_in = request.state_cache.recurrent_states[request.cache_idx]
+        max_seqs = request.state_cache.max_seqs
+        slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
 
         kernel_inputs = [
-            q.reshape(total_tokens, n_hk, d_k),
-            k.reshape(total_tokens, n_hk, d_k),
-            v.reshape(total_tokens, n_hv, d_v),
-            g.reshape(total_tokens, n_hv),
-            beta.reshape(total_tokens, n_hv),
+            request.q.reshape(total_tokens, n_hk, d_k),
+            request.k.reshape(total_tokens, n_hk, d_k),
+            request.v.reshape(total_tokens, n_hv, d_v),
+            request.g.reshape(total_tokens, n_hv),
+            request.beta.reshape(total_tokens, n_hv),
             state_in,
             slot_ids_arr,
             num_requests,
         ]
         template = [
-            ("T", output_dtype),
+            ("T", request.output_dtype),
             ("StT", mx.float32),
             ("Dk", d_k),
             ("Dv", d_v),
@@ -209,37 +262,7 @@ class GDNLazyDecodeKernels:
             grid=(32, d_v, max_seqs * n_hv),
             threadgroup=(32, 4, 1),
             output_shapes=[(total_tokens, n_hv, d_v), state_in.shape],
-            output_dtypes=[output_dtype, mx.float32],
+            output_dtypes=[request.output_dtype, mx.float32],
         )
-        state_cache.recurrent_states[cache_idx] = state_out
+        request.state_cache.recurrent_states[request.cache_idx] = state_out
         return y_out
-
-
-_gdn_lazy_decode_kernels: GDNLazyDecodeKernels | None = None
-_gdn_lazy_decode_enabled: bool | None = None
-_gdn_lazy_decode_lock = Lock()
-
-
-def get_gdn_lazy_decode_kernels() -> GDNLazyDecodeKernels:
-    """Get the process-level lazy GDN decode kernel owner.
-
-    The env kill switch is read when the shared owner is acquired; existing
-    wrappers keep the owner they stored at construction time.
-    """
-    global _gdn_lazy_decode_enabled, _gdn_lazy_decode_kernels
-
-    with _gdn_lazy_decode_lock:
-        enabled = envs.VLLM_METAL_GDN_LAZY_DECODE
-        if _gdn_lazy_decode_kernels is None or _gdn_lazy_decode_enabled != enabled:
-            _gdn_lazy_decode_kernels = GDNLazyDecodeKernels(enabled=enabled)
-            _gdn_lazy_decode_enabled = enabled
-        return _gdn_lazy_decode_kernels
-
-
-def reset_gdn_lazy_decode_kernels() -> None:
-    """Reset the shared lazy GDN decode kernel owner for tests."""
-    global _gdn_lazy_decode_enabled, _gdn_lazy_decode_kernels
-
-    with _gdn_lazy_decode_lock:
-        _gdn_lazy_decode_kernels = None
-        _gdn_lazy_decode_enabled = None

@@ -15,6 +15,7 @@
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_PREFIX_CACHE` | (unset) | Set to enable prefix caching for shared prompt reuse |
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
+| `VLLM_METAL_GDN_LAZY_DECODE` | `1` | Enable lazy GDN decode kernels for eligible decode-only hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 
 ## Multimodal Serve Modes
 
