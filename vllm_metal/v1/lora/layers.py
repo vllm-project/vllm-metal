@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MLX layer wrappers."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import mlx.core as mx
+import mlx.nn as nn
+
+if TYPE_CHECKING:
+    from .punica_wrapper import PunicaWrapperMLX
+
+
+def can_wrap(module: Any) -> bool:
+    return isinstance(module, nn.Linear) and not isinstance(
+        module, getattr(nn, "QuantizedLinear", ())
+    )
+
+
+class MLXLinearWithLoRA(nn.Module):
+    def __init__(
+        self, base_layer: nn.Linear, max_loras: int, max_lora_rank: int, dtype: mx.Dtype
+    ):
+        super().__init__()
+        self.base_layer = base_layer
+        self.max_loras, self.max_lora_rank = max_loras, max_lora_rank
+        out, in_ = base_layer.weight.shape[-2:]
+        self.input_size, self.output_size = int(in_), int(out)
+        # +1 trailing slot is the null slot (see punica_wrapper).
+        slots = max_loras + 1
+        self.lora_a_stacked = mx.zeros((slots, max_lora_rank, self.input_size), dtype)
+        self.lora_b_stacked = mx.zeros((slots, self.output_size, max_lora_rank), dtype)
+        self.punica_wrapper: PunicaWrapperMLX | None = None
+
+    def set_mapping(self, punica_wrapper: "PunicaWrapperMLX") -> None:
+        self.punica_wrapper = punica_wrapper
+
+    def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
+        """Write ``(rank, in)`` ``A`` and ``(out, rank)`` ``B`` into ``slot``."""
+        rank, in_ = int(lora_a.shape[0]), int(lora_a.shape[1])
+        out = int(lora_b.shape[0])
+        if (in_, out) != (self.input_size, self.output_size):
+            raise ValueError(
+                f"LoRA weight shape mismatch for slot {slot}: A=({rank},{in_}), "
+                f"B=({out},{rank}); expected in={self.input_size}, out={self.output_size}"
+            )
+        if rank > self.max_lora_rank:
+            raise ValueError(f"LoRA rank {rank} exceeds max_lora_rank {self.max_lora_rank}")
+        a = mx.zeros_like(self.lora_a_stacked[slot])
+        b = mx.zeros_like(self.lora_b_stacked[slot])
+        a[:rank, :] = lora_a.astype(a.dtype)
+        b[:, :rank] = lora_b.astype(b.dtype)
+        self.lora_a_stacked[slot], self.lora_b_stacked[slot] = a, b
+
+    def reset_lora(self, slot: int) -> None:
+        self.lora_a_stacked[slot] = mx.zeros_like(self.lora_a_stacked[slot])
+        self.lora_b_stacked[slot] = mx.zeros_like(self.lora_b_stacked[slot])
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = self.base_layer(x)
+        if self.punica_wrapper is None or self.punica_wrapper.no_lora:
+            return y
+
+        # Punica expects (n_tokens, dim); collapse leading dims if needed.
+        shape = y.shape
+        x2, y2 = (x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1])) if x.ndim > 2 else (x, y)
+        out = self.punica_wrapper.add_lora_linear(
+            y2, x2, self.lora_a_stacked, self.lora_b_stacked, scale=1.0
+        )
+        return out if out is y else out.reshape(shape)
