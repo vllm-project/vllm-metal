@@ -57,9 +57,9 @@ class GDNLazyDecodeKernels:
 
     The fast path uses ``mx.fast.metal_kernel`` source snippets from
     ``kernels_v2``.  Unlike the legacy recurrent C++ path, these kernels
-    materialize replacement state arrays (``conv_state_out`` / ``state_out``)
-    and then swap the active cache entry.  That allocation tradeoff keeps the
-    decode-only path lazy and avoids the eager in-place synchronization cost;
+    materialize replacement conv state arrays and compact recurrent state
+    updates.  Recurrent updates are scattered back into the stable cache pool
+    so decode-only recurrent work stays proportional to active request count;
     callers fall back to the legacy path when a request shape is ineligible.
     """
 
@@ -234,7 +234,6 @@ class GDNLazyDecodeKernels:
             return None
 
         state_in = request.state_cache.recurrent_states[request.cache_idx]
-        max_seqs = request.state_cache.max_seqs
         slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
 
         kernel_inputs = [
@@ -254,15 +253,15 @@ class GDNLazyDecodeKernels:
             ("Dv", d_v),
             ("Hk", n_hk),
             ("Hv", n_hv),
-            ("MAX_SEQS", max_seqs),
         ]
-        y_out, state_out = self._recurrent_kernel(
+        y_out, state_updates = self._recurrent_kernel(
             inputs=kernel_inputs,
             template=template,
-            grid=(32, d_v, max_seqs * n_hv),
+            grid=(32, d_v, num_requests * n_hv),
             threadgroup=(32, 4, 1),
-            output_shapes=[(total_tokens, n_hv, d_v), state_in.shape],
+            output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[request.output_dtype, mx.float32],
         )
-        request.state_cache.recurrent_states[request.cache_idx] = state_out
+        state_in[slot_ids_arr] = state_updates
+        request.state_cache.recurrent_states[request.cache_idx] = state_in
         return y_out

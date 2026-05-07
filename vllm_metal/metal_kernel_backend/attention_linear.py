@@ -105,6 +105,10 @@ class GDNPagedAttentionWrapper(nn.Module):
             if ctx.gdn_slot_mapping is not None
             else list(range(num_requests))
         )
+        if len(slot_ids) != num_requests:
+            raise RuntimeError("GDN wrapper requires one slot per request")
+        if len(set(slot_ids)) != len(slot_ids):
+            raise RuntimeError("GDN wrapper requires unique slots per request")
 
         return _GDNForwardState(
             x=x,
