@@ -50,6 +50,30 @@ class MultimodalRuntimeAdapter(Protocol):
     ) -> tuple[Any, int]:
         """Return model-specific M-RoPE positions for multimodal inputs."""
 
+    def encode_multimodal(
+        self,
+        features: list[MultiModalFeatureSpec],
+    ) -> list[Any]:
+        """Run the model's vision tower; return one MLX array per feature.
+
+        RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__`` —
+        the LM must not be re-entered through the top-level VLM dispatch.
+        """
+
+    def call_lm(
+        self,
+        input_ids: Any,
+        inputs_embeds: Any,
+        cache: list[Any],
+        position_ids: Any,
+    ) -> Any:
+        """Invoke the language model with runner-built embeds and positions.
+
+        The embeds keyword is sniffed at adapter construction so version
+        drift between ``inputs_embeds`` and ``input_embeddings`` surfaces
+        at load time, not silently inside attention.
+        """
+
 
 class ModelAdapter(Protocol):
     """Model-specific hooks used by runner and cache orchestration."""

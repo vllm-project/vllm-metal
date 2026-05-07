@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Qwen3.5-4B multimodal M-RoPE helpers."""
+"""Tests for Qwen3.5-4B multimodal helpers and adapter capabilities."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any
+
+import mlx.core as mx
 import pytest
 import torch
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
@@ -213,3 +217,337 @@ class TestQwen3VLMultimodalAdapterPositions:
             [0, 1, 2, 1, 2, 3, 4, 5, 4, 5, 6],
         ]
         assert delta == -4
+
+
+class _RecordingVisionTower:
+    """Records its calls and returns deterministic ``(hidden, deepstack)`` pairs.
+
+    Exposes ``patch_embed.proj.weight.dtype`` so the adapter's input-dtype
+    cast — mirroring ``mlx_vlm.Model.get_input_embeddings`` — has a real
+    target to read.
+    """
+
+    def __init__(
+        self,
+        hidden_factory: Any | None = None,
+        *,
+        weight_dtype: mx.Dtype = mx.float32,
+    ) -> None:
+        self.calls: list[tuple[Any, Any]] = []
+        self._hidden_factory = hidden_factory or (
+            lambda call_idx: mx.full((4, 8), float(call_idx), dtype=mx.float32)
+        )
+        # ``mlx_vlm.Model.get_input_embeddings`` reads
+        # ``vision_tower.patch_embed.proj.weight.dtype``; mirror that path.
+        self.patch_embed = SimpleNamespace(
+            proj=SimpleNamespace(weight=mx.zeros((1,), dtype=weight_dtype))
+        )
+
+    def __call__(self, pixel_values: Any, grid_thw: Any) -> tuple[mx.array, None]:
+        self.calls.append((pixel_values, grid_thw))
+        return self._hidden_factory(len(self.calls) - 1), None
+
+
+def _vision_feature(
+    *,
+    offset: int = 0,
+    length: int = _IMAGE_TOKEN_COUNT_2X2,
+    grid_thw: tuple[int, ...] = _IMAGE_GRID_THW_2X2,
+    pixel_rows: int | None = None,
+    modality: str = "image",
+) -> MultiModalFeatureSpec:
+    """Build a feature with both ``pixel_values`` and ``image_grid_thw`` fields."""
+    if pixel_rows is None:
+        pixel_rows = length
+    field_config = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+    grid_elem = field_config.build_elems("image_grid_thw", torch.tensor([grid_thw]))[0]
+    pixel_elem = field_config.build_elems(
+        "pixel_values", torch.zeros((1, pixel_rows, 8), dtype=torch.float32)
+    )[0]
+    data = MultiModalKwargsItem(
+        {"image_grid_thw": grid_elem, "pixel_values": pixel_elem}
+    )
+    return MultiModalFeatureSpec(
+        data=data,
+        modality=modality,
+        identifier=f"{modality}-{offset}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
+class TestQwen3VLMultimodalAdapterEncodeMultimodal:
+    def test_calls_vision_tower_and_strips_deepstack(self) -> None:
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+        feature = _vision_feature()
+
+        outputs = adapter.encode_multimodal([feature])
+
+        assert len(outputs) == 1
+        assert outputs[0].shape == (4, 8)
+        assert outputs[0].tolist() == [[0.0] * 8] * 4
+        assert len(tower.calls) == 1
+
+    def test_returns_one_output_per_feature(self) -> None:
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+        features = [
+            _vision_feature(offset=0),
+            _vision_feature(offset=10),
+        ]
+
+        outputs = adapter.encode_multimodal(features)
+
+        assert len(outputs) == 2
+        assert outputs[0].tolist()[0][0] == 0.0
+        assert outputs[1].tolist()[0][0] == 1.0
+        assert len(tower.calls) == 2
+
+    def test_passes_mlx_arrays_to_vision_tower(self) -> None:
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+
+        adapter.encode_multimodal([_vision_feature()])
+
+        pixel_values, grid_thw = tower.calls[0]
+        assert isinstance(pixel_values, mx.array)
+        assert isinstance(grid_thw, mx.array)
+
+    def test_reshapes_grid_thw_to_two_dim_for_vision_tower(self) -> None:
+        """vLLM batched fields deliver ``(3,)``; tower indexes ``grid_thw[:, 1:]``."""
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+
+        adapter.encode_multimodal([_vision_feature(grid_thw=_IMAGE_GRID_THW_2X2)])
+
+        _, grid_thw = tower.calls[0]
+        assert grid_thw.shape == (1, 3)
+        assert grid_thw.tolist() == [list(_IMAGE_GRID_THW_2X2)]
+
+    @pytest.mark.parametrize(
+        "weight_dtype",
+        [mx.float16, mx.bfloat16, mx.float32],
+    )
+    def test_casts_pixel_values_to_vision_tower_weight_dtype(
+        self,
+        weight_dtype: mx.Dtype,
+    ) -> None:
+        tower = _RecordingVisionTower(weight_dtype=weight_dtype)
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+
+        adapter.encode_multimodal([_vision_feature()])
+
+        pixel_values, _ = tower.calls[0]
+        assert pixel_values.dtype == weight_dtype
+
+    def test_raises_on_video_feature(self) -> None:
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+        feature = _vision_feature()
+        feature = MultiModalFeatureSpec(
+            data=feature.data,
+            modality="video",
+            identifier=feature.identifier,
+            mm_position=feature.mm_position,
+        )
+
+        with pytest.raises(ValueError, match="image features"):
+            adapter.encode_multimodal([feature])
+
+    def test_raises_when_vision_tower_is_none(self) -> None:
+        adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=_SPATIAL_MERGE_SIZE)
+
+        with pytest.raises(RuntimeError, match="vision_tower not loaded"):
+            adapter.encode_multimodal([_vision_feature()])
+
+    def test_raises_on_missing_feature_data(self) -> None:
+        tower = _RecordingVisionTower()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+        feature = MultiModalFeatureSpec(
+            data=None,
+            modality="image",
+            identifier="image-0",
+            mm_position=PlaceholderRange(offset=0, length=4),
+        )
+
+        with pytest.raises(ValueError, match="feature.data is required"):
+            adapter.encode_multimodal([feature])
+
+
+class _RecordingLanguageModel:
+    """Captures call kwargs for ``call_lm`` assertions.
+
+    Mirrors mlx_vlm 0.4.x's ``LanguageModel.__call__`` shape: ``inputs_embeds``
+    is a named parameter so signature sniffing finds it.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        inputs_embeds: mx.array | None = None,
+        cache: list[Any] | None = None,
+        position_ids: mx.array | None = None,
+    ) -> str:
+        self.calls.append(
+            {
+                "inputs": inputs,
+                "inputs_embeds": inputs_embeds,
+                "cache": cache,
+                "position_ids": position_ids,
+            }
+        )
+        return "lm-output"
+
+
+class _LegacyLanguageModel:
+    """LM that uses the older ``input_embeddings`` keyword."""
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        input_embeddings: mx.array | None = None,
+        cache: list[Any] | None = None,
+        position_ids: mx.array | None = None,
+    ) -> str:
+        return "legacy-output"
+
+
+class _UnknownLanguageModel:
+    """LM that exposes neither supported embeds keyword."""
+
+    def __call__(self, inputs: mx.array, cache: list[Any] | None = None) -> str:
+        return "no-embeds"
+
+
+class TestQwen3VLMultimodalAdapterDetectEmbedsKwarg:
+    def test_detects_inputs_embeds(self) -> None:
+        kwarg = Qwen3VLMultimodalAdapter._detect_embeds_kwarg(_RecordingLanguageModel())
+        assert kwarg == "inputs_embeds"
+
+    def test_detects_input_embeddings(self) -> None:
+        kwarg = Qwen3VLMultimodalAdapter._detect_embeds_kwarg(_LegacyLanguageModel())
+        assert kwarg == "input_embeddings"
+
+    def test_raises_on_drift(self) -> None:
+        with pytest.raises(RuntimeError, match="mlx_vlm version drift"):
+            Qwen3VLMultimodalAdapter._detect_embeds_kwarg(_UnknownLanguageModel())
+
+
+class TestQwen3VLMultimodalAdapterCallLm:
+    def test_passes_sniffed_kwarg_to_language_model(self) -> None:
+        lm = _RecordingLanguageModel()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=lm,
+            embeds_kwarg="inputs_embeds",
+        )
+        input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+        inputs_embeds = mx.zeros((1, 3, 8), dtype=mx.float32)
+        position_ids = mx.zeros((3, 1, 3), dtype=mx.int32)
+
+        output = adapter.call_lm(input_ids, inputs_embeds, [None], position_ids)
+
+        assert output == "lm-output"
+        assert len(lm.calls) == 1
+        call = lm.calls[0]
+        assert "inputs_embeds" in call
+        assert call["inputs_embeds"] is inputs_embeds
+        assert call["position_ids"] is position_ids
+        assert call["cache"] == [None]
+
+    def test_routes_through_legacy_input_embeddings_kwarg(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Capture:
+            def __call__(
+                self,
+                inputs: mx.array,
+                input_embeddings: mx.array | None = None,
+                cache: list[Any] | None = None,
+                position_ids: mx.array | None = None,
+            ) -> None:
+                captured["input_embeddings"] = input_embeddings
+
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=_Capture(),
+            embeds_kwarg="input_embeddings",
+        )
+        inputs_embeds = mx.zeros((1, 1, 8), dtype=mx.float32)
+
+        adapter.call_lm(
+            mx.array([[1]], dtype=mx.int32),
+            inputs_embeds,
+            [None],
+            mx.zeros((3, 1, 1), dtype=mx.int32),
+        )
+
+        assert captured["input_embeddings"] is inputs_embeds
+
+    def test_raises_when_language_model_missing(self) -> None:
+        adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=_SPATIAL_MERGE_SIZE)
+
+        with pytest.raises(RuntimeError, match="language_model not loaded"):
+            adapter.call_lm(
+                mx.array([[1]], dtype=mx.int32),
+                mx.zeros((1, 1, 8), dtype=mx.float32),
+                [None],
+                mx.zeros((3, 1, 1), dtype=mx.int32),
+            )
+
+    def test_raises_when_embeds_kwarg_not_detected(self) -> None:
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=_RecordingLanguageModel(),
+        )
+
+        with pytest.raises(RuntimeError, match="embeds_kwarg not detected"):
+            adapter.call_lm(
+                mx.array([[1]], dtype=mx.int32),
+                mx.zeros((1, 1, 8), dtype=mx.float32),
+                [None],
+                mx.zeros((3, 1, 1), dtype=mx.int32),
+            )
+
+
+class TestQwen3VLMultimodalAdapterFromLoadedModel:
+    def test_sniffs_embeds_kwarg_from_language_model(self) -> None:
+        class _LoadedModel:
+            class _Config:
+                class _VisionConfig:
+                    spatial_merge_size = 2
+
+                vision_config = _VisionConfig()
+
+            config = _Config()
+            vision_tower = _RecordingVisionTower()
+            language_model = _RecordingLanguageModel()
+
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+
+        assert adapter._embeds_kwarg == "inputs_embeds"
+        assert adapter._spatial_merge_size == 2

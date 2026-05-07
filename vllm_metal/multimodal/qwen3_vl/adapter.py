@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import inspect
 from functools import cache
 from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
+import torch
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 
 
 class Qwen3VLMultimodalAdapter:
@@ -23,12 +26,18 @@ class Qwen3VLMultimodalAdapter:
     can land at ``False`` without disturbing the model already in
     production."""
 
+    _SUPPORTED_EMBEDS_KWARGS: tuple[str, ...] = (
+        "inputs_embeds",
+        "input_embeddings",
+    )
+
     def __init__(
         self,
         *,
         spatial_merge_size: int,
         vision_tower: Any | None = None,
         language_model: Any | None = None,
+        embeds_kwarg: str | None = None,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
@@ -37,6 +46,7 @@ class Qwen3VLMultimodalAdapter:
         self._spatial_merge_size = spatial_merge_size
         self._vision_tower = vision_tower
         self._language_model = language_model
+        self._embeds_kwarg = embeds_kwarg
 
     def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
@@ -48,11 +58,134 @@ class Qwen3VLMultimodalAdapter:
         vision_tower = model.vision_tower
         language_model = model.language_model
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
+        embeds_kwarg = cls._detect_embeds_kwarg(language_model)
         return cls(
             spatial_merge_size=spatial_merge_size,
             vision_tower=vision_tower,
             language_model=language_model,
+            embeds_kwarg=embeds_kwarg,
         )
+
+    @classmethod
+    def _detect_embeds_kwarg(cls, language_model: Any) -> str:
+        """Return the embeds keyword accepted by ``language_model.__call__``.
+
+        mlx_vlm 0.4.x uses ``inputs_embeds``; sniffing the signature at adapter
+        construction lets future renames (``input_embeddings``) surface as a
+        clear init-time error rather than silently wrong attention.  RFC #319
+        risk #1.
+        """
+        try:
+            sig = inspect.signature(language_model.__call__)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Cannot inspect language_model.__call__ signature: {exc}"
+            ) from exc
+        params = set(sig.parameters)
+        for candidate in cls._SUPPORTED_EMBEDS_KWARGS:
+            if candidate in params:
+                return candidate
+        raise RuntimeError(
+            "language_model.__call__ accepts none of "
+            f"{cls._SUPPORTED_EMBEDS_KWARGS}; mlx_vlm version drift detected. "
+            f"Got parameters: {sorted(params)}"
+        )
+
+    def encode_multimodal(
+        self,
+        features: list[MultiModalFeatureSpec],
+    ) -> list[mx.array]:
+        """Run the vision tower per feature; return one MLX array per feature.
+
+        RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__``; route
+        through ``vision_tower`` directly so the LM is not re-entered through
+        the top-level VLM dispatch.  The vision tower returns
+        ``(hidden_states, deepstack_image_embeds)``; deepstack augmentation is
+        out of scope for the initial Qwen3.5-4B path.
+        """
+        if self._vision_tower is None:
+            raise RuntimeError(
+                "vision_tower not loaded; encode_multimodal unavailable. "
+                "Construct via Qwen3VLMultimodalAdapter.from_loaded_model."
+            )
+
+        # Match the cast that mlx_vlm.Model.get_input_embeddings performs
+        # before invoking the tower: vLLM's multimodal pipeline supplies
+        # pixel_values in fp32, but the loaded MLX vision tower may carry
+        # fp16/bf16 weights, so we align dtypes once per encode batch.
+        target_dtype = self._vision_tower.patch_embed.proj.weight.dtype
+
+        outputs: list[mx.array] = []
+        for feature in features:
+            if feature.modality != "image":
+                raise ValueError(
+                    "encode_multimodal only supports image features; got "
+                    f"modality={feature.modality!r}"
+                )
+            if feature.data is None:
+                raise ValueError("feature.data is required for vision encoding")
+
+            pixel_values = self._as_mlx(
+                self._feature_value(feature.data, "pixel_values")
+            ).astype(target_dtype)
+            # vLLM's MultiModalFieldConfig.batched delivers per-feature
+            # grid_thw as a 1D ``(3,)`` row, but the mlx_vlm vision tower
+            # indexes it as ``grid_thw[i, 1:]`` and reads
+            # ``grid_thw.shape[0]``, so reshape back to ``(1, 3)``.  One
+            # feature carries one image in this PR series; multi-image is
+            # already gated by ``_validate_image_features``.
+            image_grid_thw = self._as_mlx(
+                self._feature_value(feature.data, "image_grid_thw")
+            ).reshape(1, 3)
+
+            hidden_states, _ = self._vision_tower(pixel_values, image_grid_thw)
+            outputs.append(hidden_states)
+
+        return outputs
+
+    def call_lm(
+        self,
+        input_ids: mx.array,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+    ) -> Any:
+        """Invoke ``language_model`` with runner-built embeds and positions.
+
+        ``language_model`` is invoked directly rather than through the
+        top-level ``mlx_vlm.Model.__call__`` (RFC #319 hard rule #1), and the
+        embeds keyword is the one sniffed at construction so version drift
+        between ``inputs_embeds`` and ``input_embeddings`` surfaces at load
+        time instead of inside attention.
+        """
+        if self._language_model is None:
+            raise RuntimeError(
+                "language_model not loaded; call_lm unavailable. "
+                "Construct via Qwen3VLMultimodalAdapter.from_loaded_model."
+            )
+        if self._embeds_kwarg is None:
+            raise RuntimeError(
+                "embeds_kwarg not detected; construct via "
+                "Qwen3VLMultimodalAdapter.from_loaded_model so the language "
+                "model signature is sniffed at load time."
+            )
+        return self._language_model(
+            input_ids,
+            cache=cache,
+            position_ids=position_ids,
+            **{self._embeds_kwarg: inputs_embeds},
+        )
+
+    @staticmethod
+    def _as_mlx(value: Any) -> Any:
+        """Return ``value`` as an MLX array, converting from torch when needed.
+
+        Upstream vLLM's multimodal preprocessor stages ``MultiModalKwargsItem``
+        fields as torch tensors; vision_tower expects ``mx.array``.
+        """
+        if isinstance(value, torch.Tensor):
+            return torch_to_mlx(value)
+        return value
 
     def get_mrope_input_positions(
         self,

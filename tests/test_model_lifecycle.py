@@ -90,6 +90,20 @@ def _text_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**(_TEXT_MODEL_ARGS | overrides))
 
 
+class _Qwen35LanguageModelStub:
+    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works."""
+
+    def __call__(
+        self,
+        inputs: object,
+        inputs_embeds: object | None = None,
+        cache: object | None = None,
+        position_ids: object | None = None,
+        mask: object | None = None,
+    ) -> None:
+        return None
+
+
 def _qwen35_vlm_model(
     *,
     vision_tower: object | None = None,
@@ -102,7 +116,9 @@ def _qwen35_vlm_model(
             vision_config=SimpleNamespace(spatial_merge_size=spatial_merge_size),
         ),
         vision_tower=object() if vision_tower is None else vision_tower,
-        language_model=object() if language_model is None else language_model,
+        language_model=(
+            _Qwen35LanguageModelStub() if language_model is None else language_model
+        ),
     )
 
 
@@ -281,7 +297,7 @@ class TestModelLifecycle:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
         vision_tower = object()
-        language_model = object()
+        language_model = _Qwen35LanguageModelStub()
         fake_model = _qwen35_vlm_model(
             vision_tower=vision_tower,
             language_model=language_model,
