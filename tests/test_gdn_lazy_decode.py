@@ -205,6 +205,49 @@ class TestLazyConvDecode:
             np.array(cache.conv_states[0]), np.array(expected_state), atol=1e-5
         )
 
+    def test_updates_only_active_conv_slots(self) -> None:
+        # Arrange
+        class FakeConvKernel:
+            def __init__(self) -> None:
+                self.grid: tuple[int, int, int] | None = None
+                self.output_shapes: list[tuple[int, ...]] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.grid = kwargs["grid"]
+                self.output_shapes = kwargs["output_shapes"]
+                return (
+                    mx.ones((2, 4), dtype=mx.float32),
+                    mx.full((2, 2, 4), 9, dtype=mx.float32),
+                )
+
+        fake_kernel = FakeConvKernel()
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
+        cache.conv_states[0] = mx.array(initial_state)
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+        slot_ids = [3, 1]
+
+        # Act
+        result = GDNLazyDecodeKernels(
+            enabled=True,
+            conv_kernel=fake_kernel,
+            recurrent_kernel=_RaisingKernel(),
+        ).try_conv_decode(
+            mx.zeros((1, 2, 4), dtype=mx.float32), inner, cache, 0, slot_ids
+        )
+
+        # Assert
+        assert result is not None
+        assert fake_kernel.grid == (8, 1, 1)
+        assert fake_kernel.output_shapes == [(2, 4), (2, 2, 4)]
+        mx.eval(cache.conv_states[0])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
+
 
 class TestLazyRecurrentDecode:
     def test_matches_cpp_recurrent_path(self) -> None:

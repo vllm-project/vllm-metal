@@ -57,9 +57,9 @@ class GDNLazyDecodeKernels:
 
     The fast path uses ``mx.fast.metal_kernel`` source snippets from
     ``kernels_v2``.  Unlike the legacy recurrent C++ path, these kernels
-    materialize replacement conv state arrays and compact recurrent state
-    updates.  Recurrent updates are scattered back into the stable cache pool
-    so decode-only recurrent work stays proportional to active request count;
+    materialize compact conv/recurrent state updates.  Updates are scattered
+    back into the stable cache pool so decode-only state work stays
+    proportional to active request count;
     callers fall back to the legacy path when a request shape is ineligible.
     """
 
@@ -174,16 +174,15 @@ class GDNLazyDecodeKernels:
 
         conv_dim = state_cache.conv_dim
         kernel_size = inner.conv_kernel_size
-        max_seqs = state_cache.max_seqs
         conv_state_in = state_cache.conv_states[cache_idx]
         weight = inner.conv1d.weight
 
         mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
         slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
 
-        grid_size = max_seqs * conv_dim
+        grid_size = num_requests * conv_dim
         tg_size = min(256, grid_size)
-        state_shape = (max_seqs, kernel_size - 1, conv_dim)
+        state_updates_shape = (num_requests, kernel_size - 1, conv_dim)
 
         kernel_inputs = [
             mixed_qkv_2d,
@@ -196,17 +195,17 @@ class GDNLazyDecodeKernels:
             ("T", mixed_qkv.dtype),
             ("CONV_DIM", conv_dim),
             ("KERNEL_SIZE", kernel_size),
-            ("MAX_SEQS", max_seqs),
         ]
-        conv_silu_out, conv_state_out = self._conv_kernel(
+        conv_silu_out, conv_state_updates = self._conv_kernel(
             inputs=kernel_inputs,
             template=template,
             grid=(grid_size, 1, 1),
             threadgroup=(tg_size, 1, 1),
-            output_shapes=[(num_requests, conv_dim), state_shape],
+            output_shapes=[(num_requests, conv_dim), state_updates_shape],
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
-        state_cache.conv_states[cache_idx] = conv_state_out
+        conv_state_in[slot_ids_arr] = conv_state_updates
+        state_cache.conv_states[cache_idx] = conv_state_in
         return conv_silu_out.reshape(1, total_tokens, conv_dim)
 
     def try_recurrent_decode(
