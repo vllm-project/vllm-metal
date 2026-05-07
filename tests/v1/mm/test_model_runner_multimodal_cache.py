@@ -207,6 +207,30 @@ def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast() -> None:
     assert "drop" not in runner.encoder_cache.encoder_outputs
 
 
+def test_execute_model_cleans_finished_requests_before_encoder_fail_fast() -> None:
+    runner = _runner_with_encoder_cache()
+    features = [_feature("image-0")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("done", features)
+    runner._request_states["done"] = RequestState(
+        token_ids=[1, 2],
+        prompt_len=1,
+        cache=[],
+        sampling_params=SamplingParams(),
+    )
+
+    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+        runner.execute_model(
+            _scheduler_output(
+                finished_req_ids={"done"},
+                scheduled_encoder_inputs={"req-0": [0]},
+            )
+        )
+
+    assert "done" not in runner.encoder_cache.mm_features
+    assert "done" not in runner._request_states
+
+
 def test_execute_model_honors_forward_ready_multimodal_adapter() -> None:
     runner = _runner_with_encoder_cache()
     runner._multimodal_adapter = SimpleNamespace(forward_ready=True)

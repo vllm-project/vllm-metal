@@ -1321,8 +1321,17 @@ class MetalModelRunner:
             return self._execute_stt(scheduler_output)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
-        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
+        has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+
+        # Scheduler cleanup is independent of whether this step is supported.
+        # If the next check raises, old request state must still be evicted and
+        # any pending GDN release must be materialized now.
+        self._cleanup_finished_requests(
+            evicted_req_ids,
+            materialize_gdn_state=has_scheduled_encoder_inputs,
+        )
+        self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
 
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new
@@ -1337,11 +1346,6 @@ class MetalModelRunner:
                 "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
                 "to use structured output."
             )
-
-        self._cleanup_finished_requests(
-            evicted_req_ids,
-            materialize_gdn_state=False,
-        )
 
         batch = _ExecutionBatch()
         self._handle_new_requests(
