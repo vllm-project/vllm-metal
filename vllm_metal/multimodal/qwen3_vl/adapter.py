@@ -16,6 +16,13 @@ from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 class Qwen3VLMultimodalAdapter:
     """Model-owned multimodal helpers for the Qwen3-VL execution path."""
 
+    forward_ready: bool = False
+    """Closed until the Phase 4 parity test against pure mlx_vlm/mlx_lm or
+    upstream vLLM passes (RFC #319).  ``MetalModelRunner`` consults this
+    flag to gate ``_reject_scheduled_encoder_inputs`` so future adapters
+    can land at ``False`` without disturbing the model already in
+    production."""
+
     def __init__(
         self,
         *,

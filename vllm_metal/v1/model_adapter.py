@@ -28,6 +28,18 @@ class TargetModelForwardOutput:
 class MultimodalRuntimeAdapter(Protocol):
     """Model-owned behavior needed for native multimodal execution."""
 
+    forward_ready: bool
+    """Whether scheduled multimodal encoder inputs may be executed.
+
+    Phase 4 flips this to ``True`` for the active adapter only after the
+    fixed prompt+image parity test passes (RFC #319).  Until then the
+    runtime gate stays closed and ``MetalModelRunner`` fails fast on
+    scheduled encoder inputs even though the runtime state is already
+    registered.  Threading the gate through the adapter rather than a
+    runner-level flag means a second adapter can land at ``False``
+    without disturbing the model already in production.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 

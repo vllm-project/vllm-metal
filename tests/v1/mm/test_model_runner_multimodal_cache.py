@@ -240,3 +240,36 @@ def test_execute_model_rejects_encoder_inputs_until_forward_is_wired() -> None:
 
     with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
         runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
+
+
+def test_reject_scheduled_encoder_inputs_passes_when_adapter_is_forward_ready() -> None:
+    runner = _runner_with_encoder_cache()
+
+    class _ReadyAdapter:
+        forward_ready = True
+
+        def text_model(self) -> object:
+            return object()
+
+        def get_mrope_input_positions(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    runner._multimodal_adapter = _ReadyAdapter()
+
+    runner._reject_scheduled_encoder_inputs({"req-0": [0]})
+
+
+def test_reject_scheduled_encoder_inputs_raises_when_adapter_not_ready() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=2)
+
+    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+        runner._reject_scheduled_encoder_inputs({"req-0": [0]})
+
+
+def test_reject_scheduled_encoder_inputs_raises_when_no_adapter() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = None
+
+    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+        runner._reject_scheduled_encoder_inputs({"req-0": [0]})

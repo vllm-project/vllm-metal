@@ -1145,8 +1145,17 @@ class MetalModelRunner:
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
-        """Fail fast until encoder execution and embedding splice are wired."""
+        """Fail fast until the active adapter signals ``forward_ready``.
+
+        Phase 4 flips ``forward_ready`` on the adapter for the parity-tested
+        model.  Phase 5+ adapters land at ``False`` and route through this
+        guard until each one's parity test passes, so partial work on a new
+        model never disturbs models already in production.
+        """
         if not scheduled_encoder_inputs:
+            return
+        adapter = self._multimodal_adapter
+        if adapter is not None and adapter.forward_ready:
             return
         raise NotImplementedError(
             "Multimodal encoder execution is not wired on Metal yet. "
