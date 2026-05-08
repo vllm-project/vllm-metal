@@ -45,6 +45,10 @@ def _build_paged_row_targets(
 
     When no speculative row-span metadata is present, decode requests still map to
     one row each, matching the current paged-path behavior.
+
+    When row-span metadata is present, the caller must already have logits and
+    cu_seqlens laid out with one decode row per ``PagedDecodeSegment`` query
+    token. The production paged runner does not satisfy that contract yet.
     """
     req_id_to_rows: dict[str, tuple[int, ...]] = {}
 
@@ -137,6 +141,57 @@ def _build_constrained_rows(
     return constrained
 
 
+def _apply_grammar_bitmask_to_rows(
+    logits: mx.array,
+    grammar_bitmask: np.ndarray,
+    constrained: Sequence[tuple[int, int]],
+) -> mx.array:
+    """Apply grammar bitmask rows to explicit logits rows."""
+    if not constrained:
+        return logits
+
+    if xgr is None:
+        raise RuntimeError(
+            "xgrammar is required for structured output. "
+            "Install it with: pip install xgrammar"
+        )
+
+    # --- CPU/xgrammar bridge: operate only on constrained rows ---
+    #
+    # Copy only the n_constrained rows (not total_tokens) to CPU float32.
+    # Explicit float32 cast: numpy has no bfloat16 dtype, and np.array()
+    # forces MLX evaluation, producing an independent writable copy.
+    original_dtype = logits.dtype
+    logit_rows = [logit_row for logit_row, _ in constrained]
+    rows_np = np.array(
+        logits[0, logit_rows, :].astype(mx.float32)
+    )  # (n_constrained, vocab)
+    rows_torch = torch.from_numpy(rows_np)
+
+    # Apply per constrained row. xgrammar's indices= parameter selects rows
+    # from a full-batch bitmask — it does not support a sub-sampled bitmask
+    # paired with non-contiguous logit indices, so we apply row-by-row here.
+    # TODO: batch via indices= once xgrammar supports non-contiguous bitmask selection.
+    for i, (_, bitmask_row) in enumerate(constrained):
+        row_bitmask = torch.from_numpy(grammar_bitmask[bitmask_row : bitmask_row + 1])
+        # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
+        # vocab_size is intentionally omitted; xgrammar auto-detects it as
+        # min(logits_width, bitmask_words * 32).  Phantom slots in the last
+        # bitmask word (real_vocab % 32 != 0) get -inf, but the downstream
+        # sampler clips to the real vocabulary so they are never sampled.
+        xgr.apply_token_bitmask_inplace(rows_torch[i : i + 1], row_bitmask)
+
+    # rows_torch is CPU float32 (from torch.from_numpy), so torch_to_mlx goes
+    # through numpy — all xgrammar mutations are captured before the copy.
+    rows_mlx = torch_to_mlx(rows_torch).astype(original_dtype)  # (n_constrained, vocab)
+
+    # logits[0] produces a new lazy computation node (not a Python alias of
+    # logits), so __setitem__ here does not mutate the caller-held logits array.
+    result_2d = logits[0]
+    result_2d[logit_rows] = rows_mlx
+    return result_2d[None]  # Restore (1, total_tokens, vocab) shape
+
+
 class MetalStructuredOutputApplier:
     """Applies grammar/structured-output bitmask constraints to paged-path logits.
 
@@ -154,14 +209,11 @@ class MetalStructuredOutputApplier:
         cu_seqlens: list[int],
         num_decode: int,
         logits: mx.array,
-        paged_decode_segments: Sequence[PagedDecodeSegment] | None = None,
     ) -> mx.array:
         """Apply grammar bitmask to paged-path logits of shape (1, total_tokens, vocab).
 
         Only the sample positions are constrained:
         - Decode request i  → row i of logits[0]
-        - Decode request with row-span metadata → draft verification rows plus
-          the bonus row, using one grammar bitmask row per target row
         - Prefill request j → last-token row per sequence (from cu_seqlens)
 
         The CPU/xgrammar bridge copies only the constrained rows (n_constrained × vocab)
@@ -179,8 +231,6 @@ class MetalStructuredOutputApplier:
                 row per decode query token.
             num_decode: Number of decode requests.
             logits: Full paged logits, shape (1, total_tokens, vocab).
-            paged_decode_segments: Optional metadata describing multi-row decode
-                spans for speculative verification.
 
         Returns:
             Logits with forbidden token positions set to -inf, same shape and dtype.
@@ -195,18 +245,16 @@ class MetalStructuredOutputApplier:
             f"apply_paged expects shape (1, T, V), got {logits.shape}"
         )
 
-        # Spec-decode expands the token dimension with verification positions.
-        # Keep the old guard unless explicit row-span metadata tells us where
-        # those verification rows live. Plain requests with spec tokens can
-        # co-exist in the same batch safely.
+        # Spec-decode needs expanded decode rows, per-position grammar states,
+        # and sampling offsets that agree with those rows. Keep the production
+        # path guarded until the runtime supplies that contract. Plain requests
+        # with spec tokens can co-exist in the same batch safely.
         spec_req_ids = {
             req_id
             for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
             if tokens
         }
-        if paged_decode_segments is None and spec_req_ids & set(
-            grammar_output.structured_output_request_ids
-        ):
+        if spec_req_ids & set(grammar_output.structured_output_request_ids):
             raise NotImplementedError(
                 "Grammar/structured-output constraints are not yet supported "
                 "when speculative decoding is active on the paged Metal path."
@@ -231,7 +279,6 @@ class MetalStructuredOutputApplier:
             prefill_reqs,
             cu_seqlens,
             num_decode,
-            paged_decode_segments=paged_decode_segments,
         )
 
         # Determine which structured-output requests are present in this batch.
@@ -239,47 +286,6 @@ class MetalStructuredOutputApplier:
         constrained = _build_constrained_rows(
             grammar_output.structured_output_request_ids,
             row_targets,
-            paged_decode_segments=paged_decode_segments,
         )
 
-        if not constrained:
-            return logits
-
-        # --- CPU/xgrammar bridge: operate only on constrained rows ---
-        #
-        # Copy only the n_constrained rows (not total_tokens) to CPU float32.
-        # Explicit float32 cast: numpy has no bfloat16 dtype, and np.array()
-        # forces MLX evaluation, producing an independent writable copy.
-        original_dtype = logits.dtype
-        logit_rows = [logit_row for logit_row, _ in constrained]
-        rows_np = np.array(
-            logits[0, logit_rows, :].astype(mx.float32)
-        )  # (n_constrained, vocab)
-        rows_torch = torch.from_numpy(rows_np)
-
-        # Apply per constrained row. xgrammar's indices= parameter selects rows
-        # from a full-batch bitmask — it does not support a sub-sampled bitmask
-        # paired with non-contiguous logit indices, so we apply row-by-row here.
-        # TODO: batch via indices= once xgrammar supports non-contiguous bitmask selection.
-        for i, (_, bitmask_row) in enumerate(constrained):
-            row_bitmask = torch.from_numpy(
-                grammar_bitmask[bitmask_row : bitmask_row + 1]
-            )
-            # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
-            # vocab_size is intentionally omitted; xgrammar auto-detects it as
-            # min(logits_width, bitmask_words * 32).  Phantom slots in the last
-            # bitmask word (real_vocab % 32 != 0) get -inf, but the downstream
-            # sampler clips to the real vocabulary so they are never sampled.
-            xgr.apply_token_bitmask_inplace(rows_torch[i : i + 1], row_bitmask)
-
-        # rows_torch is CPU float32 (from torch.from_numpy), so torch_to_mlx goes
-        # through numpy — all xgrammar mutations are captured before the copy.
-        rows_mlx = torch_to_mlx(rows_torch).astype(
-            original_dtype
-        )  # (n_constrained, vocab)
-
-        # logits[0] produces a new lazy computation node (not a Python alias of
-        # logits), so __setitem__ here does not mutate the caller-held logits array.
-        result_2d = logits[0]
-        result_2d[logit_rows] = rows_mlx
-        return result_2d[None]  # Restore (1, total_tokens, vocab) shape
+        return _apply_grammar_bitmask_to_rows(logits, grammar_bitmask, constrained)
