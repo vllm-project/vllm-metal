@@ -193,6 +193,7 @@ class GDNLazyDecodeKernels:
         ]
         template = [
             ("T", mixed_qkv.dtype),
+            ("StT", conv_state_in.dtype),
             ("CONV_DIM", conv_dim),
             ("KERNEL_SIZE", kernel_size),
         ]

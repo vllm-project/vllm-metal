@@ -248,6 +248,91 @@ class TestLazyConvDecode:
         expected_state[slot_ids] = 9
         np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
 
+    def test_mixed_dtype_state_update_matches_eager_conv(self) -> None:
+        # Arrange
+        _require_metal()
+        mx.random.seed(1)
+        conv_dim = 4
+        kernel_size = 3
+        cache = _make_state_cache(conv_kernel_dim=kernel_size, conv_dim=conv_dim)
+        initial_state = mx.random.normal(cache.conv_states[0].shape).astype(mx.bfloat16)
+        cache.conv_states[0] = mx.array(initial_state)
+        weight = mx.random.normal((conv_dim, kernel_size)).astype(mx.float32)
+        inner = SimpleNamespace(
+            conv_kernel_size=kernel_size, conv1d=_DepthwiseConv1D(weight)
+        )
+        mixed_qkv = mx.random.normal((1, 2, conv_dim)).astype(mx.float32)
+        slot_ids = [1, 0]
+
+        expected_state = mx.array(initial_state)
+        expected_outputs = []
+        for req_idx, slot in enumerate(slot_ids):
+            conv_input = mx.concatenate(
+                [
+                    expected_state[slot : slot + 1],
+                    mixed_qkv[:, req_idx : req_idx + 1],
+                ],
+                axis=1,
+            )
+            expected_state[slot : slot + 1] = conv_input[
+                :, -(kernel_size - 1) :
+            ].astype(mx.bfloat16)
+            expected_outputs.append(nn.silu(inner.conv1d(conv_input))[:, -1:])
+        expected = mx.concatenate(expected_outputs, axis=1)
+
+        # Act
+        actual = GDNLazyDecodeKernels(enabled=True).try_conv_decode(
+            mixed_qkv, inner, cache, 0, slot_ids
+        )
+
+        # Assert
+        assert actual is not None
+        mx.eval(actual, expected, cache.conv_states[0], expected_state)
+        assert actual.dtype == mx.float32
+        assert cache.conv_states[0].dtype == mx.bfloat16
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=5e-3)
+        np.testing.assert_allclose(
+            np.array(cache.conv_states[0].astype(mx.float32)),
+            np.array(expected_state.astype(mx.float32)),
+            atol=5e-3,
+        )
+
+    def test_conv_state_update_template_uses_state_dtype(self) -> None:
+        # Arrange
+        class FakeConvKernel:
+            def __init__(self) -> None:
+                self.template: list[tuple[str, Any]] | None = None
+                self.output_dtypes: list[mx.Dtype] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.template = kwargs["template"]
+                self.output_dtypes = kwargs["output_dtypes"]
+                return (
+                    mx.ones((1, 4), dtype=mx.float32),
+                    mx.ones((1, 2, 4), dtype=mx.bfloat16),
+                )
+
+        fake_kernel = FakeConvKernel()
+        cache = _make_state_cache(max_seqs=2, conv_kernel_dim=3, conv_dim=4)
+        cache.conv_states[0] = cache.conv_states[0].astype(mx.bfloat16)
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+
+        # Act
+        result = GDNLazyDecodeKernels(
+            enabled=True,
+            conv_kernel=fake_kernel,
+            recurrent_kernel=_RaisingKernel(),
+        ).try_conv_decode(mx.zeros((1, 1, 4), dtype=mx.float32), inner, cache, 0, [0])
+
+        # Assert
+        assert result is not None
+        assert ("T", mx.float32) in (fake_kernel.template or [])
+        assert ("StT", mx.bfloat16) in (fake_kernel.template or [])
+        assert fake_kernel.output_dtypes == [mx.float32, mx.bfloat16]
+
 
 class TestLazyRecurrentDecode:
     def test_updates_only_active_recurrent_slots(self) -> None:

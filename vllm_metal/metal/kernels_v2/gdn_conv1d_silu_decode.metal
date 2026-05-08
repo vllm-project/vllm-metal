@@ -1,4 +1,4 @@
-// Template params: T (dtype), CONV_DIM, KERNEL_SIZE
+// Template params: T (output/input dtype), StT (state dtype), CONV_DIM, KERNEL_SIZE
 // Inputs: input, conv_state_in, weights, slot_mapping, num_requests
 // Outputs: output, conv_state_out
 // Grid: (num_requests * CONV_DIM, 1, 1) — one thread per (request, channel)
@@ -31,4 +31,4 @@ for (int t = 0; t < state_len - 1; ++t) {
     conv_state_out[state_out_base + t * CONV_DIM] =
         conv_state_in[state_base + (t + 1) * CONV_DIM];
 }
-conv_state_out[state_out_base + (state_len - 1) * CONV_DIM] = static_cast<T>(inp);
+conv_state_out[state_out_base + (state_len - 1) * CONV_DIM] = static_cast<StT>(inp);
