@@ -228,6 +228,17 @@ class SamplingBatch:
     def _make_penalty_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build per-request penalty tensors.
+
+        When the batch has no penalties, the vLLM ``Sampler`` and
+        ``RejectionSampler`` short-circuit on ``no_penalties=True`` before
+        touching these tensors, so we can return zero-length placeholders and
+        avoid allocating ``batch_size`` tensors three times every step.
+        """
+        if self.no_penalties:
+            empty = torch.empty(0, dtype=torch.float32, device=self.device)
+            return empty, empty, empty
+
         frequency_penalties = torch.tensor(
             [
                 sampling_params.frequency_penalty

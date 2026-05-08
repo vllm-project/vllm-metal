@@ -342,6 +342,66 @@ class TestV1SamplingBatch:
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.8, top_k=4)]
         )
 
+    def test_sampling_metadata_skips_penalty_allocation_when_no_penalties(
+        self,
+    ) -> None:
+        """When the batch has no penalties, the per-request penalty tensors
+        should be zero-length placeholders rather than ``batch_size`` allocations.
+
+        Both ``Sampler.apply_penalties`` and ``RejectionSampler`` short-circuit
+        on ``no_penalties=True`` before reading these fields, so skipping the
+        allocations is safe and removes 3 redundant ``torch.tensor(...)`` calls
+        per decode step on hot paths.
+        """
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=0.8),
+                SamplingParams(temperature=1.0, top_k=10),
+            ],
+            [[1, 2, 3], [4, 5], [6]],
+            [[], [], []],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+        assert batch.no_penalties
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.no_penalties is True
+        assert metadata.frequency_penalties.numel() == 0
+        assert metadata.presence_penalties.numel() == 0
+        assert metadata.repetition_penalties.numel() == 0
+        assert metadata.frequency_penalties.dtype == torch.float32
+        assert metadata.presence_penalties.dtype == torch.float32
+        assert metadata.repetition_penalties.dtype == torch.float32
+
+    def test_sampling_metadata_allocates_penalty_tensors_when_penalized(
+        self,
+    ) -> None:
+        """Regression: ensure penalty tensors are still built per-request when
+        any request opts into a non-default penalty value.
+        """
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=0.8, frequency_penalty=0.5),
+                SamplingParams(temperature=0.8, repetition_penalty=1.2),
+            ],
+            [[1], [2], [3]],
+            [[], [], []],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+        assert not batch.no_penalties
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.no_penalties is False
+        assert metadata.frequency_penalties.tolist() == pytest.approx([0.0, 0.5, 0.0])
+        assert metadata.presence_penalties.tolist() == pytest.approx([0.0, 0.0, 0.0])
+        assert metadata.repetition_penalties.tolist() == pytest.approx([1.0, 1.0, 1.2])
+
     def test_sampling_metadata_uses_requested_logprobs(self) -> None:
         batch = SamplingBatch(
             [SamplingParams(temperature=0.0, logprobs=5)],
