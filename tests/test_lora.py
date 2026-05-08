@@ -23,7 +23,6 @@ pytest.importorskip("vllm.lora.utils")
 pytest.importorskip("safetensors")
 
 
-
 def test_mapping_builder_routes_tokens_and_marks_prefill() -> None:
     builder = mapping_mod.LoRAMappingBuilder()
     assert builder.is_empty()
