@@ -1145,17 +1145,20 @@ class MetalModelRunner:
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
-        """Fail fast until the active adapter signals ``forward_ready``.
+        """Dispatch to vision encoders or fail fast based on adapter state.
 
-        Phase 4 flips ``forward_ready`` on the adapter for the parity-tested
-        model.  Phase 5+ adapters land at ``False`` and route through this
-        guard until each one's parity test passes, so partial work on a new
-        model never disturbs models already in production.
+        When the active adapter signals ``forward_ready``, scheduled encoder
+        inputs are routed to :meth:`_run_vision_encoders`.  Until Phase 4
+        flips that flag for the parity-tested model, the gate raises so
+        partial work on a new model never disturbs models already in
+        production.  Phase 5+ adapters land at ``False`` and route through
+        this guard until each one's parity test passes.
         """
         if not scheduled_encoder_inputs:
             return
         adapter = self._multimodal_adapter
         if adapter is not None and adapter.forward_ready:
+            self._run_vision_encoders(scheduled_encoder_inputs)
             return
         raise NotImplementedError(
             "Multimodal encoder execution is not wired on Metal yet. "
@@ -1189,6 +1192,48 @@ class MetalModelRunner:
             is_hybrid=self.is_hybrid,
             logitsprocs=self._logitsprocs,
         )
+
+    def _run_vision_encoders(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+    ) -> None:
+        """Run the vision encoder for each scheduled feature, stash by identifier.
+
+        Skips features whose ``identifier`` already lives in
+        ``encoder_cache.encoder_outputs`` (cache hit; the scheduler may
+        re-list a feature across chunks).  Calls
+        ``adapter.encode_multimodal`` one feature at a time so a single bad
+        feature is reported with a precise req_id+idx rather than poisoning
+        a whole request batch.
+        """
+        adapter = self._multimodal_adapter
+        cache = self.encoder_cache
+        if adapter is None or cache is None:
+            return
+        for req_id, feature_indices in scheduled_encoder_inputs.items():
+            mm_features = cache.mm_features.get(req_id)
+            if mm_features is None:
+                raise RuntimeError(
+                    f"Scheduled encoder input for unregistered request "
+                    f"{req_id!r}; encoder cache mm_features missing."
+                )
+            for idx in feature_indices:
+                if idx < 0 or idx >= len(mm_features):
+                    raise IndexError(
+                        f"Encoder feature index {idx} out of range for "
+                        f"request {req_id!r} with {len(mm_features)} features."
+                    )
+                feature = mm_features[idx]
+                if feature.identifier in cache.encoder_outputs:
+                    continue
+                outputs = adapter.encode_multimodal([feature])
+                if len(outputs) != 1:
+                    raise RuntimeError(
+                        f"encode_multimodal returned {len(outputs)} outputs "
+                        "for 1 feature; adapter must return one array per "
+                        "feature."
+                    )
+                cache.encoder_outputs[feature.identifier] = outputs[0]
 
     def _handle_new_requests(
         self,

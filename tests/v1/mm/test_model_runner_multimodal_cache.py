@@ -242,21 +242,52 @@ def test_execute_model_rejects_encoder_inputs_until_forward_is_wired() -> None:
         runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
 
 
-def test_reject_scheduled_encoder_inputs_passes_when_adapter_is_forward_ready() -> None:
+class _RecordingAdapter:
+    """Adapter stub that records ``encode_multimodal`` invocations."""
+
+    forward_ready = True
+
+    def __init__(self) -> None:
+        self.encode_calls: list[list[MultiModalFeatureSpec]] = []
+        self._next_outputs: list[list[mx.array]] | None = None
+
+    def queue_outputs(self, outputs: list[list[mx.array]]) -> None:
+        """Force a sequence of return values for successive encode calls."""
+        self._next_outputs = list(outputs)
+
+    def text_model(self) -> object:
+        return object()
+
+    def get_mrope_input_positions(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def encode_multimodal(
+        self, features: list[MultiModalFeatureSpec]
+    ) -> list[mx.array]:
+        self.encode_calls.append(list(features))
+        if self._next_outputs is not None and self._next_outputs:
+            return self._next_outputs.pop(0)
+        return [mx.zeros((1, 4)) for _ in features]
+
+    def call_lm(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("call_lm not exercised in commit 3")
+
+
+def test_reject_scheduled_encoder_inputs_dispatches_when_adapter_is_forward_ready() -> (
+    None
+):
     runner = _runner_with_encoder_cache()
-
-    class _ReadyAdapter:
-        forward_ready = True
-
-        def text_model(self) -> object:
-            return object()
-
-        def get_mrope_input_positions(self, *args: object, **kwargs: object) -> None:
-            return None
-
-    runner._multimodal_adapter = _ReadyAdapter()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("image-0")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
 
     runner._reject_scheduled_encoder_inputs({"req-0": [0]})
+
+    assert len(adapter.encode_calls) == 1
+    assert adapter.encode_calls[0] == features
+    assert "image-0" in runner.encoder_cache.encoder_outputs
 
 
 def test_reject_scheduled_encoder_inputs_raises_when_adapter_not_ready() -> None:
@@ -273,3 +304,100 @@ def test_reject_scheduled_encoder_inputs_raises_when_no_adapter() -> None:
 
     with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
+
+
+def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("image-0")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+    expected = mx.array([[1.0, 2.0]])
+    adapter.queue_outputs([[expected]])
+
+    runner._run_vision_encoders({"req-0": [0]})
+
+    assert adapter.encode_calls == [features]
+    stored = runner.encoder_cache.encoder_outputs["image-0"]
+    assert mx.allclose(stored, expected).item()
+
+
+def test_run_vision_encoders_skips_cached_features() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("image-0")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+    cached = mx.array([[7.0]])
+    runner.encoder_cache.encoder_outputs["image-0"] = cached
+
+    runner._run_vision_encoders({"req-0": [0]})
+
+    assert adapter.encode_calls == []
+    assert runner.encoder_cache.encoder_outputs["image-0"] is cached
+
+
+def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    req0_features = [_feature("img-a"), _feature("img-b")]
+    req1_features = [_feature("img-c")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", req0_features)
+    runner.encoder_cache.add_request("req-1", req1_features)
+
+    runner._run_vision_encoders({"req-0": [0, 1], "req-1": [0]})
+
+    assert len(adapter.encode_calls) == 3
+    encoded_identifiers = [call[0].identifier for call in adapter.encode_calls]
+    assert encoded_identifiers == ["img-a", "img-b", "img-c"]
+    assert set(runner.encoder_cache.encoder_outputs) == {"img-a", "img-b", "img-c"}
+
+
+def test_run_vision_encoders_raises_for_unregistered_request() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = _RecordingAdapter()
+
+    with pytest.raises(RuntimeError, match="unregistered request"):
+        runner._run_vision_encoders({"missing-req": [0]})
+
+
+def test_run_vision_encoders_raises_for_out_of_range_index() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = _RecordingAdapter()
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", [_feature("image-0")])
+
+    with pytest.raises(IndexError, match="out of range"):
+        runner._run_vision_encoders({"req-0": [3]})
+
+
+def test_run_vision_encoders_raises_when_adapter_returns_wrong_count() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("image-0")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+    adapter.queue_outputs([[mx.zeros((1,)), mx.zeros((1,))]])
+
+    with pytest.raises(RuntimeError, match="encode_multimodal returned 2"):
+        runner._run_vision_encoders({"req-0": [0]})
+
+
+def test_run_vision_encoders_no_op_when_no_adapter() -> None:
+    runner = _runner_with_encoder_cache()
+    runner._multimodal_adapter = None
+
+    runner._run_vision_encoders({"req-0": [0]})
+
+
+def test_run_vision_encoders_no_op_when_no_encoder_cache() -> None:
+    runner = make_stub_runner()
+    runner._multimodal_adapter = _RecordingAdapter()
+    assert runner.encoder_cache is None
+
+    runner._run_vision_encoders({"req-0": [0]})
