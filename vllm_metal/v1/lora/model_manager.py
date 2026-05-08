@@ -25,13 +25,16 @@ class MLXLoRAModelManager:
     def __init__(
         self,
         model: nn.Module,
-        lora_config: "LoRAConfig",
+        lora_config: LoRAConfig,
         max_num_seqs: int,
         max_num_batched_tokens: int,
         dtype: mx.Dtype,
     ):
         self.model, self.lora_config = model, lora_config
-        self.max_num_seqs, self.max_num_batched_tokens = max_num_seqs, max_num_batched_tokens
+        self.max_num_seqs, self.max_num_batched_tokens = (
+            max_num_seqs,
+            max_num_batched_tokens,
+        )
         self.dtype = dtype
 
         self._registered: dict[int, LoadedLoRA] = {}
@@ -47,20 +50,30 @@ class MLXLoRAModelManager:
         self._wrap_target_modules()
 
     @property
-    def lora_slots(self) -> int: return self.lora_config.max_loras
+    def lora_slots(self) -> int:
+        return self.lora_config.max_loras
+
     @property
-    def adapter_slots(self) -> int: return self.lora_slots
+    def adapter_slots(self) -> int:
+        return self.lora_slots
+
     @property
-    def capacity(self) -> int: return self.lora_config.max_cpu_loras or self.lora_slots
-    def __len__(self) -> int: return len(self._registered)
+    def capacity(self) -> int:
+        return self.lora_config.max_cpu_loras or self.lora_slots
+
+    def __len__(self) -> int:
+        return len(self._registered)
 
     def _wrap_target_modules(self) -> None:
         from vllm.lora.utils import is_in_target_modules
+
         targets = self.lora_config.target_modules
         repls = [
             (
                 name,
-                MLXLinearWithLoRA(m, self.lora_slots, self.lora_config.max_lora_rank, self.dtype),
+                MLXLinearWithLoRA(
+                    m, self.lora_slots, self.lora_config.max_lora_rank, self.dtype
+                ),
             )
             for name, m in self.model.named_modules()
             if can_wrap(m) and is_in_target_modules(name, targets)
@@ -137,7 +150,9 @@ class MLXLoRAModelManager:
         if loaded == 0:
             logger.warning("LoRA %d activated but matched 0 wrapped modules.", lora_id)
         else:
-            logger.info("Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded)
+            logger.info(
+                "Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded
+            )
         self._last_mapping = None
         return True
 
@@ -175,7 +190,8 @@ def _lookup_weights_for_module(
         return w
     suffix = "." + module_name
     cands = [
-        w for n, w in adapter.weights.items()
+        w
+        for n, w in adapter.weights.items()
         if n.endswith(suffix) or module_name.endswith("." + n)
     ]
     return cands[0] if len(cands) == 1 else None

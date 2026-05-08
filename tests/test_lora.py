@@ -16,17 +16,17 @@ pytest.importorskip("vllm.lora.peft_helper")
 pytest.importorskip("vllm.lora.utils")
 pytest.importorskip("safetensors")
 
-from vllm_metal.v1.lora import layers as layers_mod
-from vllm_metal.v1.lora import mapping as mapping_mod
-from vllm_metal.v1.lora import model_manager as model_manager_mod
-from vllm_metal.v1.lora import peft_loader as peft_loader_mod
-from vllm_metal.v1.lora import punica_wrapper as punica_mod
+from vllm_metal.v1.lora import layers as layers_mod  # noqa: E402
+from vllm_metal.v1.lora import mapping as mapping_mod  # noqa: E402
+from vllm_metal.v1.lora import model_manager as model_manager_mod  # noqa: E402
+from vllm_metal.v1.lora import peft_loader as peft_loader_mod  # noqa: E402
+from vllm_metal.v1.lora import punica_wrapper as punica_mod  # noqa: E402
 
 
 def test_mapping_builder_routes_tokens_and_marks_prefill() -> None:
     builder = mapping_mod.LoRAMappingBuilder()
     assert builder.is_empty()
-    builder.add_request(lora_id=7, num_tokens=4)   # prefill (>1 token)
+    builder.add_request(lora_id=7, num_tokens=4)  # prefill (>1 token)
     builder.add_request(lora_id=None, num_tokens=1)
     builder.add_request(lora_id=7, num_tokens=1)
 
@@ -55,6 +55,7 @@ def test_punica_add_lora_linear_no_lora_is_a_passthrough() -> None:
 
 # MLXLinearWithLoRA wrapper
 
+
 def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     base = nn.Linear(input_dims=3, output_dims=4, bias=False)
     wrapper = layers_mod.MLXLinearWithLoRA(
@@ -78,10 +79,12 @@ def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     "lora_a_shape,lora_b_shape,err_match",
     [
         ((2, 7), (4, 2), "LoRA weight shape mismatch"),  # in_dim mismatch
-        ((4, 3), (4, 4), "exceeds max_lora_rank"),       # rank > max_lora_rank
+        ((4, 3), (4, 4), "exceeds max_lora_rank"),  # rank > max_lora_rank
     ],
 )
-def test_linear_wrapper_rejects_bad_weights(lora_a_shape, lora_b_shape, err_match) -> None:
+def test_linear_wrapper_rejects_bad_weights(
+    lora_a_shape, lora_b_shape, err_match
+) -> None:
     base = nn.Linear(input_dims=3, output_dims=4, bias=False)
     wrapper = layers_mod.MLXLinearWithLoRA(
         base_layer=base, max_loras=1, max_lora_rank=2, dtype=mx.float32
@@ -119,6 +122,7 @@ def test_linear_wrapper_call_with_active_lora_changes_output() -> None:
 
 
 # PEFT loader (round-trip through a tmp safetensors file)
+
 
 def _write_peft_adapter(tmp_path: Path) -> Path:
     from safetensors.numpy import save_file
@@ -165,13 +169,15 @@ def test_peft_loader_normalizes_module_name_and_keeps_orientation(
 @pytest.mark.parametrize(
     "config_override,err_match",
     [
-        ({"r": 1024},                   "is greater than max_lora_rank"),
-        ({"use_dora": True},            "does not yet support DoRA"),
+        ({"r": 1024}, "is greater than max_lora_rank"),
+        ({"use_dora": True}, "does not yet support DoRA"),
         ({"modules_to_save": ["lm_head"]}, "modules_to_save being None"),
     ],
 )
 def test_peft_loader_rejects_unsupported_configs(
-    tmp_path: Path, config_override: dict, err_match: str,
+    tmp_path: Path,
+    config_override: dict,
+    err_match: str,
 ) -> None:
     """When called with a LoRAConfig, the loader must surface PEFTHelper's validation."""
     pytest.importorskip("safetensors.numpy")
@@ -182,7 +188,9 @@ def test_peft_loader_rejects_unsupported_configs(
     cfg.update(config_override)
     cfg_path.write_text(json.dumps(cfg))
 
-    lora_config = SimpleNamespace(max_lora_rank=16, max_cpu_loras=3, max_loras=2, bias_enabled=False)
+    lora_config = SimpleNamespace(
+        max_lora_rank=16, max_cpu_loras=3, max_loras=2, bias_enabled=False
+    )
     with pytest.raises(ValueError, match=err_match):
         peft_loader_mod.load_peft_adapter(
             adapter_dir, lora_id=1, lora_config=lora_config
@@ -207,16 +215,22 @@ def test_peft_loader_without_lora_config_skips_validation(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     "stored_key,lookup,expected_hit",
     [
-        ("layers.0.self_attn.q_proj", "layers.0.self_attn.q_proj", True),               # exact
-        ("language_model.model.layers.0.self_attn.q_proj",
-         "layers.0.self_attn.q_proj", True),                                            # suffix
-        (None, "layers.0.x", False),                                                    # missing
+        ("layers.0.self_attn.q_proj", "layers.0.self_attn.q_proj", True),  # exact
+        (
+            "language_model.model.layers.0.self_attn.q_proj",
+            "layers.0.self_attn.q_proj",
+            True,
+        ),  # suffix
+        (None, "layers.0.x", False),  # missing
     ],
 )
 def test_lookup_weights_for_module(stored_key, lookup, expected_hit) -> None:
     weights = peft_loader_mod.LoRALayerWeightsMLX(
         module_name=stored_key or "",
-        rank=2, lora_a=mx.zeros((2, 3)), lora_b=mx.zeros((4, 2)), scaling=1.0,
+        rank=2,
+        lora_a=mx.zeros((2, 3)),
+        lora_b=mx.zeros((4, 2)),
+        scaling=1.0,
     )
     stored = {stored_key: weights} if stored_key is not None else {}
     adapter = peft_loader_mod.LoadedLoRA(lora_id=1, rank=2, weights=stored)
@@ -225,6 +239,7 @@ def test_lookup_weights_for_module(stored_key, lookup, expected_hit) -> None:
 
 
 # Multi-adapter batching
+
 
 def _stack_with_null(*per_slot_a: np.ndarray) -> tuple[mx.array, int, int]:
     """Stack rank-1 LoRA A weights into ``(slots+1, rank, in)`` with null tail."""
@@ -248,14 +263,14 @@ def test_punica_routes_two_adapters_in_one_batch() -> None:
     a1 = np.array([[0.0, 1.0]], dtype=np.float32)  # adapter 22 picks dim 1
     a_stacked, _, _ = _stack_with_null(a0, a1)
 
-    b0 = np.array([[1.0]], dtype=np.float32)        # adapter 11: out scale 1
-    b1 = np.array([[10.0]], dtype=np.float32)       # adapter 22: out scale 10
+    b0 = np.array([[1.0]], dtype=np.float32)  # adapter 11: out scale 1
+    b1 = np.array([[10.0]], dtype=np.float32)  # adapter 22: out scale 10
     b_null = np.zeros_like(b0)
     b_stacked = mx.array(np.stack([b0, b1, b_null]))
 
-    x = mx.array(np.array(
-        [[2.0, 3.0], [2.0, 3.0], [4.0, 5.0], [4.0, 5.0]], dtype=np.float32
-    ))
+    x = mx.array(
+        np.array([[2.0, 3.0], [2.0, 3.0], [4.0, 5.0], [4.0, 5.0]], dtype=np.float32)
+    )
     y = mx.zeros((4, 1), dtype=mx.float32)
 
     out = np.array(wrapper.add_lora_linear(y, x, a_stacked, b_stacked, scale=1.0))
@@ -283,12 +298,16 @@ def test_punica_three_adapters_with_no_lora_token() -> None:
         np.array([[2.0]], dtype=np.float32),
         np.array([[3.0]], dtype=np.float32),
     )
-    b_stacked = mx.array(np.stack([
-        np.array([[1.0]], dtype=np.float32),
-        np.array([[1.0]], dtype=np.float32),
-        np.array([[1.0]], dtype=np.float32),
-        np.array([[0.0]], dtype=np.float32),  # null slot
-    ]))
+    b_stacked = mx.array(
+        np.stack(
+            [
+                np.array([[1.0]], dtype=np.float32),
+                np.array([[1.0]], dtype=np.float32),
+                np.array([[1.0]], dtype=np.float32),
+                np.array([[0.0]], dtype=np.float32),  # null slot
+            ]
+        )
+    )
 
     x = mx.array(np.ones((4, 1), dtype=np.float32))
     y = mx.full((4, 1), 100.0, dtype=mx.float32)
@@ -305,12 +324,14 @@ def test_punica_batched_matches_per_token_single_adapter_runs() -> None:
     in_dim, out_dim, rank = 4, 5, 2
 
     # Two random adapters.
-    a0, a1 = rng.standard_normal((rank, in_dim)).astype(np.float32), rng.standard_normal(
-        (rank, in_dim)
-    ).astype(np.float32)
-    b0, b1 = rng.standard_normal((out_dim, rank)).astype(np.float32), rng.standard_normal(
-        (out_dim, rank)
-    ).astype(np.float32)
+    a0, a1 = (
+        rng.standard_normal((rank, in_dim)).astype(np.float32),
+        rng.standard_normal((rank, in_dim)).astype(np.float32),
+    )
+    b0, b1 = (
+        rng.standard_normal((out_dim, rank)).astype(np.float32),
+        rng.standard_normal((out_dim, rank)).astype(np.float32),
+    )
     a_stacked = mx.array(np.stack([a0, a1, np.zeros_like(a0)]))
     b_stacked = mx.array(np.stack([b0, b1, np.zeros_like(b0)]))
 
@@ -350,11 +371,15 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
     a0 = np.array([[1.0, 0.0]], dtype=np.float32)
     a1 = np.array([[0.0, 1.0]], dtype=np.float32)
     a_stacked = mx.array(np.stack([a0, a1, np.zeros_like(a0)]))
-    b_stacked = mx.array(np.stack([
-        np.array([[1.0]], dtype=np.float32),
-        np.array([[10.0]], dtype=np.float32),
-        np.array([[0.0]], dtype=np.float32),
-    ]))
+    b_stacked = mx.array(
+        np.stack(
+            [
+                np.array([[1.0]], dtype=np.float32),
+                np.array([[10.0]], dtype=np.float32),
+                np.array([[0.0]], dtype=np.float32),
+            ]
+        )
+    )
     x = mx.array(np.array([[1.0, 1.0], [1.0, 1.0]], dtype=np.float32))
     y = mx.zeros((2, 1), dtype=mx.float32)
 
@@ -371,19 +396,23 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
     # weight stack the manager passes also gets reordered: slot 0 = adapter 22's
     # weights, slot 1 = adapter 11's. Token 0 still requests adapter 11 -> slot 1.
     a_stacked_swapped = mx.array(np.stack([a1, a0, np.zeros_like(a0)]))
-    b_stacked_swapped = mx.array(np.stack([
-        np.array([[10.0]], dtype=np.float32),
-        np.array([[1.0]], dtype=np.float32),
-        np.array([[0.0]], dtype=np.float32),
-    ]))
+    b_stacked_swapped = mx.array(
+        np.stack(
+            [
+                np.array([[10.0]], dtype=np.float32),
+                np.array([[1.0]], dtype=np.float32),
+                np.array([[0.0]], dtype=np.float32),
+            ]
+        )
+    )
     wrapper.update_metadata(
         mapping_mod.LoRAMapping(index_mapping=(11, 22), prompt_mapping=(11, 22)),
         lora_index_to_id=[22, 11],
     )
     assert wrapper.token_slot_indices.tolist() == [1, 0]
-    out2 = np.array(wrapper.add_lora_linear(
-        y, x, a_stacked_swapped, b_stacked_swapped, scale=1.0
-    ))
+    out2 = np.array(
+        wrapper.add_lora_linear(y, x, a_stacked_swapped, b_stacked_swapped, scale=1.0)
+    )
     # Token 0 (adapter 11, slot 1): a1·[1,1]=1, b·1=1.  No, wait — slot 1 holds adapter 11.
     # a_swapped[1] = a0 = [1,0]; a0·[1,1] = 1; b_swapped[1] = [[1.0]]; -> 1.0.
     # Token 1 (adapter 22, slot 0): a_swapped[0] = a1 = [0,1]; a1·[1,1] = 1; b_swapped[0] = [[10.0]]; -> 10.0.
@@ -392,8 +421,12 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
 
 # MLXLoRAModelManager — full slot-table + module-wrapping flow
 
+
 def _lora_config_stub(
-    *, max_loras: int, max_lora_rank: int, max_cpu_loras: int | None = None,
+    *,
+    max_loras: int,
+    max_lora_rank: int,
+    max_cpu_loras: int | None = None,
     target_modules: list[str] | None = None,
 ) -> SimpleNamespace:
     """Stand-in for ``vllm.config.lora.LoRAConfig`` — only the fields the manager reads."""
@@ -419,7 +452,9 @@ class _TwoLinearModel(nn.Module):
         return self.fc2(self.fc1(x))
 
 
-def _make_adapter(lora_id: int, *, fc1_a, fc1_b, scaling: float = 1.0) -> "peft_loader_mod.LoadedLoRA":
+def _make_adapter(
+    lora_id: int, *, fc1_a, fc1_b, scaling: float = 1.0
+) -> peft_loader_mod.LoadedLoRA:
     """Build a LoadedLoRA targeting only fc1 (fc2 is a no-op base + no-lora pass)."""
     return peft_loader_mod.LoadedLoRA(
         lora_id=lora_id,
@@ -498,8 +533,10 @@ def test_manager_two_adapters_mixed_batch_through_full_forward() -> None:
         fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
         fc1_b=np.array([[0.0], [7.0]], dtype=np.float32),
     )
-    manager.add_adapter(a1); manager.add_adapter(a2)
-    manager.activate_adapter(1); manager.activate_adapter(2)
+    manager.add_adapter(a1)
+    manager.add_adapter(a2)
+    manager.activate_adapter(1)
+    manager.activate_adapter(2)
     assert sorted(manager.list_adapters()) == [1, 2]
 
     # Mixed batch: token 0 -> adapter 1 with [1,0]; token 1 -> adapter 2 with [0,1].
@@ -608,10 +645,16 @@ def test_manager_no_free_slot_raises() -> None:
         max_num_batched_tokens=2,
         dtype=mx.float32,
     )
-    a = _make_adapter(1, fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
-                      fc1_b=np.array([[1.0], [0.0]], dtype=np.float32))
-    b = _make_adapter(2, fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
-                      fc1_b=np.array([[0.0], [1.0]], dtype=np.float32))
+    a = _make_adapter(
+        1,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
+    )
+    b = _make_adapter(
+        2,
+        fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
+        fc1_b=np.array([[0.0], [1.0]], dtype=np.float32),
+    )
     manager.add_adapter(a)
     manager.add_adapter(b)
     manager.activate_adapter(1)
@@ -629,10 +672,16 @@ def test_manager_add_adapter_over_capacity_raises() -> None:
         max_num_batched_tokens=2,
         dtype=mx.float32,
     )
-    a = _make_adapter(1, fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
-                      fc1_b=np.array([[1.0], [0.0]], dtype=np.float32))
-    b = _make_adapter(2, fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
-                      fc1_b=np.array([[0.0], [1.0]], dtype=np.float32))
+    a = _make_adapter(
+        1,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
+    )
+    b = _make_adapter(
+        2,
+        fc1_a=np.array([[0.0, 1.0]], dtype=np.float32),
+        fc1_b=np.array([[0.0], [1.0]], dtype=np.float32),
+    )
     manager.add_adapter(a)
     with pytest.raises(RuntimeError, match="capacity"):
         manager.add_adapter(b)

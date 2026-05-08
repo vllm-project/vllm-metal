@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class LoRAMapping:
-    index_mapping: tuple[int, ...]   # one per token (0 = no LoRA)
+    index_mapping: tuple[int, ...]  # one per token (0 = no LoRA)
     prompt_mapping: tuple[int, ...]  # one per request
     is_prefill: bool = False
 

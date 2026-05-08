@@ -52,6 +52,8 @@ def make_stub_runner(
         "_sampler": None,
         "_logitsprocs": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
+        "_lora_manager": None,
+        "_loaded_lora_requests": {},
         "model_args": _model_args,
     }
 

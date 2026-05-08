@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["LoRALayerWeightsMLX", "LoadedLoRA", "load_peft_adapter"]
 
+
 @dataclass(frozen=True)
 class LoRALayerWeightsMLX:
     module_name: str
@@ -35,9 +36,11 @@ class LoadedLoRA:
 
 
 def load_peft_adapter(
-    adapter_path: str | Path, *, lora_id: int,
+    adapter_path: str | Path,
+    *,
+    lora_id: int,
     max_position_embeddings: int | None = None,
-    lora_config: "LoRAConfig | None" = None,
+    lora_config: LoRAConfig | None = None,
 ) -> LoadedLoRA:
     from vllm.lora.peft_helper import PEFTHelper
     from vllm.lora.utils import parse_fine_tuned_lora_name
@@ -75,7 +78,8 @@ def load_peft_adapter(
         weights[module] = LoRALayerWeightsMLX(
             module_name=module,
             rank=int(pair["lora_a"].shape[0]),
-            lora_a=pair["lora_a"], lora_b=pair["lora_b"],
+            lora_a=pair["lora_a"],
+            lora_b=pair["lora_b"],
             scaling=helper.vllm_lora_scaling_factor,
         )
 
@@ -85,5 +89,3 @@ def load_peft_adapter(
             "(expected PEFT keys like 'base_model.model.<...>.lora_A.weight')."
         )
     return LoadedLoRA(lora_id=lora_id, rank=helper.r, weights=weights)
-
-

@@ -398,7 +398,9 @@ class MetalModelRunner:
         if lora_config is None:
             return
         if self._is_stt:
-            logger.warning("LoRA is not supported for STT models; ignoring --enable-lora")
+            logger.warning(
+                "LoRA is not supported for STT models; ignoring --enable-lora"
+            )
             return
 
         text_config = getattr(self.model_config.hf_config, "get_text_config", None)

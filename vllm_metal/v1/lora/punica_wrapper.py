@@ -26,14 +26,19 @@ class PunicaWrapperMLX:
         self.is_prefill = False
 
     @property
-    def no_lora(self) -> bool: return self._no_lora
+    def no_lora(self) -> bool:
+        return self._no_lora
+
     @property
-    def token_slot_indices(self) -> mx.array | None: return self._token_slot_indices
+    def token_slot_indices(self) -> mx.array | None:
+        return self._token_slot_indices
+
     @property
-    def sampler_slot_indices(self) -> mx.array | None: return self._sampler_slot_indices
+    def sampler_slot_indices(self) -> mx.array | None:
+        return self._sampler_slot_indices
 
     def update_metadata(
-        self, mapping: "LoRAMapping", lora_index_to_id: list[int | None]
+        self, mapping: LoRAMapping, lora_index_to_id: list[int | None]
     ) -> None:
         null = self.max_loras
         slot_of = {aid: i for i, aid in enumerate(lora_index_to_id) if aid is not None}
@@ -49,12 +54,19 @@ class PunicaWrapperMLX:
         self._no_lora, self.is_prefill = True, False
 
     def add_lora_linear(
-        self, y: mx.array, x: mx.array,
-        lora_a_stacked: mx.array, lora_b_stacked: mx.array, scale: float,
+        self,
+        y: mx.array,
+        x: mx.array,
+        lora_a_stacked: mx.array,
+        lora_b_stacked: mx.array,
+        scale: float,
     ) -> mx.array:
         """``y += (B[idx] @ A[idx] @ x) * scale``  per token."""
         if self._no_lora or self._token_slot_indices is None:
             return y
         idx = self._token_slot_indices
-        a, b = mx.take(lora_a_stacked, idx, axis=0), mx.take(lora_b_stacked, idx, axis=0)
+        a, b = (
+            mx.take(lora_a_stacked, idx, axis=0),
+            mx.take(lora_b_stacked, idx, axis=0),
+        )
         return y + mx.matmul(b, mx.matmul(a, x[:, :, None])).squeeze(-1) * scale

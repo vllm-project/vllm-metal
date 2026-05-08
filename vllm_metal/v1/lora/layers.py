@@ -33,7 +33,7 @@ class MLXLinearWithLoRA(nn.Module):
         self.lora_b_stacked = mx.zeros((slots, self.output_size, max_lora_rank), dtype)
         self.punica_wrapper: PunicaWrapperMLX | None = None
 
-    def set_mapping(self, punica_wrapper: "PunicaWrapperMLX") -> None:
+    def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
         self.punica_wrapper = punica_wrapper
 
     def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
@@ -46,7 +46,9 @@ class MLXLinearWithLoRA(nn.Module):
                 f"B=({out},{rank}); expected in={self.input_size}, out={self.output_size}"
             )
         if rank > self.max_lora_rank:
-            raise ValueError(f"LoRA rank {rank} exceeds max_lora_rank {self.max_lora_rank}")
+            raise ValueError(
+                f"LoRA rank {rank} exceeds max_lora_rank {self.max_lora_rank}"
+            )
         a = mx.zeros_like(self.lora_a_stacked[slot])
         b = mx.zeros_like(self.lora_b_stacked[slot])
         a[:rank, :] = lora_a.astype(a.dtype)
@@ -64,7 +66,11 @@ class MLXLinearWithLoRA(nn.Module):
 
         # Punica expects (n_tokens, dim); collapse leading dims if needed.
         shape = y.shape
-        x2, y2 = (x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1])) if x.ndim > 2 else (x, y)
+        x2, y2 = (
+            (x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1]))
+            if x.ndim > 2
+            else (x, y)
+        )
         out = self.punica_wrapper.add_lora_linear(
             y2, x2, self.lora_a_stacked, self.lora_b_stacked, scale=1.0
         )

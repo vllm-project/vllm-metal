@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 class MetalWorkerLoRAManager:
     def __init__(
         self,
-        model: "nn.Module",
-        lora_config: "LoRAConfig",
+        model: nn.Module,
+        lora_config: LoRAConfig,
         max_num_seqs: int,
         max_num_batched_tokens: int,
         dtype: mx.Dtype,
@@ -35,8 +35,9 @@ class MetalWorkerLoRAManager:
             model, lora_config, max_num_seqs, max_num_batched_tokens, dtype
         )
 
-    def add_adapter(self, lora_request: "LoRARequest") -> bool:
+    def add_adapter(self, lora_request: LoRARequest) -> bool:
         from vllm.lora.utils import get_adapter_absolute_path
+
         if lora_request.lora_int_id in self._mm.list_adapters():
             return False
         adapter = load_peft_adapter(
@@ -55,12 +56,17 @@ class MetalWorkerLoRAManager:
             raise
         return True
 
-    def remove_adapter(self, lora_id: int) -> bool: return self._mm.remove_adapter(lora_id)
-    def pin_adapter(self, lora_id: int) -> bool: return self._mm.pin_adapter(lora_id)
-    def list_adapters(self) -> set[int]: return self._mm.list_adapters()
+    def remove_adapter(self, lora_id: int) -> bool:
+        return self._mm.remove_adapter(lora_id)
+
+    def pin_adapter(self, lora_id: int) -> bool:
+        return self._mm.pin_adapter(lora_id)
+
+    def list_adapters(self) -> set[int]:
+        return self._mm.list_adapters()
 
     def set_active_adapters(
-        self, lora_requests: set["LoRARequest"], mapping: LoRAMapping | None
+        self, lora_requests: set[LoRARequest], mapping: LoRAMapping | None
     ) -> None:
         if lora_requests:
             self._apply({r.lora_int_id for r in lora_requests})
