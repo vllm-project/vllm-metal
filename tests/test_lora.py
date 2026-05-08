@@ -10,17 +10,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm_metal.v1.lora import layers as layers_mod
+from vllm_metal.v1.lora import mapping as mapping_mod
+from vllm_metal.v1.lora import model_manager as model_manager_mod
+from vllm_metal.v1.lora import peft_loader as peft_loader_mod
+from vllm_metal.v1.lora import punica_wrapper as punica_mod
+
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 pytest.importorskip("vllm.lora.peft_helper")
 pytest.importorskip("vllm.lora.utils")
 pytest.importorskip("safetensors")
 
-from vllm_metal.v1.lora import layers as layers_mod  # noqa: E402
-from vllm_metal.v1.lora import mapping as mapping_mod  # noqa: E402
-from vllm_metal.v1.lora import model_manager as model_manager_mod  # noqa: E402
-from vllm_metal.v1.lora import peft_loader as peft_loader_mod  # noqa: E402
-from vllm_metal.v1.lora import punica_wrapper as punica_mod  # noqa: E402
 
 
 def test_mapping_builder_routes_tokens_and_marks_prefill() -> None:
