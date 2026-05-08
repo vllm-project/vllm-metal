@@ -18,6 +18,7 @@ from vllm.v1.sample.sampler import Sampler
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.spec_decode import build_paged_decode_segments
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 # Shared instance used by unit tests that call apply_paged directly.
@@ -107,6 +108,7 @@ def _make_decode_req(req_id: str) -> tuple[str, SimpleNamespace]:
     """Minimal (req_id, RequestState) pair for a decode request."""
     state = SimpleNamespace(
         token_ids=[1, 2, 3],
+        block_ids=[],
         prompt_len=2,
         cache=[],
         sampling_params=None,
@@ -247,6 +249,104 @@ class TestApplyGrammarBitmaskPaged:
         # Prefill intermediate rows 1,2 untouched
         for row in [1, 2]:
             assert np.all(np.isfinite(result[0, row]))
+
+    def test_row_span_metadata_masks_verification_rows_and_prefill_tail(self) -> None:
+        """Row-span metadata must mask all verification rows and keep prefill indexing."""
+        allowed_decode = 7
+        allowed_prefill = 15
+        decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
+        prefill_reqs = [_make_prefill_req("pf0", 2)]
+        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        segments = build_paged_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1, "b": 2},
+        )
+        logits = _uniform_logits_3d(6)
+        cu = _build_cu_seqlens(num_decode=4, prefill_lens=[2])
+        sched = _make_scheduler_output(["a", "b", "pf0"])
+        sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+        grammar = _make_grammar_output(
+            ["pf0", "a"],
+            np.vstack(
+                [
+                    _make_single_token_bitmask(allowed_prefill),
+                    _make_single_token_bitmask(allowed_decode),
+                ]
+            ),
+        )
+
+        result = _to_numpy(
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                prefill_reqs,
+                cu,
+                2,
+                logits,
+                paged_decode_segments=segments,
+            )
+        )
+
+        # Verification rows for a live at rows 0 and 1.
+        for row in [0, 1]:
+            assert np.isfinite(result[0, row, allowed_decode])
+            assert result[0, row, (allowed_decode + 1) % VOCAB_SIZE] == float("-inf")
+
+        # Plain decode row b stays untouched.
+        assert np.all(np.isfinite(result[0, 3]))
+
+        # Prefill tail row is indexed after all decode rows (0..3), not after num_decode.
+        assert np.isfinite(result[0, 5, allowed_prefill])
+        assert result[0, 5, (allowed_prefill + 1) % VOCAB_SIZE] == float("-inf")
+
+    def test_row_span_metadata_keeps_request_bitmasks_isolated_by_req_id(self) -> None:
+        """Structured-output rows must stay attached to their request IDs."""
+        allowed_a = 3
+        allowed_b = 19
+        decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
+        scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
+        segments = build_paged_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1, "b": 2},
+        )
+        logits = _uniform_logits_3d(5)
+        cu = _build_cu_seqlens(num_decode=5, prefill_lens=[])
+        sched = _make_scheduler_output(["a", "b"])
+        sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+        grammar = _make_grammar_output(
+            ["b", "a"],
+            np.vstack(
+                [
+                    _make_single_token_bitmask(allowed_b),
+                    _make_single_token_bitmask(allowed_a),
+                ]
+            ),
+        )
+
+        result = _to_numpy(
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                2,
+                logits,
+                paged_decode_segments=tuple(reversed(segments)),
+            )
+        )
+
+        # a occupies rows 0,1 (verification rows) and row 2 is its bonus row.
+        for row in [0, 1]:
+            assert np.isfinite(result[0, row, allowed_a])
+            assert result[0, row, (allowed_a + 1) % VOCAB_SIZE] == float("-inf")
+
+        # b's verification row remains tied to b, even though grammar_output order differs.
+        assert np.isfinite(result[0, 3, allowed_b])
+        assert result[0, 3, (allowed_b + 1) % VOCAB_SIZE] == float("-inf")
 
     def test_no_constrained_requests_returns_unchanged_logits(self) -> None:
         """If no scheduled request has grammar constraints, logits are returned as-is."""

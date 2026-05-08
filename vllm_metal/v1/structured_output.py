@@ -8,6 +8,8 @@ Owns xgrammar bridging, bitmask application, and request-to-logit-row remapping.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -22,6 +24,69 @@ except ImportError:
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.v1.spec_decode import PagedDecodeSegment
+
+
+@dataclass(frozen=True, slots=True)
+class _PagedRowTargets:
+    decode_row_count: int
+    req_id_to_rows: dict[str, tuple[int, ...]]
+
+
+def _build_paged_row_targets(
+    decode_reqs: Sequence[tuple[str, Any]],
+    prefill_reqs: Sequence[Any],
+    cu_seqlens: Sequence[int],
+    num_decode: int,
+    paged_decode_segments: Sequence[PagedDecodeSegment] | None = None,
+) -> _PagedRowTargets:
+    """Build request-id -> constrained-logit-row mapping for paged structured output.
+
+    When no speculative row-span metadata is present, decode requests still map to
+    one row each, matching the current paged-path behavior.
+    """
+    req_id_to_rows: dict[str, tuple[int, ...]] = {}
+
+    if paged_decode_segments is None:
+        decode_row_count = num_decode
+        for i, (req_id, _) in enumerate(decode_reqs):
+            req_id_to_rows[req_id] = (i,)
+    else:
+        segment_by_req_id = {
+            segment.req_id: segment for segment in paged_decode_segments
+        }
+        decode_req_ids = {req_id for req_id, _ in decode_reqs}
+        if set(segment_by_req_id) != decode_req_ids:
+            raise ValueError(
+                "paged_decode_segments must match decode_reqs one-to-one when provided"
+            )
+
+        decode_row_count = 0
+        for req_id, _ in decode_reqs:
+            segment = segment_by_req_id[req_id]
+            decode_row_count += segment.num_query_tokens
+            if segment.draft_token_ids:
+                req_id_to_rows[req_id] = segment.draft_verification_rows
+            else:
+                req_id_to_rows[req_id] = (segment.bonus_row,)
+
+    expected_cu_seqlens_len = decode_row_count + len(prefill_reqs) + 1
+    if len(cu_seqlens) != expected_cu_seqlens_len:
+        raise AssertionError(
+            "cu_seqlens length "
+            f"{len(cu_seqlens)}, expected decode_row_count={decode_row_count} "
+            f"+ prefill_count={len(prefill_reqs)} + 1"
+        )
+
+    for j, pr in enumerate(prefill_reqs):
+        # cu_seqlens[decode_row_count + j + 1] is the exclusive end of seq j.
+        last_row = cu_seqlens[decode_row_count + j + 1] - 1
+        req_id_to_rows[pr.req_id] = (last_row,)
+
+    return _PagedRowTargets(
+        decode_row_count=decode_row_count,
+        req_id_to_rows=req_id_to_rows,
+    )
 
 
 class MetalStructuredOutputApplier:
@@ -41,11 +106,13 @@ class MetalStructuredOutputApplier:
         cu_seqlens: list[int],
         num_decode: int,
         logits: mx.array,
+        paged_decode_segments: Sequence[PagedDecodeSegment] | None = None,
     ) -> mx.array:
         """Apply grammar bitmask to paged-path logits of shape (1, total_tokens, vocab).
 
         Only the sample positions are constrained:
         - Decode request i  → row i of logits[0]
+        - Decode request with row-span metadata → draft verification rows
         - Prefill request j → last-token row per sequence (from cu_seqlens)
 
         The CPU/xgrammar bridge copies only the constrained rows (n_constrained × vocab)
@@ -53,15 +120,18 @@ class MetalStructuredOutputApplier:
         modified rows back into logits via MLX indexed assignment.
 
         Args:
-            scheduler_output: Used to guard against spec-decode requests, which are
-                not yet supported with grammar constraints on the paged path.
+            scheduler_output: Used to guard against spec-decode requests when no
+                row-span metadata is available.
             grammar_output: Grammar bitmask and structured-output request IDs.
             decode_reqs: (req_id, RequestState) pairs in decode-batch order.
             prefill_reqs: PrefillRequest objects in prefill order.
-            cu_seqlens: Cumulative token counts: [0, 1, …, num_decode,
-                num_decode+len(pr0), …].  Used to locate last-token rows.
-            num_decode: Number of decode requests (prefix of the token dimension).
+            cu_seqlens: Cumulative token counts. Without row-span metadata the
+                decode prefix has one row per request; with metadata it has one
+                row per decode query token.
+            num_decode: Number of decode requests.
             logits: Full paged logits, shape (1, total_tokens, vocab).
+            paged_decode_segments: Optional metadata describing multi-row decode
+                spans for speculative verification.
 
         Returns:
             Logits with forbidden token positions set to -inf, same shape and dtype.
@@ -76,16 +146,18 @@ class MetalStructuredOutputApplier:
             f"apply_paged expects shape (1, T, V), got {logits.shape}"
         )
 
-        # Spec-decode expands the token dimension with verification positions that
-        # don't map 1:1 to grammar_bitmask rows — guard until that's implemented.
-        # Only raise when a structured-output request overlaps with spec-decode;
-        # plain requests with spec tokens can co-exist in the same batch safely.
+        # Spec-decode expands the token dimension with verification positions.
+        # Keep the old guard unless explicit row-span metadata tells us where
+        # those verification rows live. Plain requests with spec tokens can
+        # co-exist in the same batch safely.
         spec_req_ids = {
             req_id
             for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
             if tokens
         }
-        if spec_req_ids & set(grammar_output.structured_output_request_ids):
+        if paged_decode_segments is None and spec_req_ids & set(
+            grammar_output.structured_output_request_ids
+        ):
             raise NotImplementedError(
                 "Grammar/structured-output constraints are not yet supported "
                 "when speculative decoding is active on the paged Metal path."
@@ -104,28 +176,24 @@ class MetalStructuredOutputApplier:
             return logits
 
         # cu_seqlens must be exactly [0, 1*decode, ..., +prefill_lens...]: one entry
-        # per decode token plus one per prefill sequence, plus the leading zero.
-        assert len(cu_seqlens) == num_decode + len(prefill_reqs) + 1, (
-            f"cu_seqlens length {len(cu_seqlens)}, "
-            f"expected num_decode={num_decode} + prefill_count={len(prefill_reqs)} + 1"
+        # per decode row plus one per prefill sequence, plus the leading zero.
+        row_targets = _build_paged_row_targets(
+            decode_reqs,
+            prefill_reqs,
+            cu_seqlens,
+            num_decode,
+            paged_decode_segments=paged_decode_segments,
         )
-
-        # Build req_id → sample row index in logits[0].
-        req_id_to_row: dict[str, int] = {}
-        for i, (req_id, _) in enumerate(decode_reqs):
-            req_id_to_row[req_id] = i
-        for j, pr in enumerate(prefill_reqs):
-            # cu_seqlens[num_decode + j + 1] - 1 is the last token of prefill seq j.
-            last_row = cu_seqlens[num_decode + j + 1] - 1
-            req_id_to_row[pr.req_id] = last_row
 
         # Determine which structured-output requests are present in this batch.
         constrained: list[tuple[int, int]] = []  # (logit_row, bitmask_row)
         for bitmask_row, req_id in enumerate(
             grammar_output.structured_output_request_ids
         ):
-            if req_id in req_id_to_row:
-                constrained.append((req_id_to_row[req_id], bitmask_row))
+            rows = row_targets.req_id_to_rows.get(req_id)
+            if rows:
+                for row in rows:
+                    constrained.append((row, bitmask_row))
 
         if not constrained:
             return logits
