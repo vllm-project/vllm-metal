@@ -163,6 +163,7 @@ def _apply_row_span_grammar(
     constrained = so._build_constrained_rows(
         grammar.structured_output_request_ids,
         row_targets,
+        grammar_bitmask_row_count=grammar.grammar_bitmask.shape[0],
         paged_decode_segments=segments,
     )
     return so._apply_grammar_bitmask_to_rows(
@@ -295,7 +296,7 @@ class TestApplyGrammarBitmaskPaged:
         logits = _uniform_logits_3d(7)
         cu = _build_cu_seqlens(num_decode=5, prefill_lens=[2])
         grammar = _make_grammar_output(
-            ["pf0", "a", "a", "a"],
+            ["pf0", "a"],
             np.vstack(
                 [
                     _make_single_token_bitmask(allowed_prefill),
@@ -345,7 +346,7 @@ class TestApplyGrammarBitmaskPaged:
         logits = _uniform_logits_3d(5)
         cu = _build_cu_seqlens(num_decode=5, prefill_lens=[])
         grammar = _make_grammar_output(
-            ["b", "b", "a", "a", "a"],
+            ["b", "a"],
             np.vstack(
                 [
                     *(_make_single_token_bitmask(token) for token in allowed_b_rows),

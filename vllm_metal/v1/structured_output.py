@@ -8,7 +8,6 @@ Owns xgrammar bridging, bitmask application, and request-to-logit-row remapping.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -98,14 +97,15 @@ def _build_constrained_rows(
     structured_output_request_ids: Sequence[str],
     row_targets: _PagedRowTargets,
     *,
+    grammar_bitmask_row_count: int | None = None,
     paged_decode_segments: Sequence[PagedDecodeSegment] | None = None,
 ) -> list[tuple[int, int]]:
     """Pair target logits rows with the grammar bitmask row to apply.
 
     The legacy path keeps the existing request-id -> one bitmask row behavior.
-    Row-span metadata can map a request to multiple logits rows, which requires
-    one grammar bitmask row per target row because each speculative position may
-    have a different grammar state.
+    With row-span metadata, vLLM keeps one request ID per structured request
+    while expanding grammar_bitmask rows for each speculative position, so rows
+    are consumed sequentially in request-id order.
     """
     if paged_decode_segments is None:
         constrained: list[tuple[int, int]] = []
@@ -116,27 +116,50 @@ def _build_constrained_rows(
                     constrained.append((row, bitmask_row))
         return constrained
 
-    bitmask_rows_by_req_id: dict[str, list[int]] = defaultdict(list)
-    for bitmask_row, req_id in enumerate(structured_output_request_ids):
-        if req_id in row_targets.req_id_to_rows:
-            bitmask_rows_by_req_id[req_id].append(bitmask_row)
+    if grammar_bitmask_row_count is None:
+        raise ValueError("grammar_bitmask_row_count is required with row-span metadata")
 
     constrained = []
-    for req_id, bitmask_rows in bitmask_rows_by_req_id.items():
-        rows = row_targets.req_id_to_rows[req_id]
-        if len(rows) != len(bitmask_rows):
-            if len(rows) > 1 and len(bitmask_rows) == 1:
+    seen_req_ids: set[str] = set()
+    bitmask_row = 0
+    for req_id in structured_output_request_ids:
+        if req_id in seen_req_ids:
+            raise ValueError(
+                "row-span grammar bitmask rows must be expanded in "
+                f"grammar_bitmask, not by repeating request ID {req_id!r}"
+            )
+        seen_req_ids.add(req_id)
+
+        rows = row_targets.req_id_to_rows.get(req_id)
+        row_count = len(rows) if rows else 1
+        end_bitmask_row = bitmask_row + row_count
+        if end_bitmask_row > grammar_bitmask_row_count:
+            if rows and len(rows) > 1:
                 raise NotImplementedError(
                     "Row-span structured-output masking requires one grammar "
                     "bitmask row per logits row for request "
-                    f"{req_id!r}; got 1 bitmask row for {len(rows)} logits rows."
+                    f"{req_id!r}; got {grammar_bitmask_row_count - bitmask_row} "
+                    f"bitmask rows for {len(rows)} logits rows."
                 )
             raise ValueError(
                 "Grammar bitmask row count must match row-span logits targets "
-                f"for request {req_id!r}: got {len(bitmask_rows)} bitmask rows "
-                f"for {len(rows)} logits rows."
+                f"for request {req_id!r}: got {grammar_bitmask_row_count} total "
+                f"bitmask rows, needed at least {end_bitmask_row}."
             )
-        constrained.extend(zip(rows, bitmask_rows, strict=True))
+        if rows:
+            constrained.extend(
+                (row, bitmask_index)
+                for row, bitmask_index in zip(
+                    rows, range(bitmask_row, end_bitmask_row), strict=True
+                )
+            )
+        bitmask_row = end_bitmask_row
+
+    if bitmask_row != grammar_bitmask_row_count:
+        raise ValueError(
+            "Grammar bitmask row count must match row-span logits targets: "
+            f"consumed {bitmask_row}, got {grammar_bitmask_row_count}."
+        )
 
     return constrained
 
@@ -286,6 +309,7 @@ class MetalStructuredOutputApplier:
         constrained = _build_constrained_rows(
             grammar_output.structured_output_request_ids,
             row_targets,
+            grammar_bitmask_row_count=grammar_bitmask.shape[0],
         )
 
         return _apply_grammar_bitmask_to_rows(logits, grammar_bitmask, constrained)
