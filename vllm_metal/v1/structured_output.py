@@ -8,6 +8,7 @@ Owns xgrammar bridging, bitmask application, and request-to-logit-row remapping.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -65,10 +66,10 @@ def _build_paged_row_targets(
         for req_id, _ in decode_reqs:
             segment = segment_by_req_id[req_id]
             decode_row_count += segment.num_query_tokens
-            if segment.draft_token_ids:
-                req_id_to_rows[req_id] = segment.draft_verification_rows
-            else:
-                req_id_to_rows[req_id] = (segment.bonus_row,)
+            req_id_to_rows[req_id] = (
+                *segment.draft_verification_rows,
+                segment.bonus_row,
+            )
 
     expected_cu_seqlens_len = decode_row_count + len(prefill_reqs) + 1
     if len(cu_seqlens) != expected_cu_seqlens_len:
@@ -87,6 +88,53 @@ def _build_paged_row_targets(
         decode_row_count=decode_row_count,
         req_id_to_rows=req_id_to_rows,
     )
+
+
+def _build_constrained_rows(
+    structured_output_request_ids: Sequence[str],
+    row_targets: _PagedRowTargets,
+    *,
+    paged_decode_segments: Sequence[PagedDecodeSegment] | None = None,
+) -> list[tuple[int, int]]:
+    """Pair target logits rows with the grammar bitmask row to apply.
+
+    The legacy path keeps the existing request-id -> one bitmask row behavior.
+    Row-span metadata can map a request to multiple logits rows, which requires
+    one grammar bitmask row per target row because each speculative position may
+    have a different grammar state.
+    """
+    if paged_decode_segments is None:
+        constrained: list[tuple[int, int]] = []
+        for bitmask_row, req_id in enumerate(structured_output_request_ids):
+            rows = row_targets.req_id_to_rows.get(req_id)
+            if rows:
+                for row in rows:
+                    constrained.append((row, bitmask_row))
+        return constrained
+
+    bitmask_rows_by_req_id: dict[str, list[int]] = defaultdict(list)
+    for bitmask_row, req_id in enumerate(structured_output_request_ids):
+        if req_id in row_targets.req_id_to_rows:
+            bitmask_rows_by_req_id[req_id].append(bitmask_row)
+
+    constrained = []
+    for req_id, bitmask_rows in bitmask_rows_by_req_id.items():
+        rows = row_targets.req_id_to_rows[req_id]
+        if len(rows) != len(bitmask_rows):
+            if len(rows) > 1 and len(bitmask_rows) == 1:
+                raise NotImplementedError(
+                    "Row-span structured-output masking requires one grammar "
+                    "bitmask row per logits row for request "
+                    f"{req_id!r}; got 1 bitmask row for {len(rows)} logits rows."
+                )
+            raise ValueError(
+                "Grammar bitmask row count must match row-span logits targets "
+                f"for request {req_id!r}: got {len(bitmask_rows)} bitmask rows "
+                f"for {len(rows)} logits rows."
+            )
+        constrained.extend(zip(rows, bitmask_rows, strict=True))
+
+    return constrained
 
 
 class MetalStructuredOutputApplier:
@@ -112,7 +160,8 @@ class MetalStructuredOutputApplier:
 
         Only the sample positions are constrained:
         - Decode request i  → row i of logits[0]
-        - Decode request with row-span metadata → draft verification rows
+        - Decode request with row-span metadata → draft verification rows plus
+          the bonus row, using one grammar bitmask row per target row
         - Prefill request j → last-token row per sequence (from cu_seqlens)
 
         The CPU/xgrammar bridge copies only the constrained rows (n_constrained × vocab)
@@ -186,14 +235,12 @@ class MetalStructuredOutputApplier:
         )
 
         # Determine which structured-output requests are present in this batch.
-        constrained: list[tuple[int, int]] = []  # (logit_row, bitmask_row)
-        for bitmask_row, req_id in enumerate(
-            grammar_output.structured_output_request_ids
-        ):
-            rows = row_targets.req_id_to_rows.get(req_id)
-            if rows:
-                for row in rows:
-                    constrained.append((row, bitmask_row))
+        # Each tuple is (logit_row, bitmask_row).
+        constrained = _build_constrained_rows(
+            grammar_output.structured_output_request_ids,
+            row_targets,
+            paged_decode_segments=paged_decode_segments,
+        )
 
         if not constrained:
             return logits

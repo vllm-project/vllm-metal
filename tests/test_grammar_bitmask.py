@@ -252,7 +252,7 @@ class TestApplyGrammarBitmaskPaged:
 
     def test_row_span_metadata_masks_verification_rows_and_prefill_tail(self) -> None:
         """Row-span metadata must mask structured rows while leaving plain spec rows alone."""
-        allowed_decode = 7
+        allowed_decode_rows = (7, 8, 9)
         allowed_prefill = 15
         decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
         prefill_reqs = [_make_prefill_req("pf0", 2)]
@@ -267,11 +267,14 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["a", "b", "pf0"])
         sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
         grammar = _make_grammar_output(
-            ["pf0", "a"],
+            ["pf0", "a", "a", "a"],
             np.vstack(
                 [
                     _make_single_token_bitmask(allowed_prefill),
-                    _make_single_token_bitmask(allowed_decode),
+                    *(
+                        _make_single_token_bitmask(token)
+                        for token in allowed_decode_rows
+                    ),
                 ]
             ),
         )
@@ -289,10 +292,10 @@ class TestApplyGrammarBitmaskPaged:
             )
         )
 
-        # Verification rows for a live at rows 0 and 1.
-        for row in [0, 1]:
-            assert np.isfinite(result[0, row, allowed_decode])
-            assert result[0, row, (allowed_decode + 1) % VOCAB_SIZE] == float("-inf")
+        # Verification rows for a live at rows 0 and 1; row 2 is its bonus row.
+        for row, allowed_token in enumerate(allowed_decode_rows):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
 
         # Plain speculative decode rows for b stay untouched.
         np.testing.assert_array_equal(result[0, 3:5], _to_numpy(logits)[0, 3:5])
@@ -303,8 +306,8 @@ class TestApplyGrammarBitmaskPaged:
 
     def test_row_span_metadata_keeps_request_bitmasks_isolated_by_req_id(self) -> None:
         """Structured-output rows must stay attached to their request IDs."""
-        allowed_a = 3
-        allowed_b = 19
+        allowed_a_rows = (3, 4, 5)
+        allowed_b_rows = (19, 20)
         decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
         scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
         segments = build_paged_decode_segments(
@@ -317,11 +320,11 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["a", "b"])
         sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
         grammar = _make_grammar_output(
-            ["b", "a"],
+            ["b", "b", "a", "a", "a"],
             np.vstack(
                 [
-                    _make_single_token_bitmask(allowed_b),
-                    _make_single_token_bitmask(allowed_a),
+                    *(_make_single_token_bitmask(token) for token in allowed_b_rows),
+                    *(_make_single_token_bitmask(token) for token in allowed_a_rows),
                 ]
             ),
         )
@@ -340,13 +343,41 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         # a occupies rows 0,1 (verification rows) and row 2 is its bonus row.
-        for row in [0, 1]:
-            assert np.isfinite(result[0, row, allowed_a])
-            assert result[0, row, (allowed_a + 1) % VOCAB_SIZE] == float("-inf")
+        for row, allowed_token in enumerate(allowed_a_rows):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
 
-        # b's verification row remains tied to b, even though grammar_output order differs.
-        assert np.isfinite(result[0, 3, allowed_b])
-        assert result[0, 3, (allowed_b + 1) % VOCAB_SIZE] == float("-inf")
+        # b's rows remain tied to b, even though grammar_output order differs.
+        for row, allowed_token in zip([3, 4], allowed_b_rows, strict=True):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
+
+    def test_row_span_metadata_requires_per_position_bitmask_rows(self) -> None:
+        """A multi-row speculative target must not reuse one request-level bitmask."""
+        decode_reqs = [_make_decode_req("a")]
+        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        segments = build_paged_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1},
+        )
+        logits = _uniform_logits_3d(3)
+        cu = _build_cu_seqlens(num_decode=3, prefill_lens=[])
+        sched = _make_scheduler_output(["a"])
+        sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+        grammar = _make_grammar_output(["a"], _make_single_token_bitmask(7))
+
+        with pytest.raises(NotImplementedError, match="one grammar bitmask row"):
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                1,
+                logits,
+                paged_decode_segments=segments,
+            )
 
     def test_no_constrained_requests_returns_unchanged_logits(self) -> None:
         """If no scheduled request has grammar constraints, logits are returned as-is."""
