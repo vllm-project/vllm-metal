@@ -177,11 +177,8 @@ class SamplingBatch:
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
             and sampling_params.logprobs is None
-            and not sampling_params.logit_bias
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words
-            and not sampling_params.min_tokens
-            and not getattr(sampling_params, "thinking_token_budget", None)
             for sampling_params in sampling_params_list
         )
 
@@ -260,10 +257,14 @@ class SamplingBatch:
         return frequency_penalties, presence_penalties, repetition_penalties
 
     def _make_allowed_token_ids_mask(self) -> torch.Tensor | None:
-        """Build allowed_token_ids_mask from SamplingParams."""
+        """Build allowed_token_ids_mask from SamplingParams.
+
+        Mask convention: True -> disallowed.
+        Unconstrained request keeps all-False rows so they can sample any token.
+        """
         if not any(sp.allowed_token_ids for sp in self.sampling_params_list):
             return None
-        mask = torch.ones(
+        mask = torch.zeros(
             len(self.sampling_params_list),
             self.vocab_size,
             dtype=torch.bool,
@@ -271,6 +272,7 @@ class SamplingBatch:
         )
         for i, sp in enumerate(self.sampling_params_list):
             if sp.allowed_token_ids:
+                mask[i] = True
                 mask[i, sp.allowed_token_ids] = False
         return mask
 

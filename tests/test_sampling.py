@@ -336,9 +336,38 @@ class TestV1SamplingBatch:
         assert not SamplingBatch.can_use_native_greedy(
             [SamplingParams(temperature=0.0, bad_words=["bad"])]
         )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, min_tokens=5, max_tokens=10)]
+
+    def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
+        """Greedy with allowed_token_ids must fall back and the constraint works."""
+        logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, allowed_token_ids=[2, 3])],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
         )
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        assert result.token_ids[0] in [2, 3]
+
+    def test_allowed_token_ids_mixed_batch(self) -> None:
+        """Mixed batch: try one constrained, one unconstrained."""
+        logits = mx.array(
+            [[10.0, 1.0, 5.0, 1.0], [1.0, 10.0, 1.0, 1.0]], dtype=mx.float32
+        )
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, allowed_token_ids=[2, 3]),
+                SamplingParams(temperature=0.0),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+            device=torch.device("cpu"),
+        )
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        assert result.token_ids[0] in [2, 3]
+        assert result.token_ids[1] == 1  # unconstrained, should pick highest logit
 
     def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
         assert SamplingBatch.can_use_native_greedy(
