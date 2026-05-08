@@ -55,3 +55,4 @@ runtime dtype. The preflight, dtype alignment, and
 | Qwen2.5-3B-Instruct | ✅ | GQA (paged) | ✅ | [#323](https://github.com/vllm-project/vllm-metal/pull/323) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-3B-Instruct-4bit` |
 | SmolLM3-3B | ✅ | GQA (paged) | ✅ | [#334](https://github.com/vllm-project/vllm-metal/pull/334) | Validated on MacBook Air (Apple M2, 16 GB) with `mlx-community/SmolLM3-3B-4bit` |
 | Qwen2.5-1.5B-Instruct-AWQ | ✅ | GQA (paged) | ✅ | [#340](https://github.com/vllm-project/vllm-metal/pull/340) | First HF AWQ checkpoint validated on Metal; tested with `Qwen/Qwen2.5-1.5B-Instruct-AWQ` on MacBook Pro (Apple M1 Pro, 16 GB), macOS 26.2. See AWQ note above the table |
+| Qwen2-7B-Instruct | ✅ | GQA (paged) | ✅ | [#353](https://github.com/vllm-project/vllm-metal/pull/353) | Validated on MacBook Pro (Apple M5 Pro, 48 GB) on macOS 26.4.1; tested with `mlx-community/Qwen2-7B-Instruct-4bit` |
