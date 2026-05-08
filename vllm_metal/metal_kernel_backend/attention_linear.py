@@ -160,11 +160,12 @@ class GDNPagedAttentionWrapper(nn.Module):
         cache_idx = self._gdn_cache_idx
         slot_ids = state.slot_ids
 
-        conv_packed = self._gdn_lazy_decode.try_conv_decode(
-            mixed_qkv, inner, state_cache, cache_idx, slot_ids
-        )
-        if conv_packed is not None:
-            return conv_packed
+        if state.total_tokens == state.num_requests:
+            conv_packed = self._gdn_lazy_decode.try_conv_decode(
+                mixed_qkv, inner, state_cache, cache_idx, slot_ids
+            )
+            if conv_packed is not None:
+                return conv_packed
 
         conv_outputs = []
         for req_idx in range(state.num_requests):
@@ -231,20 +232,21 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # === Step 5: Batched recurrent update ===
-        request = GDNRecurrentDecodeRequest(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            state_cache=self._gdn_state_cache,
-            cache_idx=self._gdn_cache_idx,
-            slot_ids=state.slot_ids,
-            output_dtype=state.x.dtype,
-        )
-        y_flat = self._gdn_lazy_decode.try_recurrent_decode(request)
-        if y_flat is not None:
-            return y_flat
+        if state.total_tokens == state.num_requests:
+            request = GDNRecurrentDecodeRequest(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                state_cache=self._gdn_state_cache,
+                cache_idx=self._gdn_cache_idx,
+                slot_ids=state.slot_ids,
+                output_dtype=state.x.dtype,
+            )
+            y_flat = self._gdn_lazy_decode.try_recurrent_decode(request)
+            if y_flat is not None:
+                return y_flat
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
 
     def _run_recurrent_fallback(
