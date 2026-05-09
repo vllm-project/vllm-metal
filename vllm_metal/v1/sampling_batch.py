@@ -164,11 +164,10 @@ class SamplingBatch:
             cu_num_generated_tokens=None,
         )
 
-    @staticmethod
-    def can_use_native_greedy(
-        sampling_params_list: Sequence[SamplingParams],
-    ) -> bool:
+    def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
+        if any(self.logitsprocs.non_argmax_invariant):
+            return False
         return all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             and sampling_params.top_k <= 0
@@ -178,8 +177,8 @@ class SamplingBatch:
             and sampling_params.repetition_penalty == 1.0
             and sampling_params.logprobs is None
             and not sampling_params.allowed_token_ids
-            and not sampling_params.bad_words
-            for sampling_params in sampling_params_list
+            and not sampling_params.bad_words_token_ids
+            for sampling_params in self.sampling_params_list
         )
 
     def _make_temperature(self) -> torch.Tensor | None:
@@ -336,10 +335,7 @@ def sample_from_logits(
     need sample logprobs must use the vLLM sampler so ``ModelRunnerOutput`` can
     satisfy the OpenAI serving contract.
     """
-    if (
-        SamplingBatch.can_use_native_greedy(batch.sampling_params_list)
-        and not batch.needs_logprobs
-    ):
+    if batch.can_use_native_greedy() and not batch.needs_logprobs:
         tokens = _mlx_greedy_sample(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
