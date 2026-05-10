@@ -475,6 +475,53 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert structured_state.token_ids == [1, 6, 5]
         assert draft_state.token_ids == [2, 3, 7, 9]
 
+    def test_structured_output_after_spec_decode_uses_segment_start_row(self) -> None:
+        runner = self._make_runner()
+        draft_state = self._make_state([1, 6])
+        structured_state = self._make_state([2, 3])
+        decode_reqs = [("draft", draft_state), ("structured", structured_state)]
+        segments = (
+            mr.PagedDecodeSegment(
+                req_id="draft",
+                input_token_ids=(6, 7),
+                start_row=0,
+                num_query_tokens=2,
+                draft_token_ids=(7,),
+                cache_start_pos=1,
+                block_ids=(0,),
+            ),
+            mr.PagedDecodeSegment(
+                req_id="structured",
+                input_token_ids=(3,),
+                start_row=2,
+                num_query_tokens=1,
+                draft_token_ids=(),
+                cache_start_pos=1,
+                block_ids=(1,),
+            ),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"draft": 2, "structured": 1},
+            {"draft": [7]},
+        )
+        self._install_paged_state(
+            runner,
+            decode_reqs,
+            segments,
+            self._make_logits([7, 9, 0]),
+            scheduler_output,
+        )
+
+        output = runner.sample_tokens(
+            grammar_output=self._make_grammar_output(["structured"], 5),
+        )
+
+        assert output is not None
+        assert output.req_ids == ["draft", "structured"]
+        assert output.sampled_token_ids == [[7, 9], [5]]
+        assert draft_state.token_ids == [1, 6, 7, 9]
+        assert structured_state.token_ids == [2, 3, 5]
+
     def test_structured_output_rejects_same_request_spec_decode(self) -> None:
         runner = self._make_runner()
         req_state = self._make_state([1, 6])

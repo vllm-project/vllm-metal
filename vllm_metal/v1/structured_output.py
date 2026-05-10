@@ -45,7 +45,7 @@ class MetalStructuredOutputApplier:
         """Apply grammar bitmask to paged-path logits of shape (1, total_tokens, vocab).
 
         Only the sample positions are constrained:
-        - Decode request i  → row i of logits[0]
+        - Decode request i  → row cu_seqlens[i] of logits[0]
         - Prefill request j → last-token row per sequence (from cu_seqlens)
 
         The CPU/xgrammar bridge copies only the constrained rows (n_constrained × vocab)
@@ -58,9 +58,9 @@ class MetalStructuredOutputApplier:
             grammar_output: Grammar bitmask and structured-output request IDs.
             decode_reqs: (req_id, RequestState) pairs in decode-batch order.
             prefill_reqs: PrefillRequest objects in prefill order.
-            cu_seqlens: Cumulative token counts: [0, 1, …, num_decode,
-                num_decode+len(pr0), …].  Used to locate last-token rows.
-            num_decode: Number of decode requests (prefix of the token dimension).
+            cu_seqlens: Cumulative token counts for decode verification spans
+                and prefill chunks. Used to locate sample rows.
+            num_decode: Number of decode requests/segments.
             logits: Full paged logits, shape (1, total_tokens, vocab).
 
         Returns:
@@ -103,8 +103,9 @@ class MetalStructuredOutputApplier:
         ):
             return logits
 
-        # cu_seqlens must be exactly [0, 1*decode, ..., +prefill_lens...]: one entry
-        # per decode token plus one per prefill sequence, plus the leading zero.
+        # cu_seqlens has one entry per decode segment plus one per prefill
+        # sequence, plus the leading zero. Decode segment lengths may be >1
+        # when earlier requests verify scheduled draft tokens.
         assert len(cu_seqlens) == num_decode + len(prefill_reqs) + 1, (
             f"cu_seqlens length {len(cu_seqlens)}, "
             f"expected num_decode={num_decode} + prefill_count={len(prefill_reqs)} + 1"
@@ -113,7 +114,7 @@ class MetalStructuredOutputApplier:
         # Build req_id → sample row index in logits[0].
         req_id_to_row: dict[str, int] = {}
         for i, (req_id, _) in enumerate(decode_reqs):
-            req_id_to_row[req_id] = i
+            req_id_to_row[req_id] = cu_seqlens[i]
         for j, pr in enumerate(prefill_reqs):
             # cu_seqlens[num_decode + j + 1] - 1 is the last token of prefill seq j.
             last_row = cu_seqlens[num_decode + j + 1] - 1
