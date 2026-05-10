@@ -6,16 +6,34 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
     build_paged_decode_segments,
+    unsupported_spec_decode_reason,
+    validate_greedy_spec_decode_sampling,
+    verify_greedy_spec_decode,
 )
 
 
 def _state(token_ids: list[int], block_ids: list[int]) -> SimpleNamespace:
     return SimpleNamespace(token_ids=token_ids, block_ids=block_ids)
+
+
+def _request_state(temperature: float = 0.0) -> SimpleNamespace:
+    return SimpleNamespace(sampling_params=SamplingParams(temperature=temperature))
+
+
+def _logits(token_ids: list[int], vocab_size: int = 16) -> mx.array:
+    rows = []
+    for token_id in token_ids:
+        row = [0.0] * vocab_size
+        row[token_id] = 10.0
+        rows.append(row)
+    return mx.array([rows])
 
 
 class TestPagedDecodeSegment:
@@ -104,3 +122,113 @@ class TestBuildPagedDecodeSegments:
         assert segments[1].bonus_row == 3
         assert segments[2].draft_verification_rows == (4,)
         assert segments[2].bonus_row == 5
+
+    def test_rejects_invalid_draft_token_sentinel(self) -> None:
+        with pytest.raises(NotImplementedError, match="invalid draft-token"):
+            build_paged_decode_segments(
+                [("r0", _state([10, 11], [0]))],
+                scheduled_spec_decode_tokens={"r0": [-1]},
+                paged_request_seq_lens={},
+            )
+
+
+class TestSpecDecodePolicy:
+    def test_empty_scheduled_tokens_are_supported(self) -> None:
+        assert (
+            unsupported_spec_decode_reason(
+                {"r0": []},
+                paged_attention_enabled=False,
+                is_hybrid=True,
+            )
+            is None
+        )
+
+    def test_non_paged_scheduled_tokens_are_rejected(self) -> None:
+        assert (
+            unsupported_spec_decode_reason(
+                {"r0": [1]},
+                paged_attention_enabled=False,
+                is_hybrid=False,
+            )
+            == "Speculative decode verification on Metal requires paged "
+            "attention so draft-token rows can share scheduler-assigned KV slots."
+        )
+
+    def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
+        assert (
+            unsupported_spec_decode_reason(
+                {"r0": [1]},
+                paged_attention_enabled=True,
+                is_hybrid=True,
+            )
+            == "Speculative decode verification is not supported for hybrid "
+            "GDN models on Metal yet."
+        )
+
+
+class TestVerifyGreedySpecDecode:
+    def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
+        segment = PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6, 7, 8),
+            start_row=0,
+            num_query_tokens=3,
+            draft_token_ids=(7, 8),
+            cache_start_pos=1,
+            block_ids=(0,),
+        )
+
+        output = verify_greedy_spec_decode(
+            _logits([7, 8, 9]),
+            [("r0", _request_state())],
+            (segment,),
+            num_decode_tokens=3,
+        )
+
+        assert output == [[7, 8, 9]]
+
+    def test_rejects_first_mismatched_draft_and_stops_before_bonus(self) -> None:
+        segment = PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6, 7, 8),
+            start_row=0,
+            num_query_tokens=3,
+            draft_token_ids=(7, 8),
+            cache_start_pos=1,
+            block_ids=(0,),
+        )
+
+        output = verify_greedy_spec_decode(
+            _logits([7, 5, 9]),
+            [("r0", _request_state())],
+            (segment,),
+            num_decode_tokens=3,
+        )
+
+        assert output == [[7, 5]]
+
+    def test_rejects_non_greedy_sampling(self) -> None:
+        segment = PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6, 7),
+            start_row=0,
+            num_query_tokens=2,
+            draft_token_ids=(7,),
+            cache_start_pos=1,
+            block_ids=(0,),
+        )
+
+        with pytest.raises(NotImplementedError, match="greedy sampling"):
+            verify_greedy_spec_decode(
+                _logits([7, 9]),
+                [("r0", _request_state(temperature=0.7))],
+                (segment,),
+                num_decode_tokens=2,
+            )
+
+    def test_rejects_logits_processors_that_can_change_argmax(self) -> None:
+        with pytest.raises(NotImplementedError, match="logits processors"):
+            validate_greedy_spec_decode_sampling(
+                [("r0", _request_state())],
+                logitsprocs=SimpleNamespace(non_argmax_invariant=[object()]),
+            )

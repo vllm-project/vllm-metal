@@ -72,6 +72,13 @@ from vllm_metal.v1.sampling_batch import (
     sample_from_logits,
     sample_prefill_tokens,
 )
+from vllm_metal.v1.spec_decode import (
+    PagedDecodeSegment,
+    build_paged_decode_segments,
+    unsupported_spec_decode_reason,
+    validate_greedy_spec_decode_sampling,
+    verify_greedy_spec_decode,
+)
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 logger = init_logger(__name__)
@@ -198,7 +205,8 @@ class _PagedForwardState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: mx.array
     cu_seqlens: list[int]
-    num_decode: int
+    decode_segments: tuple[PagedDecodeSegment, ...]
+    num_decode_tokens: int
 
 
 class MetalModelRunner:
@@ -786,26 +794,47 @@ class MetalModelRunner:
         Stashes all state needed by ``sample_tokens`` in
         ``_execute_model_state`` (mirrors upstream's pattern).
         """
-        num_decode = len(decode_reqs)
+        decode_segments = build_paged_decode_segments(
+            decode_reqs,
+            scheduler_output.scheduled_spec_decode_tokens,
+            self._paged_request_seq_lens,
+        )
+        num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
+        has_scheduled_drafts = any(
+            segment.draft_token_ids for segment in decode_segments
+        )
+        if has_scheduled_drafts and self.is_hybrid:
+            raise NotImplementedError(
+                "Speculative decode verification is not supported for hybrid "
+                "GDN models on Metal yet."
+            )
+        if has_scheduled_drafts:
+            validate_greedy_spec_decode_sampling(
+                decode_reqs,
+                logitsprocs=self._logitsprocs,
+            )
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
 
-        # Decode: last token per request
-        last_tokens = [
-            state.token_ids[-1] if state.token_ids else 0 for _, state in decode_reqs
-        ]
-        all_token_ids.extend(last_tokens)
+        # Decode: last token plus any scheduled draft tokens per request.
+        for segment in decode_segments:
+            all_token_ids.extend(segment.input_token_ids)
 
         # Prefill: tokens per request
         for pr in prefill_reqs:
             all_token_ids.extend(pr.token_ids)
 
         # ---- build metadata for prepare_unified ----
-        decode_info: list[tuple[list[int], int]] = []
-        for req_id, state in decode_reqs:
-            seq_len = self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 1)
-            decode_info.append((state.block_ids, seq_len))
+        decode_info: list[tuple[list[int], int, int]] = []
+        for segment in decode_segments:
+            decode_info.append(
+                (
+                    list(segment.block_ids),
+                    segment.cache_start_pos,
+                    segment.num_query_tokens,
+                )
+            )
 
         prefill_info: list[tuple[list[int], int, int]] = []
         for pr in prefill_reqs:
@@ -846,8 +875,8 @@ class MetalModelRunner:
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
-        for _ in decode_reqs:
-            cu_seqlens.append(cu_seqlens[-1] + 1)
+        for segment in decode_segments:
+            cu_seqlens.append(cu_seqlens[-1] + segment.num_query_tokens)
         for pr in prefill_reqs:
             cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
 
@@ -858,7 +887,8 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             cu_seqlens=cu_seqlens,
-            num_decode=num_decode,
+            decode_segments=decode_segments,
+            num_decode_tokens=num_decode_tokens,
         )
 
     def _sample_paged_batch(
@@ -879,7 +909,12 @@ class MetalModelRunner:
         scheduler_output = state.scheduler_output
         logits = state.logits
         cu_seqlens = state.cu_seqlens
-        num_decode = state.num_decode
+        decode_segments = state.decode_segments
+        num_decode_segments = len(decode_segments)
+        num_decode_tokens = state.num_decode_tokens
+        has_scheduled_drafts = any(
+            segment.draft_token_ids for segment in decode_segments
+        )
 
         # ---- wait for MLX forward to complete ----
         mx.eval(logits)
@@ -892,27 +927,39 @@ class MetalModelRunner:
                 decode_reqs,
                 prefill_reqs,
                 cu_seqlens,
-                num_decode,
+                num_decode_segments,
                 logits,
             )
 
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
-        decode_result = sample_decode_tokens(
-            logits,
-            decode_reqs,
-            num_decode,
-            self._sampler,
-            self.device,
-            vocab_size=vocab_size,
-            logitsprocs=logitsprocs,
-        )
+        decode_logprobs: LogprobsLists | None = None
+        if has_scheduled_drafts:
+            decode_token_ids = verify_greedy_spec_decode(
+                logits,
+                decode_reqs,
+                decode_segments,
+                num_decode_tokens,
+                logitsprocs=logitsprocs,
+            )
+        else:
+            decode_result = sample_decode_tokens(
+                logits,
+                decode_reqs,
+                num_decode_tokens,
+                self._sampler,
+                self.device,
+                vocab_size=vocab_size,
+                logitsprocs=logitsprocs,
+            )
+            decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
+            decode_logprobs = decode_result.logprobs
         prefill_result = sample_prefill_tokens(
             logits,
             prefill_reqs,
             cu_seqlens,
-            num_decode,
+            num_decode_segments,
             self._sampler,
             self.device,
             vocab_size=vocab_size,
@@ -921,11 +968,13 @@ class MetalModelRunner:
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
-            state.token_ids.append(decode_result.token_ids[i])
-            state.generated_tokens += 1
-            self._paged_request_seq_lens[req_id] = (
-                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
-            )
+            sampled_ids = decode_token_ids[i]
+            state.token_ids.extend(sampled_ids)
+            state.generated_tokens += len(sampled_ids)
+            self._paged_request_seq_lens[req_id] = self._paged_request_seq_lens.get(
+                req_id,
+                len(state.token_ids) - len(sampled_ids) - 1,
+            ) + len(sampled_ids)
 
         # ---- update prefill seq lens ----
         for pr in prefill_reqs:
@@ -971,11 +1020,11 @@ class MetalModelRunner:
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
             logprobs = (
-                decode_result.logprobs.slice_request(i, 1)
-                if decode_result.logprobs is not None
+                decode_logprobs.slice_request(i, 1)
+                if decode_logprobs is not None
                 else None
             )
-            batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
+            batch.add_output(req_id, decode_token_ids[i], logprobs)
 
         return batch, scheduler_output
 
@@ -1018,6 +1067,16 @@ class MetalModelRunner:
             "Multimodal encoder execution is not wired on Metal yet. "
             "Metal currently registers multimodal runtime state, but image "
             "encoding and embedding splice are not connected to the runner."
+        )
+
+    def _unsupported_spec_decode_reason(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> str | None:
+        return unsupported_spec_decode_reason(
+            scheduler_output.scheduled_spec_decode_tokens,
+            paged_attention_enabled=self._paged_attention_backend is not None,
+            is_hybrid=self.is_hybrid,
         )
 
     def _handle_new_requests(
@@ -1363,23 +1422,34 @@ class MetalModelRunner:
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+        unsupported_spec_decode_reason = self._unsupported_spec_decode_reason(
+            scheduler_output
+        )
+        has_unsupported_non_paged_structured_output = (
+            self._paged_attention_backend is None
+            and scheduler_output.has_structured_output_requests
+        )
+        will_fail_fast_before_model_work = (
+            has_scheduled_encoder_inputs
+            or unsupported_spec_decode_reason is not None
+            or has_unsupported_non_paged_structured_output
+        )
 
         # Scheduler cleanup is independent of whether this step's work is
         # supported. If the next check raises, old request state must still be
         # evicted and any pending GDN release must be materialized now.
         self._cleanup_finished_requests(
             evicted_req_ids,
-            materialize_gdn_state=has_scheduled_encoder_inputs,
+            materialize_gdn_state=will_fail_fast_before_model_work,
         )
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
+        if unsupported_spec_decode_reason is not None:
+            raise NotImplementedError(unsupported_spec_decode_reason)
 
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new
         # requests, so the guard must come before it — not after.
-        if (
-            self._paged_attention_backend is None
-            and scheduler_output.has_structured_output_requests
-        ):
+        if has_unsupported_non_paged_structured_output:
             raise NotImplementedError(
                 "Grammar/structured-output constraints are not supported on "
                 "the non-paged (legacy) Metal path. "

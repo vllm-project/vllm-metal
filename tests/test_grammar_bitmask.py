@@ -580,7 +580,18 @@ class TestSampleTokensGrammarPagedPath:
             scheduler_output=scheduler_output,
             logits=logits,
             cu_seqlens=[0, 1],
-            num_decode=1,
+            decode_segments=(
+                mr.PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(1,),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=0,
+                    block_ids=(),
+                ),
+            ),
+            num_decode_tokens=1,
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)
