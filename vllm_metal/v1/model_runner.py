@@ -74,10 +74,7 @@ from vllm_metal.v1.sampling_batch import (
 )
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
-    build_paged_decode_segments,
-    unsupported_spec_decode_reason,
-    validate_greedy_spec_decode_sampling,
-    verify_greedy_spec_decode,
+    SpeculativeDecodeController,
 )
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
@@ -237,6 +234,7 @@ class MetalModelRunner:
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
+        self._spec_decode_controller = SpeculativeDecodeController()
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -794,25 +792,12 @@ class MetalModelRunner:
         Stashes all state needed by ``sample_tokens`` in
         ``_execute_model_state`` (mirrors upstream's pattern).
         """
-        decode_segments = build_paged_decode_segments(
+        decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
             scheduler_output.scheduled_spec_decode_tokens,
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
-        has_scheduled_drafts = any(
-            segment.draft_token_ids for segment in decode_segments
-        )
-        if has_scheduled_drafts and self.is_hybrid:
-            raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "GDN models on Metal yet."
-            )
-        if has_scheduled_drafts:
-            validate_greedy_spec_decode_sampling(
-                decode_reqs,
-                logitsprocs=self._logitsprocs,
-            )
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
@@ -934,15 +919,80 @@ class MetalModelRunner:
         # ---- sample tokens ----
         vocab_size = self._vocab_size
         logitsprocs = self._logitsprocs
-        decode_logprobs: LogprobsLists | None = None
+        decode_token_ids: list[list[int]] = [[] for _ in decode_reqs]
+        decode_logprobs_rows: list[LogprobsLists | None] = [None for _ in decode_reqs]
         if has_scheduled_drafts:
-            decode_token_ids = verify_greedy_spec_decode(
-                logits,
-                decode_reqs,
-                decode_segments,
-                num_decode_tokens,
-                logitsprocs=logitsprocs,
-            )
+            spec_items = [
+                (i, req, segment)
+                for i, (req, segment) in enumerate(
+                    zip(decode_reqs, decode_segments, strict=True)
+                )
+                if segment.draft_token_ids
+            ]
+            if spec_items:
+                spec_token_ids = self._spec_decode_controller.verify_greedy(
+                    logits,
+                    [req for _, req, _ in spec_items],
+                    [segment for _, _, segment in spec_items],
+                    logitsprocs=logitsprocs,
+                )
+                for (decode_index, _, _), sampled_ids in zip(
+                    spec_items,
+                    spec_token_ids,
+                    strict=True,
+                ):
+                    decode_token_ids[decode_index] = sampled_ids
+
+            plain_items = [
+                (i, req, segment)
+                for i, (req, segment) in enumerate(
+                    zip(decode_reqs, decode_segments, strict=True)
+                )
+                if not segment.draft_token_ids
+            ]
+            if plain_items:
+                plain_logits = mx.stack(
+                    [logits[0, segment.start_row, :] for _, _, segment in plain_items]
+                )
+                plain_reqs = [req for _, req, _ in plain_items]
+                sampling_params_list = [
+                    state.sampling_params for _, state in plain_reqs
+                ]
+                prompt_token_ids_list = [
+                    state.token_ids[: state.prompt_len] for _, state in plain_reqs
+                ]
+                output_tokens_list = [
+                    state.token_ids[state.prompt_len :] for _, state in plain_reqs
+                ]
+                generators = {
+                    i: state.generator
+                    for i, (_, state) in enumerate(plain_reqs)
+                    if state.generator is not None
+                }
+                plain_batch = SamplingBatch(
+                    sampling_params_list,
+                    prompt_token_ids_list,
+                    output_tokens_list,
+                    vocab_size=vocab_size,
+                    device=self.device,
+                    logitsprocs=logitsprocs,
+                    generators=generators,
+                )
+                plain_result = sample_from_logits(
+                    plain_logits,
+                    plain_batch,
+                    self._sampler,
+                    self.device,
+                )
+                for plain_index, (decode_index, _, _) in enumerate(plain_items):
+                    decode_token_ids[decode_index] = [
+                        plain_result.token_ids[plain_index]
+                    ]
+                    if plain_result.logprobs is not None:
+                        decode_logprobs_rows[decode_index] = (
+                            plain_result.logprobs.slice_request(plain_index, 1)
+                        )
+            decode_logprobs = SamplingBatch.merge_logprobs_rows(decode_logprobs_rows)
         else:
             decode_result = sample_decode_tokens(
                 logits,
@@ -1069,14 +1119,31 @@ class MetalModelRunner:
             "encoding and embedding splice are not connected to the runner."
         )
 
-    def _unsupported_spec_decode_reason(
+    def _spec_decode_preflight_reqs(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> str | None:
-        return unsupported_spec_decode_reason(
-            scheduler_output.scheduled_spec_decode_tokens,
+    ) -> tuple[tuple[str, RequestState], ...]:
+        """Return current decode requests without mutating runner state."""
+        if self._paged_attention_backend is None:
+            return ()
+
+        decode_reqs: list[tuple[str, RequestState]] = []
+        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+            state = self._request_states.get(req_id)
+            if state is not None and state.generated_tokens > 0:
+                decode_reqs.append((req_id, state))
+        return tuple(decode_reqs)
+
+    def _validate_spec_decode_supported(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        self._spec_decode_controller.validate_supported(
+            scheduler_output,
+            self._spec_decode_preflight_reqs(scheduler_output),
             paged_attention_enabled=self._paged_attention_backend is not None,
             is_hybrid=self.is_hybrid,
+            logitsprocs=self._logitsprocs,
         )
 
     def _handle_new_requests(
@@ -1422,16 +1489,18 @@ class MetalModelRunner:
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
-        unsupported_spec_decode_reason = self._unsupported_spec_decode_reason(
-            scheduler_output
-        )
+        spec_decode_error: Exception | None = None
+        try:
+            self._validate_spec_decode_supported(scheduler_output)
+        except (NotImplementedError, ValueError) as exc:
+            spec_decode_error = exc
         has_unsupported_non_paged_structured_output = (
             self._paged_attention_backend is None
             and scheduler_output.has_structured_output_requests
         )
         will_fail_fast_before_model_work = (
             has_scheduled_encoder_inputs
-            or unsupported_spec_decode_reason is not None
+            or spec_decode_error is not None
             or has_unsupported_non_paged_structured_output
         )
 
@@ -1443,8 +1512,8 @@ class MetalModelRunner:
             materialize_gdn_state=will_fail_fast_before_model_work,
         )
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
-        if unsupported_spec_decode_reason is not None:
-            raise NotImplementedError(unsupported_spec_decode_reason)
+        if spec_decode_error is not None:
+            raise spec_decode_error
 
         # Fail fast before any model work runs.  On the non-paged path,
         # _handle_new_requests immediately calls _prefill_single for new

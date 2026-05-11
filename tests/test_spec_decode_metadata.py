@@ -8,14 +8,13 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
-    build_paged_decode_segments,
-    unsupported_spec_decode_reason,
-    validate_greedy_spec_decode_sampling,
-    verify_greedy_spec_decode,
+    SpeculativeDecodeController,
 )
 
 
@@ -23,8 +22,51 @@ def _state(token_ids: list[int], block_ids: list[int]) -> SimpleNamespace:
     return SimpleNamespace(token_ids=token_ids, block_ids=block_ids)
 
 
-def _request_state(temperature: float = 0.0) -> SimpleNamespace:
-    return SimpleNamespace(sampling_params=SamplingParams(temperature=temperature))
+def _request_state(
+    temperature: float = 0.0,
+    *,
+    generated_tokens: int = 1,
+    min_tokens: int = 0,
+    stop_token_ids: list[int] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        sampling_params=SamplingParams(
+            temperature=temperature,
+            min_tokens=min_tokens,
+            stop_token_ids=stop_token_ids,
+        ),
+        generated_tokens=generated_tokens,
+    )
+
+
+def _scheduler_output(
+    *,
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+    num_scheduled_tokens: dict[str, int] | None = None,
+    num_invalid_spec_tokens: dict[str, int] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+        num_scheduled_tokens=num_scheduled_tokens
+        or {
+            req_id: len(tokens) + 1
+            for req_id, tokens in scheduled_spec_decode_tokens.items()
+        },
+        num_invalid_spec_tokens=num_invalid_spec_tokens,
+    )
+
+
+def _spec_logitsprocs():
+    config = SimpleNamespace(
+        speculative_config=object(),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+    return build_logitsprocs(
+        config,
+        torch.device("cpu"),
+        is_pin_memory=False,
+        is_pooling_model=False,
+    )
 
 
 def _logits(token_ids: list[int], vocab_size: int = 16) -> mx.array:
@@ -60,7 +102,7 @@ class TestPagedDecodeSegment:
 
 class TestBuildPagedDecodeSegments:
     def test_single_row_decode_matches_current_shape(self) -> None:
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             [("r0", _state([5, 9], [41, 42]))],
             scheduled_spec_decode_tokens={},
             paged_request_seq_lens={"r0": 7},
@@ -79,7 +121,7 @@ class TestBuildPagedDecodeSegments:
         assert segment.bonus_row == 0
 
     def test_single_row_decode_uses_len_minus_one_fallback(self) -> None:
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             [("r0", _state([5, 9, 17], [41, 42]))],
             scheduled_spec_decode_tokens=None,
             paged_request_seq_lens={},
@@ -88,7 +130,7 @@ class TestBuildPagedDecodeSegments:
         assert segments[0].cache_start_pos == 2
 
     def test_draft_tokens_expand_the_row_span(self) -> None:
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             [("r0", _state([5, 9], [41, 42]))],
             scheduled_spec_decode_tokens={"r0": [23, 24]},
             paged_request_seq_lens={"r0": 7},
@@ -103,7 +145,7 @@ class TestBuildPagedDecodeSegments:
         assert segment.bonus_row == 2
 
     def test_mixed_batch_uses_cumulative_start_rows(self) -> None:
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             [
                 ("r0", _state([1, 2], [10])),
                 ("r1", _state([3, 4, 5], [11])),
@@ -123,47 +165,145 @@ class TestBuildPagedDecodeSegments:
         assert segments[2].draft_verification_rows == (4,)
         assert segments[2].bonus_row == 5
 
+    def test_rejects_handoff_for_request_outside_decode_set(self) -> None:
+        with pytest.raises(ValueError, match="outside the current decode set"):
+            SpeculativeDecodeController().build_decode_segments(
+                [("r0", _state([1, 2], [10]))],
+                scheduled_spec_decode_tokens={"missing": [3]},
+                paged_request_seq_lens={"r0": 1},
+            )
+
     def test_rejects_invalid_draft_token_sentinel(self) -> None:
         with pytest.raises(NotImplementedError, match="invalid draft-token"):
-            build_paged_decode_segments(
-                [("r0", _state([10, 11], [0]))],
+            SpeculativeDecodeController().build_decode_segments(
+                [("r0", _state([1, 2], [10]))],
                 scheduled_spec_decode_tokens={"r0": [-1]},
-                paged_request_seq_lens={},
+                paged_request_seq_lens={"r0": 1},
             )
 
 
 class TestSpecDecodePolicy:
     def test_empty_scheduled_tokens_are_supported(self) -> None:
-        assert (
-            unsupported_spec_decode_reason(
-                {"r0": []},
-                paged_attention_enabled=False,
-                is_hybrid=True,
-            )
-            is None
+        SpeculativeDecodeController().validate_supported(
+            _scheduler_output(scheduled_spec_decode_tokens={}),
+            (),
+            paged_attention_enabled=False,
+            is_hybrid=True,
+            logitsprocs=None,
         )
 
     def test_non_paged_scheduled_tokens_are_rejected(self) -> None:
-        assert (
-            unsupported_spec_decode_reason(
-                {"r0": [1]},
+        with pytest.raises(NotImplementedError, match="requires paged attention"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                [("r0", _request_state())],
                 paged_attention_enabled=False,
                 is_hybrid=False,
+                logitsprocs=None,
             )
-            == "Speculative decode verification on Metal requires paged "
-            "attention so draft-token rows can share scheduler-assigned KV slots."
-        )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
-        assert (
-            unsupported_spec_decode_reason(
-                {"r0": [1]},
+        with pytest.raises(NotImplementedError, match="hybrid GDN"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=True,
+                logitsprocs=None,
             )
-            == "Speculative decode verification is not supported for hybrid "
-            "GDN models on Metal yet."
+
+    def test_rejects_invalid_draft_token_sentinel(self) -> None:
+        with pytest.raises(NotImplementedError, match="invalid draft-token"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [-1]}),
+                [("r0", _request_state())],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+            )
+
+    def test_rejects_scheduler_invalid_spec_tokens(self) -> None:
+        with pytest.raises(NotImplementedError, match="scheduler-invalid"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(
+                    scheduled_spec_decode_tokens={"r0": [-1]},
+                    num_invalid_spec_tokens={"r0": 1},
+                ),
+                [("r0", _request_state())],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+            )
+
+    def test_rejects_handoff_for_request_outside_decode_set(self) -> None:
+        with pytest.raises(ValueError, match="outside the current decode set"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"missing": [1]}),
+                [("r0", _request_state())],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+            )
+
+    def test_rejects_empty_handoff_for_request_outside_decode_set(self) -> None:
+        with pytest.raises(ValueError, match="outside the current decode set"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"missing": []}),
+                [("r0", _request_state())],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+            )
+
+    def test_rejects_mismatched_scheduler_token_accounting(self) -> None:
+        with pytest.raises(ValueError, match="inconsistent token accounting"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(
+                    scheduled_spec_decode_tokens={"r0": [1, 2]},
+                    num_scheduled_tokens={"r0": 2},
+                ),
+                [("r0", _request_state())],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+            )
+
+    def test_allows_inactive_min_tokens_processor_from_speculative_config(self) -> None:
+        SpeculativeDecodeController().validate_supported(
+            _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+            [
+                (
+                    "r0",
+                    _request_state(
+                        generated_tokens=2,
+                        min_tokens=1,
+                        stop_token_ids=[2],
+                    ),
+                )
+            ],
+            paged_attention_enabled=True,
+            is_hybrid=False,
+            logitsprocs=_spec_logitsprocs(),
         )
+
+    def test_rejects_active_min_tokens_constraint(self) -> None:
+        with pytest.raises(NotImplementedError, match="active min_tokens"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
+                [
+                    (
+                        "r0",
+                        _request_state(
+                            generated_tokens=0,
+                            min_tokens=3,
+                            stop_token_ids=[2],
+                        ),
+                    )
+                ],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=_spec_logitsprocs(),
+            )
 
 
 class TestVerifyGreedySpecDecode:
@@ -178,11 +318,11 @@ class TestVerifyGreedySpecDecode:
             block_ids=(0,),
         )
 
-        output = verify_greedy_spec_decode(
+        output = SpeculativeDecodeController().verify_greedy(
             _logits([7, 8, 9]),
             [("r0", _request_state())],
             (segment,),
-            num_decode_tokens=3,
+            logitsprocs=None,
         )
 
         assert output == [[7, 8, 9]]
@@ -198,11 +338,11 @@ class TestVerifyGreedySpecDecode:
             block_ids=(0,),
         )
 
-        output = verify_greedy_spec_decode(
+        output = SpeculativeDecodeController().verify_greedy(
             _logits([7, 5, 9]),
             [("r0", _request_state())],
             (segment,),
-            num_decode_tokens=3,
+            logitsprocs=None,
         )
 
         assert output == [[7, 5]]
@@ -219,16 +359,32 @@ class TestVerifyGreedySpecDecode:
         )
 
         with pytest.raises(NotImplementedError, match="greedy sampling"):
-            verify_greedy_spec_decode(
+            SpeculativeDecodeController().verify_greedy(
                 _logits([7, 9]),
                 [("r0", _request_state(temperature=0.7))],
                 (segment,),
-                num_decode_tokens=2,
+                logitsprocs=None,
             )
 
     def test_rejects_logits_processors_that_can_change_argmax(self) -> None:
+        class _NonArgmaxProcessor:
+            def is_argmax_invariant(self) -> bool:
+                return False
+
         with pytest.raises(NotImplementedError, match="logits processors"):
-            validate_greedy_spec_decode_sampling(
+            SpeculativeDecodeController().verify_greedy(
+                _logits([7, 9]),
                 [("r0", _request_state())],
-                logitsprocs=SimpleNamespace(non_argmax_invariant=[object()]),
+                (
+                    PagedDecodeSegment(
+                        req_id="r0",
+                        input_token_ids=(6, 7),
+                        start_row=0,
+                        num_query_tokens=2,
+                        draft_token_ids=(7,),
+                        cache_start_pos=1,
+                        block_ids=(0,),
+                    ),
+                ),
+                logitsprocs=LogitsProcessors([_NonArgmaxProcessor()]),
             )

@@ -57,6 +57,7 @@ def _make_scheduler_output(
     """Minimal SchedulerOutput stub — no spec-decode tokens."""
     return SimpleNamespace(
         scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=None,
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
         total_num_scheduled_tokens=len(req_ids),
         scheduled_new_reqs=[],

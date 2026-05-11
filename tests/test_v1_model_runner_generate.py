@@ -164,11 +164,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         self,
         num_scheduled_tokens: dict[str, int],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        num_invalid_spec_tokens: dict[str, int] | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=num_invalid_spec_tokens,
             finished_req_ids=set(),
         )
 
@@ -251,71 +253,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert captured["block_size"] == 4
         assert runner._execute_model_state is not None
         assert runner._execute_model_state.cu_seqlens == [0, 3]
-
-    def test_start_paged_forward_rejects_non_argmax_logits_processors(
-        self,
-        monkeypatch,
-    ) -> None:
-        runner = self._make_runner()
-        runner.num_layers = 0
-        runner._paged_block_size = 4
-        runner._logitsprocs = SimpleNamespace(non_argmax_invariant=[object()])
-
-        monkeypatch.setattr(
-            mr,
-            "prepare_unified",
-            lambda *args, **kwargs: pytest.fail("prepare_unified should not run"),
-        )
-        runner.model = lambda *args, **kwargs: pytest.fail("model should not run")
-
-        req_state = self._make_state([1, 6])
-        req_state.block_ids = [0]
-        scheduler_output = self._make_scheduler_output(
-            {"r0": 2},
-            {"r0": [7]},
-        )
-
-        with pytest.raises(NotImplementedError, match="logits processors"):
-            runner._start_paged_forward(
-                mr._ExecutionBatch(),
-                prefill_reqs=[],
-                decode_reqs=[("r0", req_state)],
-                scheduler_output=scheduler_output,
-            )
-
-        assert runner._execute_model_state is None
-
-    def test_start_paged_forward_rejects_invalid_draft_token_sentinel(
-        self,
-        monkeypatch,
-    ) -> None:
-        runner = self._make_runner()
-        runner.num_layers = 0
-        runner._paged_block_size = 4
-
-        monkeypatch.setattr(
-            mr,
-            "prepare_unified",
-            lambda *args, **kwargs: pytest.fail("prepare_unified should not run"),
-        )
-        runner.model = lambda *args, **kwargs: pytest.fail("model should not run")
-
-        req_state = self._make_state([1, 6])
-        req_state.block_ids = [0]
-        scheduler_output = self._make_scheduler_output(
-            {"r0": 2},
-            {"r0": [-1]},
-        )
-
-        with pytest.raises(NotImplementedError, match="invalid draft-token"):
-            runner._start_paged_forward(
-                mr._ExecutionBatch(),
-                prefill_reqs=[],
-                decode_reqs=[("r0", req_state)],
-                scheduler_output=scheduler_output,
-            )
-
-        assert runner._execute_model_state is None
 
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         runner = self._make_runner()
@@ -427,6 +364,60 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert output.sampled_token_ids == [[7, 9], [4]]
         assert draft_state.token_ids == [1, 6, 7, 9]
         assert plain_state.token_ids == [2, 3, 4]
+
+    def test_mixed_batch_routes_plain_request_through_sampler(
+        self, monkeypatch
+    ) -> None:
+        runner = self._make_runner()
+        draft_state = self._make_state([1, 6])
+        plain_state = self._make_state([2, 3], temperature=0.7)
+        decode_reqs = [("draft", draft_state), ("plain", plain_state)]
+        segments = (
+            mr.PagedDecodeSegment(
+                req_id="draft",
+                input_token_ids=(6, 7),
+                start_row=0,
+                num_query_tokens=2,
+                draft_token_ids=(7,),
+                cache_start_pos=1,
+                block_ids=(0,),
+            ),
+            mr.PagedDecodeSegment(
+                req_id="plain",
+                input_token_ids=(3,),
+                start_row=2,
+                num_query_tokens=1,
+                draft_token_ids=(),
+                cache_start_pos=1,
+                block_ids=(1,),
+            ),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"draft": 2, "plain": 1},
+            {"draft": [7]},
+        )
+        self._install_paged_state(
+            runner,
+            decode_reqs,
+            segments,
+            self._make_logits([7, 9, 4]),
+            scheduler_output,
+        )
+        sampled_rows = []
+
+        def fake_sample_from_logits(logits_2d, batch, sampler, device):
+            del sampler, device
+            sampled_rows.append(logits_2d.tolist())
+            assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]
+            return mr._SamplingResult([4])
+
+        monkeypatch.setattr(mr, "sample_from_logits", fake_sample_from_logits)
+
+        output = runner.sample_tokens(grammar_output=None)
+
+        assert output is not None
+        assert output.sampled_token_ids == [[7, 9], [4]]
+        assert sampled_rows == [[[0.0] * 4 + [10.0] + [0.0] * 11]]
 
     def test_structured_output_plain_spec_decode_request_is_allowed(self) -> None:
         runner = self._make_runner()
@@ -593,6 +584,7 @@ class TestV1MetalModelRunnerExecuteModel:
         *,
         finished_req_ids: set[str] | None = None,
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
+        num_invalid_spec_tokens: dict[str, int] | None = None,
         scheduled_new_reqs: list[SimpleNamespace] | None = None,
     ) -> SimpleNamespace:
         req_ids = cached_req_ids or []
@@ -610,6 +602,7 @@ class TestV1MetalModelRunnerExecuteModel:
             num_scheduled_tokens=dict.fromkeys(req_ids, 1),
             total_num_scheduled_tokens=len(req_ids),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
+            num_invalid_spec_tokens=num_invalid_spec_tokens,
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=finished_req_ids or set(),
@@ -662,6 +655,35 @@ class TestV1MetalModelRunnerExecuteModel:
             runner.execute_model(scheduler_output)
 
         assert "done" not in runner._request_states
+        assert "new" not in runner._request_states
+
+    def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
+        runner = self._make_runner()
+        runner._paged_attention_backend = object()
+        req_state = mr.RequestState(
+            token_ids=[1, 6],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=1,
+            block_ids=[0],
+        )
+        runner._request_states["r0"] = req_state
+        scheduler_output = self._make_scheduler_output(
+            ["r0"],
+            scheduled_spec_decode_tokens={"r0": [-1]},
+            num_invalid_spec_tokens={"r0": 1},
+            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+        )
+        scheduler_output.num_scheduled_tokens = {"r0": 2, "new": 1}
+        scheduler_output.total_num_scheduled_tokens = 3
+        scheduler_output.scheduled_cached_reqs.new_block_ids = [[[99]]]
+
+        with pytest.raises(NotImplementedError, match="scheduler-invalid"):
+            runner.execute_model(scheduler_output)
+
+        assert req_state.block_ids == [0]
         assert "new" not in runner._request_states
 
 

@@ -10,6 +10,7 @@ import torch
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
+from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 
@@ -44,6 +45,7 @@ def make_stub_runner(
         "_pending_output": None,
         "_execute_model_state": None,
         "_model_adapter": DefaultModelAdapter(),
+        "_spec_decode_controller": SpeculativeDecodeController(),
         "kv_heads_per_layer": None,
         "head_dim_per_layer": None,
         "sliding_window_per_layer": None,
