@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
 from vllm.logger import init_logger
@@ -60,7 +61,7 @@ class MultimodalRuntimeAdapter(Protocol):
     def encode_multimodal(
         self,
         features: list[MultiModalFeatureSpec],
-    ) -> list[MultimodalEncodeResult]:
+    ) -> Sequence[MultimodalEncodeResult]:
         """Run the model's vision tower; return one result per feature.
 
         RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__`` —
@@ -422,7 +423,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
-        return Qwen3VLMultimodalAdapter.from_loaded_model(model)
+        return cast(
+            MultimodalRuntimeAdapter,
+            Qwen3VLMultimodalAdapter.from_loaded_model(model),
+        )
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]
