@@ -16,7 +16,10 @@ from vllm.v1.core.sched.output import (
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
-from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.multimodal.qwen3_vl import (
+    Qwen3VLMultimodalAdapter,
+    Qwen3VLVisionEncodeResult,
+)
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import RequestState
 
@@ -249,9 +252,9 @@ class _RecordingAdapter:
 
     def __init__(self) -> None:
         self.encode_calls: list[list[MultiModalFeatureSpec]] = []
-        self._next_outputs: list[list[mx.array]] | None = None
+        self._next_outputs: list[list[Qwen3VLVisionEncodeResult]] | None = None
 
-    def queue_outputs(self, outputs: list[list[mx.array]]) -> None:
+    def queue_outputs(self, outputs: list[list[Qwen3VLVisionEncodeResult]]) -> None:
         """Force a sequence of return values for successive encode calls."""
         self._next_outputs = list(outputs)
 
@@ -263,11 +266,17 @@ class _RecordingAdapter:
 
     def encode_multimodal(
         self, features: list[MultiModalFeatureSpec]
-    ) -> list[mx.array]:
+    ) -> list[Qwen3VLVisionEncodeResult]:
         self.encode_calls.append(list(features))
         if self._next_outputs is not None and self._next_outputs:
             return self._next_outputs.pop(0)
-        return [mx.zeros((1, 4)) for _ in features]
+        return [
+            Qwen3VLVisionEncodeResult(
+                hidden_states=mx.zeros((1, 4)),
+                deepstack_visual_embeds=None,
+            )
+            for _ in features
+        ]
 
     def call_lm(self, *args: object, **kwargs: object) -> object:
         raise AssertionError("call_lm not exercised in commit 3")
@@ -314,7 +323,16 @@ def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
     expected = mx.array([[1.0, 2.0]])
-    adapter.queue_outputs([[expected]])
+    adapter.queue_outputs(
+        [
+            [
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=expected,
+                    deepstack_visual_embeds=[mx.array([[3.0, 4.0]])],
+                )
+            ]
+        ]
+    )
 
     runner._run_vision_encoders({"req-0": [0]})
 
@@ -382,7 +400,20 @@ def test_run_vision_encoders_raises_when_adapter_returns_wrong_count() -> None:
     features = [_feature("image-0")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
-    adapter.queue_outputs([[mx.zeros((1,)), mx.zeros((1,))]])
+    adapter.queue_outputs(
+        [
+            [
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=mx.zeros((1,)),
+                    deepstack_visual_embeds=None,
+                ),
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=mx.zeros((1,)),
+                    deepstack_visual_embeds=None,
+                ),
+            ]
+        ]
+    )
 
     with pytest.raises(RuntimeError, match="encode_multimodal returned 2"):
         runner._run_vision_encoders({"req-0": [0]})

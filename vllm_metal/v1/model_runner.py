@@ -1230,10 +1230,10 @@ class MetalModelRunner:
                 if len(outputs) != 1:
                     raise RuntimeError(
                         f"encode_multimodal returned {len(outputs)} outputs "
-                        "for 1 feature; adapter must return one array per "
+                        "for 1 feature; adapter must return one result per "
                         "feature."
                     )
-                cache.encoder_outputs[feature.identifier] = outputs[0]
+                cache.encoder_outputs[feature.identifier] = outputs[0].hidden_states
 
     def _handle_new_requests(
         self,

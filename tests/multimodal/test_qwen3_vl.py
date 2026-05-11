@@ -230,6 +230,7 @@ class _RecordingVisionTower:
     def __init__(
         self,
         hidden_factory: Any | None = None,
+        deepstack_factory: Any | None = None,
         *,
         weight_dtype: mx.Dtype = mx.float32,
     ) -> None:
@@ -237,15 +238,17 @@ class _RecordingVisionTower:
         self._hidden_factory = hidden_factory or (
             lambda call_idx: mx.full((4, 8), float(call_idx), dtype=mx.float32)
         )
+        self._deepstack_factory = deepstack_factory or (lambda call_idx: None)
         # ``mlx_vlm.Model.get_input_embeddings`` reads
         # ``vision_tower.patch_embed.proj.weight.dtype``; mirror that path.
         self.patch_embed = SimpleNamespace(
             proj=SimpleNamespace(weight=mx.zeros((1,), dtype=weight_dtype))
         )
 
-    def __call__(self, pixel_values: Any, grid_thw: Any) -> tuple[mx.array, None]:
+    def __call__(self, pixel_values: Any, grid_thw: Any) -> tuple[mx.array, Any]:
         self.calls.append((pixel_values, grid_thw))
-        return self._hidden_factory(len(self.calls) - 1), None
+        call_idx = len(self.calls) - 1
+        return self._hidden_factory(call_idx), self._deepstack_factory(call_idx)
 
 
 def _vision_feature(
@@ -276,8 +279,9 @@ def _vision_feature(
 
 
 class TestQwen3VLMultimodalAdapterEncodeMultimodal:
-    def test_calls_vision_tower_and_strips_deepstack(self) -> None:
-        tower = _RecordingVisionTower()
+    def test_calls_vision_tower_and_preserves_deepstack(self) -> None:
+        deepstack = [mx.full((4, 8), 9.0, dtype=mx.float32)]
+        tower = _RecordingVisionTower(deepstack_factory=lambda _: deepstack)
         adapter = Qwen3VLMultimodalAdapter(
             spatial_merge_size=_SPATIAL_MERGE_SIZE,
             vision_tower=tower,
@@ -287,8 +291,9 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         outputs = adapter.encode_multimodal([feature])
 
         assert len(outputs) == 1
-        assert outputs[0].shape == (4, 8)
-        assert outputs[0].tolist() == [[0.0] * 8] * 4
+        assert outputs[0].hidden_states.shape == (4, 8)
+        assert outputs[0].hidden_states.tolist() == [[0.0] * 8] * 4
+        assert outputs[0].deepstack_visual_embeds is deepstack
         assert len(tower.calls) == 1
 
     def test_returns_one_output_per_feature(self) -> None:
@@ -305,8 +310,8 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         outputs = adapter.encode_multimodal(features)
 
         assert len(outputs) == 2
-        assert outputs[0].tolist()[0][0] == 0.0
-        assert outputs[1].tolist()[0][0] == 1.0
+        assert outputs[0].hidden_states.tolist()[0][0] == 0.0
+        assert outputs[1].hidden_states.tolist()[0][0] == 1.0
         assert len(tower.calls) == 2
 
     def test_passes_mlx_arrays_to_vision_tower(self) -> None:

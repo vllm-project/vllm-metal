@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import dataclass
 from functools import cache
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,14 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+
+
+@dataclass(frozen=True)
+class Qwen3VLVisionEncodeResult:
+    """Vision tower output for one Qwen3-VL multimodal feature."""
+
+    hidden_states: mx.array
+    deepstack_visual_embeds: Any | None
 
 
 class Qwen3VLMultimodalAdapter:
@@ -94,14 +103,16 @@ class Qwen3VLMultimodalAdapter:
     def encode_multimodal(
         self,
         features: list[MultiModalFeatureSpec],
-    ) -> list[mx.array]:
-        """Run the vision tower per feature; return one MLX array per feature.
+    ) -> list[Qwen3VLVisionEncodeResult]:
+        """Run the vision tower per feature; return one result per feature.
 
         RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__``; route
         through ``vision_tower`` directly so the LM is not re-entered through
         the top-level VLM dispatch.  The vision tower returns
-        ``(hidden_states, deepstack_image_embeds)``; deepstack augmentation is
-        out of scope for the initial Qwen3.5-4B path.
+        ``(hidden_states, deepstack_visual_embeds)``.  mlx-vlm 0.4.x returns
+        ``None`` for deepstack because of its reference bug; preserving the
+        field here keeps the adapter contract ready for the mlx-vlm 0.5.x
+        dependency unlock without enabling multimodal forward yet.
         """
         if self._vision_tower is None:
             raise RuntimeError(
@@ -115,7 +126,7 @@ class Qwen3VLMultimodalAdapter:
         # fp16/bf16 weights, so we align dtypes once per encode batch.
         target_dtype = self._vision_tower.patch_embed.proj.weight.dtype
 
-        outputs: list[mx.array] = []
+        outputs: list[Qwen3VLVisionEncodeResult] = []
         for feature in features:
             if feature.modality != "image":
                 raise ValueError(
@@ -138,8 +149,16 @@ class Qwen3VLMultimodalAdapter:
                 self._feature_value(feature.data, "image_grid_thw")
             ).reshape(1, 3)
 
-            hidden_states, _ = self._vision_tower(pixel_values, image_grid_thw)
-            outputs.append(hidden_states)
+            hidden_states, deepstack_visual_embeds = self._vision_tower(
+                pixel_values,
+                image_grid_thw,
+            )
+            outputs.append(
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=hidden_states,
+                    deepstack_visual_embeds=deepstack_visual_embeds,
+                )
+            )
 
         return outputs
 

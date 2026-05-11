@@ -25,6 +25,13 @@ class TargetModelForwardOutput:
     hidden_states: mx.array | None = None
 
 
+class MultimodalEncodeResult(Protocol):
+    """Adapter-owned vision output for one multimodal feature."""
+
+    hidden_states: Any
+    deepstack_visual_embeds: Any | None
+
+
 class MultimodalRuntimeAdapter(Protocol):
     """Model-owned behavior needed for native multimodal execution."""
 
@@ -53,11 +60,13 @@ class MultimodalRuntimeAdapter(Protocol):
     def encode_multimodal(
         self,
         features: list[MultiModalFeatureSpec],
-    ) -> list[Any]:
-        """Run the model's vision tower; return one MLX array per feature.
+    ) -> list[MultimodalEncodeResult]:
+        """Run the model's vision tower; return one result per feature.
 
         RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__`` —
         the LM must not be re-entered through the top-level VLM dispatch.
+        Results may carry optional deepstack visual embeds for models whose
+        language model injects vision residuals in intermediate layers.
         """
 
     def call_lm(
