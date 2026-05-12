@@ -300,6 +300,120 @@ def metal_mla_paged_attention(
     mx.synchronize()
 
 
+# Hard-coded for now: matches the only instantiated reduce kernel
+# (see kernels_v2/mla.metal). If we add more PARTITION_SIZE specializations
+# later, this becomes a parameter.
+MLA_PARTITION_SIZE = 512
+
+
+def metal_mla_paged_attention_partitioned(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    out,  # [total_q_tokens, num_heads, kv_lora_rank]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32
+    scale: float,
+    heads_per_tg: int = 1,
+) -> None:
+    """Paged MLA with split-K + reduce (RFC #360 Phase 3 — for long contexts /
+    low-batch decode where the single-pass kernel under-fills the GPU).
+
+    Same shape contract and decode-only constraints as
+    ``metal_mla_paged_attention``. Internally allocates per-partition
+    ``exp_sums`` / ``max_logits`` / ``tmp_out`` scratch and dispatches the
+    main kernel with ``PARTITION_SIZE=512`` followed by the reduce kernel.
+
+    Caller is responsible for the partitioning routing decision (e.g., based
+    on max ctx_len and total threadgroup count); this function unconditionally
+    runs the partitioned path.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    # Shape contract — identical to the non-partitioned entry.
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+    if MLA_PARTITION_SIZE % block_size != 0:
+        raise ValueError(
+            f"MLA partitioned: PARTITION_SIZE ({MLA_PARTITION_SIZE}) must be "
+            f"divisible by block_size ({block_size})."
+        )
+
+    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
+
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA partitioned kernel (P1) supports decode only — one query "
+            f"token per sequence. Got request {bad} with {int(deltas[bad])} "
+            "query tokens."
+        )
+
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA partitioned: block_tables row width ({max_blocks_per_seq}) "
+            f"too small for request {bad}: ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    total_q_tokens = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    kv_lora_rank = int(q_nope.shape[2])
+    max_ctx = int(ctx.max())
+    max_num_partitions = max(
+        1, (max_ctx + MLA_PARTITION_SIZE - 1) // MLA_PARTITION_SIZE
+    )
+
+    # Scratch buffers. Zero-initialized so partitions that return early (no
+    # blocks to process for their seq) leave a no-op contribution.
+    exp_sums = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    max_logits = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    tmp_out = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions, kv_lora_rank),
+        dtype=q_nope.dtype,
+    )
+    mx.eval(exp_sums, max_logits, tmp_out)
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    ops.mla_paged_attention_partitioned(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        MLA_PARTITION_SIZE,
+        max_num_partitions,
+        heads_per_tg,
+    )
+    mx.synchronize()
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 

@@ -359,14 +359,134 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
   }
 }
 
+// ========================================== Reduce kernel
+//
+// Cross-partition online-softmax merge. One threadgroup per (head, q_token).
+// Unchanged from the previous version — partial outputs from the new main
+// kernel still follow the same (max, lse, normalized partial) contract, and
+// the reduce kernel is per-head (so HEADS_PER_TG doesn't propagate here).
+//
+// Buffer layout:
+//   0: out         [total_q_tokens, num_heads, HEAD_SIZE] T
+//   1: exp_sums    [num_seqs, num_heads, max_num_partitions] fp32
+//   2: max_logits  [num_seqs, num_heads, max_num_partitions] fp32
+//   3: tmp_out     [num_seqs, num_heads, max_num_partitions, HEAD_SIZE] T
+//   4: context_lens [num_seqs] uint32
+//   5: max_num_partitions (constant int)
+
+template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
+          int PARTITION_SIZE>
+[[kernel]] void paged_mla_attention_reduce(
+    device T *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device T *tmp_out [[buffer(3)]],
+    const device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int num_heads = threadgroups_per_grid.x;
+  const int thread_idx = thread_position_in_threadgroup.x;
+  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
+  const int warp_idx = (int)simd_tid;
+  const int lane = (int)simd_lid;
+
+  const int seq_idx = q_token_idx;
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int num_partitions =
+      (ctx_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+
+  threadgroup float *shared_max_logits = (threadgroup float *)shared_mem;
+  threadgroup float *shared_exp_sums = shared_max_logits + max_num_partitions;
+  threadgroup float *red_smem = shared_exp_sums + max_num_partitions;
+
+  device T *out_ptr =
+      out + (q_token_idx * num_heads + head_idx) * HEAD_SIZE;
+  const device T *tmp_out_ptr =
+      tmp_out +
+      (q_token_idx * num_heads + head_idx) * max_num_partitions * HEAD_SIZE;
+
+  if (num_partitions == 1) {
+    for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+      out_ptr[d] = tmp_out_ptr[d];
+    }
+    return;
+  }
+
+  const device float *max_logits_ptr =
+      max_logits +
+      (q_token_idx * num_heads + head_idx) * max_num_partitions;
+  float thread_max = -INFINITY;
+  for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
+    const float l = max_logits_ptr[i];
+    shared_max_logits[i] = l;
+    thread_max = max(thread_max, l);
+  }
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+    thread_max = max(thread_max, simd_shuffle_xor(thread_max, mask));
+  }
+  if (lane == 0) {
+    red_smem[warp_idx] = thread_max;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread_max = (lane < NUM_WARPS) ? red_smem[lane] : -INFINITY;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    thread_max = max(thread_max, simd_shuffle_xor(thread_max, mask));
+  }
+  const float global_max = simd_shuffle(thread_max, 0);
+
+  const device float *exp_sums_ptr =
+      exp_sums + (q_token_idx * num_heads + head_idx) * max_num_partitions;
+  float thread_exp_sum = 0.0f;
+  for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
+    const float l = shared_max_logits[i];
+    const float rescaled = exp_sums_ptr[i] * fast::exp(l - global_max);
+    shared_exp_sums[i] = rescaled;
+    thread_exp_sum += rescaled;
+  }
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+    thread_exp_sum += simd_shuffle_xor(thread_exp_sum, mask);
+  }
+  if (lane == 0) {
+    red_smem[NUM_WARPS + warp_idx] = thread_exp_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread_exp_sum = (lane < NUM_WARPS) ? red_smem[NUM_WARPS + lane] : 0.0f;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    thread_exp_sum += simd_shuffle_xor(thread_exp_sum, mask);
+  }
+  const float global_exp_sum = simd_shuffle(thread_exp_sum, 0);
+  const float inv_global =
+      (global_exp_sum > 0.0f) ? (1.0f / global_exp_sum) : 0.0f;
+
+  for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+    float acc = 0.0f;
+    for (int j = 0; j < num_partitions; j++) {
+      acc += float(tmp_out_ptr[j * HEAD_SIZE + d]) * shared_exp_sums[j] *
+             inv_global;
+    }
+    out_ptr[d] = T(acc);
+  }
+}
 
 // ========================================== Instantiations
 //
-// Single-pass main kernel: dtype × block_size × heads_per_tg.
+// Single-pass main kernel: dtype × block_size × heads_per_tg × partition_size.
 //   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
 //   G=2 → NUM_THREADS=512  (16 simdgroups, 2× KV-bandwidth amortization).
 //   G=4 → NUM_THREADS=256  (8 simdgroups, 4× the per-thread arithmetic;
 //                           register footprint per TG stays roughly constant).
+// Reduce kernel: dtype × partition_size, NUM_THREADS=256.
 
 #define instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size,      \
                         heads_per_tg, num_threads, partition_size)             \
@@ -396,20 +516,52 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
       uint simd_lid [[thread_index_in_simdgroup]]);
 
+#define instantiate_mla_reduce(type, head_size, partition_size)                \
+  template [[host_name("paged_mla_attention_reduce_" #type "_hs" #head_size    \
+                       "_nt256_nsl32_ps" #partition_size)]] [[kernel]] void    \
+  paged_mla_attention_reduce<type, head_size, 256, 32, partition_size>(        \
+      device type * out [[buffer(0)]],                                         \
+      const device float *exp_sums [[buffer(1)]],                              \
+      const device float *max_logits [[buffer(2)]],                            \
+      const device type *tmp_out [[buffer(3)]],                                \
+      const device uint32_t *context_lens [[buffer(4)]],                       \
+      const constant int &max_num_partitions [[buffer(5)]],                    \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
 // G=1 (single-head per TG, NUM_THREADS=1024).
 instantiate_mla(half, 512, 64, 16, 1, 1024, 0);
 instantiate_mla(half, 512, 64, 32, 1, 1024, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, 0);
+instantiate_mla(half, 512, 64, 16, 1, 1024, 512);
+instantiate_mla(half, 512, 64, 32, 1, 1024, 512);
+instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, 512);
+instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, 512);
 
 // G=2 (2 heads per TG, NUM_THREADS=512). 2× KV-bandwidth amortization.
 instantiate_mla(half, 512, 64, 16, 2, 512, 0);
 instantiate_mla(half, 512, 64, 32, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 0);
+instantiate_mla(half, 512, 64, 16, 2, 512, 512);
+instantiate_mla(half, 512, 64, 32, 2, 512, 512);
+instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 512);
+instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 512);
 
 // G=4 (4 heads per TG, NUM_THREADS=256). 4× KV-bandwidth amortization.
 instantiate_mla(half, 512, 64, 16, 4, 256, 0);
 instantiate_mla(half, 512, 64, 32, 4, 256, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 4, 256, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 4, 256, 0);
+instantiate_mla(half, 512, 64, 16, 4, 256, 512);
+instantiate_mla(half, 512, 64, 32, 4, 256, 512);
+instantiate_mla(bfloat16_t, 512, 64, 16, 4, 256, 512);
+instantiate_mla(bfloat16_t, 512, 64, 32, 4, 256, 512);
+
+instantiate_mla_reduce(half, 512, 512);
+instantiate_mla_reduce(bfloat16_t, 512, 512);

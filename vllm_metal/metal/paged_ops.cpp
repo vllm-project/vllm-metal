@@ -1341,6 +1341,239 @@ void mla_paged_attention_impl(
       heads_per_tg,
       default_stream(Device::gpu));
 }
+
+// Partitioned MLA dispatch: split-K main kernel + reduce.
+//
+// Caller pre-allocates exp_sums [num_seqs, num_heads, max_num_partitions]
+// fp32, max_logits same shape, tmp_out [num_seqs, num_heads,
+// max_num_partitions, kv_lora_rank] T (zero-initialized — partitions with no
+// work return early without writing).
+//
+// partition_size must be one of the instantiated values (currently 512).
+static void dispatch_mla_paged_attention_partitioned(
+    array& out,
+    array& exp_sums,
+    array& max_logits,
+    array& tmp_out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    int heads_per_tg,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  // Shape sanity — match the instantiated specializations.
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only block_size in {16, 32} is instantiated; got " +
+        std::to_string(block_size));
+  }
+  if (partition_size != 512) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: only partition_size=512 is instantiated; got " +
+        std::to_string(partition_size));
+  }
+  if (partition_size % block_size != 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: partition_size (" +
+        std::to_string(partition_size) + ") must be divisible by block_size (" +
+        std::to_string(block_size) + ").");
+  }
+  int num_threads = mla_num_threads_for_g(heads_per_tg);
+  if (num_threads == 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: heads_per_tg must be in {1, 4}; got " +
+        std::to_string(heads_per_tg));
+  }
+  if (num_heads % heads_per_tg != 0) {
+    throw std::runtime_error(
+        "MLA partitioned kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be divisible by heads_per_tg (" +
+        std::to_string(heads_per_tg) + ")");
+  }
+  mla_validate_t_dtypes("MLA partitioned kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+      {"tmp_out", &tmp_out},
+  });
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_g" +
+                      std::to_string(heads_per_tg) + "_nt" +
+                      std::to_string(num_threads) + "_nsl32_ps" +
+                      std::to_string(partition_size);
+
+  bool use_partitioning = true;
+  bool use_alibi = false;
+  bool use_fp8_scales = false;
+  bool use_sinks = false;
+  bool use_turboquant = false;
+
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0") +
+                          "_alibi0_fp80_sinks0_tq0";
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(
+      kname,
+      lib,
+      hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_alibi, MTL::DataType::DataTypeBool, NS::UInteger(20)},
+       {&use_fp8_scales, MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_turboquant, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+
+  // Threadgroup memory: same layout as the non-partitioned path. See the
+  // comment in dispatch_mla_paged_attention.
+  const int BD = 32;
+  const int BN = num_threads / BD;
+  size_t shmem =
+      static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+  enc.set_input_array(cu_seqlens_q, 8);
+
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  enc.set_bytes(num_seqs_i, 9);
+  enc.set_bytes(max_blocks_i, 10);
+  enc.set_bytes(scale, 11);
+
+  // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Empty
+  // partitions return early in the kernel body.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens,
+                      max_num_partitions),
+      MTL::Size::Make(num_threads, 1, 1));
+
+  // Reduce kernel: merges per-partition (max, lse, partial out) into final out.
+  // Reduce work is small (one merge per (head, query) over max_num_partitions
+  // floats + max_num_partitions × HEAD_SIZE values), so 256 threads is enough.
+  // The reduce kernel template is instantiated at NUM_THREADS=256 — keep this
+  // constant in sync with `instantiate_mla_reduce` in mla.metal.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length(reduce_shmem, 0);
+
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, exp_sums, d, s);
+  add_temporary_compat(enc, max_logits, d, s);
+  add_temporary_compat(enc, tmp_out, d, s);
+  add_temporary_compat(enc, q_nope, d, s);
+  add_temporary_compat(enc, q_pe, d, s);
+  add_temporary_compat(enc, latent_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, context_lens, d, s);
+  add_temporary_compat(enc, cu_seqlens_q, d, s);
+}
+
+void mla_paged_attention_partitioned_impl(
+    nb::handle out_h,
+    nb::handle exp_sums_h,
+    nb::handle max_logits_h,
+    nb::handle tmp_out_h,
+    nb::handle q_nope_h,
+    nb::handle q_pe_h,
+    nb::handle latent_cache_h,
+    nb::handle block_tables_h,
+    nb::handle context_lens_h,
+    nb::handle cu_seqlens_q_h,
+    int block_size,
+    float scale,
+    int partition_size,
+    int max_num_partitions,
+    int heads_per_tg) {
+  auto& out = *nb::inst_ptr<array>(out_h);
+  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
+  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
+  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
+  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
+  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
+  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
+  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
+  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
+  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
+
+  dispatch_mla_paged_attention_partitioned(
+      out,
+      exp_sums,
+      max_logits,
+      tmp_out,
+      q_nope,
+      q_pe,
+      latent_cache,
+      block_tables,
+      context_lens,
+      cu_seqlens_q,
+      block_size,
+      scale,
+      partition_size,
+      max_num_partitions,
+      heads_per_tg,
+      default_stream(Device::gpu));
+}
+
 void gdn_linear_attention_impl(
     nb::handle q_h, nb::handle k_h, nb::handle v_h,
     nb::handle g_h, nb::handle beta_h,
@@ -1610,4 +1843,16 @@ NB_MODULE(_paged_ops, m) {
         "Paged MLA (single-pass), eager in-place dispatch. Kept for "
         "bench / tests; production wrapper uses the primitive variant.");
 
+  m.def("mla_paged_attention_partitioned",
+        &mla_paged_attention_partitioned_impl,
+        nb::arg("out"),
+        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("partition_size"), nb::arg("max_num_partitions"),
+        nb::arg("heads_per_tg") = 1,
+        "Paged MLA attention with split-K + reduce (RFC #360 Phase 3).");
 }

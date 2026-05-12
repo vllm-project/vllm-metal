@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct unit tests for the MLA Metal kernel (RFC #360).
 
-Single-pass decode kernel. The kernel handles ``ctx_len`` of any size
-that fits the caller-provided block_tables row, with two-pass softmax
-and a cross-simdgroup merge.
+Single-pass + split-K decode kernels. The single-pass kernel handles
+``ctx_len`` of any size that fits the caller-provided block_tables row;
+the partitioned (split-K) variant chunks ctx across multiple TGs and
+merges partials with the reduce kernel.
 """
 
 from __future__ import annotations
@@ -12,7 +13,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from vllm_metal.metal import metal_mla_paged_attention
+from vllm_metal.metal import (
+    MLA_PARTITION_SIZE,
+    metal_mla_paged_attention,
+    metal_mla_paged_attention_partitioned,
+)
 
 # Production shapes — only kv_lora_rank=512, qk_rope_head_dim=64 are
 # instantiated in mla.metal.
@@ -619,6 +624,231 @@ def test_unsupported_kv_lora_rank_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Split-K + reduce (RFC #360 Phase 3): metal_mla_paged_attention_partitioned
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_partitioned_single_partition_matches_dense(dtype: mx.Dtype) -> None:
+    """ctx_len ≤ PARTITION_SIZE — only one partition runs and the reduce
+    kernel hits its single-partition fast path (plain copy from tmp_out).
+    Output must match the dense reference, just like the non-partitioned
+    kernel."""
+    ctx_len = MLA_PARTITION_SIZE  # exactly one partition (boundary case)
+    block_size = 32
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=1,
+        num_heads=4,
+        ctx_len=ctx_len,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    metal_mla_paged_attention_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope, q_pe, latent_cache, block_tables_np, ctx_lens=[ctx_len], scale=0.125
+    )
+
+    rtol, atol = _tolerance(dtype)
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_partitioned_two_partitions_matches_dense(
+    dtype: mx.Dtype, block_size: int
+) -> None:
+    """ctx_len spanning two partitions — exercises the reduce kernel's full
+    online-softmax merge path. Each partition computes its own (max, lse,
+    partial out); reduce normalizes against the global max."""
+    ctx_len = MLA_PARTITION_SIZE + block_size  # 528 (bs=16) or 544 (bs=32)
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=1,
+        num_heads=8,
+        ctx_len=ctx_len,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    metal_mla_paged_attention_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope, q_pe, latent_cache, block_tables_np, ctx_lens=[ctx_len], scale=0.125
+    )
+
+    rtol, atol = _tolerance(dtype)
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_partitioned_many_partitions_matches_dense(dtype: mx.Dtype) -> None:
+    """Long context spanning many partitions — stresses the reduce kernel's
+    cross-partition merge across a large max_num_partitions count."""
+    ctx_len = MLA_PARTITION_SIZE * 6 + 17  # 3089 — last partition is partial
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=2,
+        num_heads=8,
+        ctx_len=ctx_len,
+        block_size=16,
+        dtype=dtype,
+    )
+
+    metal_mla_paged_attention_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=[ctx_len, ctx_len],
+        scale=0.125,
+    )
+
+    rtol, atol = _tolerance(dtype)
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_partitioned_mixed_ctx_lens_matches_dense(dtype: mx.Dtype) -> None:
+    """Mixed ctx_lens — sequences with different partition counts in one
+    batch. Each seq's reduce kernel sees only its own num_partitions; the
+    unused partition slots in the scratch buffers must be zero-init
+    sentinels."""
+    ctx_lens = [100, MLA_PARTITION_SIZE * 2, MLA_PARTITION_SIZE - 1, 1500]
+    block_size = 16
+    num_seqs = len(ctx_lens)
+    num_heads = 4
+    dtype_in = dtype
+
+    mx.random.seed(0)
+    max_ctx = max(ctx_lens)
+    n_blocks_per_seq = (max_ctx + block_size - 1) // block_size
+    num_blocks = n_blocks_per_seq * num_seqs
+
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype_in)
+    q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(
+        dtype_in
+    )
+    q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
+        dtype_in
+    )
+    latent_cache = mx.random.normal(shape=(num_blocks, block_size, _LATENT_DIM)).astype(
+        dtype_in
+    )
+    block_tables_np = np.arange(num_blocks, dtype=np.int32).reshape(
+        num_seqs, n_blocks_per_seq
+    )
+    block_tables = mx.array(block_tables_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+
+    metal_mla_paged_attention_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope, q_pe, latent_cache, block_tables_np, ctx_lens=ctx_lens, scale=0.125
+    )
+
+    rtol, atol = _tolerance(dtype)
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item()
+
+
+def test_partitioned_rejects_multi_token_query() -> None:
+    """Same decode-only guard as the non-partitioned entry."""
+    block_size = 16
+    latent_cache = mx.zeros((4, block_size, _LATENT_DIM), dtype=mx.float16)
+    block_tables = mx.zeros((1, 4), dtype=mx.int32)
+    context_lens = mx.array([8], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 2], dtype=mx.int32)
+    out = mx.zeros((2, 2, _KV_LORA_RANK), dtype=mx.float16)
+    q_nope = mx.zeros((2, 2, _KV_LORA_RANK), dtype=mx.float16)
+    q_pe = mx.zeros((2, 2, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
+
+    with pytest.raises(NotImplementedError, match="one query token per sequence"):
+        metal_mla_paged_attention_partitioned(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            scale=0.125,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cross-head amortization (HEADS_PER_TG > 1)
 # ---------------------------------------------------------------------------
 # G=4 packs 4 query heads into one threadgroup so each K/V load is reused
@@ -736,6 +966,57 @@ def test_g4_matches_g1() -> None:
     assert max_abs < 1e-2, f"G=4 vs G=1 divergence: max_abs_diff={max_abs:.5f}"
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_g4_partitioned_matches_dense(dtype: mx.Dtype) -> None:
+    """G=4 + split-K (Phase 3 long-ctx infra) — must match the dense
+    reference, mirroring the G=1 partitioned tests above."""
+    ctx_len = 1536  # 3 partitions at PARTITION_SIZE=512
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=2,
+        num_heads=8,
+        ctx_len=ctx_len,
+        block_size=16,
+        dtype=dtype,
+    )
+
+    metal_mla_paged_attention_partitioned(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+        heads_per_tg=4,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=[ctx_len, ctx_len],
+        scale=0.125,
+    )
+
+    rtol, atol = _tolerance(dtype)
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), f"G=4 partitioned mismatch (dtype={dtype}): max_abs_diff={max_abs:.5f}"
+
+
 def test_g_invalid_raises() -> None:
     """num_heads not divisible by G should raise at the dispatch boundary,
     not silently produce garbage."""
@@ -795,6 +1076,23 @@ def test_mla_rejects_mixed_dtypes_single_pass() -> None:
     )
     with pytest.raises(RuntimeError, match="must share the same dtype"):
         metal_mla_paged_attention(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=btab,
+            context_lens=ctx_lens,
+            cu_seqlens_q=cu_q,
+            scale=0.125,
+        )
+
+
+def test_mla_rejects_mixed_dtypes_partitioned() -> None:
+    out, q_nope, q_pe, latent_cache, btab, ctx_lens, cu_q = _mixed_dtype_inputs(
+        dtype_q=mx.bfloat16, dtype_kv=mx.float16
+    )
+    with pytest.raises(RuntimeError, match="must share the same dtype"):
+        metal_mla_paged_attention_partitioned(
             q_nope=q_nope,
             q_pe=q_pe,
             latent_cache=latent_cache,
