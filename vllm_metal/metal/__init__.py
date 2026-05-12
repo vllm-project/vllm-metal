@@ -33,6 +33,13 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 # paged_ops.cpp is newer than the .so).
 _ops_module: ModuleType | None = None
 
+# The MLA paged-attention shader set is loaded lazily on the first MLA
+# entrypoint call (see _ensure_mla_library). Initialising it inside
+# get_ops() would compile experimental MLA Metal source for every
+# paged-attention user, so non-MLA models pay the compile cost and a
+# compile error in MLA would block unrelated paged-attention paths.
+_mla_library_initialized: bool = False
+
 
 def _read_metal_source(path: Path) -> str:
     """Read a .metal file and strip local #include directives."""
@@ -85,6 +92,15 @@ def _build_gdn_source() -> str:
     parts = [
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "gdn_linear_attention.metal"),
+    ]
+    return "\n".join(parts)
+
+
+def _build_mla_paged_attention_source() -> str:
+    """Concatenate utils + mla into a single source for the MLA library."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "mla.metal"),
     ]
     return "\n".join(parts)
 
@@ -191,6 +207,177 @@ def metal_unified_attention(
         mx.synchronize()
 
 
+def metal_mla_paged_attention(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    out,  # [total_q_tokens, num_heads, kv_lora_rank]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32
+    scale: float,
+    heads_per_tg: int = 1,
+) -> None:
+    """Paged Multi-head Latent Attention (RFC #360).
+
+    Phase 1 step 8 (multi-block decode): the kernel iterates the per-sequence
+    block table with NUM_WARPS-strided online softmax and a cross-warp merge,
+    so any ``ctx_len`` that fits into the allocated block_tables row is fine.
+    Decode-only is still required (one query token per sequence) — varlen
+    prefill lands in P2.
+
+    Q is expected to be already projected through ``embed_q`` (so q_nope is
+    in kv_lora_rank space) and ``q_pe`` is RoPE-applied. The caller is
+    responsible for ``unembed_out`` on the result to recover v_head_dim.
+
+    ``heads_per_tg`` (G) controls cross-head KV amortization: each
+    threadgroup processes ``G`` consecutive query heads sharing the same
+    latent KV. Total dispatched threadgroups drop from ``B×H`` to
+    ``B×ceil(H/G)``, so total KV bandwidth is amortized G×. ``num_heads``
+    must be divisible by G. Currently instantiated for G ∈ {1, 4}; G=1 is
+    the existing single-head-per-TG kernel.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    # Shape contract — fail fast at the Python boundary so the C++ error
+    # path isn't the only line of defence.
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+
+    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
+
+    # P1 decode-only guard: q_token_idx == seq_idx is hard-wired in the
+    # kernel. Reading cu_seqlens_q back to host is cheap (tens of int32 per
+    # layer per step) and the guard goes away when P2 makes the kernel
+    # cu_seqlens_q-aware via find_seq_idx.
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA kernel (P1) supports decode only — one query token per "
+            f"sequence. Got request {bad} with {int(deltas[bad])} query "
+            "tokens. Multi-token prefill / varlen support lands in P2."
+        )
+
+    # block_tables row-width guard. The kernel walks block_table_row[0..
+    # num_context_blocks-1] for each sequence; if the caller-allocated row
+    # is too narrow we'd silently read into the next sequence's row or off
+    # the end of the buffer. Caller-side capacity bug (ValueError, not
+    # NotImplementedError — this isn't a feature gap).
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA: block_tables row width ({max_blocks_per_seq}) too small "
+            f"for request {bad}: ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    ops.mla_paged_attention(
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        heads_per_tg,
+    )
+    mx.synchronize()
+
+
+def metal_mla_paged_attention_primitive(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32
+    scale: float,
+    heads_per_tg: int = 1,
+):
+    """Primitive variant of :func:`metal_mla_paged_attention` — returns
+    a lazy ``mx.array`` whose evaluation triggers the kernel dispatch.
+
+    Same shape contract and decode-only guard as the eager binding; the
+    only difference is the call participates in MLX's lazy graph
+    instead of forcing an ``mx.eval`` boundary inside this entry. That
+    saves ~200 μs at small workloads (B=1, H≤64) where MLX dispatch
+    overhead is a meaningful fraction of total wrapper time.
+    """
+    import numpy as np
+
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA kernel (primitive) supports decode only — one query "
+            f"token per sequence. Got request {bad} with "
+            f"{int(deltas[bad])} query tokens."
+        )
+
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA: block_tables row width ({max_blocks_per_seq}) too small "
+            f"for request {bad}: ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    import mlx.core as mx
+
+    total_q_tokens = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    kv_lora_rank = int(q_nope.shape[2])
+    # ``mx.zeros`` here is lazy — the C++ side replaces ``out``'s
+    # descriptor with the Primitive output before the zeros ever
+    # evaluate, so the memset is never scheduled.
+    out = mx.zeros((total_q_tokens, num_heads, kv_lora_rank), dtype=q_nope.dtype)
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    ops.mla_paged_attention_primitive(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        heads_per_tg,
+        out,
+    )
+    return out
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 
@@ -231,6 +418,25 @@ def get_ops() -> ModuleType:
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
 
+    # The MLA paged-attention library is loaded lazily on first use via
+    # _ensure_mla_library so non-MLA paged-attention users do not pay the
+    # experimental MLA shader compile cost, and a compile error in the
+    # experimental MLA shader cannot block unrelated paged-attention paths.
+
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
     return mod
+
+
+def _ensure_mla_library(mod: ModuleType) -> None:
+    """Lazy-init the MLA shader library so non-MLA paged-attention users
+    do not pay the experimental MLA shader compile cost; called from
+    each MLA direct entrypoint before its first C++ dispatch.
+    """
+    global _mla_library_initialized
+    if _mla_library_initialized:
+        return
+    mla_src = _build_mla_paged_attention_source()
+    mod.init_mla_library(mla_src)
+    _mla_library_initialized = True
+    logger.info("MLA paged-attention Metal kernels loaded")
