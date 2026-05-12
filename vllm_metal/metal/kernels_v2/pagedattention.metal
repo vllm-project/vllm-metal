@@ -1853,8 +1853,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   instantiate_paged_attention_tiled_inner(type, 96, block_size);               \
   instantiate_paged_attention_tiled_inner(type, 128, block_size);              \
   instantiate_paged_attention_tiled_inner(type, 192, block_size);              \
-  instantiate_paged_attention_tiled_inner(type, 256, block_size);              \
-  instantiate_paged_attention_tiled_inner(type, 512, block_size);
+  instantiate_paged_attention_tiled_inner(type, 256, block_size);
 
 #define instantiate_paged_attention_tiled_all(type)                             \
   instantiate_paged_attention_tiled_heads(type, 8);                            \
