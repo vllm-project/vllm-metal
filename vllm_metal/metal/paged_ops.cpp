@@ -383,7 +383,11 @@ static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
   if (use_turboquant) return false;
   if (query_dtype == float32) return false;
   if (query_dtype != k_cache_dtype) return false;
-  return head_size == 64 || head_size == 128;
+  // 80, 112 excluded: HD_TILES % NUM_SG(4) != 0
+  switch (head_size) {
+    case 64: case 96: case 128: case 192: case 256: case 512: return true;
+    default: return false;
+  }
 }
 
 static void dispatch_paged_attention_tiled(
