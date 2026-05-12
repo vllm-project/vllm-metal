@@ -580,6 +580,7 @@ class TestSampleTokensGrammarPagedPath:
             decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
             logits=logits,
+            target_hidden_states=None,
             cu_seqlens=[0, 1],
             decode_segments=(
                 mr.PagedDecodeSegment(

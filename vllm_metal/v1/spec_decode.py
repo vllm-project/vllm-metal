@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -13,6 +13,9 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+
+if TYPE_CHECKING:
+    from vllm.config.speculative import SpeculativeConfig
 
 
 class _PagedDecodeStateLike(Protocol):
@@ -182,6 +185,30 @@ class SpeculativeDecodeController:
             start_row += segment.num_query_tokens
 
         return tuple(segments)
+
+    def needs_target_hidden_states(
+        self,
+        decode_segments: Sequence[PagedDecodeSegment],
+        *,
+        has_final_prefill: bool = False,
+        speculative_config: SpeculativeConfig | None = None,
+    ) -> bool:
+        """Return whether target hidden states are needed for draft follow-up."""
+        if not decode_segments and not has_final_prefill:
+            return False
+        return self._uses_gemma4_mtp(speculative_config)
+
+    @staticmethod
+    def _uses_gemma4_mtp(speculative_config: SpeculativeConfig | None) -> bool:
+        if speculative_config is None or speculative_config.method != "mtp":
+            return False
+
+        draft_model_config = speculative_config.draft_model_config
+        return (
+            draft_model_config is not None
+            and getattr(draft_model_config.hf_config, "model_type", None)
+            == "gemma4_mtp"
+        )
 
     def verify_greedy(
         self,

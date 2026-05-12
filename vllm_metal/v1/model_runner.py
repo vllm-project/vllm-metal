@@ -62,6 +62,7 @@ from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
     ModelAdapter,
     MultimodalRuntimeAdapter,
+    TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.sampling_batch import (
@@ -201,6 +202,7 @@ class _PagedForwardState(NamedTuple):
     decode_reqs: list[tuple[str, RequestState]]
     scheduler_output: SchedulerOutput
     logits: mx.array
+    target_hidden_states: mx.array | None
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
     num_decode_tokens: int
@@ -458,11 +460,21 @@ class MetalModelRunner:
         Returns:
             Logits array
         """
-        if hasattr(model_output, "logits"):
-            # mlx-vlm returns LanguageModelOutput
-            return model_output.logits
-        # mlx-lm returns logits directly
-        return model_output
+        return self._model_adapter.extract_logits(model_output)
+
+    def _target_forward(
+        self,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+        collect_hidden_states: bool = False,
+    ) -> TargetModelForwardOutput:
+        return self._model_adapter.target_forward(
+            self._forward_model,
+            input_ids,
+            cache=cache,
+            collect_hidden_states=collect_hidden_states,
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -798,6 +810,13 @@ class MetalModelRunner:
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
+        collect_target_hidden_states = (
+            self._spec_decode_controller.needs_target_hidden_states(
+                decode_segments,
+                has_final_prefill=any(pr.prompt_len is not None for pr in prefill_reqs),
+                speculative_config=self.vllm_config.speculative_config,
+            )
+        )
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
@@ -845,18 +864,24 @@ class MetalModelRunner:
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
         try:
-            model_output = self._forward_model(input_ids, cache=offset_caches)
-            logits = self._extract_logits(model_output)
-            # MLX uses lazy evaluation — model_output holds the entire
-            # computation graph.  Dropping it before mx.eval lets MLX
-            # free intermediate buffers (per-layer Q/K/V, MLP outputs)
-            # as the graph evaluates, rather than pinning them all.
-            del model_output
+            target_output = self._target_forward(
+                input_ids,
+                cache=offset_caches,
+                collect_hidden_states=collect_target_hidden_states,
+            )
+            logits = target_output.logits
+            target_hidden_states = target_output.hidden_states
+            # Keep only logits and the optional row-major hidden states before
+            # scheduling evaluation.
+            del target_output
         finally:
             clear_context()
 
         # Submit to GPU — returns immediately, GPU runs in background
-        mx.async_eval(logits)
+        if target_hidden_states is not None:
+            mx.async_eval(logits, target_hidden_states)
+        else:
+            mx.async_eval(logits)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -871,6 +896,7 @@ class MetalModelRunner:
             decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
             logits=logits,
+            target_hidden_states=target_hidden_states,
             cu_seqlens=cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
@@ -893,6 +919,7 @@ class MetalModelRunner:
         decode_reqs = state.decode_reqs
         scheduler_output = state.scheduler_output
         logits = state.logits
+        target_hidden_states = state.target_hidden_states
         cu_seqlens = state.cu_seqlens
         decode_segments = state.decode_segments
         num_decode_segments = len(decode_segments)
@@ -902,7 +929,10 @@ class MetalModelRunner:
         )
 
         # ---- wait for MLX forward to complete ----
-        mx.eval(logits)
+        if target_hidden_states is not None:
+            mx.eval(logits, target_hidden_states)
+        else:
+            mx.eval(logits)
 
         # ---- apply structured output bitmask if present ----
         if grammar_output is not None:

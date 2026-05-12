@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -30,6 +31,7 @@ def make_stub_runner(
     _model_args = model_args or {}
 
     defaults: dict[str, Any] = {
+        "vllm_config": SimpleNamespace(speculative_config=None),
         "model": object(),
         "_is_stt": False,
         "_is_vlm": False,

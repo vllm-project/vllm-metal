@@ -174,6 +174,16 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             finished_req_ids=set(),
         )
 
+    def _make_gemma4_mtp_config(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="gemma4_mtp")
+                ),
+            )
+        )
+
     def _make_grammar_output(
         self,
         req_ids: list[str],
@@ -203,6 +213,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
             logits=logits,
+            target_hidden_states=None,
             cu_seqlens=[
                 0,
                 *[s.start_row + s.num_query_tokens for s in decode_segments],
@@ -213,6 +224,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
     def test_start_paged_forward_includes_scheduled_drafts(self, monkeypatch) -> None:
         runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._paged_request_seq_lens["r0"] = 1
@@ -224,14 +236,17 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_forward_model(input_ids, *, cache):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
             del cache
             captured["input_ids"] = input_ids.tolist()
-            return mx.zeros((1, 3, 16))
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 3, 16)),
+                hidden_states=mx.ones((3, 4)),
+            )
 
         monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
-        runner.model = fake_forward_model
-        runner._extract_logits = lambda model_output: model_output
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
 
         req_state = self._make_state([1, 6])
         req_state.block_ids = [0, 1]
@@ -248,11 +263,214 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
 
         assert captured["input_ids"] == [[6, 7, 8]]
+        assert captured["collect_hidden_states"] is True
         assert captured["decode_info"] == [([0, 1], 1, 3)]
         assert captured["prefill_info"] == []
         assert captured["block_size"] == 4
         assert runner._execute_model_state is not None
+        assert runner._execute_model_state.target_hidden_states is not None
         assert runner._execute_model_state.cu_seqlens == [0, 3]
+
+    def test_start_paged_forward_skips_hidden_states_without_drafts(
+        self, monkeypatch
+    ) -> None:
+        runner = self._make_runner()
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["r0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+            captured["prefill_info"] = prefill_info
+            captured["block_size"] = block_size
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache
+            captured["input_ids"] = input_ids.tolist()
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(logits=mx.zeros((1, 1, 16)))
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [0, 1]
+        scheduler_output = self._make_scheduler_output({"r0": 1}, {})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6]]
+        assert captured["collect_hidden_states"] is False
+        assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert captured["prefill_info"] == []
+        assert captured["block_size"] == 4
+        assert runner._execute_model_state is not None
+        assert runner._execute_model_state.target_hidden_states is None
+        assert runner._execute_model_state.cu_seqlens == [0, 1]
+
+    def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp(
+        self, monkeypatch
+    ) -> None:
+        runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["r0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+            captured["prefill_info"] = prefill_info
+            captured["block_size"] = block_size
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache
+            captured["input_ids"] = input_ids.tolist()
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 16)),
+                hidden_states=mx.ones((1, 4)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [0, 1]
+        scheduler_output = self._make_scheduler_output({"r0": 1}, {})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6]]
+        assert captured["collect_hidden_states"] is True
+        assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert captured["prefill_info"] == []
+        assert captured["block_size"] == 4
+        assert runner._execute_model_state is not None
+        assert runner._execute_model_state.target_hidden_states is not None
+        assert runner._execute_model_state.cu_seqlens == [0, 1]
+
+    def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp_prefill(
+        self, monkeypatch
+    ) -> None:
+        runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+            captured["prefill_info"] = prefill_info
+            captured["block_size"] = block_size
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache
+            captured["input_ids"] = input_ids.tolist()
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 2, 16)),
+                hidden_states=mx.ones((2, 4)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        scheduler_output = self._make_scheduler_output({"r0": 2}, {})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[
+                mr.PrefillRequest(
+                    req_id="r0",
+                    token_ids=[5, 6],
+                    sampling_params=SamplingParams(),
+                    block_ids=[0],
+                    generator=None,
+                    prompt_len=2,
+                    start_pos=0,
+                    full_prompt_token_ids=None,
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[5, 6]]
+        assert captured["collect_hidden_states"] is True
+        assert captured["decode_info"] == []
+        assert captured["prefill_info"] == [([0], 2, 0)]
+        assert captured["block_size"] == 4
+        assert runner._execute_model_state is not None
+        assert runner._execute_model_state.target_hidden_states is not None
+        assert runner._execute_model_state.cu_seqlens == [0, 2]
+
+    def test_start_paged_forward_skips_hidden_states_for_intermediate_prefill(
+        self, monkeypatch
+    ) -> None:
+        runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+            captured["prefill_info"] = prefill_info
+            captured["block_size"] = block_size
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache
+            captured["input_ids"] = input_ids.tolist()
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(logits=mx.zeros((1, 2, 16)))
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        scheduler_output = self._make_scheduler_output({"r0": 2}, {})
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[
+                mr.PrefillRequest(
+                    req_id="r0",
+                    token_ids=[5, 6],
+                    sampling_params=SamplingParams(),
+                    block_ids=[0],
+                    generator=None,
+                    prompt_len=None,
+                    start_pos=0,
+                    full_prompt_token_ids=None,
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[5, 6]]
+        assert captured["collect_hidden_states"] is False
+        assert captured["decode_info"] == []
+        assert captured["prefill_info"] == [([0], 2, 0)]
+        assert captured["block_size"] == 4
+        assert runner._execute_model_state is not None
+        assert runner._execute_model_state.target_hidden_states is None
+        assert runner._execute_model_state.cu_seqlens == [0, 2]
 
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         runner = self._make_runner()

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+import mlx.core as mx
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -13,6 +15,14 @@ if TYPE_CHECKING:
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TargetModelForwardOutput:
+    """Target-model forward output needed by sampling and speculative decode."""
+
+    logits: Any
+    hidden_states: Any | None = None
 
 
 class MultimodalRuntimeAdapter(Protocol):
@@ -54,6 +64,19 @@ class ModelAdapter(Protocol):
 
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
+
+    def target_forward(
+        self,
+        model: Any,
+        input_ids: Any,
+        *,
+        cache: Any | None = None,
+        collect_hidden_states: bool = False,
+    ) -> TargetModelForwardOutput:
+        """Run the target text model and optionally retain target hidden states."""
+
+    def extract_logits(self, model_output: Any) -> Any:
+        """Extract logits from raw model output."""
 
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any
@@ -231,6 +254,99 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         if hasattr(model, "language_model"):
             return model.language_model
         return model
+
+    def target_forward(
+        self,
+        model: Any,
+        input_ids: Any,
+        *,
+        cache: Any | None = None,
+        collect_hidden_states: bool = False,
+    ) -> TargetModelForwardOutput:
+        """Run the target model and return logits plus optional hidden states."""
+        if not collect_hidden_states:
+            output = model(input_ids, cache=cache)
+            return TargetModelForwardOutput(
+                logits=self.extract_logits(output),
+                hidden_states=None,
+            )
+
+        hidden_states = self._forward_target_hidden_states(
+            model,
+            input_ids,
+            cache=cache,
+        )
+        logits = self._compute_target_logits(model, hidden_states)
+        return TargetModelForwardOutput(
+            logits=logits,
+            hidden_states=self._flatten_target_hidden_states(hidden_states),
+        )
+
+    def extract_logits(self, model_output: Any) -> Any:
+        """Extract logits from mlx-lm arrays or mlx-vlm model outputs."""
+        if isinstance(model_output, TargetModelForwardOutput):
+            return model_output.logits
+        if hasattr(model_output, "logits"):
+            return model_output.logits
+        return model_output
+
+    def _forward_target_hidden_states(
+        self,
+        model: Any,
+        input_ids: Any,
+        *,
+        cache: Any | None,
+    ) -> Any:
+        backbone = getattr(model, "model", None)
+        if backbone is None:
+            raise NotImplementedError(
+                "Target hidden states require a text model with a `model` "
+                "backbone; this model output does not expose hidden states."
+            )
+        return backbone(input_ids, cache=cache)
+
+    def _compute_target_logits(self, model: Any, hidden_states: Any) -> Any:
+        if hasattr(model, "compute_logits"):
+            return model.compute_logits(hidden_states)
+
+        args = getattr(model, "args", None)
+        tie_word_embeddings = bool(
+            getattr(model, "tie_word_embeddings", False)
+            or getattr(args, "tie_word_embeddings", False)
+        )
+        if tie_word_embeddings:
+            logits = self._compute_tied_embedding_logits(model, hidden_states)
+            return self._apply_target_logit_postprocessing(model, logits)
+
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is not None:
+            logits = lm_head(hidden_states)
+            return self._apply_target_logit_postprocessing(model, logits)
+
+        logits = self._compute_tied_embedding_logits(model, hidden_states)
+        return self._apply_target_logit_postprocessing(model, logits)
+
+    def _compute_tied_embedding_logits(self, model: Any, hidden_states: Any) -> Any:
+        backbone = getattr(model, "model", None)
+        embed_tokens = getattr(backbone, "embed_tokens", None)
+        as_linear = getattr(embed_tokens, "as_linear", None)
+        if as_linear is None:
+            raise NotImplementedError(
+                "Target hidden states require either `lm_head` or tied "
+                "`model.embed_tokens.as_linear` logits projection."
+            )
+        return as_linear(hidden_states)
+
+    def _flatten_target_hidden_states(self, hidden_states: Any) -> Any:
+        if len(hidden_states.shape) == 3 and hidden_states.shape[0] == 1:
+            return hidden_states[0]
+        return hidden_states
+
+    def _apply_target_logit_postprocessing(self, model: Any, logits: Any) -> Any:
+        softcap = getattr(model, "final_logit_softcapping", None)
+        if softcap is None:
+            return logits
+        return mx.tanh(logits / softcap) * softcap
 
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any
