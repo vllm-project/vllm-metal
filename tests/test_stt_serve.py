@@ -42,6 +42,19 @@ class TestSTTServeRequestAdapter:
         assert normalized.prompt_token_ids == (1, 2)
         assert normalized.input_features is mel
 
+    def test_normalizes_qwen3_asr_vllm_feature_payload(self) -> None:
+        mel = np.zeros((128, 3000), dtype=np.float32)
+        field_elem = SimpleNamespace(data=mel)
+        feature_spec = SimpleNamespace(
+            data=UserDict({"input_audio_features": field_elem})
+        )
+
+        normalized = VLLMSTTRequestAdapter.from_vllm_request(
+            self._make_request(prompt_token_ids=[1, 2], mm_features=[feature_spec])
+        )
+
+        assert normalized.input_features is mel
+
     def test_rejects_empty_mm_features(self) -> None:
         request = self._make_request(req_id="broken-req", mm_features=[])
 

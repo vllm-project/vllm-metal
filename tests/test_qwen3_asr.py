@@ -26,6 +26,7 @@ from vllm_metal.stt.qwen3_asr.model import (
     AudioEncoder,
     Qwen3ASRModel,
     Qwen3Attention,
+    Qwen3InterleavedMRoPE,
     Qwen3LM,
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
@@ -62,6 +63,10 @@ class TestQwen3ASRConfigAdaptation:
                     vocab_size=151936,
                     rms_norm_eps=1e-6,
                     rope_theta=1000000.0,
+                    rope_scaling={
+                        "mrope_section": [24, 20, 20],
+                        "mrope_interleaved": True,
+                    },
                     tie_word_embeddings=True,
                 ),
                 audio_token_id=151676,
@@ -71,6 +76,10 @@ class TestQwen3ASRConfigAdaptation:
 
         assert config.audio_token_id == 151676
         assert config.eos_token_id == 151643
+        assert config.text_config.rope_scaling == {
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        }
 
 
 class TestCNNOutputLengths:
@@ -158,6 +167,21 @@ class TestAudioEncoderShapes:
 
 class TestQwen3Attention:
     """Tests for GQA with QK normalization."""
+
+    def test_mrope_outputs_shape(self) -> None:
+        """Interleaved MRoPE should produce decoder cos/sin tensors."""
+        rope = Qwen3InterleavedMRoPE(
+            head_dim=16,
+            rope_theta=1000000.0,
+            mrope_section=[3, 3, 2],
+        )
+        pos = mx.array([[[0, 1, 2], [0, 1, 2], [0, 1, 2]]], dtype=mx.int32)
+
+        cos, sin = rope(pos, dtype=mx.float32)
+        mx.eval(cos, sin)
+
+        assert cos.shape == (1, 3, 16)
+        assert sin.shape == (1, 3, 16)
 
     def test_head_counts(self) -> None:
         """GQA should have correct head counts."""

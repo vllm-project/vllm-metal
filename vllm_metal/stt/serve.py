@@ -43,6 +43,7 @@ class VLLMSTTRequestAdapter:
         For STT, we currently assume one audio feature per request and unwrap:
 
         - `mm_features[0].data["input_features"].data`
+        - `mm_features[0].data["input_audio_features"].data`
 
         Each `.data` layer may be `None` (e.g. cached/absent), so we treat any
         missing/None value as an invalid STT request and raise a request-scoped
@@ -52,9 +53,16 @@ class VLLMSTTRequestAdapter:
             raise ValueError(f"STT request {req_id!r} must include mm_features.")
 
         payload = mm_features[0].data
-        field_elem = payload.get("input_features") if payload else None
+        field_elem = None
+        if payload:
+            field_elem = payload.get("input_features")
+            if field_elem is None:
+                field_elem = payload.get("input_audio_features")
         input_features = field_elem.data if field_elem is not None else None
         if input_features is None:
-            raise ValueError(f"STT request {req_id!r} must include input_features.")
+            raise ValueError(
+                f"STT request {req_id!r} must include input_features "
+                "or input_audio_features."
+            )
 
         return input_features
