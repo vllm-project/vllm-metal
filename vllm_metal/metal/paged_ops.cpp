@@ -461,9 +461,14 @@ static void dispatch_paged_attention_v2_online(
     int v_bits = 3) {
   int head_size = static_cast<int>(query.shape(2));
 
-  // Route to tiled kernel when possible
-  if (can_use_tiled_kernel(head_size, use_turboquant,
-                           query.dtype(), key_cache.dtype())) {
+  // Tiled kernel for prefill batches (max_seqlen_q > 1), matching vLLM
+  // Triton's 2D/3D dispatch split.  Pure-decode batches (every sequence has
+  // exactly 1 query token) use the original per-token kernel.
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  bool has_prefill = total_q_tokens > num_seqs;
+  if (has_prefill && can_use_tiled_kernel(head_size, use_turboquant,
+                                          query.dtype(), key_cache.dtype())) {
     dispatch_paged_attention_tiled(
         out, query, key_cache, value_cache,
         num_kv_heads, scale, softcap,
@@ -475,9 +480,7 @@ static void dispatch_paged_attention_v2_online(
   // Fallback: original per-token kernel
   auto& d = metal::device(s.device);
 
-  int total_q_tokens = static_cast<int>(query.shape(0));
   int num_heads  = static_cast<int>(query.shape(1));
-  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   auto dt        = dtype_to_metal(query.dtype());
   auto k_cache_dt = dtype_to_metal(key_cache.dtype());
