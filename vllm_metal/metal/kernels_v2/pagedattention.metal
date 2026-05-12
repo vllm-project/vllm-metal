@@ -1604,13 +1604,15 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   const int kv_token_stride = num_kv_heads * kv_head_stride;
 
   // === Varlen: resolve sequence and Q-block position ===
+  // Uses block-space binary search (not token-space like find_seq_idx):
+  // the predicate cu_seqlens_q[mid]/BQ + mid accounts for the per-sequence
+  // over-allocation sentinel in the Q-block grid.
   int seq_idx;
   {
     int lo = 0, hi = num_seqs;
     while (lo < hi) {
       int mid = (lo + hi + 1) / 2;
-      int val = cu_seqlens_q[mid];
-      if (val / BQ + mid <= q_block_global_idx) lo = mid;
+      if (cu_seqlens_q[mid] / BQ + mid <= q_block_global_idx) lo = mid;
       else hi = mid - 1;
     }
     seq_idx = lo;
@@ -1628,12 +1630,6 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   const int context_len = seq_len - cur_batch_query_len;
   const int valid_q = min(BQ, cur_batch_query_len - q_pos_start);
 
-  // === Threadgroup memory layout ===
-  // Q_smem [BQ, HEAD_SIZE] in T — loaded once
-  // KV_smem [TILE_KV, HEAD_SIZE] in T — shared K/V buffer
-  // S_smem [BQ, TILE_KV] in float — scores, then P overwrites as T
-  // O_smem [BQ, HEAD_SIZE] in float — output accumulator
-  // M_smem [BQ], L_smem [BQ] in float — online softmax state
   constexpr int Q_ELEMS = BQ * HEAD_SIZE;
   constexpr int KV_ELEMS = TILE_KV * HEAD_SIZE;
   constexpr int S_ELEMS = BQ * TILE_KV;
@@ -1642,8 +1638,6 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   threadgroup T *Q_smem = reinterpret_cast<threadgroup T *>(shared_mem);
   threadgroup T *KV_smem = Q_smem + Q_ELEMS;
   threadgroup float *S_smem = reinterpret_cast<threadgroup float *>(KV_smem + KV_ELEMS);
-  // P overwrites S in-place as T (sizeof(T)*S_ELEMS <= sizeof(float)*S_ELEMS)
-  threadgroup T *P_smem = reinterpret_cast<threadgroup T *>(S_smem);
   threadgroup float *O_smem = S_smem + S_ELEMS;
   threadgroup float *M_smem = O_smem + O_ELEMS;
   threadgroup float *L_smem = M_smem + BQ;
@@ -1758,8 +1752,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
         L_smem[row] = L_smem[row] * old_corr + row_sum;
         M_smem[row] = new_m;
 
-        // Write P as T in-place over S_smem
-        P_smem[row * TILE_KV + lane] = T(e);
+        // Write P as float in S_smem (preserves softmax precision for PV MMA)
+        S_smem[row * TILE_KV + lane] = e;
 
         // Rescale this simdgroup's own O rows (no cross-sg dependency)
         for (int d = lane; d < HEAD_SIZE; d += NUM_SIMD_LANES)
@@ -1786,6 +1780,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     threadgroup_barrier(mem_flags::mem_threadgroup);  // B3: P, O rescaled, V visible
 
     // --- PV matmul: O += P × V via 8×8 MMA ---
+    // P is kept in float (S_smem) to preserve softmax precision.
+    // Uses float×half→float MMA (same mixed-precision path as llama.cpp).
 #pragma unroll
     for (int c = 0; c < PV_TILES_PER_SG; c++) {
       int hd_start = (sg_idx * PV_TILES_PER_SG + c) * 8;
@@ -1795,8 +1791,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
 #pragma unroll
       for (int t = 0; t < TILE_KV; t += 8) {
-        simdgroup_matrix<T, 8, 8> p_frag;
-        simdgroup_load(p_frag, P_smem + t, TILE_KV);
+        simdgroup_matrix<float, 8, 8> p_frag;
+        simdgroup_load(p_frag, S_smem + t, TILE_KV);
 
         simdgroup_matrix<T, 8, 8> v_frag;
         simdgroup_load(v_frag, KV_smem + t * HEAD_SIZE + hd_start, HEAD_SIZE);

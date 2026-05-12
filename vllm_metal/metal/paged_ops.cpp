@@ -318,6 +318,64 @@ void paged_attention_v1_impl(
 // paged_attention_v2_online — dispatch helper + eager wrappers
 // ---------------------------------------------------------------------------
 
+// Shared buffer binding for paged attention kernels (slots 2-21).
+static void bind_paged_attn_buffers(
+    metal::CommandEncoder& enc,
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int sliding_window) {
+  int num_heads = static_cast<int>(query.shape(1));
+  int head_size = static_cast<int>(query.shape(2));
+
+  enc.set_output_array(out, 2);
+  enc.set_input_array(query,        3);
+  enc.set_input_array(key_cache,    4);
+  enc.set_input_array(value_cache,  5);
+
+  int32_t nkv = static_cast<int32_t>(num_kv_heads);
+  enc.set_bytes(nkv,   8);
+  // Slot 9 (scale) is set by the caller — varies per dispatch path.
+  enc.set_bytes(softcap, 10);
+
+  enc.set_input_array(block_tables, 11);
+  enc.set_input_array(seq_lens,     12);
+
+  int32_t max_blocks_i = static_cast<int32_t>(block_tables.shape(1));
+  enc.set_bytes(max_blocks_i, 13);
+
+  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
+  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
+  enc.set_bytes(q_stride,        15);
+  enc.set_bytes(kv_block_stride, 16);
+  enc.set_bytes(kv_head_stride,  17);
+
+  enc.set_input_array(cu_seqlens_q, 19);
+  int32_t num_seqs_i = static_cast<int32_t>(cu_seqlens_q.shape(0) - 1);
+  enc.set_bytes(num_seqs_i, 20);
+  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
+  enc.set_bytes(sliding_window_i, 21);
+}
+
+static void add_paged_attn_temporaries(
+    metal::CommandEncoder& enc,
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    metal::Device& d, Stream s) {
+  add_temporary_compat(enc, out, d, s);
+  add_temporary_compat(enc, query, d, s);
+  add_temporary_compat(enc, key_cache, d, s);
+  add_temporary_compat(enc, value_cache, d, s);
+  add_temporary_compat(enc, block_tables, d, s);
+  add_temporary_compat(enc, seq_lens, d, s);
+  add_temporary_compat(enc, cu_seqlens_q, d, s);
+}
+
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
 // Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 128}.
 static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
@@ -339,9 +397,7 @@ static void dispatch_paged_attention_tiled(
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
-  int num_heads  = static_cast<int>(query.shape(1));
   int head_size  = static_cast<int>(query.shape(2));
-  int max_blocks = static_cast<int>(block_tables.shape(1));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   constexpr int BQ = 8;
@@ -367,52 +423,23 @@ static void dispatch_paged_attention_tiled(
       + BQ * head_size * 4             // O_smem (float)
       + 2 * BQ * 4);                   // M, L (float)
 
+  int num_heads = static_cast<int>(query.shape(1));
   auto& enc = get_command_encoder_compat(d, s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(out, 2);
-  enc.set_input_array(query,        3);
-  enc.set_input_array(key_cache,    4);
-  enc.set_input_array(value_cache,  5);
-
-  int32_t nkv = static_cast<int32_t>(num_kv_heads);
-  enc.set_bytes(nkv,   8);
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
   enc.set_bytes(scale, 9);
-  float softcapping = softcap;
-  enc.set_bytes(softcapping, 10);
-
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens,     12);
-
-  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
-  enc.set_bytes(max_blocks_i, 13);
-
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
-
-  enc.set_input_array(cu_seqlens_q, 19);
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  enc.set_bytes(num_seqs_i, 20);
-  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
-  enc.set_bytes(sliding_window_i, 21);
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_blocks, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   if (!from_primitive) {
-    add_temporary_compat(enc, out, d, s);
-    add_temporary_compat(enc, query, d, s);
-    add_temporary_compat(enc, key_cache, d, s);
-    add_temporary_compat(enc, value_cache, d, s);
-    add_temporary_compat(enc, block_tables, d, s);
-    add_temporary_compat(enc, seq_lens, d, s);
-    add_temporary_compat(enc, cu_seqlens_q, d, s);
+    add_paged_attn_temporaries(enc, out, query, key_cache, value_cache,
+                               block_tables, seq_lens, cu_seqlens_q, d, s);
   }
 }
 
@@ -450,10 +477,8 @@ static void dispatch_paged_attention_v2_online(
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int num_heads  = static_cast<int>(query.shape(1));
-  int max_blocks = static_cast<int>(block_tables.shape(1));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  // 3-part kernel name: paged_attention_<T>_cache_<K>_<V>_hs...
   auto dt        = dtype_to_metal(query.dtype());
   auto k_cache_dt = dtype_to_metal(key_cache.dtype());
   auto v_cache_dt = dtype_to_metal(value_cache.dtype());
@@ -471,6 +496,9 @@ static void dispatch_paged_attention_v2_online(
   int  k_bits_i          = k_bits;
   int  v_bits_i          = v_bits;
 
+  // The hash name is MLX's cache key.  It MUST encode every function-constant
+  // value that varies across calls — otherwise the first compilation wins and
+  // subsequent calls with different constants silently reuse the wrong kernel.
   std::string hash_name = kname + "_v2"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_kb" + std::to_string(k_bits_i)
@@ -494,6 +522,7 @@ static void dispatch_paged_attention_v2_online(
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
+  // TurboQuant V uses register-only FWHT (no threadgroup workspace needed).
   (void)use_turboquant;
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
@@ -501,37 +530,11 @@ static void dispatch_paged_attention_v2_online(
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(out, 2);
-  enc.set_input_array(query,        3);
-  enc.set_input_array(key_cache,    4);
-  enc.set_input_array(value_cache,  5);
-
-  int32_t nkv = static_cast<int32_t>(num_kv_heads);
-  enc.set_bytes(nkv,   8);
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
   enc.set_bytes(scale, 9);
-  float softcapping = softcap;
-  enc.set_bytes(softcapping, 10);
 
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens,     12);
-
-  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
-  enc.set_bytes(max_blocks_i, 13);
-
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
-
-  enc.set_input_array(cu_seqlens_q, 19);
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  enc.set_bytes(num_seqs_i, 20);
-  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
-  enc.set_bytes(sliding_window_i, 21);
-
-  // TurboQuant buffers (slots 22-27, only bound when use_turboquant)
   if (use_turboquant) {
     enc.set_input_array(*key_scale_cache,   22);
     enc.set_input_array(*value_scale_cache, 23);
@@ -548,13 +551,8 @@ static void dispatch_paged_attention_v2_online(
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   if (!from_primitive) {
-    add_temporary_compat(enc, out, d, s);
-    add_temporary_compat(enc, query, d, s);
-    add_temporary_compat(enc, key_cache, d, s);
-    add_temporary_compat(enc, value_cache, d, s);
-    add_temporary_compat(enc, block_tables, d, s);
-    add_temporary_compat(enc, seq_lens, d, s);
-    add_temporary_compat(enc, cu_seqlens_q, d, s);
+    add_paged_attn_temporaries(enc, out, query, key_cache, value_cache,
+                               block_tables, seq_lens, cu_seqlens_q, d, s);
     if (use_turboquant) {
       add_temporary_compat(enc, *key_scale_cache, d, s);
       add_temporary_compat(enc, *value_scale_cache, d, s);
