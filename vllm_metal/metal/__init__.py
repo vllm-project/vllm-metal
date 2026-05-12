@@ -414,6 +414,139 @@ def metal_mla_paged_attention_partitioned(
     mx.synchronize()
 
 
+# Decode-2pass kernel partition sizes (mirrored in mla.metal as
+# instantiate_mla_2pass + the matching reduce specializations).
+# 256 is kept as a bench knob between 128 and 512; auto-pick still
+# returns {64, 128}.
+_MLA_DECODE_2PASS_SIZES = (64, 128, 256, 512)
+
+
+def _pick_mla_decode_2pass_partition(max_ctx: int) -> int:
+    """Pick PARTITION_SIZE for the 2pass decode kernel.
+
+    Smaller partition → more TGs → better GPU fill on small ctx. Larger
+    partition → less reduce overhead at long ctx. Mirrors MLX's choice in
+    `mlx/backend/metal/scaled_dot_product_attention.cpp::sdpa_vector_2pass`
+    (devc=='s' branch): 64 by default, 128 once ctx > 1024."""
+    if max_ctx <= 1024:
+        return 64
+    return 128
+
+
+def metal_mla_paged_attention_decode_2pass(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    out,  # [total_q_tokens, num_heads, kv_lora_rank]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32  (only used for decode-only validation)
+    scale: float,
+    partition_size: int | None = None,
+) -> None:
+    """MLX sdpa_vector_2pass-style cross-head amortization for absorbed MLA
+    decode (RFC #360, follow-up to the G-batched single-pass kernel).
+
+    Each TG handles one (seq, ctx-partition) pair with 32*num_heads threads
+    arranged as 32-lane × num_heads-head simdgroups. All heads in the TG
+    read the same K cache tokens — the L1/L2 cache serves the H-1 repeats
+    so total KV bandwidth is amortized H× across the whole launch.
+
+    Same shape contract and decode-only constraints as
+    `metal_mla_paged_attention`. Internally allocates `exp_sums` /
+    `max_logits` / `tmp_out` scratch and dispatches the main kernel
+    followed by the existing reduce kernel.
+
+    `partition_size` defaults to a heuristic based on max ctx_len; pass an
+    explicit value to override.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+
+    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
+
+    cu_q = np.asarray(cu_seqlens_q)
+    deltas = np.diff(cu_q)
+    if np.any(deltas != 1):
+        bad = int(np.argmax(deltas != 1))
+        raise NotImplementedError(
+            "MLA decode-2pass kernel supports decode only — one query token "
+            f"per sequence. Got request {bad} with {int(deltas[bad])} query "
+            "tokens."
+        )
+
+    ctx = np.asarray(context_lens)
+    max_blocks_per_seq = int(block_tables.shape[1])
+    required_blocks = (ctx + block_size - 1) // block_size
+    if np.any(required_blocks > max_blocks_per_seq):
+        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
+        raise ValueError(
+            f"MLA decode-2pass: block_tables row width ({max_blocks_per_seq}) "
+            f"too small for request {bad}: ctx_len={int(ctx[bad])} requires "
+            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
+        )
+
+    total_q_tokens = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    kv_lora_rank = int(q_nope.shape[2])
+    max_ctx = int(ctx.max())
+
+    if partition_size is None:
+        partition_size = _pick_mla_decode_2pass_partition(max_ctx)
+    if partition_size not in _MLA_DECODE_2PASS_SIZES:
+        raise ValueError(
+            f"MLA decode-2pass: partition_size must be in "
+            f"{_MLA_DECODE_2PASS_SIZES}; got {partition_size}"
+        )
+    if partition_size % block_size != 0:
+        raise ValueError(
+            f"MLA decode-2pass: partition_size ({partition_size}) must be "
+            f"divisible by block_size ({block_size})."
+        )
+
+    max_num_partitions = max(1, (max_ctx + partition_size - 1) // partition_size)
+
+    exp_sums = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    max_logits = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions), dtype=mx.float32
+    )
+    tmp_out = mx.zeros(
+        (total_q_tokens, num_heads, max_num_partitions, kv_lora_rank),
+        dtype=q_nope.dtype,
+    )
+    mx.eval(exp_sums, max_logits, tmp_out)
+
+    ops = get_ops()
+    _ensure_mla_library(ops)
+    ops.mla_paged_attention_decode_2pass(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        block_size,
+        scale,
+        partition_size,
+        max_num_partitions,
+    )
+    mx.synchronize()
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 

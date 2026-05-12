@@ -479,6 +479,240 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
+// ========================================== Decode 2pass main kernel
+//
+// MLX-style cross-head amortization for absorbed-MLA decode (mirrors
+// mlx/backend/metal/kernels/sdpa_vector.h sdpa_vector_2pass_1, ml-explore/
+// mlx@v0.31.2):
+//
+//   - Threadgroup layout: (32, HEADS_PER_TG, 1) — 32 lanes × HEADS_PER_TG
+//     heads per TG. One simdgroup per query head. ALL heads in the TG read
+//     the same K-cache token addresses (coalesced / L1-served), so KV
+//     bandwidth is amortized HEADS_PER_TG× per TG.
+//   - HEADS_PER_TG ≤ 32 because Apple Metal caps total threads per TG at
+//     1024. For num_heads > HEADS_PER_TG the host dispatches multiple
+//     head-groups along grid.z; the L2 cache then amortizes across them
+//     (different head-groups for the same (seq, partition) read identical
+//     K addresses on subsequent waves).
+//   - Grid: (num_seqs, num_partitions, ceil(num_heads / HEADS_PER_TG)).
+//   - Per-thread state: q_nope_local (16 T), q_pe_local (2 T), v_local
+//     (16 fp32). Q/K kept as T (fp16/bf16) since Apple GPU's mixed
+//     T×T→fp32 FMA is native — promoting Q at load time only inflates
+//     register footprint with no throughput benefit. num_heads scales by
+//     adding more simdgroups, NOT by adding per-thread state.
+//   - No cross-simdgroup merge for V: each simdgroup is one head and owns
+//     its full output independently.
+//
+// num_heads_total is passed via constant buffer; head_idx for this thread
+// is `head_group_idx * HEADS_PER_TG + thread_position_in_threadgroup.y`.
+// Threads with head_idx >= num_heads_total bail (last head-group may be
+// partial when num_heads is not a multiple of HEADS_PER_TG).
+//
+// Buffer layout (matches paged_mla_attention partitioned mode):
+//   0: exp_sums    [num_seqs, num_heads, num_partitions]  fp32
+//   1: max_logits  [num_seqs, num_heads, num_partitions]  fp32
+//   2: tmp_out     [num_seqs, num_heads, num_partitions, KV_LORA_RANK] T
+//                  (NORMALIZED partial — divided by partition_sum;
+//                  reduce kernel re-weights by exp_sums.)
+//   3: q_nope      [total_q_tokens, num_heads, KV_LORA_RANK] T
+//   4: q_pe        [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM] T
+//   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM] T
+//   6: block_tables [num_seqs, max_num_blocks_per_seq] uint32
+//   7: context_lens [num_seqs] uint32
+//   8: max_num_blocks_per_seq (constant int)
+//   9: num_heads_total          (constant int)
+//  10: scale (constant float)
+//
+// Reuses the existing paged_mla_attention_reduce kernel (same partial
+// contract).
+
+template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
+          int PARTITION_SIZE, int HEADS_PER_TG>
+[[kernel]] void paged_mla_attention_decode_2pass_1(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]],
+    device const T *q_nope [[buffer(3)]],
+    device const T *q_pe [[buffer(4)]],
+    device const T *latent_cache [[buffer(5)]],
+    device const uint32_t *block_tables [[buffer(6)]],
+    device const uint32_t *context_lens [[buffer(7)]],
+    const constant int &max_num_blocks_per_seq [[buffer(8)]],
+    const constant int &num_heads_total [[buffer(9)]],
+    const constant float &scale [[buffer(10)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int LATENT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int BD = 32;
+  constexpr int QK_PER_THREAD = KV_LORA_RANK / BD;
+  constexpr int QPE_PER_THREAD = QK_ROPE_HEAD_DIM / BD;
+  constexpr int V_PER_THREAD = KV_LORA_RANK / BD;
+  static_assert(KV_LORA_RANK % BD == 0,
+                "KV_LORA_RANK must be divisible by 32");
+  static_assert(QK_ROPE_HEAD_DIM % BD == 0,
+                "QK_ROPE_HEAD_DIM must be divisible by 32");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "PARTITION_SIZE must be divisible by BLOCK_SIZE");
+  static_assert(HEADS_PER_TG >= 1 && HEADS_PER_TG <= 32,
+                "HEADS_PER_TG must be in [1, 32]. M5 Max g17s caps every "
+                "kernel at 1024 threads/TG (verified by querying "
+                "PSO::maxTotalThreadsPerThreadgroup on a trivial kernel and "
+                "on MLX's own sdpa_vector_2pass_1 — both report 1024). "
+                "BD * HEADS_PER_TG = 32 * 32 = 1024 is the ceiling.");
+
+  const int seq_idx = (int)threadgroup_position_in_grid.x;
+  const int partition_idx = (int)threadgroup_position_in_grid.y;
+  const int head_group_idx = (int)threadgroup_position_in_grid.z;
+  const int num_partitions = (int)threadgroups_per_grid.y;
+  const int head_idx_in_tg = (int)thread_position_in_threadgroup.y;
+  const int head_idx = head_group_idx * HEADS_PER_TG + head_idx_in_tg;
+  const int num_heads = num_heads_total;
+  const int lane = (int)simd_lid;
+
+  // Last head-group may be partial when num_heads is not a multiple of
+  // HEADS_PER_TG — out-of-range threads bail out.
+  if (head_idx >= num_heads) {
+    return;
+  }
+
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int token_start = partition_idx * PARTITION_SIZE;
+  const int token_end = min(token_start + PARTITION_SIZE, ctx_len);
+
+  // Empty partition: emit -INF / 0 sentinels so the reduce sees a no-op
+  // contribution. (Caller is responsible for zero-init of tmp_out.)
+  if (token_start >= ctx_len) {
+    if (lane == 0) {
+      max_logits[(seq_idx * num_heads + head_idx) * num_partitions +
+                 partition_idx] = -INFINITY;
+      exp_sums[(seq_idx * num_heads + head_idx) * num_partitions +
+               partition_idx] = 0.0f;
+    }
+    return;
+  }
+
+  // Load Q for this (seq, head); pre-scale by `scale` so we save one mul
+  // per token in the inner loop. Q is held in T (fp16/bf16) registers, not
+  // fp32 — Apple GPU's mixed-precision FMA (T × T → fp32) is native, so
+  // promoting Q at load time only inflates register footprint without any
+  // throughput benefit. Halving Q register state is a meaningful lever for
+  // raising Apple's per-kernel maxTotalThreadsPerThreadgroup cap.
+  const device T *q_nope_ptr =
+      q_nope + (seq_idx * num_heads + head_idx) * KV_LORA_RANK +
+      lane * QK_PER_THREAD;
+  const device T *q_pe_ptr =
+      q_pe + (seq_idx * num_heads + head_idx) * QK_ROPE_HEAD_DIM +
+      lane * QPE_PER_THREAD;
+
+  T q_nope_local[QK_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < QK_PER_THREAD; i++) {
+    q_nope_local[i] = T(scale * float(q_nope_ptr[i]));
+  }
+  T q_pe_local[QPE_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < QPE_PER_THREAD; i++) {
+    q_pe_local[i] = T(scale * float(q_pe_ptr[i]));
+  }
+
+  // Combined acc registers. `o` doubles as the V accumulator and is
+  // initialized to 0 — keeping it as a single named array (instead of
+  // splitting v_norm vs v_pe state) keeps the compiler's register-residence
+  // analysis simpler; smaller live state has been shown to lift Apple
+  // GPU's per-kernel maxTotalThreadsPerThreadgroup cap.
+  float v_local[V_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < V_PER_THREAD; i++) {
+    v_local[i] = 0.0f;
+  }
+
+  float max_score = -INFINITY;
+  float sum_exp_score = 0.0f;
+
+  const device uint32_t *block_table_row =
+      block_tables + (uint64_t)seq_idx * max_num_blocks_per_seq;
+
+  // Token loop within partition, block-major: hoist block_table_row lookup
+  // and physical-block base pointer arithmetic out of the inner per-token
+  // body. Eliminates BLOCK_SIZE-1 redundant block_table_row reads and
+  // div/mod operations per outer iteration. K loads still go through L1
+  // (all heads read the same address — shared for free).
+  const int kb_first = token_start / BLOCK_SIZE;
+  const int kb_last_excl = (token_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  for (int kb = kb_first; kb < kb_last_excl; kb++) {
+    const uint32_t physical_block = block_table_row[kb];
+    const device T *block_base =
+        latent_cache + (uint64_t)physical_block * BLOCK_SIZE * LATENT_DIM;
+    const int t_block_start = max(token_start, kb * BLOCK_SIZE);
+    const int t_block_end = min(token_end, (kb + 1) * BLOCK_SIZE);
+    for (int t = t_block_start; t < t_block_end; t++) {
+      const int block_offset = t - kb * BLOCK_SIZE;
+      const device T *token_ptr = block_base + block_offset * LATENT_DIM;
+
+      // K read in T (fp16/bf16). Mixed-precision FMA below keeps fp32
+      // accumulation precision without ever materializing K as fp32.
+      T k_norm_local[QK_PER_THREAD];
+#pragma unroll
+      for (int j = 0; j < QK_PER_THREAD; j++) {
+        k_norm_local[j] = token_ptr[lane * QK_PER_THREAD + j];
+      }
+
+      // Score = q · k (Q is pre-scaled). Per-lane partial then simd_sum.
+      // Mixed precision: T*T promoted to fp32 for the FMA, free on Apple GPU.
+      // PE contribution uses short-lived k_pe loads (no persistent
+      // k_pe_local across inner body) so the compiler can pack the loads
+      // alongside k_norm and reuse registers.
+      float partial = 0.0f;
+#pragma unroll
+      for (int j = 0; j < QK_PER_THREAD; j++) {
+        partial += float(q_nope_local[j]) * float(k_norm_local[j]);
+      }
+#pragma unroll
+      for (int j = 0; j < QPE_PER_THREAD; j++) {
+        partial += float(q_pe_local[j]) *
+                   float(token_ptr[KV_LORA_RANK + lane * QPE_PER_THREAD + j]);
+      }
+      const float score = simd_sum(partial);
+
+      // Online softmax + V accumulation. fast::exp matches MLX's choice —
+      // ~ULP off scalar exp, but much cheaper.
+      const float new_max = max(max_score, score);
+      const float factor =
+          (max_score == -INFINITY) ? 0.0f : fast::exp(max_score - new_max);
+      const float exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+
+      // V == kv_norm in absorbed MLA, so reuse k_norm_local — saves a load.
+#pragma unroll
+      for (int j = 0; j < V_PER_THREAD; j++) {
+        v_local[j] = v_local[j] * factor + exp_score * float(k_norm_local[j]);
+      }
+    }
+  }
+
+  // Write per-partition (max, sum) and the NORMALIZED partial output. The
+  // reduce kernel re-weights by exp_sums so partition_sum cancels out.
+  if (lane == 0) {
+    max_logits[(seq_idx * num_heads + head_idx) * num_partitions +
+               partition_idx] = max_score;
+    exp_sums[(seq_idx * num_heads + head_idx) * num_partitions +
+             partition_idx] = sum_exp_score;
+  }
+
+  const float inv_sum = (sum_exp_score > 0.0f) ? (1.0f / sum_exp_score) : 0.0f;
+  device T *out_ptr =
+      tmp_out + ((seq_idx * num_heads + head_idx) * num_partitions +
+                 partition_idx) * KV_LORA_RANK +
+      lane * V_PER_THREAD;
+#pragma unroll
+  for (int i = 0; i < V_PER_THREAD; i++) {
+    out_ptr[i] = T(v_local[i] * inv_sum);
+  }
+}
+
 // ========================================== Instantiations
 //
 // Single-pass main kernel: dtype × block_size × heads_per_tg × partition_size.
@@ -565,3 +799,79 @@ instantiate_mla(bfloat16_t, 512, 64, 32, 4, 256, 512);
 
 instantiate_mla_reduce(half, 512, 512);
 instantiate_mla_reduce(bfloat16_t, 512, 512);
+
+// Decode 2pass kernel — MLX sdpa_vector_2pass-style cross-head amortization.
+#define instantiate_mla_2pass(type, kv_lora_rank, qk_rope_head_dim,            \
+                              block_size, partition_size, heads_per_tg)        \
+  template [[host_name("paged_mla_attention_decode_2pass_1_" #type "_kvr"      \
+                       #kv_lora_rank "_pe" #qk_rope_head_dim "_bs"             \
+                       #block_size "_ps" #partition_size "_hpt"                \
+                       #heads_per_tg)]] [[kernel]] void                        \
+  paged_mla_attention_decode_2pass_1<type, kv_lora_rank, qk_rope_head_dim,     \
+                                     block_size, partition_size,               \
+                                     heads_per_tg>(                            \
+      device float * exp_sums [[buffer(0)]],                                   \
+      device float *max_logits [[buffer(1)]],                                  \
+      device type *tmp_out [[buffer(2)]],                                      \
+      device const type *q_nope [[buffer(3)]],                                 \
+      device const type *q_pe [[buffer(4)]],                                   \
+      device const type *latent_cache [[buffer(5)]],                           \
+      device const uint32_t *block_tables [[buffer(6)]],                       \
+      device const uint32_t *context_lens [[buffer(7)]],                       \
+      const constant int &max_num_blocks_per_seq [[buffer(8)]],                \
+      const constant int &num_heads_total [[buffer(9)]],                       \
+      const constant float &scale [[buffer(10)]],                              \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+// HEADS_PER_TG=32 is the maximum (Apple's 1024 threads/TG cap = 32 lanes ×
+// 32 simdgroups). 8 covers small models (e.g. MiniCPM3 H=40 → uses 8 + a
+// partial last group, net 5 TGs/seq/partition; close to the H=8 ceiling
+// most decode workloads sit at). PARTITION_SIZE specializations let the
+// dispatcher pick a finer split for small ctx and a coarser split for
+// long ctx.
+instantiate_mla_2pass(half, 512, 64, 16, 64, 32);
+instantiate_mla_2pass(half, 512, 64, 16, 128, 32);
+instantiate_mla_2pass(half, 512, 64, 16, 256, 32);
+instantiate_mla_2pass(half, 512, 64, 16, 512, 32);
+instantiate_mla_2pass(half, 512, 64, 32, 64, 32);
+instantiate_mla_2pass(half, 512, 64, 32, 128, 32);
+instantiate_mla_2pass(half, 512, 64, 32, 256, 32);
+instantiate_mla_2pass(half, 512, 64, 32, 512, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 64, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 128, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 256, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 512, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 64, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 128, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 256, 32);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 512, 32);
+
+instantiate_mla_2pass(half, 512, 64, 16, 64, 8);
+instantiate_mla_2pass(half, 512, 64, 16, 128, 8);
+instantiate_mla_2pass(half, 512, 64, 16, 256, 8);
+instantiate_mla_2pass(half, 512, 64, 16, 512, 8);
+instantiate_mla_2pass(half, 512, 64, 32, 64, 8);
+instantiate_mla_2pass(half, 512, 64, 32, 128, 8);
+instantiate_mla_2pass(half, 512, 64, 32, 256, 8);
+instantiate_mla_2pass(half, 512, 64, 32, 512, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 64, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 128, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 256, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 16, 512, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 64, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 128, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 256, 8);
+instantiate_mla_2pass(bfloat16_t, 512, 64, 32, 512, 8);
+
+// Reduce kernel instantiations to cover the 2pass partition sizes.
+// ps=512 is already instantiated above for the G-batched single-pass
+// kernel's partitioned path; reuse here.
+instantiate_mla_reduce(half, 512, 64);
+instantiate_mla_reduce(half, 512, 128);
+instantiate_mla_reduce(half, 512, 256);
+instantiate_mla_reduce(bfloat16_t, 512, 64);
+instantiate_mla_reduce(bfloat16_t, 512, 128);
+instantiate_mla_reduce(bfloat16_t, 512, 256);

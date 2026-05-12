@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct unit tests for the MLA Metal kernel (RFC #360).
 
-Single-pass + split-K decode kernels. The single-pass kernel handles
-``ctx_len`` of any size that fits the caller-provided block_tables row;
-the partitioned (split-K) variant chunks ctx across multiple TGs and
-merges partials with the reduce kernel.
+Single-pass + split-K + 2pass decode kernels. The single-pass kernel
+handles ``ctx_len`` of any size that fits the caller-provided
+block_tables row; the partitioned (split-K) variant chunks ctx across
+multiple TGs and merges partials with the reduce kernel; the 2pass
+variant uses an MLX sdpa_vector_2pass-style cross-head amortized layout.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import pytest
 from vllm_metal.metal import (
     MLA_PARTITION_SIZE,
     metal_mla_paged_attention,
+    metal_mla_paged_attention_decode_2pass,
     metal_mla_paged_attention_partitioned,
 )
 
@@ -1043,6 +1045,201 @@ def test_g_invalid_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Decode 2pass kernel — MLX sdpa_vector_2pass-style cross-head amortization.
+# ---------------------------------------------------------------------------
+# One TG per (seq, partition) with 32*num_heads threads. All H heads share
+# K cache reads — total KV bandwidth amortized H× across the launch.
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("num_heads", [8, 32, 96, 128])
+def test_decode_2pass_matches_dense(
+    dtype: mx.Dtype, block_size: int, num_heads: int
+) -> None:
+    """2pass kernel must match the dense reference for all production head
+    counts within fp16 / bf16 tolerance."""
+    ctx_len = 768
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=2,
+        num_heads=num_heads,
+        ctx_len=ctx_len,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    metal_mla_paged_attention_decode_2pass(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=[ctx_len, ctx_len],
+        scale=0.125,
+    )
+
+    rtol, atol = _tolerance(dtype)
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), (
+        f"2pass mismatch (dtype={dtype}, bs={block_size}, H={num_heads}): "
+        f"max_abs_diff={max_abs:.5f}"
+    )
+
+
+@pytest.mark.parametrize("partition_size", [64, 128, 256, 512])
+def test_decode_2pass_partition_sizes_match(partition_size: int) -> None:
+    """Each instantiated PARTITION_SIZE must produce the correct output
+    on the same workload — different ctx-split, same math."""
+    ctx_len = 1536
+    (
+        out,
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=2,
+        num_heads=32,
+        ctx_len=ctx_len,
+        block_size=16,
+        dtype=mx.float16,
+    )
+
+    metal_mla_paged_attention_decode_2pass(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+        partition_size=partition_size,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=[ctx_len, ctx_len],
+        scale=0.125,
+    )
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert max_abs < 5e-3, (
+        f"2pass partition_size={partition_size} mismatch: max_abs_diff={max_abs:.5f}"
+    )
+
+
+def test_decode_2pass_mixed_ctx_lens() -> None:
+    """Mixed ctx_lens — short / medium / long sequences. Empty-tail
+    partitions must contribute nothing to the reduce."""
+    ctx_lens = [128, 1024, 2500, 64]
+    num_seqs = len(ctx_lens)
+    num_heads = 32
+    block_size = 16
+    max_ctx = max(ctx_lens)
+    n_blocks_per_seq = (max_ctx + block_size - 1) // block_size
+    num_blocks = n_blocks_per_seq * num_seqs
+
+    mx.random.seed(0)
+    q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(
+        mx.float16
+    )
+    q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
+        mx.float16
+    )
+    latent_cache = mx.random.normal(shape=(num_blocks, block_size, _LATENT_DIM)).astype(
+        mx.float16
+    )
+
+    block_tables_np = np.arange(num_blocks, dtype=np.int32).reshape(
+        num_seqs, n_blocks_per_seq
+    )
+    block_tables = mx.array(block_tables_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
+
+    metal_mla_paged_attention_decode_2pass(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        out=out,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=ctx_lens,
+        scale=0.125,
+    )
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    rtol, atol = _tolerance(mx.float16)
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), (
+        f"2pass mixed-ctx mismatch: max_abs_diff={max_abs:.5f}, ctx_lens={ctx_lens}"
+    )
+
+
+def test_decode_2pass_rejects_multi_token_query() -> None:
+    """Same decode-only contract as the other entries."""
+    out = mx.zeros((2, 8, _KV_LORA_RANK), dtype=mx.float16)
+    q_nope = mx.zeros((2, 8, _KV_LORA_RANK), dtype=mx.float16)
+    q_pe = mx.zeros((2, 8, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
+    latent_cache = mx.zeros((1, 16, _LATENT_DIM), dtype=mx.float16)
+    block_tables = mx.zeros((1, 1), dtype=mx.int32)
+    context_lens = mx.array([1], dtype=mx.uint32)
+    cu_seqlens_q = mx.array([0, 2], dtype=mx.int32)
+
+    with pytest.raises(NotImplementedError, match="decode only"):
+        metal_mla_paged_attention_decode_2pass(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            scale=0.125,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Mixed-dtype rejection: every MLA dispatcher picks one Metal specialization
 # from q_nope.dtype() but the kernel template binds the same `T` to all
 # fp16/bf16 buffers (q_nope, q_pe, latent_cache, out, tmp_out). If they
@@ -1093,6 +1290,23 @@ def test_mla_rejects_mixed_dtypes_partitioned() -> None:
     )
     with pytest.raises(RuntimeError, match="must share the same dtype"):
         metal_mla_paged_attention_partitioned(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            latent_cache=latent_cache,
+            out=out,
+            block_tables=btab,
+            context_lens=ctx_lens,
+            cu_seqlens_q=cu_q,
+            scale=0.125,
+        )
+
+
+def test_mla_rejects_mixed_dtypes_decode_2pass() -> None:
+    out, q_nope, q_pe, latent_cache, btab, ctx_lens, cu_q = _mixed_dtype_inputs(
+        dtype_q=mx.float16, dtype_kv=mx.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="must share the same dtype"):
+        metal_mla_paged_attention_decode_2pass(
             q_nope=q_nope,
             q_pe=q_pe,
             latent_cache=latent_cache,
