@@ -1548,17 +1548,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
-// ========================================== Tiled Paged Attention
-// Flash-Attention-style unified kernel for both prefill and decode.
-// Each threadgroup processes BQ query tokens against TILE_KV KV tokens
-// per tile using simdgroup 8×8 matrix multiply-accumulate.
-//
-// Grid: (num_query_heads, total_q_blocks, 1)
-// Threadgroup: (NUM_THREADS, 1, 1)
-//
-// Q-block indexing follows the same over-allocation scheme as vLLM's
-// Triton unified attention: total_q_blocks = total_q_tokens / BQ + num_seqs.
+// Tiled paged attention kernel (paged_attention_tiled) is in
+// pagedattention_tiled.metal.
 
+#if 0  // moved to pagedattention_tiled.metal
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 8, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -1862,6 +1855,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
 instantiate_paged_attention_tiled_all(half);
 instantiate_paged_attention_tiled_all(bfloat16_t);
+#endif  // moved to pagedattention_tiled.metal
 
 #define instantiate_paged_attention_inner(type, k_cache_type, v_cache_type,    \
                                           head_size, block_size, num_threads,  \
