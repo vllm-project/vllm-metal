@@ -559,3 +559,180 @@ class TestMLAPagedAttentionWrapperPagedPath:
         mx.eval(out, expected)
 
         assert bool(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
+
+
+# Single-pass kernel dimensions (matches mla.metal instantiation).
+_KERNEL_KV_RANK = 512
+_KERNEL_ROPE_DIM = 64
+_KERNEL_NOPE_DIM = 128
+_KERNEL_V_DIM = 128
+
+
+class _KernelDimsAbsorbedInner(nn.Module):
+    """Absorbed-MLA inner stub shaped to match the single-pass kernel
+    instantiation (kv_lora_rank=512, qk_rope_head_dim=64). Used by the
+    routing admission tests so ``_can_use_kernel`` actually exercises
+    the accept path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_lora_rank = None
+        self.num_heads = 8  # multiple of 2 so _pick_heads_per_tg returns 2
+        self.q_head_dim = _KERNEL_NOPE_DIM + _KERNEL_ROPE_DIM
+        self.qk_nope_head_dim = _KERNEL_NOPE_DIM
+        self.qk_rope_head_dim = _KERNEL_ROPE_DIM
+        self.kv_lora_rank = _KERNEL_KV_RANK
+        self.scale = 1.0 / math.sqrt(_KERNEL_KV_RANK)
+        # embed_q / unembed_out presence is what flags the inner as absorbed.
+        self.embed_q = nn.Linear(_KERNEL_NOPE_DIM, _KERNEL_KV_RANK, bias=False)
+        self.unembed_out = nn.Linear(_KERNEL_KV_RANK, _KERNEL_V_DIM, bias=False)
+
+
+def _make_kernel_dims_wrapper(
+    *, block_size: int = 16, dtype: mx.Dtype = mx.float16
+) -> MLAPagedAttentionWrapper:
+    cache = MLAPagedLatentCache(
+        num_layers=1,
+        latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+        num_blocks=4,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    return MLAPagedAttentionWrapper(
+        inner=_KernelDimsAbsorbedInner(), layer_idx=0, latent_cache=cache
+    )
+
+
+def _make_decode_ctx(num_seqs: int = 1) -> SimpleNamespace:
+    """Single-token-per-seq decode context, just enough for
+    ``_can_use_kernel`` to inspect."""
+    return SimpleNamespace(
+        context_lens=[16] * num_seqs,
+        cu_seqlens=list(range(num_seqs + 1)),
+        block_tables=[[0]] * num_seqs,
+    )
+
+
+class TestSinglePassRouting:
+    """Focused tests for the env-gated single-pass kernel fast path.
+    Each test exercises one admission rule of ``_can_use_kernel`` —
+    no exhaustive cell sweeps. Per the alignment with reviewers on
+    ``Ship one kernel, prove it wins'', the kernel routing is a
+    single boolean gate, not a multi-variant priority chain."""
+
+    def test_env_off_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", False)
+        wrapper = _make_kernel_dims_wrapper()
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_env_on_accepts(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper()
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is True
+        )
+
+    def test_non_absorbed_rejects(self, monkeypatch) -> None:
+        """Inner without embed_q / unembed_out (kv_b_proj-style models
+        like MiniCPM3) is not routed through the absorbed-MLA kernel."""
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(
+            inner=_MiniCPM3StyleInner(), layer_idx=0, latent_cache=cache
+        )
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_wrong_kv_lora_rank_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper()
+        wrapper._inner.kv_lora_rank = 256  # not 512
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_wrong_qk_rope_head_dim_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper()
+        wrapper._inner.qk_rope_head_dim = 32  # not 64
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_unsupported_block_size_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper(block_size=64)  # not in {16, 32}
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_unsupported_dtype_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper(dtype=mx.float32)
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is False
+        )
+
+    def test_multi_token_query_rejects(self, monkeypatch) -> None:
+        """Decode-only kernel — any request with >1 query token must
+        fall back to MLX (varlen prefill is a follow-up)."""
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper()
+        prefill_ctx = SimpleNamespace(
+            context_lens=[16],
+            cu_seqlens=[0, 4],  # 4 query tokens for seq 0
+            block_tables=[[0]],
+        )
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, prefill_ctx
+            )
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "num_heads,batch_size,expected_g",
+        [
+            (1, 1, 1),  # odd num_heads → fall back to G=1
+            (16, 1, 1),  # B=1 small H → G=1 (better single-TG utilization)
+            (16, 8, 2),  # B*H ≳ 30 → G=2 wins
+            (32, 1, 2),  # B=1 but H≥32 → G=2 saturates GPU
+        ],
+    )
+    def test_pick_heads_per_tg(
+        self, num_heads: int, batch_size: int, expected_g: int
+    ) -> None:
+        assert (
+            MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
+            == expected_g
+        )
