@@ -468,6 +468,72 @@ class _UnknownLanguageModel:
         return "no-embeds"
 
 
+class _DeepstackLanguageModel:
+    """Mirrors mlx_vlm 0.5.x Qwen3-VL ``LanguageModel.__call__``.
+
+    Declares ``visual_pos_masks`` and ``deepstack_visual_embeds`` as named
+    parameters so the deepstack detector flips to True.  Records the kwargs
+    each call receives.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        inputs_embeds: mx.array | None = None,
+        cache: list[Any] | None = None,
+        position_ids: mx.array | None = None,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> str:
+        self.calls.append(
+            {
+                "inputs": inputs,
+                "inputs_embeds": inputs_embeds,
+                "cache": cache,
+                "position_ids": position_ids,
+                "visual_pos_masks": visual_pos_masks,
+                "deepstack_visual_embeds": deepstack_visual_embeds,
+            }
+        )
+        return "deepstack-output"
+
+
+class _KwargsOnlyLanguageModel:
+    """LM with ``inputs_embeds`` plus ``**kwargs`` — qwen3_5 0.4.x shape.
+
+    Catches deepstack-named kwargs into the catch-all rather than via
+    explicit parameters, so ``_detect_deepstack_kwargs`` should return
+    False and the adapter must omit deepstack kwargs entirely.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        inputs_embeds: mx.array | None = None,
+        cache: list[Any] | None = None,
+        position_ids: mx.array | None = None,
+        **kwargs: Any,
+    ) -> str:
+        self.calls.append(
+            {
+                "inputs": inputs,
+                "inputs_embeds": inputs_embeds,
+                "cache": cache,
+                "position_ids": position_ids,
+                "extra": dict(kwargs),
+            }
+        )
+        return "kwargs-only-output"
+
+
 class TestQwen3VLMultimodalAdapterDetectEmbedsKwarg:
     def test_detects_inputs_embeds(self) -> None:
         kwarg = Qwen3VLMultimodalAdapter._detect_embeds_kwarg(_RecordingLanguageModel())
@@ -480,6 +546,47 @@ class TestQwen3VLMultimodalAdapterDetectEmbedsKwarg:
     def test_raises_on_drift(self) -> None:
         with pytest.raises(RuntimeError, match="mlx_vlm version drift"):
             Qwen3VLMultimodalAdapter._detect_embeds_kwarg(_UnknownLanguageModel())
+
+
+class TestQwen3VLMultimodalAdapterDetectDeepstackKwargs:
+    def test_detects_explicit_deepstack_params(self) -> None:
+        assert (
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(
+                _DeepstackLanguageModel()
+            )
+            is True
+        )
+
+    def test_rejects_kwargs_catch_all(self) -> None:
+        assert (
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(
+                _KwargsOnlyLanguageModel()
+            )
+            is False
+        )
+
+    def test_rejects_lm_missing_both_params(self) -> None:
+        assert (
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(
+                _RecordingLanguageModel()
+            )
+            is False
+        )
+
+    def test_rejects_when_only_one_param_present(self) -> None:
+        class _PartialDeepstackLM:
+            def __call__(
+                self,
+                inputs: mx.array,
+                inputs_embeds: mx.array | None = None,
+                visual_pos_masks: Any | None = None,
+            ) -> None:
+                return None
+
+        assert (
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(_PartialDeepstackLM())
+            is False
+        )
 
 
 class TestQwen3VLMultimodalAdapterCallLm:
@@ -558,6 +665,72 @@ class TestQwen3VLMultimodalAdapterCallLm:
                 mx.zeros((3, 1, 1), dtype=mx.int32),
             )
 
+    def test_omits_deepstack_kwargs_when_unsupported(self) -> None:
+        lm = _KwargsOnlyLanguageModel()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=lm,
+            embeds_kwarg="inputs_embeds",
+            supports_deepstack=False,
+        )
+
+        adapter.call_lm(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            mx.zeros((1, 3, 8), dtype=mx.float32),
+            [None],
+            mx.zeros((3, 1, 3), dtype=mx.int32),
+            visual_pos_masks=mx.array([[True, False, True]]),
+            deepstack_visual_embeds=[mx.zeros((1, 2, 8))],
+        )
+
+        assert len(lm.calls) == 1
+        assert lm.calls[0]["extra"] == {}
+
+    def test_forwards_deepstack_kwargs_when_supported(self) -> None:
+        lm = _DeepstackLanguageModel()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=lm,
+            embeds_kwarg="inputs_embeds",
+            supports_deepstack=True,
+        )
+        visual_pos_masks = mx.array([[True, False, True]])
+        deepstack_visual_embeds = [mx.zeros((1, 2, 8))]
+
+        adapter.call_lm(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            mx.zeros((1, 3, 8), dtype=mx.float32),
+            [None],
+            mx.zeros((3, 1, 3), dtype=mx.int32),
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+
+        assert len(lm.calls) == 1
+        call = lm.calls[0]
+        assert call["visual_pos_masks"] is visual_pos_masks
+        assert call["deepstack_visual_embeds"] is deepstack_visual_embeds
+
+    def test_passes_none_deepstack_kwargs_when_supported_and_unset(self) -> None:
+        lm = _DeepstackLanguageModel()
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            language_model=lm,
+            embeds_kwarg="inputs_embeds",
+            supports_deepstack=True,
+        )
+
+        adapter.call_lm(
+            mx.array([[1]], dtype=mx.int32),
+            mx.zeros((1, 1, 8), dtype=mx.float32),
+            [None],
+            mx.zeros((3, 1, 1), dtype=mx.int32),
+        )
+
+        assert len(lm.calls) == 1
+        assert lm.calls[0]["visual_pos_masks"] is None
+        assert lm.calls[0]["deepstack_visual_embeds"] is None
+
 
 class TestQwen3VLMultimodalAdapterFromLoadedModel:
     def test_sniffs_embeds_kwarg_from_language_model(self) -> None:
@@ -596,6 +769,38 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
         adapter = Qwen3VLMultimodalAdapter.from_loaded_model(loaded)
 
         assert adapter._embed_tokens_fn is language_model.model.embed_tokens
+
+    def test_detects_no_deepstack_on_qwen3_5_style_lm(self) -> None:
+        class _LoadedModel:
+            class _Config:
+                class _VisionConfig:
+                    spatial_merge_size = 2
+
+                vision_config = _VisionConfig()
+
+            config = _Config()
+            vision_tower = _RecordingVisionTower()
+            language_model = _RecordingLanguageModel()
+
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+
+        assert adapter._supports_deepstack is False
+
+    def test_detects_deepstack_on_qwen3_vl_style_lm(self) -> None:
+        class _LoadedModel:
+            class _Config:
+                class _VisionConfig:
+                    spatial_merge_size = 2
+
+                vision_config = _VisionConfig()
+
+            config = _Config()
+            vision_tower = _RecordingVisionTower()
+            language_model = _DeepstackLanguageModel()
+
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(_LoadedModel())
+
+        assert adapter._supports_deepstack is True
 
 
 class TestQwen3VLMultimodalAdapterResolveEmbedTokens:

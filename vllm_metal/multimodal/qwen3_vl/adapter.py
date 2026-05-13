@@ -41,6 +41,11 @@ class Qwen3VLMultimodalAdapter:
         "input_embeddings",
     )
 
+    _DEEPSTACK_KWARGS: tuple[str, ...] = (
+        "visual_pos_masks",
+        "deepstack_visual_embeds",
+    )
+
     def __init__(
         self,
         *,
@@ -49,6 +54,7 @@ class Qwen3VLMultimodalAdapter:
         language_model: Any | None = None,
         embeds_kwarg: str | None = None,
         embed_tokens_fn: Callable[[Any], Any] | None = None,
+        supports_deepstack: bool = False,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
@@ -59,6 +65,7 @@ class Qwen3VLMultimodalAdapter:
         self._language_model = language_model
         self._embeds_kwarg = embeds_kwarg
         self._embed_tokens_fn = embed_tokens_fn
+        self._supports_deepstack = supports_deepstack
 
     def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
@@ -72,12 +79,14 @@ class Qwen3VLMultimodalAdapter:
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
         embeds_kwarg = cls._detect_embeds_kwarg(language_model)
         embed_tokens_fn = cls._resolve_embed_tokens(language_model)
+        supports_deepstack = cls._detect_deepstack_kwargs(language_model)
         return cls(
             spatial_merge_size=spatial_merge_size,
             vision_tower=vision_tower,
             language_model=language_model,
             embeds_kwarg=embeds_kwarg,
             embed_tokens_fn=embed_tokens_fn,
+            supports_deepstack=supports_deepstack,
         )
 
     @classmethod
@@ -133,6 +142,34 @@ class Qwen3VLMultimodalAdapter:
             f"{cls._SUPPORTED_EMBEDS_KWARGS}; mlx_vlm version drift detected. "
             f"Got parameters: {sorted(params)}"
         )
+
+    @classmethod
+    def _detect_deepstack_kwargs(cls, language_model: Any) -> bool:
+        """Return True iff the LM declares both deepstack params explicitly.
+
+        mlx-vlm 0.5.x Qwen3-VL's ``LanguageModel.__call__`` takes
+        ``visual_pos_masks`` and ``deepstack_visual_embeds`` as named
+        parameters and runs ``_deepstack_process``; 0.4.x's qwen3_5 LM
+        exposes only ``**kwargs``.  Only the explicit form counts as
+        support, so a LM with ``**kwargs`` does not silently absorb
+        deepstack arrays into a dropped catch-all.
+        """
+        try:
+            sig = inspect.signature(language_model.__call__)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Cannot inspect language_model.__call__ signature: {exc}"
+            ) from exc
+        explicit = {
+            name
+            for name, param in sig.parameters.items()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return all(kw in explicit for kw in cls._DEEPSTACK_KWARGS)
 
     def embed_tokens(self, input_ids: mx.array) -> mx.array:
         """Return the language model's input embeddings for ``input_ids``.
@@ -218,6 +255,9 @@ class Qwen3VLMultimodalAdapter:
         inputs_embeds: mx.array,
         cache: list[Any],
         position_ids: mx.array,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
     ) -> Any:
         """Invoke ``language_model`` with runner-built embeds and positions.
 
@@ -226,6 +266,13 @@ class Qwen3VLMultimodalAdapter:
         embeds keyword is the one sniffed at construction so version drift
         between ``inputs_embeds`` and ``input_embeddings`` surfaces at load
         time instead of inside attention.
+
+        ``visual_pos_masks`` and ``deepstack_visual_embeds`` are forwarded
+        only when the language model declares both deepstack parameters
+        explicitly (mlx-vlm 0.5.x).  On 0.4.x qwen3_5 the LM signature
+        exposes only ``**kwargs``; passing arrays into that catch-all
+        would silently drop them, so the adapter omits the kwargs entirely
+        instead of relying on the LM's tolerance.
         """
         if self._language_model is None:
             raise RuntimeError(
@@ -238,11 +285,16 @@ class Qwen3VLMultimodalAdapter:
                 "Qwen3VLMultimodalAdapter.from_loaded_model so the language "
                 "model signature is sniffed at load time."
             )
+        extra_kwargs: dict[str, Any] = {}
+        if self._supports_deepstack:
+            extra_kwargs["visual_pos_masks"] = visual_pos_masks
+            extra_kwargs["deepstack_visual_embeds"] = deepstack_visual_embeds
         return self._language_model(
             input_ids,
             cache=cache,
             position_ids=position_ids,
             **{self._embeds_kwarg: inputs_embeds},
+            **extra_kwargs,
         )
 
     @staticmethod

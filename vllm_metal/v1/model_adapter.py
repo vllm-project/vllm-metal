@@ -92,12 +92,20 @@ class MultimodalRuntimeAdapter(Protocol):
         inputs_embeds: Any,
         cache: list[Any],
         position_ids: Any,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
     ) -> Any:
         """Invoke the language model with runner-built embeds and positions.
 
         The embeds keyword is sniffed at adapter construction so version
         drift between ``inputs_embeds`` and ``input_embeddings`` surfaces
         at load time, not silently inside attention.
+
+        ``visual_pos_masks`` and ``deepstack_visual_embeds`` are forwarded
+        only on language models that declare both explicitly (mlx-vlm
+        0.5.x Qwen3-VL); LMs that take only ``**kwargs`` would silently
+        absorb the arrays, so the adapter omits these on that path.
         """
 
 
