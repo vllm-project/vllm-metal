@@ -344,9 +344,7 @@ def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
     stored = runner.encoder_cache.encoder_outputs["image-0"]
     assert mx.allclose(stored.hidden_states, expected).item()
     assert stored.deepstack_visual_embeds is not None
-    assert mx.allclose(
-        stored.deepstack_visual_embeds[0], mx.array([[3.0, 4.0]])
-    ).item()
+    assert mx.allclose(stored.deepstack_visual_embeds[0], mx.array([[3.0, 4.0]])).item()
 
 
 def test_run_vision_encoders_skips_cached_features(fake_encode_result) -> None:

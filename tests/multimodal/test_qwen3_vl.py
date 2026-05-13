@@ -551,9 +551,7 @@ class TestQwen3VLMultimodalAdapterDetectEmbedsKwarg:
 class TestQwen3VLMultimodalAdapterDetectDeepstackKwargs:
     def test_detects_explicit_deepstack_params(self) -> None:
         assert (
-            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(
-                _DeepstackLanguageModel()
-            )
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(_DeepstackLanguageModel())
             is True
         )
 
@@ -567,9 +565,7 @@ class TestQwen3VLMultimodalAdapterDetectDeepstackKwargs:
 
     def test_rejects_lm_missing_both_params(self) -> None:
         assert (
-            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(
-                _RecordingLanguageModel()
-            )
+            Qwen3VLMultimodalAdapter._detect_deepstack_kwargs(_RecordingLanguageModel())
             is False
         )
 

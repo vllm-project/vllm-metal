@@ -90,9 +90,7 @@ class Qwen3VLMultimodalAdapter:
         )
 
     @classmethod
-    def _resolve_embed_tokens(
-        cls, language_model: Any
-    ) -> Callable[[Any], Any]:
+    def _resolve_embed_tokens(cls, language_model: Any) -> Callable[[Any], Any]:
         """Return ``language_model.model.embed_tokens`` or raise.
 
         mlx-vlm 0.4.x Qwen3-VL/Qwen3.5 routes text embedding through

@@ -218,17 +218,12 @@ class TestPackedRoPE:
         # restores the original sys.modules entry at teardown so this fake
         # cannot leak into later tests in the same process.
         fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
-        fake_mod.apply_multimodal_rotary_pos_emb = (
-            lambda q, k, cos, sin: (q, k)
-        )
-        monkeypatch.setitem(
-            sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod
-        )
+        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
 
         q = mx.zeros((1, 1, 3, 2))
         k = mx.zeros((1, 1, 3, 2))
-        provided = mx.array([[[0, 1, 2]], [[0, 1, 2]], [[0, 1, 2]]],
-                             dtype=mx.int32)
+        provided = mx.array([[[0, 1, 2]], [[0, 1, 2]], [[0, 1, 2]]], dtype=mx.int32)
         apply_packed_rope(
             FakeMRoPE(),
             q,
@@ -263,20 +258,14 @@ class TestPackedRoPE:
                 return cos, sin
 
         fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
-        fake_mod.apply_multimodal_rotary_pos_emb = (
-            lambda q, k, cos, sin: (q, k)
-        )
-        monkeypatch.setitem(
-            sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod
-        )
+        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
 
         q = mx.zeros((1, 1, 5, 2))
         k = mx.zeros((1, 1, 5, 2))
         # Two segments: first uses int offset (no positions[0]),
         # second uses array positions[1].
-        caller_pos = mx.array(
-            [[[10, 11]], [[10, 11]], [[10, 11]]], dtype=mx.int32
-        )
+        caller_pos = mx.array([[[10, 11]], [[10, 11]], [[10, 11]]], dtype=mx.int32)
         apply_packed_rope(
             FakeMRoPE(),
             q,

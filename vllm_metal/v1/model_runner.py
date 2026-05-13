@@ -820,6 +820,32 @@ class MetalModelRunner:
             )
         )
 
+        # Multimodal paged-forward splice is not yet wired; an mm request
+        # reaching here would silently get a text-only forward.  The
+        # encoder gate (``_reject_scheduled_encoder_inputs``) catches the
+        # fresh-encode case but not a continuation chunk whose vision
+        # features were encoded in a prior step, so raise here too.  Mirror
+        # C's non-paged fail-fast and check unconditionally regardless of
+        # ``adapter.forward_ready`` / adapter presence — a misconfigured
+        # adapter must not silently produce wrong output.
+        mm_prefill_req_ids = [
+            pr.req_id for pr in prefill_reqs if self._is_mm_request(pr.req_id)
+        ]
+        mm_decode_req_ids = [
+            req_id
+            for req_id, state in decode_reqs
+            if state.mrope_position_delta is not None
+        ]
+        if mm_prefill_req_ids or mm_decode_req_ids:
+            raise NotImplementedError(
+                "Paged forward with multimodal requests is not wired yet. "
+                f"Affected prefill requests: {mm_prefill_req_ids}; affected "
+                f"decode requests: {mm_decode_req_ids}.  Non-paged prefill/"
+                f"decode already routes mm through adapter.call_lm; the "
+                f"paged splice + per-segment M-RoPE positions lands in a "
+                f"follow-up commit."
+            )
+
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
 
@@ -1425,8 +1451,8 @@ class MetalModelRunner:
             prefill = entry.prefill
             full_prompt = None
 
-            needs_full_prompt = (
-                prefill.start_pos > 0 or self._is_mm_request(prefill.req_id)
+            needs_full_prompt = prefill.start_pos > 0 or self._is_mm_request(
+                prefill.req_id
             )
             if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)

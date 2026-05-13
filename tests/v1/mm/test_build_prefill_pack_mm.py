@@ -131,9 +131,7 @@ class TestBuildPrefillPackMmFullPrompt:
         entry = _make_prefill_entry(
             "req-0", token_ids=[1, 99], prompt_len=4, start_pos=0
         )
-        batch = self._make_batch(
-            [entry], [_new_req("req-0", [1, 99, 99, 2])]
-        )
+        batch = self._make_batch([entry], [_new_req("req-0", [1, 99, 99, 2])])
 
         pack = runner._build_prefill_pack(batch)
 
@@ -142,9 +140,7 @@ class TestBuildPrefillPackMmFullPrompt:
     def test_mm_raises_when_state_and_new_req_both_missing(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner.encoder_cache.add_request("req-0", [_feature("img-0")])
-        entry = _make_prefill_entry(
-            "req-0", token_ids=[1], prompt_len=4, start_pos=0
-        )
+        entry = _make_prefill_entry("req-0", token_ids=[1], prompt_len=4, start_pos=0)
         batch = self._make_batch([entry], [])
 
         with pytest.raises(RuntimeError, match="state tracking bug"):
@@ -153,9 +149,7 @@ class TestBuildPrefillPackMmFullPrompt:
     def test_mm_raises_when_new_req_prompt_token_ids_missing(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner.encoder_cache.add_request("req-0", [_feature("img-0")])
-        entry = _make_prefill_entry(
-            "req-0", token_ids=[1], prompt_len=4, start_pos=0
-        )
+        entry = _make_prefill_entry("req-0", token_ids=[1], prompt_len=4, start_pos=0)
         batch = self._make_batch([entry], [_new_req("req-0", None)])
 
         with pytest.raises(RuntimeError, match="scheduler contract bug"):
