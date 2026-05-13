@@ -76,8 +76,6 @@ run_smoke_test() {
     echo "Smoke test passed! Output matches golden."
   fi
 
-  echo "Smoke test passed! Output matches golden."
-
   # Graceful shutdown with SIGKILL fallback
   local shutdown_timeout=10
   local port_timeout=15
