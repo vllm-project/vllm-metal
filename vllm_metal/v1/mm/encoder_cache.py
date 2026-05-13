@@ -3,21 +3,27 @@
 
 from __future__ import annotations
 
-import mlx.core as mx
+from typing import TYPE_CHECKING
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
+if TYPE_CHECKING:
+    from vllm_metal.v1.model_adapter import MultimodalEncodeResult
+
 
 class EncoderCache:
-    """Store multimodal features and MLX encoder outputs by request/hash.
+    """Store multimodal features and encoder-output records by request/hash.
 
-    Mirrors upstream vLLM's v1 GPU ``EncoderCache`` with the tensor type
-    changed from ``torch.Tensor`` to ``mlx.core.array``.
+    Mirrors upstream vLLM's v1 GPU ``EncoderCache``.  Stores the adapter's
+    full ``MultimodalEncodeResult`` (hidden_states + deepstack channel) so
+    downstream splice has both fields available; consumers read
+    ``.hidden_states`` for first-token splice and ``.deepstack_visual_embeds``
+    for layer-residual injection.
     """
 
     def __init__(self) -> None:
         self.mm_features: dict[str, list[MultiModalFeatureSpec]] = {}
-        self.encoder_outputs: dict[str, mx.array] = {}
+        self.encoder_outputs: dict[str, MultimodalEncodeResult] = {}
 
     def add_request(
         self, req_id: str, mm_features: list[MultiModalFeatureSpec]

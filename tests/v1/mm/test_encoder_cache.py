@@ -42,10 +42,10 @@ def test_remove_request_is_idempotent() -> None:
     assert "req-0" not in cache.mm_features
 
 
-def test_free_encoder_cache_removes_one_hash() -> None:
+def test_free_encoder_cache_removes_one_hash(fake_encode_result) -> None:
     cache = EncoderCache()
-    cache.encoder_outputs["hash-0"] = mx.array([[1.0]])
-    cache.encoder_outputs["hash-1"] = mx.array([[2.0]])
+    cache.encoder_outputs["hash-0"] = fake_encode_result(mx.array([[1.0]]))
+    cache.encoder_outputs["hash-1"] = fake_encode_result(mx.array([[2.0]]))
 
     cache.free_encoder_cache("hash-0")
     cache.free_encoder_cache("missing")
@@ -53,11 +53,11 @@ def test_free_encoder_cache_removes_one_hash() -> None:
     assert set(cache.encoder_outputs) == {"hash-1"}
 
 
-def test_reset_encoder_cache_clears_outputs_only() -> None:
+def test_reset_encoder_cache_clears_outputs_only(fake_encode_result) -> None:
     cache = EncoderCache()
     features = [_feature("image-0")]
     cache.add_request("req-0", features)
-    cache.encoder_outputs["hash-0"] = mx.array([[1.0]])
+    cache.encoder_outputs["hash-0"] = fake_encode_result(mx.array([[1.0]]))
 
     cache.reset_encoder_cache()
 

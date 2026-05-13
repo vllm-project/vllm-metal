@@ -1233,7 +1233,7 @@ class MetalModelRunner:
                         "for 1 feature; adapter must return one result per "
                         "feature."
                     )
-                cache.encoder_outputs[feature.identifier] = outputs[0].hidden_states
+                cache.encoder_outputs[feature.identifier] = outputs[0]
 
     def _handle_new_requests(
         self,

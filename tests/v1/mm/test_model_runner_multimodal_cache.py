@@ -164,21 +164,23 @@ def test_resubmitted_request_keeps_new_mm_features() -> None:
     assert runner.encoder_cache.mm_features["req-0"] == new_features
 
 
-def test_execute_model_frees_released_encoder_outputs() -> None:
+def test_execute_model_frees_released_encoder_outputs(fake_encode_result) -> None:
     runner = _runner_with_encoder_cache()
     assert runner.encoder_cache is not None
-    runner.encoder_cache.encoder_outputs["keep"] = mx.array([[1.0]])
-    runner.encoder_cache.encoder_outputs["drop"] = mx.array([[2.0]])
+    runner.encoder_cache.encoder_outputs["keep"] = fake_encode_result(mx.array([[1.0]]))
+    runner.encoder_cache.encoder_outputs["drop"] = fake_encode_result(mx.array([[2.0]]))
 
     runner.execute_model(_scheduler_output(free_encoder_mm_hashes=["drop"]))
 
     assert set(runner.encoder_cache.encoder_outputs) == {"keep"}
 
 
-def test_reset_encoder_cache_delegates_to_encoder_cache() -> None:
+def test_reset_encoder_cache_delegates_to_encoder_cache(fake_encode_result) -> None:
     runner = _runner_with_encoder_cache()
     assert runner.encoder_cache is not None
-    runner.encoder_cache.encoder_outputs["image-0"] = mx.array([[1.0]])
+    runner.encoder_cache.encoder_outputs["image-0"] = fake_encode_result(
+        mx.array([[1.0]])
+    )
 
     runner.reset_encoder_cache()
 
@@ -194,10 +196,12 @@ def test_reset_mm_cache_delegates_to_encoder_cache() -> None:
     encoder_cache.reset_mm_cache.assert_called_once_with()
 
 
-def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast() -> None:
+def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast(
+    fake_encode_result,
+) -> None:
     runner = _runner_with_encoder_cache()
     assert runner.encoder_cache is not None
-    runner.encoder_cache.encoder_outputs["drop"] = mx.array([[1.0]])
+    runner.encoder_cache.encoder_outputs["drop"] = fake_encode_result(mx.array([[1.0]]))
 
     with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
         runner.execute_model(
@@ -338,17 +342,21 @@ def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
 
     assert adapter.encode_calls == [features]
     stored = runner.encoder_cache.encoder_outputs["image-0"]
-    assert mx.allclose(stored, expected).item()
+    assert mx.allclose(stored.hidden_states, expected).item()
+    assert stored.deepstack_visual_embeds is not None
+    assert mx.allclose(
+        stored.deepstack_visual_embeds[0], mx.array([[3.0, 4.0]])
+    ).item()
 
 
-def test_run_vision_encoders_skips_cached_features() -> None:
+def test_run_vision_encoders_skips_cached_features(fake_encode_result) -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
     features = [_feature("image-0")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
-    cached = mx.array([[7.0]])
+    cached = fake_encode_result(mx.array([[7.0]]))
     runner.encoder_cache.encoder_outputs["image-0"] = cached
 
     runner._run_vision_encoders({"req-0": [0]})
