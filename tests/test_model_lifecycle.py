@@ -91,7 +91,14 @@ def _text_config(**overrides: object) -> SimpleNamespace:
 
 
 class _Qwen35LanguageModelStub:
-    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works."""
+    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
+
+    Also exposes ``self.model.embed_tokens`` so ``from_loaded_model`` can
+    resolve the bottom-level embedding callable at load time.
+    """
+
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
 
     def __call__(
         self,

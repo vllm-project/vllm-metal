@@ -370,7 +370,15 @@ class TestTextModel:
 
 
 class _Qwen35LanguageModelStub:
-    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works."""
+    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
+
+    Also exposes ``self.model.embed_tokens`` to mirror the bottom-level
+    embedding callable the real LM holds — ``from_loaded_model`` resolves
+    it at load time.
+    """
+
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
 
     def __call__(
         self,

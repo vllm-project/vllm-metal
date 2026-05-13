@@ -51,6 +51,15 @@ class MultimodalRuntimeAdapter(Protocol):
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 
+    def embed_tokens(self, input_ids: Any) -> Any:
+        """Return the language model's input embeddings for ``input_ids``.
+
+        Resolved at adapter construction so the runner builds embeds via
+        a stable adapter method instead of reaching into private model
+        internals (``model.language_model.model.embed_tokens`` for mlx-vlm
+        0.4.x).  Returns an MLX array of shape ``(batch, seq_len, hidden)``.
+        """
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],

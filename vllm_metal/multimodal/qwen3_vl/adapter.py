@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from types import SimpleNamespace
@@ -47,6 +48,7 @@ class Qwen3VLMultimodalAdapter:
         vision_tower: Any | None = None,
         language_model: Any | None = None,
         embeds_kwarg: str | None = None,
+        embed_tokens_fn: Callable[[Any], Any] | None = None,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
@@ -56,6 +58,7 @@ class Qwen3VLMultimodalAdapter:
         self._vision_tower = vision_tower
         self._language_model = language_model
         self._embeds_kwarg = embeds_kwarg
+        self._embed_tokens_fn = embed_tokens_fn
 
     def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
@@ -68,12 +71,43 @@ class Qwen3VLMultimodalAdapter:
         language_model = model.language_model
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
         embeds_kwarg = cls._detect_embeds_kwarg(language_model)
+        embed_tokens_fn = cls._resolve_embed_tokens(language_model)
         return cls(
             spatial_merge_size=spatial_merge_size,
             vision_tower=vision_tower,
             language_model=language_model,
             embeds_kwarg=embeds_kwarg,
+            embed_tokens_fn=embed_tokens_fn,
         )
+
+    @classmethod
+    def _resolve_embed_tokens(
+        cls, language_model: Any
+    ) -> Callable[[Any], Any]:
+        """Return ``language_model.model.embed_tokens`` or raise.
+
+        mlx-vlm 0.4.x Qwen3-VL/Qwen3.5 routes text embedding through
+        ``language_model.model.embed_tokens`` — the same callable the
+        top-level ``Model.get_input_embeddings`` defers to in text-only
+        mode.  Resolving here keeps the runner away from private model
+        internals (``language_model.model.*`` is not a stable public
+        surface) and converts any rename/restructure into a clear
+        load-time error instead of an attribute-error mid-forward.
+        """
+        inner = getattr(language_model, "model", None)
+        if inner is None:
+            raise RuntimeError(
+                "language_model.model attribute missing; mlx_vlm version "
+                "drift detected.  Expected the bottom-level LM module that "
+                "exposes embed_tokens."
+            )
+        embed_tokens = getattr(inner, "embed_tokens", None)
+        if embed_tokens is None or not callable(embed_tokens):
+            raise RuntimeError(
+                "language_model.model.embed_tokens missing or not callable; "
+                "mlx_vlm version drift detected."
+            )
+        return embed_tokens
 
     @classmethod
     def _detect_embeds_kwarg(cls, language_model: Any) -> str:
@@ -99,6 +133,22 @@ class Qwen3VLMultimodalAdapter:
             f"{cls._SUPPORTED_EMBEDS_KWARGS}; mlx_vlm version drift detected. "
             f"Got parameters: {sorted(params)}"
         )
+
+    def embed_tokens(self, input_ids: mx.array) -> mx.array:
+        """Return the language model's input embeddings for ``input_ids``.
+
+        Forwards to the callable resolved at ``from_loaded_model`` time so
+        the runner does not reach into private model internals.  Construct
+        via :meth:`from_loaded_model` for the resolution; manually built
+        instances (e.g. unit tests) must pass ``embed_tokens_fn``.
+        """
+        if self._embed_tokens_fn is None:
+            raise RuntimeError(
+                "embed_tokens_fn not resolved; construct via "
+                "Qwen3VLMultimodalAdapter.from_loaded_model so the language "
+                "model embedding path is sniffed at load time."
+            )
+        return self._embed_tokens_fn(input_ids)
 
     def encode_multimodal(
         self,

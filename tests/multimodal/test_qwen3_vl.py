@@ -404,11 +404,19 @@ class _RecordingLanguageModel:
     """Captures call kwargs for ``call_lm`` assertions.
 
     Mirrors mlx_vlm 0.4.x's ``LanguageModel.__call__`` shape: ``inputs_embeds``
-    is a named parameter so signature sniffing finds it.
+    is a named parameter so signature sniffing finds it.  ``self.model.embed_tokens``
+    mirrors the bottom-level embedding callable the real LM exposes.
     """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.embed_calls: list[mx.array] = []
+
+        def _embed(input_ids: mx.array) -> mx.array:
+            self.embed_calls.append(input_ids)
+            return input_ids
+
+        self.model = SimpleNamespace(embed_tokens=_embed)
 
     def __call__(
         self,
@@ -430,6 +438,9 @@ class _RecordingLanguageModel:
 
 class _LegacyLanguageModel:
     """LM that uses the older ``input_embeddings`` keyword."""
+
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
 
     def __call__(
         self,
@@ -556,3 +567,79 @@ class TestQwen3VLMultimodalAdapterFromLoadedModel:
 
         assert adapter._embeds_kwarg == "inputs_embeds"
         assert adapter._spatial_merge_size == 2
+
+    def test_resolves_embed_tokens_at_load_time(self) -> None:
+        language_model = _RecordingLanguageModel()
+
+        class _LoadedModel:
+            class _Config:
+                class _VisionConfig:
+                    spatial_merge_size = 2
+
+                vision_config = _VisionConfig()
+
+            config = _Config()
+            vision_tower = _RecordingVisionTower()
+
+        loaded = _LoadedModel()
+        loaded.language_model = language_model
+
+        adapter = Qwen3VLMultimodalAdapter.from_loaded_model(loaded)
+
+        assert adapter._embed_tokens_fn is language_model.model.embed_tokens
+
+
+class TestQwen3VLMultimodalAdapterResolveEmbedTokens:
+    def test_returns_inner_embed_tokens_callable(self) -> None:
+        language_model = _RecordingLanguageModel()
+
+        resolved = Qwen3VLMultimodalAdapter._resolve_embed_tokens(language_model)
+
+        assert resolved is language_model.model.embed_tokens
+
+    def test_raises_when_inner_model_missing(self) -> None:
+        class _NoInner:
+            def __call__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        with pytest.raises(RuntimeError, match="language_model.model attribute"):
+            Qwen3VLMultimodalAdapter._resolve_embed_tokens(_NoInner())
+
+    def test_raises_when_embed_tokens_missing(self) -> None:
+        bad = SimpleNamespace(model=SimpleNamespace())
+
+        with pytest.raises(RuntimeError, match="embed_tokens missing"):
+            Qwen3VLMultimodalAdapter._resolve_embed_tokens(bad)
+
+    def test_raises_when_embed_tokens_not_callable(self) -> None:
+        bad = SimpleNamespace(model=SimpleNamespace(embed_tokens="not-a-callable"))
+
+        with pytest.raises(RuntimeError, match="not callable"):
+            Qwen3VLMultimodalAdapter._resolve_embed_tokens(bad)
+
+
+class TestQwen3VLMultimodalAdapterEmbedTokens:
+    def test_forwards_to_resolved_callable(self) -> None:
+        recorded: list[mx.array] = []
+
+        def _embed(input_ids: mx.array) -> mx.array:
+            recorded.append(input_ids)
+            return input_ids + 1
+
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            embed_tokens_fn=_embed,
+        )
+        input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+        out = adapter.embed_tokens(input_ids)
+
+        assert mx.allclose(out, input_ids + 1).item()
+        assert len(recorded) == 1
+        assert recorded[0] is input_ids
+
+    def test_raises_when_not_resolved(self) -> None:
+        adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=_SPATIAL_MERGE_SIZE)
+
+        with pytest.raises(RuntimeError, match="embed_tokens_fn not resolved"):
+            adapter.embed_tokens(mx.array([[1]], dtype=mx.int32))
