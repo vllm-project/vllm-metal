@@ -377,7 +377,7 @@ static void add_paged_attn_temporaries(
 }
 
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
-// Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 128}.
+// Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 96, 128, 192, 256}.
 static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
                                  Dtype query_dtype, Dtype k_cache_dtype) {
   if (use_turboquant) return false;
