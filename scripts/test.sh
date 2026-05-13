@@ -8,9 +8,13 @@ run_smoke_test() {
   local revision="$2"
   local prompt="$3"
   local expected="$4"
-  local alt_expected="${5:-}"
-  shift; shift; shift; shift
-  [ -n "$alt_expected" ] && shift
+  local alt_expected=""
+  shift 4
+  # Optional alt golden: next arg that doesn't start with '--' is alt_expected.
+  if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    alt_expected="$1"
+    shift
+  fi
   local extra_args=("$@")
 
   section "Smoke test: $model"

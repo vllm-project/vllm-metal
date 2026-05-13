@@ -237,7 +237,15 @@ def test_metal_unified_attn_decode_only(
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+    "seq_lens",
+    [
+        [(1, 1328), (5, 18), (129, 463)],
+        [(1, 523), (1, 37), (1, 2011)],
+        # Prefill-only: all q_len > 1, guarantees tiled kernel dispatch
+        # (total_q_tokens > num_seqs).
+        [(8, 128), (16, 256)],
+        [(32, 512), (64, 1024)],
+    ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
