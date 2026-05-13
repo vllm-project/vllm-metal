@@ -17,6 +17,11 @@ from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
+_GEMMA4_MTP_DRAFT_MODEL_TYPES = frozenset({"gemma4_assistant", "gemma4_mtp"})
+_GEMMA4_MTP_DRAFT_ARCHITECTURES = frozenset(
+    {"Gemma4AssistantForCausalLM", "Gemma4MTPModel"}
+)
+
 
 class _PagedDecodeStateLike(Protocol):
     token_ids: Sequence[int]
@@ -204,11 +209,18 @@ class SpeculativeDecodeController:
             return False
 
         draft_model_config = speculative_config.draft_model_config
-        return (
-            draft_model_config is not None
-            and getattr(draft_model_config.hf_config, "model_type", None)
-            == "gemma4_mtp"
-        )
+        if draft_model_config is None:
+            return False
+
+        hf_config = draft_model_config.hf_config
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type in _GEMMA4_MTP_DRAFT_MODEL_TYPES:
+            return True
+
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if isinstance(architectures, str):
+            architectures = (architectures,)
+        return any(arch in _GEMMA4_MTP_DRAFT_ARCHITECTURES for arch in architectures)
 
     def verify_greedy(
         self,

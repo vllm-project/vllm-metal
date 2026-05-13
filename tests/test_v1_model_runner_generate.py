@@ -179,7 +179,10 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             speculative_config=SimpleNamespace(
                 method="mtp",
                 draft_model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(model_type="gemma4_mtp")
+                    hf_config=SimpleNamespace(
+                        model_type="gemma4_assistant",
+                        architectures=["Gemma4AssistantForCausalLM"],
+                    )
                 ),
             )
         )

@@ -73,7 +73,10 @@ def _gemma4_mtp_speculative_config() -> SimpleNamespace:
     return SimpleNamespace(
         method="mtp",
         draft_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="gemma4_mtp")
+            hf_config=SimpleNamespace(
+                model_type="gemma4_assistant",
+                architectures=["Gemma4AssistantForCausalLM"],
+            )
         ),
     )
 
@@ -276,6 +279,28 @@ class TestBuildPagedDecodeSegments:
         )
 
         assert not controller.needs_target_hidden_states(
+            segments,
+            speculative_config=speculative_config,
+        )
+
+    def test_target_hidden_states_detect_mapped_gemma4_mtp_architecture(self) -> None:
+        controller = SpeculativeDecodeController()
+        speculative_config = SimpleNamespace(
+            method="mtp",
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="unknown",
+                    architectures=["Gemma4MTPModel"],
+                )
+            ),
+        )
+        segments = controller.build_decode_segments(
+            [("r0", _state([1, 2], [10]))],
+            scheduled_spec_decode_tokens={"r0": [3]},
+            paged_request_seq_lens={"r0": 1},
+        )
+
+        assert controller.needs_target_hidden_states(
             segments,
             speculative_config=speculative_config,
         )
