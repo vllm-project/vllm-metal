@@ -42,6 +42,7 @@ from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
+    get_context,
     prepare_unified,
 )
 from vllm_metal.stt.runtime import STTRuntimeAdapter
@@ -820,30 +821,24 @@ class MetalModelRunner:
             )
         )
 
-        # Multimodal paged-forward splice is not yet wired; an mm request
-        # reaching here would silently get a text-only forward.  The
-        # encoder gate (``_reject_scheduled_encoder_inputs``) catches the
-        # fresh-encode case but not a continuation chunk whose vision
-        # features were encoded in a prior step, so raise here too.  Mirror
-        # C's non-paged fail-fast and check unconditionally regardless of
-        # ``adapter.forward_ready`` / adapter presence — a misconfigured
-        # adapter must not silently produce wrong output.
-        mm_prefill_req_ids = [
-            pr.req_id for pr in prefill_reqs if self._is_mm_request(pr.req_id)
-        ]
-        mm_decode_req_ids = [
-            req_id
-            for req_id, state in decode_reqs
-            if state.mrope_position_delta is not None
-        ]
-        if mm_prefill_req_ids or mm_decode_req_ids:
-            raise NotImplementedError(
-                "Paged forward with multimodal requests is not wired yet. "
-                f"Affected prefill requests: {mm_prefill_req_ids}; affected "
-                f"decode requests: {mm_decode_req_ids}.  Non-paged prefill/"
-                f"decode already routes mm through adapter.call_lm; the "
-                f"paged splice + per-segment M-RoPE positions lands in a "
-                f"follow-up commit."
+        # Detect multimodal segments.  Mirror C's non-paged fail-fast: an
+        # mm request reaching here without a ``forward_ready`` adapter is
+        # a bookkeeping bug (the encoder gate only catches fresh-encode
+        # cases — a continuation chunk whose vision features were encoded
+        # in a prior step has no scheduled encoder input and would
+        # otherwise slip through to the text path).
+        has_mm_prefill = any(self._is_mm_request(pr.req_id) for pr in prefill_reqs)
+        has_mm_decode = any(
+            state.mrope_position_delta is not None for _, state in decode_reqs
+        )
+        has_mm = has_mm_prefill or has_mm_decode
+        adapter = self._multimodal_adapter
+        if has_mm and (adapter is None or not adapter.forward_ready):
+            raise RuntimeError(
+                "Paged forward saw a multimodal request but the adapter is "
+                "not forward_ready; this indicates a misconfigured adapter "
+                "or a bookkeeping bug — only forward-ready adapters should "
+                "let mm requests reach paged forward."
             )
 
         # ---- build unified token sequence: decode first, then prefill ----
@@ -876,8 +871,6 @@ class MetalModelRunner:
 
         # ---- GDN slot mapping (hybrid models) ----
         if self.is_hybrid:
-            from vllm_metal.paged_attention_common import get_context
-
             ctx = get_context()
             if ctx is not None:
                 gdn_slots = []
@@ -892,16 +885,25 @@ class MetalModelRunner:
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
         try:
-            target_output = self._target_forward(
-                input_ids,
-                cache=offset_caches,
-                collect_hidden_states=collect_target_hidden_states,
-            )
-            logits = target_output.logits
-            target_hidden_states = target_output.hidden_states
-            # Keep only logits and the optional row-major hidden states before
-            # scheduling evaluation.
-            del target_output
+            if has_mm:
+                model_output = self._run_mm_paged_forward(
+                    input_ids,
+                    offset_caches,
+                    prefill_reqs,
+                    decode_segments,
+                )
+                logits = self._extract_logits(model_output)
+                target_hidden_states = None
+                del model_output
+            else:
+                target_output = self._target_forward(
+                    input_ids,
+                    cache=offset_caches,
+                    collect_hidden_states=collect_target_hidden_states,
+                )
+                logits = target_output.logits
+                target_hidden_states = target_output.hidden_states
+                del target_output
         finally:
             clear_context()
 
@@ -1260,6 +1262,214 @@ class MetalModelRunner:
                         "feature."
                     )
                 cache.encoder_outputs[feature.identifier] = outputs[0]
+
+    def _run_mm_paged_forward(
+        self,
+        input_ids: mx.array,
+        offset_caches: list[OffsetCache],
+        prefill_reqs: list[PrefillRequest],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+    ) -> Any:
+        """Run paged forward through ``adapter.call_lm`` with packed splice.
+
+        Builds per-segment M-RoPE positions (sliced out of the full-prompt
+        positions for mm prefill chunks, computed as ``cache_start_pos +
+        delta + arange(num_query_tokens)`` for mm decode), splices vision
+        embeds into the packed text embeds at placeholder positions
+        (chunk-aware: each feature only contributes the slice that lands
+        in *this* chunk), and concatenates per-layer deepstack residual
+        arrays across all mm prefill segments in packed order.
+
+        Sets ``ctx.segment_positions`` so ``apply_packed_rope`` reads
+        caller-supplied positions on mm segments and falls back to the
+        int-offset arange path on text segments.
+
+        Spec decode mm: when ``num_query_tokens > 1`` on a decode segment
+        whose request has ``mrope_position_delta`` set, draft-row
+        positions are filled as ``arange(cache_start_pos, ...) + delta``.
+        """
+        adapter = self._multimodal_adapter
+        assert adapter is not None and adapter.forward_ready
+        encoder_cache = self.encoder_cache
+        assert encoder_cache is not None
+
+        # Pre-compute full-prompt M-RoPE positions per mm prefill request.
+        # Chunked prefill of the same request would only appear once in
+        # ``prefill_reqs`` per step, so per-request caching here is for
+        # clarity rather than work avoidance.
+        mm_request_meta: dict[
+            str, tuple[mx.array, int, list[MultiModalFeatureSpec]]
+        ] = {}
+        for pr in prefill_reqs:
+            if not self._is_mm_request(pr.req_id):
+                continue
+            full_prompt = pr.full_prompt_token_ids
+            if full_prompt is None:
+                raise RuntimeError(
+                    f"mm prefill request {pr.req_id!r} reached paged forward "
+                    f"without full_prompt_token_ids; _build_prefill_pack bug."
+                )
+            mm_features = encoder_cache.mm_features.get(pr.req_id, [])
+            sorted_features = sorted(mm_features, key=lambda f: f.mm_position.offset)
+            full_positions, delta = adapter.get_mrope_input_positions(
+                full_prompt, sorted_features
+            )
+            mm_request_meta[pr.req_id] = (full_positions, delta, sorted_features)
+
+        total_len = int(input_ids.shape[1])
+        visual_pos_masks_np = np.zeros(total_len, dtype=bool)
+        mm_embeds_parts: list[mx.array] = []
+        deepstack_per_layer: list[list[mx.array]] = []
+        deepstack_present: bool | None = None
+        ctx_segment_positions: list[Any] = []
+        position_ids_parts: list[mx.array] = []
+        cursor = 0
+
+        # Decode segments come first in the packed sequence.
+        for segment in decode_segments:
+            n = segment.num_query_tokens
+            state = self._request_states.get(segment.req_id)
+            is_mm_decode = state is not None and state.mrope_position_delta is not None
+            if is_mm_decode:
+                assert state is not None and state.mrope_position_delta is not None
+                offset_arr = np.arange(
+                    segment.cache_start_pos,
+                    segment.cache_start_pos + n,
+                    dtype=np.int32,
+                )
+                offset_arr = offset_arr + state.mrope_position_delta
+            else:
+                offset_arr = np.arange(
+                    segment.cache_start_pos,
+                    segment.cache_start_pos + n,
+                    dtype=np.int32,
+                )
+            seg_positions = mx.broadcast_to(
+                mx.array(offset_arr)[None, None, :], (3, 1, n)
+            )
+            ctx_segment_positions.append(seg_positions if is_mm_decode else None)
+            position_ids_parts.append(seg_positions)
+            cursor += n
+
+        # Prefill segments follow.
+        for pr in prefill_reqs:
+            n = len(pr.token_ids)
+            if pr.req_id in mm_request_meta:
+                full_positions, _delta, sorted_features = mm_request_meta[pr.req_id]
+                seg_positions = full_positions[:, :, pr.start_pos : pr.start_pos + n]
+                ctx_segment_positions.append(seg_positions)
+                position_ids_parts.append(seg_positions)
+
+                # Splice each feature's chunk-intersecting slice.
+                for feature in sorted_features:
+                    f_start = feature.mm_position.offset
+                    f_end = f_start + feature.mm_position.length
+                    chunk_start = pr.start_pos
+                    chunk_end = pr.start_pos + n
+                    inter_start = max(f_start, chunk_start)
+                    inter_end = min(f_end, chunk_end)
+                    if inter_start >= inter_end:
+                        continue  # feature doesn't overlap this chunk
+                    length = inter_end - inter_start
+                    chunk_local = inter_start - chunk_start
+                    feature_local = inter_start - f_start
+
+                    result = encoder_cache.encoder_outputs.get(feature.identifier)
+                    if result is None:
+                        raise RuntimeError(
+                            f"Encoder output for feature {feature.identifier!r} "
+                            f"of request {pr.req_id!r} is missing; the encoder "
+                            f"gate should have populated it before prefill."
+                        )
+
+                    # Pack-coord mask range for this feature/chunk slice.
+                    packed_start = cursor + chunk_local
+                    visual_pos_masks_np[packed_start : packed_start + length] = True
+
+                    # Hidden states slice.
+                    mm_embeds_parts.append(
+                        result.hidden_states[feature_local : feature_local + length]
+                    )
+
+                    # Deepstack: same chunk-aware slice per layer; reject
+                    # mixed presence across features in this request.
+                    layers = result.deepstack_visual_embeds
+                    this_has = layers is not None
+                    if deepstack_present is None:
+                        deepstack_present = this_has
+                    elif deepstack_present != this_has:
+                        raise RuntimeError(
+                            f"Mixed deepstack presence across features for "
+                            f"request {pr.req_id!r}: either all features must "
+                            f"carry ``deepstack_visual_embeds`` or none.  "
+                            f"Partial deepstack would leave the LM with mask "
+                            f"positions that out-number the concatenated "
+                            f"residual rows."
+                        )
+                    if not this_has:
+                        continue
+                    assert layers is not None
+                    if not deepstack_per_layer:
+                        deepstack_per_layer = [
+                            [layer[feature_local : feature_local + length]]
+                            for layer in layers
+                        ]
+                    elif len(deepstack_per_layer) != len(layers):
+                        raise RuntimeError(
+                            f"Inconsistent deepstack layer count across "
+                            f"features for request {pr.req_id!r}: expected "
+                            f"{len(deepstack_per_layer)}, got {len(layers)}."
+                        )
+                    else:
+                        for layer_idx, layer in enumerate(layers):
+                            deepstack_per_layer[layer_idx].append(
+                                layer[feature_local : feature_local + length]
+                            )
+            else:
+                # text prefill: arange positions, but mark segment as None
+                # so attention falls back to the int-offset arange path.
+                offset_arr = np.arange(pr.start_pos, pr.start_pos + n, dtype=np.int32)
+                seg_positions = mx.broadcast_to(
+                    mx.array(offset_arr)[None, None, :], (3, 1, n)
+                )
+                ctx_segment_positions.append(None)
+                position_ids_parts.append(seg_positions)
+            cursor += n
+
+        # Build spliced inputs_embeds + packed position_ids.
+        inputs_embeds_text = adapter.embed_tokens(input_ids)
+        visual_pos_masks = mx.array(visual_pos_masks_np)[None, :]
+        if mm_embeds_parts:
+            inputs_embeds = merge_multimodal_embeddings(
+                inputs_embeds_text, mm_embeds_parts, visual_pos_masks
+            )
+        else:
+            inputs_embeds = inputs_embeds_text
+
+        deepstack_visual_embeds: Any | None = None
+        if deepstack_per_layer:
+            deepstack_visual_embeds = [
+                mx.concatenate(layer_parts, axis=0)
+                for layer_parts in deepstack_per_layer
+            ]
+
+        position_ids = mx.concatenate(position_ids_parts, axis=2)
+
+        # Thread per-segment positions into the paged context so
+        # ``apply_packed_rope`` reads caller-supplied positions on mm
+        # segments instead of the sequential-arange policy.
+        ctx = get_context()
+        if ctx is not None:
+            ctx.segment_positions = ctx_segment_positions
+
+        return adapter.call_lm(
+            input_ids,
+            inputs_embeds,
+            offset_caches,
+            position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     def _handle_new_requests(
         self,
