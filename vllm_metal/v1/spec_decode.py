@@ -17,6 +17,9 @@ from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
+# Raw Gemma4 assistant checkpoints use the HF/Transformers identifiers;
+# upstream vLLM maps them to the Gemma4MTP wrapper identifiers during config
+# normalization. Accept both so this gate works before and after that mapping.
 _GEMMA4_MTP_DRAFT_MODEL_TYPES = frozenset({"gemma4_assistant", "gemma4_mtp"})
 _GEMMA4_MTP_DRAFT_ARCHITECTURES = frozenset(
     {"Gemma4AssistantForCausalLM", "Gemma4MTPModel"}
@@ -198,7 +201,12 @@ class SpeculativeDecodeController:
         has_final_prefill: bool = False,
         speculative_config: SpeculativeConfig | None = None,
     ) -> bool:
-        """Return whether target hidden states are needed for draft follow-up."""
+        """Return whether target hidden states are needed for draft follow-up.
+
+        Gemma4 MTP needs the previous target step's hidden states even for
+        plain decode or final prefill rows, because the assistant consumes
+        those rows to draft the next tokens.
+        """
         if not decode_segments and not has_final_prefill:
             return False
         return self._uses_gemma4_mtp(speculative_config)
@@ -217,6 +225,8 @@ class SpeculativeDecodeController:
         if model_type in _GEMMA4_MTP_DRAFT_MODEL_TYPES:
             return True
 
+        # Architectures may be absent, None, or already rewritten by upstream
+        # vLLM, so normalize this optional HF field defensively.
         architectures = getattr(hf_config, "architectures", ()) or ()
         if isinstance(architectures, str):
             architectures = (architectures,)

@@ -217,6 +217,26 @@ class TestTargetForward:
         assert output.hidden_states.tolist() == [[1.0, 2.0]]
         assert mx.allclose(output.logits, expected_logits).item()
 
+    def test_rejects_batched_target_hidden_states(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.zeros((2, 1, 4))
+
+        class Head:
+            def __call__(self, hidden_states):
+                return hidden_states
+
+        model = SimpleNamespace(model=Backbone(), lm_head=Head())
+
+        with pytest.raises(ValueError, match="row-major"):
+            DefaultModelAdapter().target_forward(
+                model,
+                mx.array([[1]]),
+                cache=[],
+                collect_hidden_states=True,
+            )
+
 
 class TestNormalizeModelConfig:
     """Tests for normalize_model_config()."""

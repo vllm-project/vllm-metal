@@ -21,8 +21,8 @@ logger = init_logger(__name__)
 class TargetModelForwardOutput:
     """Target-model forward output needed by sampling and speculative decode."""
 
-    logits: Any
-    hidden_states: Any | None = None
+    logits: mx.array
+    hidden_states: mx.array | None = None
 
 
 class MultimodalRuntimeAdapter(Protocol):
@@ -68,14 +68,14 @@ class ModelAdapter(Protocol):
     def target_forward(
         self,
         model: Any,
-        input_ids: Any,
+        input_ids: mx.array,
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
     ) -> TargetModelForwardOutput:
         """Run the target text model and optionally retain target hidden states."""
 
-    def extract_logits(self, model_output: Any) -> Any:
+    def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from raw model output."""
 
     def build_multimodal_adapter(
@@ -258,7 +258,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def target_forward(
         self,
         model: Any,
-        input_ids: Any,
+        input_ids: mx.array,
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
@@ -282,7 +282,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             hidden_states=self._flatten_target_hidden_states(hidden_states),
         )
 
-    def extract_logits(self, model_output: Any) -> Any:
+    def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from mlx-lm arrays or mlx-vlm model outputs."""
         if isinstance(model_output, TargetModelForwardOutput):
             return model_output.logits
@@ -293,10 +293,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _forward_target_hidden_states(
         self,
         model: Any,
-        input_ids: Any,
+        input_ids: mx.array,
         *,
         cache: Any | None,
-    ) -> Any:
+    ) -> mx.array:
         backbone = getattr(model, "model", None)
         if backbone is None:
             raise NotImplementedError(
@@ -305,7 +305,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             )
         return backbone(input_ids, cache=cache)
 
-    def _compute_target_logits(self, model: Any, hidden_states: Any) -> Any:
+    def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:
         if hasattr(model, "compute_logits"):
             return model.compute_logits(hidden_states)
 
@@ -323,10 +323,15 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             logits = lm_head(hidden_states)
             return self._apply_target_logit_postprocessing(model, logits)
 
+        # Some Gemma4-compatible MLX loaders expose tied embedding projection
+        # without setting tie_word_embeddings on the wrapper; try that shape
+        # explicitly, then fail inside _compute_tied_embedding_logits if absent.
         logits = self._compute_tied_embedding_logits(model, hidden_states)
         return self._apply_target_logit_postprocessing(model, logits)
 
-    def _compute_tied_embedding_logits(self, model: Any, hidden_states: Any) -> Any:
+    def _compute_tied_embedding_logits(
+        self, model: Any, hidden_states: mx.array
+    ) -> mx.array:
         backbone = getattr(model, "model", None)
         embed_tokens = getattr(backbone, "embed_tokens", None)
         as_linear = getattr(embed_tokens, "as_linear", None)
@@ -337,12 +342,20 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             )
         return as_linear(hidden_states)
 
-    def _flatten_target_hidden_states(self, hidden_states: Any) -> Any:
-        if len(hidden_states.shape) == 3 and hidden_states.shape[0] == 1:
+    def _flatten_target_hidden_states(self, hidden_states: mx.array) -> mx.array:
+        ndim = len(hidden_states.shape)
+        if ndim == 2:
+            return hidden_states
+        if ndim == 3 and hidden_states.shape[0] == 1:
             return hidden_states[0]
-        return hidden_states
+        raise ValueError(
+            "Target hidden states must be row-major [num_tokens, hidden_size] "
+            "or single-batch [1, num_tokens, hidden_size]."
+        )
 
-    def _apply_target_logit_postprocessing(self, model: Any, logits: Any) -> Any:
+    def _apply_target_logit_postprocessing(
+        self, model: Any, logits: mx.array
+    ) -> mx.array:
         softcap = getattr(model, "final_logit_softcapping", None)
         if softcap is None:
             return logits

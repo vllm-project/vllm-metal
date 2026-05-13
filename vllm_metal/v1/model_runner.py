@@ -810,6 +810,8 @@ class MetalModelRunner:
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
+        # prompt_len=None marks an intermediate prefill chunk; only final
+        # prefill rows can seed the next Gemma4 MTP draft step.
         collect_target_hidden_states = (
             self._spec_decode_controller.needs_target_hidden_states(
                 decode_segments,
@@ -930,6 +932,8 @@ class MetalModelRunner:
 
         # ---- wait for MLX forward to complete ----
         if target_hidden_states is not None:
+            # The Gemma4 MTP assistant drafter will consume these rows after
+            # sampling; evaluate them with logits so the retained state is ready.
             mx.eval(logits, target_hidden_states)
         else:
             mx.eval(logits)
