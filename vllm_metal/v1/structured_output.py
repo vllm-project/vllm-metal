@@ -206,10 +206,15 @@ class MetalStructuredOutputApplier:
             seen_req_ids.add(req_id)
 
             rows = row_targets.get(req_id)
-            row_count = len(rows) if rows else 1
+            if rows is None:
+                raise ValueError(
+                    f"Grammar bitmask references {req_id!r}, but that request "
+                    "has no paged logits rows in the current batch."
+                )
+            row_count = len(rows)
             end_bitmask_row = bitmask_row + row_count
             if end_bitmask_row > grammar_bitmask_row_count:
-                if rows and len(rows) > 1:
+                if len(rows) > 1:
                     raise NotImplementedError(
                         "Row-span structured-output masking requires one grammar "
                         "bitmask row per logits row for request "
@@ -221,9 +226,8 @@ class MetalStructuredOutputApplier:
                     f"for request {req_id!r}: got {grammar_bitmask_row_count} total "
                     f"bitmask rows, needed at least {end_bitmask_row}."
                 )
-            if rows:
-                for row_offset, row in enumerate(rows):
-                    constrained.append((row, bitmask_row + row_offset))
+            for row_offset, row in enumerate(rows):
+                constrained.append((row, bitmask_row + row_offset))
             bitmask_row = end_bitmask_row
 
         if bitmask_row != grammar_bitmask_row_count:

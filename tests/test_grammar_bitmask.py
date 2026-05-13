@@ -413,6 +413,50 @@ class TestApplyGrammarBitmaskPaged:
                 decode_segments=segments,
             )
 
+    def test_row_span_metadata_rejects_missing_row_target(self) -> None:
+        """Row-span masking must not infer bitmask consumption for absent requests."""
+        decode_reqs = [_make_decode_req("a")]
+        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        segments = SpeculativeDecodeController().build_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1},
+        )
+        logits = _uniform_logits_3d(3)
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3},
+            total_num_scheduled_tokens=3,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(
+            ["a", "missing"],
+            np.vstack(
+                [
+                    _make_single_token_bitmask(7),
+                    _make_single_token_bitmask(8),
+                    _make_single_token_bitmask(9),
+                    _make_single_token_bitmask(10),
+                ]
+            ),
+        )
+
+        with pytest.raises(ValueError, match="Grammar bitmask references 'missing'"):
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                len(segments),
+                logits,
+                decode_segments=segments,
+            )
+
     def test_no_constrained_requests_returns_unchanged_logits(self) -> None:
         """If no scheduled request has grammar constraints, logits are returned as-is."""
         data = np.random.randn(1, 2, VOCAB_SIZE).astype(np.float32)
