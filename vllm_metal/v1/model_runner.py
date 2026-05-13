@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
@@ -36,6 +37,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.multimodal import merge_multimodal_embeddings
+from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
@@ -124,6 +127,10 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
+    # M-RoPE position delta stashed by mm prefill; ``None`` for text-only
+    # requests and used by paged decode to rebuild ``(3, 1, 1)`` positions
+    # at ``len(token_ids) - 1 + delta``.
+    mrope_position_delta: int | None = None
 
 
 class PrefillRequest(NamedTuple):
@@ -207,6 +214,11 @@ class _PagedForwardState(NamedTuple):
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
     num_decode_tokens: int
+    # ``{req_id: mrope_position_delta}`` computed during a paged mm
+    # prefill forward.  ``_sample_paged_batch`` writes the delta onto
+    # the request's ``RequestState`` so later decode steps can rebuild
+    # M-RoPE positions; empty for text-only batches.
+    mm_prefill_deltas: dict[str, int]
 
 
 class MetalModelRunner:
@@ -884,9 +896,10 @@ class MetalModelRunner:
         # ---- forward (lazy graph + async submit) ----
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
+        mm_prefill_deltas: dict[str, int] = {}
         try:
             if has_mm:
-                model_output = self._run_mm_paged_forward(
+                model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
                     prefill_reqs,
@@ -930,6 +943,7 @@ class MetalModelRunner:
             cu_seqlens=cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
+            mm_prefill_deltas=mm_prefill_deltas,
         )
 
     def _sample_paged_batch(
@@ -941,19 +955,20 @@ class MetalModelRunner:
         Consumes state stashed by ``_start_paged_forward``.
         Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
-        state = self._execute_model_state
-        assert state is not None
+        paged_state = self._execute_model_state
+        assert paged_state is not None
         self._execute_model_state = None
-        batch = state.batch
-        prefill_reqs = state.prefill_reqs
-        decode_reqs = state.decode_reqs
-        scheduler_output = state.scheduler_output
-        logits = state.logits
-        target_hidden_states = state.target_hidden_states
-        cu_seqlens = state.cu_seqlens
-        decode_segments = state.decode_segments
+        batch = paged_state.batch
+        prefill_reqs = paged_state.prefill_reqs
+        decode_reqs = paged_state.decode_reqs
+        scheduler_output = paged_state.scheduler_output
+        logits = paged_state.logits
+        target_hidden_states = paged_state.target_hidden_states
+        cu_seqlens = paged_state.cu_seqlens
+        decode_segments = paged_state.decode_segments
         num_decode_segments = len(decode_segments)
-        num_decode_tokens = state.num_decode_tokens
+        num_decode_tokens = paged_state.num_decode_tokens
+        mm_prefill_deltas = paged_state.mm_prefill_deltas
         has_scheduled_drafts = any(
             segment.draft_token_ids for segment in decode_segments
         )
@@ -1108,6 +1123,7 @@ class MetalModelRunner:
                 continue
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
+            mm_delta = mm_prefill_deltas.get(prefill.req_id)
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
@@ -1124,12 +1140,19 @@ class MetalModelRunner:
                     generator=prefill.generator,
                     generated_tokens=1,
                     block_ids=prefill.block_ids,
+                    mrope_position_delta=mm_delta,
                 )
                 continue
 
             req_state = self._request_states[prefill.req_id]
             req_state.token_ids.append(next_token)
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
+            if mm_delta is not None:
+                # cached_final for an mm request: stash the freshly
+                # computed delta so the next decode round routes through
+                # the mm path.  ``_run_mm_paged_forward`` recomputes per
+                # step, so the value is always current.
+                req_state.mrope_position_delta = mm_delta
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
             logprobs = (
@@ -1269,7 +1292,7 @@ class MetalModelRunner:
         offset_caches: list[OffsetCache],
         prefill_reqs: list[PrefillRequest],
         decode_segments: tuple[PagedDecodeSegment, ...],
-    ) -> Any:
+    ) -> tuple[Any, dict[str, int]]:
         """Run paged forward through ``adapter.call_lm`` with packed splice.
 
         Builds per-segment M-RoPE positions (sliced out of the full-prompt
@@ -1462,7 +1485,11 @@ class MetalModelRunner:
         if ctx is not None:
             ctx.segment_positions = ctx_segment_positions
 
-        return adapter.call_lm(
+        mm_prefill_deltas = {
+            req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
+        }
+
+        model_output = adapter.call_lm(
             input_ids,
             inputs_embeds,
             offset_caches,
@@ -1470,6 +1497,7 @@ class MetalModelRunner:
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        return model_output, mm_prefill_deltas
 
     def _handle_new_requests(
         self,

@@ -429,6 +429,143 @@ class TestDeepstackPerChunkSlice:
         ).item()
 
 
+class TestMmPrefillDeltaRoundTrip:
+    """``_start_paged_forward`` → ``_sample_paged_batch`` round-trip.
+
+    The mm prefill's ``mrope_position_delta`` must land on the new
+    ``RequestState`` so the next paged round routes through the mm
+    decode path; otherwise the next round would treat the request as
+    text-only and produce wrong M-RoPE positions.
+    """
+
+    def _patch_sampling(self, monkeypatch, prefill_tokens, decode_tokens):
+        import vllm_metal.v1.model_runner as mr
+        from vllm_metal.v1.sampling_batch import _SamplingResult
+
+        monkeypatch.setattr(
+            mr,
+            "sample_prefill_tokens",
+            lambda *a, **kw: _SamplingResult(prefill_tokens, None),
+        )
+        monkeypatch.setattr(
+            mr,
+            "sample_decode_tokens",
+            lambda *a, **kw: _SamplingResult(decode_tokens, None),
+        )
+
+    def test_new_final_mm_prefill_writes_delta_to_request_state(
+        self, monkeypatch
+    ) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        features = [_feature("img-0", offset=0, length=1)]
+        runner.encoder_cache.add_request("req-0", features)
+        _put_encode(runner, "img-0", hidden_states=mx.ones((1, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        prefill = _mm_prefill(
+            "req-0",
+            token_ids=[99, 11],
+            prompt_len=2,
+            start_pos=0,
+            full_prompt=[99, 11],
+        )
+
+        # Use the runner's real ExecutionBatch path so the postprocess
+        # iterates ``paged_prefill_entries``.
+        from vllm_metal.v1.model_runner import (
+            _ExecutionBatch,
+            _PendingPrefillEntry,
+        )
+
+        batch = _ExecutionBatch()
+        entry = _PendingPrefillEntry(
+            output_idx=batch.add_output("req-0", []),
+            prefill=prefill,
+            result_mode="new_final",
+        )
+        batch.paged_prefill_entries.append(entry)
+
+        runner._start_paged_forward(
+            batch=batch,
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        # mm_prefill_deltas stashed on _PagedForwardState.
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.mm_prefill_deltas == {"req-0": -2}
+
+        # Run _sample_paged_batch to drive postprocess; patch sampling
+        # to bypass the real sampler stack.
+        self._patch_sampling(monkeypatch, prefill_tokens=[42], decode_tokens=[])
+        runner._sample_paged_batch()
+
+        new_state = runner._request_states["req-0"]
+        assert new_state.mrope_position_delta == -2
+        # Sanity: token_ids = full_prompt + [next_token]
+        assert new_state.token_ids == [99, 11, 42]
+
+    def test_cached_final_mm_prefill_updates_existing_state_delta(
+        self, monkeypatch
+    ) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        features = [_feature("img-0", offset=0, length=1)]
+        runner.encoder_cache.add_request("req-0", features)
+        _put_encode(runner, "img-0", hidden_states=mx.ones((1, adapter.hidden_size)))
+        # Pre-existing state from a prior intermediate chunk — delta
+        # not yet stashed (mirrors the gap this fix closes).
+        runner._request_states["req-0"] = RequestState(
+            token_ids=[99, 11],  # prompt only (no sampled token yet)
+            prompt_len=2,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            mrope_position_delta=None,
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        prefill = _mm_prefill(
+            "req-0",
+            token_ids=[11],  # final continuation chunk
+            prompt_len=2,
+            start_pos=1,
+            full_prompt=[99, 11],
+        )
+
+        from vllm_metal.v1.model_runner import (
+            _ExecutionBatch,
+            _PendingPrefillEntry,
+        )
+
+        batch = _ExecutionBatch()
+        entry = _PendingPrefillEntry(
+            output_idx=batch.add_output("req-0", []),
+            prefill=prefill,
+            result_mode="cached_final",
+        )
+        batch.paged_prefill_entries.append(entry)
+
+        runner._start_paged_forward(
+            batch=batch,
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        self._patch_sampling(monkeypatch, prefill_tokens=[42], decode_tokens=[])
+        runner._sample_paged_batch()
+
+        state = runner._request_states["req-0"]
+        assert state.mrope_position_delta == -2
+
+
 class TestMmPrefillFullPromptRequired:
     def test_raises_when_full_prompt_missing(self) -> None:
         adapter = _MmAdapter()

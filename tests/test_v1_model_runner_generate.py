@@ -233,6 +233,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             ],
             decode_segments=decode_segments,
             num_decode_tokens=sum(s.num_query_tokens for s in decode_segments),
+            mm_prefill_deltas={},
         )
 
     def test_start_paged_forward_includes_scheduled_drafts(self, monkeypatch) -> None:
