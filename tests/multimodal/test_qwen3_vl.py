@@ -129,16 +129,23 @@ class TestQwen3VLMultimodalAdapterValidation:
 
 
 class TestQwen3VLMultimodalAdapterPositions:
+    def test_empty_positions_carry_batch_axis(self) -> None:
+        positions, delta = _adapter().get_mrope_input_positions([], [])
+
+        assert positions.shape == (3, 1, 0)
+        assert delta == 0
+
     def test_text_only_positions(self) -> None:
         positions, delta = _adapter().get_mrope_input_positions(
             [_TEXT_TOKEN_ID] * 4,
             [],
         )
-        assert positions.tolist() == [[0, 1, 2, 3]] * 3
+        assert positions.shape == (3, 1, 4)
+        assert positions.tolist() == [[[0, 1, 2, 3]]] * 3
         assert delta == 0
 
     @pytest.mark.parametrize(
-        ("text_before", "text_after", "expected_positions", "expected_delta"),
+        ("text_before", "text_after", "expected_rows", "expected_delta"),
         [
             pytest.param(
                 0,
@@ -179,7 +186,7 @@ class TestQwen3VLMultimodalAdapterPositions:
         self,
         text_before: int,
         text_after: int,
-        expected_positions: list[list[int]],
+        expected_rows: list[list[int]],
         expected_delta: int,
     ) -> None:
         tokens = _single_image_tokens(
@@ -193,7 +200,8 @@ class TestQwen3VLMultimodalAdapterPositions:
 
         positions, delta = _adapter().get_mrope_input_positions(tokens, [feature])
 
-        assert positions.tolist() == expected_positions
+        assert positions.shape == (3, 1, len(tokens))
+        assert positions.tolist() == [[row] for row in expected_rows]
         assert delta == expected_delta
 
     def test_multi_image_positions_preserve_feature_offsets(self) -> None:
@@ -211,10 +219,11 @@ class TestQwen3VLMultimodalAdapterPositions:
 
         positions, delta = _adapter().get_mrope_input_positions(tokens, features)
 
+        assert positions.shape == (3, 1, len(tokens))
         assert positions.tolist() == [
-            [0, 1, 1, 1, 1, 3, 4, 4, 4, 4, 6],
-            [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6],
-            [0, 1, 2, 1, 2, 3, 4, 5, 4, 5, 6],
+            [[0, 1, 1, 1, 1, 3, 4, 4, 4, 4, 6]],
+            [[0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6]],
+            [[0, 1, 2, 1, 2, 3, 4, 5, 4, 5, 6]],
         ]
         assert delta == -4
 

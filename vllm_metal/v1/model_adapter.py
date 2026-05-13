@@ -65,7 +65,14 @@ class MultimodalRuntimeAdapter(Protocol):
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[Any, int]:
-        """Return model-specific M-RoPE positions for multimodal inputs."""
+        """Return ``((3, 1, seq_len) positions, mrope_position_delta)``.
+
+        Positions carry an explicit batch axis so ``call_lm`` receives the
+        ``(3, batch, seq_len)`` layout mlx-vlm's Qwen3-VL language model
+        expects; decode reshapes the runtime offset to ``(3, B, 1)``.
+        ``mrope_position_delta`` is request state — the runner must stash
+        it on ``RequestState`` so decode positions stay correct.
+        """
 
     def encode_multimodal(
         self,
