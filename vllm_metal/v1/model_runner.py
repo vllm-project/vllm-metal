@@ -1399,17 +1399,36 @@ class MetalModelRunner:
 
             batch.paged_decode_reqs.append((req_id, state))
 
+    def _is_mm_request(self, req_id: str) -> bool:
+        """Whether the request has multimodal features registered."""
+        if self.encoder_cache is None:
+            return False
+        return bool(self.encoder_cache.mm_features.get(req_id))
+
     def _build_prefill_pack(
         self,
         batch: _ExecutionBatch,
     ) -> list[PrefillRequest]:
-        """Reconstruct full prompt context for paged prefill requests."""
+        """Reconstruct full prompt context for paged prefill requests.
+
+        Continuation chunks (``start_pos > 0``) need the full prompt so
+        sampling metadata reflects the whole prefix, not just this chunk.
+        Multimodal requests need it at every chunk including the first —
+        ``adapter.get_mrope_input_positions`` must see the whole prompt
+        to compute correct M-RoPE positions for image placeholders, then
+        a later commit slices the chunk-relevant range.  Both conditions
+        share the same two-source resolution (RequestState first, new_req
+        fallback) and the same contract-bug raises.
+        """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
             prefill = entry.prefill
             full_prompt = None
 
-            if prefill.start_pos > 0:
+            needs_full_prompt = (
+                prefill.start_pos > 0 or self._is_mm_request(prefill.req_id)
+            )
+            if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)
                 if state is not None:
                     full_prompt = state.token_ids[: state.prompt_len]
@@ -1417,16 +1436,19 @@ class MetalModelRunner:
                     new_req = batch.new_reqs_by_id.get(prefill.req_id)
                     if new_req is None:
                         raise RuntimeError(
-                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
-                            f"request {prefill.req_id!r} but it has no RequestState "
-                            "and is not in new_reqs. This is a state tracking bug."
+                            f"Need full prompt (start_pos={prefill.start_pos}, "
+                            f"mm={self._is_mm_request(prefill.req_id)}) for "
+                            f"request {prefill.req_id!r} but it has no "
+                            f"RequestState and is not in new_reqs. This is a "
+                            f"state tracking bug."
                         )
                     prompt_token_ids = new_req.prompt_token_ids
                     if prompt_token_ids is None:
                         raise RuntimeError(
-                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
-                            f"request {prefill.req_id!r} but prompt_token_ids is "
-                            "missing. This is a scheduler contract bug."
+                            f"Need full prompt (start_pos={prefill.start_pos}, "
+                            f"mm={self._is_mm_request(prefill.req_id)}) for "
+                            f"request {prefill.req_id!r} but prompt_token_ids "
+                            f"is missing. This is a scheduler contract bug."
                         )
                     full_prompt = list(prompt_token_ids)
 
