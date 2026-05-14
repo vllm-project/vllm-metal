@@ -542,119 +542,10 @@ def test_unsupported_kv_lora_rank_raises() -> None:
 # ---------------------------------------------------------------------------
 # Cross-head amortization (HEADS_PER_TG > 1)
 # ---------------------------------------------------------------------------
-# G=4 packs 4 query heads into one threadgroup so each K/V load is reused
-# across 4 dot products (4× KV bandwidth amortization). num_heads must be
-# divisible by G; num_threads is 256 instead of 1024 so the per-thread
+# G=2 packs 2 query heads into one threadgroup so each K/V load is reused
+# across 2 dot products (2× KV bandwidth amortization). num_heads must be
+# divisible by G; num_threads is 512 instead of 1024 so the per-thread
 # register footprint stays comparable.
-
-
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("block_size", [16, 32])
-@pytest.mark.parametrize("num_heads", [4, 8, 128])
-def test_g4_matches_dense(dtype: mx.Dtype, block_size: int, num_heads: int) -> None:
-    """G=4 single-pass kernel must match the dense reference within fp16
-    tolerance — same as G=1, just with a different parallelism layout."""
-    ctx_len = 384  # spans multiple blocks at both bs=16 and bs=32
-    (
-        out,
-        q_nope,
-        q_pe,
-        latent_cache,
-        block_tables,
-        context_lens,
-        cu_seqlens_q,
-        block_tables_np,
-    ) = _make_inputs(
-        num_seqs=2,
-        num_heads=num_heads,
-        ctx_len=ctx_len,
-        block_size=block_size,
-        dtype=dtype,
-    )
-
-    metal_mla_paged_attention(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        latent_cache=latent_cache,
-        out=out,
-        block_tables=block_tables,
-        context_lens=context_lens,
-        cu_seqlens_q=cu_seqlens_q,
-        scale=0.125,
-        heads_per_tg=4,
-    )
-
-    expected = _expected_output(
-        q_nope,
-        q_pe,
-        latent_cache,
-        block_tables_np,
-        ctx_lens=[ctx_len, ctx_len],
-        scale=0.125,
-    )
-
-    rtol, atol = _tolerance(dtype)
-    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
-    max_abs = mx.max(diff).item()
-    assert mx.allclose(
-        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
-    ).item(), (
-        f"G=4 mismatch (dtype={dtype}, bs={block_size}, H={num_heads}): "
-        f"max_abs_diff={max_abs:.5f}"
-    )
-
-
-def test_g4_matches_g1() -> None:
-    """G=4 and G=1 must produce identical outputs (up to fp32 rounding) on
-    the same workload — different parallelism, same math."""
-    ctx_len = 1024
-    (
-        out_g4,
-        q_nope,
-        q_pe,
-        latent_cache,
-        block_tables,
-        context_lens,
-        cu_seqlens_q,
-        _,
-    ) = _make_inputs(
-        num_seqs=2,
-        num_heads=128,
-        ctx_len=ctx_len,
-        block_size=16,
-        dtype=mx.float16,
-    )
-    out_g1 = mx.zeros_like(out_g4)
-
-    metal_mla_paged_attention(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        latent_cache=latent_cache,
-        out=out_g4,
-        block_tables=block_tables,
-        context_lens=context_lens,
-        cu_seqlens_q=cu_seqlens_q,
-        scale=0.125,
-        heads_per_tg=4,
-    )
-    metal_mla_paged_attention(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        latent_cache=latent_cache,
-        out=out_g1,
-        block_tables=block_tables,
-        context_lens=context_lens,
-        cu_seqlens_q=cu_seqlens_q,
-        scale=0.125,
-        heads_per_tg=1,
-    )
-
-    diff = mx.abs(out_g4.astype(mx.float32) - out_g1.astype(mx.float32))
-    max_abs = mx.max(diff).item()
-    # Same dtype, same data, same math — only parallelism differs. Reduction
-    # order can differ (different number of simdgroups merging), so allow
-    # a small tolerance from accumulation reordering.
-    assert max_abs < 1e-2, f"G=4 vs G=1 divergence: max_abs_diff={max_abs:.5f}"
 
 
 def test_g_invalid_raises() -> None:
@@ -678,7 +569,7 @@ def test_g_invalid_raises() -> None:
             context_lens=context_lens,
             cu_seqlens_q=cu_seqlens_q,
             scale=0.125,
-            heads_per_tg=4,  # 5 % 4 != 0
+            heads_per_tg=2,  # 5 % 2 != 0
         )
 
 

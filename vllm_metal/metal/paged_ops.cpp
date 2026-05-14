@@ -1087,13 +1087,12 @@ void init_mla_library(const std::string& src) {
 // Map heads_per_tg → NUM_THREADS. Each variant keeps the per-thread register
 // footprint roughly constant (NUM_THREADS scaled inversely to G).
 //   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
-//   G=4 → NUM_THREADS=256  (8  simdgroups, 4× cross-head amortization).
+//   G=2 → NUM_THREADS=512  (16 simdgroups, 2× cross-head amortization).
 // Returns 0 for an unsupported G so callers can validate.
 static int mla_num_threads_for_g(int heads_per_tg) {
   switch (heads_per_tg) {
     case 1: return 1024;
     case 2: return 512;
-    case 4: return 256;
     default: return 0;
   }
 }
@@ -1139,7 +1138,7 @@ static void dispatch_mla_paged_attention(
   int num_threads = mla_num_threads_for_g(heads_per_tg);
   if (num_threads == 0) {
     throw std::runtime_error(
-        "MLA kernel: heads_per_tg must be in {1, 2, 4}; got " +
+        "MLA kernel: heads_per_tg must be in {1, 2}; got " +
         std::to_string(heads_per_tg));
   }
   if (num_heads % heads_per_tg != 0) {

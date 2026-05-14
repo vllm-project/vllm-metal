@@ -395,9 +395,3 @@ instantiate_mla(half, 512, 64, 16, 2, 512, 0);
 instantiate_mla(half, 512, 64, 32, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 0);
-
-// G=4 (4 heads per TG, NUM_THREADS=256). 4× KV-bandwidth amortization.
-instantiate_mla(half, 512, 64, 16, 4, 256, 0);
-instantiate_mla(half, 512, 64, 32, 4, 256, 0);
-instantiate_mla(bfloat16_t, 512, 64, 16, 4, 256, 0);
-instantiate_mla(bfloat16_t, 512, 64, 32, 4, 256, 0);
