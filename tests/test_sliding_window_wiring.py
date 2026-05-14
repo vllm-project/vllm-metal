@@ -11,11 +11,9 @@ Verifies the full chain from model config to Metal KV cache:
       -> MetalPagedKVCache.sliding_window_per_layer
 
 Kernel-level correctness (that a ``sliding_window`` value actually
-masks out-of-window tokens) is separately validated by
-``test_metal_unified_attn`` in ``test_metal_unified_attention.py``;
-both the production ``paged_attention_primitive`` and the test helper
-``metal_unified_attention`` dispatch to the same
-``paged_attention_v2_online`` kernel (see ``paged_ops.cpp``).
+masks out-of-window tokens) is validated via the production
+``paged_attention_primitive`` path which dispatches
+``paged_attention_v2_online`` (see ``paged_ops.cpp``).
 """
 
 from __future__ import annotations
