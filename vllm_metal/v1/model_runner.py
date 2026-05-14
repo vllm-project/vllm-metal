@@ -127,9 +127,8 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
-    # M-RoPE position delta stashed by mm prefill; ``None`` for text-only
-    # requests and used by paged decode to rebuild ``(3, 1, 1)`` positions
-    # at ``len(token_ids) - 1 + delta``.
+    # Decode reconstructs M-RoPE positions as
+    # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
     mrope_position_delta: int | None = None
 
 
@@ -214,10 +213,8 @@ class _PagedForwardState(NamedTuple):
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
     num_decode_tokens: int
-    # ``{req_id: mrope_position_delta}`` computed during a paged mm
-    # prefill forward.  ``_sample_paged_batch`` writes the delta onto
-    # the request's ``RequestState`` so later decode steps can rebuild
-    # M-RoPE positions; empty for text-only batches.
+    # ``{req_id: mrope_position_delta}`` from paged mm prefill;
+    # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
 
 
@@ -833,12 +830,10 @@ class MetalModelRunner:
             )
         )
 
-        # Detect multimodal segments.  Mirror C's non-paged fail-fast: an
-        # mm request reaching here without a ``forward_ready`` adapter is
-        # a bookkeeping bug (the encoder gate only catches fresh-encode
-        # cases — a continuation chunk whose vision features were encoded
-        # in a prior step has no scheduled encoder input and would
-        # otherwise slip through to the text path).
+        # Fail fast on mm requests reaching the paged path without a
+        # forward-ready adapter: continuation chunks whose vision features
+        # were encoded earlier have no scheduled encoder input and would
+        # otherwise slip through to the text path.
         has_mm_prefill = any(self._is_mm_request(pr.req_id) for pr in prefill_reqs)
         has_mm_decode = any(
             state.mrope_position_delta is not None for _, state in decode_reqs
@@ -1148,10 +1143,8 @@ class MetalModelRunner:
             req_state.token_ids.append(next_token)
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
             if mm_delta is not None:
-                # cached_final for an mm request: stash the freshly
-                # computed delta so the next decode round routes through
-                # the mm path.  ``_run_mm_paged_forward`` recomputes per
-                # step, so the value is always current.
+                # Stash the freshly computed delta so the next decode round
+                # routes through the mm path.
                 req_state.mrope_position_delta = mm_delta
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
@@ -1316,10 +1309,7 @@ class MetalModelRunner:
         encoder_cache = self.encoder_cache
         assert encoder_cache is not None
 
-        # Pre-compute full-prompt M-RoPE positions per mm prefill request.
-        # Chunked prefill of the same request would only appear once in
-        # ``prefill_reqs`` per step, so per-request caching here is for
-        # clarity rather than work avoidance.
+        # Full-prompt M-RoPE positions per mm prefill request.
         mm_request_meta: dict[
             str, tuple[mx.array, int, list[MultiModalFeatureSpec]]
         ] = {}
@@ -1348,7 +1338,6 @@ class MetalModelRunner:
         position_ids_parts: list[mx.array] = []
         cursor = 0
 
-        # Decode segments come first in the packed sequence.
         for segment in decode_segments:
             n = segment.num_query_tokens
             state = self._request_states.get(segment.req_id)
@@ -1374,7 +1363,6 @@ class MetalModelRunner:
             position_ids_parts.append(seg_positions)
             cursor += n
 
-        # Prefill segments follow.
         for pr in prefill_reqs:
             n = len(pr.token_ids)
             if pr.req_id in mm_request_meta:
@@ -1383,7 +1371,6 @@ class MetalModelRunner:
                 ctx_segment_positions.append(seg_positions)
                 position_ids_parts.append(seg_positions)
 
-                # Splice each feature's chunk-intersecting slice.
                 for feature in sorted_features:
                     f_start = feature.mm_position.offset
                     f_end = f_start + feature.mm_position.length
@@ -1405,17 +1392,14 @@ class MetalModelRunner:
                             f"gate should have populated it before prefill."
                         )
 
-                    # Pack-coord mask range for this feature/chunk slice.
                     packed_start = cursor + chunk_local
                     visual_pos_masks_np[packed_start : packed_start + length] = True
 
-                    # Hidden states slice.
                     mm_embeds_parts.append(
                         result.hidden_states[feature_local : feature_local + length]
                     )
 
-                    # Deepstack: same chunk-aware slice per layer; reject
-                    # mixed presence across features in this request.
+                    # Deepstack: same chunk-aware slice per layer.
                     layers = result.deepstack_visual_embeds
                     this_has = layers is not None
                     if deepstack_present is None:
@@ -1449,8 +1433,8 @@ class MetalModelRunner:
                                 layer[feature_local : feature_local + length]
                             )
             else:
-                # text prefill: arange positions, but mark segment as None
-                # so attention falls back to the int-offset arange path.
+                # text prefill: mark segment as None so attention uses the
+                # int-offset arange path.
                 offset_arr = np.arange(pr.start_pos, pr.start_pos + n, dtype=np.int32)
                 seg_positions = mx.broadcast_to(
                     mx.array(offset_arr)[None, None, :], (3, 1, n)
@@ -1459,7 +1443,6 @@ class MetalModelRunner:
                 position_ids_parts.append(seg_positions)
             cursor += n
 
-        # Build spliced inputs_embeds + packed position_ids.
         inputs_embeds_text = adapter.embed_tokens(input_ids)
         visual_pos_masks = mx.array(visual_pos_masks_np)[None, :]
         if mm_embeds_parts:
@@ -1478,9 +1461,8 @@ class MetalModelRunner:
 
         position_ids = mx.concatenate(position_ids_parts, axis=2)
 
-        # Thread per-segment positions into the paged context so
-        # ``apply_packed_rope`` reads caller-supplied positions on mm
-        # segments instead of the sequential-arange policy.
+        # Hand per-segment positions to ``apply_packed_rope`` via the
+        # paged context, overriding the sequential-arange policy.
         ctx = get_context()
         if ctx is not None:
             ctx.segment_positions = ctx_segment_positions

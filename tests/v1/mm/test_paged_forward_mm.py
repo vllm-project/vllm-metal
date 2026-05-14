@@ -519,7 +519,7 @@ class TestMmPrefillDeltaRoundTrip:
         runner.encoder_cache.add_request("req-0", features)
         _put_encode(runner, "img-0", hidden_states=mx.ones((1, adapter.hidden_size)))
         # Pre-existing state from a prior intermediate chunk — delta
-        # not yet stashed (mirrors the gap this fix closes).
+        # not yet stashed.
         runner._request_states["req-0"] = RequestState(
             token_ids=[99, 11],  # prompt only (no sampled token yet)
             prompt_len=2,

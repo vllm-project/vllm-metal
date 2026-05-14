@@ -52,13 +52,10 @@ class PagedAttentionContext:
     # GDN state pool slot mapping: request batch position → stable slot ID.
     # Populated by model_runner for hybrid models; None for non-hybrid.
     gdn_slot_mapping: list[int] | None = None
-    # Per-segment caller-supplied M-RoPE positions.  Each entry is either
-    # ``None`` ("use ``offsets[i]`` with sequential arange" — text
-    # default) or an ``(3, 1, seg_len)`` MLX array overriding the policy
-    # with values the runner sliced out of the full-prompt M-RoPE
-    # positions.  Used by multimodal prefill where image placeholder
-    # positions do not follow the simple arange policy.  ``None`` (the
-    # field itself) skips per-segment handling entirely.
+    # Per-segment caller-supplied M-RoPE positions: each entry is either
+    # ``None`` (use ``offsets[i]`` with sequential arange) or an
+    # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
+    # per-segment handling entirely.
     segment_positions: list[Any] | None = None
 
 

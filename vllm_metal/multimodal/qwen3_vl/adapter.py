@@ -30,11 +30,7 @@ class Qwen3VLMultimodalAdapter:
     """Model-owned multimodal helpers for the Qwen3-VL execution path."""
 
     forward_ready: bool = False
-    """Closed until the Phase 4 parity test against pure mlx_vlm/mlx_lm or
-    upstream vLLM passes (RFC #319).  ``MetalModelRunner`` consults this
-    flag to gate ``_reject_scheduled_encoder_inputs`` so future adapters
-    can land at ``False`` without disturbing the model already in
-    production."""
+    """Closed until parity against ``mlx_vlm.Model.__call__`` passes."""
 
     _SUPPORTED_EMBEDS_KWARGS: tuple[str, ...] = (
         "inputs_embeds",
@@ -93,13 +89,8 @@ class Qwen3VLMultimodalAdapter:
     def _resolve_embed_tokens(cls, language_model: Any) -> Callable[[Any], Any]:
         """Return ``language_model.model.embed_tokens`` or raise.
 
-        mlx-vlm 0.4.x Qwen3-VL/Qwen3.5 routes text embedding through
-        ``language_model.model.embed_tokens`` — the same callable the
-        top-level ``Model.get_input_embeddings`` defers to in text-only
-        mode.  Resolving here keeps the runner away from private model
-        internals (``language_model.model.*`` is not a stable public
-        surface) and converts any rename/restructure into a clear
-        load-time error instead of an attribute-error mid-forward.
+        Resolving at load time turns any rename/restructure into a clear
+        init-time error instead of an attribute-error mid-forward.
         """
         inner = getattr(language_model, "model", None)
         if inner is None:
@@ -120,10 +111,9 @@ class Qwen3VLMultimodalAdapter:
     def _detect_embeds_kwarg(cls, language_model: Any) -> str:
         """Return the embeds keyword accepted by ``language_model.__call__``.
 
-        mlx_vlm 0.4.x uses ``inputs_embeds``; sniffing the signature at adapter
-        construction lets future renames (``input_embeddings``) surface as a
-        clear init-time error rather than silently wrong attention.  RFC #319
-        risk #1.
+        Sniffing at load time turns a rename (``inputs_embeds`` →
+        ``input_embeddings``) into a clear init-time error rather than
+        silently wrong attention.
         """
         try:
             sig = inspect.signature(language_model.__call__)
@@ -145,12 +135,8 @@ class Qwen3VLMultimodalAdapter:
     def _detect_deepstack_kwargs(cls, language_model: Any) -> bool:
         """Return True iff the LM declares both deepstack params explicitly.
 
-        mlx-vlm 0.5.x Qwen3-VL's ``LanguageModel.__call__`` takes
-        ``visual_pos_masks`` and ``deepstack_visual_embeds`` as named
-        parameters and runs ``_deepstack_process``; 0.4.x's qwen3_5 LM
-        exposes only ``**kwargs``.  Only the explicit form counts as
-        support, so a LM with ``**kwargs`` does not silently absorb
-        deepstack arrays into a dropped catch-all.
+        Only the explicit form counts; a LM with just ``**kwargs`` would
+        silently absorb the arrays without injecting deepstack residuals.
         """
         try:
             sig = inspect.signature(language_model.__call__)
@@ -172,10 +158,8 @@ class Qwen3VLMultimodalAdapter:
     def embed_tokens(self, input_ids: mx.array) -> mx.array:
         """Return the language model's input embeddings for ``input_ids``.
 
-        Forwards to the callable resolved at ``from_loaded_model`` time so
-        the runner does not reach into private model internals.  Construct
-        via :meth:`from_loaded_model` for the resolution; manually built
-        instances (e.g. unit tests) must pass ``embed_tokens_fn``.
+        Construct via :meth:`from_loaded_model` so the callable is resolved
+        at load time; manually built instances must pass ``embed_tokens_fn``.
         """
         if self._embed_tokens_fn is None:
             raise RuntimeError(
@@ -191,13 +175,10 @@ class Qwen3VLMultimodalAdapter:
     ) -> list[Qwen3VLVisionEncodeResult]:
         """Run the vision tower per feature; return one result per feature.
 
-        RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__``; route
-        through ``vision_tower`` directly so the LM is not re-entered through
-        the top-level VLM dispatch.  The vision tower returns
-        ``(hidden_states, deepstack_visual_embeds)``.  mlx-vlm 0.4.x returns
-        ``None`` for deepstack because of its reference bug; preserving the
-        field here keeps the adapter contract ready for the mlx-vlm 0.5.x
-        dependency unlock without enabling multimodal forward yet.
+        Calls ``vision_tower`` directly rather than ``mlx_vlm.Model.__call__``
+        so the LM is not re-entered through the top-level VLM dispatch.
+        ``deepstack_visual_embeds`` may be ``None`` when the tower does not
+        expose per-layer residuals.
         """
         if self._vision_tower is None:
             raise RuntimeError(
@@ -224,12 +205,9 @@ class Qwen3VLMultimodalAdapter:
             pixel_values = self._as_mlx(
                 self._feature_value(feature.data, "pixel_values")
             ).astype(target_dtype)
-            # vLLM's MultiModalFieldConfig.batched delivers per-feature
-            # grid_thw as a 1D ``(3,)`` row, but the mlx_vlm vision tower
-            # indexes it as ``grid_thw[i, 1:]`` and reads
-            # ``grid_thw.shape[0]``, so reshape back to ``(1, 3)``.  One
-            # feature carries one image in this PR series; multi-image is
-            # already gated by ``_validate_image_features``.
+            # vLLM delivers per-feature grid_thw as a 1D ``(3,)`` row, but
+            # the mlx_vlm vision tower indexes ``grid_thw[i, 1:]`` and reads
+            # ``grid_thw.shape[0]``; reshape back to ``(1, 3)``.
             image_grid_thw = self._as_mlx(
                 self._feature_value(feature.data, "image_grid_thw")
             ).reshape(1, 3)
@@ -259,18 +237,10 @@ class Qwen3VLMultimodalAdapter:
     ) -> Any:
         """Invoke ``language_model`` with runner-built embeds and positions.
 
-        ``language_model`` is invoked directly rather than through the
-        top-level ``mlx_vlm.Model.__call__`` (RFC #319 hard rule #1), and the
-        embeds keyword is the one sniffed at construction so version drift
-        between ``inputs_embeds`` and ``input_embeddings`` surfaces at load
-        time instead of inside attention.
-
-        ``visual_pos_masks`` and ``deepstack_visual_embeds`` are forwarded
-        only when the language model declares both deepstack parameters
-        explicitly (mlx-vlm 0.5.x).  On 0.4.x qwen3_5 the LM signature
-        exposes only ``**kwargs``; passing arrays into that catch-all
-        would silently drop them, so the adapter omits the kwargs entirely
-        instead of relying on the LM's tolerance.
+        Calls ``language_model`` directly rather than through the top-level
+        ``mlx_vlm.Model.__call__``.  Deepstack kwargs are forwarded only
+        when the LM declares both as explicit parameters; otherwise they
+        are omitted to avoid silently dropping arrays into ``**kwargs``.
         """
         if self._language_model is None:
             raise RuntimeError(
@@ -313,15 +283,8 @@ class Qwen3VLMultimodalAdapter:
     ) -> tuple[mx.array, int]:
         """Return ``((3, 1, seq_len) int32 positions, mrope_position_delta)``.
 
-        Calls upstream vLLM's mm_features-driven Qwen3-VL M-RoPE helper with a
-        minimal image-only config shim, then converts the returned torch tensor
-        to an MLX array.  This keeps the position-building policy upstream-owned
-        while the vllm-metal runner can consume MLX arrays.
-
-        The batch axis is materialised here so ``call_lm`` receives the
-        ``(3, batch, seq_len)`` layout mlx-vlm's Qwen3-VL language model
-        expects; prefill carries batch=1 and decode reshapes to
-        ``(3, B, 1)``.
+        Delegates to upstream vLLM's Qwen3-VL M-RoPE helper, materialises
+        the batch axis, and returns an MLX array shaped for ``call_lm``.
         """
         if not input_tokens:
             return mx.zeros((3, 1, 0), dtype=mx.int32), 0
@@ -343,13 +306,12 @@ class Qwen3VLMultimodalAdapter:
         self,
         features: list[MultiModalFeatureSpec],
     ) -> None:
-        """Validate the image-only feature shape accepted by this PR series."""
+        """Validate the image-only feature shape accepted by the adapter."""
         for feature in sorted(features, key=lambda feature: feature.mm_position.offset):
             modality = feature.modality
             if modality == "video":
                 raise NotImplementedError(
-                    "Video multimodal features are out of scope for the initial "
-                    "Qwen3.5-4B multimodal PR series."
+                    "Video multimodal features are not yet supported."
                 )
             if modality != "image":
                 raise ValueError(f"Unsupported modality: {modality}")
@@ -360,10 +322,7 @@ class Qwen3VLMultimodalAdapter:
 
             t, h, w = self._grid_thw(feature.data, "image_grid_thw")
             if t != 1:
-                raise ValueError(
-                    "Multi-frame images are out of scope for the initial "
-                    f"Qwen3.5-4B multimodal PR series, got t={t}"
-                )
+                raise ValueError(f"Multi-frame images are not yet supported, got t={t}")
 
             llm_grid_h = h // self._spatial_merge_size
             llm_grid_w = w // self._spatial_merge_size

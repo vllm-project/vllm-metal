@@ -39,13 +39,9 @@ class MultimodalRuntimeAdapter(Protocol):
     forward_ready: bool
     """Whether scheduled multimodal encoder inputs may be executed.
 
-    Phase 4 flips this to ``True`` for the active adapter only after the
-    fixed prompt+image parity test passes (RFC #319).  Until then the
-    runtime gate stays closed and ``MetalModelRunner`` fails fast on
-    scheduled encoder inputs even though the runtime state is already
-    registered.  Threading the gate through the adapter rather than a
-    runner-level flag means a second adapter can land at ``False``
-    without disturbing the model already in production.
+    ``MetalModelRunner`` fails fast on scheduled encoder inputs when this
+    is ``False``, so a new adapter can land closed without disturbing the
+    model already in production.
     """
 
     def text_model(self) -> Any:
@@ -54,10 +50,7 @@ class MultimodalRuntimeAdapter(Protocol):
     def embed_tokens(self, input_ids: Any) -> Any:
         """Return the language model's input embeddings for ``input_ids``.
 
-        Resolved at adapter construction so the runner builds embeds via
-        a stable adapter method instead of reaching into private model
-        internals (``model.language_model.model.embed_tokens`` for mlx-vlm
-        0.4.x).  Returns an MLX array of shape ``(batch, seq_len, hidden)``.
+        Returns an MLX array of shape ``(batch, seq_len, hidden)``.
         """
 
     def get_mrope_input_positions(
@@ -67,11 +60,8 @@ class MultimodalRuntimeAdapter(Protocol):
     ) -> tuple[Any, int]:
         """Return ``((3, 1, seq_len) positions, mrope_position_delta)``.
 
-        Positions carry an explicit batch axis so ``call_lm`` receives the
-        ``(3, batch, seq_len)`` layout mlx-vlm's Qwen3-VL language model
-        expects; decode reshapes the runtime offset to ``(3, B, 1)``.
-        ``mrope_position_delta`` is request state — the runner must stash
-        it on ``RequestState`` so decode positions stay correct.
+        The runner stashes ``mrope_position_delta`` on ``RequestState`` so
+        decode positions stay correct.
         """
 
     def encode_multimodal(
@@ -80,8 +70,6 @@ class MultimodalRuntimeAdapter(Protocol):
     ) -> Sequence[MultimodalEncodeResult]:
         """Run the model's vision tower; return one result per feature.
 
-        RFC #319 hard rule #1: never invoke ``mlx_vlm.Model.__call__`` —
-        the LM must not be re-entered through the top-level VLM dispatch.
         Results may carry optional deepstack visual embeds for models whose
         language model injects vision residuals in intermediate layers.
         """
@@ -98,14 +86,10 @@ class MultimodalRuntimeAdapter(Protocol):
     ) -> Any:
         """Invoke the language model with runner-built embeds and positions.
 
-        The embeds keyword is sniffed at adapter construction so version
-        drift between ``inputs_embeds`` and ``input_embeddings`` surfaces
-        at load time, not silently inside attention.
-
         ``visual_pos_masks`` and ``deepstack_visual_embeds`` are forwarded
-        only on language models that declare both explicitly (mlx-vlm
-        0.5.x Qwen3-VL); LMs that take only ``**kwargs`` would silently
-        absorb the arrays, so the adapter omits these on that path.
+        only when the language model declares both as explicit parameters;
+        adapters omit them otherwise to avoid silently dropping the arrays
+        into a ``**kwargs`` catch-all.
         """
 
 
