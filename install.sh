@@ -179,7 +179,7 @@ EOF
 
   ensure_venv "$venv"
 
-  local vllm_v="0.20.1"
+  local vllm_v="0.20.2"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
   curl -OL $url_base/v$vllm_v/$filename

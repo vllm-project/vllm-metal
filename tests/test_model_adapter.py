@@ -3,12 +3,16 @@
 
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 import vllm_metal.envs as envs
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
-from vllm_metal.v1.model_adapter import DefaultModelAdapter
+from vllm_metal.v1.model_adapter import (
+    DefaultModelAdapter,
+    TargetModelForwardOutput,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -114,6 +118,124 @@ class TestShouldForceTextBackbone:
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(None)
         assert result is False
+
+
+class TestTargetForward:
+    def test_plain_forward_extracts_logits_without_hidden_states(self) -> None:
+        class Model:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        output = DefaultModelAdapter().target_forward(
+            Model(),
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=False,
+        )
+
+        assert isinstance(output, TargetModelForwardOutput)
+        assert output.logits.tolist() == [[[1.0, 2.0]]]
+        assert output.hidden_states is None
+
+    def test_collects_hidden_states_and_recomputes_logits(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[-2.0, 0.0, 2.0]]])
+
+        class Head:
+            def __call__(self, hidden_states):
+                return hidden_states * 3.0
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=Head(),
+            final_logit_softcapping=2.0,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=True,
+        )
+
+        expected_logits = mx.tanh(mx.array([[[-2.0, 0.0, 2.0]]]) * 3.0 / 2.0) * 2.0
+        mx.eval(output.logits, expected_logits)
+        assert output.hidden_states.tolist() == [[-2.0, 0.0, 2.0]]
+        assert mx.allclose(output.logits, expected_logits).item()
+
+    def test_collects_hidden_states_with_model_owned_compute_logits(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        class Model:
+            def __init__(self) -> None:
+                self.model = Backbone()
+                self.final_logit_softcapping = 2.0
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        output = DefaultModelAdapter().target_forward(
+            Model(),
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=True,
+        )
+
+        assert output.hidden_states.tolist() == [[1.0, 2.0]]
+        assert output.logits.tolist() == [[[3.0, 6.0]]]
+
+    def test_collects_hidden_states_with_gemma4_tied_embedding_logits(self) -> None:
+        class Embedding:
+            def as_linear(self, hidden_states):
+                return hidden_states + 5.0
+
+        class Backbone:
+            def __init__(self) -> None:
+                self.embed_tokens = Embedding()
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        model = SimpleNamespace(model=Backbone(), final_logit_softcapping=2.0)
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=True,
+        )
+
+        expected_logits = mx.tanh((mx.array([[[1.0, 2.0]]]) + 5.0) / 2.0) * 2.0
+        mx.eval(output.logits, expected_logits)
+        assert output.hidden_states.tolist() == [[1.0, 2.0]]
+        assert mx.allclose(output.logits, expected_logits).item()
+
+    def test_rejects_batched_target_hidden_states(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.zeros((2, 1, 4))
+
+        class Head:
+            def __call__(self, hidden_states):
+                return hidden_states
+
+        model = SimpleNamespace(model=Backbone(), lm_head=Head())
+
+        with pytest.raises(ValueError, match="row-major"):
+            DefaultModelAdapter().target_forward(
+                model,
+                mx.array([[1]]),
+                cache=[],
+                collect_hidden_states=True,
+            )
 
 
 class TestNormalizeModelConfig:

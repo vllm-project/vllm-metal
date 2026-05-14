@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from types import ModuleType
 
-from vllm_metal.metal.constants import PARTITION_SIZE, PARTITION_THRESHOLD
+from vllm_metal.metal.constants import PARTITION_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -88,108 +88,6 @@ def _build_gdn_source() -> str:
         _read_metal_source(_KERNELS_V2_DIR / "gdn_linear_attention.metal"),
     ]
     return "\n".join(parts)
-
-
-def metal_unified_attention(
-    q,  # [total_q_tokens, num_q_heads, head_size]
-    k,  # [num_blocks, block_size, num_kv_heads, head_size]
-    v,  # [num_blocks, block_size, num_kv_heads, head_size]
-    out,  # [total_q_tokens, num_q_heads, head_size]
-    cu_seqlens_q,  # [num_seqs + 1], int32
-    seqused_k,  # [num_seqs], int32
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    causal: bool,
-    window_size: tuple[int, int],
-    block_table,  # [num_seqs, max_blocks_per_seq], int32
-    softcap: float,
-) -> None:
-    """Unified varlen paged attention for Metal.
-
-    Supports variable-length queries (prefill + decode) with online softmax,
-    paged KV cache, causal masking, sliding window, and soft capping.
-
-    Grid: one threadgroup per (head, query_token). Each threadgroup uses
-    binary search on cu_seqlens_q to find its sequence and computes causal
-    attention against the paged KV cache.
-    """
-    assert causal, "Only causal attention is supported"
-    import mlx.core as mx
-
-    # Extract dimensions from cache shape
-    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
-    num_kv_heads = k.shape[2]
-    block_size = k.shape[1]
-
-    # Convert window_size tuple to a single sliding_window int.
-    # window_size = (left, right) where left = sw-1, right = 0 for causal.
-    # sliding_window = left + 1 = total window size. -1 = disabled.
-    if window_size == (-1, -1):
-        sliding_window = -1
-    else:
-        sliding_window = window_size[0] + 1
-
-    ops = get_ops()
-
-    # Ensure all inputs are evaluated before raw Metal dispatch
-    mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
-    max_num_partitions = max(1, (max_seqlen_k + PARTITION_SIZE - 1) // PARTITION_SIZE)
-    use_partitioning = (
-        PARTITION_SIZE % block_size == 0
-        and max_seqlen_q == 1
-        and max_seqlen_k >= PARTITION_THRESHOLD
-        and max_num_partitions > 1
-    )
-
-    if use_partitioning:
-        exp_sums = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
-        )
-        max_logits = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
-        )
-        tmp_out = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions, q.shape[2]),
-            dtype=q.dtype,
-        )
-        mx.eval(exp_sums, max_logits, tmp_out)
-        ops.paged_attention_v2_online_partitioned(
-            out,
-            q,
-            k,
-            v,
-            num_kv_heads,
-            softmax_scale,
-            softcap,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            block_size,
-            max_seqlen_k,
-            sliding_window,
-            exp_sums,
-            max_logits,
-            tmp_out,
-        )
-        mx.synchronize()
-    else:
-        ops.paged_attention_v2_online(
-            out,
-            q,
-            k,
-            v,
-            num_kv_heads,
-            softmax_scale,
-            softcap,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            block_size,
-            max_seqlen_k,
-            sliding_window,
-        )
-        mx.synchronize()
 
 
 def get_ops() -> ModuleType:

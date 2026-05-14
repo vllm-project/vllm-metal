@@ -18,6 +18,7 @@ from vllm.v1.sample.sampler import Sampler
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 # Shared instance used by unit tests that call apply_paged directly.
@@ -57,6 +58,7 @@ def _make_scheduler_output(
     """Minimal SchedulerOutput stub — no spec-decode tokens."""
     return SimpleNamespace(
         scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=None,
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
         total_num_scheduled_tokens=len(req_ids),
         scheduled_new_reqs=[],
@@ -107,6 +109,7 @@ def _make_decode_req(req_id: str) -> tuple[str, SimpleNamespace]:
     """Minimal (req_id, RequestState) pair for a decode request."""
     state = SimpleNamespace(
         token_ids=[1, 2, 3],
+        block_ids=[],
         prompt_len=2,
         cache=[],
         sampling_params=None,
@@ -135,6 +138,18 @@ def _build_cu_seqlens(num_decode: int, prefill_lens: list[int]) -> list[int]:
     cu = [0]
     for _ in range(num_decode):
         cu.append(cu[-1] + 1)
+    for length in prefill_lens:
+        cu.append(cu[-1] + length)
+    return cu
+
+
+def _build_cu_seqlens_from_segment_lengths(
+    decode_lengths: list[int], prefill_lens: list[int]
+) -> list[int]:
+    """Build cu_seqlens for decode row spans plus prefill chunks."""
+    cu = [0]
+    for length in decode_lengths:
+        cu.append(cu[-1] + length)
     for length in prefill_lens:
         cu.append(cu[-1] + length)
     return cu
@@ -247,6 +262,200 @@ class TestApplyGrammarBitmaskPaged:
         # Prefill intermediate rows 1,2 untouched
         for row in [1, 2]:
             assert np.all(np.isfinite(result[0, row]))
+
+    def test_row_span_metadata_masks_verification_rows_and_prefill_tail(self) -> None:
+        """Row-span metadata must mask structured rows while leaving plain spec rows alone."""
+        allowed_decode_rows = (7, 8, 9)
+        allowed_prefill = 15
+        decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
+        prefill_reqs = [_make_prefill_req("pf0", 2)]
+        scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
+        segments = SpeculativeDecodeController().build_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1, "b": 2},
+        )
+        logits = _uniform_logits_3d(7)
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[2],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3, "b": 2},
+            total_num_scheduled_tokens=5,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(
+            ["pf0", "a"],
+            np.vstack(
+                [
+                    _make_single_token_bitmask(allowed_prefill),
+                    *(
+                        _make_single_token_bitmask(token)
+                        for token in allowed_decode_rows
+                    ),
+                ]
+            ),
+        )
+
+        result = _to_numpy(
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                prefill_reqs,
+                cu,
+                len(segments),
+                logits,
+                decode_segments=segments,
+            )
+        )
+
+        # Verification rows for a live at rows 0 and 1; row 2 is its bonus row.
+        for row, allowed_token in enumerate(allowed_decode_rows):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
+
+        # Plain speculative decode rows for b stay untouched.
+        np.testing.assert_array_equal(result[0, 3:5], _to_numpy(logits)[0, 3:5])
+
+        # Prefill tail row is indexed after all decode rows (0..4), not after num_decode.
+        assert np.isfinite(result[0, 6, allowed_prefill])
+        assert result[0, 6, (allowed_prefill + 1) % VOCAB_SIZE] == float("-inf")
+
+    def test_row_span_metadata_keeps_request_bitmasks_isolated_by_req_id(self) -> None:
+        """Structured-output rows must stay attached to their request IDs."""
+        allowed_a_rows = (3, 4, 5)
+        allowed_b_rows = (19, 20)
+        decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
+        scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
+        segments = SpeculativeDecodeController().build_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1, "b": 2},
+        )
+        logits = _uniform_logits_3d(5)
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3, "b": 2},
+            total_num_scheduled_tokens=5,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(
+            ["b", "a"],
+            np.vstack(
+                [
+                    *(_make_single_token_bitmask(token) for token in allowed_b_rows),
+                    *(_make_single_token_bitmask(token) for token in allowed_a_rows),
+                ]
+            ),
+        )
+
+        result = _to_numpy(
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                len(segments),
+                logits,
+                decode_segments=segments,
+            )
+        )
+
+        # a occupies rows 0,1 (verification rows) and row 2 is its bonus row.
+        for row, allowed_token in enumerate(allowed_a_rows):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
+
+        # b's rows remain tied to b, even though grammar_output order differs.
+        for row, allowed_token in zip([3, 4], allowed_b_rows, strict=True):
+            assert np.isfinite(result[0, row, allowed_token])
+            assert result[0, row, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")
+
+    def test_row_span_metadata_requires_per_position_bitmask_rows(self) -> None:
+        """A multi-row speculative target must not reuse one request-level bitmask."""
+        decode_reqs = [_make_decode_req("a")]
+        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        segments = SpeculativeDecodeController().build_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1},
+        )
+        logits = _uniform_logits_3d(3)
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3},
+            total_num_scheduled_tokens=3,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(["a"], _make_single_token_bitmask(7))
+
+        with pytest.raises(NotImplementedError, match="one grammar bitmask row"):
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                len(segments),
+                logits,
+                decode_segments=segments,
+            )
+
+    def test_row_span_metadata_rejects_missing_row_target(self) -> None:
+        """Row-span masking must not infer bitmask consumption for absent requests."""
+        decode_reqs = [_make_decode_req("a")]
+        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        segments = SpeculativeDecodeController().build_decode_segments(
+            decode_reqs,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            paged_request_seq_lens={"a": 1},
+        )
+        logits = _uniform_logits_3d(3)
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3},
+            total_num_scheduled_tokens=3,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(
+            ["a", "missing"],
+            np.vstack(
+                [
+                    _make_single_token_bitmask(7),
+                    _make_single_token_bitmask(8),
+                    _make_single_token_bitmask(9),
+                    _make_single_token_bitmask(10),
+                ]
+            ),
+        )
+
+        with pytest.raises(ValueError, match="Grammar bitmask references 'missing'"):
+            _applier.apply_paged(
+                sched,
+                grammar,
+                decode_reqs,
+                [],
+                cu,
+                len(segments),
+                logits,
+                decode_segments=segments,
+            )
 
     def test_no_constrained_requests_returns_unchanged_logits(self) -> None:
         """If no scheduled request has grammar constraints, logits are returned as-is."""
@@ -579,8 +788,20 @@ class TestSampleTokensGrammarPagedPath:
             decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
             logits=logits,
+            target_hidden_states=None,
             cu_seqlens=[0, 1],
-            num_decode=1,
+            decode_segments=(
+                mr.PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(1,),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=0,
+                    block_ids=(),
+                ),
+            ),
+            num_decode_tokens=1,
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)

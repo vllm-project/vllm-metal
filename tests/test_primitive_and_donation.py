@@ -94,11 +94,13 @@ def _make_cache_and_inputs(
     "num_heads",
     [(4, 4), (8, 2)],
 )
+@pytest.mark.parametrize("sliding_window", [-1, 128])
 @pytest.mark.parametrize("num_blocks", [256])
 def test_primitive_vs_reference_decode(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     num_blocks: int,
+    sliding_window: int,
 ) -> None:
     """paged_attention_primitive matches the pure-MLX reference (decode)."""
     mx.random.seed(0)
@@ -119,7 +121,7 @@ def test_primitive_vs_reference_decode(
         d["cu_seqlens_q"],
         BLOCK_SIZE,
         d["max_kv_len"],
-        -1,  # sliding_window
+        sliding_window,
         out,
     )
     mx.eval(out)
@@ -132,6 +134,7 @@ def test_primitive_vs_reference_decode(
         kv_lens=d["kv_lens"],
         block_tables=np.array(d["block_tables"]),
         scale=d["scale"],
+        sliding_window=sliding_window if sliding_window >= 0 else None,
     )
     mx.eval(ref)
 
@@ -148,17 +151,23 @@ def test_primitive_vs_reference_decode(
     [
         [(1, 1328), (5, 18), (129, 463)],
         [(1, 523), (1, 37), (1, 2011)],
+        # Prefill-only: all q_len > 1, guarantees tiled kernel dispatch
+        # (total_q_tokens > num_seqs).
+        [(8, 128), (16, 256)],
+        [(32, 512), (64, 1024)],
     ],
 )
 @pytest.mark.parametrize(
     "num_heads",
     [(4, 4), (8, 2)],
 )
+@pytest.mark.parametrize("sliding_window", [-1, 128])
 @pytest.mark.parametrize("num_blocks", [256])
 def test_primitive_vs_reference_varlen(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     num_blocks: int,
+    sliding_window: int,
 ) -> None:
     """paged_attention_primitive matches reference for mixed prefill+decode."""
     mx.random.seed(0)
@@ -179,7 +188,7 @@ def test_primitive_vs_reference_varlen(
         d["cu_seqlens_q"],
         BLOCK_SIZE,
         d["max_kv_len"],
-        -1,  # sliding_window
+        sliding_window,
         out,
     )
     mx.eval(out)
@@ -192,6 +201,7 @@ def test_primitive_vs_reference_varlen(
         kv_lens=d["kv_lens"],
         block_tables=np.array(d["block_tables"]),
         scale=d["scale"],
+        sliding_window=sliding_window if sliding_window >= 0 else None,
     )
     mx.eval(ref)
 
