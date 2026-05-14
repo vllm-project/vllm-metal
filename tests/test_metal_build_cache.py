@@ -21,7 +21,7 @@ class _Paths:
     nb_src: Path
     out: Path
     hsh: Path
-    spec: "build._BuildSpec"
+    spec: build._BuildSpec
 
 
 @pytest.fixture
@@ -112,9 +112,7 @@ def test_hash_changes_with_nb_src_bytes(patched):
 def test_hash_changes_with_cmd(patched):
     # Simulates venv switch / different MLX install path.
     h1 = build._input_hash(patched.spec)
-    s2 = dataclasses.replace(
-        patched.spec, cmd=patched.spec.cmd + ["-L/other/mlx/lib"]
-    )
+    s2 = dataclasses.replace(patched.spec, cmd=patched.spec.cmd + ["-L/other/mlx/lib"])
     assert build._input_hash(s2) != h1
 
 
