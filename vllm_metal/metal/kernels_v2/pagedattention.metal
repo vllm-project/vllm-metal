@@ -1548,6 +1548,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
+// Tiled paged attention kernel (paged_attention_tiled) is in
+// pagedattention_tiled.metal.
+
 #define instantiate_paged_attention_inner(type, k_cache_type, v_cache_type,    \
                                           head_size, block_size, num_threads,  \
                                           num_simd_lanes, partition_size)      \

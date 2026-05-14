@@ -153,20 +153,22 @@ def find_attn_attr(layer: Any) -> str | None:
 
 
 def prepare_unified(
-    decode_requests: list[tuple[list[int], int]],
+    decode_requests: list[tuple[list[int], int] | tuple[list[int], int, int]],
     prefill_requests: list[tuple[list[int], int, int]],
     block_size: int,
 ) -> None:
     """Compute metadata for a unified prefill + decode forward pass.
 
-    Packs decode tokens (1 per request) followed by prefill tokens into a
-    single flattened sequence.  ``cu_seqlens`` marks request boundaries so
-    the varlen kernel handles both decode (length-1) and prefill (length-N)
-    subsequences in one dispatch.
+    Packs decode tokens followed by prefill tokens into a single flattened
+    sequence. ``cu_seqlens`` marks attention segments so the varlen kernel
+    handles decode and prefill subsequences in one dispatch.
 
     Args:
-        decode_requests: list of ``(block_ids, seq_len)`` for decode requests.
-            ``seq_len`` = tokens already cached before this step.
+        decode_requests: list of ``(block_ids, seq_len)`` or
+            ``(block_ids, seq_len, num_tokens)`` for decode requests.
+            ``seq_len`` = tokens already cached before this step. ``num_tokens``
+            defaults to 1 and expands the decode row span for speculative
+            verification.
         prefill_requests: list of ``(block_ids, num_tokens, start_pos)`` for
             prefill.  ``start_pos`` is the position of the first token in this
             chunk (0 for a fresh prefill, >0 for continuation chunks).
@@ -178,16 +180,22 @@ def prepare_unified(
     context_lens: list[int] = []
     offsets: list[int] = []
 
-    # Decode requests first (1 token each)
-    for block_ids, seq_len in decode_requests:
-        new_pos = seq_len
-        block_idx = block_ids[new_pos // block_size]
-        slot = block_idx * block_size + (new_pos % block_size)
-        slot_mapping.append(slot)
-        cu_seqlens.append(cu_seqlens[-1] + 1)
-        block_tables.append(block_ids)
-        context_lens.append(seq_len + 1)  # including new token
-        offsets.append(seq_len)  # RoPE position
+    # Decode requests first.
+    for decode_request in decode_requests:
+        if len(decode_request) == 2:
+            block_ids, seq_len = decode_request
+            num_tokens = 1
+        else:
+            block_ids, seq_len, num_tokens = decode_request
+
+        for pos in range(seq_len, seq_len + num_tokens):
+            block_idx = block_ids[pos // block_size]
+            slot = block_idx * block_size + (pos % block_size)
+            slot_mapping.append(slot)
+            cu_seqlens.append(cu_seqlens[-1] + 1)
+            block_tables.append(block_ids)
+            context_lens.append(pos + 1)  # including this decode token
+            offsets.append(pos)  # RoPE position
 
     # Prefill requests (variable tokens each, starting at start_pos)
     for block_ids, num_tokens, start_pos in prefill_requests:
