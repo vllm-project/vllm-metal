@@ -239,18 +239,16 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
       for (int j = 0; j < QPE_PER_THREAD; j++) {
         partial += q_pe_local[h * QPE_PER_THREAD + j] * k_pe_local[j];
       }
-      const float score = simd_sum(partial) * scale;
+      // Pre-multiply by log2(e) so the softmax runs in log2 space and the
+      // subsequent fast::exp2 calls are 1-instruction Metal intrinsics
+      // (identity: exp(x - y) = exp2((x - y) * log2(e))). Matches the
+      // pagedattention.metal pattern.
+      const float score = simd_sum(partial) * scale * M_LOG2E_F;
 
       const float new_max = max(max_score[h], score);
-      // fast::exp + conditional division guards match the newer kernels
-      // (2pass main, FA, pr_mma). Mixing exp vs fast::exp across kernels
-      // — or eps-add vs conditional in the divisor — diverges on hardware
-      // where fast::exp's approximation order or the eps bias compounds
-      // across reductions; the reduce-side mismatch was the root cause of
-      // the macos-15 2pass parity failures on the first push of this PR.
       const float factor = (max_score[h] == -INFINITY) ? 0.0f
-                                                       : fast::exp(max_score[h] - new_max);
-      const float exp_score = fast::exp(score - new_max);
+                                                       : fast::exp2(max_score[h] - new_max);
+      const float exp_score = fast::exp2(score - new_max);
       max_score[h] = new_max;
       sum_exp_score[h] = sum_exp_score[h] * factor + exp_score;
 
@@ -301,7 +299,7 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     const float global_max = simd_max(my_simdgroup_max);
     const float rescale =
         (my_simdgroup_max == -INFINITY) ? 0.0f
-                                        : fast::exp(my_simdgroup_max - global_max);
+                                        : fast::exp2(my_simdgroup_max - global_max);
     const float global_sum =
         simd_sum((lane < BN) ? sum_exp_scores[h * BN + lane] * rescale : 0.0f);
     const float inv_global = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
