@@ -7,6 +7,7 @@ Metal shaders through MLX's own command encoder.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 import sysconfig
@@ -20,10 +21,22 @@ _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
+_INPUTS = (_SRC, _BUILD, _CONSTANTS)
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 _CACHE_DIR = Path.home() / ".cache" / "vllm-metal"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _OUT = _CACHE_DIR / f"_paged_ops{_EXT_SUFFIX}"
+_HASH = _OUT.with_suffix(_OUT.suffix + ".sha256")
+
+
+def _input_hash() -> str:
+    h = hashlib.sha256()
+    for p in _INPUTS:
+        h.update(p.name.encode())
+        h.update(b"\0")
+        h.update(p.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _find_package_path(name: str) -> Path:
@@ -41,15 +54,12 @@ def _find_package_path(name: str) -> Path:
 
 
 def needs_rebuild() -> bool:
-    """Return True if the .so is missing or older than the source."""
-    if not _OUT.exists():
+    if not _OUT.exists() or not _HASH.exists():
         return True
-    latest_input_mtime = max(
-        _SRC.stat().st_mtime,
-        _BUILD.stat().st_mtime,
-        _CONSTANTS.stat().st_mtime,
-    )
-    return _OUT.stat().st_mtime < latest_input_mtime
+    try:
+        return _HASH.read_text().strip() != _input_hash()
+    except OSError:
+        return True
 
 
 def build() -> Path:
@@ -121,5 +131,6 @@ def build() -> Path:
             f"stderr:\n{result.stderr}"
         )
 
+    _HASH.write_text(_input_hash())
     logger.info("Built %s", _OUT)
     return _OUT
