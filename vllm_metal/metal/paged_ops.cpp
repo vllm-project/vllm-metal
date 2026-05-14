@@ -1299,38 +1299,6 @@ static array mla_paged_attention_primitive_fn(
       {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
 }
 
-void mla_paged_attention_impl(
-    nb::handle out_h,
-    nb::handle q_nope_h,
-    nb::handle q_pe_h,
-    nb::handle latent_cache_h,
-    nb::handle block_tables_h,
-    nb::handle context_lens_h,
-    nb::handle cu_seqlens_q_h,
-    int block_size,
-    float scale,
-    int heads_per_tg) {
-  auto& out = *nb::inst_ptr<array>(out_h);
-  auto& q_nope = *nb::inst_ptr<array>(q_nope_h);
-  auto& q_pe = *nb::inst_ptr<array>(q_pe_h);
-  auto& latent_cache = *nb::inst_ptr<array>(latent_cache_h);
-  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
-  auto& context_lens = *nb::inst_ptr<array>(context_lens_h);
-  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
-
-  dispatch_mla_paged_attention(
-      out,
-      q_nope,
-      q_pe,
-      latent_cache,
-      block_tables,
-      context_lens,
-      cu_seqlens_q,
-      block_size,
-      scale,
-      heads_per_tg,
-      default_stream(Device::gpu));
-}
 void gdn_linear_attention_impl(
     nb::handle q_h, nb::handle k_h, nb::handle v_h,
     nb::handle g_h, nb::handle beta_h,
@@ -1588,17 +1556,6 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_mla_library", &init_mla_library,
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
-
-  m.def("mla_paged_attention", &mla_paged_attention_impl,
-        nb::arg("out"),
-        nb::arg("q_nope"), nb::arg("q_pe"),
-        nb::arg("latent_cache"),
-        nb::arg("block_tables"), nb::arg("context_lens"),
-        nb::arg("cu_seqlens_q"),
-        nb::arg("block_size"), nb::arg("scale"),
-        nb::arg("heads_per_tg") = 1,
-        "Paged MLA (single-pass), eager in-place dispatch. Kept for "
-        "bench / tests; production wrapper uses the primitive variant.");
 
   m.def("mla_paged_attention_primitive",
         [](nb::handle q_nope_h,

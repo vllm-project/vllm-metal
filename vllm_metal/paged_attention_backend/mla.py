@@ -151,7 +151,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         recover v_head_dim through unembed_out, and concatenate for
         o_proj. Replaces the per-request Python loop entirely when the
         gate above accepts."""
-        from vllm_metal.metal import metal_mla_paged_attention_primitive
+        from vllm_metal.metal import metal_mla_paged_attention
 
         # Cast Q to the latent cache dtype so we hit a real kernel
         # specialization. In production this is a no-op (weights are
@@ -183,7 +183,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
         cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
 
-        out_kvr = metal_mla_paged_attention_primitive(
+        out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
             q_pe=q_pe_kernel,
             latent_cache=latent_cache.latent_caches[layer_idx],

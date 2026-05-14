@@ -204,86 +204,26 @@ def metal_mla_paged_attention(
     q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
     q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
     latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
-    out,  # [total_q_tokens, num_heads, kv_lora_rank]
-    block_tables,  # [num_seqs, max_blocks_per_seq], int32
-    context_lens,  # [num_seqs], uint32
-    cu_seqlens_q,  # [num_seqs + 1], int32
-    scale: float,
-    heads_per_tg: int = 1,
-) -> None:
-    """Paged Multi-head Latent Attention (RFC #360).
-
-    Phase 1 step 8 (multi-block decode): the kernel iterates the per-sequence
-    block table with NUM_WARPS-strided online softmax and a cross-warp merge,
-    so any ``ctx_len`` that fits into the allocated block_tables row is fine.
-    Decode-only is still required (one query token per sequence) — varlen
-    prefill lands in P2.
-
-    Q is expected to be already projected through ``embed_q`` (so q_nope is
-    in kv_lora_rank space) and ``q_pe`` is RoPE-applied. The caller is
-    responsible for ``unembed_out`` on the result to recover v_head_dim.
-
-    ``heads_per_tg`` (G) controls cross-head KV amortization: each
-    threadgroup processes ``G`` consecutive query heads sharing the same
-    latent KV. Total dispatched threadgroups drop from ``B×H`` to
-    ``B×ceil(H/G)``, so total KV bandwidth is amortized G×. ``num_heads``
-    must be divisible by G. Currently instantiated for G ∈ {1, 4}; G=1 is
-    the existing single-head-per-TG kernel.
-    """
-    import mlx.core as mx
-
-    # Shape contract — fail fast at the Python boundary so the C++ error
-    # path isn't the only line of defence.
-    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
-        raise ValueError(
-            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
-            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
-            f"q_pe.shape[2] ({q_pe.shape[2]})"
-        )
-
-    block_size = latent_cache.shape[1]
-
-    # Materialise inputs before the C++ in-place dispatch. The eager
-    # binding reads input buffer pointers directly (no MLX primitive
-    # graph), so we need real Metal buffers backing each array here.
-    # The lazy primitive variant ``metal_mla_paged_attention_primitive``
-    # does not need this — MLX's primitive system materialises inputs
-    # as part of graph evaluation.
-    mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
-
-    ops = get_ops()
-    ops.mla_paged_attention(
-        out,
-        q_nope,
-        q_pe,
-        latent_cache,
-        block_tables,
-        context_lens,
-        cu_seqlens_q,
-        block_size,
-        scale,
-        heads_per_tg,
-    )
-    mx.synchronize()
-
-
-def metal_mla_paged_attention_primitive(
-    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
-    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
-    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
     block_tables,  # [num_seqs, max_blocks_per_seq], int32
     context_lens,  # [num_seqs], uint32
     cu_seqlens_q,  # [num_seqs + 1], int32
     scale: float,
     heads_per_tg: int = 1,
 ):
-    """Primitive variant of :func:`metal_mla_paged_attention` — returns
-    a lazy ``mx.array`` whose evaluation triggers the kernel dispatch.
+    """Paged Multi-head Latent Attention (RFC #360). Returns a lazy
+    ``mx.array`` whose evaluation triggers the kernel dispatch.
 
-    The call participates in MLX's lazy graph instead of forcing an
-    ``mx.eval`` boundary inside this entry. That saves ~200 μs at small
-    workloads (B=1, H≤64) where MLX dispatch overhead is a meaningful
-    fraction of total wrapper time.
+    Q is expected to be already projected through ``embed_q`` (so
+    q_nope is in kv_lora_rank space) and ``q_pe`` is RoPE-applied. The
+    caller is responsible for ``unembed_out`` on the result to recover
+    v_head_dim.
+
+    The dispatch is wrapped in an MLX Primitive so it participates in
+    MLX's lazy graph — no ``mx.eval`` / ``mx.synchronize`` boundary
+    inside this entry. ``heads_per_tg`` (G) controls cross-head KV
+    amortization: each threadgroup processes G consecutive query
+    heads sharing the same latent KV; ``num_heads`` must be divisible
+    by G. Currently instantiated for G ∈ {1, 2}.
     """
     import mlx.core as mx
 

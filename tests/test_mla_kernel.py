@@ -73,7 +73,6 @@ def _make_inputs(
     n_blocks_per_seq = max(1, (ctx_len + block_size - 1) // block_size)
     num_blocks = n_blocks_per_seq * num_seqs
 
-    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
     q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
     q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
         dtype
@@ -91,7 +90,6 @@ def _make_inputs(
     cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
 
     return (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -147,7 +145,6 @@ def test_decode_single_block(dtype: mx.Dtype, block_size: int) -> None:
     must not contribute to the softmax."""
     ctx_len = max(1, block_size // 2)  # 8 or 16
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -163,17 +160,15 @@ def test_decode_single_block(dtype: mx.Dtype, block_size: int) -> None:
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -202,7 +197,6 @@ def test_decode_full_block(dtype: mx.Dtype, block_size: int) -> None:
     Catches off-by-one errors in the ctx_len boundary check."""
     ctx_len = block_size
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -218,17 +212,15 @@ def test_decode_full_block(dtype: mx.Dtype, block_size: int) -> None:
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -256,7 +248,6 @@ def test_decode_single_token_context(dtype: mx.Dtype = mx.float16) -> None:
     softmax / accumulation bugs."""
     block_size = 16
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -272,17 +263,15 @@ def test_decode_single_token_context(dtype: mx.Dtype = mx.float16) -> None:
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     # Expected: out[0, h, :] = kv_norm[block_idx, 0, :KV_LORA_RANK] for all h
     expected_row = latent_cache[
@@ -307,7 +296,6 @@ def test_decode_two_blocks_with_partial_tail(dtype: mx.Dtype, block_size: int) -
     seven idle (their state must be the identity element)."""
     ctx_len = block_size + 1
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -323,17 +311,15 @@ def test_decode_two_blocks_with_partial_tail(dtype: mx.Dtype, block_size: int) -
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -362,7 +348,6 @@ def test_decode_one_block_per_warp(dtype: mx.Dtype, block_size: int) -> None:
     num_warps = 8
     ctx_len = block_size * num_warps
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -378,17 +363,15 @@ def test_decode_one_block_per_warp(dtype: mx.Dtype, block_size: int) -> None:
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -412,7 +395,6 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
     block_size = 32
     ctx_len = 4096
     (
-        out,
         q_nope,
         q_pe,
         latent_cache,
@@ -428,17 +410,15 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
         dtype=dtype,
     )
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -474,7 +454,6 @@ def test_decode_mixed_ctx_batch() -> None:
 
     mx.random.seed(13)
     num_blocks = n_blocks_per_seq * num_seqs
-    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype)
     q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
     q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
         dtype
@@ -489,17 +468,15 @@ def test_decode_mixed_ctx_batch() -> None:
     context_lens = mx.array(ctx_lens, dtype=mx.uint32)
     cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
 
-    metal_mla_paged_attention(
+    out = metal_mla_paged_attention(
         q_nope=q_nope,
         q_pe=q_pe,
         latent_cache=latent_cache,
-        out=out,
         block_tables=block_tables,
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
     )
-    mx.synchronize()
 
     expected = _expected_output(
         q_nope,
@@ -518,7 +495,6 @@ def test_decode_mixed_ctx_batch() -> None:
 def test_unsupported_kv_lora_rank_raises() -> None:
     """Phase 1 only instantiates kv_lora_rank=512. Anything else must
     raise at dispatch time, not silently dispatch a wrong kernel."""
-    out = mx.zeros((1, 2, 16), dtype=mx.float16)
     q_nope = mx.zeros((1, 2, 16), dtype=mx.float16)
     q_pe = mx.zeros((1, 2, 4), dtype=mx.float16)
     latent_cache = mx.zeros((1, 16, 20), dtype=mx.float16)
@@ -527,16 +503,16 @@ def test_unsupported_kv_lora_rank_raises() -> None:
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
 
     with pytest.raises(RuntimeError, match="kv_lora_rank=512"):
-        metal_mla_paged_attention(
+        out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,
             latent_cache=latent_cache,
-            out=out,
             block_tables=block_tables,
             context_lens=context_lens,
             cu_seqlens_q=cu_seqlens_q,
             scale=0.125,
         )
+        mx.eval(out)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +527,6 @@ def test_unsupported_kv_lora_rank_raises() -> None:
 def test_g_invalid_raises() -> None:
     """num_heads not divisible by G should raise at the dispatch boundary,
     not silently produce garbage."""
-    out = mx.zeros((1, 5, _KV_LORA_RANK), dtype=mx.float16)
     q_nope = mx.zeros((1, 5, _KV_LORA_RANK), dtype=mx.float16)
     q_pe = mx.zeros((1, 5, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
     latent_cache = mx.zeros((1, 16, _LATENT_DIM), dtype=mx.float16)
@@ -560,17 +535,17 @@ def test_g_invalid_raises() -> None:
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
 
     with pytest.raises(RuntimeError, match="divisible by heads_per_tg"):
-        metal_mla_paged_attention(
+        out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,
             latent_cache=latent_cache,
-            out=out,
             block_tables=block_tables,
             context_lens=context_lens,
             cu_seqlens_q=cu_seqlens_q,
             scale=0.125,
             heads_per_tg=2,  # 5 % 2 != 0
         )
+        mx.eval(out)
 
 
 # ---------------------------------------------------------------------------
@@ -590,56 +565,28 @@ def _mixed_dtype_inputs(dtype_q: mx.Dtype, dtype_kv: mx.Dtype):
     block_size = 16
     num_seqs = 1
     num_heads = 4
-    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype_q)
     q_nope = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=dtype_q)
     q_pe = mx.zeros((num_seqs, num_heads, _QK_ROPE_HEAD_DIM), dtype=dtype_q)
     latent_cache = mx.zeros((1, block_size, _LATENT_DIM), dtype=dtype_kv)
     block_tables = mx.zeros((num_seqs, 1), dtype=mx.int32)
     context_lens = mx.array([1], dtype=mx.uint32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
-    return out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q
+    return q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q
 
 
 def test_mla_rejects_mixed_dtypes_single_pass() -> None:
     """fp16 queries vs bf16 latent cache must raise, not silently corrupt."""
-    out, q_nope, q_pe, latent_cache, btab, ctx_lens, cu_q = _mixed_dtype_inputs(
+    q_nope, q_pe, latent_cache, btab, ctx_lens, cu_q = _mixed_dtype_inputs(
         dtype_q=mx.float16, dtype_kv=mx.bfloat16
     )
     with pytest.raises(RuntimeError, match="must share the same dtype"):
-        metal_mla_paged_attention(
+        out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,
             latent_cache=latent_cache,
-            out=out,
             block_tables=btab,
             context_lens=ctx_lens,
             cu_seqlens_q=cu_q,
             scale=0.125,
         )
-
-
-def test_mla_rejects_out_dtype_mismatch() -> None:
-    """Catches the case where everything reads correctly but the output
-    buffer has the wrong dtype — the kernel would write fp16 bytes into a
-    bf16 buffer (or vice versa)."""
-    block_size = 16
-    num_seqs = 1
-    num_heads = 4
-    q_nope = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.float16)
-    q_pe = mx.zeros((num_seqs, num_heads, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
-    latent_cache = mx.zeros((1, block_size, _LATENT_DIM), dtype=mx.float16)
-    out = mx.zeros((num_seqs, num_heads, _KV_LORA_RANK), dtype=mx.bfloat16)  # mismatch
-    block_tables = mx.zeros((num_seqs, 1), dtype=mx.int32)
-    context_lens = mx.array([1], dtype=mx.uint32)
-    cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
-    with pytest.raises(RuntimeError, match="must share the same dtype"):
-        metal_mla_paged_attention(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            latent_cache=latent_cache,
-            out=out,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            cu_seqlens_q=cu_seqlens_q,
-            scale=0.125,
-        )
+        mx.eval(out)
