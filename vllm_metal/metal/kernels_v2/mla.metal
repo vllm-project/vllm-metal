@@ -310,7 +310,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     // [(p * BN + sg) * V_PER_THREAD, (p * BN + sg + 1) * V_PER_THREAD).
     // We write to device memory immediately rather than buffering
     // NUM_PASSES * V_PER_THREAD floats per thread — the v_final[] register
-    // array would push G=4 over the per-thread register budget.
+    // array would push larger HEADS_PER_TG variants over the per-thread
+    // register budget.
     const int head_idx = head_idx_base + h;
     device T *out_base = USE_PARTITIONING
         ? (out +
@@ -353,8 +354,6 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
 // Single-pass main kernel: dtype × block_size × heads_per_tg.
 //   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
 //   G=2 → NUM_THREADS=512  (16 simdgroups, 2× KV-bandwidth amortization).
-//   G=4 → NUM_THREADS=256  (8 simdgroups, 4× the per-thread arithmetic;
-//                           register footprint per TG stays roughly constant).
 
 #define instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size,      \
                         heads_per_tg, num_threads, partition_size)             \

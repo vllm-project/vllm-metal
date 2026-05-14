@@ -1180,7 +1180,7 @@ static void dispatch_mla_paged_attention(
   // (rather than BN*BD) gives enough room across all G; on G=1 (BN=BD=32)
   // they coincide.
   // For G=1, NT=1024: 2*32 + 32*32 = 1088 fp32 ≈ 4.3 KB.
-  // For G=4, NT=256:  2*4*8 + 32*32 = 1088 fp32 ≈ 4.3 KB.
+  // For G=2, NT=512:  2*2*16 + 32*32 = 1088 fp32 ≈ 4.3 KB.
   const int BD = 32;
   const int BN = num_threads / BD;
   size_t shmem =
@@ -1224,21 +1224,8 @@ static void dispatch_mla_paged_attention(
   }
 }
 
-// MLA single-pass paged attention as a proper MLX Primitive so that the
-// kernel dispatch joins the wrapper's lazy graph instead of forcing a
-// mx.eval boundary inside the Python entry. The eager
-// ``mla_paged_attention`` binding is kept for backward-compat callers
-// (bench tools, tests); ``_kernel_fast_path`` switches to the
-// primitive variant.
-//
-// Why this matters: at B=1 H=16 ctx=128 the kernel itself is ~170 μs
-// but the wrapper end-to-end is ~700 μs — the gap is ~3-4 per-call
-// MLX dispatch boundaries (each ~200 μs at this small workload). The
-// kernel-entry mx.eval (which materialises q_nope, q_pe, etc. before
-// our in-place dispatch) is one of those boundaries. As a Primitive
-// the kernel call lives in the lazy graph; MLX evaluates everything
-// at the wrapper's terminal mx.eval and the per-dispatch overhead
-// folds into the wrapper's existing sync.
+// MLA single-pass paged attention as an MLX Primitive so the kernel
+// dispatch participates in the lazy graph (no per-call mx.eval boundary).
 class MlaPagedAttentionPrimitive : public UnaryPrimitive {
  public:
   MlaPagedAttentionPrimitive(
