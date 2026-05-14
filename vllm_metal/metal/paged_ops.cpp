@@ -1164,24 +1164,15 @@ static void dispatch_mla_paged_attention(
                       std::to_string(num_threads) + "_nsl32_ps0";
 
   bool use_partitioning = false;
-  bool use_alibi = false;
-  bool use_fp8_scales = false;
-  bool use_sinks = false;
-  bool use_turboquant = false;
 
-  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0") +
-                          "_alibi0_fp80_sinks0_tq0";
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
 
   auto* lib = d.get_library("paged_mla_kern");
   auto* kernel = d.get_kernel(
       kname,
       lib,
       hash_name,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
-       {&use_alibi, MTL::DataType::DataTypeBool, NS::UInteger(20)},
-       {&use_fp8_scales, MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&use_turboquant, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
 
   // Threadgroup memory:
   //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]

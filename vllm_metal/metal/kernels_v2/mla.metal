@@ -4,18 +4,12 @@
 //
 // Tracks RFC https://github.com/vllm-project/vllm-metal/issues/360.
 //
-// Two kernels in this file:
-//   - paged_mla_attention         — fused score+softmax+V over a single
-//                                   threadgroup per (head_group, q_token).
-//                                   With PARTITION_SIZE > 0, each
-//                                   (head_group, q_token, partition) handles
-//                                   a ctx slice and writes its partial
-//                                   (max, lse, normalized output) to scratch
-//                                   buffers; the reduce kernel merges across
-//                                   partitions.
-//   - paged_mla_attention_reduce  — cross-partition online-softmax merge,
-//                                   mirroring kernels_v2/pagedattention.metal
-//                                   paged_attention_v2_reduce.
+// paged_mla_attention — fused score+softmax+V over a single threadgroup
+// per (head_group, q_token). The `use_partitioning` function constant and
+// PARTITION_SIZE template parameter are scaffolded for a future 2-pass
+// mode (each partition writes scratch max/lse/output, a separate reduce
+// kernel merges across partitions); only the single-pass mode
+// (use_partitioning=false, PARTITION_SIZE=0) is wired up today.
 //
 // Decode kernel parallelism scheme mirrors MLX's sdpa_vector
 // (mlx/backend/metal/kernels/sdpa_vector.h, ml-explore/mlx@v0.31.2):
@@ -50,10 +44,6 @@ using namespace metal;
 // ========================================== Function constants
 
 constant bool mla_use_partitioning [[function_constant(10)]];
-constant bool mla_use_alibi        [[function_constant(20)]];
-constant bool mla_use_fp8_scales   [[function_constant(30)]];
-constant bool mla_use_sinks        [[function_constant(40)]];
-constant bool mla_use_turboquant   [[function_constant(50)]];
 
 // ========================================== Main kernel
 //
