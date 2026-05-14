@@ -33,13 +33,6 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 # paged_ops.cpp is newer than the .so).
 _ops_module: ModuleType | None = None
 
-# The MLA paged-attention shader set is loaded lazily on the first MLA
-# entrypoint call (see _ensure_mla_library). Initialising it inside
-# get_ops() would compile experimental MLA Metal source for every
-# paged-attention user, so non-MLA models pay the compile cost and a
-# compile error in MLA would block unrelated paged-attention paths.
-_mla_library_initialized: bool = False
-
 
 def _read_metal_source(path: Path) -> str:
     """Read a .metal file and strip local #include directives."""
@@ -238,7 +231,6 @@ def metal_mla_paged_attention(
     the existing single-head-per-TG kernel.
     """
     import mlx.core as mx
-    import numpy as np
 
     # Shape contract — fail fast at the Python boundary so the C++ error
     # path isn't the only line of defence.
@@ -251,40 +243,15 @@ def metal_mla_paged_attention(
 
     block_size = latent_cache.shape[1]
 
+    # Materialise inputs before the C++ in-place dispatch. The eager
+    # binding reads input buffer pointers directly (no MLX primitive
+    # graph), so we need real Metal buffers backing each array here.
+    # The lazy primitive variant ``metal_mla_paged_attention_primitive``
+    # does not need this — MLX's primitive system materialises inputs
+    # as part of graph evaluation.
     mx.eval(out, q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q)
 
-    # P1 decode-only guard: q_token_idx == seq_idx is hard-wired in the
-    # kernel. Reading cu_seqlens_q back to host is cheap (tens of int32 per
-    # layer per step) and the guard goes away when P2 makes the kernel
-    # cu_seqlens_q-aware via find_seq_idx.
-    cu_q = np.asarray(cu_seqlens_q)
-    deltas = np.diff(cu_q)
-    if np.any(deltas != 1):
-        bad = int(np.argmax(deltas != 1))
-        raise NotImplementedError(
-            "MLA kernel (P1) supports decode only — one query token per "
-            f"sequence. Got request {bad} with {int(deltas[bad])} query "
-            "tokens. Multi-token prefill / varlen support lands in P2."
-        )
-
-    # block_tables row-width guard. The kernel walks block_table_row[0..
-    # num_context_blocks-1] for each sequence; if the caller-allocated row
-    # is too narrow we'd silently read into the next sequence's row or off
-    # the end of the buffer. Caller-side capacity bug (ValueError, not
-    # NotImplementedError — this isn't a feature gap).
-    ctx = np.asarray(context_lens)
-    max_blocks_per_seq = int(block_tables.shape[1])
-    required_blocks = (ctx + block_size - 1) // block_size
-    if np.any(required_blocks > max_blocks_per_seq):
-        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
-        raise ValueError(
-            f"MLA: block_tables row width ({max_blocks_per_seq}) too small "
-            f"for request {bad}: ctx_len={int(ctx[bad])} requires "
-            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
-        )
-
     ops = get_ops()
-    _ensure_mla_library(ops)
     ops.mla_paged_attention(
         out,
         q_nope,
@@ -313,13 +280,12 @@ def metal_mla_paged_attention_primitive(
     """Primitive variant of :func:`metal_mla_paged_attention` — returns
     a lazy ``mx.array`` whose evaluation triggers the kernel dispatch.
 
-    Same shape contract and decode-only guard as the eager binding; the
-    only difference is the call participates in MLX's lazy graph
-    instead of forcing an ``mx.eval`` boundary inside this entry. That
-    saves ~200 μs at small workloads (B=1, H≤64) where MLX dispatch
-    overhead is a meaningful fraction of total wrapper time.
+    The call participates in MLX's lazy graph instead of forcing an
+    ``mx.eval`` boundary inside this entry. That saves ~200 μs at small
+    workloads (B=1, H≤64) where MLX dispatch overhead is a meaningful
+    fraction of total wrapper time.
     """
-    import numpy as np
+    import mlx.core as mx
 
     if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
         raise ValueError(
@@ -330,29 +296,6 @@ def metal_mla_paged_attention_primitive(
 
     block_size = latent_cache.shape[1]
 
-    cu_q = np.asarray(cu_seqlens_q)
-    deltas = np.diff(cu_q)
-    if np.any(deltas != 1):
-        bad = int(np.argmax(deltas != 1))
-        raise NotImplementedError(
-            "MLA kernel (primitive) supports decode only — one query "
-            f"token per sequence. Got request {bad} with "
-            f"{int(deltas[bad])} query tokens."
-        )
-
-    ctx = np.asarray(context_lens)
-    max_blocks_per_seq = int(block_tables.shape[1])
-    required_blocks = (ctx + block_size - 1) // block_size
-    if np.any(required_blocks > max_blocks_per_seq):
-        bad = int(np.argmax(required_blocks > max_blocks_per_seq))
-        raise ValueError(
-            f"MLA: block_tables row width ({max_blocks_per_seq}) too small "
-            f"for request {bad}: ctx_len={int(ctx[bad])} requires "
-            f"{int(required_blocks[bad])} blocks at block_size={block_size}."
-        )
-
-    import mlx.core as mx
-
     total_q_tokens = int(q_nope.shape[0])
     num_heads = int(q_nope.shape[1])
     kv_lora_rank = int(q_nope.shape[2])
@@ -362,7 +305,6 @@ def metal_mla_paged_attention_primitive(
     out = mx.zeros((total_q_tokens, num_heads, kv_lora_rank), dtype=q_nope.dtype)
 
     ops = get_ops()
-    _ensure_mla_library(ops)
     ops.mla_paged_attention_primitive(
         q_nope,
         q_pe,
@@ -418,25 +360,10 @@ def get_ops() -> ModuleType:
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
 
-    # The MLA paged-attention library is loaded lazily on first use via
-    # _ensure_mla_library so non-MLA paged-attention users do not pay the
-    # experimental MLA shader compile cost, and a compile error in the
-    # experimental MLA shader cannot block unrelated paged-attention paths.
+    # 6. Initialise MLA paged-attention library (RFC #360)
+    mla_src = _build_mla_paged_attention_source()
+    mod.init_mla_library(mla_src)
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
     return mod
-
-
-def _ensure_mla_library(mod: ModuleType) -> None:
-    """Lazy-init the MLA shader library so non-MLA paged-attention users
-    do not pay the experimental MLA shader compile cost; called from
-    each MLA direct entrypoint before its first C++ dispatch.
-    """
-    global _mla_library_initialized
-    if _mla_library_initialized:
-        return
-    mla_src = _build_mla_paged_attention_source()
-    mod.init_mla_library(mla_src)
-    _mla_library_initialized = True
-    logger.info("MLA paged-attention Metal kernels loaded")
