@@ -36,6 +36,7 @@ def make_stub_runner(
         "_is_stt": False,
         "_is_vlm": False,
         "_multimodal_adapter": None,
+        "_gemma4_mtp_assistant": None,
         "encoder_cache": None,
         "_paged_attention_backend": None,
         "_gdn_req_to_slot": {},

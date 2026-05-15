@@ -17,6 +17,7 @@ from vllm_metal.config import reset_config
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
@@ -187,7 +188,7 @@ class TestModelLifecycle:
         (model_dir / "model.safetensors").write_text("", encoding="utf-8")
 
         with model_lifecycle._mlx_lm_compatible_model_path(str(model_dir)) as compat:
-            assert compat == str(model_dir)
+            assert Path(compat) == model_dir
 
     def test_load_uses_adapter_override_for_text_only_multimodal_model(
         self,
@@ -463,6 +464,141 @@ class TestModelLifecycle:
         assert runner.model_args["vocab_size"] == 32000
         assert runner.hidden_size == 4096
         assert runner.kv_cache_dtype is not None
+
+    def test_load_wires_gemma4_mtp_assistant_after_target_dims(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = object()
+        calls: list[dict[str, object]] = []
+
+        class _StubGemma4MTPAssistantLoader:
+            def load_if_needed(self, **kwargs: object) -> object:
+                calls.append(kwargs)
+                return runtime
+
+        _cache_generation_model(monkeypatch, config=_text_config())
+        monkeypatch.setattr(
+            model_lifecycle,
+            "Gemma4MTPAssistantLoader",
+            _StubGemma4MTPAssistantLoader,
+        )
+        speculative_config = SimpleNamespace(
+            method="mtp",
+            draft_model_config=SimpleNamespace(
+                model="assistant",
+                hf_config=SimpleNamespace(model_type="gemma4_mtp"),
+            ),
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(),
+        )
+        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+
+        lifecycle.load()
+
+        assert runner._gemma4_mtp_assistant is runtime
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["speculative_config"] is speculative_config
+        assert call["target_model_args"] == runner.model_args
+        assert runner.hidden_size == 4096
+
+    def test_load_clears_stale_gemma4_mtp_assistant_before_reload(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class _FailingGemma4MTPAssistantLoader:
+            def load_if_needed(self, **kwargs: object) -> object:
+                raise RuntimeError("assistant load failed")
+
+        _cache_generation_model(monkeypatch, config=_text_config())
+        monkeypatch.setattr(
+            model_lifecycle,
+            "Gemma4MTPAssistantLoader",
+            _FailingGemma4MTPAssistantLoader,
+        )
+        speculative_config = SimpleNamespace(
+            method="mtp",
+            draft_model_config=SimpleNamespace(
+                model="assistant",
+                hf_config=SimpleNamespace(model_type="gemma4_mtp"),
+            ),
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(),
+        )
+        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner._gemma4_mtp_assistant = object()
+
+        with pytest.raises(RuntimeError, match="assistant load failed"):
+            lifecycle.load()
+
+        assert runner._gemma4_mtp_assistant is None
+
+    def test_reset_model_cache_clears_gemma4_mtp_assistant_cache(self) -> None:
+        load_model_calls = 0
+
+        def _load_model(
+            *args: object, **kwargs: object
+        ) -> tuple[object, dict[str, object]]:
+            nonlocal load_model_calls
+            load_model_calls += 1
+            return object(), {
+                "model_type": "gemma4_assistant",
+                "architectures": ["Gemma4AssistantForCausalLM"],
+                "backbone_hidden_size": 4096,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "vocab_size": 32000,
+                    "hidden_size": 256,
+                    "num_hidden_layers": 1,
+                    "layer_types": ["full_attention"],
+                },
+            }
+
+        spec_config = SimpleNamespace(
+            method="mtp",
+            revision=None,
+            draft_model_config=SimpleNamespace(
+                model="/assistant",
+                hf_config=SimpleNamespace(model_type="gemma4_mtp"),
+            ),
+        )
+        target_args = {
+            "model_type": "gemma4_text",
+            "vocab_size": 32000,
+            "hidden_size": 4096,
+            "num_kv_shared_layers": 0,
+            "layer_types": ["full_attention"],
+        }
+        loader = Gemma4MTPAssistantLoader(
+            load_model_fn=_load_model,
+            download_fn=lambda model_name, revision: Path(model_name),
+        )
+
+        first = loader.load_if_needed(
+            speculative_config=spec_config,
+            target_hf_config=None,
+            target_model_args=target_args,
+        )
+        second = loader.load_if_needed(
+            speculative_config=spec_config,
+            target_hf_config=None,
+            target_model_args=target_args,
+        )
+        assert first is second
+        assert load_model_calls == 1
+
+        model_lifecycle.reset_model_cache()
+
+        third = loader.load_if_needed(
+            speculative_config=spec_config,
+            target_hf_config=None,
+            target_model_args=target_args,
+        )
+        assert third is not first
+        assert load_model_calls == 2
 
     def test_load_merges_nested_text_config_for_non_vlm_model(
         self,

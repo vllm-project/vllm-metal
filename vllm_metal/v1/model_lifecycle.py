@@ -3,12 +3,8 @@
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Mapping
-from contextlib import contextmanager
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +19,13 @@ from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.gemma4_mtp import (
+    Gemma4MTPAssistantLoader,
+    reset_gemma4_mtp_assistant_cache,
+)
+from vllm_metal.v1.mlx_lm_paths import (
+    mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
+)
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
 
@@ -53,6 +56,7 @@ def reset_model_cache() -> None:
     """
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
+    reset_gemma4_mtp_assistant_cache()
 
 
 def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:
@@ -62,74 +66,6 @@ def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:
 
 def _stt_cache_key(model_name: str) -> tuple[str, str]:
     return (model_name, "stt")
-
-
-@contextmanager
-def _mlx_lm_compatible_model_path(model_name: str):
-    """Yield a model path compatible with ``mlx_lm.load`` shard discovery.
-
-    Some local checkpoints ship valid ``.safetensors`` shards and a
-    ``model.safetensors.index.json`` file, but use custom shard names such as
-    ``layers-*.safetensors`` or ``outside.safetensors``. ``mlx_lm.load`` only
-    discovers shards whose basename matches ``model*.safetensors``.
-
-    For those checkpoints, create a temporary directory that mirrors the
-    original config/tokenizer files and exposes the indexed shard files via
-    ``model-xxxxx-of-yyyyy.safetensors`` symlinks. The actual weight bytes stay
-    in place; only the filenames are adapted for ``mlx_lm``.
-    """
-    model_path = Path(model_name)
-    if not model_path.is_dir():
-        yield model_name
-        return
-
-    if any(model_path.glob("model*.safetensors")):
-        yield model_name
-        return
-
-    index_path = model_path / "model.safetensors.index.json"
-    if not index_path.is_file():
-        yield model_name
-        return
-
-    with index_path.open("r") as fid:
-        weight_map = json.load(fid).get("weight_map", {})
-
-    shard_names = sorted(
-        {
-            shard_name
-            for shard_name in weight_map.values()
-            if isinstance(shard_name, str) and shard_name.endswith(".safetensors")
-        }
-    )
-    if not shard_names:
-        yield model_name
-        return
-
-    with TemporaryDirectory(prefix="vllm-metal-mlx-lm-") as tmpdir:
-        compat_path = Path(tmpdir)
-
-        for src in model_path.iterdir():
-            if not src.is_file() or src.name.endswith(".safetensors"):
-                continue
-            (compat_path / src.name).symlink_to(src)
-
-        total_shards = len(shard_names)
-        for shard_index, shard_name in enumerate(shard_names, start=1):
-            shard_path = model_path / shard_name
-            compat_name = (
-                "model.safetensors"
-                if total_shards == 1
-                else f"model-{shard_index:05d}-of-{total_shards:05d}.safetensors"
-            )
-            (compat_path / compat_name).symlink_to(shard_path)
-
-        logger.info(
-            "Using mlx_lm shard compatibility view for %s (%d shard files)",
-            model_name,
-            total_shards,
-        )
-        yield str(compat_path)
 
 
 class ModelLifecycle:
@@ -178,9 +114,16 @@ class ModelLifecycle:
         if runner.metal_config.debug:
             logger.info("Model args: %s", model_args)
         self.resolve_model_dims()
+        runner._gemma4_mtp_assistant = None
+        gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
+            speculative_config=runner.vllm_config.speculative_config,
+            target_hf_config=hf_config,
+            target_model_args=model_args,
+        )
         runner.kv_cache_dtype = torch_to_mlx(
             torch.empty(0, dtype=model_config.dtype)
         ).dtype
+        runner._gemma4_mtp_assistant = gemma4_mtp_assistant
 
     def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
@@ -231,14 +174,14 @@ class ModelLifecycle:
         elif awq_loader is not None:
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
                 model, tokenizer = awq_loader.load(
-                    compatible_model_name,
+                    str(compatible_model_name),
                     target_dtype=target_dtype,
                     tokenizer_config=tokenizer_config,
                 )
         else:
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
                 model, tokenizer = mlx_lm_load(
-                    compatible_model_name,
+                    str(compatible_model_name),
                     tokenizer_config=tokenizer_config,
                 )
 
@@ -279,6 +222,7 @@ class ModelLifecycle:
         self._runner._is_stt = True
         self._runner._stt_runtime_adapter = model.create_runtime_adapter(model_name)
         self._runner._multimodal_adapter = None
+        self._runner._gemma4_mtp_assistant = None
         self._runner.encoder_cache = None
 
     def resolve_model_dims(self) -> None:
