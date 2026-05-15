@@ -383,9 +383,10 @@ static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
   if (use_turboquant) return false;
   if (query_dtype == float32) return false;
   if (query_dtype != k_cache_dtype) return false;
-  // 80, 112: HD_TILES % NUM_SG(4) != 0.  512: exceeds 32KB threadgroup memory.
+  // BQ=32 flash kernel: 80, 112 fail HD_TILES % NUM_SG(4)==0; 192, 256 exceed
+  // 32 KB threadgroup memory budget with separate K_smem and V_smem buffers.
   switch (head_size) {
-    case 64: case 96: case 128: case 192: case 256: return true;
+    case 64: case 96: case 128: return true;
     default: return false;
   }
 }
@@ -404,7 +405,7 @@ static void dispatch_paged_attention_tiled(
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  constexpr int BQ = 8;
+  constexpr int BQ = 32;
   int total_q_blocks = total_q_tokens / BQ + num_seqs;
 
   auto dt = dtype_to_metal(query.dtype());
@@ -412,7 +413,7 @@ static void dispatch_paged_attention_tiled(
       "paged_attention_tiled_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_bq8_tk32_nt128";
+      "_bq32_tk32_nt128";
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(kname, lib, kname, {});
@@ -420,12 +421,13 @@ static void dispatch_paged_attention_tiled(
   constexpr int NUM_THREADS = 128;
   constexpr int TILE_KV = 32;
   int t_size = 2;  // half or bfloat16
+  // BQ=32 flash layout: Q_smem (T) + K_smem (T) + V_smem (T) only.
+  // S, O, m, l are register-resident.  Output staging reuses Q_smem as float
+  // at exit; fits because BQ <= 2*TILE_KV (32 <= 64).
   size_t shmem = static_cast<size_t>(
-      BQ * head_size * t_size          // Q_smem
-      + TILE_KV * head_size * t_size   // KV_smem
-      + BQ * TILE_KV * 4               // S_smem (float); P aliases in-place
-      + BQ * head_size * 4             // O_smem (float)
-      + 2 * BQ * 4);                   // M, L (float)
+      BQ * head_size * t_size           // Q_smem
+      + TILE_KV * head_size * t_size    // K_smem
+      + TILE_KV * head_size * t_size);  // V_smem
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = get_command_encoder_compat(d, s);
