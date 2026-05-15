@@ -938,8 +938,7 @@ static void dispatch_mla_paged_attention(
     int block_size,
     float scale,
     int heads_per_tg,
-    Stream s,
-    bool from_primitive = false) {
+    Stream s) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(q_nope.shape(0));
@@ -1040,18 +1039,9 @@ static void dispatch_mla_paged_attention(
       MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
       MTL::Size::Make(num_threads, 1, 1));
 
-  // See dispatch_reshape_and_cache: inside a primitive, MLX manages array
-  // lifetimes via the completion handler; add_temporary would defeat
-  // fence-based sync across the command buffer boundary.
-  if (!from_primitive) {
-    add_temporary_compat(enc, out, d, s);
-    add_temporary_compat(enc, q_nope, d, s);
-    add_temporary_compat(enc, q_pe, d, s);
-    add_temporary_compat(enc, latent_cache, d, s);
-    add_temporary_compat(enc, block_tables, d, s);
-    add_temporary_compat(enc, context_lens, d, s);
-    add_temporary_compat(enc, cu_seqlens_q, d, s);
-  }
+  // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
+  // and inside a primitive MLX manages array lifetimes via the completion
+  // handler.
 }
 
 // MLA single-pass paged attention as an MLX Primitive so the kernel
@@ -1078,8 +1068,7 @@ class MlaPagedAttentionPrimitive : public UnaryPrimitive {
         inputs[0], inputs[1], inputs[2],
         inputs[3], inputs[4], inputs[5],
         block_size_, scale_, heads_per_tg_,
-        stream(),
-        /*from_primitive=*/true);
+        stream());
   }
 
   const char* name() const override { return "MlaPagedAttention"; }
