@@ -170,15 +170,10 @@ class MLAPagedAttentionWrapper(nn.Module):
         # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
         # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
         # padding entries beyond n_context_blocks are never read.
-        import numpy as np
-
         bts = ctx.block_tables
-        num_seqs = len(bts)
         max_blocks = max(len(bt) for bt in bts)
-        bt_np = np.zeros((num_seqs, max_blocks), dtype=np.int32)
-        for i, bt in enumerate(bts):
-            bt_np[i, : len(bt)] = bt
-        block_tables_mx = mx.array(bt_np)
+        padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
+        block_tables_mx = mx.array(padded, dtype=mx.int32)
 
         context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
         cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
