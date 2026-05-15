@@ -360,22 +360,6 @@ static void bind_paged_attn_buffers(
   enc.set_bytes(sliding_window_i, 21);
 }
 
-static void add_paged_attn_temporaries(
-    metal::CommandEncoder& enc,
-    array& out, const array& query,
-    const array& key_cache, const array& value_cache,
-    const array& block_tables, const array& seq_lens,
-    const array& cu_seqlens_q,
-    metal::Device& d, Stream s) {
-  add_temporary_compat(enc, out, d, s);
-  add_temporary_compat(enc, query, d, s);
-  add_temporary_compat(enc, key_cache, d, s);
-  add_temporary_compat(enc, value_cache, d, s);
-  add_temporary_compat(enc, block_tables, d, s);
-  add_temporary_compat(enc, seq_lens, d, s);
-  add_temporary_compat(enc, cu_seqlens_q, d, s);
-}
-
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
 // Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 96, 128, 192, 256}.
 static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
@@ -396,8 +380,7 @@ static void dispatch_paged_attention_tiled(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window, Stream s,
-    bool from_primitive = false) {
+    int block_size, int max_seq_len, int sliding_window, Stream s) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -440,11 +423,6 @@ static void dispatch_paged_attention_tiled(
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_blocks, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
-
-  if (!from_primitive) {
-    add_paged_attn_temporaries(enc, out, query, key_cache, value_cache,
-                               block_tables, seq_lens, cu_seqlens_q, d, s);
-  }
 }
 
 static void dispatch_paged_attention_v2_online(
@@ -454,7 +432,6 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, Stream s,
-    bool from_primitive = false,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -477,7 +454,7 @@ static void dispatch_paged_attention_v2_online(
         out, query, key_cache, value_cache,
         num_kv_heads, scale, softcap,
         block_tables, seq_lens, cu_seqlens_q,
-        block_size, max_seq_len, sliding_window, s, from_primitive);
+        block_size, max_seq_len, sliding_window, s);
     return;
   }
 
@@ -556,17 +533,6 @@ static void dispatch_paged_attention_v2_online(
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
-
-  if (!from_primitive) {
-    add_paged_attn_temporaries(enc, out, query, key_cache, value_cache,
-                               block_tables, seq_lens, cu_seqlens_q, d, s);
-    if (use_turboquant) {
-      add_temporary_compat(enc, *key_scale_cache, d, s);
-      add_temporary_compat(enc, *value_scale_cache, d, s);
-      add_temporary_compat(enc, *key_zero_cache, d, s);
-      add_temporary_compat(enc, *v_centroids, d, s);
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +577,6 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_,
         stream(),
-        /*from_primitive=*/true,
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_);
   }
 
