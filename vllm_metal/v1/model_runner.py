@@ -57,7 +57,7 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
-from vllm_metal.v1.lora import LoRAMappingBuilder, MetalWorkerLoRAManager
+from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -85,12 +85,11 @@ SchedulerMemoryReportingMode: TypeAlias = Literal[
 ]
 
 
-def _lora_id_from_request_data(request_data: Any) -> int | None:
-    """Pull the int LoRA ID off a vLLM ``NewRequestData``-shaped record."""
-    lora_request = getattr(request_data, "lora_request", None)
-    if lora_request is None:
+def _lora_id_from_request_data(new_req: NewRequestData) -> int | None:
+    """Pull the int LoRA ID off a `NewRequestData` record."""
+    if new_req.lora_request is None:
         return None
-    return int(lora_request.lora_int_id)
+    return int(new_req.lora_request.lora_int_id)
 
 
 def _create_request_generator(
@@ -240,8 +239,7 @@ class MetalModelRunner:
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
-        self._lora_manager: MetalWorkerLoRAManager | None = None
-        self._loaded_lora_requests: dict[int, Any] = {}
+        self._lora = MetalLoRARuntime()
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -391,27 +389,15 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
-        self._maybe_init_lora_manager()
-
-    def _maybe_init_lora_manager(self) -> None:
-        lora_config = getattr(self.vllm_config, "lora_config", None)
-        if lora_config is None:
-            return
-        if self._is_stt:
-            logger.warning(
-                "LoRA is not supported for STT models; ignoring --enable-lora"
-            )
-            return
-
         text_config = getattr(self.model_config.hf_config, "get_text_config", None)
         max_position_embeddings = None
         if callable(text_config):
             cfg = text_config()
             max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
-
-        self._lora_manager = MetalWorkerLoRAManager(
+        self._lora.setup(
             model=self._forward_model,
-            lora_config=lora_config,
+            lora_config=getattr(self.vllm_config, "lora_config", None),
+            is_stt=self._is_stt,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             dtype=self.kv_cache_dtype or mx.float16,
@@ -419,37 +405,16 @@ class MetalModelRunner:
         )
 
     def add_lora(self, lora_request: Any) -> bool:
-        """Load a LoRA/QLoRA adapter for later request-time activation."""
-        if self._lora_manager is None:
-            logger.warning(
-                "add_lora called but --enable-lora was not passed; ignoring."
-            )
-            return False
-        added = self._lora_manager.add_adapter(lora_request)
-        if added:
-            self._loaded_lora_requests[lora_request.lora_int_id] = lora_request
-        return added
+        return self._lora.add_adapter(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        """Unload a LoRA adapter."""
-        if self._lora_manager is None:
-            return False
-        removed = self._lora_manager.remove_adapter(lora_id)
-        if removed:
-            self._loaded_lora_requests.pop(lora_id, None)
-        return removed
+        return self._lora.remove_adapter(lora_id)
 
     def pin_lora(self, lora_id: int) -> bool:
-        """Mark a LoRA adapter as non-removable."""
-        if self._lora_manager is None:
-            return False
-        return self._lora_manager.pin_adapter(lora_id)
+        return self._lora.pin_adapter(lora_id)
 
     def list_loras(self) -> set[int]:
-        """Return loaded LoRA adapter IDs."""
-        if self._lora_manager is None:
-            return set()
-        return self._lora_manager.list_adapters()
+        return self._lora.list_adapters()
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
@@ -1052,35 +1017,31 @@ class MetalModelRunner:
 
         return batch, scheduler_output
 
-    def _activate_step_loras(self, scheduler_output: SchedulerOutput) -> None:
-        if self._lora_manager is None:
-            return
+    def _paged_lora_routing(
+        self,
+        decode_reqs: list[tuple[str, RequestState]],
+        prefill_pack: list[PrefillRequest],
+    ) -> list[tuple[int | None, int]]:
+        entries = []
+        for _, state in decode_reqs:
+            entries.append((state.lora_id, 1))
+        for pr in prefill_pack:
+            entries.append((pr.lora_id, len(pr.token_ids)))
+        return entries
 
-        builder = LoRAMappingBuilder()
-        active_requests: set[Any] = set()
-
+    def _scheduler_lora_routing(
+        self, scheduler_output: SchedulerOutput
+    ) -> list[tuple[int | None, int]]:
+        entries = []
         for new_req in scheduler_output.scheduled_new_reqs:
-            req_id = new_req.req_id
-            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            lora_request = getattr(new_req, "lora_request", None)
-            lora_id = lora_request.lora_int_id if lora_request is not None else None
-            builder.add_request(lora_id, num_tokens)
-            if lora_request is not None:
-                active_requests.add(lora_request)
-
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id in cached.req_ids:
+            num_tokens = scheduler_output.num_scheduled_tokens.get(new_req.req_id, 0)
+            entries.append((_lora_id_from_request_data(new_req), num_tokens))
+        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             state = self._request_states.get(req_id)
             lora_id = state.lora_id if state is not None else None
-            builder.add_request(lora_id, num_tokens)
-            if lora_id is not None:
-                lora_request = self._loaded_lora_requests.get(lora_id)
-                if lora_request is not None:
-                    active_requests.add(lora_request)
-
-        mapping = builder.build() if not builder.is_empty() else None
-        self._lora_manager.set_active_adapters(active_requests, mapping)
+            entries.append((lora_id, num_tokens))
+        return entries
 
     def _register_new_request_mm_features(
         self, req_id: str, new_req: NewRequestData
@@ -1495,7 +1456,8 @@ class MetalModelRunner:
                 "to use structured output."
             )
 
-        self._activate_step_loras(scheduler_output)
+        if self._paged_attention_backend is None:
+            self._lora.prepare_step(self._scheduler_lora_routing(scheduler_output))
 
         batch = _ExecutionBatch()
         self._handle_new_requests(
@@ -1508,6 +1470,9 @@ class MetalModelRunner:
 
         if self._paged_attention_backend is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
+            self._lora.prepare_step(
+                self._paged_lora_routing(batch.paged_decode_reqs, prefill_pack)
+            )
             self._start_paged_forward(
                 batch,
                 prefill_pack,

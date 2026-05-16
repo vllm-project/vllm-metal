@@ -5,6 +5,7 @@ from .mapping import LoRAMapping, LoRAMappingBuilder
 from .model_manager import MLXLoRAModelManager
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX, load_peft_adapter
 from .punica_wrapper import PunicaWrapperMLX
+from .runtime import MetalLoRARuntime
 from .worker_manager import MetalWorkerLoRAManager
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "MLXLinearWithLoRA",
     "can_wrap",
     "MLXLoRAModelManager",
+    "MetalLoRARuntime",
     "MetalWorkerLoRAManager",
     "LoadedLoRA",
     "LoRALayerWeightsMLX",

@@ -73,8 +73,17 @@ def load_peft_adapter(
     weights: dict[str, LoRALayerWeightsMLX] = {}
     for module, pair in pairs.items():
         if "lora_a" not in pair or "lora_b" not in pair:
-            logger.warning("LoRA module %s missing lora_a or lora_b; skipping.", module)
-            continue
+            present = "lora_a" if "lora_a" in pair else "lora_b"
+            missing = "lora_b" if present == "lora_a" else "lora_a"
+            peft_key = f"lora_{missing[-1].upper()}"  # lora_a -> lora_A
+            raise ValueError(
+                f"LoRA adapter at {adapter_path}: module {module!r} has "
+                f"{present} but no matching {missing} tensor. Either the "
+                f"{missing} tensor is absent from adapter_model.safetensors, "
+                "or its key does not follow PEFT naming "
+                f"('base_model.model.<module>.{peft_key}.weight'). "
+                "Both lora_a and lora_b are required per adapted module."
+            )
         weights[module] = LoRALayerWeightsMLX(
             module_name=module,
             rank=int(pair["lora_a"].shape[0]),

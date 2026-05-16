@@ -9,6 +9,7 @@ import torch
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.v1.cache_policy import ModelCachePolicy
+from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
@@ -52,8 +53,7 @@ def make_stub_runner(
         "_sampler": None,
         "_logitsprocs": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
-        "_lora_manager": None,
-        "_loaded_lora_requests": {},
+        "_lora": MetalLoRARuntime(),
         "model_args": _model_args,
     }
 

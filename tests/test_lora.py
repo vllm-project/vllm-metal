@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from tests.stub_runner import make_stub_runner
 from vllm_metal.v1.lora import layers as layers_mod
 from vllm_metal.v1.lora import mapping as mapping_mod
 from vllm_metal.v1.lora import model_manager as model_manager_mod
@@ -195,6 +196,31 @@ def test_peft_loader_rejects_unsupported_configs(
         peft_loader_mod.load_peft_adapter(
             adapter_dir, lora_id=1, lora_config=lora_config
         )
+
+
+def test_peft_loader_rejects_partial_adapter(tmp_path: Path) -> None:
+    """Adapter file with only lora_A (or only lora_B) for a module must fail Explicitly."""
+    from safetensors.numpy import save_file
+
+    pytest.importorskip("safetensors.numpy")
+
+    config = {
+        "peft_type": "LORA",
+        "r": 2,
+        "lora_alpha": 8,
+        "lora_dropout": 0.0,
+        "target_modules": ["q_proj"],
+        "use_rslora": False,
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+    a_only = np.arange(6, dtype=np.float32).reshape(2, 3)
+    save_file(
+        {"base_model.model.layers.0.self_attn.q_proj.lora_A.weight": a_only},
+        str(tmp_path / "adapter_model.safetensors"),
+    )
+
+    with pytest.raises(ValueError, match=r"has lora_a but no matching lora_b"):
+        peft_loader_mod.load_peft_adapter(tmp_path, lora_id=1)
 
 
 def test_peft_loader_without_lora_config_skips_validation(tmp_path: Path) -> None:
@@ -722,3 +748,31 @@ def test_manager_target_modules_filter_excludes_unmatched() -> None:
     assert set(manager.modules) == {"fc1"}
     assert isinstance(model.fc1, layers_mod.MLXLinearWithLoRA)
     assert not isinstance(model.fc2, layers_mod.MLXLinearWithLoRA)
+
+
+# Runner routing: paged forward processes decode tokens before prefill tokens,
+
+def test_paged_lora_routing_orders_decode_before_prefill() -> None:
+    """Mixed decode+prefill batch with different lora_ids routes by execution order."""
+    decode_state = SimpleNamespace(lora_id=11)
+    decode_reqs = [("decode-req", decode_state)]
+    prefill_pack = [
+        SimpleNamespace(lora_id=22, token_ids=[101, 102, 103, 104]),
+    ]
+
+    runner = make_stub_runner()
+    entries = runner._paged_lora_routing(decode_reqs, prefill_pack)
+
+    assert entries == [(11, 1), (22, 4)]
+
+    builder = mapping_mod.LoRAMappingBuilder()
+    for lora_id, num_tokens in entries:
+        builder.add_request(lora_id, num_tokens)
+    mapping = builder.build()
+
+    # Token 0 is the decode token (adapter 11); tokens 1..4 are the prefill
+    # tokens (adapter 22). Scheduler-order routing would have produced
+    # (22, 22, 22, 22, 11) here — that is the bug this test prevents.
+    assert mapping.index_mapping == (11, 22, 22, 22, 22)
+    assert mapping.prompt_mapping == (11, 22)
+    assert mapping.is_prefill is True
