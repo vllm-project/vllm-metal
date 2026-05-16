@@ -68,6 +68,11 @@ GOLDEN_MLX = {
 # exceptions; the test accepts either the MLX golden or this fallback.
 GOLDEN_PAGED_FALLBACK = {
     "One plus one equals":                        [825, 13, 3776, 5519, 825, 16819, 1378, 13, 3776, 5519],
+    # Tiled MMA kernel (paged_attention_tiled): half×half QK products accumulate
+    # in a different order than the scalar kernel, shifting argmax at token 6.
+    # First 5 tokens match ("Paris. The capital of"); diverges to "Italy is Rome"
+    # vs "France is also" — both valid completions.
+    "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
 }
 # fmt: on
 

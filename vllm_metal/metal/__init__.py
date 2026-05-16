@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from types import ModuleType
 
-from vllm_metal.metal.constants import PARTITION_SIZE, PARTITION_THRESHOLD
+from vllm_metal.metal.constants import PARTITION_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,11 @@ def _read_metal_source(path: Path) -> str:
     # Remove #include "..." for our vendored files (keep <metal_stdlib> etc.)
     text = re.sub(r'#include\s+"[^"]*"', "", text)
     return text
+
+
+def _read_v2_metal_source(filename: str) -> str:
+    """Read a kernels_v2 .metal source file."""
+    return _read_metal_source(_KERNELS_V2_DIR / filename)
 
 
 def _build_reshape_cache_source() -> str:
@@ -71,6 +76,7 @@ def _build_v2_paged_attention_source() -> str:
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "pagedattention_tiled.metal"),
     ]
     return "\n".join(parts)
 
@@ -84,106 +90,73 @@ def _build_gdn_source() -> str:
     return "\n".join(parts)
 
 
-def metal_unified_attention(
-    q,  # [total_q_tokens, num_q_heads, head_size]
-    k,  # [num_blocks, block_size, num_kv_heads, head_size]
-    v,  # [num_blocks, block_size, num_kv_heads, head_size]
-    out,  # [total_q_tokens, num_q_heads, head_size]
+def _build_mla_paged_attention_source() -> str:
+    """Concatenate utils + mla into a single source for the MLA library."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "mla.metal"),
+    ]
+    return "\n".join(parts)
+
+
+def metal_mla_paged_attention(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
     cu_seqlens_q,  # [num_seqs + 1], int32
-    seqused_k,  # [num_seqs], int32
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    causal: bool,
-    window_size: tuple[int, int],
-    block_table,  # [num_seqs, max_blocks_per_seq], int32
-    softcap: float,
-) -> None:
-    """Unified varlen paged attention for Metal.
+    scale: float,
+    heads_per_tg: int = 1,
+):
+    """Paged Multi-head Latent Attention (RFC #360). Returns a lazy
+    ``mx.array`` whose evaluation triggers the kernel dispatch.
 
-    Supports variable-length queries (prefill + decode) with online softmax,
-    paged KV cache, causal masking, sliding window, and soft capping.
+    Q is expected to be already projected through ``embed_q`` (so
+    q_nope is in kv_lora_rank space) and ``q_pe`` is RoPE-applied. The
+    caller is responsible for ``unembed_out`` on the result to recover
+    v_head_dim.
 
-    Grid: one threadgroup per (head, query_token). Each threadgroup uses
-    binary search on cu_seqlens_q to find its sequence and computes causal
-    attention against the paged KV cache.
+    The dispatch is wrapped in an MLX Primitive so it participates in
+    MLX's lazy graph — no ``mx.eval`` / ``mx.synchronize`` boundary
+    inside this entry. ``heads_per_tg`` (G) controls cross-head KV
+    amortization: each threadgroup processes G consecutive query
+    heads sharing the same latent KV; ``num_heads`` must be divisible
+    by G. Currently instantiated for G ∈ {1, 2}.
     """
-    assert causal, "Only causal attention is supported"
     import mlx.core as mx
 
-    # Extract dimensions from cache shape
-    # k shape: [num_blocks, block_size, num_kv_heads, head_size]
-    num_kv_heads = k.shape[2]
-    block_size = k.shape[1]
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
 
-    # Convert window_size tuple to a single sliding_window int.
-    # window_size = (left, right) where left = sw-1, right = 0 for causal.
-    # sliding_window = left + 1 = total window size. -1 = disabled.
-    if window_size == (-1, -1):
-        sliding_window = -1
-    else:
-        sliding_window = window_size[0] + 1
+    block_size = latent_cache.shape[1]
+
+    total_q_tokens = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    kv_lora_rank = int(q_nope.shape[2])
+    # ``mx.zeros`` here is lazy — the C++ side replaces ``out``'s
+    # descriptor with the Primitive output before the zeros ever
+    # evaluate, so the memset is never scheduled.
+    out = mx.zeros((total_q_tokens, num_heads, kv_lora_rank), dtype=q_nope.dtype)
 
     ops = get_ops()
-
-    # Ensure all inputs are evaluated before raw Metal dispatch
-    mx.eval(out, q, k, v, block_table, seqused_k, cu_seqlens_q)
-    max_num_partitions = max(1, (max_seqlen_k + PARTITION_SIZE - 1) // PARTITION_SIZE)
-    use_partitioning = (
-        PARTITION_SIZE % block_size == 0
-        and max_seqlen_q == 1
-        and max_seqlen_k >= PARTITION_THRESHOLD
-        and max_num_partitions > 1
+    ops.mla_paged_attention_primitive(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        heads_per_tg,
+        out,
     )
-
-    if use_partitioning:
-        exp_sums = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
-        )
-        max_logits = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions), dtype=mx.float32
-        )
-        tmp_out = mx.zeros(
-            (q.shape[0], q.shape[1], max_num_partitions, q.shape[2]),
-            dtype=q.dtype,
-        )
-        mx.eval(exp_sums, max_logits, tmp_out)
-        ops.paged_attention_v2_online_partitioned(
-            out,
-            q,
-            k,
-            v,
-            num_kv_heads,
-            softmax_scale,
-            softcap,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            block_size,
-            max_seqlen_k,
-            sliding_window,
-            exp_sums,
-            max_logits,
-            tmp_out,
-        )
-        mx.synchronize()
-    else:
-        ops.paged_attention_v2_online(
-            out,
-            q,
-            k,
-            v,
-            num_kv_heads,
-            softmax_scale,
-            softcap,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            block_size,
-            max_seqlen_k,
-            sliding_window,
-        )
-        mx.synchronize()
+    return out
 
 
 def get_ops() -> ModuleType:
@@ -225,6 +198,10 @@ def get_ops() -> ModuleType:
     # 5. Initialise GDN linear attention library
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
+
+    # 6. Initialise MLA paged-attention library (RFC #360)
+    mla_src = _build_mla_paged_attention_source()
+    mod.init_mla_library(mla_src)
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")

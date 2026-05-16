@@ -303,44 +303,167 @@ class TestV1SeededSamplingGenerator:
 
 
 class TestV1SamplingBatch:
-    def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
-        assert SamplingBatch.can_use_native_greedy([SamplingParams(temperature=0.0)])
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.8)]
-        )
-        # vLLM normalizes top-k/top-p back to no-op under greedy decoding.
-        assert SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, top_k=5)]
-        )
-        assert SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, top_p=0.9)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.8, top_k=5)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.8, top_p=0.9)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, presence_penalty=0.5)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, repetition_penalty=1.1)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
-            [SamplingParams(temperature=0.0, logprobs=1)]
+    @staticmethod
+    def _batch(params_list: list[SamplingParams]) -> SamplingBatch:
+        return SamplingBatch(
+            params_list,
+            [[1]] * len(params_list),
+            [[]] * len(params_list),
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
         )
 
+    def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
+        assert self._batch([SamplingParams(temperature=0.0)]).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8)]
+        ).can_use_native_greedy()
+        # vLLM normalizes top-k/top-p back to no-op under greedy decoding.
+        assert self._batch(
+            [SamplingParams(temperature=0.0, top_k=5)]
+        ).can_use_native_greedy()
+        assert self._batch(
+            [SamplingParams(temperature=0.0, top_p=0.9)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, top_k=5)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, top_p=0.9)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, presence_penalty=0.5)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, repetition_penalty=1.1)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, logprobs=1)]
+        ).can_use_native_greedy()
+        assert not self._batch(
+            [SamplingParams(temperature=0.0, allowed_token_ids=[1, 2])]
+        ).can_use_native_greedy()
+        bad_sp = SamplingParams(temperature=0.0)
+        bad_sp._bad_words_token_ids = [[99]]
+        assert not self._batch([bad_sp]).can_use_native_greedy()
+
+    def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
+        """Greedy with allowed_token_ids must fall back and the constraint works."""
+        logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, allowed_token_ids=[2, 3])],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+        )
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        assert result.token_ids[0] in [2, 3]
+
+    def test_allowed_token_ids_mixed_batch(self) -> None:
+        """Mixed batch: try one constrained, one unconstrained."""
+        logits = mx.array(
+            [[10.0, 1.0, 5.0, 1.0], [1.0, 10.0, 1.0, 1.0]], dtype=mx.float32
+        )
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, allowed_token_ids=[2, 3]),
+                SamplingParams(temperature=0.0),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+            device=torch.device("cpu"),
+        )
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        assert result.token_ids[0] in [2, 3]
+        assert result.token_ids[1] == 1  # unconstrained, should pick highest logit
+
+    def test_bad_words_blocks_greedy_token(self) -> None:
+        """Greedy + bad_words_token_ids must fall back and block the banned token."""
+        logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
+        sp = SamplingParams(temperature=0.0)
+        sp._bad_words_token_ids = [[0]]  # ban token 0 (the highest logit)
+        batch = SamplingBatch(
+            [sp],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+        )
+        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        assert result.token_ids[0] != 0  # token 0 should be blocked
+
     def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
-        assert SamplingBatch.can_use_native_greedy(
+        assert self._batch(
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
+        ).can_use_native_greedy()
+        assert not self._batch(
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.3)]
-        )
-        assert not SamplingBatch.can_use_native_greedy(
+        ).can_use_native_greedy()
+        assert not self._batch(
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.8, top_k=4)]
+        ).can_use_native_greedy()
+
+    def test_sampling_metadata_skips_penalty_allocation_when_no_penalties(
+        self,
+    ) -> None:
+        """When the batch has no penalties, the per-request penalty tensors
+        should be zero-length placeholders rather than ``batch_size`` allocations.
+
+        Both ``Sampler.apply_penalties`` and ``RejectionSampler`` short-circuit
+        on ``no_penalties=True`` before reading these fields, so skipping the
+        allocations is safe and removes 3 redundant ``torch.tensor(...)`` calls
+        per decode step on hot paths.
+        """
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=0.8),
+                SamplingParams(temperature=1.0, top_k=10),
+            ],
+            [[1, 2, 3], [4, 5], [6]],
+            [[], [], []],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
         )
+        assert batch.no_penalties
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.no_penalties is True
+        assert metadata.frequency_penalties.numel() == 0
+        assert metadata.presence_penalties.numel() == 0
+        assert metadata.repetition_penalties.numel() == 0
+        assert metadata.frequency_penalties.dtype == torch.float32
+        assert metadata.presence_penalties.dtype == torch.float32
+        assert metadata.repetition_penalties.dtype == torch.float32
+
+    def test_sampling_metadata_allocates_penalty_tensors_when_penalized(
+        self,
+    ) -> None:
+        """Regression: ensure penalty tensors are still built per-request when
+        any request opts into a non-default penalty value.
+        """
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=0.8, frequency_penalty=0.5),
+                SamplingParams(temperature=0.8, repetition_penalty=1.2),
+            ],
+            [[1], [2], [3]],
+            [[], [], []],
+            vocab_size=VOCAB_SIZE,
+            device=torch.device("cpu"),
+        )
+        assert not batch.no_penalties
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.no_penalties is False
+        assert metadata.frequency_penalties.tolist() == pytest.approx([0.0, 0.5, 0.0])
+        assert metadata.presence_penalties.tolist() == pytest.approx([0.0, 0.0, 0.0])
+        assert metadata.repetition_penalties.tolist() == pytest.approx([1.0, 1.0, 1.2])
 
     def test_sampling_metadata_uses_requested_logprobs(self) -> None:
         batch = SamplingBatch(

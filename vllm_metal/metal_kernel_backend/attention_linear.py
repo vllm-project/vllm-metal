@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Linear attention (Gated DeltaNet) with C++ Metal kernel for paged state.
+"""Linear attention (Gated DeltaNet) with paged Metal state dispatch.
 
-Decomposes the mlx_lm GDN module's forward pass and replaces the recurrent
-update step with a C++ nanobind Metal kernel that reads/writes state in-place
-from a managed pool via slot_mapping.
-
-Conv1d remains per-request (stateful), but the expensive recurrent step is
-dispatched as a single batched Metal kernel call across all requests.
+Decomposes the mlx_lm GDN module's forward pass and routes eligible decode-only
+batches through lazy Metal conv/recurrent kernels.  Unsupported shapes, mixed
+prefill+decode batches, or disabled lazy decode use the eager conv / C++ Metal
+recurrent fallback path.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -18,8 +17,12 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
 from vllm_metal.metal import get_ops
+from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
+    GDNLazyDecodeKernels,
+    GDNRecurrentDecodeRequest,
+)
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_common import get_context
+from vllm_metal.paged_attention_common import PagedAttentionContext, get_context
 
 
 def is_linear_attention(module: nn.Module) -> bool:
@@ -31,14 +34,23 @@ def is_linear_attention(module: nn.Module) -> bool:
     return hasattr(module, "conv1d") and not hasattr(module, "q_proj")
 
 
+@dataclass(frozen=True)
+class _GDNForwardState:
+    x: mx.array
+    cu_seqlens: list[int]
+    num_requests: int
+    total_tokens: int
+    slot_ids: list[int]
+
+
 class GDNPagedAttentionWrapper(nn.Module):
-    """Wraps a GDN linear attention module with C++ Metal kernel dispatch.
+    """Wraps a GDN linear attention module for paged state dispatch.
 
     The forward pass decomposes the mlx_lm GDN module into:
     1. Projections (in_proj_qkv, z, a, b) — stateless, batched
     2. Conv1d with state management — per-request (stateful)
     3. Q/K/V split + RMS norm + gating — stateless, batched
-    4. Recurrent update — C++ Metal kernel, batched, in-place state pool
+    4. Recurrent update — lazy Metal decode fast path, with C++ Metal fallback
     5. Output norm + projection — stateless, batched
 
     When no ``PagedAttentionContext`` is active, delegates to the original
@@ -57,6 +69,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
         object.__setattr__(self, "_gdn_state_cache", state_cache)
+        object.__setattr__(self, "_gdn_lazy_decode", GDNLazyDecodeKernels.shared())
 
     def __call__(
         self,
@@ -71,18 +84,50 @@ class GDNPagedAttentionWrapper(nn.Module):
             # GDN is recurrent — does not use position_ids; drop it.
             return self._inner(x, mask=mask, cache=cache)
 
-        inner = self._inner
-        cache_idx: int = self._gdn_cache_idx
-        state_cache: GDNPagedStateCache = self._gdn_state_cache
+        state = self._prepare_gdn_forward_state(x, ctx)
+        mixed_qkv, z, a, b = self._project_inputs(state)
+        conv_packed = self._run_conv(mixed_qkv, state)
+        q, k, v = self._split_and_normalize(conv_packed, state)
+        g, beta = self._compute_gates(a, b, state)
+        y_flat = self._run_recurrent(q, k, v, g, beta, state)
+        return self._project_output(y_flat, z, state)
 
+    def _prepare_gdn_forward_state(
+        self, x: mx.array, ctx: PagedAttentionContext
+    ) -> _GDNForwardState:
         cu_seqlens = ctx.cu_seqlens
         if cu_seqlens is None or len(cu_seqlens) < 2:
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        total_tokens = x.shape[1]
+        slot_ids = (
+            ctx.gdn_slot_mapping
+            if ctx.gdn_slot_mapping is not None
+            else list(range(num_requests))
+        )
+        if len(slot_ids) != num_requests:
+            raise RuntimeError("GDN wrapper requires one slot per request")
+        if len(set(slot_ids)) != len(slot_ids):
+            raise RuntimeError("GDN wrapper requires unique slots per request")
+        if any(slot < 0 or slot >= self._gdn_state_cache.max_seqs for slot in slot_ids):
+            raise RuntimeError("GDN wrapper received out-of-range slot mapping")
 
+        return _GDNForwardState(
+            x=x,
+            cu_seqlens=cu_seqlens,
+            num_requests=num_requests,
+            total_tokens=x.shape[1],
+            slot_ids=slot_ids,
+        )
+
+    def _project_inputs(
+        self, state: _GDNForwardState
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
         # === Step 1: Projections (stateless, on full packed input) ===
+        inner = self._inner
+        total_tokens = state.total_tokens
+        x = state.x
+
         if hasattr(inner, "in_proj_qkvz"):
             # Qwen3-Next style: combined projections
             q_pre, k_pre, v_pre, z, b, a = inner.fix_query_key_value_ordering(
@@ -106,18 +151,27 @@ class GDNPagedAttentionWrapper(nn.Module):
             b = inner.in_proj_b(x)  # [1, total_tokens, Hv]
             a = inner.in_proj_a(x)  # [1, total_tokens, Hk]
 
+        return mixed_qkv, z, a, b
+
+    def _run_conv(self, mixed_qkv: mx.array, state: _GDNForwardState) -> mx.array:
         # === Step 2: Conv1d (per-request, needs conv_state) ===
-        # Use stable slot mapping for state pool access.
-        slot_ids = (
-            ctx.gdn_slot_mapping
-            if ctx.gdn_slot_mapping is not None
-            else list(range(num_requests))
-        )
+        inner = self._inner
+        state_cache = self._gdn_state_cache
+        cache_idx = self._gdn_cache_idx
+        slot_ids = state.slot_ids
+
+        if state.total_tokens == state.num_requests:
+            conv_packed = self._gdn_lazy_decode.try_conv_decode(
+                mixed_qkv, inner, state_cache, cache_idx, slot_ids
+            )
+            if conv_packed is not None:
+                return conv_packed
+
         conv_outputs = []
-        for req_idx in range(num_requests):
+        for req_idx in range(state.num_requests):
             slot = slot_ids[req_idx]
-            start = cu_seqlens[req_idx]
-            end = cu_seqlens[req_idx + 1]
+            start = state.cu_seqlens[req_idx]
+            end = state.cu_seqlens[req_idx + 1]
             req_qkv = mixed_qkv[:, start:end, :]
 
             # Load conv state from stable slot
@@ -134,11 +188,15 @@ class GDNPagedAttentionWrapper(nn.Module):
             # Take only the output tokens (not the conv state prefix)
             conv_outputs.append(conv_out[:, -(end - start) :, :])
 
-        conv_packed = mx.concatenate(conv_outputs, axis=1)
+        return mx.concatenate(conv_outputs, axis=1)
 
+    def _split_and_normalize(
+        self, conv_packed: mx.array, state: _GDNForwardState
+    ) -> tuple[mx.array, mx.array, mx.array]:
         # === Step 3: Split Q/K/V + norm ===
+        inner = self._inner
         q, k, v = [
-            t.reshape(1, total_tokens, h, d)
+            t.reshape(1, state.total_tokens, h, d)
             for t, h, d in zip(
                 mx.split(
                     conv_packed,
@@ -153,13 +211,56 @@ class GDNPagedAttentionWrapper(nn.Module):
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        return q, k, v
 
+    def _compute_gates(
+        self, a: mx.array, b: mx.array, state: _GDNForwardState
+    ) -> tuple[mx.array, mx.array]:
         # === Step 4: Gating (stateless) ===
         # compute_g returns float32; cast to match kernel dispatch dtype.
-        g = compute_g(inner.A_log, a, inner.dt_bias).astype(x.dtype)
-        beta = mx.sigmoid(b).astype(x.dtype)
+        g = compute_g(self._inner.A_log, a, self._inner.dt_bias).astype(state.x.dtype)
+        beta = mx.sigmoid(b).astype(state.x.dtype)
+        return g, beta
 
-        # === Step 5: C++ Metal kernel — batched recurrent update ===
+    def _run_recurrent(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        g: mx.array,
+        beta: mx.array,
+        state: _GDNForwardState,
+    ) -> mx.array:
+        # === Step 5: Batched recurrent update ===
+        if state.total_tokens == state.num_requests:
+            request = GDNRecurrentDecodeRequest(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                state_cache=self._gdn_state_cache,
+                cache_idx=self._gdn_cache_idx,
+                slot_ids=state.slot_ids,
+                output_dtype=state.x.dtype,
+            )
+            y_flat = self._gdn_lazy_decode.try_recurrent_decode(request)
+            if y_flat is not None:
+                return y_flat
+        return self._run_recurrent_fallback(q, k, v, g, beta, state)
+
+    def _run_recurrent_fallback(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        g: mx.array,
+        beta: mx.array,
+        state: _GDNForwardState,
+    ) -> mx.array:
+        # C++ Metal fallback path.
+        inner = self._inner
+        total_tokens = state.total_tokens
         n_hk = inner.num_k_heads
         n_hv = inner.num_v_heads
         d_k = inner.head_k_dim
@@ -175,15 +276,12 @@ class GDNPagedAttentionWrapper(nn.Module):
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(kernel_dtype))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(kernel_dtype))
 
-        cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
+        cu_seqlens_arr = mx.array(state.cu_seqlens, dtype=mx.int32)
         # Stable request → slot mapping from model_runner's allocator.
-        if ctx.gdn_slot_mapping is not None:
-            slot_mapping = mx.array(ctx.gdn_slot_mapping, dtype=mx.int32)
-        else:
-            slot_mapping = mx.arange(num_requests, dtype=mx.int32)
+        slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
 
         y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
-        recurrent_pool = state_cache.recurrent_states[cache_idx]
+        recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
 
         mx.eval(
             q_flat,
@@ -214,9 +312,13 @@ class GDNPagedAttentionWrapper(nn.Module):
             d_v,
         )
         mx.eval(y_flat, recurrent_pool)
-        y_flat = y_flat.astype(x.dtype)
+        return y_flat.astype(state.x.dtype)
 
+    def _project_output(
+        self, y_flat: mx.array, z: mx.array, state: _GDNForwardState
+    ) -> mx.array:
         # === Step 6: Output norm + projection ===
-        out = y_flat.reshape(1, total_tokens, n_hv, d_v)
+        inner = self._inner
+        out = y_flat.reshape(1, state.total_tokens, inner.num_v_heads, inner.head_v_dim)
         out = inner.norm(out, z)
-        return inner.out_proj(out.reshape(1, total_tokens, -1))
+        return inner.out_proj(out.reshape(1, state.total_tokens, -1))

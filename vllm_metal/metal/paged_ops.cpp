@@ -113,6 +113,33 @@ static std::string dtype_to_metal(Dtype dt) {
   }
 }
 
+// MLA dispatchers pick a single Metal specialization from one tensor's
+// dtype (q_nope) but the kernel template binds the same `T` to every
+// fp16/bf16 buffer (q_nope, q_pe, latent_cache, out, tmp_out). If they
+// disagree the shader will reinterpret bytes — e.g. read a bf16 cache
+// as fp16 — and silently corrupt attention. Validate up front.
+static void mla_validate_t_dtypes(
+    const char* dispatcher_name,
+    std::initializer_list<std::pair<const char*, const array*>> tensors) {
+  if (tensors.size() == 0) return;
+  Dtype expected = tensors.begin()->second->dtype();
+  if (expected != float16 && expected != bfloat16) {
+    throw std::runtime_error(
+        std::string(dispatcher_name) +
+        ": T buffers must be fp16 or bf16; got " +
+        dtype_to_metal(expected) + " on " + tensors.begin()->first);
+  }
+  for (const auto& [name, arr] : tensors) {
+    if (arr->dtype() != expected) {
+      throw std::runtime_error(
+          std::string(dispatcher_name) +
+          ": all T buffers must share the same dtype; got " +
+          dtype_to_metal(expected) + " on " + tensors.begin()->first +
+          " but " + dtype_to_metal(arr->dtype()) + " on " + name);
+    }
+  }
+}
+
 static int get_bits(const std::string& quant_type) {
   static const std::unordered_map<std::string, int> BITS = {
       {"q8_0", 8}, {"int8", 8}, {"uint8", 8},
@@ -315,8 +342,115 @@ void paged_attention_v1_impl(
 }
 
 // ---------------------------------------------------------------------------
-// paged_attention_v2_online — dispatch helper + eager wrappers
+// paged_attention_v2_online — dispatch helper (used by PagedAttentionPrimitive)
 // ---------------------------------------------------------------------------
+
+// Shared buffer binding for paged attention kernels (slots 2-21).
+static void bind_paged_attn_buffers(
+    metal::CommandEncoder& enc,
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int sliding_window) {
+  int num_heads = static_cast<int>(query.shape(1));
+  int head_size = static_cast<int>(query.shape(2));
+
+  enc.set_output_array(out, 2);
+  enc.set_input_array(query,        3);
+  enc.set_input_array(key_cache,    4);
+  enc.set_input_array(value_cache,  5);
+
+  int32_t nkv = static_cast<int32_t>(num_kv_heads);
+  enc.set_bytes(nkv,   8);
+  // Slot 9 (scale) is set by the caller — varies per dispatch path.
+  enc.set_bytes(softcap, 10);
+
+  enc.set_input_array(block_tables, 11);
+  enc.set_input_array(seq_lens,     12);
+
+  int32_t max_blocks_i = static_cast<int32_t>(block_tables.shape(1));
+  enc.set_bytes(max_blocks_i, 13);
+
+  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
+  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
+  enc.set_bytes(q_stride,        15);
+  enc.set_bytes(kv_block_stride, 16);
+  enc.set_bytes(kv_head_stride,  17);
+
+  enc.set_input_array(cu_seqlens_q, 19);
+  int32_t num_seqs_i = static_cast<int32_t>(cu_seqlens_q.shape(0) - 1);
+  enc.set_bytes(num_seqs_i, 20);
+  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
+  enc.set_bytes(sliding_window_i, 21);
+}
+
+// Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
+// Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 96, 128, 192, 256}.
+static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
+                                 Dtype query_dtype, Dtype k_cache_dtype) {
+  if (use_turboquant) return false;
+  if (query_dtype == float32) return false;
+  if (query_dtype != k_cache_dtype) return false;
+  // 80, 112: HD_TILES % NUM_SG(4) != 0.  512: exceeds 32KB threadgroup memory.
+  switch (head_size) {
+    case 64: case 96: case 128: case 192: case 256: return true;
+    default: return false;
+  }
+}
+
+static void dispatch_paged_attention_tiled(
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int max_seq_len, int sliding_window, Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int head_size  = static_cast<int>(query.shape(2));
+  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  constexpr int BQ = 8;
+  int total_q_blocks = total_q_tokens / BQ + num_seqs;
+
+  auto dt = dtype_to_metal(query.dtype());
+  std::string kname =
+      "paged_attention_tiled_" + dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size) +
+      "_bq8_tk32_nt128";
+
+  auto* lib = d.get_library("paged_attention_v2_kern");
+  auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+  constexpr int NUM_THREADS = 128;
+  constexpr int TILE_KV = 32;
+  int t_size = 2;  // half or bfloat16
+  size_t shmem = static_cast<size_t>(
+      BQ * head_size * t_size          // Q_smem
+      + TILE_KV * head_size * t_size   // KV_smem
+      + BQ * TILE_KV * 4               // S_smem (float); P aliases in-place
+      + BQ * head_size * 4             // O_smem (float)
+      + 2 * BQ * 4);                   // M, L (float)
+
+  int num_heads = static_cast<int>(query.shape(1));
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
+  enc.set_bytes(scale, 9);
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_blocks, 1),
+      MTL::Size::Make(NUM_THREADS, 1, 1));
+}
 
 static void dispatch_paged_attention_v2_online(
     array& out, const array& query,
@@ -325,7 +459,6 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, Stream s,
-    bool from_primitive = false,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -334,15 +467,29 @@ static void dispatch_paged_attention_v2_online(
     bool use_turboquant = false,
     int k_bits = 8,
     int v_bits = 3) {
+  int head_size = static_cast<int>(query.shape(2));
+
+  // Tiled kernel for prefill batches (max_seqlen_q > 1), matching vLLM
+  // Triton's 2D/3D dispatch split.  Pure-decode batches (every sequence has
+  // exactly 1 query token) use the original per-token kernel.
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  bool has_prefill = total_q_tokens > num_seqs;
+  if (has_prefill && can_use_tiled_kernel(head_size, use_turboquant,
+                                          query.dtype(), key_cache.dtype())) {
+    dispatch_paged_attention_tiled(
+        out, query, key_cache, value_cache,
+        num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q,
+        block_size, max_seq_len, sliding_window, s);
+    return;
+  }
+
+  // Fallback: original per-token kernel
   auto& d = metal::device(s.device);
 
-  int total_q_tokens = static_cast<int>(query.shape(0));
   int num_heads  = static_cast<int>(query.shape(1));
-  int head_size  = static_cast<int>(query.shape(2));
-  int max_blocks = static_cast<int>(block_tables.shape(1));
-  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  // 3-part kernel name: paged_attention_<T>_cache_<K>_<V>_hs...
   auto dt        = dtype_to_metal(query.dtype());
   auto k_cache_dt = dtype_to_metal(key_cache.dtype());
   auto v_cache_dt = dtype_to_metal(value_cache.dtype());
@@ -360,7 +507,7 @@ static void dispatch_paged_attention_v2_online(
   int  k_bits_i          = k_bits;
   int  v_bits_i          = v_bits;
 
-  // The hash name is MLX's cache key. It MUST encode every function-constant
+  // The hash name is MLX's cache key.  It MUST encode every function-constant
   // value that varies across calls — otherwise the first compilation wins and
   // subsequent calls with different constants silently reuse the wrong kernel.
   std::string hash_name = kname + "_v2"
@@ -386,10 +533,7 @@ static void dispatch_paged_attention_v2_online(
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
-  // TurboQuant V path is now register-only (inverse FWHT runs entirely on
-  // the simdgroup register file via simd_shuffle_xor).  The previous
-  // per-warp NUM_WARPS * head_size FWHT workspace in shared_mem has been
-  // removed from the kernel, so no TQ bonus is needed here.
+  // TurboQuant V uses register-only FWHT (no threadgroup workspace needed).
   (void)use_turboquant;
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
@@ -397,41 +541,14 @@ static void dispatch_paged_attention_v2_online(
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(out, 2);
-  enc.set_input_array(query,        3);
-  enc.set_input_array(key_cache,    4);
-  enc.set_input_array(value_cache,  5);
-
-  int32_t nkv = static_cast<int32_t>(num_kv_heads);
-  enc.set_bytes(nkv,   8);
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
   enc.set_bytes(scale, 9);
-  float softcapping = softcap;
-  enc.set_bytes(softcapping, 10);
 
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens,     12);
-
-  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
-  enc.set_bytes(max_blocks_i, 13);
-
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
-
-  enc.set_input_array(cu_seqlens_q, 19);
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  enc.set_bytes(num_seqs_i, 20);
-  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
-  enc.set_bytes(sliding_window_i, 21);
-
-  // TurboQuant buffers (slots 22-27, only bound when use_turboquant)
   if (use_turboquant) {
     enc.set_input_array(*key_scale_cache,   22);
     enc.set_input_array(*value_scale_cache, 23);
-    // v_block_stride = value_cache.strides()[0], v_head_stride = value_cache.strides()[2]
     int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
     int32_t v_head_stride_i  = static_cast<int32_t>(value_cache.strides()[2]);
     enc.set_bytes(v_block_stride_i, 24);
@@ -443,224 +560,6 @@ static void dispatch_paged_attention_v2_online(
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
-
-  if (!from_primitive) {
-    add_temporary_compat(enc, out, d, s);
-    add_temporary_compat(enc, query, d, s);
-    add_temporary_compat(enc, key_cache, d, s);
-    add_temporary_compat(enc, value_cache, d, s);
-    add_temporary_compat(enc, block_tables, d, s);
-    add_temporary_compat(enc, seq_lens, d, s);
-    add_temporary_compat(enc, cu_seqlens_q, d, s);
-    if (use_turboquant) {
-      add_temporary_compat(enc, *key_scale_cache, d, s);
-      add_temporary_compat(enc, *value_scale_cache, d, s);
-      add_temporary_compat(enc, *key_zero_cache, d, s);
-      add_temporary_compat(enc, *v_centroids, d, s);
-    }
-  }
-}
-
-// Eager wrapper — keeps the old handle-based API for metal_unified_attention.
-// Non-partitioned case delegates to the dispatch helper above;
-// partitioned case is handled inline (same as original code on main).
-void paged_attention_v2_online_impl_common(
-    nb::handle out_h,
-    nb::handle query_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
-    int num_kv_heads,
-    float scale,
-    float softcap,
-    nb::handle block_tables_h,
-    nb::handle seq_lens_h,
-    nb::handle cu_seqlens_q_h,
-    int block_size,
-    int max_seq_len,
-    int sliding_window,
-    array* exp_sums,
-    array* max_logits,
-    array* tmp_out,
-    array* sinks
-) {
-  auto& out          = *nb::inst_ptr<array>(out_h);
-  auto& query        = *nb::inst_ptr<array>(query_h);
-  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
-  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
-  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
-  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
-  auto& cu_seqlens_q = *nb::inst_ptr<array>(cu_seqlens_q_h);
-
-  // Non-partitioned case: delegate to the shared dispatch helper
-  bool needs_partitioning =
-      exp_sums != nullptr && max_logits != nullptr && tmp_out != nullptr;
-  if (!needs_partitioning) {
-    dispatch_paged_attention_v2_online(
-        out, query, key_cache, value_cache,
-        num_kv_heads, scale, softcap,
-        block_tables, seq_lens, cu_seqlens_q,
-        block_size, max_seq_len, sliding_window,
-        default_stream(Device::gpu));
-    return;
-  }
-
-  // Partitioned path (unchanged from main)
-  auto s = default_stream(Device::gpu);
-  auto& d = metal::device(Device::gpu);
-
-  int total_q_tokens = static_cast<int>(query.shape(0));
-  int num_heads  = static_cast<int>(query.shape(1));
-  int head_size  = static_cast<int>(query.shape(2));
-  int max_blocks = static_cast<int>(block_tables.shape(1));
-  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-  int max_num_partitions =
-      std::max(1, (max_seq_len + kPartitionSize - 1) / kPartitionSize);
-  bool use_partitioning =
-      kPartitionSize % block_size == 0 && max_num_partitions > 1;
-
-  auto dt        = dtype_to_metal(query.dtype());
-  auto k_cache_dt = dtype_to_metal(key_cache.dtype());
-  auto v_cache_dt = dtype_to_metal(value_cache.dtype());
-  std::string kname =
-      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps" +
-      std::to_string(use_partitioning ? kPartitionSize : 0);
-
-  bool use_alibi        = false;
-  bool use_fp8          = false;
-  bool use_sinks        = sinks != nullptr;
-  bool use_tq_fc        = false;
-  int  k_bits_i         = 8;
-
-  // Same hash-name discipline as v2: encode every varying function constant
-  // (use_sinks here) so MLX doesn't reuse a stale specialization.
-  std::string hash_name = kname + "_v2"
-      + "_sinks" + (use_sinks ? "1" : "0");
-
-  auto* lib = d.get_library("paged_attention_v2_kern");
-  auto* kernel = d.get_kernel(
-      kname, lib, hash_name,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
-       {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
-       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
-       {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)}});
-
-  constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
-  int warp_scores_bytes = NUM_WARPS * block_size
-                          * static_cast<int>(sizeof(float));
-  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
-                    * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
-
-  auto& enc = get_command_encoder_compat(d, s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_threadgroup_memory_length(shmem, 0);
-
-  if (use_partitioning) {
-    enc.set_output_array(*exp_sums, 0);
-    enc.set_output_array(*max_logits, 1);
-    enc.set_output_array(*tmp_out, 2);
-  } else {
-    enc.set_output_array(out, 2);
-  }
-  enc.set_input_array(query,        3);
-  enc.set_input_array(key_cache,    4);
-  enc.set_input_array(value_cache,  5);
-
-  int32_t nkv = static_cast<int32_t>(num_kv_heads);
-  enc.set_bytes(nkv,   8);
-  enc.set_bytes(scale, 9);
-  float softcapping = softcap;
-  enc.set_bytes(softcapping, 10);
-
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens,     12);
-
-  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
-  enc.set_bytes(max_blocks_i, 13);
-
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
-  if (use_sinks) {
-    enc.set_input_array(*sinks, 18);
-  }
-
-  enc.set_input_array(cu_seqlens_q, 19);
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  enc.set_bytes(num_seqs_i, 20);
-  int32_t sliding_window_i = static_cast<int32_t>(sliding_window);
-  enc.set_bytes(sliding_window_i, 21);
-
-  const int32_t grid_z =
-      static_cast<int32_t>(use_partitioning ? max_num_partitions : 1);
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_tokens, grid_z),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
-
-  if (use_partitioning) {
-    std::string reduce_kname =
-        "paged_attention_v2_reduce_" + dt +
-        "_hs" + std::to_string(head_size) +
-        "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
-    // The reduce kernel now references function_constant(50) (use_turboquant)
-    // to gate the deferred-FWHT path.  Reaching this dispatch from the
-    // non-TQ wrapper means use_turboquant is always false here; encode it
-    // in the hash name anyway so a future TQ-partitioned dispatch picks up
-    // its own specialisation instead of reusing the non-TQ one.
-    bool reduce_use_tq = false;
-    auto* reduce_kernel = d.get_kernel(
-        reduce_kname,
-        lib,
-        reduce_kname + "_v2_reduce_tq" + (reduce_use_tq ? "1" : "0"),
-        {{&use_sinks,       MTL::DataType::DataTypeBool, NS::UInteger(40)},
-         {&reduce_use_tq,   MTL::DataType::DataTypeBool, NS::UInteger(50)}});
-    size_t reduce_shmem =
-        static_cast<size_t>(2 * max_num_partitions * sizeof(float));
-    enc.set_compute_pipeline_state(reduce_kernel);
-    enc.set_threadgroup_memory_length(reduce_shmem, 0);
-
-    enc.set_output_array(out,         0);
-    enc.set_input_array(*exp_sums,    1);
-    enc.set_input_array(*max_logits,  2);
-    enc.set_input_array(*tmp_out,     3);
-    enc.set_input_array(seq_lens,     4);
-    int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
-    enc.set_bytes(max_num_partitions_i, 5);
-    if (use_sinks) {
-      enc.set_input_array(*sinks, 6);
-    }
-    enc.set_input_array(cu_seqlens_q, 7);
-    enc.set_bytes(num_seqs_i, 8);
-    enc.dispatch_threadgroups(
-        MTL::Size::Make(num_heads, total_q_tokens, 1),
-        MTL::Size::Make(NUM_THREADS, 1, 1));
-  }
-
-  add_temporary_compat(enc, out, d, s);
-  add_temporary_compat(enc, query, d, s);
-  add_temporary_compat(enc, key_cache, d, s);
-  add_temporary_compat(enc, value_cache, d, s);
-  add_temporary_compat(enc, block_tables, d, s);
-  add_temporary_compat(enc, seq_lens, d, s);
-  add_temporary_compat(enc, cu_seqlens_q, d, s);
-  if (use_partitioning) {
-    add_temporary_compat(enc, *exp_sums, d, s);
-    add_temporary_compat(enc, *max_logits, d, s);
-    add_temporary_compat(enc, *tmp_out, d, s);
-  }
-  if (use_sinks) {
-    add_temporary_compat(enc, *sinks, d, s);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +604,6 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_,
         stream(),
-        /*from_primitive=*/true,
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_);
   }
 
@@ -763,82 +661,6 @@ static array paged_attention_primitive_fn(
   return array(
       query.shape(), query.dtype(), std::move(prim),
       {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
-}
-
-void paged_attention_v2_online_impl(
-    nb::handle out_h,
-    nb::handle query_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
-    int num_kv_heads,
-    float scale,
-    float softcap,
-    nb::handle block_tables_h,
-    nb::handle seq_lens_h,
-    nb::handle cu_seqlens_q_h,
-    int block_size,
-    int max_seq_len,
-    int sliding_window
-) {
-  paged_attention_v2_online_impl_common(
-      out_h,
-      query_h,
-      key_cache_h,
-      value_cache_h,
-      num_kv_heads,
-      scale,
-      softcap,
-      block_tables_h,
-      seq_lens_h,
-      cu_seqlens_q_h,
-      block_size,
-      max_seq_len,
-      sliding_window,
-      nullptr,
-      nullptr,
-      nullptr,
-      nullptr);
-}
-
-void paged_attention_v2_online_partitioned_impl(
-    nb::handle out_h,
-    nb::handle query_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
-    int num_kv_heads,
-    float scale,
-    float softcap,
-    nb::handle block_tables_h,
-    nb::handle seq_lens_h,
-    nb::handle cu_seqlens_q_h,
-    int block_size,
-    int max_seq_len,
-    int sliding_window,
-    nb::handle exp_sums_h,
-    nb::handle max_logits_h,
-    nb::handle tmp_out_h
-) {
-  auto& exp_sums = *nb::inst_ptr<array>(exp_sums_h);
-  auto& max_logits = *nb::inst_ptr<array>(max_logits_h);
-  auto& tmp_out = *nb::inst_ptr<array>(tmp_out_h);
-  paged_attention_v2_online_impl_common(
-      out_h,
-      query_h,
-      key_cache_h,
-      value_cache_h,
-      num_kv_heads,
-      scale,
-      softcap,
-      block_tables_h,
-      seq_lens_h,
-      cu_seqlens_q_h,
-      block_size,
-      max_seq_len,
-      sliding_window,
-      &exp_sums,
-      &max_logits,
-      &tmp_out,
-      nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +858,218 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
+// ---------------------------------------------------------------------------
+// MLA paged attention (RFC #360)
+// ---------------------------------------------------------------------------
+
+static std::string mla_source_;
+
+void init_mla_library(const std::string& src) {
+  mla_source_ = src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_mla_kern", [&]() { return mla_source_; });
+}
+
+// Dispatch the MLA paged attention kernel.
+//
+// Buffer slot map (must match kernels_v2/mla.metal):
+//   2: out          [total_q_tokens, num_heads, KV_LORA_RANK]
+//   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK]
+//   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM]
+//   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM]
+//   6: block_tables 7: context_lens 8: cu_seqlens_q
+//   9: num_seqs 10: max_num_blocks_per_seq 11: scale
+// Map heads_per_tg → NUM_THREADS. Each variant keeps the per-thread register
+// footprint roughly constant (NUM_THREADS scaled inversely to G).
+//   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
+//   G=2 → NUM_THREADS=512  (16 simdgroups, 2× cross-head amortization).
+// Returns 0 for an unsupported G so callers can validate.
+static int mla_num_threads_for_g(int heads_per_tg) {
+  switch (heads_per_tg) {
+    case 1: return 1024;
+    case 2: return 512;
+    default: return 0;
+  }
+}
+
+static void dispatch_mla_paged_attention(
+    array& out,
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int heads_per_tg,
+    Stream s) {
+  auto& d = metal::device(s.device);
+
+  int total_q_tokens = static_cast<int>(q_nope.shape(0));
+  int num_heads = static_cast<int>(q_nope.shape(1));
+  int kv_lora_rank = static_cast<int>(q_nope.shape(2));
+  int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
+  int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
+  int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+
+  // Shape sanity — these must match what the kernel template was instantiated for.
+  if (kv_lora_rank != 512) {
+    throw std::runtime_error(
+        "MLA kernel: only kv_lora_rank=512 is instantiated; got " +
+        std::to_string(kv_lora_rank));
+  }
+  if (qk_rope_head_dim != 64) {
+    throw std::runtime_error(
+        "MLA kernel: only qk_rope_head_dim=64 is instantiated; got " +
+        std::to_string(qk_rope_head_dim));
+  }
+  if (block_size != 16 && block_size != 32) {
+    throw std::runtime_error(
+        "MLA kernel: only block_size in {16, 32} is instantiated; got " +
+        std::to_string(block_size));
+  }
+  int num_threads = mla_num_threads_for_g(heads_per_tg);
+  if (num_threads == 0) {
+    throw std::runtime_error(
+        "MLA kernel: heads_per_tg must be in {1, 2}; got " +
+        std::to_string(heads_per_tg));
+  }
+  if (num_heads % heads_per_tg != 0) {
+    throw std::runtime_error(
+        "MLA kernel: num_heads (" + std::to_string(num_heads) +
+        ") must be divisible by heads_per_tg (" +
+        std::to_string(heads_per_tg) + ")");
+  }
+  mla_validate_t_dtypes("MLA kernel", {
+      {"q_nope", &q_nope},
+      {"q_pe", &q_pe},
+      {"latent_cache", &latent_cache},
+      {"out", &out},
+  });
+
+  auto dt = dtype_to_metal(q_nope.dtype());
+  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_g" +
+                      std::to_string(heads_per_tg) + "_nt" +
+                      std::to_string(num_threads) + "_nsl32_ps0";
+
+  bool use_partitioning = false;
+
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
+
+  auto* lib = d.get_library("paged_mla_kern");
+  auto* kernel = d.get_kernel(
+      kname,
+      lib,
+      hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
+
+  // Threadgroup memory:
+  //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]
+  // The outputs buffer must be sized for the maximum write offset
+  // `lane*BD + sg`, which reaches (BD-1)*BD + (BN-1). Using BD*BD always
+  // (rather than BN*BD) gives enough room across all G; on G=1 (BN=BD=32)
+  // they coincide.
+  // For G=1, NT=1024: 2*32 + 32*32 = 1088 fp32 ≈ 4.3 KB.
+  // For G=2, NT=512:  2*2*16 + 32*32 = 1088 fp32 ≈ 4.3 KB.
+  const int BD = 32;
+  const int BN = num_threads / BD;
+  size_t shmem =
+      static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
+
+  auto& enc = get_command_encoder_compat(d, s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+
+  enc.set_output_array(out, 2);
+  enc.set_input_array(q_nope, 3);
+  enc.set_input_array(q_pe, 4);
+  enc.set_input_array(latent_cache, 5);
+  enc.set_input_array(block_tables, 6);
+  enc.set_input_array(context_lens, 7);
+  enc.set_input_array(cu_seqlens_q, 8);
+
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+  enc.set_bytes(num_seqs_i, 9);
+  enc.set_bytes(max_blocks_i, 10);
+  enc.set_bytes(scale, 11);
+
+  // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
+  // query heads sharing the same latent KV.
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
+      MTL::Size::Make(num_threads, 1, 1));
+
+  // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
+  // and inside a primitive MLX manages array lifetimes via the completion
+  // handler.
+}
+
+// MLA single-pass paged attention as an MLX Primitive so the kernel
+// dispatch participates in the lazy graph (no per-call mx.eval boundary).
+class MlaPagedAttentionPrimitive : public UnaryPrimitive {
+ public:
+  MlaPagedAttentionPrimitive(
+      Stream stream, int block_size, float scale, int heads_per_tg)
+      : UnaryPrimitive(stream),
+        block_size_(block_size),
+        scale_(scale),
+        heads_per_tg_(heads_per_tg) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("MlaPagedAttentionPrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    // Inputs match the single-pass dispatcher's positional order:
+    //   [q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q]
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_mla_paged_attention(
+        out,
+        inputs[0], inputs[1], inputs[2],
+        inputs[3], inputs[4], inputs[5],
+        block_size_, scale_, heads_per_tg_,
+        stream());
+  }
+
+  const char* name() const override { return "MlaPagedAttention"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const MlaPagedAttentionPrimitive*>(&other);
+    return rhs && rhs->block_size_ == block_size_
+        && rhs->scale_ == scale_ && rhs->heads_per_tg_ == heads_per_tg_;
+  }
+
+ private:
+  int block_size_;
+  float scale_;
+  int heads_per_tg_;
+};
+
+static array mla_paged_attention_primitive_fn(
+    const array& q_nope,
+    const array& q_pe,
+    const array& latent_cache,
+    const array& block_tables,
+    const array& context_lens,
+    const array& cu_seqlens_q,
+    int block_size,
+    float scale,
+    int heads_per_tg) {
+  auto prim = std::make_shared<MlaPagedAttentionPrimitive>(
+      default_stream(Device::gpu), block_size, scale, heads_per_tg);
+  // Output shape matches q_nope: (total_q_tokens, num_heads, kv_lora_rank).
+  return array(
+      q_nope.shape(),
+      q_nope.dtype(),
+      std::move(prim),
+      {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
+}
+
 void gdn_linear_attention_impl(
     nb::handle q_h, nb::handle k_h, nb::handle v_h,
     nb::handle g_h, nb::handle beta_h,
@@ -1104,7 +1138,6 @@ void gdn_linear_attention_impl(
   add_temporary_compat(enc, slot_mapping, d, s);
   add_temporary_compat(enc, y, d, s);
 }
-
 // ---------------------------------------------------------------------------
 // nanobind module
 // ---------------------------------------------------------------------------
@@ -1202,31 +1235,6 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("max_seq_len"),
         "Zero-copy paged attention (v1, no partitioning).");
 
-  m.def("paged_attention_v2_online", &paged_attention_v2_online_impl,
-        nb::arg("out"), nb::arg("query"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("num_kv_heads"), nb::arg("scale"),
-        nb::arg("softcap"),
-        nb::arg("block_tables"), nb::arg("seq_lens"),
-        nb::arg("cu_seqlens_q"),
-        nb::arg("block_size"), nb::arg("max_seq_len"),
-        nb::arg("sliding_window"),
-        "Online-softmax varlen paged attention (v2, unified prefill+decode).");
-
-  m.def("paged_attention_v2_online_partitioned",
-        &paged_attention_v2_online_partitioned_impl,
-        nb::arg("out"), nb::arg("query"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("num_kv_heads"), nb::arg("scale"),
-        nb::arg("softcap"),
-        nb::arg("block_tables"), nb::arg("seq_lens"),
-        nb::arg("cu_seqlens_q"),
-        nb::arg("block_size"), nb::arg("max_seq_len"),
-        nb::arg("sliding_window"),
-        nb::arg("exp_sums"), nb::arg("max_logits"), nb::arg("tmp_out"),
-        "Online-softmax varlen paged attention (v2) with caller-provided "
-        "partition scratch buffers.");
-
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.
   // Uses overwrite_descriptor to bypass cross-module nanobind RTTI.
@@ -1290,4 +1298,41 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("slot_mapping"), nb::arg("y"),
         nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
         "GDN linear attention with in-place paged state management.");
+
+  m.def("init_mla_library", &init_mla_library,
+        nb::arg("src"),
+        "JIT-compile the MLA paged attention Metal shader (RFC #360).");
+
+  m.def("mla_paged_attention_primitive",
+        [](nb::handle q_nope_h,
+           nb::handle q_pe_h,
+           nb::handle latent_cache_h,
+           nb::handle block_tables_h,
+           nb::handle context_lens_h,
+           nb::handle cu_seqlens_q_h,
+           int block_size, float scale, int heads_per_tg,
+           nb::handle out_h) {
+          auto result = mla_paged_attention_primitive_fn(
+              *nb::inst_ptr<array>(q_nope_h),
+              *nb::inst_ptr<array>(q_pe_h),
+              *nb::inst_ptr<array>(latent_cache_h),
+              *nb::inst_ptr<array>(block_tables_h),
+              *nb::inst_ptr<array>(context_lens_h),
+              *nb::inst_ptr<array>(cu_seqlens_q_h),
+              block_size, scale, heads_per_tg);
+          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
+        },
+        nb::arg("q_nope"), nb::arg("q_pe"),
+        nb::arg("latent_cache"),
+        nb::arg("block_tables"), nb::arg("context_lens"),
+        nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("scale"),
+        nb::arg("heads_per_tg") = 1,
+        nb::arg("out"),
+        "Paged MLA (single-pass), wrapped as an MLX Primitive — fills "
+        "``out`` with a lazy descriptor so the kernel call participates "
+        "in the wrapper's lazy graph and avoids the per-call mx.eval "
+        "boundary the eager binding requires. Saves ~200 μs at B=1 "
+        "small-H cells where dispatch overhead dominates.");
+
 }
