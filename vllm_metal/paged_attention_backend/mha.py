@@ -22,9 +22,7 @@ def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
     backends (called by ``hybrid.py`` and ``MHAPagedAttentionBackend``).
     """
     del cache
-    logger.info(
-        "Paged attention (v2/MLX-native): skipping Metal kernel warm-up"
-    )
+    logger.info("Paged attention (v2/MLX-native): skipping Metal kernel warm-up")
 
 
 class MHAPagedAttentionBackend:
