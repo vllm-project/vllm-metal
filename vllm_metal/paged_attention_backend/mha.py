@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import platform
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 from vllm.logger import init_logger
+
+from vllm_metal.metal import get_ops
 
 if TYPE_CHECKING:
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
@@ -13,16 +16,32 @@ logger = init_logger(__name__)
 
 
 def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
-    """No-op warm-up for the v2 / MLX-native paged-attention path.
+    """Front-load v2 paged-attention kernel compilation at startup.
 
-    The legacy v1 Metal kernels (reshape_and_cache / paged_attention_v1)
-    have been removed. Production KV writes use MLX-native scatter and the
-    attention kernel JIT-compiles on first use, so there is no Metal shader
-    to pre-compile here. Kept as a stable entry point for the MHA and Hybrid
-    backends (called by ``hybrid.py`` and ``MHAPagedAttentionBackend``).
+    ``get_ops()`` JIT-builds the C++ ``_paged_ops`` extension and eagerly
+    compiles the v2 / GDN / MLA Metal libraries: MLX's
+    ``Device::get_library`` compiles the source synchronously inside each
+    ``init_*_library`` call. Calling it here moves that cost off the first
+    request and fails fast at startup if the kernels cannot compile on this
+    macOS (e.g. an unsupported Metal language version).
+
+    The legacy v1 ``reshape_and_cache`` probe is gone: KV writes are now
+    MLX-native scatter, and the probe was only needed in v1 because the
+    dispatch itself was the compile trigger. Kept as the stable warm-up
+    entry point for the MHA and Hybrid backends (``hybrid.py`` /
+    ``MHAPagedAttentionBackend``); ``cache`` is intentionally unused.
     """
     del cache
-    logger.info("Paged attention (v2/MLX-native): skipping Metal kernel warm-up")
+    macos_version = platform.mac_ver()[0]
+    logger.info("Warming up v2 paged-attention Metal kernels...")
+    try:
+        get_ops()
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to compile paged-attention Metal kernels on "
+            f"macOS {macos_version}: {e}"
+        ) from e
+    logger.info("Paged-attention Metal kernel warm-up complete")
 
 
 class MHAPagedAttentionBackend:
