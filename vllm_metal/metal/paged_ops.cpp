@@ -422,12 +422,14 @@ static void dispatch_paged_attention_tiled(
   constexpr int TILE_KV = 32;
   constexpr int t_size = 2;  // half or bfloat16
   // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
-  // Output staging reuses Q_smem as float at exit; fits because the float
-  // buffer (BQ*HEAD*4) stays within Q+K+V (BQ <= 2*TILE_KV, i.e. 32 <= 64).
+  // Output staging reuses Q_smem as fp32 O_smem at exit; fits because
+  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV (32 <= 64).
+  // A1: leading dim padded by 16 B for bank-conflict avoidance —
+  // smem_pad/ld MUST match SMEM_PAD/LD in pagedattention_tiled.metal.
+  const int smem_pad = 16 / t_size;            // 8 elems for half/bf16
+  const int ld       = head_size + smem_pad;   // padded leading dim
   size_t shmem = static_cast<size_t>(
-      BQ * head_size * t_size           // Q_smem
-      + TILE_KV * head_size * t_size    // K_smem
-      + TILE_KV * head_size * t_size);  // V_smem
+      (BQ + 2 * TILE_KV) * ld * t_size);       // Q + K + V, padded
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = get_command_encoder_compat(d, s);

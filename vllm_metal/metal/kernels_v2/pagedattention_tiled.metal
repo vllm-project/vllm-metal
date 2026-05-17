@@ -170,12 +170,16 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   const int context_len = seq_len - cur_batch_query_len;
   const int valid_q = min(BQ, cur_batch_query_len - q_pos_start);
 
-  // ─ Threadgroup memory layout ──────────────────────────────────────────
-  // Q_smem: BQ × HEAD_SIZE         (loaded once, then read into registers)
-  // K_smem: TILE_KV × HEAD_SIZE    (overwritten each KV tile)
-  // V_smem: TILE_KV × HEAD_SIZE    (overwritten each KV tile)
-  constexpr int Q_ELEMS = BQ * HEAD_SIZE;
-  constexpr int KV_ELEMS = TILE_KV * HEAD_SIZE;
+  // ─ Threadgroup memory layout (A1: bank-conflict padding) ──────────────
+  // Each row padded to LD = HEAD_SIZE + SMEM_PAD so the 8 columns of every
+  // 8×8 simdgroup_load/store land on distinct threadgroup-memory banks
+  // (a HEAD_SIZE power-of-two stride aliases them).  The fp32 O_smem that
+  // aliases Q_smem at exit reuses the SAME LD.
+  //   Q_smem: BQ × LD,   K_smem/V_smem: TILE_KV × LD.
+  constexpr int SMEM_PAD = 16 / sizeof(T);   // 8 elems (16 B) for fp16/bf16
+  constexpr int LD = HEAD_SIZE + SMEM_PAD;   // padded leading dim
+  constexpr int Q_ELEMS = BQ * LD;
+  constexpr int KV_ELEMS = TILE_KV * LD;
 
   threadgroup T *Q_smem = reinterpret_cast<threadgroup T *>(shared_mem);
   threadgroup T *K_smem = Q_smem + Q_ELEMS;
@@ -188,10 +192,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   // anyway, but zeroing avoids garbage propagating through QK).
   const device T *q_base = q + (q_seq_start + q_pos_start) * q_stride
                              + head_idx * HEAD_SIZE;
-  for (int i = thread_idx; i < Q_ELEMS; i += NUM_THREADS) {
+  for (int i = thread_idx; i < BQ * HEAD_SIZE; i += NUM_THREADS) {
     int r = i / HEAD_SIZE;
     int d = i % HEAD_SIZE;
-    Q_smem[i] = (r < valid_q) ? q_base[r * q_stride + d] : T(0);
+    Q_smem[r * LD + d] = (r < valid_q) ? q_base[r * q_stride + d] : T(0);
   }
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -210,7 +214,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   #pragma unroll
   for (int d = 0; d < TD; d++) {
     simdgroup_matrix<T, 8, 8> tmp;
-    simdgroup_load(tmp, Q_smem + sg_idx * 8 * HEAD_SIZE + d * 8, HEAD_SIZE);
+    simdgroup_load(tmp, Q_smem + sg_idx * 8 * LD + d * 8, LD);
     Qreg[d] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
   }
 
@@ -275,17 +279,17 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
         const device T *v_ptr = v_cache + off;
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * HEAD_SIZE + d]) =
+          *((threadgroup vec2T *)&K_smem[t * LD + d]) =
               *((const device vec2T *)(k_ptr + d));
-          *((threadgroup vec2T *)&V_smem[t * HEAD_SIZE + d]) =
+          *((threadgroup vec2T *)&V_smem[t * LD + d]) =
               *((const device vec2T *)(v_ptr + d));
         }
       } else {
         const vec2T zero(T(0));
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * HEAD_SIZE + d]) = zero;
-          *((threadgroup vec2T *)&V_smem[t * HEAD_SIZE + d]) = zero;
+          *((threadgroup vec2T *)&K_smem[t * LD + d]) = zero;
+          *((threadgroup vec2T *)&V_smem[t * LD + d]) = zero;
         }
       }
     }
@@ -312,8 +316,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       for (int k = 0; k < TK; k++) {
         simdgroup_matrix<T, 8, 8> k_frag;
         simdgroup_load(k_frag,
-                       K_smem + k * 8 * HEAD_SIZE + d * 8,
-                       HEAD_SIZE, ulong2(0), /*transpose=*/true);
+                       K_smem + k * 8 * LD + d * 8,
+                       LD, ulong2(0), /*transpose=*/true);
 
         // Materialize S accumulator from register vec → simdgroup_matrix.
         simdgroup_matrix<float, 8, 8> s_frag;
@@ -428,8 +432,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       for (int d = 0; d < TD; d++) {
         simdgroup_matrix<T, 8, 8> v_frag;
         simdgroup_load(v_frag,
-                       V_smem + k * 8 * HEAD_SIZE + d * 8,
-                       HEAD_SIZE);
+                       V_smem + k * 8 * LD + d * 8,
+                       LD);
 
         // Materialize O accumulator fragment from register vec.
         simdgroup_matrix<float, 8, 8> o_frag;
@@ -463,8 +467,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     simdgroup_matrix<float, 8, 8> o_frag;
     reinterpret_cast<thread vec2F &>(o_frag.thread_elements()) = Oreg[d];
     simdgroup_store(o_frag,
-                    O_smem + sg_idx * 8 * HEAD_SIZE + d * 8,
-                    HEAD_SIZE);
+                    O_smem + sg_idx * 8 * LD + d * 8,
+                    LD);
   }
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -476,7 +480,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   for (int i = thread_idx; i < total; i += NUM_THREADS) {
     int r = i / HEAD_SIZE;
     int d = i % HEAD_SIZE;
-    out_base[r * q_stride + d] = T(O_smem[r * HEAD_SIZE + d]);
+    out_base[r * q_stride + d] = T(O_smem[r * LD + d]);
   }
 }
 
