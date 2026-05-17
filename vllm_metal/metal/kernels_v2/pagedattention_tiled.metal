@@ -414,13 +414,15 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // (One barrier at the END of this iteration protects V_smem against
     //  the next iteration's K+V load.)
     // P is in registers (Sreg, fp32). V is in smem. O accumulator stays in
-    // registers (Oreg). Convert P to T fragment for the MMA.
+    // registers (Oreg).  P is kept fp32 into the MMA (mixed float×T→float),
+    // matching the pre-PR kernel exactly — this PR is precision-neutral.
+    // Sreg is already vec2F, so this is the same MFAMMAFrag reinterpret used
+    // for Q/S/O (no downcast).  Narrowing P to T is a separate,
+    // benchmark-gated follow-up, not bundled into this perf migration.
     #pragma unroll
     for (int k = 0; k < TK; k++) {
-      simdgroup_matrix<T, 8, 8> p_frag;
-      thread auto &pf_elems = p_frag.thread_elements();
-      pf_elems[0] = T(Sreg[k][0]);
-      pf_elems[1] = T(Sreg[k][1]);
+      simdgroup_matrix<float, 8, 8> p_frag;
+      reinterpret_cast<thread vec2F &>(p_frag.thread_elements()) = Sreg[k];
 
       #pragma unroll
       for (int d = 0; d < TD; d++) {
