@@ -11,6 +11,16 @@ vllm-metal currently focuses on text-only language models on Apple Silicon. Mult
 | ❌ | Not supported model/feature |
 | 🟡 | Not tested or verified |
 
+## Text Embedding Pooling
+
+Metal V1 has experimental text-only `embed` pooling support. See
+[Text Embedding Pooling](text_embedding_pooling.md) for scope, usage, and
+validation guidance.
+
+| Model | Support | Runner | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| mlx-community/Qwen3-Embedding-0.6B-8bit | 🔵 | `pooling` / `embed` (paged) | `LLM.embed(["hello metal", "semantic search"])` -> `embedding-smoke-ok 2 1024` | Revision `b8d7100604f51da6d14eab4dd1805f596fa1ce3f`; validated on MacBook Air (Apple M5, 16 GB) with vLLM 0.21.0, MLX 0.31.2, `max_model_len=512` |
+
 ## Text-Only Language Models
 
 `Automatic Prefix Cache` describes the default behavior when the user does
