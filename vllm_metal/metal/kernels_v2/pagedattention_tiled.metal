@@ -57,6 +57,33 @@ inline short2 frag_coord(ushort lane_id) {
   return short2{fn, fm};
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Reduce one row of the 8×8 fragment across the 4 lanes that share it.
+//
+// Masks {1, 8} are FORCED by the frag_coord layout above: the row index fm
+// depends on lane bits {b4,b2,b1}, so the 4 lanes of a row vary only in
+// bits {b0,b3} = XOR masks 1 and 8.  Two shuffles (log2(4)) reduce them,
+// and because XOR-shuffle is a symmetric butterfly the result is replicated
+// to all 4 lanes — the per-row online-softmax state below relies on that.
+//
+// Do NOT replace with simd_sum: all 8 rows of the fragment live in one
+// 32-lane simdgroup, so a 32-lane reduction would fold the rows together.
+//
+// Op mirrors MLX Steel BaseMMAFrag<T,8,8>::row_reduce
+// (mlx/backend/metal/kernels/steel/attn/mma.h) so this stays diff-able
+// against upstream; vendored, not #included, to keep the Metal build off
+// MLX's private steel header tree.
+// ─────────────────────────────────────────────────────────────────────────
+struct FragMax { static inline float apply(float a, float b) { return max(a, b); } };
+struct FragSum { static inline float apply(float a, float b) { return a + b; } };
+
+template <typename Op>
+inline float frag_row_reduce(float v) {
+  v = Op::apply(v, simd_shuffle_xor(v, ushort(1)));
+  v = Op::apply(v, simd_shuffle_xor(v, ushort(8)));
+  return v;
+}
+
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -329,9 +356,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     for (int k = 0; k < TK; k++) {
       local_max = max(local_max, max(Sreg[k][0], Sreg[k][1]));
     }
-    float row_max = local_max;
-    row_max = max(row_max, simd_shuffle_xor(row_max, ushort(1)));
-    row_max = max(row_max, simd_shuffle_xor(row_max, ushort(8)));
+    float row_max = frag_row_reduce<FragMax>(local_max);
 
     float new_max = max(max_score, row_max);
     float factor;
@@ -357,9 +382,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
         local_sum += p;
       }
     }
-    float row_sum = local_sum;
-    row_sum += simd_shuffle_xor(row_sum, ushort(1));
-    row_sum += simd_shuffle_xor(row_sum, ushort(8));
+    float row_sum = frag_row_reduce<FragSum>(local_sum);
 
     sum_score = sum_score * factor + row_sum;
 
