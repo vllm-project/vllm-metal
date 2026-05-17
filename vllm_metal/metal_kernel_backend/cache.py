@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLX-backed paged KV cache for native Metal paged attention.
 
-Stores per-layer key/value caches as MLX arrays in the layout expected by
-``reshape_and_cache`` and ``paged_attention_v1``:
+Stores per-layer key/value caches as MLX arrays.  KV is written via
+MLX-native scatter (Python, donation-friendly) and read by the v2
+paged-attention kernels:
 
 - key_cache:   [num_blocks, block_size, num_kv_heads, head_dim]
 - value_cache: [num_blocks, block_size, num_kv_heads, head_dim]

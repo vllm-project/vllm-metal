@@ -1,60 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import platform
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 from vllm.logger import init_logger
-
-from vllm_metal.metal import get_ops
 
 if TYPE_CHECKING:
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 
 logger = init_logger(__name__)
 
-# Substring present in Metal shader compilation errors when the OS's Metal
-# language version is too old for the kernel. Matched against str(e) because
-# the C++/nanobind layer does not raise a typed exception for this case.
-_METAL_LANGUAGE_VERSION_ERROR = "language version"
-
 
 def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
-    """Trigger Metal shader compilation with a dummy reshape_and_cache call.
+    """No-op warm-up for the v2 / MLX-native paged-attention path.
 
-    Shared by MHA and Hybrid backends to avoid duplicating warm-up logic.
+    The legacy v1 Metal kernels (reshape_and_cache / paged_attention_v1)
+    have been removed. Production KV writes use MLX-native scatter and the
+    attention kernel JIT-compiles on first use, so there is no Metal shader
+    to pre-compile here. Kept as a stable entry point for the MHA and Hybrid
+    backends (called by ``hybrid.py`` and ``MHAPagedAttentionBackend``).
     """
-    macos_version = platform.mac_ver()[0]
-    logger.info("Warming up paged attention Metal kernel...")
-
-    try:
-        ops = get_ops()
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load Metal kernel: {e}. macOS {macos_version}"
-        ) from e
-
-    try:
-        # Warm up against the concrete layer-0 cache shape. Per-layer cache
-        # allocation may differ from the scalar constructor fallback.
-        warmup_kv_heads = cache.kv_heads_per_layer[0]
-        warmup_head_dim = cache.head_dim_per_layer[0]
-        dummy_k = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
-        dummy_v = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
-        dummy_slot = mx.zeros((1,), dtype=mx.int64)
-        mx.eval(dummy_k, dummy_v, dummy_slot)
-        ops.reshape_and_cache(
-            dummy_k, dummy_v, cache.key_caches[0], cache.value_caches[0], dummy_slot
-        )
-        mx.eval(cache.key_caches[0])
-        logger.info("Paged attention Metal kernel warm-up complete")
-    except RuntimeError as e:
-        if _METAL_LANGUAGE_VERSION_ERROR in str(e):
-            raise RuntimeError(
-                f"Metal kernel incompatible with macOS {macos_version}: {e}"
-            ) from e
-        raise
+    del cache
+    logger.info(
+        "Paged attention (v2/MLX-native): skipping Metal kernel warm-up"
+    )
 
 
 class MHAPagedAttentionBackend:

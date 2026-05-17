@@ -5,8 +5,7 @@ Usage::
 
     from vllm_metal.metal import get_ops
     ops = get_ops()
-    ops.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
-    ops.paged_attention_v1(out, query, key_cache, value_cache, ...)
+    out = ops.paged_attention_primitive(query, key_cache, value_cache, ...)
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from vllm_metal.metal.constants import PARTITION_SIZE
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
-_KERNELS_DIR = _THIS_DIR / "kernels_v1"
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
@@ -45,27 +43,6 @@ def _read_metal_source(path: Path) -> str:
 def _read_v2_metal_source(filename: str) -> str:
     """Read a kernels_v2 .metal source file."""
     return _read_metal_source(_KERNELS_V2_DIR / filename)
-
-
-def _build_reshape_cache_source() -> str:
-    """Concatenate float8 + utils + reshape_and_cache into a single source."""
-    parts = [
-        _read_metal_source(_KERNELS_DIR / "float8.metal"),
-        _read_metal_source(_KERNELS_DIR / "utils.metal"),
-        _read_metal_source(_KERNELS_DIR / "reshape_and_cache.metal"),
-    ]
-    return "\n".join(parts)
-
-
-def _build_paged_attention_source() -> str:
-    """Concatenate float8 + utils + paged_attention into a single source."""
-    parts = [
-        f"#define VLLM_METAL_PARTITION_SIZE {PARTITION_SIZE}",
-        _read_metal_source(_KERNELS_DIR / "float8.metal"),
-        _read_metal_source(_KERNELS_DIR / "utils.metal"),
-        _read_metal_source(_KERNELS_DIR / "pagedattention.metal"),
-    ]
-    return "\n".join(parts)
 
 
 def _build_v2_paged_attention_source() -> str:
@@ -167,8 +144,8 @@ def get_ops() -> ModuleType:
     ``mlx::core::metal::Device::get_library()``.
 
     Returns:
-        The ``_paged_ops`` module with ``reshape_and_cache()`` and
-        ``paged_attention_v1()``.
+        The ``_paged_ops`` module with ``paged_attention_primitive()`` and
+        the TurboQuant / GDN / MLA ops.
     """
     global _ops_module
     if _ops_module is not None:
@@ -186,20 +163,15 @@ def get_ops() -> ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 3. Initialise Metal libraries (JIT-compile shaders)
-    reshape_src = _build_reshape_cache_source()
-    paged_attn_src = _build_paged_attention_source()
-    mod.init_libraries(reshape_src, paged_attn_src)
-
-    # 4. Initialise v2 library (online softmax kernel)
+    # 3. Initialise v2 library (online softmax kernel)
     v2_src = _build_v2_paged_attention_source()
     mod.init_v2_library(v2_src)
 
-    # 5. Initialise GDN linear attention library
+    # 4. Initialise GDN linear attention library
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
 
-    # 6. Initialise MLA paged-attention library (RFC #360)
+    # 5. Initialise MLA paged-attention library (RFC #360)
     mla_src = _build_mla_paged_attention_source()
     mod.init_mla_library(mla_src)
 

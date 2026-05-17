@@ -60,36 +60,3 @@ def ref_paged_attn(
         start_idx += query_len
 
     return mx.concatenate(outputs, axis=0)
-
-
-def run_v1_paged_attention(
-    query: mx.array,
-    key_cache: mx.array,
-    value_cache: mx.array,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: mx.array,
-    seq_lens: mx.array,
-    block_size: int,
-    max_seq_len: int,
-) -> mx.array:
-    """Run kernel_v1 paged attention."""
-    from vllm_metal.metal import get_ops
-
-    ops = get_ops()
-    out = mx.zeros_like(query)
-    mx.eval(out, query, key_cache, value_cache, block_tables, seq_lens)
-    ops.paged_attention_v1(
-        out,
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        scale,
-        block_tables,
-        seq_lens,
-        block_size,
-        max_seq_len,
-    )
-    mx.synchronize()
-    return out

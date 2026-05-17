@@ -549,10 +549,9 @@ class MetalModelRunner:
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
 
-        When paged attention is enabled, also loads the HF Metal kernel and
-        runs a tiny ``reshape_and_cache`` to force Metal library creation.
-        This catches Metal language-version incompatibilities at startup
-        rather than during the first real inference request.
+        Paged-attention Metal/MLX kernels JIT-compile lazily on first use,
+        so the paged backend's ``warm_up`` is a no-op; this method only runs
+        a small dummy forward pass.
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
