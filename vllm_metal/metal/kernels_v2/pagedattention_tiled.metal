@@ -66,6 +66,23 @@ inline short2 frag_coord(ushort lane_id) {
 // and because XOR-shuffle is a symmetric butterfly the result is replicated
 // to all 4 lanes — the per-row online-softmax state below relies on that.
 //
+// Worked example — row 0 lives in lanes {0,1,8,9}; each lane starts with
+// the max over its own 2 columns:
+//
+//             L0    L1    L8    L9
+// start:       3     7     2     5            (true row max = 7; goal: all four = 7)
+//
+// step A:  x = max(x, simd_shuffle_xor(x, 1))      partner = lane ^ 1
+//          L0↔L1   (0^1=1, 1^1=0)   L8↔L9  (8^1=9, 9^1=8)
+//          L0 = max(3,7)=7   L1 = max(7,3)=7   L8 = max(2,5)=5   L9 = max(5,2)=5
+//                  └── pair {0,1} now both 7 ──┘  └── pair {8,9} now both 5 ──┘
+//
+// step B:  x = max(x, simd_shuffle_xor(x, 8))      partner = lane ^ 8
+//          L0↔L8   (0^8=8, 8^8=0)   L1↔L9  (1^8=9, 9^8=1)
+//          L0 = max(7,5)=7   L8 = max(5,7)=7   L1 = max(7,5)=7   L9 = max(5,7)=7
+//
+// end:        7     7     7     7            ✓ every lane of the row holds the max
+//
 // Do NOT replace with simd_sum: all 8 rows of the fragment live in one
 // 32-lane simdgroup, so a 32-lane reduction would fold the rows together.
 //
