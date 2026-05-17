@@ -32,6 +32,23 @@
 // Element 0 of thread_elements() lives at (fm, fn).
 // Element 1 of thread_elements() lives at (fm, fn+1).
 // Verified against simdgroup_load+store round-trip.
+//
+// Per-lane ownership of the 8×8 fragment (Lk = lane k; each lane owns 2
+// horizontally-adjacent cells of one row):
+//
+//          c0    c1    c2    c3    c4    c5    c6    c7
+// row0 │   L0    L0    L1    L1    L8    L8    L9    L9
+// row1 │   L2    L2    L3    L3    L10   L10   L11   L11
+// row2 │   L4    L4    L5    L5    L12   L12   L13   L13
+// row3 │   L6    L6    L7    L7    L14   L14   L15   L15
+// row4 │   L16   L16   L17   L17   L24   L24   L25   L25
+// row5 │   L18   L18   L19   L19   L26   L26   L27   L27
+// row6 │   L20   L20   L21   L21   L28   L28   L29   L29
+// row7 │   L22   L22   L23   L23   L30   L30   L31   L31
+//
+// Each row is split over exactly 4 lanes — e.g. row0 → {L0, L1, L8, L9}.
+// Those 4 differ only in lane-id bits 0 and 3, which is exactly why the
+// per-row softmax reduction below is simd_shuffle_xor with masks 1 then 8.
 // ─────────────────────────────────────────────────────────────────────────
 inline short2 frag_coord(ushort lane_id) {
   const short qid = short(lane_id) / 4;
