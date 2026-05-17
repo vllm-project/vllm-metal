@@ -7,14 +7,12 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import scaled_dot_product_attention
-from vllm.logger import init_logger
 
 from vllm_metal import envs
+from vllm_metal.metal import warm_up_kernels
 from vllm_metal.metal_kernel_backend.packed_prefill_compat import apply_packed_rope
 from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
 from vllm_metal.paged_attention_common import find_attn_attr, find_layers, get_context
-
-logger = init_logger(__name__)
 
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
@@ -383,8 +381,10 @@ class MLAPagedAttentionBackend:
     """Paged attention backend for MLA models.
 
     Implements the PagedAttentionBackend protocol. Uses MLX-native
-    scatter/gather (no vendored C++/Metal kernel) because MLA latents
-    do not fit the standard (num_heads, head_dim) kernel layout.
+    scatter/gather (cache I/O only; attention is MLX SDPA by default
+    or an opt-in single-pass Metal kernel, RFC #360) because MLA
+    latents do not fit the standard (num_heads, head_dim) kernel
+    layout.
     """
 
     def __init__(
@@ -444,9 +444,8 @@ class MLAPagedAttentionBackend:
         return patched
 
     def warm_up(self) -> None:
-        # MLX ops JIT-compile on first use; no Metal shader warm-up needed.
         self._require_initialized("warm_up")
-        logger.info("MLA paged attention (MLX-native): skipping Metal kernel warm-up")
+        warm_up_kernels()
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks

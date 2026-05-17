@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import platform
 import re
 from pathlib import Path
 from types import ModuleType
@@ -178,3 +179,28 @@ def get_ops() -> ModuleType:
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
     return mod
+
+
+def warm_up_kernels() -> None:
+    """Front-load v2 / GDN / MLA Metal kernel compilation at startup.
+
+    :func:`get_ops` JIT-builds the C++ ``_paged_ops`` extension and eagerly
+    compiles the v2 / GDN / MLA Metal libraries: MLX's
+    ``Device::get_library`` compiles the source synchronously inside each
+    ``init_*_library`` call. Calling it here moves that cost off the first
+    request and fails fast at startup if the kernels cannot compile on this
+    macOS (e.g. an unsupported Metal language version).
+
+    The compile is process-wide with no per-cache state, which is why this
+    takes no arguments.
+    """
+    macos_version = platform.mac_ver()[0]
+    logger.info("Warming up v2 paged-attention Metal kernels...")
+    try:
+        get_ops()
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to compile paged-attention Metal kernels on "
+            f"macOS {macos_version}: {e}"
+        ) from e
+    logger.info("Paged-attention Metal kernel warm-up complete")
