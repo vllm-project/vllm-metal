@@ -256,16 +256,17 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     //     physical block, hiding K-load latency behind V-load and v.v.
     //   * saves a barrier vs loading them separately
     //
-    // vec<T,2> loads halve the number of load/store instructions issued.
-    // For HEAD_SIZE=64 with 32 lanes: each lane does 1 vec2 = 4 bytes per
-    // token, covering all 64 channels.  HEAD_SIZE=128: 2 vec2 per lane.
+    // vec<T,4> loads halve the load instruction count vs vec<T,2>.
+    // For HEAD_SIZE=128 with 32 lanes: each lane does 1 vec4 = 8 bytes per
+    // token, covering all 128 channels in one go.  HEAD_SIZE=256: 2 vec4
+    // per lane.  HEAD_SIZE=512: 4 vec4 per lane.
     //
     // Alignment: every contributing stride (kv_block_stride, kv_token_stride,
     // kv_head_stride = HEAD_SIZE) is even because HEAD_SIZE is a multiple
-    // of 8, so `off` and `lane*VEC` are both even → 4-byte aligned vec2.
-    static_assert(HEAD_SIZE % 2 == 0, "HEAD_SIZE must be even for vec2 loads");
-    constexpr int VEC = 2;
-    using vec2T = vec<T, VEC>;
+    // of 8, so `off` and `lane*VEC` are 8-byte aligned for vec4.
+    static_assert(HEAD_SIZE % 4 == 0, "HEAD_SIZE must be /4 for vec4 loads");
+    constexpr int VEC = 4;
+    using vecLoadT = vec<T, VEC>;
     #pragma unroll
     for (int t_iter = 0; t_iter < TILE_KV / NUM_SG; t_iter++) {
       int t = sg_idx * (TILE_KV / NUM_SG) + t_iter;
@@ -279,17 +280,17 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
         const device T *v_ptr = v_cache + off;
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * LD + d]) =
-              *((const device vec2T *)(k_ptr + d));
-          *((threadgroup vec2T *)&V_smem[t * LD + d]) =
-              *((const device vec2T *)(v_ptr + d));
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) =
+              *((const device vecLoadT *)(k_ptr + d));
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) =
+              *((const device vecLoadT *)(v_ptr + d));
         }
       } else {
-        const vec2T zero(T(0));
+        const vecLoadT zero(T(0));
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * LD + d]) = zero;
-          *((threadgroup vec2T *)&V_smem[t * LD + d]) = zero;
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) = zero;
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) = zero;
         }
       }
     }
