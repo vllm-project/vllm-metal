@@ -101,6 +101,14 @@ inline float frag_row_reduce(float v) {
   return v;
 }
 
+// Opaque NBYTES-wide, NBYTES-aligned load unit for the cooperative K/V copy.
+// Metal has no native vec<T,8>, so a 16-byte (128-bit) transaction can only
+// be expressed as an aligned byte struct + reinterpret (MLX steel BlockLoader
+// pattern, mlx/backend/metal/kernels/steel/attn/loader.h). NBYTES is a
+// power of two (8 or 16) so `alignas` is well-formed.
+template <int NBYTES>
+struct alignas(NBYTES) LoadUnit { uint8_t bytes[NBYTES]; };
+
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -256,17 +264,23 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     //     physical block, hiding K-load latency behind V-load and v.v.
     //   * saves a barrier vs loading them separately
     //
-    // vec<T,4> loads halve the load instruction count vs vec<T,2>.
-    // For HEAD_SIZE=128 with 32 lanes: each lane does 1 vec4 = 8 bytes per
-    // token, covering all 128 channels in one go.  HEAD_SIZE=256: 2 vec4
-    // per lane.  HEAD_SIZE=512: 4 vec4 per lane.
+    // Cooperative K/V load width scales with HEAD_SIZE: 128-bit (16 B)
+    // transactions for HEAD_SIZE >= 256 (Gemma 4's 256/512), 64-bit (8 B)
+    // for <= 128 (byte-identical to the prior vec<T,4> path, so the small
+    // head sizes are unchanged).  Wider-than-vec4 needs the LoadUnit byte
+    // struct because Metal has no native vec<T,8>.
     //
-    // Alignment: every contributing stride (kv_block_stride, kv_token_stride,
-    // kv_head_stride = HEAD_SIZE) is even because HEAD_SIZE is a multiple
-    // of 8, so `off` and `lane*VEC` are 8-byte aligned for vec4.
-    static_assert(HEAD_SIZE % 4 == 0, "HEAD_SIZE must be /4 for vec4 loads");
-    constexpr int VEC = 4;
-    using vecLoadT = vec<T, VEC>;
+    // Strided layout preserved (lane owns d=lane*VEC, stride NUM_SIMD_LANES
+    // *VEC): consecutive lanes touch consecutive VEC-element runs -> reads
+    // stay coalesced, and all 32 lanes stay active at 256/512.
+    //
+    // Alignment (verified for HEAD_SIZE in {64,96,128,256,512}): device
+    // `off` is a multiple of HEAD_SIZE elems; smem stride LD=HEAD_SIZE+8;
+    // both make `&[t*LD + lane*VEC]` a multiple of VEC_BYTES.
+    constexpr int VEC_BYTES = (HEAD_SIZE >= 256) ? 16 : 8;
+    constexpr int VEC = VEC_BYTES / int(sizeof(T));
+    using vecLoadT = LoadUnit<VEC_BYTES>;
+    static_assert(HEAD_SIZE % VEC == 0, "HEAD_SIZE must be divisible by VEC");
     #pragma unroll
     for (int t_iter = 0; t_iter < TILE_KV / NUM_SG; t_iter++) {
       int t = sg_idx * (TILE_KV / NUM_SG) + t_iter;
@@ -286,7 +300,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
               *((const device vecLoadT *)(v_ptr + d));
         }
       } else {
-        const vecLoadT zero(T(0));
+        const vecLoadT zero = {};
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
           *((threadgroup vecLoadT *)&K_smem[t * LD + d]) = zero;
