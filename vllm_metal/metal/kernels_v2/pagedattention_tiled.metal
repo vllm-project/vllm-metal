@@ -101,13 +101,15 @@ inline float frag_row_reduce(float v) {
   return v;
 }
 
-// Opaque NBYTES-wide, NBYTES-aligned load unit for the cooperative K/V copy.
-// Metal has no native vec<T,8>, so a 16-byte (128-bit) transaction can only
-// be expressed as an aligned byte struct + reinterpret (MLX steel BlockLoader
-// pattern, mlx/backend/metal/kernels/steel/attn/loader.h). NBYTES is a
-// power of two (8 or 16) so `alignas` is well-formed.
-template <int NBYTES>
-struct alignas(NBYTES) LoadUnit { uint8_t bytes[NBYTES]; };
+// Load unit for the cooperative K/V copy. Metal has no native vec<T,8>, so
+// K/V bytes are bit-copied through uint2 (64-bit) / uint4 (128-bit) — native
+// vectors that lower 1:1 to one wide load/store. A uint8_t[N] struct would
+// rely on the optimizer to coalesce (and the zero-store could degrade to a
+// memset loop). MLX steel BlockLoader pattern,
+// mlx/backend/metal/kernels/steel/attn/loader.h.
+template <int NBYTES> struct LoadUnit;
+template <> struct LoadUnit<8>  { using type = uint2; };
+template <> struct LoadUnit<16> { using type = uint4; };
 
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
@@ -279,8 +281,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // both make `&[t*LD + lane*VEC]` a multiple of VEC_BYTES.
     constexpr int VEC_BYTES = (HEAD_SIZE >= 256) ? 16 : 8;
     constexpr int VEC = VEC_BYTES / int(sizeof(T));
-    using vecLoadT = LoadUnit<VEC_BYTES>;
-    static_assert(HEAD_SIZE % VEC == 0, "HEAD_SIZE must be divisible by VEC");
+    using vecLoadT = typename LoadUnit<VEC_BYTES>::type;  // uint2 / uint4
+    // Guards the alignment claimed above: LD%VEC==0 keeps every
+    // &K_smem[t*LD + lane*VEC] a multiple of VEC_BYTES (device side is
+    // aligned via `off`, a multiple of HEAD_SIZE).
+    static_assert(LD % VEC == 0, "smem row stride LD must be VEC-aligned");
     #pragma unroll
     for (int t_iter = 0; t_iter < TILE_KV / NUM_SG; t_iter++) {
       int t = sg_idx * (TILE_KV / NUM_SG) + t_iter;
@@ -300,7 +305,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
               *((const device vecLoadT *)(v_ptr + d));
         }
       } else {
-        const vecLoadT zero = {};
+        const vecLoadT zero = {};  // all-zero bits == +0.0 in half/bf16
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
           *((threadgroup vecLoadT *)&K_smem[t * LD + d]) = zero;
