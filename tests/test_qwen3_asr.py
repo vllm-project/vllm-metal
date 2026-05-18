@@ -168,6 +168,16 @@ class TestAudioEncoderShapes:
 class TestQwen3Attention:
     """Tests for GQA with QK normalization."""
 
+    @staticmethod
+    def _rope_inputs(
+        config: Qwen3ASRTextConfig, seq: int, offset: int = 0
+    ) -> tuple[Qwen3InterleavedMRoPE, mx.array, mx.array]:
+        rope = Qwen3InterleavedMRoPE.from_config(config)
+        positions = mx.arange(offset, offset + seq)[None, :]
+        position_ids = mx.stack([positions, positions, positions], axis=1)
+        cos, sin = rope(position_ids, dtype=mx.float32)
+        return rope, cos, sin
+
     def test_mrope_outputs_shape(self) -> None:
         """Interleaved MRoPE should produce decoder cos/sin tensors."""
         rope = Qwen3InterleavedMRoPE(
@@ -182,6 +192,22 @@ class TestQwen3Attention:
 
         assert cos.shape == (1, 3, 16)
         assert sin.shape == (1, 3, 16)
+
+    def test_mrope_from_config_uses_rope_scaling(self) -> None:
+        """Interleaved MRoPE should use checkpoint rope_scaling metadata."""
+        config = Qwen3ASRTextConfig(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            intermediate_size=128,
+            vocab_size=100,
+            rope_scaling={"mrope_section": [3, 3, 2]},
+        )
+
+        rope = Qwen3InterleavedMRoPE.from_config(config)
+
+        assert rope.mrope_section == [3, 3, 2]
 
     def test_head_counts(self) -> None:
         """GQA should have correct head counts."""
@@ -210,7 +236,8 @@ class TestQwen3Attention:
         )
         attn = Qwen3Attention(config, dtype=mx.float32)
         x = mx.random.normal((1, 5, 64))
-        out, cache = attn(x)
+        rope, cos, sin = self._rope_inputs(config, seq=5)
+        out, cache = attn(x, rope=rope, cos=cos, sin=sin)
         mx.eval(out)
         assert out.shape == (1, 5, 64)
         assert cache[0].shape == (1, 2, 5, 16)  # k: (B, n_kv_heads, L, head_dim)
@@ -227,10 +254,12 @@ class TestQwen3Attention:
         )
         attn = Qwen3Attention(config, dtype=mx.float32)
         x = mx.random.normal((1, 5, 64))
-        _, cache = attn(x)
+        rope, cos, sin = self._rope_inputs(config, seq=5)
+        _, cache = attn(x, rope=rope, cos=cos, sin=sin)
 
         x2 = mx.random.normal((1, 1, 64))
-        out2, cache2 = attn(x2, cache=cache)
+        _, cos2, sin2 = self._rope_inputs(config, seq=1, offset=5)
+        out2, cache2 = attn(x2, rope=rope, cos=cos2, sin=sin2, cache=cache)
         mx.eval(out2)
         assert out2.shape == (1, 1, 64)
         assert cache2[0].shape == (1, 2, 6, 16)  # 5 + 1 = 6

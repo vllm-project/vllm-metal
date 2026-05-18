@@ -314,30 +314,42 @@ class Qwen3InterleavedMRoPE(nn.Module):
         emb = mx.concatenate([freqs_t, freqs_t], axis=-1)
         return mx.cos(emb).astype(dtype), mx.sin(emb).astype(dtype)
 
+    @classmethod
+    def from_config(cls, config: Qwen3ASRTextConfig) -> Qwen3InterleavedMRoPE:
+        """Build RoPE from Qwen3-ASR text config."""
+        return cls(
+            config.head_dim,
+            config.rope_theta,
+            cls._mrope_section_from_config(config),
+        )
 
-def _rotate_half(x: mx.array) -> mx.array:
-    mid = x.shape[-1] // 2
-    return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
+    def apply(
+        self,
+        q: mx.array,
+        k: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply this RoPE instance to query/key tensors."""
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+        return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(
+            k
+        ) * sin
 
+    @staticmethod
+    def _rotate_half(x: mx.array) -> mx.array:
+        mid = x.shape[-1] // 2
+        return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
 
-def _apply_rotary_pos_emb(
-    q: mx.array,
-    k: mx.array,
-    cos: mx.array,
-    sin: mx.array,
-) -> tuple[mx.array, mx.array]:
-    cos = cos[:, None, :, :]
-    sin = sin[:, None, :, :]
-    return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
-
-
-def _mrope_section_from_config(config: Qwen3ASRTextConfig) -> list[int] | None:
-    rope_scaling = config.rope_scaling
-    if isinstance(rope_scaling, dict):
-        section = rope_scaling.get("mrope_section")
-        if section:
-            return list(section)
-    return None
+    @staticmethod
+    def _mrope_section_from_config(config: Qwen3ASRTextConfig) -> list[int] | None:
+        rope_scaling = config.rope_scaling
+        if isinstance(rope_scaling, dict):
+            section = rope_scaling.get("mrope_section")
+            if section:
+                return list(section)
+        return None
 
 
 class Qwen3Attention(nn.Module):
@@ -367,18 +379,14 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.rope = Qwen3InterleavedMRoPE(
-            self.head_dim,
-            config.rope_theta,
-            _mrope_section_from_config(config),
-        )
         self.scale = self.head_dim**-0.5
 
     def __call__(
         self,
         x: mx.array,
-        cos: mx.array | None = None,
-        sin: mx.array | None = None,
+        rope: Qwen3InterleavedMRoPE,
+        cos: mx.array,
+        sin: mx.array,
         mask: mx.array | None = None,
         cache: tuple[mx.array, mx.array] | None = None,
     ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
@@ -397,12 +405,7 @@ class Qwen3Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        offset = cache[0].shape[2] if cache is not None else 0
-        if cos is None or sin is None:
-            positions = mx.arange(offset, offset + seq)[None, :]
-            position_ids = mx.stack([positions, positions, positions], axis=1)
-            cos, sin = self.rope(position_ids, dtype=x.dtype)
-        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = rope.apply(q, k, cos, sin)
 
         # KV cache
         if cache is not None:
@@ -458,13 +461,15 @@ class Qwen3DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cos: mx.array | None = None,
-        sin: mx.array | None = None,
+        rope: Qwen3InterleavedMRoPE,
+        cos: mx.array,
+        sin: mx.array,
         mask: mx.array | None = None,
         cache: tuple[mx.array, mx.array] | None = None,
     ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
         r, new_cache = self.self_attn(
             self.input_layernorm(x),
+            rope=rope,
             cos=cos,
             sin=sin,
             mask=mask,
@@ -491,11 +496,7 @@ class Qwen3LM(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.rope = Qwen3InterleavedMRoPE(
-            config.head_dim,
-            config.rope_theta,
-            _mrope_section_from_config(config),
-        )
+        self.rope = Qwen3InterleavedMRoPE.from_config(config)
 
     def embed(self, token_ids: mx.array) -> mx.array:
         """Convert token IDs to embeddings."""
@@ -531,7 +532,14 @@ class Qwen3LM(nn.Module):
 
         new_cache = []
         for i, layer in enumerate(self.layers):
-            h, layer_cache = layer(h, cos=cos, sin=sin, mask=mask, cache=cache[i])
+            h, layer_cache = layer(
+                h,
+                rope=self.rope,
+                cos=cos,
+                sin=sin,
+                mask=mask,
+                cache=cache[i],
+            )
             new_cache.append(layer_cache)
 
         h = self.norm(h)
