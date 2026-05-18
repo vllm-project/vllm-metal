@@ -35,11 +35,11 @@ def _make_cache_and_inputs(
     num_query_heads: int,
     seq_lens: list[tuple[int, int]],
     *,
+    head_size: int = HEAD_SIZE,
     dtype: mx.Dtype = DTYPE,
 ):
     """Build a populated cache and matching query/metadata tensors."""
     block_size = BLOCK_SIZE
-    head_size = HEAD_SIZE
     num_seqs = len(seq_lens)
     query_lens = [s[0] for s in seq_lens]
     kv_lens = [s[1] for s in seq_lens]
@@ -202,6 +202,63 @@ def test_primitive_vs_reference_varlen(
         block_tables=np.array(d["block_tables"]),
         scale=d["scale"],
         sliding_window=sliding_window if sliding_window >= 0 else None,
+    )
+    mx.eval(ref)
+
+    np.testing.assert_allclose(
+        np.array(out),
+        np.array(ref),
+        atol=1.5e-2,
+        rtol=1e-2,
+    )
+
+
+# ── 1b. Tiled-kernel head-size coverage ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("head_size", [64, 96, 128])
+def test_tiled_kernel_head_size_parity(head_size: int) -> None:
+    """Tiled prefill kernel matches reference for every routed head size.
+
+    can_use_tiled_kernel() routes head sizes {64, 96, 128} to the BQ=32
+    flash kernel; each is a separately compiled template specialization
+    (TD = HEAD_SIZE / 8 differs).  The varlen test only exercises 128, so
+    this adds one prefill shape per head size to keep CI parity 1:1 with
+    can_use_tiled_kernel().
+    """
+    mx.random.seed(0)
+    # Prefill-only (q_len > 1 for every seq) guarantees tiled dispatch.
+    seq_lens = [(32, 512), (64, 1024)]
+    d = _make_cache_and_inputs(256, 2, 8, seq_lens, head_size=head_size)
+
+    ops = get_ops()
+    out = mx.array(0)
+    ops.paged_attention_primitive(
+        d["query"],
+        d["key_cache"],
+        d["value_cache"],
+        d["num_kv_heads"],
+        d["scale"],
+        0.0,  # softcap
+        d["block_tables"],
+        d["kv_lens_arr"],
+        d["cu_seqlens_q"],
+        BLOCK_SIZE,
+        d["max_kv_len"],
+        -1,  # sliding_window
+        out,
+    )
+    mx.eval(out)
+
+    ref = ref_paged_attn(
+        query=d["query"],
+        key_cache=d["key_cache"],
+        value_cache=d["value_cache"],
+        query_lens=d["query_lens"],
+        kv_lens=d["kv_lens"],
+        block_tables=np.array(d["block_tables"]),
+        scale=d["scale"],
+        sliding_window=None,
     )
     mx.eval(ref)
 
