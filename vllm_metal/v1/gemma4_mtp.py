@@ -10,19 +10,17 @@ from json import JSONDecodeError, loads
 from numbers import Integral
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, ClassVar
 
 from vllm.logger import init_logger
 
-from vllm_metal.v1.gemma4_mtp_constants import (
-    GEMMA4_MTP_DEFAULT_CENTROID_TOP_K,
-    GEMMA4_MTP_DEFAULT_NUM_CENTROIDS,
-    GEMMA4_MTP_N_PREDICT,
-)
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
 
+GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
+GEMMA4_MTP_DEFAULT_CENTROID_TOP_K = 32
+GEMMA4_MTP_N_PREDICT = 1
 GEMMA4_MTP_DRAFT_MODEL_TYPES = frozenset({"gemma4_assistant", "gemma4_mtp"})
 GEMMA4_MTP_DRAFT_ARCHITECTURES = frozenset(
     {"Gemma4AssistantForCausalLM", "Gemma4MTPModel"}
@@ -38,13 +36,6 @@ _ASSISTANT_DOWNLOAD_ALLOW_PATTERNS = [
     "*.safetensors",
 ]
 
-_ASSISTANT_CACHE: dict[tuple[str, str | None], Gemma4MTPAssistantRuntime] = {}
-_ASSISTANT_CACHE_LOCK = Lock()
-
-
-def _identity_model_path(model_name: str) -> str:
-    return model_name
-
 
 @dataclass(frozen=True, slots=True)
 class Gemma4MTPAssistantRuntime:
@@ -59,12 +50,15 @@ class Gemma4MTPAssistantRuntime:
 class Gemma4MTPAssistantLoader:
     """Loads and validates a Gemma4 MTP assistant runtime."""
 
+    _CACHE: ClassVar[dict[tuple[str, str | None], Gemma4MTPAssistantRuntime]] = {}
+    _CACHE_LOCK: ClassVar[Lock] = Lock()
+
     def __init__(
         self,
         *,
         load_model_fn: Callable[..., tuple[Any, dict[str, Any]]] | None = None,
         download_fn: Callable[[str, str | None], Path] | None = None,
-        model_path_resolver: Callable[[str], str] = _identity_model_path,
+        model_path_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self._load_model = load_model_fn
         self._download = download_fn
@@ -81,9 +75,9 @@ class Gemma4MTPAssistantLoader:
         if not Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config):
             return None
 
-        source = Gemma4MTPAssistantSource.from_speculative_config(
-            speculative_config
-        ).resolve(self._model_path_resolver)
+        source = Gemma4MTPAssistantSource.from_speculative_config(speculative_config)
+        if self._model_path_resolver is not None:
+            source = source.resolve(self._model_path_resolver)
         target_metadata = Gemma4MTPTargetMetadata.from_configs(
             target_hf_config=target_hf_config,
             target_model_args=target_model_args,
@@ -113,8 +107,8 @@ class Gemma4MTPAssistantLoader:
             model=model,
             metadata=metadata,
         )
-        with _ASSISTANT_CACHE_LOCK:
-            _ASSISTANT_CACHE[source.cache_key] = runtime
+        with self._CACHE_LOCK:
+            self._CACHE[source.cache_key] = runtime
         logger.info(
             "Gemma4 MTP assistant loaded in %.2fs: %s",
             time.time() - start_time,
@@ -126,8 +120,14 @@ class Gemma4MTPAssistantLoader:
         self,
         source: Gemma4MTPAssistantSource,
     ) -> Gemma4MTPAssistantRuntime | None:
-        with _ASSISTANT_CACHE_LOCK:
-            return _ASSISTANT_CACHE.get(source.cache_key)
+        with self._CACHE_LOCK:
+            return self._CACHE.get(source.cache_key)
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear the process-level Gemma4 MTP assistant cache."""
+        with cls._CACHE_LOCK:
+            cls._CACHE.clear()
 
     def _preflight_config(
         self,
@@ -212,9 +212,8 @@ class Gemma4MTPAssistantLoader:
                 f"does not support custom model_file={model_file!r}"
             )
 
-    @classmethod
+    @staticmethod
     def _get_model_classes(
-        cls,
         config: dict[str, Any],
     ) -> tuple[type[Any], type[Any]]:
         if config.get("model_type") not in GEMMA4_MTP_DRAFT_MODEL_TYPES:
@@ -225,10 +224,6 @@ class Gemma4MTPAssistantLoader:
                 f"gemma4_mtp configs, got model_type={model_type!r}, "
                 f"architectures={architectures!r}"
             )
-        return cls._assistant_model_classes()
-
-    @staticmethod
-    def _assistant_model_classes() -> tuple[type[Any], type[Any]]:
         # Keep MLX model imports lazy so config detection and spec-decode
         # metadata tests do not construct Metal-backed modules just by
         # importing this owner.
@@ -342,7 +337,7 @@ class Gemma4MTPTargetMetadata:
         model_types = {
             model_type
             for model_type in (
-                _field(target_text_config, "model_type"),
+                _config_value(target_text_config, "model_type"),
                 target_model_args.get("model_type"),
             )
             if model_type is not None
@@ -421,38 +416,83 @@ class Gemma4MTPTargetMetadata:
         num_non_shared = len(layer_types) - num_kv_shared_layers
         return layer_types[:num_non_shared]
 
-    @staticmethod
+    @classmethod
     def _matching_optional_int(
+        cls,
         key: str,
         target_text_config: Any | None,
         target_model_args: Mapping[str, Any],
     ) -> int | None:
-        return _matching_target_value(
+        return cls._matching_value(
             key,
             target_text_config,
             target_model_args,
-            parse=lambda config, field: _optional_int(
-                config,
-                field,
-                context="target model",
-            ),
+            parse=cls._optional_int,
         )
 
-    @staticmethod
+    @classmethod
     def _matching_sequence(
+        cls,
         key: str,
         target_text_config: Any | None,
         target_model_args: Mapping[str, Any],
     ) -> tuple[str, ...]:
         return (
-            _matching_target_value(
+            cls._matching_value(
                 key,
                 target_text_config,
                 target_model_args,
-                parse=_sequence_field,
+                parse=cls._sequence_field,
             )
             or ()
         )
+
+    @staticmethod
+    def _matching_value[T](
+        key: str,
+        target_text_config: Any | None,
+        target_model_args: Mapping[str, Any],
+        *,
+        parse: Callable[[Any, str], T],
+    ) -> T | None:
+        sources: list[tuple[str, T]] = []
+        if key in target_model_args and target_model_args.get(key) is not None:
+            sources.append(("target_model_args", parse(target_model_args, key)))
+        if _config_value(target_text_config, key) is not None:
+            sources.append(
+                ("target_hf_config.text_config", parse(target_text_config, key))
+            )
+        if not sources:
+            return None
+
+        _, value = sources[0]
+        for label, other in sources[1:]:
+            if other != value:
+                raise ValueError(
+                    f"Gemma4 MTP target {key} metadata mismatch: "
+                    f"{sources[0][0]}={value}, {label}={other}"
+                )
+        return value
+
+    @staticmethod
+    def _optional_int(config: Any, key: str) -> int | None:
+        value = _config_value(config, key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"target model {key} must be an integer, got {value!r}")
+        return int(value)
+
+    @staticmethod
+    def _sequence_field(config: Any, key: str) -> tuple[str, ...]:
+        value = _config_value(config, key, ()) or ()
+        if isinstance(value, str):
+            raise ValueError(f"{key} must be a non-string sequence")
+        if not isinstance(value, Sequence):
+            raise ValueError(f"{key} must be a sequence")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{key} entries must be strings")
+        return tuple(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,12 +514,12 @@ class Gemma4MTPAssistantMetadata:
         """Accept raw assistant configs and upstream vLLM's wrapper config."""
         if config is None:
             return False
-        model_type = _field(config, "model_type")
+        model_type = _config_value(config, "model_type")
         if model_type in GEMMA4_MTP_DRAFT_MODEL_TYPES:
             return True
         return any(
             arch in GEMMA4_MTP_DRAFT_ARCHITECTURES
-            for arch in _architectures(config, strict=False)
+            for arch in cls._architectures(config, strict=False)
         )
 
     @classmethod
@@ -499,12 +539,12 @@ class Gemma4MTPAssistantMetadata:
                 f"{GEMMA4_MTP_TEXT_MODEL_TYPE!r}, got {text_model_type!r}"
             )
 
-        vocab_size = _required_positive_int(
+        vocab_size = cls._required_positive_int(
             text_config,
             "vocab_size",
             context="assistant",
         )
-        top_level_vocab_size = _optional_positive_int(
+        top_level_vocab_size = cls._optional_positive_int(
             config,
             "vocab_size",
             context="assistant",
@@ -515,42 +555,42 @@ class Gemma4MTPAssistantMetadata:
                 f"top-level={top_level_vocab_size}, text_config={vocab_size}"
             )
 
-        hidden_size = _required_positive_int(
+        hidden_size = cls._required_positive_int(
             text_config,
             "hidden_size",
             context="assistant",
         )
-        backbone_hidden_size = _required_positive_int(
+        backbone_hidden_size = cls._required_positive_int(
             config,
             "backbone_hidden_size",
             context="assistant",
         )
-        num_hidden_layers = _required_positive_int(
+        num_hidden_layers = cls._required_positive_int(
             text_config,
             "num_hidden_layers",
             context="assistant",
         )
-        layer_types = _required_layer_types(text_config, num_hidden_layers)
-        architectures = _architectures(config, strict=True)
+        layer_types = cls._required_layer_types(text_config, num_hidden_layers)
+        architectures = cls._architectures(config, strict=True)
         if not any(arch in GEMMA4_MTP_DRAFT_ARCHITECTURES for arch in architectures):
             raise ValueError(
                 "Gemma4 MTP assistant requires a Gemma4 MTP architecture, got "
                 f"architectures={architectures!r}"
             )
 
-        n_predict = _optional_int(config, "n_predict", context="assistant")
+        n_predict = cls._optional_int(config, "n_predict", context="assistant")
         if n_predict is not None and n_predict != GEMMA4_MTP_N_PREDICT:
             raise ValueError(
                 "Gemma4 MTP assistant config must use "
                 f"n_predict={GEMMA4_MTP_N_PREDICT}, got {n_predict!r}"
             )
-        tie_word_embeddings = _optional_bool(
+        tie_word_embeddings = cls._optional_bool(
             config,
             "tie_word_embeddings",
             context="assistant",
             default=True,
         )
-        use_ordered_embeddings = _optional_bool(
+        use_ordered_embeddings = cls._optional_bool(
             config,
             "use_ordered_embeddings",
             context="assistant",
@@ -574,19 +614,20 @@ class Gemma4MTPAssistantMetadata:
             use_ordered_embeddings=use_ordered_embeddings,
         )
 
-    @staticmethod
+    @classmethod
     def _validate_ordered_embedding_config(
+        cls,
         config: Any,
         *,
         vocab_size: int,
         use_ordered_embeddings: bool,
     ) -> None:
-        num_centroids = _optional_positive_int(
+        num_centroids = cls._optional_positive_int(
             config,
             "num_centroids",
             context="assistant",
         )
-        centroid_intermediate_top_k = _optional_positive_int(
+        centroid_intermediate_top_k = cls._optional_positive_int(
             config,
             "centroid_intermediate_top_k",
             context="assistant",
@@ -644,122 +685,114 @@ class Gemma4MTPAssistantMetadata:
                 f"target_tail_layer_types={target_tail}"
             )
 
-
-def reset_gemma4_mtp_assistant_cache() -> None:
-    """Clear the process-level Gemma4 MTP assistant cache."""
-    with _ASSISTANT_CACHE_LOCK:
-        _ASSISTANT_CACHE.clear()
-
-
-def uses_gemma4_mtp(speculative_config: Any | None) -> bool:
-    """Return whether speculative config points at Gemma4 MTP."""
-    return Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
-
-
-def is_gemma4_mtp_assistant_config(config: Any | None) -> bool:
-    """Return whether a config shape looks like a Gemma4 MTP assistant."""
-    return Gemma4MTPAssistantMetadata.is_assistant_config(config)
-
-
-def validate_gemma4_mtp_assistant_config(
-    assistant_config: Any,
-    *,
-    target_hf_config: Any | None,
-    target_model_args: Mapping[str, Any],
-) -> Gemma4MTPAssistantMetadata:
-    """Validate assistant config compatibility with the loaded target."""
-    target_metadata = Gemma4MTPTargetMetadata.from_configs(
-        target_hf_config=target_hf_config,
-        target_model_args=target_model_args,
-    )
-    if isinstance(assistant_config, Gemma4MTPAssistantMetadata):
-        metadata = assistant_config
-    else:
-        metadata = Gemma4MTPAssistantMetadata.from_config(assistant_config)
-    metadata.validate_compatible_with(target_metadata)
-    return metadata
-
-
-def _required_layer_types(config: Any, num_hidden_layers: int) -> tuple[str, ...]:
-    layer_types = _sequence_field(config, "layer_types")
-    if len(layer_types) != num_hidden_layers:
-        raise ValueError(
-            "Gemma4 MTP assistant layer_types must match num_hidden_layers: "
-            f"len(layer_types)={len(layer_types)}, "
-            f"num_hidden_layers={num_hidden_layers}"
+    @staticmethod
+    def _required_layer_types(config: Any, num_hidden_layers: int) -> tuple[str, ...]:
+        layer_types = Gemma4MTPAssistantMetadata._sequence_field(
+            config,
+            "layer_types",
         )
-    unknown = sorted(set(layer_types) - GEMMA4_MTP_VALID_LAYER_TYPES)
-    if unknown:
-        raise ValueError(f"Unsupported Gemma4 MTP assistant layer types: {unknown}")
-    return layer_types
-
-
-def _matching_target_value[T](
-    key: str,
-    target_text_config: Any | None,
-    target_model_args: Mapping[str, Any],
-    *,
-    parse: Callable[[Any, str], T],
-) -> T | None:
-    sources: list[tuple[str, T]] = []
-    if key in target_model_args and target_model_args.get(key) is not None:
-        sources.append(("target_model_args", parse(target_model_args, key)))
-    if _field(target_text_config, key) is not None:
-        sources.append(("target_hf_config.text_config", parse(target_text_config, key)))
-    if not sources:
-        return None
-
-    _, value = sources[0]
-    for label, other in sources[1:]:
-        if other != value:
+        if len(layer_types) != num_hidden_layers:
             raise ValueError(
-                f"Gemma4 MTP target {key} metadata mismatch: "
-                f"{sources[0][0]}={value}, {label}={other}"
+                "Gemma4 MTP assistant layer_types must match num_hidden_layers: "
+                f"len(layer_types)={len(layer_types)}, "
+                f"num_hidden_layers={num_hidden_layers}"
             )
-    return value
+        unknown = sorted(set(layer_types) - GEMMA4_MTP_VALID_LAYER_TYPES)
+        if unknown:
+            raise ValueError(f"Unsupported Gemma4 MTP assistant layer types: {unknown}")
+        return layer_types
 
+    @staticmethod
+    def _required_int(config: Any, key: str, *, context: str) -> int:
+        value = _config_value(config, key)
+        if value is None:
+            raise ValueError(f"Missing {context} {key}")
+        return Gemma4MTPAssistantMetadata._coerce_int(
+            value,
+            key=key,
+            context=context,
+        )
 
-def _required_int(config: Any, key: str, *, context: str) -> int:
-    value = _config_value(config, key)
-    if value is None:
-        raise ValueError(f"Missing {context} {key}")
-    return _coerce_int(value, key=key, context=context)
+    @staticmethod
+    def _optional_int(config: Any, key: str, *, context: str) -> int | None:
+        value = _config_value(config, key)
+        if value is None:
+            return None
+        return Gemma4MTPAssistantMetadata._coerce_int(
+            value,
+            key=key,
+            context=context,
+        )
 
+    @staticmethod
+    def _optional_positive_int(config: Any, key: str, *, context: str) -> int | None:
+        value = Gemma4MTPAssistantMetadata._optional_int(
+            config,
+            key,
+            context=context,
+        )
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError(f"{context} {key} must be positive, got {value}")
+        return value
 
-def _optional_int(config: Any, key: str, *, context: str) -> int | None:
-    value = _config_value(config, key)
-    if value is None:
-        return None
-    return _coerce_int(value, key=key, context=context)
+    @staticmethod
+    def _optional_bool(config: Any, key: str, *, context: str, default: bool) -> bool:
+        value = _config_value(config, key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{context} {key} must be a boolean, got {value!r}")
+        return value
 
+    @staticmethod
+    def _coerce_int(value: Any, *, key: str, context: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"{context} {key} must be an integer, got {value!r}")
+        return int(value)
 
-def _optional_positive_int(config: Any, key: str, *, context: str) -> int | None:
-    value = _optional_int(config, key, context=context)
-    if value is None:
-        return None
-    if value <= 0:
-        raise ValueError(f"{context} {key} must be positive, got {value}")
-    return value
+    @staticmethod
+    def _required_positive_int(config: Any, key: str, *, context: str) -> int:
+        value = Gemma4MTPAssistantMetadata._required_int(
+            config,
+            key,
+            context=context,
+        )
+        if value <= 0:
+            raise ValueError(f"{context} {key} must be positive, got {value}")
+        return value
 
+    @staticmethod
+    def _architectures(config: Any, *, strict: bool) -> tuple[str, ...]:
+        architectures = _config_value(config, "architectures", ()) or ()
+        if isinstance(architectures, str):
+            if strict:
+                raise ValueError(
+                    "assistant architectures must be a non-string sequence"
+                )
+            return (architectures,)
+        if not isinstance(architectures, Sequence):
+            if strict:
+                raise ValueError("assistant architectures must be a sequence")
+            return ()
+        names: list[str] = []
+        for arch in architectures:
+            if not isinstance(arch, str):
+                if strict:
+                    raise ValueError("assistant architectures entries must be strings")
+                continue
+            names.append(arch)
+        return tuple(names)
 
-def _optional_bool(config: Any, key: str, *, context: str, default: bool) -> bool:
-    value = _config_value(config, key, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"{context} {key} must be a boolean, got {value!r}")
-    return value
-
-
-def _coerce_int(value: Any, *, key: str, context: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{context} {key} must be an integer, got {value!r}")
-    return int(value)
-
-
-def _required_positive_int(config: Any, key: str, *, context: str) -> int:
-    value = _required_int(config, key, context=context)
-    if value <= 0:
-        raise ValueError(f"{context} {key} must be positive, got {value}")
-    return value
+    @staticmethod
+    def _sequence_field(config: Any, key: str) -> tuple[str, ...]:
+        value = _config_value(config, key, ()) or ()
+        if isinstance(value, str):
+            raise ValueError(f"{key} must be a non-string sequence")
+        if not isinstance(value, Sequence):
+            raise ValueError(f"{key} must be a sequence")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{key} entries must be strings")
+        return tuple(value)
 
 
 def _text_config(config: Any | None) -> Any | None:
@@ -768,47 +801,10 @@ def _text_config(config: Any | None) -> Any | None:
     get_text_config = getattr(config, "get_text_config", None)
     if callable(get_text_config):
         return get_text_config()
-    return _field(config, "text_config", config)
-
-
-def _architectures(config: Any, *, strict: bool) -> tuple[str, ...]:
-    architectures = _config_value(config, "architectures", ()) or ()
-    if isinstance(architectures, str):
-        if strict:
-            raise ValueError("assistant architectures must be a non-string sequence")
-        return (architectures,)
-    if not isinstance(architectures, Sequence):
-        if strict:
-            raise ValueError("assistant architectures must be a sequence")
-        return ()
-    names: list[str] = []
-    for arch in architectures:
-        if not isinstance(arch, str):
-            if strict:
-                raise ValueError("assistant architectures entries must be strings")
-            continue
-        names.append(arch)
-    return tuple(names)
-
-
-def _sequence_field(config: Any, key: str) -> tuple[str, ...]:
-    value = _config_value(config, key, ()) or ()
-    if isinstance(value, str):
-        raise ValueError(f"{key} must be a non-string sequence")
-    if not isinstance(value, Sequence):
-        raise ValueError(f"{key} must be a sequence")
-    if any(not isinstance(item, str) for item in value):
-        raise ValueError(f"{key} entries must be strings")
-    return tuple(value)
-
-
-def _field(config: Any, key: str, default: Any = None) -> Any:
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    return getattr(config, key, default)
+    return _config_value(config, "text_config", config)
 
 
 def _config_value(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, Mapping):
         return config.get(key, default)
-    return _field(config, key, default)
+    return getattr(config, key, default)

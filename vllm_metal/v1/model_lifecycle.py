@@ -19,10 +19,7 @@ from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.gemma4_mtp import (
-    Gemma4MTPAssistantLoader,
-    reset_gemma4_mtp_assistant_cache,
-)
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
 )
@@ -56,7 +53,7 @@ def reset_model_cache() -> None:
     """
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
-    reset_gemma4_mtp_assistant_cache()
+    Gemma4MTPAssistantLoader.clear_cache()
 
 
 def _generation_cache_key(model_name: str, *, is_vlm: bool) -> tuple[str, str]:

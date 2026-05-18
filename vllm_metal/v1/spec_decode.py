@@ -12,7 +12,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
-from vllm_metal.v1.gemma4_mtp import uses_gemma4_mtp
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantSource
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 
 if TYPE_CHECKING:
@@ -202,11 +202,7 @@ class SpeculativeDecodeController:
         """
         if not decode_segments and not has_final_prefill:
             return False
-        return self._uses_gemma4_mtp(speculative_config)
-
-    @staticmethod
-    def _uses_gemma4_mtp(speculative_config: SpeculativeConfig | None) -> bool:
-        return uses_gemma4_mtp(speculative_config)
+        return Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
 
     def verify_greedy(
         self,

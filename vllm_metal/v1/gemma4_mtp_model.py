@@ -11,12 +11,10 @@ import mlx.nn as nn
 from mlx_lm.models import gemma4_text
 from mlx_lm.models.base import BaseModelArgs
 
-from vllm_metal.v1.gemma4_mtp_constants import (
-    GEMMA4_MTP_DEFAULT_CENTROID_TOP_K,
-    GEMMA4_MTP_DEFAULT_NUM_CENTROIDS,
-    GEMMA4_MTP_DEFAULT_VOCAB_SIZE,
-    GEMMA4_MTP_PREPROJECTION_INPUTS,
-)
+GEMMA4_MTP_DEFAULT_VOCAB_SIZE = 262144
+GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
+GEMMA4_MTP_DEFAULT_CENTROID_TOP_K = 32
+GEMMA4_MTP_PREPROJECTION_INPUTS = 2
 
 
 @dataclass
@@ -86,7 +84,10 @@ class Gemma4MTPAssistantModel(nn.Module):
         self.model_type = args.model_type
         self.tie_word_embeddings = args.tie_word_embeddings
         text_config = dict(args.text_config or {})
-        num_hidden_layers = _required_positive_int(text_config, "num_hidden_layers")
+        num_hidden_layers = self._required_positive_int(
+            text_config,
+            "num_hidden_layers",
+        )
         if args.backbone_hidden_size <= 0:
             raise ValueError("Gemma4 MTP assistant requires backbone_hidden_size > 0")
 
@@ -147,13 +148,13 @@ class Gemma4MTPAssistantModel(nn.Module):
             "Gemma4 MTP assistant forward is not wired on Metal yet."
         )
 
-
-def _required_positive_int(config: dict[str, Any], key: str) -> int:
-    value = config.get(key)
-    if value is None:
-        raise ValueError(f"Gemma4 MTP assistant requires {key}")
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"Gemma4 MTP assistant {key} must be an integer")
-    if value <= 0:
-        raise ValueError(f"Gemma4 MTP assistant requires {key} > 0")
-    return value
+    @staticmethod
+    def _required_positive_int(config: dict[str, Any], key: str) -> int:
+        value = config.get(key)
+        if value is None:
+            raise ValueError(f"Gemma4 MTP assistant requires {key}")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Gemma4 MTP assistant {key} must be an integer")
+        if value <= 0:
+            raise ValueError(f"Gemma4 MTP assistant requires {key} > 0")
+        return value
