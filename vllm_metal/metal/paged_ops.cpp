@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -184,17 +185,44 @@ static void bind_paged_attn_buffers(
 }
 
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
-// Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 96, 128, 192, 256}.
-static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
-                                 Dtype query_dtype, Dtype k_cache_dtype) {
-  if (use_turboquant) return false;
-  if (query_dtype == float32) return false;
-  if (query_dtype != k_cache_dtype) return false;
-  // BQ=32 flash kernel: 80, 112 fail HD_TILES % NUM_SG(4)==0; 192, 256 exceed
-  // 32 KB threadgroup memory budget with separate K_smem and V_smem buffers.
+// One TileConfig per supported HEAD_SIZE. NUM_THREADS = NUM_SG * 32.
+struct TileConfig {
+  int BQ;
+  int TILE_KV;
+  int NUM_THREADS;
+};
+
+// ─ How to add a new HEAD_SIZE ────────────────────────────────────────────
+// Budget: smem <= 32 KB (Apple Silicon per-threadgroup memory limit, M1-M4).
+// Formula:
+//   smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + 8) * 2 bytes
+//   where  BQ+2*TILE_KV = Q-rows + K-rows + V-rows
+//          HEAD_SIZE+8  = row stride (+8 = SMEM_PAD for bank-conflict
+//                                     avoidance; see pagedattention_tiled.metal)
+//          *2           = sizeof(bf16/half); fp8 KV would change this
+//
+// Constraints on (BQ, TILE_KV):
+//   BQ <= 2*TILE_KV       (O_smem fp32 reuses Q+K+V region at kernel exit)
+//   BQ / NUM_SG == 8      (each simdgroup owns 8 Q rows; 8x8 MMA fragment)
+//   HEAD_SIZE, TILE_KV multiples of 8
+// NUM_THREADS = NUM_SG * 32 (one Apple simdgroup = 32 lanes).
+//
+// HEAD_SIZE -> (BQ, TILE_KV, NUM_THREADS, NUM_SG, smem):
+//   64, 96, 128 -> (32, 32, 128, 4, 24-26 KB)
+//   256         -> (16, 16,  64, 2,   25.3 KB)
+//   512         -> ( 8,  8,  32, 1,   24.9 KB)  // no in-threadgroup SG parallelism
+// 80, 112 excluded by HD_TILES % NUM_SG(4) == 0.
+// ─────────────────────────────────────────────────────────────────────────
+static std::optional<TileConfig> select_tile_config(int head_size) {
   switch (head_size) {
-    case 64: case 96: case 128: return true;
-    default: return false;
+    case 64: case 96: case 128:
+      return TileConfig{32, 32, 128};
+    case 256:
+      return TileConfig{16, 16, 64};
+    case 512:
+      return TileConfig{8, 8, 32};
+    default:
+      return std::nullopt;
   }
 }
 
@@ -204,38 +232,38 @@ static void dispatch_paged_attention_tiled(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window, Stream s) {
+    int block_size, int max_seq_len, int sliding_window,
+    TileConfig cfg, Stream s) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  constexpr int BQ = 32;
-  int total_q_blocks = total_q_tokens / BQ + num_seqs;
+  int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
 
   auto dt = dtype_to_metal(query.dtype());
   std::string kname =
       "paged_attention_tiled_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_bq32_tk32_nt128";
+      "_bq" + std::to_string(cfg.BQ) +
+      "_tk" + std::to_string(cfg.TILE_KV) +
+      "_nt" + std::to_string(cfg.NUM_THREADS);
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(kname, lib, kname, {});
 
-  constexpr int NUM_THREADS = 128;
-  constexpr int TILE_KV = 32;
-  constexpr int t_size = 2;  // half or bfloat16
+  const int t_size = static_cast<int>(query.itemsize());
   // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
   // Output staging reuses Q_smem as fp32 O_smem at exit; fits because
-  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV (32 <= 64).
+  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV.
   // A1: leading dim padded by 16 B for bank-conflict avoidance —
   // smem_pad/ld MUST match SMEM_PAD/LD in pagedattention_tiled.metal.
-  const int smem_pad = 16 / t_size;            // 8 elems for half/bf16
-  const int ld       = head_size + smem_pad;   // padded leading dim
+  const int smem_pad = 16 / t_size;
+  const int ld       = head_size + smem_pad;
   size_t shmem = static_cast<size_t>(
-      (BQ + 2 * TILE_KV) * ld * t_size);       // Q + K + V, padded
+      (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = get_command_encoder_compat(d, s);
@@ -249,7 +277,7 @@ static void dispatch_paged_attention_tiled(
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_blocks, 1),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
+      MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
 static void dispatch_paged_attention_v2_online(
@@ -275,14 +303,17 @@ static void dispatch_paged_attention_v2_online(
   int total_q_tokens = static_cast<int>(query.shape(0));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   bool has_prefill = total_q_tokens > num_seqs;
-  if (has_prefill && can_use_tiled_kernel(head_size, use_turboquant,
-                                          query.dtype(), key_cache.dtype())) {
-    dispatch_paged_attention_tiled(
-        out, query, key_cache, value_cache,
-        num_kv_heads, scale, softcap,
-        block_tables, seq_lens, cu_seqlens_q,
-        block_size, max_seq_len, sliding_window, s);
-    return;
+  bool dtype_ok = query.dtype() != float32
+               && query.dtype() == key_cache.dtype();
+  if (has_prefill && !use_turboquant && dtype_ok) {
+    if (auto cfg = select_tile_config(head_size)) {
+      dispatch_paged_attention_tiled(
+          out, query, key_cache, value_cache,
+          num_kv_heads, scale, softcap,
+          block_tables, seq_lens, cu_seqlens_q,
+          block_size, max_seq_len, sliding_window, *cfg, s);
+      return;
+    }
   }
 
   // Fallback: original per-token kernel

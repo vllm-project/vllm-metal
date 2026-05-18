@@ -486,12 +486,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
 // ─── Template instantiation ──────────────────────────────────────────────
 
-#define instantiate_paged_attention_tiled_inner(type, head_size, block_size)   \
+#define instantiate_paged_attention_tiled_inner(type, head_size, block_size,   \
+                                                bq, tkv, nt)                   \
   template [[host_name("paged_attention_tiled_" #type                          \
                        "_hs" #head_size "_bs" #block_size                      \
-                       "_bq32_tk32_nt128")]]                                   \
+                       "_bq" #bq "_tk" #tkv "_nt" #nt)]]                       \
   [[kernel]] void paged_attention_tiled<type, head_size, block_size,           \
-                                        32, 32, 128>(                          \
+                                        bq, tkv, nt>(                          \
       device type *out [[buffer(2)]],                                          \
       device const type *q [[buffer(3)]],                                      \
       device const type *k_cache [[buffer(4)]],                                \
@@ -515,10 +516,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       uint sg_idx [[simdgroup_index_in_threadgroup]],                          \
       uint lane [[thread_index_in_simdgroup]]);
 
+// Each entry must match a (head_size -> TileConfig) row in select_tile_config
+// in vllm_metal/metal/paged_ops.cpp.
 #define instantiate_paged_attention_tiled_heads(type, block_size)              \
-  instantiate_paged_attention_tiled_inner(type, 64, block_size);               \
-  instantiate_paged_attention_tiled_inner(type, 96, block_size);               \
-  instantiate_paged_attention_tiled_inner(type, 128, block_size);
+  instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 128, block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 256, block_size, 16, 16,  64); \
+  instantiate_paged_attention_tiled_inner(type, 512, block_size,  8,  8,  32);
 
 #define instantiate_paged_attention_tiled_all(type)                            \
   instantiate_paged_attention_tiled_heads(type, 8);                            \
