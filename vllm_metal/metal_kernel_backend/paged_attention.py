@@ -60,6 +60,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         block_size: int,
         *,
         cache_idx: int | None = None,
+        force_shared_kv: bool = False,
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
@@ -71,6 +72,46 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         object.__setattr__(
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
+        object.__setattr__(self, "_mk_force_shared_kv", force_shared_kv)
+
+    def _shared_kv_sentinel(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        """Build dummy K/V tensors for layers that read cache-only K/V."""
+        if len(x.shape) != 3:
+            raise ValueError(
+                "Paged attention shared-KV sentinel expects input shaped "
+                f"(batch, tokens, hidden), got {x.shape}"
+            )
+
+        cache = self._mk_kv_cache
+        cache_idx = self._mk_cache_idx
+        if cache_idx < 0 or cache_idx >= cache.num_layers:
+            raise ValueError(
+                f"cache_idx={cache_idx} is outside target KV cache with "
+                f"{cache.num_layers} layers"
+            )
+
+        inner = self._inner
+        num_kv_heads = (
+            getattr(inner, "n_kv_heads", None)
+            or getattr(inner, "num_key_value_heads", None)
+            or cache.kv_heads_per_layer[cache_idx]
+        )
+        head_dim = getattr(inner, "head_dim", None)
+        k_proj = getattr(inner, "k_proj", None)
+        if head_dim is None and k_proj is not None:
+            head_dim = k_proj.weight.shape[0] // num_kv_heads
+        if head_dim is None:
+            head_dim = cache.head_dim_per_layer[cache_idx]
+
+        batch_size, seq_len, _ = x.shape
+        shape = (
+            batch_size,
+            int(num_kv_heads),
+            seq_len,
+            int(head_dim),
+        )
+        sentinel = mx.zeros(shape, dtype=x.dtype)
+        return sentinel, sentinel
 
     def __call__(
         self,
@@ -96,7 +137,16 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         # SDPA attention via Metal kernel.
         # Pass shared_kv for YOCO KV sharing (Gemma4: later layers reuse
         # K/V from earlier same-type layers instead of projecting their own).
-        shared_kv = kwargs.get("shared_kv")
+        if self._mk_force_shared_kv:
+            # Cross-model shared layers always read from this wrapper's mapped
+            # target cache slot; ignore any caller-propagated placeholder from
+            # a previous assistant layer.
+            shared_kv = self._shared_kv_sentinel(x)
+            has_shared_kv = True
+        else:
+            has_shared_kv = "shared_kv" in kwargs
+            shared_kv = kwargs.get("shared_kv")
+
         output, kv_pair = sdpa_forward(
             inner,
             x,
@@ -107,8 +157,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.
-        # Key off shared_kv presence — it's the definitive YOCO indicator.
-        if "shared_kv" in kwargs:
+        # Key off shared_kv presence, including cache-only shared layers whose
+        # K/V are read directly from the target paged cache.
+        if has_shared_kv:
             return (output, kv_pair, kwargs.get("offset", 0))
 
         return output
@@ -157,18 +208,20 @@ def patch_model_attention_metal_kernel(
             continue
 
         attn = getattr(layer, attn_attr)
-        if isinstance(attn, MetalKernelPagedAttentionWrapper):
-            # Already patched — update cache reference
-            object.__setattr__(attn, "_mk_kv_cache", kv_cache)
-            object.__setattr__(attn, "_mk_block_size", block_size)
-            patched += 1
-            continue
-
         cache_idx = (
             cache_idx_map[layer_idx]
             if cache_idx_map is not None and layer_idx in cache_idx_map
             else layer_idx
         )
+        if isinstance(attn, MetalKernelPagedAttentionWrapper):
+            # Already patched — update cache reference
+            object.__setattr__(attn, "_mk_kv_cache", kv_cache)
+            object.__setattr__(attn, "_mk_block_size", block_size)
+            object.__setattr__(attn, "_mk_cache_idx", cache_idx)
+            object.__setattr__(attn, "_mk_force_shared_kv", False)
+            patched += 1
+            continue
+
         wrapper = MetalKernelPagedAttentionWrapper(
             attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
         )

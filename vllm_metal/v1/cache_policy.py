@@ -38,6 +38,7 @@ from vllm_metal.stt.policy import (
     STT_SCHED_BLOCK_BYTES,
     STT_SCHED_NOMINAL_HEAD_SIZE,
 )
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
@@ -360,6 +361,32 @@ class ModelCachePolicy:
             return self._build_mla_backend(block_size)
         return self._build_mha_backend(block_size)
 
+    def _install_gemma4_mtp_kv_sharing(
+        self,
+        backend: PagedAttentionBackend,
+        *,
+        block_size: int,
+    ) -> None:
+        """Wire Gemma4 MTP assistant layers to the target paged KV cache."""
+        assistant = self._runner._gemma4_mtp_assistant
+        if assistant is None:
+            return
+        if not isinstance(backend, MHAPagedAttentionBackend):
+            raise NotImplementedError(
+                "Gemma4 MTP assistant KV sharing requires the MHA paged "
+                "attention backend on Metal."
+            )
+        model_config = getattr(self._runner, "model_config", None)
+        target_metadata = Gemma4MTPTargetMetadata.from_configs(
+            target_hf_config=getattr(model_config, "hf_config", None),
+            target_model_args=self._runner.model_args,
+        )
+        self._runner._gemma4_mtp_assistant = assistant.with_target_kv_sharing(
+            target_metadata=target_metadata,
+            target_kv_cache=backend.kv_cache,
+            block_size=block_size,
+        )
+
     def estimate_one_sequence_kv_bytes(
         self, *, max_model_len: int, block_size: int
     ) -> int:
@@ -586,6 +613,10 @@ class WorkerCachePlanner:
             block_size=plan.block_size
         )
         backend.initialize(plan.num_blocks)
+        self._worker.model_runner._cache_policy._install_gemma4_mtp_kv_sharing(
+            backend,
+            block_size=plan.block_size,
+        )
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
         if config.kv_sharing_fast_prefill:
