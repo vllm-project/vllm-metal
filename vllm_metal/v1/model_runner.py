@@ -406,6 +406,8 @@ class MetalModelRunner:
             model=self._forward_model,
             lora_config=getattr(self.vllm_config, "lora_config", None),
             is_stt=self._is_stt,
+            paged_attention_enabled=self.metal_config.use_paged_attention,
+            speculative_decode_enabled=self.vllm_config.speculative_config is not None,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             dtype=self.kv_cache_dtype or mx.float16,
@@ -1156,25 +1158,11 @@ class MetalModelRunner:
         decode_reqs: list[tuple[str, RequestState]],
         prefill_pack: list[PrefillRequest],
     ) -> list[tuple[int | None, int]]:
-        entries = []
+        entries: list[tuple[int | None, int]] = []
         for _, state in decode_reqs:
             entries.append((state.lora_id, 1))
         for pr in prefill_pack:
             entries.append((pr.lora_id, len(pr.token_ids)))
-        return entries
-
-    def _scheduler_lora_routing(
-        self, scheduler_output: SchedulerOutput
-    ) -> list[tuple[int | None, int]]:
-        entries = []
-        for new_req in scheduler_output.scheduled_new_reqs:
-            num_tokens = scheduler_output.num_scheduled_tokens.get(new_req.req_id, 0)
-            entries.append((_lora_id_from_request_data(new_req), num_tokens))
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            state = self._request_states.get(req_id)
-            lora_id = state.lora_id if state is not None else None
-            entries.append((lora_id, num_tokens))
         return entries
 
     def _register_new_request_mm_features(
@@ -1629,9 +1617,6 @@ class MetalModelRunner:
                 "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
                 "to use structured output."
             )
-
-        if self._paged_attention_backend is None:
-            self._lora.prepare_step(self._scheduler_lora_routing(scheduler_output))
 
         batch = _ExecutionBatch()
         self._handle_new_requests(

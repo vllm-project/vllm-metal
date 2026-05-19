@@ -16,6 +16,8 @@ from vllm_metal.v1.lora import mapping as mapping_mod
 from vllm_metal.v1.lora import model_manager as model_manager_mod
 from vllm_metal.v1.lora import peft_loader as peft_loader_mod
 from vllm_metal.v1.lora import punica_wrapper as punica_mod
+from vllm_metal.v1.lora import runtime as runtime_mod
+from vllm_metal.v1.lora import worker_manager as worker_manager_mod
 
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
@@ -81,6 +83,8 @@ def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     [
         ((2, 7), (4, 2), "LoRA weight shape mismatch"),  # in_dim mismatch
         ((4, 3), (4, 4), "exceeds max_lora_rank"),  # rank > max_lora_rank
+        ((2, 3, 1), (4, 2), "must be 2-D"),         # A not 2-D
+        ((2, 3), (4, 3), "does not match B rank"),  # A rank != B rank
     ],
 )
 def test_linear_wrapper_rejects_bad_weights(
@@ -777,3 +781,95 @@ def test_paged_lora_routing_orders_decode_before_prefill() -> None:
     assert mapping.index_mapping == (11, 22, 22, 22, 22)
     assert mapping.prompt_mapping == (11, 22)
     assert mapping.is_prefill is True
+
+
+# MetalLoRARuntime guards
+
+
+def _runtime_setup_kwargs(**overrides: object) -> dict:
+    kwargs: dict = {
+        "model": object(),
+        "lora_config": _lora_config_stub(max_loras=1, max_lora_rank=8),
+        "is_stt": False,
+        "paged_attention_enabled": True,
+        "speculative_decode_enabled": False,
+        "max_num_seqs": 1,
+        "max_num_batched_tokens": 8,
+        "dtype": mx.float16,
+        "max_position_embeddings": None,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_runtime_rejects_lora_without_paged_attention() -> None:
+    rt = runtime_mod.MetalLoRARuntime()
+    with pytest.raises(NotImplementedError, match="requires paged attention"):
+        rt.setup(**_runtime_setup_kwargs(paged_attention_enabled=False))
+    assert rt.enabled is False
+
+
+def test_runtime_rejects_lora_with_speculative_decode() -> None:
+    rt = runtime_mod.MetalLoRARuntime()
+    with pytest.raises(NotImplementedError, match="speculative decode"):
+        rt.setup(**_runtime_setup_kwargs(speculative_decode_enabled=True))
+    assert rt.enabled is False
+
+
+def test_runtime_stt_disables_lora_without_raising() -> None:
+    rt = runtime_mod.MetalLoRARuntime()
+    rt.setup(**_runtime_setup_kwargs(is_stt=True))
+    assert rt.enabled is False
+
+
+def test_prepare_step_raises_for_unloaded_lora_id() -> None:
+    rt = runtime_mod.MetalLoRARuntime()
+    # Manager presence is all prepare_step checks before routing; the raise
+    # fires in the routing loop before the manager is ever touched.
+    rt._manager = SimpleNamespace(set_active_adapters=lambda *a, **k: None)
+    with pytest.raises(ValueError, match="LoRA id 7 was routed .* not "):
+        rt.prepare_step([(7, 1)])
+
+
+def test_worker_manager_rejects_cpu_loras_gt_max_loras() -> None:
+    with pytest.raises(NotImplementedError, match="max_cpu_loras > max_loras"):
+        worker_manager_mod.MetalWorkerLoRAManager(
+            model=_TwoLinearModel(),
+            lora_config=_lora_config_stub(
+                max_loras=2, max_lora_rank=8, max_cpu_loras=4
+            ),
+            max_num_seqs=1,
+            max_num_batched_tokens=8,
+            dtype=mx.float32,
+        )
+
+
+def test_activate_adapter_rejects_zero_module_match() -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    # Adapter targets a module the model does not expose under LoRA.
+    bogus = peft_loader_mod.LoadedLoRA(
+        lora_id=1,
+        rank=1,
+        weights={
+            "does.not.exist": peft_loader_mod.LoRALayerWeightsMLX(
+                module_name="does.not.exist",
+                rank=1,
+                lora_a=mx.array(np.zeros((1, 2), dtype=np.float32)),
+                lora_b=mx.array(np.zeros((2, 1), dtype=np.float32)),
+                scaling=1.0,
+            )
+        },
+    )
+    manager.add_adapter(bogus)
+    with pytest.raises(ValueError, match="matched 0 wrapped modules"):
+        manager.activate_adapter(1)
+    # Slot must be rolled back so a later valid activation can use it.
+    assert all(sid is None for sid in manager.lora_index_to_id)
+    assert 1 not in manager._active

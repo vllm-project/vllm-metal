@@ -148,11 +148,15 @@ class MLXLoRAModelManager:
             w.set_lora(slot, mw.lora_a, mw.lora_b * mw.scaling)
             loaded += 1
         if loaded == 0:
-            logger.warning("LoRA %d activated but matched 0 wrapped modules.", lora_id)
-        else:
-            logger.info(
-                "Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded
+            self.lora_index_to_id[slot] = None
+            self._active.discard(lora_id)
+            raise ValueError(
+                f"LoRA adapter {lora_id} matched 0 wrapped modules "
+                f"(wrapped: {sorted(self.modules)}). The adapter targets "
+                "modules this model does not expose under LoRA; check "
+                "target_modules / the adapter's base model."
             )
+        logger.info("Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded)
         self._last_mapping = None
         return True
 

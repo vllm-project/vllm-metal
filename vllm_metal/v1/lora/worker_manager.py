@@ -29,6 +29,15 @@ class MetalWorkerLoRAManager:
         dtype: mx.Dtype,
         max_position_embeddings: int | None = None,
     ):
+        max_cpu_loras = lora_config.max_cpu_loras
+        if max_cpu_loras is not None and max_cpu_loras != lora_config.max_loras:
+            raise NotImplementedError(
+                "Metal LoRA does not implement the upstream "
+                "max_cpu_loras > max_loras cache tier yet: every added "
+                f"adapter is activated immediately. Got max_cpu_loras="
+                f"{max_cpu_loras}, max_loras={lora_config.max_loras}; set "
+                "--max-cpu-loras equal to --max-loras (or omit it)."
+            )
         self.lora_config = lora_config
         self.max_position_embeddings = max_position_embeddings
         self._mm = MLXLoRAModelManager(

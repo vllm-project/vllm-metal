@@ -37,9 +37,20 @@ class MLXLinearWithLoRA(nn.Module):
         self.punica_wrapper = punica_wrapper
 
     def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
-        """Write ``(rank, in)`` ``A`` and ``(out, rank)`` ``B`` into ``slot``."""
+        if lora_a.ndim != 2 or lora_b.ndim != 2:
+            raise ValueError(
+                f"LoRA weight shape mismatch for slot {slot}: A and B must be "
+                f"2-D, got A.ndim={lora_a.ndim}, B.ndim={lora_b.ndim} "
+                "(expected A=(rank, in), B=(out, rank))"
+            )
         rank, in_ = int(lora_a.shape[0]), int(lora_a.shape[1])
-        out = int(lora_b.shape[0])
+        out, b_rank = int(lora_b.shape[0]), int(lora_b.shape[1])
+        if b_rank != rank:
+            raise ValueError(
+                f"LoRA weight shape mismatch for slot {slot}: A rank {rank} "
+                f"(A=({rank},{in_})) does not match B rank {b_rank} "
+                f"(B=({out},{b_rank})); A=(rank, in), B=(out, rank)"
+            )
         if (in_, out) != (self.input_size, self.output_size):
             raise ValueError(
                 f"LoRA weight shape mismatch for slot {slot}: A=({rank},{in_}), "

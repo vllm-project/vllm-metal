@@ -37,6 +37,8 @@ class MetalLoRARuntime:
         model: nn.Module,
         lora_config: LoRAConfig | None,
         is_stt: bool,
+        paged_attention_enabled: bool,
+        speculative_decode_enabled: bool,
         max_num_seqs: int,
         max_num_batched_tokens: int,
         dtype: mx.Dtype,
@@ -49,6 +51,22 @@ class MetalLoRARuntime:
                 "LoRA is not supported for STT models; ignoring --enable-lora"
             )
             return
+        if not paged_attention_enabled:
+            raise NotImplementedError(
+                "LoRA on Metal requires paged attention. The non-paged "
+                "(legacy MLX KV cache) path runs multiple separate forwards "
+                "per step, which the step-level Punica routing cannot align. "
+                "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
+                "or drop --enable-lora."
+            )
+        if speculative_decode_enabled:
+            raise NotImplementedError(
+                "LoRA combined with speculative decode is not supported on "
+                "Metal yet: speculative decode forwards multiple draft rows "
+                "per decode request, which the current per-request LoRA row "
+                "contract does not model. Disable speculative decode or drop "
+                "--enable-lora."
+            )
         self._manager = MetalWorkerLoRAManager(
             model=model,
             lora_config=lora_config,
@@ -99,9 +117,16 @@ class MetalLoRARuntime:
         active_requests: set[LoRARequest] = set()
         for lora_id, num_tokens in routing_entries:
             builder.add_request(lora_id, num_tokens)
-            if lora_id is not None:
-                req = self._loaded.get(lora_id)
-                if req is not None:
-                    active_requests.add(req)
+            if lora_id is None:
+                continue
+            req = self._loaded.get(lora_id)
+            if req is None:
+                raise ValueError(
+                    f"LoRA id {lora_id} was routed for this step but is not "
+                    f"loaded (loaded ids: {sorted(self._loaded)}). The engine "
+                    "must call add_lora before scheduling a request that uses "
+                    "it."
+                )
+            active_requests.add(req)
         mapping = builder.build() if not builder.is_empty() else None
         self._manager.set_active_adapters(active_requests, mapping)
