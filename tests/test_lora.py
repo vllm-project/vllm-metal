@@ -83,7 +83,7 @@ def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     [
         ((2, 7), (4, 2), "LoRA weight shape mismatch"),  # in_dim mismatch
         ((4, 3), (4, 4), "exceeds max_lora_rank"),  # rank > max_lora_rank
-        ((2, 3, 1), (4, 2), "must be 2-D"),         # A not 2-D
+        ((2, 3, 1), (4, 2), "must be 2-D"),  # A not 2-D
         ((2, 3), (4, 3), "does not match B rank"),  # A rank != B rank
     ],
 )
