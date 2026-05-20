@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     VLLM_METAL_PREFIX_CACHE: bool = False
     VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
-    VLLM_METAL_GDN_LAZY_DECODE: bool = True
+    VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -73,10 +73,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
-    # Enable lazy GDN decode kernels by default. Set to "0" to force the
-    # eager conv / C++ recurrent fallback path.
-    "VLLM_METAL_GDN_LAZY_DECODE": lambda: (
-        os.getenv("VLLM_METAL_GDN_LAZY_DECODE", "1") == "1"
+    # Enable lazy GDN kernels by default.
+    # Set to "0" to force the eager conv / C++ recurrent fallback path.
+    "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
+        os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
     ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Focused regression tests for lazy GDN decode dispatch."""
+"""Focused regression tests for lazy GDN kernels."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,26 +12,20 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-import vllm_metal.metal_kernel_backend.attention_linear as attention_linear
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.attention_linear import GDNPagedAttentionWrapper
-from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
-    GDNLazyDecodeKernels,
+from vllm_metal.metal_kernel_backend.gdn_lazy import (
+    GDNLazyKernels,
     GDNRecurrentDecodeRequest,
+    GDNRecurrentPrefillRequest,
 )
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_common import (
-    PagedAttentionContext,
-    clear_context,
-    set_context,
-)
 
 
 @pytest.fixture(autouse=True)
-def _reset_lazy_decode_kernels() -> None:
-    GDNLazyDecodeKernels.reset_shared_for_tests()
+def _reset_lazy_gdn_kernels() -> Iterator[None]:
+    GDNLazyKernels.reset_shared_for_tests()
     yield
-    GDNLazyDecodeKernels.reset_shared_for_tests()
+    GDNLazyKernels.reset_shared_for_tests()
 
 
 class _DepthwiseConv1D:
@@ -147,6 +142,7 @@ def _recurrent_request(
     cache: GDNPagedStateCache,
     slot_ids: list[int],
     output_dtype: mx.Dtype = mx.float32,
+    threadgroup_dv: int = 4,
 ) -> GDNRecurrentDecodeRequest:
     return GDNRecurrentDecodeRequest(
         q=q,
@@ -158,6 +154,37 @@ def _recurrent_request(
         cache_idx=0,
         slot_ids=slot_ids,
         output_dtype=output_dtype,
+        threadgroup_dv=threadgroup_dv,
+    )
+
+
+def _recurrent_prefill_request(
+    *,
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    cache: GDNPagedStateCache,
+    slot_ids: list[int],
+    cu_seqlens: list[int],
+    output_dtype: mx.Dtype = mx.float32,
+    compute_dtype: mx.Dtype | None = None,
+    materialize_outputs: bool = False,
+) -> GDNRecurrentPrefillRequest:
+    return GDNRecurrentPrefillRequest(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        state_cache=cache,
+        cache_idx=0,
+        slot_ids=slot_ids,
+        output_dtype=output_dtype,
+        cu_seqlens=cu_seqlens,
+        compute_dtype=compute_dtype,
+        materialize_outputs=materialize_outputs,
     )
 
 
@@ -193,7 +220,7 @@ class TestLazyConvDecode:
         expected = mx.concatenate(expected_outputs, axis=1)
 
         # Act
-        actual = GDNLazyDecodeKernels(enabled=True).try_conv_decode(
+        actual = GDNLazyKernels(enabled=True).try_conv_decode(
             mixed_qkv, inner, cache, 0, slot_ids
         )
 
@@ -231,10 +258,10 @@ class TestLazyConvDecode:
         slot_ids = [3, 1]
 
         # Act
-        result = GDNLazyDecodeKernels(
+        result = GDNLazyKernels(
             enabled=True,
             conv_kernel=fake_kernel,
-            recurrent_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
         ).try_conv_decode(
             mx.zeros((1, 2, 4), dtype=mx.float32), inner, cache, 0, slot_ids
         )
@@ -281,7 +308,7 @@ class TestLazyConvDecode:
         expected = mx.concatenate(expected_outputs, axis=1)
 
         # Act
-        actual = GDNLazyDecodeKernels(enabled=True).try_conv_decode(
+        actual = GDNLazyKernels(enabled=True).try_conv_decode(
             mixed_qkv, inner, cache, 0, slot_ids
         )
 
@@ -313,7 +340,7 @@ class TestLazyConvDecode:
                 )
 
         fake_kernel = FakeConvKernel()
-        cache = _make_state_cache(max_seqs=2, conv_kernel_dim=3, conv_dim=4)
+        cache = _make_state_cache(max_seqs=3, conv_kernel_dim=3, conv_dim=4)
         cache.conv_states[0] = cache.conv_states[0].astype(mx.bfloat16)
         inner = SimpleNamespace(
             conv_kernel_size=3,
@@ -321,10 +348,10 @@ class TestLazyConvDecode:
         )
 
         # Act
-        result = GDNLazyDecodeKernels(
+        result = GDNLazyKernels(
             enabled=True,
             conv_kernel=fake_kernel,
-            recurrent_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
         ).try_conv_decode(mx.zeros((1, 1, 4), dtype=mx.float32), inner, cache, 0, [0])
 
         # Assert
@@ -340,10 +367,12 @@ class TestLazyRecurrentDecode:
         class FakeRecurrentKernel:
             def __init__(self) -> None:
                 self.grid: tuple[int, int, int] | None = None
+                self.threadgroup: tuple[int, int, int] | None = None
                 self.output_shapes: list[tuple[int, ...]] | None = None
 
             def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
                 self.grid = kwargs["grid"]
+                self.threadgroup = kwargs["threadgroup"]
                 self.output_shapes = kwargs["output_shapes"]
                 return (
                     mx.ones((2, 2, 3), dtype=mx.float32),
@@ -371,15 +400,16 @@ class TestLazyRecurrentDecode:
         )
 
         # Act
-        result = GDNLazyDecodeKernels(
+        result = GDNLazyKernels(
             enabled=True,
             conv_kernel=_RaisingKernel(),
-            recurrent_kernel=fake_kernel,
+            recurrent_decode_kernel=fake_kernel,
         ).try_recurrent_decode(request)
 
         # Assert
         assert result is not None
         assert fake_kernel.grid == (32, 3, 4)
+        assert fake_kernel.threadgroup == (32, 4, 1)
         assert fake_kernel.output_shapes == [(2, 2, 3), (2, 2, 3, 32)]
         mx.eval(cache.recurrent_states[0])
         expected_state = np.array(initial_state)
@@ -387,6 +417,48 @@ class TestLazyRecurrentDecode:
         np.testing.assert_array_equal(
             np.array(cache.recurrent_states[0]), expected_state
         )
+
+    def test_uses_requested_decode_threadgroup_dv(self) -> None:
+        # Arrange
+        class FakeRecurrentKernel:
+            def __init__(self) -> None:
+                self.threadgroup: tuple[int, int, int] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.threadgroup = kwargs["threadgroup"]
+                return (
+                    mx.ones((2, 2, 3), dtype=mx.float32),
+                    mx.zeros((2, 2, 3, 32), dtype=mx.float32),
+                )
+
+        fake_kernel = FakeRecurrentKernel()
+        cache = _make_state_cache(
+            max_seqs=2,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        request = _recurrent_request(
+            q=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 2, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 2, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 2, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=[0, 1],
+            threadgroup_dv=8,
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=fake_kernel,
+        ).try_recurrent_decode(request)
+
+        # Assert
+        assert result is not None
+        assert fake_kernel.threadgroup == (32, 8, 1)
 
     def test_matches_cpp_recurrent_path(self) -> None:
         # Arrange
@@ -422,7 +494,7 @@ class TestLazyRecurrentDecode:
         )
 
         # Act
-        lazy_out = GDNLazyDecodeKernels(enabled=True).try_recurrent_decode(request)
+        lazy_out = GDNLazyKernels(enabled=True).try_recurrent_decode(request)
 
         # Assert
         assert lazy_out is not None
@@ -466,10 +538,339 @@ class TestLazyRecurrentDecode:
             cache_cpp.recurrent_states[0],
         )
         np.testing.assert_allclose(np.array(lazy_out), np.array(cpp_out), atol=1e-4)
+        # The lazy typed prefill path intentionally runs the recurrence at the
+        # requested output dtype to avoid extra graph casts.  The fallback C++
+        # oracle above runs in fp32, so the state can differ slightly more than
+        # the rounded y output while still remaining numerically close.
         np.testing.assert_allclose(
             np.array(cache_lazy.recurrent_states[0]),
             np.array(cache_cpp.recurrent_states[0]),
-            atol=1e-4,
+            atol=1e-3,
+        )
+
+
+class TestLazyRecurrentPrefill:
+    def test_updates_only_active_prefill_slots(self) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __init__(self) -> None:
+                self.grid: tuple[int, int, int] | None = None
+                self.output_shapes: list[tuple[int, ...]] | None = None
+                self.input_names_seen = False
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.grid = kwargs["grid"]
+                self.output_shapes = kwargs["output_shapes"]
+                self.input_names_seen = True
+                return (
+                    mx.ones((5, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+                )
+
+        fake_kernel = FakePrefillKernel()
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        slot_ids = [3, 1]
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 5, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 5, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 5, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 2, 5],
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=fake_kernel,
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        assert fake_kernel.grid == (32, 3, 4)
+        assert fake_kernel.output_shapes == [(5, 2, 3), (2, 2, 3, 32)]
+        mx.eval(cache.recurrent_states[0])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), expected_state
+        )
+
+    @pytest.mark.parametrize("cu_seqlens", ([0, 1, 3], [0, 3], [1, 2, 3], [0, 2, 4]))
+    def test_prefill_rejects_ineligible_or_inconsistent_segments(
+        self, cu_seqlens: list[int]
+    ) -> None:
+        # Arrange
+        cache = _make_state_cache()
+        initial_state = mx.ones_like(cache.recurrent_states[0])
+        cache.recurrent_states[0] = initial_state
+        kernels = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        )
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 3, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 3, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 3, 1, 4), dtype=mx.float32),
+            g=mx.zeros((1, 3, 1), dtype=mx.float32),
+            beta=mx.zeros((1, 3, 1), dtype=mx.float32),
+            cache=cache,
+            slot_ids=[0, 1],
+            cu_seqlens=cu_seqlens,
+        )
+
+        # Act
+        result = kernels.try_recurrent_prefill(request)
+
+        # Assert
+        assert result is None
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), np.array(initial_state)
+        )
+
+    def test_prefill_recurrent_template_uses_input_and_state_dtypes(self) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __init__(self) -> None:
+                self.template: list[tuple[str, Any]] | None = None
+                self.output_dtypes: list[mx.Dtype] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.template = kwargs["template"]
+                self.output_dtypes = kwargs["output_dtypes"]
+                return (
+                    mx.ones((3, 1, 4), dtype=kwargs["output_dtypes"][0]),
+                    mx.ones((1, 1, 4, 32), dtype=kwargs["output_dtypes"][1]),
+                )
+
+        fake_kernel = FakePrefillKernel()
+        cache = _make_state_cache(value_head_dim=4, key_head_dim=32)
+        cache.recurrent_states[0] = mx.zeros(
+            cache.recurrent_states[0].shape, dtype=mx.bfloat16
+        )
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 3, 1, 32), dtype=mx.bfloat16),
+            k=mx.zeros((1, 3, 1, 32), dtype=mx.bfloat16),
+            v=mx.zeros((1, 3, 1, 4), dtype=mx.bfloat16),
+            g=mx.zeros((1, 3, 1), dtype=mx.bfloat16),
+            beta=mx.zeros((1, 3, 1), dtype=mx.bfloat16),
+            cache=cache,
+            slot_ids=[0],
+            cu_seqlens=[0, 3],
+            output_dtype=mx.bfloat16,
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=fake_kernel,
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        assert result.dtype == mx.bfloat16
+        assert ("T", mx.bfloat16) in (fake_kernel.template or [])
+        assert ("StT", mx.bfloat16) in (fake_kernel.template or [])
+        assert fake_kernel.output_dtypes == [mx.bfloat16, mx.bfloat16]
+
+    def test_matches_cpp_recurrent_path_for_prefill(self) -> None:
+        # Arrange
+        _require_metal()
+        mx.random.seed(2)
+        total_tokens = 5
+        n_hk = 1
+        n_hv = 1
+        d_k = 32
+        d_v = 4
+        slot_ids = [1, 0]
+        cu_seqlens = [0, 2, 5]
+        cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        initial_state = mx.random.normal(cache_lazy.recurrent_states[0].shape).astype(
+            mx.float32
+        )
+        cache_lazy.recurrent_states[0] = mx.array(initial_state)
+        cache_cpp.recurrent_states[0] = mx.array(initial_state)
+
+        q = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
+        k = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
+        v = mx.random.normal((1, total_tokens, n_hv, d_v)).astype(mx.float32)
+        g = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
+        beta = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
+        request = _recurrent_prefill_request(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cache=cache_lazy,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # Act
+        lazy_out = GDNLazyKernels(enabled=True).try_recurrent_prefill(request)
+
+        # Assert
+        assert lazy_out is not None
+        mx.eval(lazy_out, cache_lazy.recurrent_states[0])
+
+        q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k))
+        k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k))
+        v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v))
+        g_flat = mx.contiguous(g.reshape(total_tokens, n_hv))
+        beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv))
+        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
+        mx.eval(
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            cache_cpp.recurrent_states[0],
+            cpp_out,
+        )
+        _get_native_ops_or_skip().gdn_linear_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            cache_cpp.recurrent_states[0],
+            mx.array(cu_seqlens, dtype=mx.int32),
+            mx.array(slot_ids, dtype=mx.int32),
+            cpp_out,
+            n_hk,
+            n_hv,
+            d_k,
+            d_v,
+        )
+        mx.synchronize()
+        mx.eval(
+            lazy_out,
+            cpp_out,
+            cache_lazy.recurrent_states[0],
+            cache_cpp.recurrent_states[0],
+        )
+        np.testing.assert_allclose(np.array(lazy_out), np.array(cpp_out), atol=1e-4)
+        # The lazy typed prefill path intentionally runs the recurrence at the
+        # requested output dtype to avoid extra graph casts.  The fallback C++
+        # oracle above runs in fp32, so the state can differ slightly more than
+        # the rounded y output while still remaining numerically close.
+        np.testing.assert_allclose(
+            np.array(cache_lazy.recurrent_states[0]),
+            np.array(cache_cpp.recurrent_states[0]),
+            atol=1e-3,
+        )
+
+    def test_prefill_uses_requested_output_dtype_without_losing_fallback_parity(
+        self,
+    ) -> None:
+        # Arrange
+        _require_metal()
+        mx.random.seed(4)
+        total_tokens = 5
+        n_hk = 1
+        n_hv = 1
+        d_k = 32
+        d_v = 4
+        slot_ids = [1, 0]
+        cu_seqlens = [0, 2, 5]
+        cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        initial_state = (
+            mx.random.normal(cache_lazy.recurrent_states[0].shape) * 0.01
+        ).astype(mx.float32)
+        cache_lazy.recurrent_states[0] = mx.array(initial_state)
+        cache_cpp.recurrent_states[0] = mx.array(initial_state)
+
+        q = (mx.random.normal((1, total_tokens, n_hk, d_k)) * 0.01).astype(mx.bfloat16)
+        k = (mx.random.normal((1, total_tokens, n_hk, d_k)) * 0.01).astype(mx.bfloat16)
+        v = (mx.random.normal((1, total_tokens, n_hv, d_v)) * 0.01).astype(mx.bfloat16)
+        g = mx.ones((1, total_tokens, n_hv), dtype=mx.bfloat16) * 0.99
+        beta = mx.ones((1, total_tokens, n_hv), dtype=mx.bfloat16) * 0.5
+        request = _recurrent_prefill_request(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cache=cache_lazy,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            output_dtype=mx.bfloat16,
+        )
+
+        # Act
+        lazy_out = GDNLazyKernels(enabled=True).try_recurrent_prefill(request)
+
+        # Assert
+        assert lazy_out is not None
+        assert lazy_out.dtype == mx.bfloat16
+
+        q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k).astype(mx.float32))
+        k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k).astype(mx.float32))
+        v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(mx.float32))
+        g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(mx.float32))
+        beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(mx.float32))
+        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
+        mx.eval(
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            cache_cpp.recurrent_states[0],
+            cpp_out,
+        )
+        _get_native_ops_or_skip().gdn_linear_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            g_flat,
+            beta_flat,
+            cache_cpp.recurrent_states[0],
+            mx.array(cu_seqlens, dtype=mx.int32),
+            mx.array(slot_ids, dtype=mx.int32),
+            cpp_out,
+            n_hk,
+            n_hv,
+            d_k,
+            d_v,
+        )
+        mx.synchronize()
+        lazy_cmp = lazy_out.astype(mx.float32)
+        cpp_cmp = cpp_out.astype(mx.bfloat16).astype(mx.float32)
+        mx.eval(
+            lazy_cmp,
+            cpp_cmp,
+            cache_lazy.recurrent_states[0],
+            cache_cpp.recurrent_states[0],
+        )
+        np.testing.assert_allclose(np.array(lazy_cmp), np.array(cpp_cmp), atol=1e-4)
+        # The lazy typed prefill path intentionally runs the recurrence at the
+        # requested output dtype to avoid extra graph casts.  The fallback C++
+        # oracle above runs in fp32, so the state can differ slightly more than
+        # the rounded y output while still remaining numerically close.
+        np.testing.assert_allclose(
+            np.array(cache_lazy.recurrent_states[0]),
+            np.array(cache_cpp.recurrent_states[0]),
+            atol=1e-3,
         )
 
 
@@ -481,10 +882,11 @@ class TestLazyDecodeFallbacks:
         recurrent_state = mx.ones_like(cache.recurrent_states[0])
         cache.conv_states[0] = conv_state
         cache.recurrent_states[0] = recurrent_state
-        kernels = GDNLazyDecodeKernels(
+        kernels = GDNLazyKernels(
             enabled=True,
             conv_kernel=_RaisingKernel(),
-            recurrent_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
         )
         recurrent_request = _recurrent_request(
             q=mx.zeros((1, 3, 1, 32), dtype=mx.float32),
@@ -535,10 +937,11 @@ class TestLazyDecodeFallbacks:
         )
 
         # Act
-        result = GDNLazyDecodeKernels(
+        result = GDNLazyKernels(
             enabled=True,
             conv_kernel=_RaisingKernel(),
-            recurrent_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
         ).try_recurrent_decode(request)
 
         # Assert
@@ -552,15 +955,15 @@ class TestLazyDecodeFallbacks:
     ) -> None:
         # Arrange
         def fail_make_kernel(*_: Any) -> None:
-            raise AssertionError("disabled lazy decode should not construct kernels")
+            raise AssertionError("disabled lazy GDN should not construct kernels")
 
-        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "0")
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
         monkeypatch.setattr(
-            GDNLazyDecodeKernels,
+            GDNLazyKernels,
             "_make_kernel",
             staticmethod(fail_make_kernel),
         )
-        kernels = GDNLazyDecodeKernels.from_env()
+        kernels = GDNLazyKernels.from_env()
         cache = _make_state_cache()
         request = _recurrent_request(
             q=mx.zeros((1, 1, 1, 32), dtype=mx.float32),
@@ -583,7 +986,7 @@ class TestLazyDecodeFallbacks:
         assert recurrent_result is None
 
 
-class TestGDNLazyDecodeSharedOwner:
+class TestGDNLazySharedOwner:
     def test_reuses_kernel_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Arrange
         calls = []
@@ -592,151 +995,30 @@ class TestGDNLazyDecodeSharedOwner:
             calls.append(name)
             return object()
 
-        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "1")
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "1")
         monkeypatch.setattr(
-            GDNLazyDecodeKernels,
+            GDNLazyKernels,
             "_make_kernel",
             staticmethod(fake_make_kernel),
         )
 
         # Act
-        first = GDNLazyDecodeKernels.shared()
-        second = GDNLazyDecodeKernels.shared()
+        first = GDNLazyKernels.shared()
+        second = GDNLazyKernels.shared()
 
         # Assert
         assert first is second
-        assert calls == ["gdn_conv1d_silu_decode_v2", "gdn_recurrent_v2"]
-        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "0")
-        disabled = GDNLazyDecodeKernels.shared()
+        assert calls == [
+            "gdn_conv1d_silu_decode_v2",
+            "gdn_recurrent_decode_v2",
+            "gdn_recurrent_prefill_v2",
+        ]
+
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
+        disabled = GDNLazyKernels.shared()
         assert disabled is not first
-        assert calls == ["gdn_conv1d_silu_decode_v2", "gdn_recurrent_v2"]
-
-
-class TestGDNPagedAttentionWrapperLazyDecode:
-    def test_rejects_duplicate_gdn_slots(self) -> None:
-        # Arrange
-        inner = _TinyGDNInner()
-        cache = _make_state_cache(
-            conv_kernel_dim=inner.conv_kernel_size,
-            conv_dim=inner.conv_dim,
-            num_v_heads=inner.num_v_heads,
-            value_head_dim=inner.head_v_dim,
-            key_head_dim=inner.head_k_dim,
-        )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
-        set_context(
-            PagedAttentionContext(
-                slot_mapping=[0, 1],
-                cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[1, 1],
-            )
-        )
-
-        # Act / Assert
-        try:
-            with pytest.raises(RuntimeError, match="unique slots"):
-                wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
-        finally:
-            clear_context()
-
-    def test_rejects_out_of_range_gdn_slots(self) -> None:
-        # Arrange
-        inner = _TinyGDNInner()
-        cache = _make_state_cache(
-            conv_kernel_dim=inner.conv_kernel_size,
-            conv_dim=inner.conv_dim,
-            num_v_heads=inner.num_v_heads,
-            value_head_dim=inner.head_v_dim,
-            key_head_dim=inner.head_k_dim,
-        )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
-        set_context(
-            PagedAttentionContext(
-                slot_mapping=[0, 1],
-                cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[0, cache.max_seqs],
-            )
-        )
-
-        # Act / Assert
-        try:
-            with pytest.raises(RuntimeError, match="out-of-range slot"):
-                wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
-        finally:
-            clear_context()
-
-    def test_kill_switch_uses_recurrent_fallback(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Arrange
-        class FakeOps:
-            def __init__(self) -> None:
-                self.called = False
-                self.args: tuple[Any, ...] | None = None
-
-            def gdn_linear_attention(self, *args: Any) -> None:
-                self.called = True
-                self.args = args
-                state_pool = args[5]
-                y_flat = args[8]
-                state_pool[:] = 7
-                y_flat[:] = 0
-
-        def fail_make_kernel(*_: Any) -> None:
-            raise AssertionError("disabled wrapper path should not construct kernels")
-
-        fake_ops = FakeOps()
-        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_DECODE", "0")
-        monkeypatch.setattr(attention_linear, "get_ops", lambda: fake_ops)
-        monkeypatch.setattr(
-            GDNLazyDecodeKernels,
-            "_make_kernel",
-            staticmethod(fail_make_kernel),
-        )
-        inner = _TinyGDNInner()
-        cache = _make_state_cache(
-            conv_kernel_dim=inner.conv_kernel_size,
-            conv_dim=inner.conv_dim,
-            num_v_heads=inner.num_v_heads,
-            value_head_dim=inner.head_v_dim,
-            key_head_dim=inner.head_k_dim,
-        )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
-        set_context(
-            PagedAttentionContext(
-                slot_mapping=[0, 1],
-                cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[0, 1],
-            )
-        )
-
-        # Act
-        try:
-            out = wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
-        finally:
-            clear_context()
-
-        # Assert
-        assert fake_ops.called
-        assert fake_ops.args is not None
-        np.testing.assert_array_equal(np.array(fake_ops.args[6]), np.array([0, 1, 2]))
-        np.testing.assert_array_equal(np.array(fake_ops.args[7]), np.array([0, 1]))
-        np.testing.assert_array_equal(
-            np.array(cache.conv_states[0][:2]),
-            np.ones((2, inner.conv_kernel_size - 1, inner.conv_dim), dtype=np.float32),
-        )
-        np.testing.assert_array_equal(
-            np.array(cache.conv_states[0][2:]),
-            np.zeros((1, inner.conv_kernel_size - 1, inner.conv_dim), dtype=np.float32),
-        )
-        np.testing.assert_array_equal(
-            np.array(cache.recurrent_states[0]),
-            np.full(cache.recurrent_states[0].shape, 7, dtype=np.float32),
-        )
-        assert out.shape == (1, 2, inner.num_v_heads * inner.head_v_dim)
+        assert calls == [
+            "gdn_conv1d_silu_decode_v2",
+            "gdn_recurrent_decode_v2",
+            "gdn_recurrent_prefill_v2",
+        ]

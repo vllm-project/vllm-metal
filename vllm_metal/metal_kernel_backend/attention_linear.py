@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Linear attention (Gated DeltaNet) with paged Metal state dispatch.
 
-Decomposes the mlx_lm GDN module's forward pass and routes eligible decode-only
-batches through lazy Metal conv/recurrent kernels.  Unsupported shapes, mixed
-prefill+decode batches, or disabled lazy decode use the eager conv / C++ Metal
+Decomposes the mlx_lm GDN module's forward pass and routes eligible decode or
+pure-prefill batches through lazy Metal GDN kernels.  Unsupported shapes, mixed
+prefill+decode batches, or disabled lazy paths use the eager conv / C++ Metal
 recurrent fallback path.
 """
 
@@ -17,9 +17,10 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.gdn_lazy_decode import (
-    GDNLazyDecodeKernels,
+from vllm_metal.metal_kernel_backend.gdn_lazy import (
+    GDNLazyKernels,
     GDNRecurrentDecodeRequest,
+    GDNRecurrentPrefillRequest,
 )
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import PagedAttentionContext, get_context
@@ -41,6 +42,7 @@ class _GDNForwardState:
     num_requests: int
     total_tokens: int
     slot_ids: list[int]
+    num_decode_requests: int
 
 
 class GDNPagedAttentionWrapper(nn.Module):
@@ -50,7 +52,7 @@ class GDNPagedAttentionWrapper(nn.Module):
     1. Projections (in_proj_qkv, z, a, b) — stateless, batched
     2. Conv1d with state management — per-request (stateful)
     3. Q/K/V split + RMS norm + gating — stateless, batched
-    4. Recurrent update — lazy Metal decode fast path, with C++ Metal fallback
+    4. Recurrent update — lazy Metal decode/prefill fast paths, with fallback
     5. Output norm + projection — stateless, batched
 
     When no ``PagedAttentionContext`` is active, delegates to the original
@@ -69,7 +71,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
         object.__setattr__(self, "_gdn_state_cache", state_cache)
-        object.__setattr__(self, "_gdn_lazy_decode", GDNLazyDecodeKernels.shared())
+        object.__setattr__(self, "_gdn_lazy", GDNLazyKernels.shared())
 
     def __call__(
         self,
@@ -118,6 +120,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             num_requests=num_requests,
             total_tokens=x.shape[1],
             slot_ids=slot_ids,
+            num_decode_requests=ctx.num_decode_requests,
         )
 
     def _project_inputs(
@@ -160,13 +163,15 @@ class GDNPagedAttentionWrapper(nn.Module):
         cache_idx = self._gdn_cache_idx
         slot_ids = state.slot_ids
 
-        if state.total_tokens == state.num_requests:
-            conv_packed = self._gdn_lazy_decode.try_conv_decode(
+        if (
+            state.total_tokens == state.num_requests
+            and state.num_decode_requests == state.num_requests
+        ):
+            conv_packed = self._gdn_lazy.try_conv_decode(
                 mixed_qkv, inner, state_cache, cache_idx, slot_ids
             )
             if conv_packed is not None:
                 return conv_packed
-
         conv_outputs = []
         for req_idx in range(state.num_requests):
             slot = slot_ids[req_idx]
@@ -232,7 +237,10 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # === Step 5: Batched recurrent update ===
-        if state.total_tokens == state.num_requests:
+        if (
+            state.total_tokens == state.num_requests
+            and state.num_decode_requests == state.num_requests
+        ):
             request = GDNRecurrentDecodeRequest(
                 q=q,
                 k=k,
@@ -244,10 +252,30 @@ class GDNPagedAttentionWrapper(nn.Module):
                 slot_ids=state.slot_ids,
                 output_dtype=state.x.dtype,
             )
-            y_flat = self._gdn_lazy_decode.try_recurrent_decode(request)
+            y_flat = self._gdn_lazy.try_recurrent_decode(request)
+            if y_flat is not None:
+                return y_flat
+        elif self._should_try_recurrent_prefill_lazy(state):
+            request = GDNRecurrentPrefillRequest(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                state_cache=self._gdn_state_cache,
+                cache_idx=self._gdn_cache_idx,
+                slot_ids=state.slot_ids,
+                output_dtype=state.x.dtype,
+                cu_seqlens=state.cu_seqlens,
+                compute_dtype=mx.float32,
+            )
+            y_flat = self._gdn_lazy.try_recurrent_prefill(request)
             if y_flat is not None:
                 return y_flat
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
+
+    def _should_try_recurrent_prefill_lazy(self, state: _GDNForwardState) -> bool:
+        return state.num_decode_requests == 0
 
     def _run_recurrent_fallback(
         self,

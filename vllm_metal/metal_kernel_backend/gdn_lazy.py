@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lazy Gated DeltaNet decode kernels for MLX/Metal execution."""
+"""Lazy Gated DeltaNet kernels for MLX/Metal execution."""
 
 from __future__ import annotations
 
@@ -14,12 +14,19 @@ from vllm_metal.metal import _read_v2_metal_source
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
-_GDN_RECURRENT_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
+_GDN_RECURRENT_DECODE_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
+_GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.metal")
+
+
+def _astype_if_needed(array: mx.array, dtype: mx.Dtype) -> mx.array:
+    if array.dtype == dtype:
+        return array
+    return array.astype(dtype)
 
 
 @dataclass(frozen=True)
-class GDNRecurrentDecodeRequest:
-    """Inputs for one lazy GDN recurrent decode attempt."""
+class GDNRecurrentRequest:
+    """Common inputs for one lazy GDN recurrent kernel attempt."""
 
     q: mx.array
     k: mx.array
@@ -52,18 +59,35 @@ class GDNRecurrentDecodeRequest:
         return self.v.shape[3]
 
 
-class GDNLazyDecodeKernels:
-    """Owner for lazy GDN decode fast-path policy and kernels.
+@dataclass(frozen=True)
+class GDNRecurrentDecodeRequest(GDNRecurrentRequest):
+    """Inputs for one lazy GDN recurrent decode attempt."""
+
+    threadgroup_dv: int = 4
+
+
+@dataclass(frozen=True)
+class GDNRecurrentPrefillRequest(GDNRecurrentRequest):
+    """Inputs for one lazy GDN recurrent pure-prefill attempt."""
+
+    cu_seqlens: list[int]
+    materialize_outputs: bool = False
+    compute_dtype: mx.Dtype | None = None
+
+
+class GDNLazyKernels:
+    """Owner for lazy GDN fast-path policy and kernels.
 
     The fast path uses ``mx.fast.metal_kernel`` source snippets from
     ``kernels_v2``.  Unlike the legacy recurrent C++ path, these kernels
-    materialize compact conv/recurrent state updates.  Updates are scattered
-    back into the stable cache pool so decode-only state work stays
-    proportional to active request count;
-    callers fall back to the legacy path when a request shape is ineligible.
+    materialize compact conv/recurrent state updates.  Decode scatters updates
+    back into the stable cache pool; eligible prefill may defer compact
+    recurrent updates until the next decode, fallback, materialize, or release
+    boundary.  Callers fall back to the legacy path when a request shape is
+    ineligible.
     """
 
-    _shared: ClassVar[GDNLazyDecodeKernels | None] = None
+    _shared: ClassVar[GDNLazyKernels | None] = None
     _shared_enabled: ClassVar[bool | None] = None
     _shared_lock: ClassVar[Lock] = Lock()
 
@@ -72,12 +96,14 @@ class GDNLazyDecodeKernels:
         *,
         enabled: bool,
         conv_kernel: Any | None = None,
-        recurrent_kernel: Any | None = None,
+        recurrent_decode_kernel: Any | None = None,
+        recurrent_prefill_kernel: Any | None = None,
     ) -> None:
         self._enabled = enabled
         if not enabled:
             self._conv_kernel = None
-            self._recurrent_kernel = None
+            self._recurrent_decode_kernel = None
+            self._recurrent_prefill_kernel = None
             return
 
         self._conv_kernel = (
@@ -90,11 +116,11 @@ class GDNLazyDecodeKernels:
                 _GDN_CONV1D_V2_SOURCE,
             )
         )
-        self._recurrent_kernel = (
-            recurrent_kernel
-            if recurrent_kernel is not None
+        self._recurrent_decode_kernel = (
+            recurrent_decode_kernel
+            if recurrent_decode_kernel is not None
             else self._make_kernel(
-                "gdn_recurrent_v2",
+                "gdn_recurrent_decode_v2",
                 [
                     "q",
                     "k",
@@ -106,23 +132,43 @@ class GDNLazyDecodeKernels:
                     "num_requests",
                 ],
                 ["y", "state_out"],
-                _GDN_RECURRENT_V2_SOURCE,
+                _GDN_RECURRENT_DECODE_V2_SOURCE,
+            )
+        )
+        self._recurrent_prefill_kernel = (
+            recurrent_prefill_kernel
+            if recurrent_prefill_kernel is not None
+            else self._make_kernel(
+                "gdn_recurrent_prefill_v2",
+                [
+                    "q",
+                    "k",
+                    "v",
+                    "g",
+                    "beta",
+                    "state_in",
+                    "cu_seqlens",
+                    "slot_mapping",
+                    "num_requests",
+                ],
+                ["y", "state_out"],
+                _GDN_RECURRENT_PREFILL_V2_SOURCE,
             )
         )
 
     @classmethod
-    def from_env(cls) -> GDNLazyDecodeKernels:
-        return cls(enabled=envs.VLLM_METAL_GDN_LAZY_DECODE)
+    def from_env(cls) -> GDNLazyKernels:
+        return cls(enabled=envs.VLLM_METAL_GDN_LAZY_KERNELS)
 
     @classmethod
-    def shared(cls) -> GDNLazyDecodeKernels:
-        """Get the process-level lazy GDN decode kernel owner.
+    def shared(cls) -> GDNLazyKernels:
+        """Get the process-level lazy GDN kernel owner.
 
         The env kill switch is read when the shared owner is acquired;
         existing wrappers keep the owner they stored at construction time.
         """
         with cls._shared_lock:
-            enabled = envs.VLLM_METAL_GDN_LAZY_DECODE
+            enabled = envs.VLLM_METAL_GDN_LAZY_KERNELS
             if cls._shared is None or cls._shared_enabled != enabled:
                 cls._shared = cls(enabled=enabled)
                 cls._shared_enabled = enabled
@@ -130,7 +176,7 @@ class GDNLazyDecodeKernels:
 
     @classmethod
     def reset_shared_for_tests(cls) -> None:
-        """Reset the shared lazy GDN decode kernel owner for tests."""
+        """Reset the shared lazy GDN kernel owner for tests."""
         with cls._shared_lock:
             cls._shared = None
             cls._shared_enabled = None
@@ -227,14 +273,17 @@ class GDNLazyDecodeKernels:
         recurrent_shape_supported = d_k % 32 == 0 and d_k <= 256
         if not (
             self._enabled
-            and self._recurrent_kernel is not None
+            and self._recurrent_decode_kernel is not None
             and total_tokens == num_requests
             and recurrent_shape_supported
         ):
             return None
 
-        state_in = request.state_cache.recurrent_states[request.cache_idx]
+        state_cache = request.state_cache
+        state_pool = state_cache.recurrent_states[request.cache_idx]
+        state_in = state_pool
         slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
+        state_slot_ids_arr = slot_ids_arr
 
         kernel_inputs = [
             request.q.reshape(total_tokens, n_hk, d_k),
@@ -243,7 +292,7 @@ class GDNLazyDecodeKernels:
             request.g.reshape(total_tokens, n_hv),
             request.beta.reshape(total_tokens, n_hv),
             state_in,
-            slot_ids_arr,
+            state_slot_ids_arr,
             num_requests,
         ]
         template = [
@@ -254,14 +303,87 @@ class GDNLazyDecodeKernels:
             ("Hk", n_hk),
             ("Hv", n_hv),
         ]
-        y_out, state_updates = self._recurrent_kernel(
+        y_out, state_updates = self._recurrent_decode_kernel(
+            inputs=kernel_inputs,
+            template=template,
+            grid=(32, d_v, num_requests * n_hv),
+            threadgroup=(32, request.threadgroup_dv, 1),
+            output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
+            output_dtypes=[request.output_dtype, mx.float32],
+        )
+        state_pool[slot_ids_arr] = state_updates
+        state_cache.recurrent_states[request.cache_idx] = state_pool
+        return y_out
+
+    def try_recurrent_prefill(
+        self,
+        request: GDNRecurrentPrefillRequest,
+    ) -> mx.array | None:
+        """Run the lazy GDN recurrent pure-prefill fast path, or return None."""
+        total_tokens = request.total_tokens
+        n_hk = request.num_key_heads
+        n_hv = request.num_value_heads
+        d_k = request.key_head_dim
+        d_v = request.value_head_dim
+        num_requests = len(request.slot_ids)
+        recurrent_shape_supported = d_k % 32 == 0 and d_k <= 256
+        pure_prefill = (
+            total_tokens > num_requests
+            and len(request.cu_seqlens) == num_requests + 1
+            and request.cu_seqlens[0] == 0
+            and request.cu_seqlens[-1] == total_tokens
+            and all(
+                request.cu_seqlens[i + 1] - request.cu_seqlens[i] > 1
+                for i in range(num_requests)
+            )
+        )
+        if not (
+            self._enabled
+            and self._recurrent_prefill_kernel is not None
+            and pure_prefill
+            and recurrent_shape_supported
+        ):
+            return None
+
+        state_cache = request.state_cache
+        state_in = state_cache.recurrent_states[request.cache_idx]
+        slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
+        cu_seqlens_arr = mx.array(request.cu_seqlens, dtype=mx.int32)
+        kernel_dtype = request.compute_dtype or request.output_dtype
+        state_dtype = state_in.dtype
+
+        kernel_inputs = [
+            _astype_if_needed(request.q.reshape(total_tokens, n_hk, d_k), kernel_dtype),
+            _astype_if_needed(request.k.reshape(total_tokens, n_hk, d_k), kernel_dtype),
+            _astype_if_needed(request.v.reshape(total_tokens, n_hv, d_v), kernel_dtype),
+            _astype_if_needed(request.g.reshape(total_tokens, n_hv), kernel_dtype),
+            _astype_if_needed(request.beta.reshape(total_tokens, n_hv), kernel_dtype),
+            state_in,
+            cu_seqlens_arr,
+            slot_ids_arr,
+            num_requests,
+        ]
+        template = [
+            ("T", kernel_dtype),
+            ("StT", state_dtype),
+            ("Dk", d_k),
+            ("Dv", d_v),
+            ("Hk", n_hk),
+            ("Hv", n_hv),
+        ]
+        y_out, state_updates = self._recurrent_prefill_kernel(
             inputs=kernel_inputs,
             template=template,
             grid=(32, d_v, num_requests * n_hv),
             threadgroup=(32, 4, 1),
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
-            output_dtypes=[request.output_dtype, mx.float32],
+            output_dtypes=[kernel_dtype, state_dtype],
         )
         state_in[slot_ids_arr] = state_updates
+        if request.materialize_outputs:
+            state_in = mx.contiguous(state_in)
         request.state_cache.recurrent_states[request.cache_idx] = state_in
+        y_out = _astype_if_needed(y_out, request.output_dtype)
+        if request.materialize_outputs:
+            mx.eval(y_out, state_in)
         return y_out

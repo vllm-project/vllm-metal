@@ -13,6 +13,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+
+
+class _HybridBackendStub(HybridPagedAttentionBackend):
+    pass
 
 
 class TestV1MetalModelRunnerGenerate:
@@ -919,6 +924,68 @@ class TestV1MetalModelRunnerExecuteModel:
 
         assert req_state.block_ids == [0]
         assert "new" not in runner._request_states
+
+
+class TestV1MetalModelRunnerGDNSubmit:
+    def _make_hybrid_backend(self) -> HybridPagedAttentionBackend:
+        backend = _HybridBackendStub.__new__(_HybridBackendStub)
+        backend._state_cache = SimpleNamespace(
+            conv_states=[
+                mx.array([1], dtype=mx.float32),
+                mx.array([2], dtype=mx.float32),
+            ],
+            recurrent_states=[
+                mx.array([3], dtype=mx.float32),
+                mx.array([4], dtype=mx.float32),
+            ],
+        )
+        return backend
+
+    def test_prefill_hybrid_submits_logits_and_updated_gdn_states(
+        self, monkeypatch
+    ) -> None:
+        # Arrange
+        submitted: list[tuple[object, ...]] = []
+        runner = make_stub_runner(_paged_attention_backend=self._make_hybrid_backend())
+        logits = mx.array([0], dtype=mx.float32)
+        expected_states = runner._gdn_updated_state_arrays()
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        # Act
+        runner._submit_paged_forward_outputs(logits, has_prefill=True)
+
+        # Assert
+        assert len(submitted) == 1
+        assert submitted[0][0] is logits
+        assert len(submitted[0][1:]) == len(expected_states)
+        for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
+            assert actual is expected
+
+    def test_decode_only_hybrid_submits_logits_only(self, monkeypatch) -> None:
+        # Arrange
+        submitted: list[tuple[object, ...]] = []
+        runner = make_stub_runner(_paged_attention_backend=self._make_hybrid_backend())
+        logits = mx.array([0], dtype=mx.float32)
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        # Act
+        runner._submit_paged_forward_outputs(logits, has_prefill=False)
+
+        # Assert
+        assert submitted == [(logits,)]
+
+    def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
+        # Arrange
+        submitted: list[tuple[object, ...]] = []
+        runner = make_stub_runner(_paged_attention_backend=object())
+        logits = mx.array([0], dtype=mx.float32)
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        # Act
+        runner._submit_paged_forward_outputs(logits, has_prefill=True)
+
+        # Assert
+        assert submitted == [(logits,)]
 
 
 class TestRunnerMlaProperties:
