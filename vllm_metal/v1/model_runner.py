@@ -1166,6 +1166,26 @@ class MetalModelRunner:
         self.encoder_cache.remove_request(req_id)
         self.encoder_cache.add_request(req_id, new_req.mm_features)
 
+    def _pre_register_new_request_mm_features(
+        self, new_reqs: list[NewRequestData]
+    ) -> None:
+        """Register mm_features for new requests before encoder dispatch.
+
+        The vLLM scheduler can place a brand-new multimodal request and its
+        first ``scheduled_encoder_inputs`` in the same ``SchedulerOutput``.
+        Encoder dispatch looks the request's mm_features up by ``req_id``,
+        so registration must happen before
+        :meth:`_reject_scheduled_encoder_inputs`, not later inside
+        :meth:`_handle_new_requests`.  Only the lightweight mm-features
+        bookkeeping is moved up; per-request prefill scheduling remains in
+        ``_handle_new_requests`` so the fail-fast checks still guard the
+        real model work.
+        """
+        if self.encoder_cache is None:
+            return
+        for new_req in new_reqs:
+            self._register_new_request_mm_features(new_req.req_id, new_req)
+
     def _remove_request_mm_features(self, req_id: str) -> None:
         """Drop request-scoped multimodal feature metadata."""
         if self.encoder_cache is not None:
@@ -1492,7 +1512,8 @@ class MetalModelRunner:
 
         for new_req in new_reqs:
             req_id = new_req.req_id
-            self._register_new_request_mm_features(req_id, new_req)
+            # mm_features were pre-registered before encoder dispatch in
+            # ``execute_model``; no further bookkeeping needed here.
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
 
@@ -1867,6 +1888,12 @@ class MetalModelRunner:
         self._cleanup_finished_requests(
             evicted_req_ids,
             materialize_gdn_state=will_fail_fast_before_model_work,
+        )
+        # Pre-register mm_features so a new request whose first encoder input
+        # lands in the same SchedulerOutput is already known to the encoder
+        # cache when dispatch runs.
+        self._pre_register_new_request_mm_features(
+            scheduler_output.scheduled_new_reqs
         )
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         if spec_decode_error is not None:

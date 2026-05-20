@@ -249,6 +249,45 @@ def test_execute_model_rejects_encoder_inputs_until_forward_is_wired() -> None:
         runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
 
 
+def test_execute_model_pre_registers_new_request_before_encoder_dispatch() -> None:
+    """A brand-new mm request + its first encoder input in one SchedulerOutput.
+
+    Upstream's scheduler can place a new multimodal request and its first
+    ``scheduled_encoder_inputs`` in the same step; encoder dispatch must
+    find the request's ``mm_features`` already registered.  Before the
+    pre-register step was lifted out of ``_handle_new_requests``, encoder
+    dispatch ran first and raised an "unregistered request" RuntimeError.
+    """
+    runner = _paged_runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("image-0")]
+    expected_hidden = mx.array([[5.0, 6.0]])
+    adapter.queue_outputs(
+        [
+            [
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=expected_hidden,
+                    deepstack_visual_embeds=None,
+                )
+            ]
+        ]
+    )
+
+    runner.execute_model(
+        _scheduler_output(
+            scheduled_new_reqs=[_new_request("req-0", features)],
+            scheduled_encoder_inputs={"req-0": [0]},
+        )
+    )
+
+    assert runner.encoder_cache is not None
+    assert runner.encoder_cache.mm_features["req-0"] == features
+    assert adapter.encode_calls == [features]
+    stored = runner.encoder_cache.encoder_outputs["image-0"]
+    assert mx.allclose(stored.hidden_states, expected_hidden).item()
+
+
 class _RecordingAdapter:
     """Adapter stub that records ``encode_multimodal`` invocations."""
 

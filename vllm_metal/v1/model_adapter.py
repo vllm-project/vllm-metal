@@ -29,8 +29,8 @@ class TargetModelForwardOutput:
 class MultimodalEncodeResult(Protocol):
     """Adapter-owned vision output for one multimodal feature."""
 
-    hidden_states: Any
-    deepstack_visual_embeds: Any | None
+    hidden_states: mx.array
+    deepstack_visual_embeds: Sequence[mx.array] | None
 
 
 class MultimodalRuntimeAdapter(Protocol):

@@ -37,6 +37,33 @@ class _MmAdapter:
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.call_lm_calls: list[dict[str, Any]] = []
+        self.encode_calls: list[list[MultiModalFeatureSpec]] = []
+        self._encode_outputs: dict[str, Qwen3VLVisionEncodeResult] = {}
+
+    def queue_encode_output(
+        self, identifier: str, result: Qwen3VLVisionEncodeResult
+    ) -> None:
+        """Map a feature identifier to a fake vision-tower result."""
+        self._encode_outputs[identifier] = result
+
+    def encode_multimodal(
+        self, features: list[MultiModalFeatureSpec]
+    ) -> list[Qwen3VLVisionEncodeResult]:
+        self.encode_calls.append(list(features))
+        outputs: list[Qwen3VLVisionEncodeResult] = []
+        for feature in features:
+            queued = self._encode_outputs.get(feature.identifier)
+            if queued is not None:
+                outputs.append(queued)
+                continue
+            length = feature.mm_position.length
+            outputs.append(
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=mx.zeros((length, self.hidden_size)),
+                    deepstack_visual_embeds=None,
+                )
+            )
+        return outputs
 
     def text_model(self) -> Any:
         return MagicMock(
@@ -592,3 +619,64 @@ class TestMmPrefillFullPromptRequired:
                 decode_reqs=[],
                 scheduler_output=_scheduler_output(),
             )
+
+
+class TestMmIdentifierFlowsEncoderToCallLm:
+    """Prove the encoder→cache→paged-forward chain uses the same identifier.
+
+    Avoids stubbing ``_start_paged_forward`` or pre-seeding the encoder
+    cache: ``_run_vision_encoders`` populates ``encoder_outputs`` via the
+    adapter's real ``encode_multimodal`` keyed by ``feature.identifier``,
+    and the immediately-following paged forward looks the result back up
+    by the same identifier and splices its ``hidden_states`` into the
+    ``inputs_embeds`` payload passed to ``adapter.call_lm``.
+    """
+
+    def test_paged_forward_consumes_encoder_output_by_identifier(self) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        features = [_feature("img-0", offset=1, length=2)]
+        runner.encoder_cache.add_request("req-0", features)
+        sentinel = mx.array(
+            [[float(11)] * adapter.hidden_size, [float(22)] * adapter.hidden_size],
+            dtype=mx.float32,
+        )
+        adapter.queue_encode_output(
+            "img-0",
+            Qwen3VLVisionEncodeResult(
+                hidden_states=sentinel,
+                deepstack_visual_embeds=None,
+            ),
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        # Step 1: encoder dispatch populates encoder_outputs by identifier.
+        runner._run_vision_encoders({"req-0": [0]})
+
+        assert adapter.encode_calls == [features]
+        stored = runner.encoder_cache.encoder_outputs["img-0"]
+        assert mx.allclose(stored.hidden_states, sentinel).item()
+
+        # Step 2: paged forward picks the same identifier out of the cache
+        # and splices its hidden_states into the call_lm inputs_embeds.
+        prefill = _mm_prefill(
+            "req-0",
+            token_ids=[10, 99, 99, 11],
+            prompt_len=4,
+            start_pos=0,
+            full_prompt=[10, 99, 99, 11],
+        )
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        assert len(adapter.call_lm_calls) == 1
+        embeds = adapter.call_lm_calls[0]["inputs_embeds"]
+        # Placeholder rows at offsets 1, 2 carry the encoder output rows.
+        assert mx.allclose(embeds[0, 1], sentinel[0]).item()
+        assert mx.allclose(embeds[0, 2], sentinel[1]).item()

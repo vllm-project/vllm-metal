@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
 from types import SimpleNamespace
@@ -23,7 +23,7 @@ class Qwen3VLVisionEncodeResult:
     """Vision tower output for one Qwen3-VL multimodal feature."""
 
     hidden_states: mx.array
-    deepstack_visual_embeds: Any | None
+    deepstack_visual_embeds: Sequence[mx.array] | None
 
 
 class Qwen3VLMultimodalAdapter:
@@ -238,9 +238,11 @@ class Qwen3VLMultimodalAdapter:
         """Invoke ``language_model`` with runner-built embeds and positions.
 
         Calls ``language_model`` directly rather than through the top-level
-        ``mlx_vlm.Model.__call__``.  Deepstack kwargs are forwarded only
-        when the LM declares both as explicit parameters; otherwise they
-        are omitted to avoid silently dropping arrays into ``**kwargs``.
+        ``mlx_vlm.Model.__call__``.  Deepstack kwargs are forwarded when
+        the LM declares both as explicit parameters.  Receiving non-None
+        ``deepstack_visual_embeds`` on a LM without those parameters is a
+        mlx-vlm signature mismatch and raises rather than silently running
+        with incomplete vision residuals.
         """
         if self._language_model is None:
             raise RuntimeError(
@@ -257,6 +259,14 @@ class Qwen3VLMultimodalAdapter:
         if self._supports_deepstack:
             extra_kwargs["visual_pos_masks"] = visual_pos_masks
             extra_kwargs["deepstack_visual_embeds"] = deepstack_visual_embeds
+        elif deepstack_visual_embeds is not None:
+            raise RuntimeError(
+                "deepstack_visual_embeds were produced by the vision tower "
+                "but language_model.__call__ does not declare "
+                f"{self._DEEPSTACK_KWARGS} as explicit parameters; mlx-vlm "
+                "signature mismatch.  Refusing to drop deepstack residuals "
+                "silently."
+            )
         return self._language_model(
             input_ids,
             cache=cache,
