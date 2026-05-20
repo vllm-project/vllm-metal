@@ -14,6 +14,7 @@ from vllm_metal.metal import _read_v2_metal_source
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
+_GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")
 _GDN_RECURRENT_DECODE_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
 _GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.metal")
 
@@ -97,12 +98,14 @@ class GDNLazyKernels:
         *,
         enabled: bool,
         conv_kernel: Any | None = None,
+        conv_prefill_kernel: Any | None = None,
         recurrent_decode_kernel: Any | None = None,
         recurrent_prefill_kernel: Any | None = None,
     ) -> None:
         self._enabled = enabled
         if not enabled:
             self._conv_kernel = None
+            self._conv_prefill_kernel = None
             self._recurrent_decode_kernel = None
             self._recurrent_prefill_kernel = None
             return
@@ -115,6 +118,24 @@ class GDNLazyKernels:
                 ["input", "conv_state_in", "weights", "slot_mapping", "num_requests"],
                 ["output", "conv_state_out"],
                 _GDN_CONV1D_V2_SOURCE,
+            )
+        )
+        self._conv_prefill_kernel = (
+            conv_prefill_kernel
+            if conv_prefill_kernel is not None
+            else self._make_kernel(
+                "gdn_conv1d_silu_prefill_v2",
+                [
+                    "input",
+                    "conv_state_in",
+                    "weights",
+                    "cu_seqlens",
+                    "slot_mapping",
+                    "num_requests",
+                    "total_tokens",
+                ],
+                ["output", "conv_state_out"],
+                _GDN_CONV1D_PREFILL_V2_SOURCE,
             )
         )
         self._recurrent_decode_kernel = (
@@ -255,6 +276,66 @@ class GDNLazyKernels:
         conv_state_in[slot_ids_arr] = conv_state_updates
         state_cache.conv_states[cache_idx] = conv_state_in
         return conv_silu_out.reshape(1, total_tokens, conv_dim)
+
+    def try_conv_prefill(
+        self,
+        mixed_qkv: mx.array,
+        inner: Any,
+        state_cache: GDNPagedStateCache,
+        cache_idx: int,
+        slot_ids: list[int],
+        cu_seqlens: list[int],
+    ) -> mx.array | None:
+        """Run the lazy GDN conv pure-prefill fast path, or return None."""
+        num_requests = len(slot_ids)
+        total_tokens = mixed_qkv.shape[1]
+        pure_prefill = (
+            total_tokens > num_requests
+            and len(cu_seqlens) == num_requests + 1
+            and cu_seqlens[0] == 0
+            and cu_seqlens[-1] == total_tokens
+            and all(cu_seqlens[i + 1] >= cu_seqlens[i] for i in range(num_requests))
+        )
+        if not (
+            self._enabled and self._conv_prefill_kernel is not None and pure_prefill
+        ):
+            return None
+
+        conv_dim = state_cache.conv_dim
+        kernel_size = inner.conv_kernel_size
+        state_len = kernel_size - 1
+        conv_state_in = state_cache.conv_states[cache_idx]
+        mixed_qkv_2d = mixed_qkv.reshape(total_tokens, conv_dim)
+        slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
+        cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
+
+        state_updates_shape = (num_requests, state_len, conv_dim)
+        grid_size = (total_tokens + num_requests * state_len) * conv_dim
+        tg_size = min(256, grid_size)
+        conv_out, conv_state_updates = self._conv_prefill_kernel(
+            inputs=[
+                mixed_qkv_2d,
+                conv_state_in,
+                inner.conv1d.weight,
+                cu_seqlens_arr,
+                slot_ids_arr,
+                num_requests,
+                total_tokens,
+            ],
+            template=[
+                ("T", mixed_qkv.dtype),
+                ("StT", conv_state_in.dtype),
+                ("CONV_DIM", conv_dim),
+                ("KERNEL_SIZE", kernel_size),
+            ],
+            grid=(grid_size, 1, 1),
+            threadgroup=(tg_size, 1, 1),
+            output_shapes=[(total_tokens, conv_dim), state_updates_shape],
+            output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
+        )
+        conv_state_in[slot_ids_arr] = conv_state_updates
+        state_cache.conv_states[cache_idx] = conv_state_in
+        return conv_out.reshape(1, total_tokens, conv_dim)
 
     def try_recurrent_decode(
         self,

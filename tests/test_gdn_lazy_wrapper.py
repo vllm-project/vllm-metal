@@ -631,6 +631,53 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         # Assert
         assert result.shape[-1] == inner.conv_dim
 
+    def test_multi_request_prefill_expanded_value_state_tries_lazy_conv(
+        self,
+    ) -> None:
+        # Arrange
+        class FakeLazy:
+            def __init__(self) -> None:
+                self.prefill_called = False
+
+            def try_conv_decode(self, *_: Any) -> None:
+                raise AssertionError("pure prefill is not decode-only")
+
+            def try_conv_prefill(self, *_: Any) -> mx.array:
+                self.prefill_called = True
+                return lazy_out
+
+        inner = _TinyExpandedValueGDNInner()
+        lazy_out = mx.ones((1, 4, inner.conv_dim), dtype=mx.float32)
+        fake_lazy = FakeLazy()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        result = wrapper._run_conv(
+            mx.ones((1, 4, inner.conv_dim), dtype=mx.float32), state
+        )
+
+        # Assert
+        assert result is lazy_out
+        assert fake_lazy.prefill_called
+
     def test_multi_request_prefill_qwen3_next_style_keeps_conv_state_lazy(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

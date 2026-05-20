@@ -56,7 +56,8 @@ class _GDNLazyPolicy:
     - combined QKVZ projection: Qwen3-Next style, cheapest handoff path
     - separate projection with expanded value state: Qwen3.6 style, use the
       conservative fp32/materialized handoff policy
-    - separate projection with compact value state: Qwen3.5 style
+    - separate projection with compact value state: Qwen3.5 style, avoid the
+      extra conv-prefill launch but keep lazy recurrent prefill
     """
 
     combined_qkvz_projection: bool
@@ -68,6 +69,9 @@ class _GDNLazyPolicy:
             combined_qkvz_projection=hasattr(inner, "in_proj_qkvz"),
             expanded_recurrent_value_state=inner.num_v_heads > inner.num_k_heads,
         )
+
+    def should_try_conv_prefill_lazy(self) -> bool:
+        return self.combined_qkvz_projection or self.expanded_recurrent_value_state
 
     def recurrent_decode_threadgroup_dv(self) -> int:
         if self.uses_conservative_recurrent_prefill_policy():
@@ -219,6 +223,15 @@ class GDNPagedAttentionWrapper(nn.Module):
             )
             if conv_packed is not None:
                 return conv_packed
+        elif self._should_try_conv_prefill_lazy(state):
+            conv_packed = self._gdn_lazy.try_conv_prefill(
+                mixed_qkv, inner, state_cache, cache_idx, slot_ids, state.cu_seqlens
+            )
+            if conv_packed is not None:
+                if self._should_materialize_prefill_state(state):
+                    mx.eval(state_cache.conv_states[cache_idx])
+                return conv_packed
+
         conv_outputs = []
         for req_idx in range(state.num_requests):
             slot = slot_ids[req_idx]
@@ -330,6 +343,17 @@ class GDNPagedAttentionWrapper(nn.Module):
 
     def _should_try_recurrent_prefill_lazy(self, state: _GDNForwardState) -> bool:
         return state.num_decode_requests == 0
+
+    def _should_try_conv_prefill_lazy(self, state: _GDNForwardState) -> bool:
+        # The pure-prefill conv kernel removes per-request Python dispatch, but
+        # compact separate-projection variants are small enough that the extra
+        # Metal launch can dominate long prompts.  Keep those on the existing
+        # eager conv path while enabling the lazy conv path for combined-QKVZ
+        # and expanded-value-state variants where measured handoff cost is
+        # larger.
+        return state.num_decode_requests == 0 and (
+            self._gdn_lazy_policy.should_try_conv_prefill_lazy()
+        )
 
     def _recurrent_decode_threadgroup_dv(self) -> int:
         # Expanded separate-projection variants have more value-state work per

@@ -363,6 +363,132 @@ class TestLazyConvDecode:
         assert fake_kernel.output_dtypes == [mx.float32, mx.bfloat16]
 
 
+class TestLazyConvPrefill:
+    def test_matches_eager_per_request_conv(self) -> None:
+        # Arrange
+        _require_metal()
+        mx.random.seed(2)
+        conv_dim = 4
+        kernel_size = 4
+        cache = _make_state_cache(
+            max_seqs=4, conv_kernel_dim=kernel_size, conv_dim=conv_dim
+        )
+        initial_state = mx.random.normal(cache.conv_states[0].shape).astype(mx.float32)
+        cache.conv_states[0] = mx.array(initial_state)
+        weight = mx.random.normal((conv_dim, kernel_size)).astype(mx.float32)
+        inner = SimpleNamespace(
+            conv_kernel_size=kernel_size, conv1d=_DepthwiseConv1D(weight)
+        )
+        cu_seqlens = [0, 2, 5]
+        slot_ids = [3, 1]
+        mixed_qkv = mx.random.normal((1, 5, conv_dim)).astype(mx.float32)
+
+        expected_state = mx.array(initial_state)
+        expected_outputs = []
+        for req_idx, slot in enumerate(slot_ids):
+            start = cu_seqlens[req_idx]
+            end = cu_seqlens[req_idx + 1]
+            conv_input = mx.concatenate(
+                [expected_state[slot : slot + 1], mixed_qkv[:, start:end]],
+                axis=1,
+            )
+            expected_state[slot : slot + 1] = conv_input[:, -(kernel_size - 1) :]
+            expected_outputs.append(
+                nn.silu(inner.conv1d(conv_input))[:, -(end - start) :]
+            )
+        expected = mx.concatenate(expected_outputs, axis=1)
+
+        # Act
+        actual = GDNLazyKernels(enabled=True).try_conv_prefill(
+            mixed_qkv, inner, cache, 0, slot_ids, cu_seqlens
+        )
+
+        # Assert
+        assert actual is not None
+        mx.eval(actual, expected, cache.conv_states[0], expected_state)
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-5)
+        np.testing.assert_allclose(
+            np.array(cache.conv_states[0]), np.array(expected_state), atol=1e-5
+        )
+
+    def test_updates_only_active_conv_slots(self) -> None:
+        # Arrange
+        class FakeConvPrefillKernel:
+            def __init__(self) -> None:
+                self.grid: tuple[int, int, int] | None = None
+                self.output_shapes: list[tuple[int, ...]] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.grid = kwargs["grid"]
+                self.output_shapes = kwargs["output_shapes"]
+                return (
+                    mx.ones((5, 4), dtype=mx.float32),
+                    mx.full((2, 2, 4), 9, dtype=mx.float32),
+                )
+
+        fake_kernel = FakeConvPrefillKernel()
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
+        cache.conv_states[0] = mx.array(initial_state)
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+        slot_ids = [3, 1]
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            conv_prefill_kernel=fake_kernel,
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        ).try_conv_prefill(
+            mx.zeros((1, 5, 4), dtype=mx.float32),
+            inner,
+            cache,
+            0,
+            slot_ids,
+            [0, 2, 5],
+        )
+
+        # Assert
+        assert result is not None
+        assert fake_kernel.grid == (36, 1, 1)
+        assert fake_kernel.output_shapes == [(5, 4), (2, 2, 4)]
+        mx.eval(cache.conv_states[0])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
+
+    def test_rejects_non_monotonic_cu_seqlens(self) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=2, conv_kernel_dim=3, conv_dim=4)
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            conv_prefill_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        ).try_conv_prefill(
+            mx.zeros((1, 5, 4), dtype=mx.float32),
+            inner,
+            cache,
+            0,
+            [0, 1, 2],
+            [0, 4, 3, 5],
+        )
+
+        # Assert
+        assert result is None
+
+
 class TestLazyRecurrentDecode:
     def test_updates_only_active_recurrent_slots(self) -> None:
         # Arrange
@@ -1250,6 +1376,7 @@ class TestGDNLazySharedOwner:
         assert first is second
         assert calls == [
             "gdn_conv1d_silu_decode_v2",
+            "gdn_conv1d_silu_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
@@ -1259,6 +1386,7 @@ class TestGDNLazySharedOwner:
         assert disabled is not first
         assert calls == [
             "gdn_conv1d_silu_decode_v2",
+            "gdn_conv1d_silu_prefill_v2",
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
