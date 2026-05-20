@@ -188,10 +188,8 @@ class HybridPagedAttentionBackend:
 
             if isinstance(attn, MetalKernelPagedAttentionWrapper):
                 # Already patched (cached model reuse) — refresh cache refs
-                object.__setattr__(attn, "_mk_kv_cache", kv_cache)
-                object.__setattr__(attn, "_mk_block_size", self._block_size)
                 cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
-                object.__setattr__(attn, "_mk_cache_idx", cache_idx)
+                attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
                 patched += 1
             elif isinstance(attn, GDNPagedAttentionWrapper):
                 # Already patched — refresh state cache ref

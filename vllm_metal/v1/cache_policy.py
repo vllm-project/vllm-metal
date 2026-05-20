@@ -376,9 +376,8 @@ class ModelCachePolicy:
                 "Gemma4 MTP assistant KV sharing requires the MHA paged "
                 "attention backend on Metal."
             )
-        model_config = getattr(self._runner, "model_config", None)
         target_metadata = Gemma4MTPTargetMetadata.from_configs(
-            target_hf_config=getattr(model_config, "hf_config", None),
+            target_hf_config=self._runner.model_config.hf_config,
             target_model_args=self._runner.model_args,
         )
         self._runner._gemma4_mtp_assistant = assistant.with_target_kv_sharing(

@@ -406,6 +406,60 @@ class TestPrepareSDPAQKV:
         assert values is shared_v
         assert kv_for_sharing == (shared_k, shared_v)
 
+    def test_read_existing_kv_prepares_q_without_kv_projection(self) -> None:
+        # Arrange — MTP assistant layers read target K/V from paged cache, so
+        # K/V projection must not be used as a control path.
+        inner = _make_inner(with_v_proj=True)
+        inner.k_proj = _RaisingLinear(
+            inner.k_proj.weight,
+            "k_proj must not be called when reading existing KV",
+        )
+        inner.v_proj = _RaisingLinear(
+            inner.v_proj.weight,
+            "v_proj must not be called when reading existing KV",
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
+            inner,
+            x,
+            ctx,
+            _N_HEADS,
+            _N_KV_HEADS,
+            read_existing_kv=True,
+        )
+
+        # Assert — Q is prepared normally, while K/V are local shape holders;
+        # sdpa_forward uses the explicit flag to read authoritative cache K/V.
+        mx.eval(queries, keys, values)
+        assert queries.shape == (_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert keys.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert bool(mx.all(keys == 0).item())
+        assert bool(mx.all(values == 0).item())
+        assert gate is None
+        assert kv_for_sharing == (keys, values)
+
+    def test_read_existing_kv_rejects_shared_kv_pair(self) -> None:
+        inner = _make_inner(with_v_proj=True)
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        shared_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+        shared_v = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            prepare_sdpa_qkv(
+                inner,
+                x,
+                ctx,
+                _N_HEADS,
+                _N_KV_HEADS,
+                shared_kv=(shared_k, shared_v),
+                read_existing_kv=True,
+            )
+
     def test_yoco_requires_rope_attribute(self) -> None:
         # Arrange — YOCO path must still reject non-RoPE models; without a
         # guard we would silently return un-rotated queries.
@@ -550,6 +604,65 @@ class TestSDPAForward:
                 inner, x, ctx, cache, layer_idx=0, shared_kv=(shared_k, shared_v)
             )
 
+        assert cache.key_caches[0] is original_k_cache
+        assert cache.value_caches[0] is original_v_cache
+        assert captured["key_cache"] is original_k_cache
+        assert captured["value_cache"] is original_v_cache
+
+    def test_read_existing_kv_path_does_not_rebind_cache_arrays(self) -> None:
+        """MTP cache-read mode must not write new K/V into the target cache."""
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        original_k_cache = cache.key_caches[0]
+        original_v_cache = cache.value_caches[0]
+
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.zeros((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.zeros((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, mx.array] = {}
+
+        class _FakeOps:
+            def paged_attention_primitive(
+                self,
+                _query,
+                key_cache,
+                value_cache,
+                *_args,
+                **_kwargs,
+            ) -> None:
+                captured["key_cache"] = key_cache
+                captured["value_cache"] = value_cache
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ) as prepare_mock,
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0, read_existing_kv=True)
+
+        assert prepare_mock.call_args.kwargs["read_existing_kv"] is True
         assert cache.key_caches[0] is original_k_cache
         assert cache.value_caches[0] is original_v_cache
         assert captured["key_cache"] is original_k_cache

@@ -52,8 +52,12 @@ class Gemma4MTPAssistantRuntime:
     model_name: str
     model: Any
     metadata: Gemma4MTPAssistantMetadata
-    kv_sharing_plan: Gemma4MTPKVSharingPlan | None = None
+    kv_sharing: Gemma4MTPKVSharingBinding | None = None
     forward_ready: bool = False
+
+    @property
+    def kv_sharing_plan(self) -> Gemma4MTPKVSharingPlan | None:
+        return self.kv_sharing.plan if self.kv_sharing is not None else None
 
     def with_target_kv_sharing(
         self,
@@ -62,23 +66,52 @@ class Gemma4MTPAssistantRuntime:
         target_kv_cache: MetalPagedKVCache,
         block_size: int,
     ) -> Gemma4MTPAssistantRuntime:
-        """Return a runtime whose assistant layers read target paged KV."""
+        """Return a runner-local runtime binding for target paged KV.
+
+        The loaded assistant model is cached process-wide by the loader.  Keep
+        that cached model unpatched here; the per-runner target KV cache lives
+        only in the returned immutable binding.
+        """
         plan = Gemma4MTPKVSharingPlan.from_metadata(
             assistant=self.metadata,
             target=target_metadata,
         )
-        patched = plan.patch_assistant_model(
-            self.model,
+        return replace(
+            self,
+            kv_sharing=Gemma4MTPKVSharingBinding.from_plan(
+                plan,
+                target_kv_cache=target_kv_cache,
+                block_size=block_size,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4MTPKVSharingBinding:
+    """Runner-local target KV binding for a cached assistant runtime."""
+
+    plan: Gemma4MTPKVSharingPlan
+    target_kv_cache: MetalPagedKVCache
+    block_size: int
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: Gemma4MTPKVSharingPlan,
+        *,
+        target_kv_cache: MetalPagedKVCache,
+        block_size: int,
+    ) -> Gemma4MTPKVSharingBinding:
+        if block_size <= 0:
+            raise ValueError(
+                f"Gemma4 MTP KV sharing block_size must be positive, got {block_size}"
+            )
+        plan.validate_target_cache(target_kv_cache)
+        return cls(
+            plan=plan,
             target_kv_cache=target_kv_cache,
             block_size=block_size,
         )
-        if patched != len(plan.assistant_layer_to_target_cache_idx):
-            raise RuntimeError(
-                "Gemma4 MTP KV sharing patched an unexpected number of layers: "
-                f"patched={patched}, expected="
-                f"{len(plan.assistant_layer_to_target_cache_idx)}"
-            )
-        return replace(self, kv_sharing_plan=plan)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,68 +143,15 @@ class Gemma4MTPKVSharingPlan:
             layer_types=assistant.layer_types,
         )
 
-    def patch_assistant_model(
-        self,
-        model: Any,
-        *,
-        target_kv_cache: MetalPagedKVCache,
-        block_size: int,
-    ) -> int:
-        """Patch assistant attention layers to read target KV cache slots."""
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            MetalKernelPagedAttentionWrapper,
-        )
-        from vllm_metal.paged_attention_common import find_attn_attr, find_layers
-
-        layers = find_layers(model)
-        if len(layers) != len(self.assistant_layer_to_target_cache_idx):
-            raise ValueError(
-                "Gemma4 MTP assistant layer count must match KV sharing plan: "
-                f"layers={len(layers)}, plan="
-                f"{len(self.assistant_layer_to_target_cache_idx)}"
-            )
-
-        entries: list[tuple[int, Any, str, int]] = []
-        for layer_idx, (layer, cache_idx) in enumerate(
-            zip(
-                layers,
-                self.assistant_layer_to_target_cache_idx,
-                strict=True,
-            )
-        ):
+    def validate_target_cache(self, target_kv_cache: MetalPagedKVCache) -> None:
+        """Validate that the target paged cache has every mapped layer slot."""
+        for layer_idx, cache_idx in enumerate(self.assistant_layer_to_target_cache_idx):
             if cache_idx < 0 or cache_idx >= target_kv_cache.num_layers:
                 raise ValueError(
                     "Gemma4 MTP assistant KV sharing target is outside target "
                     f"cache: assistant_layer={layer_idx}, cache_idx={cache_idx}, "
                     f"num_cache_layers={target_kv_cache.num_layers}"
                 )
-            attn_attr = find_attn_attr(layer)
-            if attn_attr is None:
-                raise ValueError(
-                    f"Gemma4 MTP assistant layer {layer_idx} has no attention module"
-                )
-            entries.append((layer_idx, layer, attn_attr, cache_idx))
-
-        patched = 0
-        for layer_idx, layer, attn_attr, cache_idx in entries:
-            attn = getattr(layer, attn_attr)
-            if isinstance(attn, MetalKernelPagedAttentionWrapper):
-                object.__setattr__(attn, "_mk_kv_cache", target_kv_cache)
-                object.__setattr__(attn, "_mk_block_size", block_size)
-                object.__setattr__(attn, "_mk_cache_idx", cache_idx)
-                object.__setattr__(attn, "_mk_force_shared_kv", True)
-            else:
-                attn = MetalKernelPagedAttentionWrapper(
-                    attn,
-                    layer_idx,
-                    target_kv_cache,
-                    block_size,
-                    cache_idx=cache_idx,
-                    force_shared_kv=True,
-                )
-                setattr(layer, attn_attr, attn)
-            patched += 1
-        return patched
 
 
 class Gemma4MTPAssistantLoader:
