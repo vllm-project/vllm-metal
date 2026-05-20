@@ -164,6 +164,53 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    def test_load_generation_model_dispatches_local_gguf_loader(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        gguf_path = tmp_path / "model-Q8_0.gguf"
+        gguf_path.write_bytes(b"GGUF" + b"\x00" * 32)
+
+        loaded_model = SimpleNamespace(config=_text_config())
+        loaded_tokenizer = object()
+        captured: dict[str, object] = {}
+
+        def fake_load_gguf_generation_model(
+            model_name,
+            *,
+            model_config,
+            model_cache,
+            model_cache_lock,
+            start_time,
+        ):
+            captured["model_name"] = model_name
+            captured["model_config"] = model_config
+            captured["model_cache"] = model_cache
+            captured["model_cache_lock"] = model_cache_lock
+            captured["start_time"] = start_time
+            return loaded_model, loaded_tokenizer
+
+        monkeypatch.setattr(
+            model_lifecycle,
+            "load_gguf_generation_model",
+            fake_load_gguf_generation_model,
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_runner_model_config())
+
+        model, tokenizer = lifecycle._load_generation_model(
+            str(gguf_path),
+            is_vlm=False,
+        )
+
+        assert model is loaded_model
+        assert tokenizer is loaded_tokenizer
+        assert captured["model_name"] == str(gguf_path)
+        assert captured["model_config"] is runner.model_config
+        assert captured["model_cache"] is model_lifecycle._MODEL_CACHE
+        assert captured["model_cache_lock"] is model_lifecycle._MODEL_CACHE_LOCK
+        assert isinstance(captured["start_time"], float)
+
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
     ) -> None:

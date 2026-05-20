@@ -15,6 +15,8 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
+from vllm_metal.gguf import is_local_gguf
+from vllm_metal.gguf.lifecycle import load_gguf_generation_model
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
@@ -114,6 +116,8 @@ class ModelLifecycle:
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if self._model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
+        if is_local_gguf(model_name):
+            is_vlm = False
 
         model, tokenizer = self._load_generation_model(model_name, is_vlm)
 
@@ -150,6 +154,15 @@ class ModelLifecycle:
     def _load_generation_model(self, model_name: str, is_vlm: bool) -> tuple[Any, Any]:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
+
+        if not is_vlm and is_local_gguf(model_name):
+            return load_gguf_generation_model(
+                model_name,
+                model_config=self._runner.model_config,
+                model_cache=_MODEL_CACHE,
+                model_cache_lock=_MODEL_CACHE_LOCK,
+                start_time=start_time,
+            )
 
         # AWQ checkpoints are owned end-to-end by AWQQuantLoader
         # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped

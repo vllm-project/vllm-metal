@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -29,6 +30,8 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
+    _patch_vllm_gguf_speculator_detection()
+    _patch_vllm_local_gguf_engine_args()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
 
@@ -447,6 +450,125 @@ def _patch_vllm_bytelevel_tokenizer_loading() -> None:
     tokenizer_registry.get_tokenizer = _patched_get_tokenizer
     tokenizer_registry.cached_get_tokenizer = lru_cache(_patched_get_tokenizer)
     setattr(tokenizer_registry, sentinel, True)
+
+
+def _patch_vllm_gguf_speculator_detection() -> None:
+    """Skip upstream speculator probing for local GGUF files it cannot parse.
+
+    vLLM probes configs for `speculators_config` before `ModelConfig` is built.
+    That probe does not receive `--hf-config-path`, so local GGUF files with
+    newer architecture strings (for example qwen35) can fail before the Metal
+    loader has a chance to use the paired HF config.  Speculator metadata is not
+    a GGUF feature we support in vllm-metal's experimental path, so falling back
+    to the original model/tokenizer/speculative config is the narrowest fix.
+    """
+    config_utils = sys.modules.get("vllm.transformers_utils.config")
+    arg_utils = sys.modules.get("vllm.engine.arg_utils")
+    if config_utils is None:
+        try:
+            import vllm.transformers_utils.config as config_utils
+        except ImportError as exc:
+            logger.warning(
+                "Could not install local GGUF speculator compatibility patch: %s",
+                exc,
+            )
+            return
+
+    sentinel = "_vllm_metal_gguf_speculator_patch"
+    if getattr(config_utils, sentinel, False):
+        return
+
+    original = config_utils.maybe_override_with_speculators
+
+    def _patched_maybe_override_with_speculators(
+        model,
+        tokenizer,
+        trust_remote_code,
+        revision=None,
+        vllm_speculative_config=None,
+        hf_token=None,
+        **kwargs,
+    ):
+        _patch_vllm_local_gguf_engine_args()
+        try:
+            return original(
+                model=model,
+                tokenizer=tokenizer,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                vllm_speculative_config=vllm_speculative_config,
+                hf_token=hf_token,
+                **kwargs,
+            )
+        except ValueError as exc:
+            from vllm_metal.gguf.refs import is_local_gguf
+
+            if is_local_gguf(model) and "GGUF model with architecture" in str(exc):
+                logger.info(
+                    "Skipping vLLM speculator config probe for local GGUF model "
+                    "that transformers cannot parse directly: %s",
+                    model,
+                )
+                return model, tokenizer, vllm_speculative_config
+            raise
+
+    config_utils.maybe_override_with_speculators = _patched_maybe_override_with_speculators
+    if arg_utils is not None:
+        arg_utils.maybe_override_with_speculators = _patched_maybe_override_with_speculators
+    setattr(config_utils, sentinel, True)
+
+
+def _patch_vllm_local_gguf_engine_args() -> None:
+    """Infer config/tokenizer paths for local GGUF files before ModelConfig."""
+    arg_utils = sys.modules.get("vllm.engine.arg_utils")
+    if arg_utils is None:
+        return
+
+    engine_args_cls = getattr(arg_utils, "EngineArgs", None)
+    if engine_args_cls is None:
+        return
+
+    sentinel = "_vllm_metal_local_gguf_engine_args_patch"
+    if getattr(engine_args_cls, sentinel, False):
+        return
+
+    original_create_model_config = engine_args_cls.create_model_config
+
+    def _patched_create_model_config(self, *args, **kwargs):
+        from vllm_metal.gguf.refs import is_local_gguf, resolve_gguf_reference
+
+        model = getattr(self, "model", None)
+        if model is not None and is_local_gguf(model):
+            try:
+                reference = resolve_gguf_reference(model, model_config=self)
+            except ValueError as exc:
+                logger.info(
+                    "Could not infer paired config/tokenizer path for local GGUF "
+                    "%s before ModelConfig creation: %s",
+                    model,
+                    exc,
+                )
+            else:
+                paired_path = str(reference.model_path)
+                if getattr(self, "hf_config_path", None) is None:
+                    self.hf_config_path = paired_path
+                    logger.info(
+                        "Using inferred local GGUF hf_config_path=%s for %s",
+                        paired_path,
+                        model,
+                    )
+                if getattr(self, "tokenizer", None) in (None, model):
+                    self.tokenizer = paired_path
+                    logger.info(
+                        "Using inferred local GGUF tokenizer=%s for %s",
+                        paired_path,
+                        model,
+                    )
+
+        return original_create_model_config(self, *args, **kwargs)
+
+    engine_args_cls.create_model_config = _patched_create_model_config
+    setattr(engine_args_cls, sentinel, True)
 
 
 def _ceildiv(value: int, divisor: int) -> int:

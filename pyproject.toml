@@ -43,6 +43,7 @@ dependencies = [
     "transformers>=5.5.1",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
+    "gguf>=0.17.0",
     # Native Metal extension JIT build
     "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
