@@ -259,7 +259,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // threadgroup will produce, we can stop.
     if (tile_start > context_len + q_pos_start + valid_q - 1) break;
 
-    // ─ Load K AND V cooperatively (paged, fused, vec2-vectorized) ─────
+    // ─ Load K AND V cooperatively (paged, fused, wide-vectorized) ────
     // Both K_smem and V_smem are filled in the same loop:
     //   * block_table lookup is shared (same kv_pos for both K and V)
     //   * memory controller interleaves K and V reads from the same
@@ -268,9 +268,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     //
     // Cooperative K/V load width scales with HEAD_SIZE: 128-bit (16 B)
     // transactions for HEAD_SIZE >= 256 (Gemma 4's 256/512), 64-bit (8 B)
-    // for <= 128 (byte-identical to the prior vec<T,4> path, so the small
-    // head sizes are unchanged).  Wider-than-vec4 needs the LoadUnit byte
-    // struct because Metal has no native vec<T,8>.
+    // for <= 128.  Metal has no native vec<T,8>, so the 16 B path needs
+    // the LoadUnit byte-struct + reinterpret pattern; the 8 B path could
+    // equivalently be vec<T,4>, but we route both through LoadUnit for
+    // uniformity.
     //
     // Strided layout preserved (lane owns d=lane*VEC, stride NUM_SIMD_LANES
     // *VEC): consecutive lanes touch consecutive VEC-element runs -> reads
