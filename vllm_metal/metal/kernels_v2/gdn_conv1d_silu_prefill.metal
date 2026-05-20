@@ -3,7 +3,7 @@
 // Outputs: output, conv_state_out
 // Grid: ((total_tokens + num_requests * (KERNEL_SIZE - 1)) * CONV_DIM, 1, 1)
 //
-// Pure-prefill depthwise conv counterpart to gdn_conv1d_silu_decode.metal.
+// Prefill-containing depthwise conv counterpart to gdn_conv1d_silu_decode.metal.
 // The first total_tokens * CONV_DIM threads compute SiLU(depthwise conv) for
 // packed prefill tokens.  The tail threads emit compact updated conv state for
 // active request slots.

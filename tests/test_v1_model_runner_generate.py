@@ -930,15 +930,18 @@ class TestV1MetalModelRunnerExecuteModel:
 class TestV1MetalModelRunnerGDNSubmit:
     def _make_hybrid_backend(self) -> HybridPagedAttentionBackend:
         backend = _HybridBackendStub.__new__(_HybridBackendStub)
+        conv_states = [
+            mx.array([1], dtype=mx.float32),
+            mx.array([2], dtype=mx.float32),
+        ]
+        recurrent_states = [
+            mx.array([3], dtype=mx.float32),
+            mx.array([4], dtype=mx.float32),
+        ]
         backend._state_cache = SimpleNamespace(
-            conv_states=[
-                mx.array([1], dtype=mx.float32),
-                mx.array([2], dtype=mx.float32),
-            ],
-            recurrent_states=[
-                mx.array([3], dtype=mx.float32),
-                mx.array([4], dtype=mx.float32),
-            ],
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            updated_state_arrays=lambda: [*conv_states, *recurrent_states],
         )
         return backend
 
@@ -962,7 +965,9 @@ class TestV1MetalModelRunnerGDNSubmit:
         for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
             assert actual is expected
 
-    def test_prefill_hybrid_submits_pending_recurrent_state(self, monkeypatch) -> None:
+    def test_prefill_hybrid_submits_pending_compact_gdn_states(
+        self, monkeypatch
+    ) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
         cache = GDNPagedStateCache(
@@ -975,8 +980,10 @@ class TestV1MetalModelRunnerGDNSubmit:
             key_head_dim=32,
             dtype=mx.float32,
         )
-        pending_state = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
-        cache.set_pending_recurrent_state(0, [1], pending_state)
+        pending_conv = mx.full((1, 1, 4), 7, dtype=mx.float32)
+        pending_recurrent = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        cache.set_pending_conv_state(0, [1], pending_conv)
+        cache.set_pending_recurrent_state(0, [1], pending_recurrent)
         backend = _HybridBackendStub.__new__(_HybridBackendStub)
         backend._state_cache = cache
         runner = make_stub_runner(_paged_attention_backend=backend)
@@ -988,7 +995,9 @@ class TestV1MetalModelRunnerGDNSubmit:
 
         # Assert
         assert len(submitted) == 1
-        assert submitted[0][-1] is pending_state
+        assert submitted[0][1] is pending_conv
+        assert submitted[0][2] is pending_recurrent
+        assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 
     def test_decode_only_hybrid_submits_logits_only(self, monkeypatch) -> None:
@@ -1017,7 +1026,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         # Assert
         assert submitted == [(logits,)]
 
-    def test_release_applies_pending_recurrent_state_before_reuse(self) -> None:
+    def test_release_applies_pending_gdn_states_before_reuse(self) -> None:
         # Arrange
         cache = GDNPagedStateCache(
             num_layers=1,
@@ -1029,6 +1038,7 @@ class TestV1MetalModelRunnerGDNSubmit:
             key_head_dim=32,
             dtype=mx.float32,
         )
+        cache.set_pending_conv_state(0, [1], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
             0, [1], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
         )
@@ -1042,8 +1052,10 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._gdn_release_slots({"done"})
 
         # Assert
+        assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
-        mx.eval(cache.recurrent_states[0])
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][1]), 7)
         np.testing.assert_array_equal(np.array(cache.recurrent_states[0][1]), 9)
         assert runner._gdn_free_slots == [1]
         assert runner._gdn_needs_materialize

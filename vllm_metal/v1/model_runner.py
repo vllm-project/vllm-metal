@@ -421,18 +421,17 @@ class MetalModelRunner:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
         backend = self._paged_attention_backend
         if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
-            backend._state_cache.apply_pending_recurrent_states()
+            backend._state_cache.apply_pending_states()
         mx.eval(*self._gdn_updated_state_arrays())
 
     def _gdn_updated_state_arrays(self) -> list[mx.array]:
         """Return GDN state arrays updated by a hybrid forward pass.
 
-        Each GDN layer updates conv state on every forward, and recurrent
-        state either in the stable pool or in a compact pending handoff that
-        the next lazy decode can consume directly.  MLX evaluation is
-        array-granular, so submit the currently authoritative state arrays:
-        conv pools plus either stable recurrent pools or compact pending
-        recurrent updates per layer.
+        Each GDN layer updates conv and recurrent state either in the stable
+        pool or in a compact pending handoff that the next lazy decode can
+        consume directly.  MLX evaluation is array-granular, so submit the
+        currently authoritative state arrays for each layer: compact pending
+        updates when present, otherwise the stable pools.
         """
 
         backend = self._paged_attention_backend
@@ -441,17 +440,14 @@ class MetalModelRunner:
         sc = backend._state_cache
         if sc is None:
             raise RuntimeError("GDN state cache is not initialized")
-        updated_arrays = getattr(sc, "updated_state_arrays", None)
-        if callable(updated_arrays):
-            return updated_arrays()
-        return [*sc.conv_states, *sc.recurrent_states]
+        return sc.updated_state_arrays()
 
     def _submit_paged_forward_outputs(
         self,
         logits: mx.array,
         *,
-        target_hidden_states: mx.array | None,
         has_prefill: bool,
+        target_hidden_states: mx.array | None = None,
     ) -> None:
         """Submit logits, hidden states, and GDN state side effects."""
         outputs = [logits]
@@ -476,7 +472,7 @@ class MetalModelRunner:
 
         backend = self._paged_attention_backend
         if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
-            backend._state_cache.apply_pending_recurrent_states()
+            backend._state_cache.apply_pending_states()
         self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
 

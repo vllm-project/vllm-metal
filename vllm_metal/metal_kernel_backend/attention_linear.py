@@ -2,9 +2,8 @@
 """Linear attention (Gated DeltaNet) with paged Metal state dispatch.
 
 Decomposes the mlx_lm GDN module's forward pass and routes eligible decode or
-pure-prefill batches through lazy Metal GDN kernels.  Unsupported shapes, mixed
-prefill+decode batches, or disabled lazy paths use the eager conv / C++ Metal
-recurrent fallback path.
+prefill-containing batches through lazy Metal GDN kernels.  Unsupported shapes
+or disabled lazy paths use the eager conv / C++ Metal recurrent fallback path.
 """
 
 from __future__ import annotations
@@ -24,6 +23,9 @@ from vllm_metal.metal_kernel_backend.gdn_lazy import (
 )
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import PagedAttentionContext, get_context
+
+_DEFAULT_RECURRENT_DECODE_THREADGROUP_DV = 4
+_EXPANDED_RECURRENT_DECODE_THREADGROUP_DV = 8
 
 
 def is_linear_attention(module: nn.Module) -> bool:
@@ -75,8 +77,8 @@ class _GDNLazyPolicy:
 
     def recurrent_decode_threadgroup_dv(self) -> int:
         if self.uses_conservative_recurrent_prefill_policy():
-            return 8
-        return 4
+            return _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV
+        return _DEFAULT_RECURRENT_DECODE_THREADGROUP_DV
 
     def should_materialize_prefill_state(self, num_requests: int) -> bool:
         return num_requests > 1 and not self.combined_qkvz_projection
@@ -214,46 +216,56 @@ class GDNPagedAttentionWrapper(nn.Module):
         cache_idx = self._gdn_cache_idx
         slot_ids = state.slot_ids
 
-        if (
-            state.total_tokens == state.num_requests
-            and state.num_decode_requests == state.num_requests
-        ):
+        if state.num_decode_requests == state.num_requests:
             conv_packed = self._gdn_lazy.try_conv_decode(
                 mixed_qkv, inner, state_cache, cache_idx, slot_ids
             )
             if conv_packed is not None:
                 return conv_packed
-        elif self._should_try_conv_prefill_lazy(state):
+        elif self._should_try_conv_prefill_containing_lazy(state):
             conv_packed = self._gdn_lazy.try_conv_prefill(
                 mixed_qkv, inner, state_cache, cache_idx, slot_ids, state.cu_seqlens
             )
             if conv_packed is not None:
                 if self._should_materialize_prefill_state(state):
-                    mx.eval(state_cache.conv_states[cache_idx])
+                    mx.eval(state_cache.updated_conv_state_array(cache_idx))
                 return conv_packed
 
+        state_cache.apply_pending_conv_state(cache_idx)
         conv_outputs = []
+        conv_updates = []
+        defer_conv_state = self._should_defer_conv_prefill_containing_state(state)
         for req_idx in range(state.num_requests):
             slot = slot_ids[req_idx]
             start = state.cu_seqlens[req_idx]
             end = state.cu_seqlens[req_idx + 1]
             req_qkv = mixed_qkv[:, start:end, :]
 
-            # Load conv state from stable slot
+            # Load conv state from stable slot.
             conv_state = state_cache.conv_states[cache_idx][slot : slot + 1]
             conv_input = mx.concatenate([conv_state, req_qkv], axis=1)
 
-            # Save updated conv state back to stable slot
+            # Prefill-containing batches keep compact updates so model_runner
+            # avoids submitting the full max_num_seqs conv pool.
             new_conv = conv_input[:, -(inner.conv_kernel_size - 1) :]
-            cs = state_cache.conv_states[cache_idx]
-            cs[slot : slot + 1] = new_conv
-            state_cache.conv_states[cache_idx] = cs
+            if defer_conv_state:
+                conv_updates.append(new_conv)
+            else:
+                cs = state_cache.conv_states[cache_idx]
+                cs[slot : slot + 1] = new_conv
+                state_cache.conv_states[cache_idx] = cs
 
             conv_out = nn.silu(inner.conv1d(conv_input))
             # Take only the output tokens (not the conv state prefix)
             conv_outputs.append(conv_out[:, -(end - start) :, :])
 
-        if self._should_materialize_prefill_state(state):
+        if defer_conv_state:
+            state_cache.set_pending_conv_state(
+                cache_idx, slot_ids, mx.concatenate(conv_updates, axis=0)
+            )
+            if self._should_materialize_prefill_state(state):
+                mx.eval(state_cache.updated_conv_state_array(cache_idx))
+        elif self._should_materialize_prefill_state(state):
             mx.eval(state_cache.conv_states[cache_idx])
 
         return mx.concatenate(conv_outputs, axis=1)
@@ -300,10 +312,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # === Step 5: Batched recurrent update ===
-        if (
-            state.total_tokens == state.num_requests
-            and state.num_decode_requests == state.num_requests
-        ):
+        if state.num_decode_requests == state.num_requests:
             request = GDNRecurrentDecodeRequest(
                 q=q,
                 k=k,
@@ -319,7 +328,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             y_flat = self._gdn_lazy.try_recurrent_decode(request)
             if y_flat is not None:
                 return y_flat
-        elif self._should_try_recurrent_prefill_lazy(state):
+        elif self._should_try_recurrent_prefill_containing_lazy(state):
             request = GDNRecurrentPrefillRequest(
                 q=q,
                 k=k,
@@ -341,18 +350,37 @@ class GDNPagedAttentionWrapper(nn.Module):
         self._gdn_state_cache.apply_pending_recurrent_state(self._gdn_cache_idx)
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
 
-    def _should_try_recurrent_prefill_lazy(self, state: _GDNForwardState) -> bool:
-        return state.num_decode_requests == 0
+    def _should_try_recurrent_prefill_containing_lazy(
+        self, state: _GDNForwardState
+    ) -> bool:
+        return (
+            self._lazy_kernels_enabled()
+            and state.num_decode_requests < state.num_requests
+            and state.total_tokens > state.num_requests
+        )
 
-    def _should_try_conv_prefill_lazy(self, state: _GDNForwardState) -> bool:
-        # The pure-prefill conv kernel removes per-request Python dispatch, but
+    def _lazy_kernels_enabled(self) -> bool:
+        return bool(getattr(self._gdn_lazy, "enabled", True))
+
+    def _should_defer_conv_prefill_containing_state(
+        self, state: _GDNForwardState
+    ) -> bool:
+        return (
+            self._lazy_kernels_enabled()
+            and state.num_decode_requests < state.num_requests
+        )
+
+    def _should_try_conv_prefill_containing_lazy(self, state: _GDNForwardState) -> bool:
+        # The prefill conv kernel removes per-request Python dispatch, but
         # compact separate-projection variants are small enough that the extra
         # Metal launch can dominate long prompts.  Keep those on the existing
         # eager conv path while enabling the lazy conv path for combined-QKVZ
         # and expanded-value-state variants where measured handoff cost is
         # larger.
-        return state.num_decode_requests == 0 and (
-            self._gdn_lazy_policy.should_try_conv_prefill_lazy()
+        return (
+            self._lazy_kernels_enabled()
+            and state.num_decode_requests < state.num_requests
+            and self._gdn_lazy_policy.should_try_conv_prefill_lazy()
         )
 
     def _recurrent_decode_threadgroup_dv(self) -> int:
@@ -375,23 +403,12 @@ class GDNPagedAttentionWrapper(nn.Module):
         return self._gdn_lazy_policy.recurrent_prefill_compute_dtype()
 
     def _should_defer_recurrent_prefill_state(self, state: _GDNForwardState) -> bool:
-        return self._gdn_lazy_policy.should_defer_recurrent_prefill_state(
-            state.num_requests
+        return (
+            self._lazy_kernels_enabled()
+            and self._gdn_lazy_policy.should_defer_recurrent_prefill_state(
+                state.num_requests
+            )
         )
-
-    def _should_use_conservative_recurrent_prefill_policy(self) -> bool:
-        # Combined-projection variants keep the lower-overhead typed/compact
-        # path.  Among separate-projection variants, only expanded value-state
-        # models retain the fallback's fp32 accumulation and immediate state
-        # scatter because their larger prefill->decode handoff is more
-        # sensitive to long-decode drift.
-        return self._gdn_lazy_policy.uses_conservative_recurrent_prefill_policy()
-
-    def _has_combined_qkvz_projection(self) -> bool:
-        return self._gdn_lazy_policy.combined_qkvz_projection
-
-    def _has_expanded_recurrent_value_state(self) -> bool:
-        return self._gdn_lazy_policy.expanded_recurrent_value_state
 
     def _run_recurrent_fallback(
         self,

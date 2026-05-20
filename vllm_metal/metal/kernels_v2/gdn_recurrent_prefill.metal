@@ -4,7 +4,7 @@
 // Grid: (32, Dv, num_requests * Hv), Threadgroup: (32, 4, 1)
 //
 // This is the lazy-graph counterpart of gdn_linear_attention.metal for
-// pure-prefill batches.  It keeps the per-request sequence loop but emits
+// prefill-containing batches.  It keeps the per-request sequence loop but emits
 // compact state updates for active requests instead of mutating the full state
 // pool in-place, allowing MLX to schedule the recurrent work lazily.
 

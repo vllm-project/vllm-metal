@@ -17,6 +17,9 @@ _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
 _GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")
 _GDN_RECURRENT_DECODE_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_decode.metal")
 _GDN_RECURRENT_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_recurrent_prefill.metal")
+_RECURRENT_SIMDGROUP_WIDTH = 32
+_RECURRENT_MAX_KEY_HEAD_DIM = 256
+_RECURRENT_PREFILL_THREADGROUP_DV = 4
 
 
 def _astype_if_needed(array: mx.array, dtype: mx.Dtype) -> mx.array:
@@ -69,7 +72,7 @@ class GDNRecurrentDecodeRequest(GDNRecurrentRequest):
 
 @dataclass(frozen=True)
 class GDNRecurrentPrefillRequest(GDNRecurrentRequest):
-    """Inputs for one lazy GDN recurrent pure-prefill attempt."""
+    """Inputs for one lazy GDN recurrent prefill-containing attempt."""
 
     cu_seqlens: list[int]
     materialize_outputs: bool = False
@@ -84,7 +87,7 @@ class GDNLazyKernels:
     ``kernels_v2``.  Unlike the legacy recurrent C++ path, these kernels
     materialize compact conv/recurrent state updates.  Decode scatters updates
     back into the stable cache pool; eligible prefill may defer compact
-    recurrent updates until the next decode, fallback, materialize, or release
+    conv/recurrent updates until the next decode, fallback, materialize, or release
     boundary.  Callers fall back to the legacy path when a request shape is
     ineligible.
     """
@@ -182,6 +185,11 @@ class GDNLazyKernels:
     def from_env(cls) -> GDNLazyKernels:
         return cls(enabled=envs.VLLM_METAL_GDN_LAZY_KERNELS)
 
+    @property
+    def enabled(self) -> bool:
+        """Return whether lazy GDN kernels are enabled for this owner."""
+        return self._enabled
+
     @classmethod
     def shared(cls) -> GDNLazyKernels:
         """Get the process-level lazy GDN kernel owner.
@@ -242,11 +250,14 @@ class GDNLazyKernels:
 
         conv_dim = state_cache.conv_dim
         kernel_size = inner.conv_kernel_size
-        conv_state_in = state_cache.conv_states[cache_idx]
+        state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
+        conv_state_in = state_view.state
+        state_pool = state_cache.conv_states[cache_idx]
         weight = inner.conv1d.weight
 
         mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
-        slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
+        slot_ids_arr = state_view.cache_slot_ids
+        state_slot_ids_arr = state_view.state_slot_ids
 
         grid_size = num_requests * conv_dim
         tg_size = min(256, grid_size)
@@ -256,7 +267,7 @@ class GDNLazyKernels:
             mixed_qkv_2d,
             conv_state_in,
             weight,
-            slot_ids_arr,
+            state_slot_ids_arr,
             num_requests,
         ]
         template = [
@@ -273,8 +284,10 @@ class GDNLazyKernels:
             output_shapes=[(num_requests, conv_dim), state_updates_shape],
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
-        conv_state_in[slot_ids_arr] = conv_state_updates
-        state_cache.conv_states[cache_idx] = conv_state_in
+        state_pool[slot_ids_arr] = conv_state_updates
+        state_cache.conv_states[cache_idx] = state_pool
+        if state_view.uses_compact_state:
+            state_cache.clear_pending_conv_state(cache_idx)
         return conv_silu_out.reshape(1, total_tokens, conv_dim)
 
     def try_conv_prefill(
@@ -286,24 +299,26 @@ class GDNLazyKernels:
         slot_ids: list[int],
         cu_seqlens: list[int],
     ) -> mx.array | None:
-        """Run the lazy GDN conv pure-prefill fast path, or return None."""
+        """Run the lazy GDN conv prefill-containing fast path, or return None."""
         num_requests = len(slot_ids)
         total_tokens = mixed_qkv.shape[1]
-        pure_prefill = (
+        prefill_batch = (
             total_tokens > num_requests
             and len(cu_seqlens) == num_requests + 1
             and cu_seqlens[0] == 0
             and cu_seqlens[-1] == total_tokens
-            and all(cu_seqlens[i + 1] >= cu_seqlens[i] for i in range(num_requests))
+            and all(cu_seqlens[i + 1] > cu_seqlens[i] for i in range(num_requests))
         )
         if not (
-            self._enabled and self._conv_prefill_kernel is not None and pure_prefill
+            self._enabled and self._conv_prefill_kernel is not None and prefill_batch
         ):
             return None
 
         conv_dim = state_cache.conv_dim
         kernel_size = inner.conv_kernel_size
         state_len = kernel_size - 1
+        if state_cache.has_pending_conv_state(cache_idx):
+            state_cache.apply_pending_conv_state(cache_idx)
         conv_state_in = state_cache.conv_states[cache_idx]
         mixed_qkv_2d = mixed_qkv.reshape(total_tokens, conv_dim)
         slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
@@ -333,8 +348,7 @@ class GDNLazyKernels:
             output_shapes=[(total_tokens, conv_dim), state_updates_shape],
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
-        conv_state_in[slot_ids_arr] = conv_state_updates
-        state_cache.conv_states[cache_idx] = conv_state_in
+        state_cache.set_pending_conv_state(cache_idx, slot_ids, conv_state_updates)
         return conv_out.reshape(1, total_tokens, conv_dim)
 
     def try_recurrent_decode(
@@ -348,11 +362,13 @@ class GDNLazyKernels:
         d_k = request.key_head_dim
         d_v = request.value_head_dim
         num_requests = len(request.slot_ids)
-        # The Metal source uses one 32-lane SIMD group across Dk and a
+        # The Metal source uses one SIMD group across Dk and a
         # fixed-size per-thread register array, matching the original C++
-        # kernel's practical Dk <= 256 envelope. Fall back for unusual head
+        # kernel's practical key-head-dim envelope. Fall back for unusual head
         # dimensions rather than silently dropping remainder channels.
-        recurrent_shape_supported = d_k % 32 == 0 and d_k <= 256
+        recurrent_shape_supported = (
+            d_k % _RECURRENT_SIMDGROUP_WIDTH == 0 and d_k <= _RECURRENT_MAX_KEY_HEAD_DIM
+        )
         if not (
             self._enabled
             and self._recurrent_decode_kernel is not None
@@ -362,21 +378,13 @@ class GDNLazyKernels:
             return None
 
         state_cache = request.state_cache
+        state_view = state_cache.recurrent_state_for_decode(
+            request.cache_idx, request.slot_ids
+        )
+        state_in = state_view.state
         state_pool = state_cache.recurrent_states[request.cache_idx]
-        pending_state = None
-        if state_cache.has_pending_recurrent_state(request.cache_idx):
-            pending_state = state_cache.pending_recurrent_state(
-                request.cache_idx, request.slot_ids
-            )
-            if pending_state is None:
-                state_cache.apply_pending_recurrent_state(request.cache_idx)
-                state_pool = state_cache.recurrent_states[request.cache_idx]
-        state_in = pending_state if pending_state is not None else state_pool
-        slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
-        if pending_state is not None and request.slot_ids != list(range(num_requests)):
-            state_slot_ids_arr = mx.arange(num_requests, dtype=mx.int32)
-        else:
-            state_slot_ids_arr = slot_ids_arr
+        slot_ids_arr = state_view.cache_slot_ids
+        state_slot_ids_arr = state_view.state_slot_ids
 
         kernel_inputs = [
             request.q.reshape(total_tokens, n_hk, d_k),
@@ -399,14 +407,14 @@ class GDNLazyKernels:
         y_out, state_updates = self._recurrent_decode_kernel(
             inputs=kernel_inputs,
             template=template,
-            grid=(32, d_v, num_requests * n_hv),
-            threadgroup=(32, request.threadgroup_dv, 1),
+            grid=(_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv),
+            threadgroup=(_RECURRENT_SIMDGROUP_WIDTH, request.threadgroup_dv, 1),
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[request.output_dtype, mx.float32],
         )
         state_pool[slot_ids_arr] = state_updates
         state_cache.recurrent_states[request.cache_idx] = state_pool
-        if pending_state is not None:
+        if state_view.uses_compact_state:
             state_cache.clear_pending_recurrent_state(request.cache_idx)
         return y_out
 
@@ -414,28 +422,30 @@ class GDNLazyKernels:
         self,
         request: GDNRecurrentPrefillRequest,
     ) -> mx.array | None:
-        """Run the lazy GDN recurrent pure-prefill fast path, or return None."""
+        """Run the lazy GDN recurrent prefill-containing fast path, or return None."""
         total_tokens = request.total_tokens
         n_hk = request.num_key_heads
         n_hv = request.num_value_heads
         d_k = request.key_head_dim
         d_v = request.value_head_dim
         num_requests = len(request.slot_ids)
-        recurrent_shape_supported = d_k % 32 == 0 and d_k <= 256
-        pure_prefill = (
+        recurrent_shape_supported = (
+            d_k % _RECURRENT_SIMDGROUP_WIDTH == 0 and d_k <= _RECURRENT_MAX_KEY_HEAD_DIM
+        )
+        prefill_batch = (
             total_tokens > num_requests
             and len(request.cu_seqlens) == num_requests + 1
             and request.cu_seqlens[0] == 0
             and request.cu_seqlens[-1] == total_tokens
             and all(
-                request.cu_seqlens[i + 1] - request.cu_seqlens[i] > 1
+                request.cu_seqlens[i + 1] - request.cu_seqlens[i] >= 1
                 for i in range(num_requests)
             )
         )
         if not (
             self._enabled
             and self._recurrent_prefill_kernel is not None
-            and pure_prefill
+            and prefill_batch
             and recurrent_shape_supported
         ):
             return None
@@ -471,8 +481,12 @@ class GDNLazyKernels:
         y_out, state_updates = self._recurrent_prefill_kernel(
             inputs=kernel_inputs,
             template=template,
-            grid=(32, d_v, num_requests * n_hv),
-            threadgroup=(32, 4, 1),
+            grid=(_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv),
+            threadgroup=(
+                _RECURRENT_SIMDGROUP_WIDTH,
+                _RECURRENT_PREFILL_THREADGROUP_DV,
+                1,
+            ),
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[kernel_dtype, state_dtype],
         )

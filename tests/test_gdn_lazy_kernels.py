@@ -89,6 +89,101 @@ class _RaisingKernel:
         raise AssertionError("fallback path should not invoke lazy kernel")
 
 
+class _ConstantKernel:
+    def __init__(self, output: mx.array, state_output: mx.array) -> None:
+        outputs: tuple[mx.array, mx.array] = (output, state_output)
+        self.outputs = outputs
+        self.grid: tuple[int, int, int] | None = None
+        self.output_shapes: list[tuple[int, ...]] | None = None
+
+    def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+        self.grid = kwargs.get("grid")
+        self.output_shapes = kwargs.get("output_shapes")
+        return self.outputs
+
+
+class _RecordingStateKernel(_ConstantKernel):
+    def __init__(
+        self,
+        *outputs: mx.array,
+        state_input_index: int,
+        slot_mapping_index: int,
+    ) -> None:
+        super().__init__(*outputs)
+        self.state_input_index = state_input_index
+        self.slot_mapping_index = slot_mapping_index
+        self.state_input: mx.array | None = None
+        self.slot_mapping: mx.array | None = None
+
+    def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+        self.state_input = kwargs["inputs"][self.state_input_index]
+        self.slot_mapping = kwargs["inputs"][self.slot_mapping_index]
+        return super().__call__(**kwargs)
+
+
+class TestGDNPagedStateCache:
+    def test_replacing_pending_conv_state_scatters_existing_update(self) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        cache.set_pending_conv_state(0, [2], mx.full((1, 2, 4), 5, dtype=mx.float32))
+
+        # Act
+        cache.set_pending_conv_state(0, [0, 1], mx.full((2, 2, 4), 9, dtype=mx.float32))
+
+        # Assert
+        pending_state = cache.pending_conv_state(0, [0, 1])
+        assert pending_state is not None
+        mx.eval(cache.conv_states[0], pending_state)
+        np.testing.assert_array_equal(
+            np.array(cache.conv_states[0][2]), np.full((2, 4), 5)
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.conv_states[0][:2]), np.zeros((2, 2, 4))
+        )
+        np.testing.assert_array_equal(np.array(pending_state), np.full((2, 2, 4), 9))
+
+    def test_replacing_pending_recurrent_state_scatters_existing_update(self) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=4)
+        cache.set_pending_recurrent_state(
+            0, [2], mx.full((1, 1, 4, 32), 5, dtype=mx.float32)
+        )
+
+        # Act
+        cache.set_pending_recurrent_state(
+            0, [0, 1], mx.full((2, 1, 4, 32), 9, dtype=mx.float32)
+        )
+
+        # Assert
+        pending_state = cache.pending_recurrent_state(0, [0, 1])
+        assert pending_state is not None
+        mx.eval(cache.recurrent_states[0], pending_state)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][2]), np.full((1, 4, 32), 5)
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][:2]), np.zeros((2, 1, 4, 32))
+        )
+        np.testing.assert_array_equal(
+            np.array(pending_state), np.full((2, 1, 4, 32), 9)
+        )
+
+    def test_decode_state_view_owns_compact_slot_mapping(self) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        pending = mx.full((2, 2, 4), 9, dtype=mx.float32)
+        cache.set_pending_conv_state(0, [3, 1], pending)
+
+        # Act
+        view = cache.conv_state_for_decode(0, [3, 1])
+
+        # Assert
+        assert view.state is pending
+        assert view.uses_compact_state
+        np.testing.assert_array_equal(np.array(view.cache_slot_ids), [3, 1])
+        np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 1])
+
+
 def _require_metal() -> None:
     try:
         available = mx.metal.is_available()
@@ -364,12 +459,14 @@ class TestLazyConvDecode:
 
 
 class TestLazyConvPrefill:
-    def test_matches_eager_per_request_conv(self) -> None:
+    @pytest.mark.parametrize("cu_seqlens", [[0, 2, 5], [0, 1, 3]])
+    def test_matches_eager_per_request_conv(self, cu_seqlens: list[int]) -> None:
         # Arrange
         _require_metal()
         mx.random.seed(2)
         conv_dim = 4
         kernel_size = 4
+        total_tokens = cu_seqlens[-1]
         cache = _make_state_cache(
             max_seqs=4, conv_kernel_dim=kernel_size, conv_dim=conv_dim
         )
@@ -379,9 +476,8 @@ class TestLazyConvPrefill:
         inner = SimpleNamespace(
             conv_kernel_size=kernel_size, conv1d=_DepthwiseConv1D(weight)
         )
-        cu_seqlens = [0, 2, 5]
         slot_ids = [3, 1]
-        mixed_qkv = mx.random.normal((1, 5, conv_dim)).astype(mx.float32)
+        mixed_qkv = mx.random.normal((1, total_tokens, conv_dim)).astype(mx.float32)
 
         expected_state = mx.array(initial_state)
         expected_outputs = []
@@ -405,28 +501,26 @@ class TestLazyConvPrefill:
 
         # Assert
         assert actual is not None
-        mx.eval(actual, expected, cache.conv_states[0], expected_state)
+        pending_state = cache.pending_conv_state(0, slot_ids)
+        assert pending_state is not None
+        mx.eval(actual, expected, pending_state, expected_state)
         np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-5)
+        np.testing.assert_allclose(
+            np.array(pending_state), np.array(expected_state[slot_ids]), atol=1e-5
+        )
+
+        cache.apply_pending_conv_state(0)
+        mx.eval(cache.conv_states[0])
         np.testing.assert_allclose(
             np.array(cache.conv_states[0]), np.array(expected_state), atol=1e-5
         )
 
     def test_updates_only_active_conv_slots(self) -> None:
         # Arrange
-        class FakeConvPrefillKernel:
-            def __init__(self) -> None:
-                self.grid: tuple[int, int, int] | None = None
-                self.output_shapes: list[tuple[int, ...]] | None = None
-
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                self.grid = kwargs["grid"]
-                self.output_shapes = kwargs["output_shapes"]
-                return (
-                    mx.ones((5, 4), dtype=mx.float32),
-                    mx.full((2, 2, 4), 9, dtype=mx.float32),
-                )
-
-        fake_kernel = FakeConvPrefillKernel()
+        fake_kernel = _ConstantKernel(
+            mx.ones((5, 4), dtype=mx.float32),
+            mx.full((2, 2, 4), 9, dtype=mx.float32),
+        )
         cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
         initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
         cache.conv_states[0] = mx.array(initial_state)
@@ -456,12 +550,158 @@ class TestLazyConvPrefill:
         assert result is not None
         assert fake_kernel.grid == (36, 1, 1)
         assert fake_kernel.output_shapes == [(5, 4), (2, 2, 4)]
-        mx.eval(cache.conv_states[0])
+        pending_state = cache.pending_conv_state(0, slot_ids)
+        assert pending_state is not None
+        mx.eval(cache.conv_states[0], pending_state)
+        np.testing.assert_array_equal(
+            np.array(cache.conv_states[0]), np.array(initial_state)
+        )
+        np.testing.assert_array_equal(np.array(pending_state), np.full((2, 2, 4), 9))
+
+        cache.apply_pending_conv_state(0)
         expected_state = np.array(initial_state)
         expected_state[slot_ids] = 9
+        mx.eval(cache.conv_states[0])
         np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
 
-    def test_rejects_non_monotonic_cu_seqlens(self) -> None:
+    def test_deferred_prefill_state_is_consumed_by_next_decode(self) -> None:
+        # Arrange
+        prefill_kernel = _ConstantKernel(
+            mx.ones((5, 4), dtype=mx.float32),
+            mx.full((2, 2, 4), 9, dtype=mx.float32),
+        )
+        decode_kernel = _RecordingStateKernel(
+            mx.ones((2, 4), dtype=mx.float32),
+            mx.full((2, 2, 4), 7, dtype=mx.float32),
+            state_input_index=1,
+            slot_mapping_index=3,
+        )
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
+        cache.conv_states[0] = mx.array(initial_state)
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+        slot_ids = [3, 1]
+        kernels = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=decode_kernel,
+            conv_prefill_kernel=prefill_kernel,
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        )
+
+        # Act
+        prefill_out = kernels.try_conv_prefill(
+            mx.zeros((1, 5, 4), dtype=mx.float32),
+            inner,
+            cache,
+            0,
+            slot_ids,
+            [0, 2, 5],
+        )
+        decode_out = kernels.try_conv_decode(
+            mx.zeros((1, 2, 4), dtype=mx.float32), inner, cache, 0, slot_ids
+        )
+
+        # Assert
+        assert prefill_out is not None
+        assert decode_out is not None
+        assert cache.pending_conv_state(0, slot_ids) is None
+        assert decode_kernel.state_input is not None
+        assert decode_kernel.state_input.shape == (2, 2, 4)
+        mx.eval(cache.conv_states[0], decode_kernel.slot_mapping)
+        np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [0, 1])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 7
+        np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
+
+    def test_pending_conv_mismatched_decode_scatters_before_kernel(self) -> None:
+        # Arrange
+        decode_kernel = _RecordingStateKernel(
+            mx.ones((2, 4), dtype=mx.float32),
+            mx.full((2, 2, 4), 7, dtype=mx.float32),
+            state_input_index=1,
+            slot_mapping_index=3,
+        )
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
+        cache.conv_states[0] = mx.array(initial_state)
+        cache.set_pending_conv_state(0, [3, 1], mx.full((2, 2, 4), 9, dtype=mx.float32))
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=decode_kernel,
+            conv_prefill_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        ).try_conv_decode(
+            mx.zeros((1, 2, 4), dtype=mx.float32), inner, cache, 0, [1, 3]
+        )
+
+        # Assert
+        assert result is not None
+        assert cache.pending_conv_state(0, [3, 1]) is None
+        assert decode_kernel.state_input is cache.conv_states[0]
+        mx.eval(cache.conv_states[0], decode_kernel.slot_mapping)
+        np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [1, 3])
+        expected_state = np.array(initial_state)
+        expected_state[[3, 1]] = 9
+        expected_state[[1, 3]] = 7
+        np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
+
+    def test_next_conv_prefill_scatters_pending_state_before_replacing_it(self) -> None:
+        # Arrange
+        prefill_kernel = _ConstantKernel(
+            mx.ones((5, 4), dtype=mx.float32),
+            mx.full((2, 2, 4), 9, dtype=mx.float32),
+        )
+
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        initial_state = mx.arange(4 * 2 * 4, dtype=mx.float32).reshape(4, 2, 4)
+        cache.conv_states[0] = mx.array(initial_state)
+        cache.set_pending_conv_state(0, [2], mx.full((1, 2, 4), 5, dtype=mx.float32))
+        inner = SimpleNamespace(
+            conv_kernel_size=3,
+            conv1d=SimpleNamespace(weight=mx.ones((4, 3), dtype=mx.float32)),
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            conv_prefill_kernel=prefill_kernel,
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=_RaisingKernel(),
+        ).try_conv_prefill(
+            mx.zeros((1, 5, 4), dtype=mx.float32),
+            inner,
+            cache,
+            0,
+            [0, 1],
+            [0, 2, 5],
+        )
+
+        # Assert
+        assert result is not None
+        pending_state = cache.pending_conv_state(0, [0, 1])
+        assert pending_state is not None
+        mx.eval(cache.conv_states[0], pending_state)
+        expected_state = np.array(initial_state)
+        expected_state[2] = 5
+        np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
+        np.testing.assert_array_equal(np.array(pending_state), np.full((2, 2, 4), 9))
+
+    @pytest.mark.parametrize("cu_seqlens", [[0, 4, 3, 5], [0, 0, 3, 5]])
+    def test_rejects_ineligible_or_inconsistent_cu_seqlens(
+        self, cu_seqlens: list[int]
+    ) -> None:
         # Arrange
         cache = _make_state_cache(max_seqs=2, conv_kernel_dim=3, conv_dim=4)
         inner = SimpleNamespace(
@@ -482,7 +722,7 @@ class TestLazyConvPrefill:
             cache,
             0,
             [0, 1, 2],
-            [0, 4, 3, 5],
+            cu_seqlens,
         )
 
         # Assert
@@ -680,22 +920,10 @@ class TestLazyRecurrentDecode:
 class TestLazyRecurrentPrefill:
     def test_updates_only_active_prefill_slots(self) -> None:
         # Arrange
-        class FakePrefillKernel:
-            def __init__(self) -> None:
-                self.grid: tuple[int, int, int] | None = None
-                self.output_shapes: list[tuple[int, ...]] | None = None
-                self.input_names_seen = False
-
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                self.grid = kwargs["grid"]
-                self.output_shapes = kwargs["output_shapes"]
-                self.input_names_seen = True
-                return (
-                    mx.ones((5, 2, 3), dtype=mx.float32),
-                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
-                )
-
-        fake_kernel = FakePrefillKernel()
+        fake_kernel = _ConstantKernel(
+            mx.ones((5, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+        )
         cache = _make_state_cache(
             max_seqs=4,
             num_v_heads=2,
@@ -735,30 +963,57 @@ class TestLazyRecurrentPrefill:
             np.array(cache.recurrent_states[0]), expected_state
         )
 
+    def test_mixed_prefill_accepts_one_token_decode_segments(self) -> None:
+        # Arrange
+        prefill_kernel = _ConstantKernel(
+            mx.ones((3, 1, 4), dtype=mx.float32),
+            mx.full((2, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        cache = _make_state_cache(max_seqs=3)
+        initial_state = mx.zeros_like(cache.recurrent_states[0])
+        cache.recurrent_states[0] = initial_state
+        slot_ids = [0, 1]
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 3, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 3, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 3, 1, 4), dtype=mx.float32),
+            g=mx.zeros((1, 3, 1), dtype=mx.float32),
+            beta=mx.zeros((1, 3, 1), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 1, 3],
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=prefill_kernel,
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        mx.eval(cache.recurrent_states[0])
+        expected_state = np.zeros_like(np.array(initial_state))
+        expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), expected_state
+        )
+
     def test_deferred_prefill_state_is_consumed_by_next_decode(self) -> None:
         # Arrange
-        class FakePrefillKernel:
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                return (
-                    mx.ones((5, 2, 3), dtype=mx.float32),
-                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
-                )
-
-        class FakeDecodeKernel:
-            def __init__(self) -> None:
-                self.state_input: mx.array | None = None
-                self.slot_mapping: mx.array | None = None
-
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                self.state_input = kwargs["inputs"][5]
-                self.slot_mapping = kwargs["inputs"][6]
-                return (
-                    mx.ones((2, 2, 3), dtype=mx.float32),
-                    mx.full((2, 2, 3, 32), 7, dtype=mx.float32),
-                )
-
-        prefill_kernel = FakePrefillKernel()
-        decode_kernel = FakeDecodeKernel()
+        prefill_kernel = _ConstantKernel(
+            mx.ones((5, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+        )
+        decode_kernel = _RecordingStateKernel(
+            mx.ones((2, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 7, dtype=mx.float32),
+            state_input_index=5,
+            slot_mapping_index=6,
+        )
         cache = _make_state_cache(
             max_seqs=4,
             num_v_heads=2,
@@ -817,12 +1072,10 @@ class TestLazyRecurrentPrefill:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
-        class FakePrefillKernel:
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                return (
-                    mx.ones((5, 2, 3), dtype=mx.float32),
-                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
-                )
+        prefill_kernel = _ConstantKernel(
+            mx.ones((5, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+        )
 
         cache = _make_state_cache(
             max_seqs=4,
@@ -853,7 +1106,7 @@ class TestLazyRecurrentPrefill:
             enabled=True,
             conv_kernel=_RaisingKernel(),
             recurrent_decode_kernel=_RaisingKernel(),
-            recurrent_prefill_kernel=FakePrefillKernel(),
+            recurrent_prefill_kernel=prefill_kernel,
         ).try_recurrent_prefill(request)
 
         # Assert
@@ -870,12 +1123,10 @@ class TestLazyRecurrentPrefill:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
-        class FakePrefillKernel:
-            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
-                return (
-                    mx.ones((5, 2, 3), dtype=mx.float32),
-                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
-                )
+        prefill_kernel = _ConstantKernel(
+            mx.ones((5, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+        )
 
         cache = _make_state_cache(
             max_seqs=4,
@@ -911,7 +1162,7 @@ class TestLazyRecurrentPrefill:
             enabled=True,
             conv_kernel=_RaisingKernel(),
             recurrent_decode_kernel=_RaisingKernel(),
-            recurrent_prefill_kernel=FakePrefillKernel(),
+            recurrent_prefill_kernel=prefill_kernel,
         ).try_recurrent_prefill(request)
 
         # Assert
@@ -925,7 +1176,7 @@ class TestLazyRecurrentPrefill:
     @pytest.mark.parametrize(
         "cu_seqlens",
         [
-            [0, 1, 3],
+            [0, 0, 3],
             [1, 3, 5],
             [0, 2, 4],
         ],
@@ -1054,17 +1305,19 @@ class TestLazyRecurrentPrefill:
         assert ("T", mx.float32) in (fake_kernel.template or [])
         assert fake_kernel.output_dtypes == [mx.float32, mx.float32]
 
-    def test_matches_cpp_recurrent_path_for_prefill(self) -> None:
+    @pytest.mark.parametrize("cu_seqlens", [[0, 2, 5], [0, 1, 3]])
+    def test_matches_cpp_recurrent_path_for_prefill(
+        self, cu_seqlens: list[int]
+    ) -> None:
         # Arrange
         _require_metal()
         mx.random.seed(2)
-        total_tokens = 5
+        total_tokens = cu_seqlens[-1]
         n_hk = 1
         n_hv = 1
         d_k = 32
         d_v = 4
         slot_ids = [1, 0]
-        cu_seqlens = [0, 2, 5]
         cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
         cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
         initial_state = mx.random.normal(cache_lazy.recurrent_states[0].shape).astype(
