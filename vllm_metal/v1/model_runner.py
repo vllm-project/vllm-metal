@@ -419,6 +419,9 @@ class MetalModelRunner:
 
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
+        backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_recurrent_states()
         mx.eval(*self._gdn_updated_state_arrays())
 
     def _gdn_updated_state_arrays(self) -> list[mx.array]:
@@ -438,6 +441,9 @@ class MetalModelRunner:
         sc = backend._state_cache
         if sc is None:
             raise RuntimeError("GDN state cache is not initialized")
+        updated_arrays = getattr(sc, "updated_state_arrays", None)
+        if callable(updated_arrays):
+            return updated_arrays()
         return [*sc.conv_states, *sc.recurrent_states]
 
     def _submit_paged_forward_outputs(
@@ -468,6 +474,9 @@ class MetalModelRunner:
         if not freed_slots:
             return
 
+        backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_recurrent_states()
         self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
 

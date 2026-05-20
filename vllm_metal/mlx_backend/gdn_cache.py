@@ -11,6 +11,13 @@ Layout per linear layer:
 
 Each request occupies one slot (indexed by request position in the batch).
 State is managed by the GDN wrapper, not by the scheduler's block system.
+
+Pending recurrent state handoff:
+  - At most one compact pending recurrent update may exist per linear layer.
+  - Lazy decode may consume that compact update directly only when the active
+    slot order exactly matches the pending slot order.
+  - Slot-order mismatches, fallback execution, new prefill work, or slot release
+    must scatter the pending update into the stable recurrent state pool first.
 """
 
 from __future__ import annotations
@@ -55,4 +62,63 @@ class GDNPagedStateCache:
         self.recurrent_states: list[mx.array] = [
             mx.zeros(recurrent_shape, dtype=mx.float32) for _ in range(num_layers)
         ]
+        self.pending_recurrent_states: list[mx.array | None] = [
+            None for _ in range(num_layers)
+        ]
+        self.pending_recurrent_slot_ids: list[list[int] | None] = [
+            None for _ in range(num_layers)
+        ]
         mx.eval(*self.conv_states, *self.recurrent_states)
+
+    def set_pending_recurrent_state(
+        self, layer_idx: int, slot_ids: list[int], state_updates: mx.array
+    ) -> None:
+        """Store compact recurrent updates to be consumed by the next decode."""
+        self.pending_recurrent_states[layer_idx] = state_updates
+        self.pending_recurrent_slot_ids[layer_idx] = list(slot_ids)
+
+    def pending_recurrent_state(
+        self, layer_idx: int, slot_ids: list[int]
+    ) -> mx.array | None:
+        """Return pending compact state when it exactly matches *slot_ids*."""
+        pending_slots = self.pending_recurrent_slot_ids[layer_idx]
+        if pending_slots != slot_ids:
+            return None
+        return self.pending_recurrent_states[layer_idx]
+
+    def clear_pending_recurrent_state(self, layer_idx: int) -> None:
+        """Drop compact recurrent updates after they have been consumed."""
+        self.pending_recurrent_states[layer_idx] = None
+        self.pending_recurrent_slot_ids[layer_idx] = None
+
+    def has_pending_recurrent_state(self, layer_idx: int) -> bool:
+        """Return whether a layer has deferred recurrent updates."""
+        return self.pending_recurrent_states[layer_idx] is not None
+
+    def updated_state_arrays(self) -> list[mx.array]:
+        """Return the minimal GDN state arrays to submit after a forward."""
+        arrays = [*self.conv_states]
+        for layer_idx, recurrent_state in enumerate(self.recurrent_states):
+            pending_state = self.pending_recurrent_states[layer_idx]
+            arrays.append(
+                pending_state if pending_state is not None else recurrent_state
+            )
+        return arrays
+
+    def apply_pending_recurrent_state(self, layer_idx: int) -> None:
+        """Scatter deferred recurrent updates into the stable state pool."""
+        pending_state = self.pending_recurrent_states[layer_idx]
+        pending_slots = self.pending_recurrent_slot_ids[layer_idx]
+        if pending_state is None or pending_slots is None:
+            return
+
+        slot_ids_arr = mx.array(pending_slots, dtype=mx.int32)
+        recurrent_state = self.recurrent_states[layer_idx]
+        recurrent_state[slot_ids_arr] = pending_state
+        self.recurrent_states[layer_idx] = recurrent_state
+        self.clear_pending_recurrent_state(layer_idx)
+
+    def apply_pending_recurrent_states(self) -> None:
+        """Scatter all deferred recurrent updates into stable state pools."""
+        for layer_idx in range(self.num_layers):
+            self.apply_pending_recurrent_state(layer_idx)

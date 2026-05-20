@@ -12,6 +12,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
+from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 
@@ -961,6 +962,35 @@ class TestV1MetalModelRunnerGDNSubmit:
         for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
             assert actual is expected
 
+    def test_prefill_hybrid_submits_pending_recurrent_state(self, monkeypatch) -> None:
+        # Arrange
+        submitted: list[tuple[object, ...]] = []
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            dtype=mx.float32,
+        )
+        pending_state = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        cache.set_pending_recurrent_state(0, [1], pending_state)
+        backend = _HybridBackendStub.__new__(_HybridBackendStub)
+        backend._state_cache = cache
+        runner = make_stub_runner(_paged_attention_backend=backend)
+        logits = mx.array([0], dtype=mx.float32)
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        # Act
+        runner._submit_paged_forward_outputs(logits, has_prefill=True)
+
+        # Assert
+        assert len(submitted) == 1
+        assert submitted[0][-1] is pending_state
+        assert cache.has_pending_recurrent_state(0)
+
     def test_decode_only_hybrid_submits_logits_only(self, monkeypatch) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
@@ -986,6 +1016,37 @@ class TestV1MetalModelRunnerGDNSubmit:
 
         # Assert
         assert submitted == [(logits,)]
+
+    def test_release_applies_pending_recurrent_state_before_reuse(self) -> None:
+        # Arrange
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            dtype=mx.float32,
+        )
+        cache.set_pending_recurrent_state(
+            0, [1], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        )
+        backend = _HybridBackendStub.__new__(_HybridBackendStub)
+        backend._state_cache = cache
+        runner = make_stub_runner(_paged_attention_backend=backend)
+        runner._gdn_req_to_slot = {"done": 1}
+        runner._gdn_free_slots = []
+
+        # Act
+        runner._gdn_release_slots({"done"})
+
+        # Assert
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][1]), 9)
+        assert runner._gdn_free_slots == [1]
+        assert runner._gdn_needs_materialize
 
 
 class TestRunnerMlaProperties:

@@ -170,6 +170,7 @@ def _recurrent_prefill_request(
     cu_seqlens: list[int],
     output_dtype: mx.Dtype = mx.float32,
     compute_dtype: mx.Dtype | None = None,
+    defer_state_scatter: bool = False,
     materialize_outputs: bool = False,
 ) -> GDNRecurrentPrefillRequest:
     return GDNRecurrentPrefillRequest(
@@ -184,6 +185,7 @@ def _recurrent_prefill_request(
         output_dtype=output_dtype,
         cu_seqlens=cu_seqlens,
         compute_dtype=compute_dtype,
+        defer_state_scatter=defer_state_scatter,
         materialize_outputs=materialize_outputs,
     )
 
@@ -607,7 +609,201 @@ class TestLazyRecurrentPrefill:
             np.array(cache.recurrent_states[0]), expected_state
         )
 
-    @pytest.mark.parametrize("cu_seqlens", ([0, 1, 3], [0, 3], [1, 2, 3], [0, 2, 4]))
+    def test_deferred_prefill_state_is_consumed_by_next_decode(self) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                return (
+                    mx.ones((5, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+                )
+
+        class FakeDecodeKernel:
+            def __init__(self) -> None:
+                self.state_input: mx.array | None = None
+                self.slot_mapping: mx.array | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.state_input = kwargs["inputs"][5]
+                self.slot_mapping = kwargs["inputs"][6]
+                return (
+                    mx.ones((2, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 7, dtype=mx.float32),
+                )
+
+        prefill_kernel = FakePrefillKernel()
+        decode_kernel = FakeDecodeKernel()
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        slot_ids = [3, 1]
+        kernels = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=decode_kernel,
+            recurrent_prefill_kernel=prefill_kernel,
+        )
+        prefill_request = _recurrent_prefill_request(
+            q=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 5, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 5, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 5, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 2, 5],
+            defer_state_scatter=True,
+        )
+        decode_request = _recurrent_request(
+            q=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 2, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 2, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 2, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+        )
+
+        # Act
+        prefill_out = kernels.try_recurrent_prefill(prefill_request)
+        decode_out = kernels.try_recurrent_decode(decode_request)
+
+        # Assert
+        assert prefill_out is not None
+        assert decode_out is not None
+        assert cache.pending_recurrent_state(0, slot_ids) is None
+        assert decode_kernel.state_input is not None
+        assert decode_kernel.state_input.shape == (2, 2, 3, 32)
+        mx.eval(cache.recurrent_states[0], decode_kernel.slot_mapping)
+        np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [0, 1])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 7
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), expected_state
+        )
+
+    def test_materialized_deferred_prefill_evals_compact_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                return (
+                    mx.ones((5, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+                )
+
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        eval_args: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+        slot_ids = [3, 1]
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 5, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 5, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 5, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 2, 5],
+            defer_state_scatter=True,
+            materialize_outputs=True,
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=FakePrefillKernel(),
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        assert len(eval_args) == 1
+        assert len(eval_args[0]) == 2
+        assert eval_args[0][1].shape == (2, 2, 3, 32)
+        assert cache.pending_recurrent_state(0, slot_ids) is eval_args[0][1]
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), np.array(initial_state)
+        )
+
+    def test_materialized_scattered_prefill_contiguates_state_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                return (
+                    mx.ones((5, 2, 3), dtype=mx.float32),
+                    mx.full((2, 2, 3, 32), 9, dtype=mx.float32),
+                )
+
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        contiguous_args: list[mx.array] = []
+        eval_args: list[tuple[Any, ...]] = []
+
+        def fake_contiguous(array: mx.array) -> mx.array:
+            contiguous_args.append(array)
+            return array
+
+        monkeypatch.setattr(mx, "contiguous", fake_contiguous)
+        monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+        slot_ids = [3, 1]
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 5, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 5, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 5, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 2, 5],
+            defer_state_scatter=False,
+            materialize_outputs=True,
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=FakePrefillKernel(),
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        assert len(contiguous_args) == 1
+        assert contiguous_args[0].shape == (4, 2, 3, 32)
+        assert len(eval_args) == 1
+        assert eval_args[0][1] is cache.recurrent_states[0]
+        assert cache.pending_recurrent_state(0, slot_ids) is None
+
+    @pytest.mark.parametrize(
+        "cu_seqlens",
+        [
+            [0, 1, 3],
+            [1, 3, 5],
+            [0, 2, 4],
+        ],
+    )
     def test_prefill_rejects_ineligible_or_inconsistent_segments(
         self, cu_seqlens: list[int]
     ) -> None:
@@ -687,6 +883,50 @@ class TestLazyRecurrentPrefill:
         assert ("T", mx.bfloat16) in (fake_kernel.template or [])
         assert ("StT", mx.bfloat16) in (fake_kernel.template or [])
         assert fake_kernel.output_dtypes == [mx.bfloat16, mx.bfloat16]
+
+    def test_prefill_compute_dtype_can_differ_from_output_dtype(self) -> None:
+        # Arrange
+        class FakePrefillKernel:
+            def __init__(self) -> None:
+                self.template: list[tuple[str, Any]] | None = None
+                self.output_dtypes: list[mx.Dtype] | None = None
+
+            def __call__(self, **kwargs: Any) -> tuple[mx.array, mx.array]:
+                self.template = kwargs["template"]
+                self.output_dtypes = kwargs["output_dtypes"]
+                return (
+                    mx.ones((3, 1, 4), dtype=kwargs["output_dtypes"][0]),
+                    mx.ones((1, 1, 4, 32), dtype=kwargs["output_dtypes"][1]),
+                )
+
+        fake_kernel = FakePrefillKernel()
+        cache = _make_state_cache(value_head_dim=4, key_head_dim=32)
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 3, 1, 32), dtype=mx.bfloat16),
+            k=mx.zeros((1, 3, 1, 32), dtype=mx.bfloat16),
+            v=mx.zeros((1, 3, 1, 4), dtype=mx.bfloat16),
+            g=mx.zeros((1, 3, 1), dtype=mx.bfloat16),
+            beta=mx.zeros((1, 3, 1), dtype=mx.bfloat16),
+            cache=cache,
+            slot_ids=[0],
+            cu_seqlens=[0, 3],
+            output_dtype=mx.bfloat16,
+            compute_dtype=mx.float32,
+        )
+
+        # Act
+        result = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=fake_kernel,
+        ).try_recurrent_prefill(request)
+
+        # Assert
+        assert result is not None
+        assert result.dtype == mx.bfloat16
+        assert ("T", mx.float32) in (fake_kernel.template or [])
+        assert fake_kernel.output_dtypes == [mx.float32, mx.float32]
 
     def test_matches_cpp_recurrent_path_for_prefill(self) -> None:
         # Arrange

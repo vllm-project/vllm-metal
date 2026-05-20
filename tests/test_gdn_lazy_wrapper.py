@@ -316,6 +316,187 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert result is fallback_out
         assert fake_lazy.prefill_called
 
+    def test_multi_request_prefill_separate_projection_defers_compact_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        class FakeLazy:
+            def __init__(self) -> None:
+                self.prefill_called = False
+                self.prefill_request: Any | None = None
+
+            def try_recurrent_decode(self, *_: Any) -> None:
+                raise AssertionError("pure prefill is not decode-only")
+
+            def try_recurrent_prefill(self, request: Any) -> mx.array:
+                self.prefill_called = True
+                self.prefill_request = request
+                return lazy_out
+
+        lazy_out = mx.ones((4, 1, 4), dtype=mx.float32)
+        fake_lazy = FakeLazy()
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
+        monkeypatch.setattr(
+            wrapper,
+            "_run_recurrent_fallback",
+            lambda *_: (_ for _ in ()).throw(
+                AssertionError("lazy recurrent prefill should handle pure prefill")
+            ),
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        result = wrapper._run_recurrent(
+            q=mx.zeros((1, 4, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 4, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 4, 1, 4), dtype=mx.float32),
+            g=mx.zeros((1, 4, 1), dtype=mx.float32),
+            beta=mx.zeros((1, 4, 1), dtype=mx.float32),
+            state=state,
+        )
+
+        # Assert
+        assert result is lazy_out
+        assert fake_lazy.prefill_called
+        assert fake_lazy.prefill_request is not None
+        assert fake_lazy.prefill_request.materialize_outputs
+        assert fake_lazy.prefill_request.compute_dtype is None
+        assert fake_lazy.prefill_request.defer_state_scatter
+
+    def test_multi_request_prefill_expanded_value_state_scatters_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        class FakeLazy:
+            def __init__(self) -> None:
+                self.prefill_called = False
+                self.prefill_request: Any | None = None
+
+            def try_recurrent_decode(self, *_: Any) -> None:
+                raise AssertionError("pure prefill is not decode-only")
+
+            def try_recurrent_prefill(self, request: Any) -> mx.array:
+                self.prefill_called = True
+                self.prefill_request = request
+                return lazy_out
+
+        lazy_out = mx.ones((4, 2, 4), dtype=mx.float32)
+        fake_lazy = FakeLazy()
+        inner = _TinyExpandedValueGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
+        monkeypatch.setattr(
+            wrapper,
+            "_run_recurrent_fallback",
+            lambda *_: (_ for _ in ()).throw(
+                AssertionError("lazy recurrent prefill should handle pure prefill")
+            ),
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        result = wrapper._run_recurrent(
+            q=mx.zeros((1, 4, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 4, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 4, 2, 4), dtype=mx.float32),
+            g=mx.zeros((1, 4, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 4, 2), dtype=mx.float32),
+            state=state,
+        )
+
+        # Assert
+        assert result is lazy_out
+        assert fake_lazy.prefill_called
+        assert fake_lazy.prefill_request is not None
+        assert fake_lazy.prefill_request.materialize_outputs
+        assert fake_lazy.prefill_request.compute_dtype == mx.float32
+        assert not fake_lazy.prefill_request.defer_state_scatter
+
+    def test_expanded_separate_projection_uses_wider_decode_threadgroup(self) -> None:
+        # Arrange
+        inner = _TinyExpandedValueGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+
+        # Act / Assert
+        assert wrapper._recurrent_decode_threadgroup_dv() == 8
+
+    def test_compact_and_combined_projection_keep_default_decode_threadgroup(
+        self,
+    ) -> None:
+        # Arrange
+        compact_inner = _TinyGDNInner()
+        compact_cache = _make_state_cache(
+            conv_kernel_dim=compact_inner.conv_kernel_size,
+            conv_dim=compact_inner.conv_dim,
+            num_v_heads=compact_inner.num_v_heads,
+            value_head_dim=compact_inner.head_v_dim,
+            key_head_dim=compact_inner.head_k_dim,
+        )
+        combined_inner = _TinyQwen3NextGDNInner()
+        combined_inner.num_v_heads = 2
+        combined_cache = _make_state_cache(
+            conv_kernel_dim=combined_inner.conv_kernel_size,
+            conv_dim=combined_inner.conv_dim,
+            num_v_heads=combined_inner.num_v_heads,
+            value_head_dim=combined_inner.head_v_dim,
+            key_head_dim=combined_inner.head_k_dim,
+        )
+
+        # Act
+        compact = GDNPagedAttentionWrapper(
+            compact_inner, layer_idx=0, cache_idx=0, state_cache=compact_cache
+        )
+        combined = GDNPagedAttentionWrapper(
+            combined_inner, layer_idx=0, cache_idx=0, state_cache=combined_cache
+        )
+
+        # Assert
+        assert compact._recurrent_decode_threadgroup_dv() == 4
+        assert combined._recurrent_decode_threadgroup_dv() == 4
+
     def test_single_request_prefill_scatters_recurrent_state(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -368,8 +549,123 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert result is lazy_out
         assert fake_lazy.prefill_request is not None
         assert not fake_lazy.prefill_request.materialize_outputs
-        assert fake_lazy.prefill_request.compute_dtype == mx.float32
+        assert fake_lazy.prefill_request.compute_dtype is None
+        assert not fake_lazy.prefill_request.defer_state_scatter
         assert fake_lazy.prefill_request.slot_ids == [2]
+
+    def test_multi_request_prefill_separate_projection_materializes_conv_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        eval_args: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(
+            attention_linear.mx,
+            "eval",
+            lambda *args: eval_args.append(args),
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        wrapper._run_conv(mx.ones((1, 4, inner.conv_dim), dtype=mx.float32), state)
+
+        # Assert
+        assert len(eval_args) == 1
+        assert len(eval_args[0]) == 1
+        assert eval_args[0][0] is cache.conv_states[0]
+
+    def test_multi_request_prefill_compact_separate_projection_skips_lazy_conv(
+        self,
+    ) -> None:
+        # Arrange
+        class FakeLazy:
+            def try_conv_decode(self, *_: Any) -> None:
+                raise AssertionError("pure prefill is not decode-only")
+
+            def try_conv_prefill(self, *_: Any) -> None:
+                raise AssertionError("compact separate projection keeps eager conv")
+
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        object.__setattr__(wrapper, "_gdn_lazy", FakeLazy())
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        result = wrapper._run_conv(
+            mx.ones((1, 4, inner.conv_dim), dtype=mx.float32), state
+        )
+
+        # Assert
+        assert result.shape[-1] == inner.conv_dim
+
+    def test_multi_request_prefill_qwen3_next_style_keeps_conv_state_lazy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arrange
+        inner = _TinyQwen3NextGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        eval_args: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(
+            attention_linear.mx,
+            "eval",
+            lambda *args: eval_args.append(args),
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[0, 1],
+            num_decode_requests=0,
+        )
+
+        # Act
+        wrapper._run_conv(mx.ones((1, 4, inner.conv_dim), dtype=mx.float32), state)
+
+        # Assert
+        assert eval_args == []
 
     def test_multi_request_prefill_qwen3_next_style_tries_lazy_prefill(
         self, monkeypatch: pytest.MonkeyPatch
@@ -433,7 +729,8 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert fake_lazy.prefill_called
         assert fake_lazy.prefill_request is not None
         assert not fake_lazy.prefill_request.materialize_outputs
-        assert fake_lazy.prefill_request.compute_dtype == mx.float32
+        assert fake_lazy.prefill_request.compute_dtype is None
+        assert fake_lazy.prefill_request.defer_state_scatter
 
     def test_long_multi_request_prefill_qwen3_next_style_tries_lazy_prefill(
         self, monkeypatch: pytest.MonkeyPatch
