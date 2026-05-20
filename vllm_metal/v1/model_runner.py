@@ -1892,9 +1892,7 @@ class MetalModelRunner:
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder
         # cache when dispatch runs.
-        self._pre_register_new_request_mm_features(
-            scheduler_output.scheduled_new_reqs
-        )
+        self._pre_register_new_request_mm_features(scheduler_output.scheduled_new_reqs)
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         if spec_decode_error is not None:
             raise spec_decode_error
