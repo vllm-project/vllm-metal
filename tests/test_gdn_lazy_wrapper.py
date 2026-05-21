@@ -114,6 +114,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
                 self.prefill_request: Any | None = None
@@ -178,6 +179,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
 
@@ -233,6 +235,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     def test_one_token_prefill_does_not_try_decode_lazy_conv(self) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def try_conv_decode(self, *_: Any) -> None:
                 raise AssertionError("pure prefill is not decode-only")
 
@@ -269,6 +272,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     def test_mixed_batch_with_prefill_tries_lazy_conv(self) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
 
@@ -316,6 +320,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
 
@@ -373,6 +378,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
                 self.prefill_request: Any | None = None
@@ -438,6 +444,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
                 self.prefill_request: Any | None = None
@@ -554,6 +561,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_request: Any | None = None
 
@@ -698,6 +706,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def try_conv_decode(self, *_: Any) -> None:
                 raise AssertionError("pure prefill is not decode-only")
 
@@ -738,6 +747,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
 
@@ -821,6 +831,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
                 self.prefill_request: Any | None = None
@@ -886,6 +897,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
     ) -> None:
         # Arrange
         class FakeLazy:
+            enabled = True
             def __init__(self) -> None:
                 self.prefill_called = False
 

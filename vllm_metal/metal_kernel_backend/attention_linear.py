@@ -360,7 +360,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         )
 
     def _lazy_kernels_enabled(self) -> bool:
-        return bool(getattr(self._gdn_lazy, "enabled", True))
+        return self._gdn_lazy.enabled
 
     def _should_defer_conv_prefill_containing_state(
         self, state: _GDNForwardState
