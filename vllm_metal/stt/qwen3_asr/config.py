@@ -8,6 +8,7 @@ shape helpers during planning/registration without pulling in the model stack.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.transformers_utils.configs.qwen3_asr import (
     Qwen3ASRConfig as VllmQwen3ASRConfig,
@@ -66,6 +67,7 @@ class Qwen3ASRTextConfig:
     vocab_size: int = 151936
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1000000.0
+    rope_scaling: dict[str, Any] | None = None
     tie_word_embeddings: bool = True
 
 
@@ -111,6 +113,7 @@ class Qwen3ASRConfig:
             vocab_size=text.vocab_size,
             rms_norm_eps=text.rms_norm_eps,
             rope_theta=text.rope_theta,
+            rope_scaling=getattr(text, "rope_scaling", None),
             tie_word_embeddings=text.tie_word_embeddings,
         )
         config_kwargs = {

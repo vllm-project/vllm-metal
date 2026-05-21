@@ -1,4 +1,5 @@
-// Grid: (32, Dv, num_requests * Hv), Threadgroup: (32, 4, 1)
+// Grid: (32, Dv, num_requests * Hv), Threadgroup: (32, TG_DV, 1)
+// TG_DV is selected by the Python wrapper for the active GDN state layout.
 // Each SIMD group of 32 threads handles Dk elements for one (request, hv, dv).
 auto n = thread_position_in_grid.z;
 auto req_idx = n / Hv;

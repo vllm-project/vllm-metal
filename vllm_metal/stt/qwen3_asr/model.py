@@ -11,10 +11,13 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 
 from .config import Qwen3ASRAudioConfig, Qwen3ASRConfig, Qwen3ASRTextConfig
+
+_DEFAULT_MROPE_SECTION = [24, 20, 20]
 
 # ===========================================================================
 # Audio Encoder Components
@@ -248,44 +251,105 @@ class Qwen3RMSNorm(nn.Module):
         return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
-class Qwen3RotaryEmbedding(nn.Module):
-    """Rotary position embedding with interleaved application."""
+class Qwen3InterleavedMRoPE(nn.Module):
+    """Qwen3-ASR interleaved multi-dimensional rotary embedding.
 
-    def __init__(self, head_dim: int, rope_theta: float = 1000000.0):
+    Qwen3-ASR checkpoints use Qwen's 3D MRoPE layout with interleaved
+    frequency assignment across temporal/height/width dimensions. For ASR text
+    decoding the three position streams are identical, but the frequency
+    assignment still differs from the simple adjacent-pair RoPE used by a
+    vanilla Qwen3 decoder.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        rope_theta: float = 1000000.0,
+        mrope_section: list[int] | None = None,
+    ):
         super().__init__()
         self.head_dim = head_dim
         self.rope_theta = rope_theta
-        # Precompute inverse frequencies
+        self.half_dim = head_dim // 2
+        self.mrope_section = mrope_section or self._default_mrope_section()
+        if sum(self.mrope_section) != self.half_dim:
+            raise ValueError(
+                "mrope_section must sum to head_dim // 2; "
+                f"got {self.mrope_section} for head_dim={head_dim}"
+            )
+
         inv_freq = 1.0 / (
             rope_theta ** (mx.arange(0, head_dim, 2).astype(mx.float32) / head_dim)
         )
         self._inv_freq = inv_freq
 
-    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
-        """Apply rotary embedding to x.
+        masks = []
+        for dim, offset in enumerate((1, 2), start=1):
+            stop = min(self.mrope_section[dim] * 3, self.half_dim)
+            indices = np.arange(offset, stop, 3, dtype=np.int32)
+            mask = np.zeros(self.half_dim, dtype=bool)
+            mask[indices] = True
+            masks.append(mx.array(mask[None, None, :]))
+        self._overwrite_masks = masks
 
-        Args:
-            x: (batch, n_heads, seq_len, head_dim)
-            offset: position offset for cached decoding.
-        """
-        seq_len = x.shape[2]
-        positions = mx.arange(offset, offset + seq_len, dtype=mx.float32)
-        freqs = positions[:, None] * self._inv_freq[None, :]  # (seq, head_dim/2)
-        # Interleaved: apply cos/sin to consecutive pairs
-        cos_f = mx.cos(freqs).astype(x.dtype)
-        sin_f = mx.sin(freqs).astype(x.dtype)
+    def _default_mrope_section(self) -> list[int]:
+        if self.half_dim == sum(_DEFAULT_MROPE_SECTION):
+            return list(_DEFAULT_MROPE_SECTION)
 
-        # Reshape for interleaved application
-        # x pairs: (x0, x1), (x2, x3), ...
-        x1 = x[..., 0::2]  # even indices
-        x2 = x[..., 1::2]  # odd indices
+        first = self.half_dim // 3
+        second = self.half_dim // 3
+        third = self.half_dim - first - second
+        return [first, second, third]
 
-        # Rotate
-        o1 = x1 * cos_f - x2 * sin_f
-        o2 = x1 * sin_f + x2 * cos_f
+    def __call__(
+        self, position_ids: mx.array, dtype: mx.Dtype
+    ) -> tuple[mx.array, mx.array]:
+        """Return cos/sin tensors for ``position_ids`` of shape ``(B, 3, L)``."""
+        pos = position_ids.astype(mx.float32).transpose(1, 0, 2)[..., None]
+        freqs = pos * self._inv_freq[None, None, None, :]
+        freqs_t = freqs[0]
+        for dim, mask in enumerate(self._overwrite_masks, start=1):
+            freqs_t = mx.where(mask, freqs[dim], freqs_t)
 
-        # Interleave back: stack pairs then reshape
-        return mx.stack([o1, o2], axis=-1).reshape(x.shape)
+        emb = mx.concatenate([freqs_t, freqs_t], axis=-1)
+        return mx.cos(emb).astype(dtype), mx.sin(emb).astype(dtype)
+
+    @classmethod
+    def from_config(cls, config: Qwen3ASRTextConfig) -> Qwen3InterleavedMRoPE:
+        """Build RoPE from Qwen3-ASR text config."""
+        return cls(
+            config.head_dim,
+            config.rope_theta,
+            cls._mrope_section_from_config(config),
+        )
+
+    def apply(
+        self,
+        q: mx.array,
+        k: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Apply this RoPE instance to query/key tensors."""
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+        return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(
+            k
+        ) * sin
+
+    @staticmethod
+    def _rotate_half(x: mx.array) -> mx.array:
+        mid = x.shape[-1] // 2
+        return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
+
+    @staticmethod
+    def _mrope_section_from_config(config: Qwen3ASRTextConfig) -> list[int] | None:
+        rope_scaling = config.rope_scaling
+        if isinstance(rope_scaling, dict):
+            section = rope_scaling.get("mrope_section")
+            if section:
+                return list(section)
+        return None
 
 
 class Qwen3Attention(nn.Module):
@@ -315,12 +379,14 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.rope = Qwen3RotaryEmbedding(self.head_dim, config.rope_theta)
         self.scale = self.head_dim**-0.5
 
     def __call__(
         self,
         x: mx.array,
+        rope: Qwen3InterleavedMRoPE,
+        cos: mx.array,
+        sin: mx.array,
         mask: mx.array | None = None,
         cache: tuple[mx.array, mx.array] | None = None,
     ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
@@ -339,10 +405,7 @@ class Qwen3Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Apply RoPE
-        offset = cache[0].shape[2] if cache is not None else 0
-        q = self.rope(q, offset=offset)
-        k = self.rope(k, offset=offset)
+        q, k = rope.apply(q, k, cos, sin)
 
         # KV cache
         if cache is not None:
@@ -398,10 +461,20 @@ class Qwen3DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        rope: Qwen3InterleavedMRoPE,
+        cos: mx.array,
+        sin: mx.array,
         mask: mx.array | None = None,
         cache: tuple[mx.array, mx.array] | None = None,
     ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
-        r, new_cache = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
+        r, new_cache = self.self_attn(
+            self.input_layernorm(x),
+            rope=rope,
+            cos=cos,
+            sin=sin,
+            mask=mask,
+            cache=cache,
+        )
         x = x + r
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x, new_cache
@@ -423,6 +496,7 @@ class Qwen3LM(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.rope = Qwen3InterleavedMRoPE.from_config(config)
 
     def embed(self, token_ids: mx.array) -> mx.array:
         """Convert token IDs to embeddings."""
@@ -443,6 +517,9 @@ class Qwen3LM(nn.Module):
         else:
             offset = 0
         total_len = offset + seq
+        positions = mx.arange(offset, offset + seq)[None, :]
+        position_ids = mx.stack([positions, positions, positions], axis=1)
+        cos, sin = self.rope(position_ids, dtype=h.dtype)
         if seq > 1:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(total_len)
             mask = mask.astype(h.dtype)
@@ -455,7 +532,14 @@ class Qwen3LM(nn.Module):
 
         new_cache = []
         for i, layer in enumerate(self.layers):
-            h, layer_cache = layer(h, mask=mask, cache=cache[i])
+            h, layer_cache = layer(
+                h,
+                rope=self.rope,
+                cos=cos,
+                sin=sin,
+                mask=mask,
+                cache=cache[i],
+            )
             new_cache.append(layer_cache)
 
         h = self.norm(h)

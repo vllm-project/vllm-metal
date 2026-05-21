@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
 from vllm.logger import init_logger
@@ -25,18 +26,71 @@ class TargetModelForwardOutput:
     hidden_states: mx.array | None = None
 
 
+class MultimodalEncodeResult(Protocol):
+    """Adapter-owned vision output for one multimodal feature."""
+
+    hidden_states: mx.array
+    deepstack_visual_embeds: Sequence[mx.array] | None
+
+
 class MultimodalRuntimeAdapter(Protocol):
     """Model-owned behavior needed for native multimodal execution."""
 
+    forward_ready: bool
+    """Whether scheduled multimodal encoder inputs may be executed.
+
+    ``MetalModelRunner`` fails fast on scheduled encoder inputs when this
+    is ``False``, so a new adapter can land closed without disturbing the
+    model already in production.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
+
+    def embed_tokens(self, input_ids: Any) -> Any:
+        """Return the language model's input embeddings for ``input_ids``.
+
+        Returns an MLX array of shape ``(batch, seq_len, hidden)``.
+        """
 
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[Any, int]:
-        """Return model-specific M-RoPE positions for multimodal inputs."""
+        """Return ``((3, 1, seq_len) positions, mrope_position_delta)``.
+
+        The runner stashes ``mrope_position_delta`` on ``RequestState`` so
+        decode positions stay correct.
+        """
+
+    def encode_multimodal(
+        self,
+        features: list[MultiModalFeatureSpec],
+    ) -> Sequence[MultimodalEncodeResult]:
+        """Run the model's vision tower; return one result per feature.
+
+        Results may carry optional deepstack visual embeds for models whose
+        language model injects vision residuals in intermediate layers.
+        """
+
+    def call_lm(
+        self,
+        input_ids: Any,
+        inputs_embeds: Any,
+        cache: list[Any],
+        position_ids: Any,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> Any:
+        """Invoke the language model with runner-built embeds and positions.
+
+        ``visual_pos_masks`` and ``deepstack_visual_embeds`` are forwarded
+        only when the language model declares both as explicit parameters;
+        adapters omit them otherwise to avoid silently dropping the arrays
+        into a ``**kwargs`` catch-all.
+        """
 
 
 class ModelAdapter(Protocol):
@@ -377,7 +431,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
-        return Qwen3VLMultimodalAdapter.from_loaded_model(model)
+        return cast(
+            MultimodalRuntimeAdapter,
+            Qwen3VLMultimodalAdapter.from_loaded_model(model),
+        )
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]

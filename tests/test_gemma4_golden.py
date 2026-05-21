@@ -27,6 +27,14 @@ Supported variants (each enabled by setting its env var to a local MLX
 checkpoint directory):
 
 - E2B:    ``GEMMA4_MODEL_PATH``          — 8-bit MLX E2B checkpoint.
+- E4B:    ``GEMMA4_E4B_MODEL_PATH``      — Gemma 4 E4B-it checkpoint
+                                           (HF bf16 multimodal works;
+                                           vllm-metal forces text-only).
+                                           **Requires mlx-lm from git
+                                           main** (PR #1240); the PyPI
+                                           0.31.3 release predates the
+                                           Gemma 4 KV-shared-layer
+                                           load fix.
 - 26B:    ``GEMMA4_26B_MODEL_PATH``      — 8-bit MLX 26B-A4B checkpoint.
 - 31B:    ``GEMMA4_31B_MODEL_PATH``      — 8-bit MLX 31B checkpoint
                                            (target of issue #276).
@@ -34,7 +42,7 @@ checkpoint directory):
 Run each variant in its own pytest invocation.  MLX holds model buffers
 at process scope, so loading two Gemma4 checkpoints in the same process
 typically exceeds 64 GB unified memory.  If several env vars are set in
-one invocation, the larger-is-better variant wins (31B > 26B > E2B).
+one invocation, the larger-is-better variant wins (31B > 26B > E4B > E2B).
 The 31B and 26B variants require a Mac with ≥ 64 GB unified memory.
 
 Regenerate goldens with:
@@ -144,6 +152,31 @@ GEMMA4_31B_GOLDEN_PAGED = {
 # regenerate the dicts via ``tools/gen_gemma4_golden.py``.
 GEMMA4_26B_GOLDEN_MLX_LM: dict[str, list[int]] = {}
 GEMMA4_26B_GOLDEN_PAGED: dict[str, list[int]] = {}
+
+# ---- E4B (multimodal text-only backbone, HD=256 sliding + HD=512 full) ---
+# google/gemma-4-E4B-it (HF), mlx 0.31.2, mlx-lm 0.31.3 (must be from git
+# main — mlx-lm PR #1240 is needed to load this checkpoint; the PyPI
+# 0.31.3 release predates the fix and hits a KV-shared-layer ValueError).
+# 42 text layers (36 sliding HD=256 + 6 full HD=512), num_kv_shared_layers=18.
+# mlx_lm and paged goldens were identical at capture; future kernel changes
+# (e.g. tiled HD>=256 dispatch) may drift paged but should keep matching mlx_lm.
+GEMMA4_E4B_GOLDEN_MLX_LM = {
+    "The capital of France is":                          [7001, 563, 7001, 563, 7001, 563, 7001, 563, 7001, 563],
+    "The weather today is not":                          [669, 7606, 3124, 563, 711, 669, 7606, 3124, 563, 711],
+    "One plus one equals":                               [886, 14339, 886, 14339, 886, 14339, 886, 14339, 886, 14339],
+    "The largest planet in our solar system is":         [506, 7488, 13401, 563, 506, 7488, 13401, 236761, 106, 106],
+    "Water boils at a temperature of":                   [496, 104264, 657, 496, 4022, 529, 496, 104264, 657, 496],
+}
+# Currently == GEMMA4_E4B_GOLDEN_MLX_LM byte-for-byte (no fp tie-break drift
+# at capture); kept separate per framework convention — paged is expected to
+# drift once the tiled HD>=256 dispatch lands.
+GEMMA4_E4B_GOLDEN_PAGED = {
+    "The capital of France is":                          [7001, 563, 7001, 563, 7001, 563, 7001, 563, 7001, 563],
+    "The weather today is not":                          [669, 7606, 3124, 563, 711, 669, 7606, 3124, 563, 711],
+    "One plus one equals":                               [886, 14339, 886, 14339, 886, 14339, 886, 14339, 886, 14339],
+    "The largest planet in our solar system is":         [506, 7488, 13401, 563, 506, 7488, 13401, 236761, 106, 106],
+    "Water boils at a temperature of":                   [496, 104264, 657, 496, 4022, 529, 496, 104264, 657, 496],
+}
 # fmt: on
 
 
@@ -155,6 +188,14 @@ _ALL_VARIANTS: list[Gemma4Variant] = [
         max_model_len=512,
         golden_mlx_lm=E2B_GOLDEN_MLX_LM,
         golden_paged=E2B_GOLDEN_PAGED,
+    ),
+    Gemma4Variant(
+        name="e4b",
+        model_env="GEMMA4_E4B_MODEL_PATH",
+        memory_fraction="0.50",
+        max_model_len=512,
+        golden_mlx_lm=GEMMA4_E4B_GOLDEN_MLX_LM,
+        golden_paged=GEMMA4_E4B_GOLDEN_PAGED,
     ),
     Gemma4Variant(
         name="26b",
@@ -239,8 +280,8 @@ def _select_variants() -> list[Gemma4Variant]:
     ]
     if not available:
         return []
-    # Prefer larger variants: 31b > 26b > e2b.
-    preference = {"31b": 0, "26b": 1, "e2b": 2}
+    # Prefer larger variants: 31b > 26b > e4b > e2b.
+    preference = {"31b": 0, "26b": 1, "e4b": 2, "e2b": 3}
     available.sort(key=lambda v: preference.get(v.name, 99))
     return [available[0]]
 

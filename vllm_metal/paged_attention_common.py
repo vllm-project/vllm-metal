@@ -52,6 +52,15 @@ class PagedAttentionContext:
     # GDN state pool slot mapping: request batch position → stable slot ID.
     # Populated by model_runner for hybrid models; None for non-hybrid.
     gdn_slot_mapping: list[int] | None = None
+    # Number of decode requests packed at the front of the batch.
+    # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
+    # without reverse-engineering one-token segments from ``cu_seqlens``.
+    num_decode_requests: int = 0
+    # Per-segment caller-supplied M-RoPE positions: each entry is either
+    # ``None`` (use ``offsets[i]`` with sequential arange) or an
+    # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
+    # per-segment handling entirely.
+    segment_positions: list[Any] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -215,5 +224,6 @@ def prepare_unified(
             context_lens=context_lens,
             cu_seqlens=cu_seqlens,
             offsets=offsets,
+            num_decode_requests=len(decode_requests),
         )
     )

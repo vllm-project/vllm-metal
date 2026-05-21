@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
-from vllm_metal.multimodal.qwen3_vl.adapter import Qwen3VLMultimodalAdapter
+from vllm_metal.multimodal.qwen3_vl.adapter import (
+    Qwen3VLMultimodalAdapter,
+    Qwen3VLVisionEncodeResult,
+)
 
-__all__ = ["Qwen3VLMultimodalAdapter"]
+__all__ = ["Qwen3VLVisionEncodeResult", "Qwen3VLMultimodalAdapter"]

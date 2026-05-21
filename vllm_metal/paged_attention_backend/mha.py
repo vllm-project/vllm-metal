@@ -1,60 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import platform
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-from vllm.logger import init_logger
 
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import warm_up_kernels
 
 if TYPE_CHECKING:
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-
-logger = init_logger(__name__)
-
-# Substring present in Metal shader compilation errors when the OS's Metal
-# language version is too old for the kernel. Matched against str(e) because
-# the C++/nanobind layer does not raise a typed exception for this case.
-_METAL_LANGUAGE_VERSION_ERROR = "language version"
-
-
-def warm_up_paged_cache(cache: MetalPagedKVCache) -> None:
-    """Trigger Metal shader compilation with a dummy reshape_and_cache call.
-
-    Shared by MHA and Hybrid backends to avoid duplicating warm-up logic.
-    """
-    macos_version = platform.mac_ver()[0]
-    logger.info("Warming up paged attention Metal kernel...")
-
-    try:
-        ops = get_ops()
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load Metal kernel: {e}. macOS {macos_version}"
-        ) from e
-
-    try:
-        # Warm up against the concrete layer-0 cache shape. Per-layer cache
-        # allocation may differ from the scalar constructor fallback.
-        warmup_kv_heads = cache.kv_heads_per_layer[0]
-        warmup_head_dim = cache.head_dim_per_layer[0]
-        dummy_k = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
-        dummy_v = mx.zeros((1, warmup_kv_heads, warmup_head_dim), dtype=cache.dtype)
-        dummy_slot = mx.zeros((1,), dtype=mx.int64)
-        mx.eval(dummy_k, dummy_v, dummy_slot)
-        ops.reshape_and_cache(
-            dummy_k, dummy_v, cache.key_caches[0], cache.value_caches[0], dummy_slot
-        )
-        mx.eval(cache.key_caches[0])
-        logger.info("Paged attention Metal kernel warm-up complete")
-    except RuntimeError as e:
-        if _METAL_LANGUAGE_VERSION_ERROR in str(e):
-            raise RuntimeError(
-                f"Metal kernel incompatible with macOS {macos_version}: {e}"
-            ) from e
-        raise
 
 
 class MHAPagedAttentionBackend:
@@ -130,7 +84,12 @@ class MHAPagedAttentionBackend:
         )
 
     def warm_up(self) -> None:
-        warm_up_paged_cache(self._require_initialized("warm_up"))
+        self._require_initialized("warm_up")
+        warm_up_kernels()
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
+
+    @property
+    def kv_cache(self) -> MetalPagedKVCache:
+        return self._require_initialized("kv_cache")

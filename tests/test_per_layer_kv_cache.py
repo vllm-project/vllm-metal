@@ -13,7 +13,6 @@ from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 from vllm_metal.paged_attention_backend.mha import (
     MHAPagedAttentionBackend,
-    warm_up_paged_cache,
 )
 
 
@@ -108,48 +107,6 @@ class TestMHABackendPerLayer:
         assert cache is not None
         assert cache.key_caches[0].shape[-2:] == (16, 256)
         assert cache.key_caches[1].shape[-2:] == (4, 512)
-
-    def test_warm_up_uses_layer_zero_shape(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Kernel warm-up should compile against the concrete layer-0 shape."""
-        cache = MetalPagedKVCache(
-            num_layers=2,
-            num_kv_heads=8,
-            head_dim=128,
-            num_blocks=1,
-            block_size=16,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=[16, 4],
-            head_dim_per_layer=[256, 512],
-        )
-        seen: dict[str, tuple[int, ...]] = {}
-
-        class _FakeOps:
-            def reshape_and_cache(
-                self,
-                dummy_k: mx.array,
-                dummy_v: mx.array,
-                key_cache: mx.array,
-                value_cache: mx.array,
-                dummy_slot: mx.array,
-            ) -> None:
-                seen["dummy_k"] = dummy_k.shape
-                seen["dummy_v"] = dummy_v.shape
-                seen["key_cache"] = key_cache.shape
-                seen["value_cache"] = value_cache.shape
-
-        monkeypatch.setattr(
-            "vllm_metal.paged_attention_backend.mha.get_ops",
-            lambda: _FakeOps(),
-        )
-
-        warm_up_paged_cache(cache)
-
-        assert seen["dummy_k"] == (1, 16, 256)
-        assert seen["dummy_v"] == (1, 16, 256)
-        assert seen["key_cache"] == (1, 16, 16, 256)
-        assert seen["value_cache"] == (1, 16, 16, 256)
 
 
 class TestCachePolicyPerLayerBytes:

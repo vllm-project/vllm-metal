@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // C++ nanobind bridge for paged attention Metal kernels.
 //
-// Dispatches reshape_and_cache and paged_attention_v1 through MLX's own
-// Metal command encoder, eliminating the PyTorch MPS bridge.
+// Dispatches the v2 paged-attention / TurboQuant / GDN / MLA kernels through
+// MLX's own Metal command encoder, eliminating the PyTorch MPS bridge.
 //
 // Uses nb::handle + nb::inst_ptr<array>() to extract the C++ array from
 // the Python mlx.core.array object, bypassing nanobind's cross-module
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -30,8 +31,6 @@ using namespace mlx::core;
 // Library caching
 // ---------------------------------------------------------------------------
 
-static std::string reshape_cache_source_;
-static std::string paged_attention_source_;
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
@@ -72,21 +71,6 @@ static void add_temporary_compat(
   d.add_temporary(arr, s.index);
 }
 #endif
-
-void init_libraries(
-    const std::string& reshape_src,
-    const std::string& paged_attn_src) {
-  reshape_cache_source_ = reshape_src;
-  paged_attention_source_ = paged_attn_src;
-
-  auto& d = metal::device(Device::gpu);
-  d.get_library(
-      "paged_reshape_cache",
-      [&]() { return reshape_cache_source_; });
-  d.get_library(
-      "paged_attention_kern",
-      [&]() { return paged_attention_source_; });
-}
 
 void init_v2_library(const std::string& v2_src) {
   v2_paged_attention_source_ = v2_src;
@@ -155,193 +139,6 @@ static int get_bits(const std::string& quant_type) {
 }
 
 // ---------------------------------------------------------------------------
-// reshape_and_cache — dispatch helper + eager binding
-// ---------------------------------------------------------------------------
-
-// When called from a primitive's eval_gpu, from_primitive should be true
-// to skip ALL add_temporary calls.  add_temporary removes buffer pointers
-// from the encoder's input/output tracking, defeating fence-based
-// synchronisation across command buffer boundaries.  Inside a primitive,
-// MLX's evaluator already manages array lifetimes via the completion
-// handler.  In the eager path, add_temporary is needed to keep
-// Python-owned arrays alive until the command buffer completes.
-static void dispatch_reshape_and_cache(
-    const array& key, const array& value,
-    array& key_cache, array& value_cache,
-    const array& slot_mapping, Stream s,
-    bool from_primitive = false) {
-  auto& d = metal::device(s.device);
-
-  int num_tokens  = static_cast<int>(key.shape(0));
-  int num_heads   = static_cast<int>(key.shape(1));
-  int head_size   = static_cast<int>(key.shape(2));
-  int block_size  = static_cast<int>(key_cache.shape(1));
-
-  int32_t key_stride   = static_cast<int32_t>(num_heads * head_size);
-  int32_t value_stride = static_cast<int32_t>(num_heads * head_size);
-  int32_t num_heads_i  = static_cast<int32_t>(num_heads);
-  int32_t head_size_i  = static_cast<int32_t>(head_size);
-  int32_t block_size_i = static_cast<int32_t>(block_size);
-
-  auto dt = dtype_to_metal(key.dtype());
-  std::string kname = "reshape_and_cache_kv_" + dt + "_cache_" + dt;
-
-  auto* lib = d.get_library("paged_reshape_cache");
-  bool use_fp8 = false;
-  auto* kernel = d.get_kernel(
-      kname, lib, kname,
-      {{&use_fp8, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
-
-  auto& enc = get_command_encoder_compat(d, s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_input_array(key, 0);
-  enc.set_input_array(value, 1);
-  enc.set_output_array(key_cache, 2);
-  enc.set_output_array(value_cache, 3);
-  enc.set_input_array(slot_mapping, 4);
-  enc.set_bytes(key_stride,   7);
-  enc.set_bytes(value_stride, 8);
-  enc.set_bytes(num_heads_i,  9);
-  enc.set_bytes(head_size_i,  10);
-  enc.set_bytes(block_size_i, 11);
-
-  int tpg = std::min(512, num_heads * head_size);
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(num_tokens, 1, 1),
-      MTL::Size::Make(tpg, 1, 1));
-
-  if (!from_primitive) {
-    add_temporary_compat(enc, key, d, s);
-    add_temporary_compat(enc, value, d, s);
-    add_temporary_compat(enc, key_cache, d, s);
-    add_temporary_compat(enc, value_cache, d, s);
-    add_temporary_compat(enc, slot_mapping, d, s);
-  }
-}
-
-void reshape_and_cache_impl(
-    nb::handle key_h, nb::handle value_h,
-    nb::handle key_cache_h, nb::handle value_cache_h,
-    nb::handle slot_mapping_h) {
-  dispatch_reshape_and_cache(
-      *nb::inst_ptr<array>(key_h), *nb::inst_ptr<array>(value_h),
-      *nb::inst_ptr<array>(key_cache_h), *nb::inst_ptr<array>(value_cache_h),
-      *nb::inst_ptr<array>(slot_mapping_h), default_stream(Device::gpu));
-}
-
-// ---------------------------------------------------------------------------
-// paged_attention_v1
-// ---------------------------------------------------------------------------
-
-void paged_attention_v1_impl(
-    nb::handle out_h,
-    nb::handle query_h,
-    nb::handle key_cache_h,
-    nb::handle value_cache_h,
-    int num_kv_heads,
-    float scale,
-    nb::handle block_tables_h,
-    nb::handle seq_lens_h,
-    int block_size,
-    int max_seq_len
-) {
-  auto& out          = *nb::inst_ptr<array>(out_h);
-  auto& query        = *nb::inst_ptr<array>(query_h);
-  auto& key_cache    = *nb::inst_ptr<array>(key_cache_h);
-  auto& value_cache  = *nb::inst_ptr<array>(value_cache_h);
-  auto& block_tables = *nb::inst_ptr<array>(block_tables_h);
-  auto& seq_lens     = *nb::inst_ptr<array>(seq_lens_h);
-
-  auto s = default_stream(Device::gpu);
-  auto& d = metal::device(Device::gpu);
-
-  int num_seqs   = static_cast<int>(query.shape(0));
-  int num_heads  = static_cast<int>(query.shape(1));
-  int head_size  = static_cast<int>(query.shape(2));
-  int max_blocks = static_cast<int>(block_tables.shape(1));
-
-  // Kernel name
-  auto dt = dtype_to_metal(query.dtype());
-  std::string kname =
-      "paged_attention_" + dt + "_cache_" + dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps0";
-
-  // Function constants
-  bool use_partitioning = false;
-  bool use_alibi        = false;
-  bool use_fp8          = false;
-  bool use_sinks        = false;
-
-  auto* lib = d.get_library("paged_attention_kern");
-  auto* kernel = d.get_kernel(
-      kname, lib, kname,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
-       {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
-       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
-
-  // Threadgroup shared memory
-  constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  int padded_ctx = ((max_seq_len + block_size - 1) / block_size) * block_size;
-  int logits_bytes  = padded_ctx * static_cast<int>(sizeof(float));
-  int outputs_bytes = (NUM_THREADS / NUM_SIMD_LANES / 2)
-                      * head_size * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(std::max(logits_bytes, outputs_bytes));
-
-  // Dispatch
-  auto& enc = get_command_encoder_compat(d, s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_threadgroup_memory_length(shmem, 0);
-
-  // Buffer bindings (match paged_attention.metal signature)
-  // 0: exp_sums   — skipped (v1, no partitioning)
-  // 1: max_logits — skipped
-  enc.set_output_array(out,         2);
-  enc.set_input_array(query,        3);
-  enc.set_input_array(key_cache,    4);
-  enc.set_input_array(value_cache,  5);
-  // 6: k_scale    — skipped (no FP8)
-  // 7: v_scale    — skipped
-
-  int32_t nkv = static_cast<int32_t>(num_kv_heads);
-  enc.set_bytes(nkv,   8);
-  enc.set_bytes(scale, 9);
-  float softcapping = 1.0f;
-  enc.set_bytes(softcapping, 10);
-
-  enc.set_input_array(block_tables, 11);
-  enc.set_input_array(seq_lens,     12);
-
-  int32_t max_blocks_i = static_cast<int32_t>(max_blocks);
-  enc.set_bytes(max_blocks_i, 13);
-  // 14: alibi_slopes — skipped
-
-  // Strides (contiguous row-major)
-  // Cache layout: [num_blocks, block_size, num_kv_heads, head_size]
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
-  int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
-  enc.set_bytes(q_stride,        15);
-  enc.set_bytes(kv_block_stride, 16);
-  enc.set_bytes(kv_head_stride,  17);
-
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, num_seqs, 1),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
-
-  // Keep ALL referenced arrays alive until the command buffer completes
-  add_temporary_compat(enc, out, d, s);
-  add_temporary_compat(enc, query, d, s);
-  add_temporary_compat(enc, key_cache, d, s);
-  add_temporary_compat(enc, value_cache, d, s);
-  add_temporary_compat(enc, block_tables, d, s);
-  add_temporary_compat(enc, seq_lens, d, s);
-}
-
-// ---------------------------------------------------------------------------
 // paged_attention_v2_online — dispatch helper (used by PagedAttentionPrimitive)
 // ---------------------------------------------------------------------------
 
@@ -388,16 +185,44 @@ static void bind_paged_attn_buffers(
 }
 
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
-// Used for non-TurboQuant, non-FP8 paths when HEAD_SIZE ∈ {64, 96, 128, 192, 256}.
-static bool can_use_tiled_kernel(int head_size, bool use_turboquant,
-                                 Dtype query_dtype, Dtype k_cache_dtype) {
-  if (use_turboquant) return false;
-  if (query_dtype == float32) return false;
-  if (query_dtype != k_cache_dtype) return false;
-  // 80, 112: HD_TILES % NUM_SG(4) != 0.  512: exceeds 32KB threadgroup memory.
+// One TileConfig per supported HEAD_SIZE. NUM_THREADS = NUM_SG * 32.
+struct TileConfig {
+  int BQ;
+  int TILE_KV;
+  int NUM_THREADS;
+};
+
+// ─ How to add a new HEAD_SIZE ────────────────────────────────────────────
+// Budget: smem <= 32 KB (Apple Silicon per-threadgroup memory limit, M1-M4).
+// Formula:
+//   smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + 8) * 2 bytes
+//   where  BQ+2*TILE_KV = Q-rows + K-rows + V-rows
+//          HEAD_SIZE+8  = row stride (+8 = SMEM_PAD for bank-conflict
+//                                     avoidance; see pagedattention_tiled.metal)
+//          *2           = sizeof(bf16/half); fp8 KV would change this
+//
+// Constraints on (BQ, TILE_KV):
+//   BQ <= 2*TILE_KV       (O_smem fp32 reuses Q+K+V region at kernel exit)
+//   BQ / NUM_SG == 8      (each simdgroup owns 8 Q rows; 8x8 MMA fragment)
+//   HEAD_SIZE, TILE_KV multiples of 8
+// NUM_THREADS = NUM_SG * 32 (one Apple simdgroup = 32 lanes).
+//
+// HEAD_SIZE -> (BQ, TILE_KV, NUM_THREADS, NUM_SG, smem):
+//   64, 96, 128 -> (32, 32, 128, 4, 24-26 KB)
+//   256         -> (16, 16,  64, 2,   25.3 KB)
+//   512         -> ( 8,  8,  32, 1,   24.9 KB)  // no in-threadgroup SG parallelism
+// 80, 112 excluded by HD_TILES % NUM_SG(4) == 0.
+// ─────────────────────────────────────────────────────────────────────────
+static std::optional<TileConfig> select_tile_config(int head_size) {
   switch (head_size) {
-    case 64: case 96: case 128: case 192: case 256: return true;
-    default: return false;
+    case 64: case 96: case 128:
+      return TileConfig{32, 32, 128};
+    case 256:
+      return TileConfig{16, 16, 64};
+    case 512:
+      return TileConfig{8, 8, 32};
+    default:
+      return std::nullopt;
   }
 }
 
@@ -407,35 +232,38 @@ static void dispatch_paged_attention_tiled(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window, Stream s) {
+    int block_size, int max_seq_len, int sliding_window,
+    TileConfig cfg, Stream s) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  constexpr int BQ = 8;
-  int total_q_blocks = total_q_tokens / BQ + num_seqs;
+  int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
 
   auto dt = dtype_to_metal(query.dtype());
   std::string kname =
       "paged_attention_tiled_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_bq8_tk32_nt128";
+      "_bq" + std::to_string(cfg.BQ) +
+      "_tk" + std::to_string(cfg.TILE_KV) +
+      "_nt" + std::to_string(cfg.NUM_THREADS);
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(kname, lib, kname, {});
 
-  constexpr int NUM_THREADS = 128;
-  constexpr int TILE_KV = 32;
-  int t_size = 2;  // half or bfloat16
+  const int t_size = static_cast<int>(query.itemsize());
+  // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
+  // Output staging reuses Q_smem as fp32 O_smem at exit; fits because
+  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV.
+  // A1: leading dim padded by 16 B for bank-conflict avoidance —
+  // smem_pad/ld MUST match SMEM_PAD/LD in pagedattention_tiled.metal.
+  const int smem_pad = 16 / t_size;
+  const int ld       = head_size + smem_pad;
   size_t shmem = static_cast<size_t>(
-      BQ * head_size * t_size          // Q_smem
-      + TILE_KV * head_size * t_size   // KV_smem
-      + BQ * TILE_KV * 4               // S_smem (float); P aliases in-place
-      + BQ * head_size * 4             // O_smem (float)
-      + 2 * BQ * 4);                   // M, L (float)
+      (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = get_command_encoder_compat(d, s);
@@ -449,7 +277,7 @@ static void dispatch_paged_attention_tiled(
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_blocks, 1),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
+      MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
 static void dispatch_paged_attention_v2_online(
@@ -475,14 +303,17 @@ static void dispatch_paged_attention_v2_online(
   int total_q_tokens = static_cast<int>(query.shape(0));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   bool has_prefill = total_q_tokens > num_seqs;
-  if (has_prefill && can_use_tiled_kernel(head_size, use_turboquant,
-                                          query.dtype(), key_cache.dtype())) {
-    dispatch_paged_attention_tiled(
-        out, query, key_cache, value_cache,
-        num_kv_heads, scale, softcap,
-        block_tables, seq_lens, cu_seqlens_q,
-        block_size, max_seq_len, sliding_window, s);
-    return;
+  bool dtype_ok = query.dtype() != float32
+               && query.dtype() == key_cache.dtype();
+  if (has_prefill && !use_turboquant && dtype_ok) {
+    if (auto cfg = select_tile_config(head_size)) {
+      dispatch_paged_attention_tiled(
+          out, query, key_cache, value_cache,
+          num_kv_heads, scale, softcap,
+          block_tables, seq_lens, cu_seqlens_q,
+          block_size, max_seq_len, sliding_window, *cfg, s);
+      return;
+    }
   }
 
   // Fallback: original per-token kernel
@@ -1145,10 +976,6 @@ void gdn_linear_attention_impl(
 NB_MODULE(_paged_ops, m) {
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
 
-  m.def("init_libraries", &init_libraries,
-        nb::arg("reshape_src"), nb::arg("paged_attn_src"),
-        "JIT-compile the vendored Metal shaders.");
-
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),
         "JIT-compile the v2 online-softmax Metal shader.");
@@ -1156,12 +983,6 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),
         "JIT-compile the GDN linear attention Metal shader.");
-
-  m.def("reshape_and_cache", &reshape_and_cache_impl,
-        nb::arg("key"), nb::arg("value"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("slot_mapping"),
-        "Write projected K/V into the paged cache.");
 
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
@@ -1226,14 +1047,6 @@ NB_MODULE(_paged_ops, m) {
         "QUANT_PARAMS (signed q8_0/int8 at k_bits=8; unsigned uint8/q5_0/"
         "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
         "any v_bits in [1, 8] via the v_centroids buffer.");
-
-  m.def("paged_attention_v1", &paged_attention_v1_impl,
-        nb::arg("out"), nb::arg("query"),
-        nb::arg("key_cache"), nb::arg("value_cache"),
-        nb::arg("num_kv_heads"), nb::arg("scale"),
-        nb::arg("block_tables"), nb::arg("seq_lens"),
-        nb::arg("block_size"), nb::arg("max_seq_len"),
-        "Zero-copy paged attention (v1, no partitioning).");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.

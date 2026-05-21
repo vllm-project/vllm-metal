@@ -17,6 +17,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_metal.metal import warm_up_kernels
 from vllm_metal.metal_kernel_backend.attention_linear import (
     GDNPagedAttentionWrapper,
     is_linear_attention,
@@ -27,7 +28,6 @@ from vllm_metal.metal_kernel_backend.paged_attention import (
     MetalKernelPagedAttentionWrapper,
 )
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_backend.mha import warm_up_paged_cache
 from vllm_metal.paged_attention_common import find_attn_attr, find_layers
 
 logger = init_logger(__name__)
@@ -188,10 +188,8 @@ class HybridPagedAttentionBackend:
 
             if isinstance(attn, MetalKernelPagedAttentionWrapper):
                 # Already patched (cached model reuse) — refresh cache refs
-                object.__setattr__(attn, "_mk_kv_cache", kv_cache)
-                object.__setattr__(attn, "_mk_block_size", self._block_size)
                 cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
-                object.__setattr__(attn, "_mk_cache_idx", cache_idx)
+                attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
                 patched += 1
             elif isinstance(attn, GDNPagedAttentionWrapper):
                 # Already patched — refresh state cache ref
@@ -217,7 +215,8 @@ class HybridPagedAttentionBackend:
         return patched
 
     def warm_up(self) -> None:
-        warm_up_paged_cache(self._require_initialized("warm_up"))
+        self._require_initialized("warm_up")
+        warm_up_kernels()
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks

@@ -23,4 +23,4 @@ vllm-rs serve Qwen/Qwen3-0.6B
 
 ## Caveat: integration direction
 
-Use `vllm-rs serve` (Rust binary spawns Python engine) on bundled vllm 0.20.2. The reverse direction `VLLM_USE_RUST_FRONTEND=1 vllm serve` requires an upstream vLLM hook that has not landed yet.
+Use `vllm-rs serve` (Rust binary spawns Python engine) on bundled vllm 0.21.0. The reverse direction `VLLM_USE_RUST_FRONTEND=1 vllm serve` requires an upstream vLLM hook that has not landed yet.

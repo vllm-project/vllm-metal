@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
 import mlx.core as mx
+import numpy as np
 import torch
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
@@ -36,12 +37,15 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.multimodal import merge_multimodal_embeddings
+from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
+    get_context,
     prepare_unified,
 )
 from vllm_metal.stt.runtime import STTRuntimeAdapter
@@ -132,6 +136,9 @@ class RequestState:
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
     lora_id: int | None = None
+    # Decode reconstructs M-RoPE positions as
+    # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
+    mrope_position_delta: int | None = None
 
 
 class PrefillRequest(NamedTuple):
@@ -216,6 +223,9 @@ class _PagedForwardState(NamedTuple):
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
     num_decode_tokens: int
+    # ``{req_id: mrope_position_delta}`` from paged mm prefill;
+    # ``_sample_paged_batch`` stashes each onto ``RequestState``.
+    mm_prefill_deltas: dict[str, int]
 
 
 class MetalModelRunner:
@@ -459,12 +469,44 @@ class MetalModelRunner:
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
         backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_states()
+        mx.eval(*self._gdn_updated_state_arrays())
+
+    def _gdn_updated_state_arrays(self) -> list[mx.array]:
+        """Return GDN state arrays updated by a hybrid forward pass.
+
+        Each GDN layer updates conv and recurrent state either in the stable
+        pool or in a compact pending handoff that the next lazy decode can
+        consume directly.  MLX evaluation is array-granular, so submit the
+        currently authoritative state arrays for each layer: compact pending
+        updates when present, otherwise the stable pools.
+        """
+
+        backend = self._paged_attention_backend
         if not isinstance(backend, HybridPagedAttentionBackend):
             raise RuntimeError("GDN state cache requires hybrid paged backend")
         sc = backend._state_cache
         if sc is None:
             raise RuntimeError("GDN state cache is not initialized")
-        mx.eval(*sc.conv_states, *sc.recurrent_states)
+        return sc.updated_state_arrays()
+
+    def _submit_paged_forward_outputs(
+        self,
+        logits: mx.array,
+        *,
+        has_prefill: bool,
+        target_hidden_states: mx.array | None = None,
+    ) -> None:
+        """Submit logits, hidden states, and GDN state side effects."""
+        outputs = [logits]
+        if target_hidden_states is not None:
+            outputs.append(target_hidden_states)
+        if has_prefill and isinstance(
+            self._paged_attention_backend, HybridPagedAttentionBackend
+        ):
+            outputs.extend(self._gdn_updated_state_arrays())
+        mx.async_eval(*outputs)
 
     def _gdn_release_slots(self, req_ids: set[str]) -> None:
         """Release finished GDN slots and defer state materialization."""
@@ -477,6 +519,9 @@ class MetalModelRunner:
         if not freed_slots:
             return
 
+        backend = self._paged_attention_backend
+        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+            backend._state_cache.apply_pending_states()
         self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
 
@@ -588,10 +633,9 @@ class MetalModelRunner:
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
 
-        When paged attention is enabled, also loads the HF Metal kernel and
-        runs a tiny ``reshape_and_cache`` to force Metal library creation.
-        This catches Metal language-version incompatibilities at startup
-        rather than during the first real inference request.
+        Paged-attention Metal/MLX kernels JIT-compile lazily on first use,
+        so the paged backend's ``warm_up`` is a no-op; this method only runs
+        a small dummy forward pass.
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
@@ -859,6 +903,24 @@ class MetalModelRunner:
             )
         )
 
+        # Fail fast on mm requests reaching the paged path without a
+        # forward-ready adapter: continuation chunks whose vision features
+        # were encoded earlier have no scheduled encoder input and would
+        # otherwise slip through to the text path.
+        has_mm_prefill = any(self._is_mm_request(pr.req_id) for pr in prefill_reqs)
+        has_mm_decode = any(
+            state.mrope_position_delta is not None for _, state in decode_reqs
+        )
+        has_mm = has_mm_prefill or has_mm_decode
+        adapter = self._multimodal_adapter
+        if has_mm and (adapter is None or not adapter.forward_ready):
+            raise RuntimeError(
+                "Paged forward saw a multimodal request but the adapter is "
+                "not forward_ready; this indicates a misconfigured adapter "
+                "or a bookkeeping bug — only forward-ready adapters should "
+                "let mm requests reach paged forward."
+            )
+
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
 
@@ -889,8 +951,6 @@ class MetalModelRunner:
 
         # ---- GDN slot mapping (hybrid models) ----
         if self.is_hybrid:
-            from vllm_metal.paged_attention_common import get_context
-
             ctx = get_context()
             if ctx is not None:
                 gdn_slots = []
@@ -904,25 +964,39 @@ class MetalModelRunner:
         # ---- forward (lazy graph + async submit) ----
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
+        mm_prefill_deltas: dict[str, int] = {}
         try:
-            target_output = self._target_forward(
-                input_ids,
-                cache=offset_caches,
-                collect_hidden_states=collect_target_hidden_states,
-            )
-            logits = target_output.logits
-            target_hidden_states = target_output.hidden_states
-            # Keep only logits and the optional row-major hidden states before
-            # scheduling evaluation.
-            del target_output
+            if has_mm:
+                model_output, mm_prefill_deltas = self._run_mm_paged_forward(
+                    input_ids,
+                    offset_caches,
+                    prefill_reqs,
+                    decode_segments,
+                )
+                logits = self._extract_logits(model_output)
+                target_hidden_states = None
+                del model_output
+            else:
+                target_output = self._target_forward(
+                    input_ids,
+                    cache=offset_caches,
+                    collect_hidden_states=collect_target_hidden_states,
+                )
+                logits = target_output.logits
+                target_hidden_states = target_output.hidden_states
+                del target_output
         finally:
             clear_context()
 
-        # Submit to GPU — returns immediately, GPU runs in background
-        if target_hidden_states is not None:
-            mx.async_eval(logits, target_hidden_states)
-        else:
-            mx.async_eval(logits)
+        # Submit to GPU — returns immediately, GPU runs in background.
+        # For GDN prefill, state-cache updates are side effects that the logits
+        # graph does not necessarily force. Submit them with logits and any
+        # target hidden states retained for assistant decoding.
+        self._submit_paged_forward_outputs(
+            logits,
+            target_hidden_states=target_hidden_states,
+            has_prefill=bool(prefill_reqs),
+        )
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -941,6 +1015,7 @@ class MetalModelRunner:
             cu_seqlens=cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
+            mm_prefill_deltas=mm_prefill_deltas,
         )
 
     def _sample_paged_batch(
@@ -952,19 +1027,20 @@ class MetalModelRunner:
         Consumes state stashed by ``_start_paged_forward``.
         Returns ``(batch, scheduler_output)`` for the caller to finalize.
         """
-        state = self._execute_model_state
-        assert state is not None
+        paged_state = self._execute_model_state
+        assert paged_state is not None
         self._execute_model_state = None
-        batch = state.batch
-        prefill_reqs = state.prefill_reqs
-        decode_reqs = state.decode_reqs
-        scheduler_output = state.scheduler_output
-        logits = state.logits
-        target_hidden_states = state.target_hidden_states
-        cu_seqlens = state.cu_seqlens
-        decode_segments = state.decode_segments
+        batch = paged_state.batch
+        prefill_reqs = paged_state.prefill_reqs
+        decode_reqs = paged_state.decode_reqs
+        scheduler_output = paged_state.scheduler_output
+        logits = paged_state.logits
+        target_hidden_states = paged_state.target_hidden_states
+        cu_seqlens = paged_state.cu_seqlens
+        decode_segments = paged_state.decode_segments
         num_decode_segments = len(decode_segments)
-        num_decode_tokens = state.num_decode_tokens
+        num_decode_tokens = paged_state.num_decode_tokens
+        mm_prefill_deltas = paged_state.mm_prefill_deltas
         has_scheduled_drafts = any(
             segment.draft_token_ids for segment in decode_segments
         )
@@ -1119,6 +1195,7 @@ class MetalModelRunner:
                 continue
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
+            mm_delta = mm_prefill_deltas.get(prefill.req_id)
             if entry.result_mode == "new_final":
                 prompt_len = prefill.prompt_len
                 assert prompt_len is not None
@@ -1136,12 +1213,17 @@ class MetalModelRunner:
                     generated_tokens=1,
                     block_ids=prefill.block_ids,
                     lora_id=prefill.lora_id,
+                    mrope_position_delta=mm_delta,
                 )
                 continue
 
             req_state = self._request_states[prefill.req_id]
             req_state.token_ids.append(next_token)
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
+            if mm_delta is not None:
+                # Stash the freshly computed delta so the next decode round
+                # routes through the mm path.
+                req_state.mrope_position_delta = mm_delta
 
         for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
             logprobs = (
@@ -1174,6 +1256,26 @@ class MetalModelRunner:
         self.encoder_cache.remove_request(req_id)
         self.encoder_cache.add_request(req_id, new_req.mm_features)
 
+    def _pre_register_new_request_mm_features(
+        self, new_reqs: list[NewRequestData]
+    ) -> None:
+        """Register mm_features for new requests before encoder dispatch.
+
+        The vLLM scheduler can place a brand-new multimodal request and its
+        first ``scheduled_encoder_inputs`` in the same ``SchedulerOutput``.
+        Encoder dispatch looks the request's mm_features up by ``req_id``,
+        so registration must happen before
+        :meth:`_reject_scheduled_encoder_inputs`, not later inside
+        :meth:`_handle_new_requests`.  Only the lightweight mm-features
+        bookkeeping is moved up; per-request prefill scheduling remains in
+        ``_handle_new_requests`` so the fail-fast checks still guard the
+        real model work.
+        """
+        if self.encoder_cache is None:
+            return
+        for new_req in new_reqs:
+            self._register_new_request_mm_features(new_req.req_id, new_req)
+
     def _remove_request_mm_features(self, req_id: str) -> None:
         """Drop request-scoped multimodal feature metadata."""
         if self.encoder_cache is not None:
@@ -1197,8 +1299,20 @@ class MetalModelRunner:
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
-        """Fail fast until encoder execution and embedding splice are wired."""
+        """Dispatch to vision encoders or fail fast based on adapter state.
+
+        When the active adapter signals ``forward_ready``, scheduled encoder
+        inputs are routed to :meth:`_run_vision_encoders`.  Until Phase 4
+        flips that flag for the parity-tested model, the gate raises so
+        partial work on a new model never disturbs models already in
+        production.  Phase 5+ adapters land at ``False`` and route through
+        this guard until each one's parity test passes.
+        """
         if not scheduled_encoder_inputs:
+            return
+        adapter = self._multimodal_adapter
+        if adapter is not None and adapter.forward_ready:
+            self._run_vision_encoders(scheduled_encoder_inputs)
             return
         raise NotImplementedError(
             "Multimodal encoder execution is not wired on Metal yet. "
@@ -1233,6 +1347,270 @@ class MetalModelRunner:
             logitsprocs=self._logitsprocs,
         )
 
+    def _run_vision_encoders(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+    ) -> None:
+        """Run the vision encoder for each scheduled feature, stash by identifier.
+
+        Skips features whose ``identifier`` already lives in
+        ``encoder_cache.encoder_outputs`` (cache hit; the scheduler may
+        re-list a feature across chunks).  Calls
+        ``adapter.encode_multimodal`` one feature at a time so a single bad
+        feature is reported with a precise req_id+idx rather than poisoning
+        a whole request batch.
+        """
+        adapter = self._multimodal_adapter
+        cache = self.encoder_cache
+        if adapter is None or cache is None:
+            return
+        for req_id, feature_indices in scheduled_encoder_inputs.items():
+            mm_features = cache.mm_features.get(req_id)
+            if mm_features is None:
+                raise RuntimeError(
+                    f"Scheduled encoder input for unregistered request "
+                    f"{req_id!r}; encoder cache mm_features missing."
+                )
+            for idx in feature_indices:
+                if idx < 0 or idx >= len(mm_features):
+                    raise IndexError(
+                        f"Encoder feature index {idx} out of range for "
+                        f"request {req_id!r} with {len(mm_features)} features."
+                    )
+                feature = mm_features[idx]
+                if feature.identifier in cache.encoder_outputs:
+                    continue
+                outputs = adapter.encode_multimodal([feature])
+                if len(outputs) != 1:
+                    raise RuntimeError(
+                        f"encode_multimodal returned {len(outputs)} outputs "
+                        "for 1 feature; adapter must return one result per "
+                        "feature."
+                    )
+                cache.encoder_outputs[feature.identifier] = outputs[0]
+
+    def _run_mm_paged_forward(
+        self,
+        input_ids: mx.array,
+        offset_caches: list[OffsetCache],
+        prefill_reqs: list[PrefillRequest],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+    ) -> tuple[Any, dict[str, int]]:
+        """Run paged forward through ``adapter.call_lm`` with packed splice.
+
+        Builds per-segment M-RoPE positions (sliced out of the full-prompt
+        positions for mm prefill chunks, computed as ``cache_start_pos +
+        delta + arange(num_query_tokens)`` for mm decode), splices vision
+        embeds into the packed text embeds at placeholder positions
+        (chunk-aware: each feature only contributes the slice that lands
+        in *this* chunk), and concatenates per-layer deepstack residual
+        arrays across all mm prefill segments in packed order.
+
+        Sets ``ctx.segment_positions`` so ``apply_packed_rope`` reads
+        caller-supplied positions on mm segments and falls back to the
+        int-offset arange path on text segments.
+
+        Any speculative-decode segment in the batch is rejected up
+        front: a decode request with ``num_query_tokens > 1`` makes
+        ``prepare_unified`` append one ``cu_seqlens`` entry per query
+        token, but ``ctx.segment_positions`` carries one entry per
+        ``PagedDecodeSegment``.  The mismatch corrupts M-RoPE positions
+        for every segment packed after the draft — including text-only
+        spec decode that happens to share the batch with an mm prefill,
+        since the whole batch still routes through this method.
+        Lifting the restriction is tracked as a follow-up to RFC #319.
+        """
+        adapter = self._multimodal_adapter
+        assert adapter is not None and adapter.forward_ready
+        encoder_cache = self.encoder_cache
+        assert encoder_cache is not None
+
+        for segment in decode_segments:
+            if segment.num_query_tokens > 1:
+                raise NotImplementedError(
+                    "Speculative decode is not supported on the multimodal "
+                    "paged path yet: prepare_unified() expands a decode "
+                    "segment with num_query_tokens > 1 into one cu_seqlens "
+                    "span per query token, but ctx.segment_positions stores "
+                    "one entry per PagedDecodeSegment — cu_seqlens and "
+                    "segment_positions would misalign for every segment "
+                    "packed after the draft, including text-only spec decode "
+                    "that shares the batch with an mm prefill.  Tracked as "
+                    "a follow-up to RFC #319."
+                )
+
+        # Full-prompt M-RoPE positions per mm prefill request.
+        mm_request_meta: dict[
+            str, tuple[mx.array, int, list[MultiModalFeatureSpec]]
+        ] = {}
+        for pr in prefill_reqs:
+            if not self._is_mm_request(pr.req_id):
+                continue
+            full_prompt = pr.full_prompt_token_ids
+            if full_prompt is None:
+                raise RuntimeError(
+                    f"mm prefill request {pr.req_id!r} reached paged forward "
+                    f"without full_prompt_token_ids; _build_prefill_pack bug."
+                )
+            mm_features = encoder_cache.mm_features.get(pr.req_id, [])
+            sorted_features = sorted(mm_features, key=lambda f: f.mm_position.offset)
+            full_positions, delta = adapter.get_mrope_input_positions(
+                full_prompt, sorted_features
+            )
+            mm_request_meta[pr.req_id] = (full_positions, delta, sorted_features)
+
+        total_len = int(input_ids.shape[1])
+        visual_pos_masks_np = np.zeros(total_len, dtype=bool)
+        mm_embeds_parts: list[mx.array] = []
+        deepstack_per_layer: list[list[mx.array]] = []
+        deepstack_present: bool | None = None
+        ctx_segment_positions: list[Any] = []
+        position_ids_parts: list[mx.array] = []
+        cursor = 0
+
+        for segment in decode_segments:
+            n = segment.num_query_tokens
+            state = self._request_states.get(segment.req_id)
+            is_mm_decode = state is not None and state.mrope_position_delta is not None
+            if is_mm_decode:
+                assert state is not None and state.mrope_position_delta is not None
+                offset_arr = np.arange(
+                    segment.cache_start_pos,
+                    segment.cache_start_pos + n,
+                    dtype=np.int32,
+                )
+                offset_arr = offset_arr + state.mrope_position_delta
+            else:
+                offset_arr = np.arange(
+                    segment.cache_start_pos,
+                    segment.cache_start_pos + n,
+                    dtype=np.int32,
+                )
+            seg_positions = mx.broadcast_to(
+                mx.array(offset_arr)[None, None, :], (3, 1, n)
+            )
+            ctx_segment_positions.append(seg_positions if is_mm_decode else None)
+            position_ids_parts.append(seg_positions)
+            cursor += n
+
+        for pr in prefill_reqs:
+            n = len(pr.token_ids)
+            if pr.req_id in mm_request_meta:
+                full_positions, _delta, sorted_features = mm_request_meta[pr.req_id]
+                seg_positions = full_positions[:, :, pr.start_pos : pr.start_pos + n]
+                ctx_segment_positions.append(seg_positions)
+                position_ids_parts.append(seg_positions)
+
+                for feature in sorted_features:
+                    f_start = feature.mm_position.offset
+                    f_end = f_start + feature.mm_position.length
+                    chunk_start = pr.start_pos
+                    chunk_end = pr.start_pos + n
+                    inter_start = max(f_start, chunk_start)
+                    inter_end = min(f_end, chunk_end)
+                    if inter_start >= inter_end:
+                        continue  # feature doesn't overlap this chunk
+                    length = inter_end - inter_start
+                    chunk_local = inter_start - chunk_start
+                    feature_local = inter_start - f_start
+
+                    result = encoder_cache.encoder_outputs.get(feature.identifier)
+                    if result is None:
+                        raise RuntimeError(
+                            f"Encoder output for feature {feature.identifier!r} "
+                            f"of request {pr.req_id!r} is missing; the encoder "
+                            f"gate should have populated it before prefill."
+                        )
+
+                    packed_start = cursor + chunk_local
+                    visual_pos_masks_np[packed_start : packed_start + length] = True
+
+                    mm_embeds_parts.append(
+                        result.hidden_states[feature_local : feature_local + length]
+                    )
+
+                    # Deepstack: same chunk-aware slice per layer.
+                    layers = result.deepstack_visual_embeds
+                    this_has = layers is not None
+                    if deepstack_present is None:
+                        deepstack_present = this_has
+                    elif deepstack_present != this_has:
+                        raise RuntimeError(
+                            f"Mixed deepstack presence across features for "
+                            f"request {pr.req_id!r}: either all features must "
+                            f"carry ``deepstack_visual_embeds`` or none.  "
+                            f"Partial deepstack would leave the LM with mask "
+                            f"positions that out-number the concatenated "
+                            f"residual rows."
+                        )
+                    if not this_has:
+                        continue
+                    assert layers is not None
+                    if not deepstack_per_layer:
+                        deepstack_per_layer = [
+                            [layer[feature_local : feature_local + length]]
+                            for layer in layers
+                        ]
+                    elif len(deepstack_per_layer) != len(layers):
+                        raise RuntimeError(
+                            f"Inconsistent deepstack layer count across "
+                            f"features for request {pr.req_id!r}: expected "
+                            f"{len(deepstack_per_layer)}, got {len(layers)}."
+                        )
+                    else:
+                        for layer_idx, layer in enumerate(layers):
+                            deepstack_per_layer[layer_idx].append(
+                                layer[feature_local : feature_local + length]
+                            )
+            else:
+                # text prefill: mark segment as None so attention uses the
+                # int-offset arange path.
+                offset_arr = np.arange(pr.start_pos, pr.start_pos + n, dtype=np.int32)
+                seg_positions = mx.broadcast_to(
+                    mx.array(offset_arr)[None, None, :], (3, 1, n)
+                )
+                ctx_segment_positions.append(None)
+                position_ids_parts.append(seg_positions)
+            cursor += n
+
+        inputs_embeds_text = adapter.embed_tokens(input_ids)
+        visual_pos_masks = mx.array(visual_pos_masks_np)[None, :]
+        if mm_embeds_parts:
+            inputs_embeds = merge_multimodal_embeddings(
+                inputs_embeds_text, mm_embeds_parts, visual_pos_masks
+            )
+        else:
+            inputs_embeds = inputs_embeds_text
+
+        deepstack_visual_embeds: Any | None = None
+        if deepstack_per_layer:
+            deepstack_visual_embeds = [
+                mx.concatenate(layer_parts, axis=0)
+                for layer_parts in deepstack_per_layer
+            ]
+
+        position_ids = mx.concatenate(position_ids_parts, axis=2)
+
+        # Hand per-segment positions to ``apply_packed_rope`` via the
+        # paged context, overriding the sequential-arange policy.
+        ctx = get_context()
+        if ctx is not None:
+            ctx.segment_positions = ctx_segment_positions
+
+        mm_prefill_deltas = {
+            req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
+        }
+
+        model_output = adapter.call_lm(
+            input_ids,
+            inputs_embeds,
+            offset_caches,
+            position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+        return model_output, mm_prefill_deltas
+
     def _handle_new_requests(
         self,
         batch: _ExecutionBatch,
@@ -1244,7 +1622,8 @@ class MetalModelRunner:
 
         for new_req in new_reqs:
             req_id = new_req.req_id
-            self._register_new_request_mm_features(req_id, new_req)
+            # mm_features were pre-registered before encoder dispatch in
+            # ``execute_model``; no further bookkeeping needed here.
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
 
@@ -1401,17 +1780,36 @@ class MetalModelRunner:
 
             batch.paged_decode_reqs.append((req_id, state))
 
+    def _is_mm_request(self, req_id: str) -> bool:
+        """Whether the request has multimodal features registered."""
+        if self.encoder_cache is None:
+            return False
+        return bool(self.encoder_cache.mm_features.get(req_id))
+
     def _build_prefill_pack(
         self,
         batch: _ExecutionBatch,
     ) -> list[PrefillRequest]:
-        """Reconstruct full prompt context for paged prefill requests."""
+        """Reconstruct full prompt context for paged prefill requests.
+
+        Continuation chunks (``start_pos > 0``) need the full prompt so
+        sampling metadata reflects the whole prefix, not just this chunk.
+        Multimodal requests need it at every chunk including the first —
+        ``adapter.get_mrope_input_positions`` must see the whole prompt
+        to compute correct M-RoPE positions for image placeholders, then
+        a later commit slices the chunk-relevant range.  Both conditions
+        share the same two-source resolution (RequestState first, new_req
+        fallback) and the same contract-bug raises.
+        """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
             prefill = entry.prefill
             full_prompt = None
 
-            if prefill.start_pos > 0:
+            needs_full_prompt = prefill.start_pos > 0 or self._is_mm_request(
+                prefill.req_id
+            )
+            if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)
                 if state is not None:
                     full_prompt = state.token_ids[: state.prompt_len]
@@ -1419,16 +1817,19 @@ class MetalModelRunner:
                     new_req = batch.new_reqs_by_id.get(prefill.req_id)
                     if new_req is None:
                         raise RuntimeError(
-                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
-                            f"request {prefill.req_id!r} but it has no RequestState "
-                            "and is not in new_reqs. This is a state tracking bug."
+                            f"Need full prompt (start_pos={prefill.start_pos}, "
+                            f"mm={self._is_mm_request(prefill.req_id)}) for "
+                            f"request {prefill.req_id!r} but it has no "
+                            f"RequestState and is not in new_reqs. This is a "
+                            f"state tracking bug."
                         )
                     prompt_token_ids = new_req.prompt_token_ids
                     if prompt_token_ids is None:
                         raise RuntimeError(
-                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
-                            f"request {prefill.req_id!r} but prompt_token_ids is "
-                            "missing. This is a scheduler contract bug."
+                            f"Need full prompt (start_pos={prefill.start_pos}, "
+                            f"mm={self._is_mm_request(prefill.req_id)}) for "
+                            f"request {prefill.req_id!r} but prompt_token_ids "
+                            f"is missing. This is a scheduler contract bug."
                         )
                     full_prompt = list(prompt_token_ids)
 
@@ -1603,6 +2004,10 @@ class MetalModelRunner:
             evicted_req_ids,
             materialize_gdn_state=will_fail_fast_before_model_work,
         )
+        # Pre-register mm_features so a new request whose first encoder input
+        # lands in the same SchedulerOutput is already known to the encoder
+        # cache when dispatch runs.
+        self._pre_register_new_request_mm_features(scheduler_output.scheduled_new_reqs)
         self._reject_scheduled_encoder_inputs(scheduler_output.scheduled_encoder_inputs)
         if spec_decode_error is not None:
             raise spec_decode_error
