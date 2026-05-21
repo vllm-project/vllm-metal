@@ -1320,14 +1320,34 @@ class MetalModelRunner:
         caller-supplied positions on mm segments and falls back to the
         int-offset arange path on text segments.
 
-        Spec decode mm: when ``num_query_tokens > 1`` on a decode segment
-        whose request has ``mrope_position_delta`` set, draft-row
-        positions are filled as ``arange(cache_start_pos, ...) + delta``.
+        Any speculative-decode segment in the batch is rejected up
+        front: a decode request with ``num_query_tokens > 1`` makes
+        ``prepare_unified`` append one ``cu_seqlens`` entry per query
+        token, but ``ctx.segment_positions`` carries one entry per
+        ``PagedDecodeSegment``.  The mismatch corrupts M-RoPE positions
+        for every segment packed after the draft — including text-only
+        spec decode that happens to share the batch with an mm prefill,
+        since the whole batch still routes through this method.
+        Lifting the restriction is tracked as a follow-up to RFC #319.
         """
         adapter = self._multimodal_adapter
         assert adapter is not None and adapter.forward_ready
         encoder_cache = self.encoder_cache
         assert encoder_cache is not None
+
+        for segment in decode_segments:
+            if segment.num_query_tokens > 1:
+                raise NotImplementedError(
+                    "Speculative decode is not supported on the multimodal "
+                    "paged path yet: prepare_unified() expands a decode "
+                    "segment with num_query_tokens > 1 into one cu_seqlens "
+                    "span per query token, but ctx.segment_positions stores "
+                    "one entry per PagedDecodeSegment — cu_seqlens and "
+                    "segment_positions would misalign for every segment "
+                    "packed after the draft, including text-only spec decode "
+                    "that shares the batch with an mm prefill.  Tracked as "
+                    "a follow-up to RFC #319."
+                )
 
         # Full-prompt M-RoPE positions per mm prefill request.
         mm_request_meta: dict[

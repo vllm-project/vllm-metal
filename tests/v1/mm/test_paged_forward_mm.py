@@ -300,7 +300,14 @@ class TestMmDecodeSegmentPositions:
         # No visual mask positions on a decode token.
         assert call["visual_pos_masks"].tolist() == [[False]]
 
-    def test_spec_decode_multi_query_arange_plus_delta(self) -> None:
+    def test_spec_decode_for_mm_request_is_rejected(self) -> None:
+        # ``prepare_unified`` expands a decode segment with
+        # ``num_query_tokens > 1`` into one cu_seqlens span per query
+        # token, but ``_run_mm_paged_forward`` only stores one entry per
+        # ``PagedDecodeSegment`` in ``ctx.segment_positions``.  Until that
+        # mismatch is resolved (RFC #319 follow-up), spec decode on the
+        # mm paged path must fail fast instead of corrupting downstream
+        # M-RoPE positions for segments packed after the draft.
         adapter = _MmAdapter()
         runner = _runner(adapter)
         state = RequestState(
@@ -311,8 +318,6 @@ class TestMmDecodeSegmentPositions:
             mrope_position_delta=-3,
         )
         runner._request_states["req-mm"] = state
-        # 3 draft rows + 1 bonus row = 4 query tokens, cache_start_pos=5.
-        # Expected positions = arange(5, 5+4) + -3 = [2, 3, 4, 5] tiled.
         segment = PagedDecodeSegment(
             req_id="req-mm",
             input_token_ids=(6, 100, 101, 102),
@@ -326,20 +331,68 @@ class TestMmDecodeSegmentPositions:
             return_value=(segment,)
         )
 
-        runner._start_paged_forward(
-            batch=MagicMock(),
-            prefill_reqs=[],
-            decode_reqs=[("req-mm", state)],
-            scheduler_output=_scheduler_output(),
+        with pytest.raises(NotImplementedError, match="Speculative decode"):
+            runner._start_paged_forward(
+                batch=MagicMock(),
+                prefill_reqs=[],
+                decode_reqs=[("req-mm", state)],
+                scheduler_output=_scheduler_output(),
+            )
+        assert adapter.call_lm_calls == []
+
+    def test_text_spec_decode_alongside_mm_prefill_is_rejected(self) -> None:
+        # Mixed batch: an mm prefill forces the runner onto
+        # ``_run_mm_paged_forward``, and a text-only request with
+        # ``num_query_tokens > 1`` rides along.  Even though the text
+        # segment carries no ``mrope_position_delta``, prepare_unified
+        # still appends one cu_seqlens span per draft token while
+        # ``ctx.segment_positions`` keeps a single ``None`` for the
+        # whole segment — so the misalignment leaks into the mm prefill
+        # positions packed after it.  The guard must trigger on the
+        # segment regardless of mm-vs-text origin.
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        features = [_feature("img-0", offset=0, length=2)]
+        runner.encoder_cache.add_request("req-mm", features)
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+
+        text_state = RequestState(
+            token_ids=[1, 2, 3, 4, 5],
+            prompt_len=4,
+            cache=[],
+            sampling_params=SamplingParams(),
+            mrope_position_delta=None,
+        )
+        runner._request_states["req-text"] = text_state
+        text_segment = PagedDecodeSegment(
+            req_id="req-text",
+            input_token_ids=(5, 100, 101),
+            start_row=0,
+            num_query_tokens=3,
+            draft_token_ids=(100, 101),
+            cache_start_pos=4,
+            block_ids=(0,),
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=(text_segment,)
         )
 
-        call = adapter.call_lm_calls[0]
-        assert call["position_ids"].shape == (3, 1, 4)
-        assert call["position_ids"].tolist() == [
-            [[2, 3, 4, 5]],
-            [[2, 3, 4, 5]],
-            [[2, 3, 4, 5]],
-        ]
+        mm_prefill = _mm_prefill(
+            "req-mm",
+            token_ids=[99, 99],
+            prompt_len=2,
+            start_pos=0,
+            full_prompt=[99, 99],
+        )
+
+        with pytest.raises(NotImplementedError, match="Speculative decode"):
+            runner._start_paged_forward(
+                batch=MagicMock(),
+                prefill_reqs=[mm_prefill],
+                decode_reqs=[("req-text", text_state)],
+                scheduler_output=_scheduler_output(),
+            )
+        assert adapter.call_lm_calls == []
 
 
 class TestMixedMmAndText:
@@ -362,6 +415,7 @@ class TestMixedMmAndText:
         def capturing_call_lm(*args, **kwargs):
             ctx = get_context()
             captured_ctx["segment_positions"] = list(ctx.segment_positions)
+            captured_ctx["cu_seqlens"] = list(ctx.cu_seqlens)
             return original_call_lm(*args, **kwargs)
 
         adapter.call_lm = capturing_call_lm  # type: ignore[method-assign]
@@ -392,8 +446,13 @@ class TestMixedMmAndText:
         )
 
         seg_positions = captured_ctx["segment_positions"]
+        cu_seqlens = captured_ctx["cu_seqlens"]
         # Two prefill segments: mm first, then text.
         assert len(seg_positions) == 2
+        # ``apply_packed_rope`` iterates ``range(len(cu_seqlens) - 1)`` and
+        # indexes ``segment_positions[i]``; these two must stay in lockstep
+        # or M-RoPE positions slip onto the wrong segment.
+        assert len(seg_positions) == len(cu_seqlens) - 1
         # mm segment: caller-supplied positions (shape (3, 1, 2)).
         assert seg_positions[0] is not None
         assert seg_positions[0].shape == (3, 1, 2)
