@@ -369,10 +369,32 @@ class TestTextModel:
         assert adapter.text_model(model) is model
 
 
+class _Qwen35LanguageModelStub:
+    """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
+
+    Also exposes ``self.model.embed_tokens`` to mirror the bottom-level
+    embedding callable the real LM holds — ``from_loaded_model`` resolves
+    it at load time.
+    """
+
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+
+    def __call__(
+        self,
+        inputs: object,
+        inputs_embeds: object | None = None,
+        cache: object | None = None,
+        position_ids: object | None = None,
+        mask: object | None = None,
+    ) -> None:
+        return None
+
+
 class TestBuildMultimodalAdapter:
     def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
         vision_tower = object()
-        language_model = object()
+        language_model = _Qwen35LanguageModelStub()
         model = SimpleNamespace(
             config=SimpleNamespace(
                 vision_config=SimpleNamespace(spatial_merge_size=2),
@@ -393,7 +415,7 @@ class TestBuildMultimodalAdapter:
                 vision_config=SimpleNamespace(spatial_merge_size=2),
             ),
             vision_tower=object(),
-            language_model=object(),
+            language_model=_Qwen35LanguageModelStub(),
         )
         hf_config = SimpleNamespace(
             model_type="custom",

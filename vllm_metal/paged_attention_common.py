@@ -56,6 +56,11 @@ class PagedAttentionContext:
     # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
     # without reverse-engineering one-token segments from ``cu_seqlens``.
     num_decode_requests: int = 0
+    # Per-segment caller-supplied M-RoPE positions: each entry is either
+    # ``None`` (use ``offsets[i]`` with sequential arange) or an
+    # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
+    # per-segment handling entirely.
+    segment_positions: list[Any] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

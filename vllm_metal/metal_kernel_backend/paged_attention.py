@@ -72,6 +72,22 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
 
+    def rebind_cache(
+        self,
+        kv_cache: MetalPagedKVCache,
+        block_size: int,
+        *,
+        cache_idx: int | None = None,
+    ) -> None:
+        """Rebind wrapper-owned paged-cache state in one place."""
+        object.__setattr__(self, "_mk_kv_cache", kv_cache)
+        object.__setattr__(self, "_mk_block_size", block_size)
+        object.__setattr__(
+            self,
+            "_mk_cache_idx",
+            cache_idx if cache_idx is not None else self._mk_layer_idx,
+        )
+
     def __call__(
         self,
         x: mx.array,
@@ -96,7 +112,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         # SDPA attention via Metal kernel.
         # Pass shared_kv for YOCO KV sharing (Gemma4: later layers reuse
         # K/V from earlier same-type layers instead of projecting their own).
+        has_shared_kv = "shared_kv" in kwargs
         shared_kv = kwargs.get("shared_kv")
+
         output, kv_pair = sdpa_forward(
             inner,
             x,
@@ -107,8 +125,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.
-        # Key off shared_kv presence — it's the definitive YOCO indicator.
-        if "shared_kv" in kwargs:
+        # Key off shared_kv presence to match mlx_lm's fixed attention
+        # signature for Gemma4 YOCO layers.
+        if has_shared_kv:
             return (output, kv_pair, kwargs.get("offset", 0))
 
         return output
@@ -157,18 +176,17 @@ def patch_model_attention_metal_kernel(
             continue
 
         attn = getattr(layer, attn_attr)
-        if isinstance(attn, MetalKernelPagedAttentionWrapper):
-            # Already patched — update cache reference
-            object.__setattr__(attn, "_mk_kv_cache", kv_cache)
-            object.__setattr__(attn, "_mk_block_size", block_size)
-            patched += 1
-            continue
-
         cache_idx = (
             cache_idx_map[layer_idx]
             if cache_idx_map is not None and layer_idx in cache_idx_map
             else layer_idx
         )
+        if isinstance(attn, MetalKernelPagedAttentionWrapper):
+            # Already patched — update cache reference
+            attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx)
+            patched += 1
+            continue
+
         wrapper = MetalKernelPagedAttentionWrapper(
             attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
         )

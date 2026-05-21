@@ -101,6 +101,16 @@ inline float frag_row_reduce(float v) {
   return v;
 }
 
+// Load unit for the cooperative K/V copy. Metal has no native vec<T,8>, so
+// K/V bytes are bit-copied through uint2 (64-bit) / uint4 (128-bit) — native
+// vectors that lower 1:1 to one wide load/store. A uint8_t[N] struct would
+// rely on the optimizer to coalesce (and the zero-store could degrade to a
+// memset loop). MLX steel BlockLoader pattern,
+// mlx/backend/metal/kernels/steel/attn/loader.h.
+template <int NBYTES> struct LoadUnit;
+template <> struct LoadUnit<8>  { using type = uint2; };
+template <> struct LoadUnit<16> { using type = uint4; };
+
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -249,23 +259,34 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // threadgroup will produce, we can stop.
     if (tile_start > context_len + q_pos_start + valid_q - 1) break;
 
-    // ─ Load K AND V cooperatively (paged, fused, vec2-vectorized) ─────
+    // ─ Load K AND V cooperatively (paged, fused, wide-vectorized) ────
     // Both K_smem and V_smem are filled in the same loop:
     //   * block_table lookup is shared (same kv_pos for both K and V)
     //   * memory controller interleaves K and V reads from the same
     //     physical block, hiding K-load latency behind V-load and v.v.
     //   * saves a barrier vs loading them separately
     //
-    // vec<T,2> loads halve the number of load/store instructions issued.
-    // For HEAD_SIZE=64 with 32 lanes: each lane does 1 vec2 = 4 bytes per
-    // token, covering all 64 channels.  HEAD_SIZE=128: 2 vec2 per lane.
+    // Cooperative K/V load width scales with HEAD_SIZE: 128-bit (16 B)
+    // transactions for HEAD_SIZE >= 256 (Gemma 4's 256/512), 64-bit (8 B)
+    // for <= 128.  Metal has no native vec<T,8>, so the 16 B path needs
+    // the LoadUnit byte-struct + reinterpret pattern; the 8 B path could
+    // equivalently be vec<T,4>, but we route both through LoadUnit for
+    // uniformity.
     //
-    // Alignment: every contributing stride (kv_block_stride, kv_token_stride,
-    // kv_head_stride = HEAD_SIZE) is even because HEAD_SIZE is a multiple
-    // of 8, so `off` and `lane*VEC` are both even → 4-byte aligned vec2.
-    static_assert(HEAD_SIZE % 2 == 0, "HEAD_SIZE must be even for vec2 loads");
-    constexpr int VEC = 2;
-    using vec2T = vec<T, VEC>;
+    // Strided layout preserved (lane owns d=lane*VEC, stride NUM_SIMD_LANES
+    // *VEC): consecutive lanes touch consecutive VEC-element runs -> reads
+    // stay coalesced, and all 32 lanes stay active at 256/512.
+    //
+    // Alignment (verified for HEAD_SIZE in {64,96,128,256,512}): device
+    // `off` is a multiple of HEAD_SIZE elems; smem stride LD=HEAD_SIZE+8;
+    // both make `&[t*LD + lane*VEC]` a multiple of VEC_BYTES.
+    constexpr int VEC_BYTES = (HEAD_SIZE >= 256) ? 16 : 8;
+    constexpr int VEC = VEC_BYTES / int(sizeof(T));
+    using vecLoadT = typename LoadUnit<VEC_BYTES>::type;  // uint2 / uint4
+    // Guards the alignment claimed above: LD%VEC==0 keeps every
+    // &K_smem[t*LD + lane*VEC] a multiple of VEC_BYTES (device side is
+    // aligned via `off`, a multiple of HEAD_SIZE).
+    static_assert(LD % VEC == 0, "smem row stride LD must be VEC-aligned");
     #pragma unroll
     for (int t_iter = 0; t_iter < TILE_KV / NUM_SG; t_iter++) {
       int t = sg_idx * (TILE_KV / NUM_SG) + t_iter;
@@ -279,17 +300,17 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
         const device T *v_ptr = v_cache + off;
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * LD + d]) =
-              *((const device vec2T *)(k_ptr + d));
-          *((threadgroup vec2T *)&V_smem[t * LD + d]) =
-              *((const device vec2T *)(v_ptr + d));
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) =
+              *((const device vecLoadT *)(k_ptr + d));
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) =
+              *((const device vecLoadT *)(v_ptr + d));
         }
       } else {
-        const vec2T zero(T(0));
+        const vecLoadT zero = {};  // all-zero bits == +0.0 in half/bf16
         #pragma unroll
         for (int d = lane * VEC; d < HEAD_SIZE; d += NUM_SIMD_LANES * VEC) {
-          *((threadgroup vec2T *)&K_smem[t * LD + d]) = zero;
-          *((threadgroup vec2T *)&V_smem[t * LD + d]) = zero;
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) = zero;
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) = zero;
         }
       }
     }
@@ -486,12 +507,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
 // ─── Template instantiation ──────────────────────────────────────────────
 
-#define instantiate_paged_attention_tiled_inner(type, head_size, block_size)   \
+#define instantiate_paged_attention_tiled_inner(type, head_size, block_size,   \
+                                                bq, tkv, nt)                   \
   template [[host_name("paged_attention_tiled_" #type                          \
                        "_hs" #head_size "_bs" #block_size                      \
-                       "_bq32_tk32_nt128")]]                                   \
+                       "_bq" #bq "_tk" #tkv "_nt" #nt)]]                       \
   [[kernel]] void paged_attention_tiled<type, head_size, block_size,           \
-                                        32, 32, 128>(                          \
+                                        bq, tkv, nt>(                          \
       device type *out [[buffer(2)]],                                          \
       device const type *q [[buffer(3)]],                                      \
       device const type *k_cache [[buffer(4)]],                                \
@@ -515,10 +537,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       uint sg_idx [[simdgroup_index_in_threadgroup]],                          \
       uint lane [[thread_index_in_simdgroup]]);
 
+// Each entry must match a (head_size -> TileConfig) row in select_tile_config
+// in vllm_metal/metal/paged_ops.cpp.
 #define instantiate_paged_attention_tiled_heads(type, block_size)              \
-  instantiate_paged_attention_tiled_inner(type, 64, block_size);               \
-  instantiate_paged_attention_tiled_inner(type, 96, block_size);               \
-  instantiate_paged_attention_tiled_inner(type, 128, block_size);
+  instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 128, block_size, 32, 32, 128); \
+  instantiate_paged_attention_tiled_inner(type, 256, block_size, 16, 16,  64); \
+  instantiate_paged_attention_tiled_inner(type, 512, block_size,  8,  8,  32);
 
 #define instantiate_paged_attention_tiled_all(type)                            \
   instantiate_paged_attention_tiled_heads(type, 8);                            \

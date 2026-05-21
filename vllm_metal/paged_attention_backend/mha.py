@@ -89,3 +89,7 @@ class MHAPagedAttentionBackend:
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
+
+    @property
+    def kv_cache(self) -> MetalPagedKVCache:
+        return self._require_initialized("kv_cache")

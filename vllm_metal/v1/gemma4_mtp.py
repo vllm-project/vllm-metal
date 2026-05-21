@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from json import JSONDecodeError, loads
 from numbers import Integral
 from pathlib import Path
 from threading import Lock
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.logger import init_logger
 
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
 GEMMA4_MTP_DEFAULT_CENTROID_TOP_K = 32
@@ -39,12 +42,116 @@ _ASSISTANT_DOWNLOAD_ALLOW_PATTERNS = [
 
 @dataclass(frozen=True, slots=True)
 class Gemma4MTPAssistantRuntime:
-    """Loaded assistant runtime owned by the model lifecycle."""
+    """Loaded assistant runtime owned by the model lifecycle.
+
+    KV sharing can be installed before the assistant forward/scheduler handoff
+    is enabled; ``forward_ready`` remains false until that later runtime path
+    lands.
+    """
 
     model_name: str
     model: Any
     metadata: Gemma4MTPAssistantMetadata
+    kv_sharing: Gemma4MTPKVSharingBinding | None = None
     forward_ready: bool = False
+
+    @property
+    def kv_sharing_plan(self) -> Gemma4MTPKVSharingPlan | None:
+        return self.kv_sharing.plan if self.kv_sharing is not None else None
+
+    def with_target_kv_sharing(
+        self,
+        *,
+        target_metadata: Gemma4MTPTargetMetadata,
+        target_kv_cache: MetalPagedKVCache,
+        block_size: int,
+    ) -> Gemma4MTPAssistantRuntime:
+        """Return a runner-local runtime binding for target paged KV.
+
+        The loaded assistant model is cached process-wide by the loader.  Keep
+        that cached model unpatched here; the per-runner target KV cache lives
+        only in the returned immutable binding.
+        """
+        plan = Gemma4MTPKVSharingPlan.from_metadata(
+            assistant=self.metadata,
+            target=target_metadata,
+        )
+        return replace(
+            self,
+            kv_sharing=Gemma4MTPKVSharingBinding.from_plan(
+                plan,
+                target_kv_cache=target_kv_cache,
+                block_size=block_size,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4MTPKVSharingBinding:
+    """Runner-local target KV binding for a cached assistant runtime."""
+
+    plan: Gemma4MTPKVSharingPlan
+    target_kv_cache: MetalPagedKVCache
+    block_size: int
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: Gemma4MTPKVSharingPlan,
+        *,
+        target_kv_cache: MetalPagedKVCache,
+        block_size: int,
+    ) -> Gemma4MTPKVSharingBinding:
+        if block_size <= 0:
+            raise ValueError(
+                f"Gemma4 MTP KV sharing block_size must be positive, got {block_size}"
+            )
+        plan.validate_target_cache(target_kv_cache)
+        return cls(
+            plan=plan,
+            target_kv_cache=target_kv_cache,
+            block_size=block_size,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4MTPKVSharingPlan:
+    """Assistant layer to target paged-KV cache mapping."""
+
+    assistant_layer_to_target_cache_idx: tuple[int, ...]
+    layer_types: tuple[str, ...]
+
+    @classmethod
+    def from_metadata(
+        cls,
+        *,
+        assistant: Gemma4MTPAssistantMetadata,
+        target: Gemma4MTPTargetMetadata,
+    ) -> Gemma4MTPKVSharingPlan:
+        assistant.validate_compatible_with(target)
+        type_to_target_idx: dict[str, int] = {}
+        for target_idx, layer_type in enumerate(target.non_shared_layer_types):
+            # Match upstream Gemma4Proposer: use the last non-shared target
+            # layer of the same attention type as the sharing source.
+            type_to_target_idx[layer_type] = target_idx
+
+        mapping = tuple(
+            type_to_target_idx[layer_type] for layer_type in assistant.layer_types
+        )
+        return cls(
+            assistant_layer_to_target_cache_idx=mapping,
+            layer_types=assistant.layer_types,
+        )
+
+    def validate_target_cache(self, target_kv_cache: MetalPagedKVCache) -> None:
+        """Validate that the target paged cache has every mapped layer slot."""
+        for layer_idx, cache_idx in enumerate(self.assistant_layer_to_target_cache_idx):
+            if cache_idx < 0 or cache_idx >= target_kv_cache.num_layers:
+                raise ValueError(
+                    "Gemma4 MTP assistant KV sharing target is outside target "
+                    f"cache: assistant_layer={layer_idx}, cache_idx={cache_idx}, "
+                    f"num_cache_layers={target_kv_cache.num_layers}"
+                )
 
 
 class Gemma4MTPAssistantLoader:

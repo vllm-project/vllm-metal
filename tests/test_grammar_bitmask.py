@@ -802,6 +802,7 @@ class TestSampleTokensGrammarPagedPath:
                 ),
             ),
             num_decode_tokens=1,
+            mm_prefill_deltas={},
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)

@@ -7,6 +7,8 @@ Run with:
 
 from __future__ import annotations
 
+import pytest
+
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
@@ -163,3 +165,119 @@ class TestPackedRoPE:
         assert q_out.shape == (1, 1, 5, 2)
         assert mx.allclose(q_out, mx.zeros_like(q_out)).item()
         assert mx.allclose(k_out, mx.zeros_like(k_out)).item()
+
+    def test_rejects_positions_on_mlx_lm_rope_path(self):
+        """Caller-provided positions are only valid on the M-RoPE path."""
+        import mlx.core as mx
+
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            apply_packed_rope,
+        )
+
+        class FakeRoPE:
+            def rope(self, x, offset=0):
+                return x
+
+        q = mx.zeros((1, 1, 3, 2))
+        k = mx.zeros((1, 1, 3, 2))
+        with pytest.raises(NotImplementedError, match="position-array slot"):
+            apply_packed_rope(
+                FakeRoPE(),
+                q,
+                k,
+                [0, 3],
+                positions=[mx.zeros((3, 1, 3), dtype=mx.int32)],
+            )
+
+    def test_mrope_uses_caller_positions_when_provided(self, monkeypatch):
+        """When ``positions[i]`` is an array, M-RoPE consumes it directly."""
+        import sys
+        import types
+
+        import mlx.core as mx
+
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            apply_packed_rope,
+        )
+
+        captured: list[mx.array] = []
+
+        class FakeMRoPE:
+            def rotary_emb(self, x, position_ids):
+                captured.append(position_ids)
+                # Return cos/sin shaped to match rotary_emb's contract; we
+                # do not care about correctness here, only routing.
+                seg_len = x.shape[2]
+                head_dim = x.shape[3]
+                cos = mx.zeros((1, 1, seg_len, head_dim))
+                sin = mx.zeros((1, 1, seg_len, head_dim))
+                return cos, sin
+
+        # Patch apply_multimodal_rotary_pos_emb so we do not need real mlx_vlm
+        # math; just route q,k through unchanged.  ``monkeypatch.setitem``
+        # restores the original sys.modules entry at teardown so this fake
+        # cannot leak into later tests in the same process.
+        fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
+        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
+
+        q = mx.zeros((1, 1, 3, 2))
+        k = mx.zeros((1, 1, 3, 2))
+        provided = mx.array([[[0, 1, 2]], [[0, 1, 2]], [[0, 1, 2]]], dtype=mx.int32)
+        apply_packed_rope(
+            FakeMRoPE(),
+            q,
+            k,
+            [0, 3],
+            positions=[provided],
+        )
+
+        assert len(captured) == 1
+        assert captured[0] is provided
+
+    def test_mrope_mixed_int_offset_and_array_positions(self, monkeypatch):
+        """Each segment independently picks int-offset or array-position."""
+        import sys
+        import types
+
+        import mlx.core as mx
+
+        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+            apply_packed_rope,
+        )
+
+        recorded: list[mx.array] = []
+
+        class FakeMRoPE:
+            def rotary_emb(self, x, position_ids):
+                recorded.append(position_ids)
+                seg_len = x.shape[2]
+                head_dim = x.shape[3]
+                cos = mx.zeros((1, 1, seg_len, head_dim))
+                sin = mx.zeros((1, 1, seg_len, head_dim))
+                return cos, sin
+
+        fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
+        fake_mod.apply_multimodal_rotary_pos_emb = lambda q, k, cos, sin: (q, k)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
+
+        q = mx.zeros((1, 1, 5, 2))
+        k = mx.zeros((1, 1, 5, 2))
+        # Two segments: first uses int offset (no positions[0]),
+        # second uses array positions[1].
+        caller_pos = mx.array([[[10, 11]], [[10, 11]], [[10, 11]]], dtype=mx.int32)
+        apply_packed_rope(
+            FakeMRoPE(),
+            q,
+            k,
+            [0, 3, 5],
+            offsets=[7, 0],
+            positions=[None, caller_pos],
+        )
+
+        assert len(recorded) == 2
+        # First seg: arange(7, 10) broadcast over (3, 1, 3)
+        assert recorded[0].shape == (3, 1, 3)
+        assert recorded[0].tolist() == [[[7, 8, 9]]] * 3
+        # Second seg: caller-supplied positions used verbatim
+        assert recorded[1] is caller_pos

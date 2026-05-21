@@ -152,6 +152,8 @@ def prepare_sdpa_qkv(
     n_heads: int,
     n_kv_heads: int,
     shared_kv: tuple[mx.array, mx.array] | None = None,
+    *,
+    read_existing_kv: bool = False,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
     """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
 
@@ -159,6 +161,8 @@ def prepare_sdpa_qkv(
 
     - **YOCO** (``shared_kv`` given): reuse K/V from a prior layer; skip
       projection and only apply Q norm + RoPE.
+    - **Read-existing KV** (``read_existing_kv=True``): prepare Q only and
+      let the paged-attention kernel read K/V already present in the cache.
     - **K-eq-V** (no ``inner.v_proj``): 26B/31B checkpoints share the
       projection so ``values`` references the same tensor as ``keys``.
     - **v_norm** (``inner.v_norm`` present): apply per-head RMSNorm to
@@ -173,6 +177,7 @@ def prepare_sdpa_qkv(
         n_kv_heads: K/V head count.
         shared_kv: Optional ``(keys, values)`` from a reference layer,
             already normed and RoPE'd, in ``(B, H, L, head_dim)`` layout.
+        read_existing_kv: If true, skip K/V projection and cache writes.
 
     Returns:
         Tuple ``(queries, keys, values, gate, kv_for_sharing)``:
@@ -189,9 +194,16 @@ def prepare_sdpa_qkv(
             ``rotary_emb`` (only RoPE-based models are supported).
     """
     B, L, _ = x.shape  # noqa: N806
+    if shared_kv is not None and read_existing_kv:
+        raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
     gate: mx.array | None = None
     packed_qkv = _has_packed_qkv_sdpa_contract(inner)
+    if read_existing_kv and packed_qkv:
+        raise NotImplementedError(
+            "read_existing_kv requires split Q/K/V projections so Q can be "
+            "prepared without projecting new K/V tensors."
+        )
     # head_dim has two architectural sources in our supported models:
     #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+, phi3)
     #   - k_proj.weight.shape (qwen3, qwen3_moe never set self.head_dim)
@@ -228,9 +240,16 @@ def prepare_sdpa_qkv(
         else:
             queries = q_proj_out.reshape(B, L, n_heads, -1)
 
-    if shared_kv is not None:
-        # YOCO: reuse K/V from a reference layer.  Q still needs norm + RoPE.
-        keys, values = shared_kv
+    if shared_kv is not None or read_existing_kv:
+        # YOCO/reuse-cache paths: Q still needs norm + RoPE, but K/V
+        # projection is skipped.  For read_existing_kv, local K/V tensors
+        # only satisfy RoPE/padding shape contracts; sdpa_forward uses the
+        # explicit flag to read the authoritative K/V from the paged cache.
+        if shared_kv is None:
+            keys = mx.zeros((B, n_kv_heads, L, head_dim), dtype=x.dtype)
+            values = keys
+        else:
+            keys, values = shared_kv
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         queries = queries.transpose(0, 2, 1, 3)
@@ -246,6 +265,7 @@ def prepare_sdpa_qkv(
             ctx.cu_seqlens,
             offsets=ctx.offsets if ctx.offsets else None,
             apply_keys=False,
+            positions=ctx.segment_positions,
         )
     else:
         if not packed_qkv:
@@ -280,6 +300,7 @@ def prepare_sdpa_qkv(
             keys,
             ctx.cu_seqlens,
             offsets=ctx.offsets if ctx.offsets else None,
+            positions=ctx.segment_positions,
         )
 
     kv_for_sharing = (keys, values)
@@ -382,6 +403,8 @@ def sdpa_forward(
     kv_cache: MetalPagedKVCache,
     layer_idx: int,
     shared_kv: tuple[mx.array, mx.array] | None = None,
+    *,
+    read_existing_kv: bool = False,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
@@ -402,7 +425,13 @@ def sdpa_forward(
     n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
-        inner, x, ctx, n_heads, n_kv_heads, shared_kv
+        inner,
+        x,
+        ctx,
+        n_heads,
+        n_kv_heads,
+        shared_kv,
+        read_existing_kv=read_existing_kv,
     )
 
     # --- Metal kernel dispatch ---
@@ -439,13 +468,10 @@ def sdpa_forward(
         ctx.block_tables, kv_cache.block_size
     )
 
-    if shared_kv is not None:
-        # YOCO shared layer: the reference layer already scattered the
-        # authoritative K/V (and, under TurboQuant, the scale/zero caches
-        # too).  Skip the write to avoid (a) redundant compute and (b)
-        # silent byte-drift if this layer's raw K/V differs marginally
-        # from the reference's — re-encoding would produce non-identical
-        # packed bytes.
+    if shared_kv is not None or read_existing_kv:
+        # YOCO shared layer / MTP read-existing layer: the authoritative K/V
+        # already lives in the paged cache.  Skip writes to avoid redundant
+        # compute and to keep the target cache read-only for assistant use.
         new_k_cache = kv_cache.key_caches[layer_idx]
         new_v_cache = kv_cache.value_caches[layer_idx]
         if kv_cache.turboquant:
