@@ -3,6 +3,16 @@
 ## Requirements
 
 - macOS on Apple Silicon
+- Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
+
+Verify the Python architecture before installing:
+
+```bash
+python3 -c "import platform; print(platform.machine())"
+file "$(which python3)"
+```
+
+The first command should print `arm64`. If it prints `x86_64`, switch to a native arm64 Python and remove `~/.venv-vllm-metal` before reinstalling.
 
 ## Install
 

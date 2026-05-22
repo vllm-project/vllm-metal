@@ -16,6 +16,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ## Requirements
 
 - macOS on Apple Silicon
+- Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
 ## Supported Models
 
