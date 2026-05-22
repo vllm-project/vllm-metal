@@ -217,6 +217,75 @@ class TestTargetForward:
         assert output.hidden_states.tolist() == [[1.0, 2.0]]
         assert mx.allclose(output.logits, expected_logits).item()
 
+    def test_collects_hidden_states_from_language_model_wrapper(self) -> None:
+        class Embedding:
+            def as_linear(self, hidden_states):
+                return hidden_states + 4.0
+
+        class Backbone:
+            def __init__(self) -> None:
+                self.embed_tokens = Embedding()
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[2.0, 3.0]]])
+
+        language_model = SimpleNamespace(
+            model=Backbone(),
+            tie_word_embeddings=True,
+            final_logit_softcapping=None,
+        )
+        model = SimpleNamespace(language_model=language_model)
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=True,
+        )
+
+        assert output.hidden_states.tolist() == [[2.0, 3.0]]
+        assert output.logits.tolist() == [[[6.0, 7.0]]]
+
+    def test_target_input_embeddings_use_target_embed_scale(self) -> None:
+        class Embedding:
+            def __call__(self, input_ids):
+                return mx.ones((*input_ids.shape, 2))
+
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=Embedding(),
+                embed_scale=3.0,
+            )
+        )
+
+        embeddings = DefaultModelAdapter().target_input_embeddings(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+        )
+
+        assert embeddings.tolist() == [[[3.0, 3.0], [3.0, 3.0]]]
+
+    def test_target_input_embeddings_use_language_model_wrapper(self) -> None:
+        class Embedding:
+            def __call__(self, input_ids):
+                return mx.ones((*input_ids.shape, 2))
+
+        language_model = SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=Embedding(),
+                embed_scale=4.0,
+            )
+        )
+        model = SimpleNamespace(language_model=language_model)
+
+        embeddings = DefaultModelAdapter().target_input_embeddings(
+            model,
+            mx.array([[1, 2]], dtype=mx.int32),
+        )
+
+        assert embeddings.tolist() == [[[4.0, 4.0], [4.0, 4.0]]]
+
     def test_rejects_batched_target_hidden_states(self) -> None:
         class Backbone:
             def __call__(self, input_ids, *, cache=None):

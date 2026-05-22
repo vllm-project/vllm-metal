@@ -129,6 +129,9 @@ class ModelAdapter(Protocol):
     ) -> TargetModelForwardOutput:
         """Run the target text model and optionally retain target hidden states."""
 
+    def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
+        """Return target/backbone-dim token embeddings for ``input_ids``."""
+
     def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from raw model output."""
 
@@ -336,6 +339,20 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             hidden_states=self._flatten_target_hidden_states(hidden_states),
         )
 
+    def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
+        """Return target/backbone-dim token embeddings for Gemma4 MTP feedback."""
+        backbone = self._target_backbone(model)
+        embed_tokens = getattr(backbone, "embed_tokens", None)
+        if embed_tokens is None:
+            raise NotImplementedError(
+                "Gemma4 MTP assistant drafting requires a target text model "
+                "with `model.embed_tokens` so sampled target tokens can be "
+                "embedded in backbone hidden size."
+            )
+        embeddings = embed_tokens(input_ids)
+        embed_scale = getattr(backbone, "embed_scale", 1)
+        return embeddings * embed_scale
+
     def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from mlx-lm arrays or mlx-vlm model outputs."""
         if isinstance(model_output, TargetModelForwardOutput):
@@ -351,7 +368,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None,
     ) -> mx.array:
-        backbone = getattr(model, "model", None)
+        backbone = self._target_backbone(model)
         if backbone is None:
             raise NotImplementedError(
                 "Target hidden states require a text model with a `model` "
@@ -360,33 +377,34 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return backbone(input_ids, cache=cache)
 
     def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:
-        if hasattr(model, "compute_logits"):
-            return model.compute_logits(hidden_states)
+        text_model = self.text_model(model)
+        if hasattr(text_model, "compute_logits"):
+            return text_model.compute_logits(hidden_states)
 
-        args = getattr(model, "args", None)
+        args = getattr(text_model, "args", None)
         tie_word_embeddings = bool(
-            getattr(model, "tie_word_embeddings", False)
+            getattr(text_model, "tie_word_embeddings", False)
             or getattr(args, "tie_word_embeddings", False)
         )
         if tie_word_embeddings:
-            logits = self._compute_tied_embedding_logits(model, hidden_states)
-            return self._apply_target_logit_postprocessing(model, logits)
+            logits = self._compute_tied_embedding_logits(text_model, hidden_states)
+            return self._apply_target_logit_postprocessing(text_model, logits)
 
-        lm_head = getattr(model, "lm_head", None)
+        lm_head = getattr(text_model, "lm_head", None)
         if lm_head is not None:
             logits = lm_head(hidden_states)
-            return self._apply_target_logit_postprocessing(model, logits)
+            return self._apply_target_logit_postprocessing(text_model, logits)
 
         # Some Gemma4-compatible MLX loaders expose tied embedding projection
         # without setting tie_word_embeddings on the wrapper; try that shape
         # explicitly, then fail inside _compute_tied_embedding_logits if absent.
-        logits = self._compute_tied_embedding_logits(model, hidden_states)
-        return self._apply_target_logit_postprocessing(model, logits)
+        logits = self._compute_tied_embedding_logits(text_model, hidden_states)
+        return self._apply_target_logit_postprocessing(text_model, logits)
 
     def _compute_tied_embedding_logits(
         self, model: Any, hidden_states: mx.array
     ) -> mx.array:
-        backbone = getattr(model, "model", None)
+        backbone = self._target_backbone(model)
         embed_tokens = getattr(backbone, "embed_tokens", None)
         as_linear = getattr(embed_tokens, "as_linear", None)
         if as_linear is None:
@@ -414,6 +432,9 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         if softcap is None:
             return logits
         return mx.tanh(logits / softcap) * softcap
+
+    def _target_backbone(self, model: Any) -> Any | None:
+        return getattr(self.text_model(model), "model", None)
 
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any

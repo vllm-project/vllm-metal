@@ -12,6 +12,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
     SpeculativeDecodeController,
@@ -316,6 +317,18 @@ class TestSpecDecodePolicy:
             logitsprocs=None,
         )
 
+    def test_gemma4_mtp_rejects_async_scheduling(self) -> None:
+        with pytest.raises(NotImplementedError, match="no-async-scheduling"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={}),
+                (),
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                logitsprocs=None,
+                use_async_scheduling=True,
+                speculative_config=_gemma4_mtp_speculative_config(),
+            )
+
     def test_non_paged_scheduled_tokens_are_rejected(self) -> None:
         with pytest.raises(NotImplementedError, match="requires paged attention"):
             SpeculativeDecodeController().validate_supported(
@@ -428,6 +441,94 @@ class TestSpecDecodePolicy:
                 is_hybrid=False,
                 logitsprocs=_spec_logitsprocs(),
             )
+
+
+class TestGemma4MTPDraftSeeds:
+    def test_decode_seeds_use_last_accepted_target_row(self) -> None:
+        seeds = SpeculativeDecodeController().build_gemma4_mtp_draft_seeds(
+            decode_reqs=[
+                ("r0", _request_state()),
+                ("r1", _request_state(temperature=0.7)),
+            ],
+            decode_segments=[
+                PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(5, 6),
+                    start_row=0,
+                    num_query_tokens=2,
+                    draft_token_ids=(6,),
+                    cache_start_pos=4,
+                    block_ids=(1,),
+                ),
+                PagedDecodeSegment(
+                    req_id="r1",
+                    input_token_ids=(7,),
+                    start_row=2,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=9,
+                    block_ids=(2,),
+                ),
+            ],
+            decode_token_ids=[[6, 8], [9]],
+            prefill_reqs=[],
+            prefill_token_ids=[],
+            prefill_result_modes=[],
+            request_states={},
+            cu_seqlens=[0, 2, 3],
+            num_decode_segments=2,
+            logitsprocs=None,
+        )
+
+        assert seeds == (
+            Gemma4MTPDraftSeed(
+                req_id="r0",
+                token_id=8,
+                target_hidden_row=1,
+                target_position=5,
+                block_ids=(1,),
+            ),
+        )
+
+    def test_prefill_seeds_skip_intermediate_chunks(self) -> None:
+        final_prefill = SimpleNamespace(
+            req_id="p0",
+            token_ids=[1, 2, 3],
+            block_ids=[4],
+            start_pos=10,
+        )
+        intermediate_prefill = SimpleNamespace(
+            req_id="p1",
+            token_ids=[4, 5],
+            block_ids=[5],
+            start_pos=20,
+        )
+
+        seeds = SpeculativeDecodeController().build_gemma4_mtp_draft_seeds(
+            decode_reqs=[],
+            decode_segments=[],
+            decode_token_ids=[],
+            prefill_reqs=[final_prefill, intermediate_prefill],
+            prefill_token_ids=[11, 12],
+            prefill_result_modes=["new_final", "intermediate"],
+            request_states={
+                "p0": _request_state(),
+                "p1": _request_state(),
+            },
+            cu_seqlens=[0, 3, 5],
+            num_decode_segments=0,
+            logitsprocs=None,
+        )
+
+        assert seeds == (
+            Gemma4MTPDraftSeed(
+                req_id="p0",
+                token_id=11,
+                target_hidden_row=2,
+                target_position=12,
+                block_ids=(4,),
+            ),
+        )
 
 
 class TestVerifyGreedySpecDecode:

@@ -1188,3 +1188,91 @@ def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
                 text_config={**text_config, "num_kv_shared_layers": 1},
             )
         )
+
+
+def test_masked_embedding_returns_sparse_top_tokens() -> None:
+    import mlx.core as mx
+
+    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPMaskedEmbedding
+
+    masked = Gemma4MTPMaskedEmbedding(
+        hidden_size=2,
+        vocab_size=4,
+        num_centroids=2,
+        centroid_intermediate_top_k=1,
+    )
+    masked.centroids.weight = mx.array([[1.0, 0.0], [0.0, 1.0]])
+    masked.token_ordering = mx.array([0, 1, 2, 3], dtype=mx.int64)
+    lm_head_weight = mx.array(
+        [
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 3.0],
+        ]
+    )
+
+    token_ids = masked.get_top_tokens(
+        mx.array([[0.0, 1.0]]),
+        lm_head_weight,
+    )
+
+    assert token_ids.tolist() == [3]
+
+
+def test_masked_embedding_uses_untied_lm_head_weight() -> None:
+    import mlx.core as mx
+
+    from vllm_metal.v1.gemma4_mtp_model import (
+        Gemma4MTPAssistantModel,
+        Gemma4MTPAssistantModelArgs,
+    )
+
+    model = Gemma4MTPAssistantModel(
+        Gemma4MTPAssistantModelArgs(
+            vocab_size=4,
+            backbone_hidden_size=2,
+            tie_word_embeddings=False,
+            use_ordered_embeddings=True,
+            num_centroids=2,
+            centroid_intermediate_top_k=1,
+            text_config={
+                "model_type": "gemma4_text",
+                "vocab_size": 4,
+                "hidden_size": 2,
+                "intermediate_size": 4,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 2,
+                "global_head_dim": 2,
+                "num_hidden_layers": 1,
+                "layer_types": ["full_attention"],
+                "hidden_size_per_layer_input": 0,
+                "num_kv_shared_layers": 1,
+                "use_double_wide_mlp": False,
+            },
+        )
+    )
+    assert model.masked_embedding is not None
+    model.masked_embedding.centroids.weight = mx.array([[1.0, 0.0], [0.0, 1.0]])
+    model.masked_embedding.token_ordering = mx.array([0, 1, 2, 3], dtype=mx.int64)
+    model.model.embed_tokens.weight = mx.array(
+        [
+            [1.0, 0.0],
+            [9.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+    )
+    model.lm_head.weight = mx.array(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 9.0],
+        ]
+    )
+
+    token_ids = model.get_top_tokens(mx.array([[0.0, 1.0]]))
+
+    assert token_ids.tolist() == [3]

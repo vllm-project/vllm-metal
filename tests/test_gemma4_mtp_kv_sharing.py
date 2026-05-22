@@ -16,9 +16,11 @@ from vllm_metal.metal_kernel_backend.paged_attention import (
     patch_model_attention_metal_kernel,
 )
 from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
+from vllm_metal.paged_attention_common import get_context
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantMetadata,
     Gemma4MTPAssistantRuntime,
+    Gemma4MTPDraftSeed,
     Gemma4MTPKVSharingBinding,
     Gemma4MTPKVSharingPlan,
     Gemma4MTPTargetMetadata,
@@ -213,7 +215,7 @@ def test_runtime_keeps_cached_assistant_model_unpatched() -> None:
     assert wired.kv_sharing_plan is not None
     assert wired.kv_sharing is not None
     assert wired.kv_sharing.target_kv_cache is cache
-    assert wired.forward_ready is False
+    assert wired.forward_ready is True
     assert all(
         layer.self_attn is original_attn[idx]
         for idx, layer in enumerate(model.model.layers)
@@ -258,6 +260,173 @@ def test_runtime_kv_binding_is_not_process_global() -> None:
         model.model.layers[0].self_attn,
         MetalKernelPagedAttentionWrapper,
     )
+
+
+def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
+    captured: dict[str, object] = {}
+
+    class AssistantModel:
+        def draft_token_ids(
+            self,
+            input_ids,
+            *,
+            target_hidden_states,
+            target_input_embeddings,
+            target_kv_cache,
+            target_cache_indices,
+        ):
+            ctx = get_context()
+            assert ctx is not None
+            captured["input_ids"] = input_ids.tolist()
+            captured["hidden_states"] = target_hidden_states.tolist()
+            captured["embeddings"] = target_input_embeddings.tolist()
+            captured["cache"] = target_kv_cache
+            captured["cache_indices"] = target_cache_indices
+            captured["context_lens"] = ctx.context_lens
+            captured["offsets"] = ctx.offsets
+            captured["block_tables"] = ctx.block_tables
+            return mx.array([101, 102], dtype=mx.int32)
+
+    layer_types = ("full_attention",)
+    runtime = Gemma4MTPAssistantRuntime(
+        model_name="/assistant",
+        model=AssistantModel(),
+        metadata=Gemma4MTPAssistantMetadata(
+            model_type="gemma4_assistant",
+            architectures=("Gemma4AssistantForCausalLM",),
+            vocab_size=16,
+            hidden_size=8,
+            backbone_hidden_size=4,
+            tie_word_embeddings=True,
+            num_hidden_layers=1,
+            layer_types=layer_types,
+            use_ordered_embeddings=False,
+        ),
+    )
+    cache = _target_cache(num_layers=1)
+    wired = runtime.with_target_kv_sharing(
+        target_metadata=Gemma4MTPTargetMetadata(
+            vocab_size=16,
+            hidden_size=4,
+            non_shared_layer_types=layer_types,
+        ),
+        target_kv_cache=cache,
+        block_size=_BLOCK_SIZE,
+    )
+
+    drafts = wired.propose_draft_token_ids(
+        seeds=(
+            Gemma4MTPDraftSeed(
+                req_id="r0",
+                token_id=7,
+                target_hidden_row=0,
+                target_position=1,
+                block_ids=(0,),
+            ),
+            Gemma4MTPDraftSeed(
+                req_id="r1",
+                token_id=8,
+                target_hidden_row=2,
+                target_position=3,
+                block_ids=(0,),
+            ),
+        ),
+        target_hidden_states=mx.array(
+            [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]
+        ),
+        target_input_embeddings=mx.ones((1, 2, 4)),
+    )
+
+    assert drafts == [[101], [102]]
+    assert captured["input_ids"] == [[7, 8]]
+    assert captured["hidden_states"] == [[[1.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]]
+    assert captured["embeddings"] == [[[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]]
+    assert captured["cache"] is cache
+    assert captured["cache_indices"] == (0,)
+    assert captured["context_lens"] == [2, 4]
+    assert captured["offsets"] == [1, 3]
+    assert captured["block_tables"] == [[0], [0]]
+    assert get_context() is None
+
+
+def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
+    from vllm_metal.v1.gemma4_mtp_model import (
+        Gemma4MTPAssistantModel,
+        Gemma4MTPAssistantModelArgs,
+    )
+
+    layer_types = ("full_attention",)
+    hidden_size = 64
+    model = Gemma4MTPAssistantModel(
+        Gemma4MTPAssistantModelArgs(
+            vocab_size=8,
+            backbone_hidden_size=hidden_size,
+            text_config={
+                "model_type": "gemma4_text",
+                "vocab_size": 8,
+                "hidden_size": hidden_size,
+                "intermediate_size": hidden_size * 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": hidden_size,
+                "global_head_dim": hidden_size,
+                "num_hidden_layers": 1,
+                "layer_types": list(layer_types),
+                "hidden_size_per_layer_input": 0,
+                "num_kv_shared_layers": 1,
+                "use_double_wide_mlp": False,
+            },
+        )
+    )
+    runtime = Gemma4MTPAssistantRuntime(
+        model_name="/assistant",
+        model=model,
+        metadata=Gemma4MTPAssistantMetadata(
+            model_type="gemma4_assistant",
+            architectures=("Gemma4AssistantForCausalLM",),
+            vocab_size=8,
+            hidden_size=hidden_size,
+            backbone_hidden_size=hidden_size,
+            tie_word_embeddings=True,
+            num_hidden_layers=1,
+            layer_types=layer_types,
+            use_ordered_embeddings=False,
+        ),
+    )
+    wired = runtime.with_target_kv_sharing(
+        target_metadata=Gemma4MTPTargetMetadata(
+            vocab_size=8,
+            hidden_size=hidden_size,
+            non_shared_layer_types=layer_types,
+        ),
+        target_kv_cache=MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=hidden_size,
+            num_blocks=1,
+            block_size=_BLOCK_SIZE,
+            dtype=mx.float16,
+        ),
+        block_size=_BLOCK_SIZE,
+    )
+
+    drafts = wired.propose_draft_token_ids(
+        seeds=(
+            Gemma4MTPDraftSeed(
+                req_id="r0",
+                token_id=1,
+                target_hidden_row=0,
+                target_position=0,
+                block_ids=(0,),
+            ),
+        ),
+        target_hidden_states=mx.ones((1, hidden_size)),
+        target_input_embeddings=mx.ones((1, 1, hidden_size)),
+    )
+
+    assert len(drafts) == 1
+    assert len(drafts[0]) == 1
+    assert 0 <= drafts[0][0] < 8
 
 
 def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:
