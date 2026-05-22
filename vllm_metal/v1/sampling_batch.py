@@ -6,6 +6,7 @@ Pure functions: logits in, token IDs out.  No model runner state accessed.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -333,6 +334,24 @@ def _mlx_greedy_sample(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
 
 
+def _prefill_prompt_and_output_tokens(
+    prefill_request: Any,
+) -> tuple[list[int], list[int]]:
+    if prefill_request.full_prompt_token_ids is not None:
+        prompt_len = len(prefill_request.full_prompt_token_ids)
+    elif prefill_request.prompt_len is not None:
+        prompt_len = prefill_request.prompt_len
+    else:
+        prompt_len = len(prefill_request.token_ids)
+
+    prompt_for_meta = (
+        prefill_request.full_prompt_token_ids
+        if prefill_request.full_prompt_token_ids is not None
+        else prefill_request.token_ids
+    )
+    return prompt_for_meta[:prompt_len], prompt_for_meta[prompt_len:]
+
+
 def sample_from_logits(
     logits_2d: mx.array,
     batch: SamplingBatch,
@@ -445,30 +464,50 @@ def sample_prefill_tokens(
     Returns:
         Sampled token IDs and optional logprobs, one row per prefill request.
     """
+    if not prefill_reqs:
+        return _SamplingResult([])
+
+    if all(pr.sampling_params.logprobs is None for pr in prefill_reqs):
+        last_logits_rows: list[mx.array] = []
+        sampling_params_list: list[SamplingParams] = []
+        prompt_token_ids_list: list[list[int]] = []
+        output_token_ids_list: list[list[int]] = []
+        generators: dict[int, torch.Generator] = {}
+
+        for j, pr in enumerate(prefill_reqs):
+            last_idx = cu_seqlens[num_decode + j + 1] - 1
+            last_logits_rows.append(logits[0, last_idx, :])
+            prompt_token_ids, output_token_ids = _prefill_prompt_and_output_tokens(pr)
+
+            sampling_params_list.append(pr.sampling_params)
+            prompt_token_ids_list.append(prompt_token_ids)
+            output_token_ids_list.append(output_token_ids)
+            if pr.generator is not None:
+                generators[j] = pr.generator
+
+        batch = SamplingBatch(
+            sampling_params_list,
+            prompt_token_ids_list,
+            output_token_ids_list,
+            vocab_size=vocab_size,
+            device=device,
+            logitsprocs=logitsprocs,
+            generators=generators,
+        )
+        return sample_from_logits(mx.stack(last_logits_rows), batch, sampler, device)
+
     prefill_next_tokens: list[int] = []
     logprobs_rows: list[LogprobsLists | None] = []
     for j, pr in enumerate(prefill_reqs):
         last_idx = cu_seqlens[num_decode + j + 1] - 1
         last_logits = logits[0, last_idx : last_idx + 1, :]  # (1, vocab)
-
-        if pr.full_prompt_token_ids is not None:
-            prompt_len = len(pr.full_prompt_token_ids)
-        elif pr.prompt_len is not None:
-            prompt_len = pr.prompt_len
-        else:
-            prompt_len = len(pr.token_ids)
-
-        prompt_for_meta = (
-            pr.full_prompt_token_ids
-            if pr.full_prompt_token_ids is not None
-            else pr.token_ids
-        )
+        prompt_token_ids, output_token_ids = _prefill_prompt_and_output_tokens(pr)
         generators = {} if pr.generator is None else {0: pr.generator}
 
         batch = SamplingBatch(
             [pr.sampling_params],
-            [prompt_for_meta[:prompt_len]],
-            [prompt_for_meta[prompt_len:]],
+            [prompt_token_ids],
+            [output_token_ids],
             vocab_size=vocab_size,
             device=device,
             logitsprocs=logitsprocs,

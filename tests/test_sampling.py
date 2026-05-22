@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal sampling with vLLM Sampler integration."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -23,7 +25,11 @@ from vllm_metal.v1.model_runner import (
     _create_request_generator,
     _ExecutionBatch,
 )
-from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
+from vllm_metal.v1.sampling_batch import (
+    SamplingBatch,
+    sample_from_logits,
+    sample_prefill_tokens,
+)
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -313,6 +319,23 @@ class TestV1SamplingBatch:
             device=torch.device("cpu"),
         )
 
+    @staticmethod
+    def _prefill_req(
+        token_ids: list[int],
+        sampling_params: SamplingParams,
+        *,
+        prompt_len: int | None,
+        full_prompt_token_ids: list[int] | None = None,
+        generator: torch.Generator | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            token_ids=token_ids,
+            sampling_params=sampling_params,
+            generator=generator,
+            prompt_len=prompt_len,
+            full_prompt_token_ids=full_prompt_token_ids,
+        )
+
     def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
         assert self._batch([SamplingParams(temperature=0.0)]).can_use_native_greedy()
         assert not self._batch(
@@ -528,6 +551,138 @@ class TestV1SamplingBatch:
         assert result.logprobs.logprob_token_ids.shape == (1, 3)
         assert result.logprobs.logprob_token_ids[0, 0] == 2
         assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_prefill_sampling_batches_no_logprobs_requests(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logits = mx.array(
+            [[[float(row)] * 4 for row in range(10)]],
+            dtype=mx.float32,
+        )
+        reqs = [
+            self._prefill_req(
+                [1, 2],
+                SamplingParams(temperature=0.8, top_p=0.9),
+                prompt_len=2,
+            ),
+            self._prefill_req(
+                [5],
+                SamplingParams(temperature=0.0),
+                prompt_len=2,
+                full_prompt_token_ids=[3, 4, 9],
+                generator=torch.Generator().manual_seed(1),
+            ),
+            self._prefill_req(
+                [7],
+                SamplingParams(temperature=1.0, top_p=0.8),
+                prompt_len=None,
+            ),
+        ]
+        calls = []
+
+        def fake_sample_from_logits(logits_2d, batch, sampler, device):
+            del sampler, device
+            calls.append((logits_2d.tolist(), batch))
+            assert [sp.temperature for sp in batch.sampling_params_list] == [
+                0.8,
+                0.0,
+                1.0,
+            ]
+            assert [sp.top_p for sp in batch.sampling_params_list] == [
+                0.9,
+                1.0,
+                0.8,
+            ]
+            assert batch.prompt_token_id_lists == [[1, 2], [3, 4, 9], [7]]
+            assert batch.output_token_id_lists == [[], [], []]
+            assert sorted(batch.generators) == [1]
+            return SimpleNamespace(token_ids=[11, 12, 13], logprobs=None)
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.sampling_batch.sample_from_logits",
+            fake_sample_from_logits,
+        )
+
+        result = sample_prefill_tokens(
+            logits,
+            reqs,
+            cu_seqlens=[0, 1, 3, 6, 10],
+            num_decode=1,
+            sampler=Sampler(),
+            device=torch.device("cpu"),
+            vocab_size=4,
+        )
+
+        assert result.token_ids == [11, 12, 13]
+        assert result.logprobs is None
+        assert len(calls) == 1
+        assert calls[0][0] == [
+            [2.0, 2.0, 2.0, 2.0],
+            [5.0, 5.0, 5.0, 5.0],
+            [9.0, 9.0, 9.0, 9.0],
+        ]
+
+    def test_prefill_sampling_falls_back_when_any_request_needs_logprobs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logits = mx.array(
+            [[[0.0, 3.0, 1.0], [2.0, 0.0, 4.0]]],
+            dtype=mx.float32,
+        )
+        reqs = [
+            self._prefill_req(
+                [1],
+                SamplingParams(temperature=0.0, logprobs=1),
+                prompt_len=1,
+            ),
+            self._prefill_req(
+                [2],
+                SamplingParams(temperature=0.0),
+                prompt_len=1,
+            ),
+        ]
+        calls = []
+
+        def fake_sample_from_logits(logits_2d, batch, sampler, device):
+            del sampler, device
+            calls.append((logits_2d.tolist(), batch))
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    token_ids=[1],
+                    logprobs=LogprobsLists(
+                        logprob_token_ids=np.array([[1, 2]], dtype=np.int32),
+                        logprobs=np.array([[-0.1, -1.1]], dtype=np.float32),
+                        sampled_token_ranks=np.array([1], dtype=np.int32),
+                    ),
+                )
+            return SimpleNamespace(token_ids=[2], logprobs=None)
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.sampling_batch.sample_from_logits",
+            fake_sample_from_logits,
+        )
+
+        result = sample_prefill_tokens(
+            logits,
+            reqs,
+            cu_seqlens=[0, 1, 2],
+            num_decode=0,
+            sampler=Sampler(),
+            device=torch.device("cpu"),
+            vocab_size=3,
+        )
+
+        assert result.token_ids == [1, 2]
+        assert len(calls) == 2
+        assert calls[0][0] == [[0.0, 3.0, 1.0]]
+        assert calls[1][0] == [[2.0, 0.0, 4.0]]
+        assert [len(call[1].sampling_params_list) for call in calls] == [1, 1]
+        assert result.logprobs is not None
+        assert result.logprobs.logprob_token_ids.shape == (2, 2)
+        assert result.logprobs.logprob_token_ids[0, 0] == 1
+        assert result.logprobs.logprobs[1, 0] == -float("inf")
 
     def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
         batch = _ExecutionBatch()
