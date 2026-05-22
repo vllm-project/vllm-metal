@@ -1190,6 +1190,54 @@ def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
         )
 
 
+def test_model_normalizes_missing_per_layer_input_fields() -> None:
+    from vllm_metal.v1.gemma4_mtp_model import (
+        Gemma4MTPAssistantModel,
+        Gemma4MTPAssistantModelArgs,
+    )
+
+    text_config = _assistant_config()["text_config"]
+    assert isinstance(text_config, dict)
+
+    model = Gemma4MTPAssistantModel(
+        Gemma4MTPAssistantModelArgs(
+            backbone_hidden_size=1536,
+            text_config=dict(text_config),
+        )
+    )
+
+    assert model.text_args.hidden_size_per_layer_input == 0
+    assert model.text_args.vocab_size_per_layer_input == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("hidden_size_per_layer_input", 256),
+        ("vocab_size_per_layer_input", 262144),
+    ],
+)
+def test_model_rejects_nonzero_per_layer_input_fields(
+    field: str,
+    value: int,
+) -> None:
+    from vllm_metal.v1.gemma4_mtp_model import (
+        Gemma4MTPAssistantModel,
+        Gemma4MTPAssistantModelArgs,
+    )
+
+    text_config = _assistant_config()["text_config"]
+    assert isinstance(text_config, dict)
+
+    with pytest.raises(ValueError, match=field):
+        Gemma4MTPAssistantModel(
+            Gemma4MTPAssistantModelArgs(
+                backbone_hidden_size=1536,
+                text_config={**text_config, field: value},
+            )
+        )
+
+
 def test_masked_embedding_returns_sparse_top_tokens() -> None:
     import mlx.core as mx
 

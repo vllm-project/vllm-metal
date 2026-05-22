@@ -136,6 +136,23 @@ class Gemma4MTPAssistantModel(nn.Module):
         if args.backbone_hidden_size <= 0:
             raise ValueError("Gemma4 MTP assistant requires backbone_hidden_size > 0")
 
+        hidden_size_per_layer_input = text_config.get("hidden_size_per_layer_input")
+        if hidden_size_per_layer_input is None:
+            text_config["hidden_size_per_layer_input"] = 0
+        elif hidden_size_per_layer_input != 0:
+            raise ValueError(
+                "Gemma4 MTP assistant forward does not support per-layer inputs: "
+                "hidden_size_per_layer_input must be 0"
+            )
+        vocab_size_per_layer_input = text_config.get("vocab_size_per_layer_input")
+        if vocab_size_per_layer_input is None:
+            text_config["vocab_size_per_layer_input"] = 0
+        elif vocab_size_per_layer_input != 0:
+            raise ValueError(
+                "Gemma4 MTP assistant forward does not support per-layer inputs: "
+                "vocab_size_per_layer_input must be 0"
+            )
+
         # All assistant layers are Q-only and read target K/V in the later
         # KV-sharing PR. The assistant config may already declare all layers as
         # KV-shared; if present, it must match the Q-only layer count.
@@ -204,7 +221,6 @@ class Gemma4MTPAssistantModel(nn.Module):
         target model because the assistant's own embedding table is draft-dim
         and is kept for logits.
         """
-        del input_ids
         hidden_states, input_embeddings = self._normalize_forward_inputs(
             target_hidden_states,
             target_input_embeddings,
@@ -305,8 +321,7 @@ class Gemma4MTPAssistantModel(nn.Module):
             )
         return hidden_states, input_embeddings
 
-    @staticmethod
-    def _ensure_single_batch_rows(value: mx.array, name: str) -> mx.array:
+    def _ensure_single_batch_rows(self, value: mx.array, name: str) -> mx.array:
         ndim = len(value.shape)
         if ndim == 2:
             return value[None, :, :]
@@ -317,8 +332,8 @@ class Gemma4MTPAssistantModel(nn.Module):
             f"single-batch [1, num_tokens, hidden], got shape {value.shape}"
         )
 
-    @staticmethod
     def _forward_q_only_layer(
+        self,
         layer: gemma4_text.DecoderLayer,
         hidden_states: mx.array,
         *,

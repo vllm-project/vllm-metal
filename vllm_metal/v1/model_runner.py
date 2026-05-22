@@ -1268,12 +1268,6 @@ class MetalModelRunner:
             target_hidden_states=target_hidden_states,
             target_input_embeddings=target_input_embeddings,
         )
-        if len(draft_token_ids) != len(seeds):
-            raise RuntimeError(
-                "Gemma4 MTP assistant returned draft tokens for the wrong "
-                f"number of requests: got {len(draft_token_ids)}, expected "
-                f"{len(seeds)}"
-            )
         if not draft_token_ids:
             return
         self._draft_token_ids = DraftTokenIds(

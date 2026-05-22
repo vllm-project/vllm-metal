@@ -12,15 +12,15 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar
 
+import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.paged_attention_common import clear_context, prepare_unified
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    import mlx.core as mx
-
     from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
@@ -103,12 +103,22 @@ class Gemma4MTPAssistantRuntime:
         if not self.forward_ready:
             raise RuntimeError("Gemma4 MTP assistant forward is not ready")
 
-        import mlx.core as mx
-
-        from vllm_metal.paged_attention_common import clear_context, prepare_unified
-
-        self._validate_draft_seeds(seeds, target_hidden_states)
-        hidden_rows = self._select_target_hidden_rows(target_hidden_states, seeds)
+        if len(target_hidden_states.shape) == 3:
+            if target_hidden_states.shape[0] != 1:
+                raise ValueError(
+                    "Gemma4 MTP target_hidden_states must use a single batch"
+                )
+            target_hidden_states = target_hidden_states[0]
+        elif len(target_hidden_states.shape) != 2:
+            raise ValueError(
+                "Gemma4 MTP target_hidden_states must be row-major "
+                f"[num_tokens, hidden], got {target_hidden_states.shape}"
+            )
+        row_indices = mx.array(
+            [seed.target_hidden_row for seed in seeds],
+            dtype=mx.int32,
+        )
+        hidden_rows = mx.take(target_hidden_states, row_indices, axis=0)[None, :, :]
         input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
 
         prepare_unified(
@@ -137,51 +147,6 @@ class Gemma4MTPAssistantRuntime:
                 f"got {len(token_ids)}, expected {len(seeds)}"
             )
         return [[int(token_id)] for token_id in token_ids]
-
-    @staticmethod
-    def _validate_draft_seeds(
-        seeds: Sequence[Gemma4MTPDraftSeed],
-        target_hidden_states: mx.array,
-    ) -> None:
-        if len(target_hidden_states.shape) == 3 and target_hidden_states.shape[0] == 1:
-            num_rows = target_hidden_states.shape[1]
-        elif len(target_hidden_states.shape) == 2:
-            num_rows = target_hidden_states.shape[0]
-        else:
-            raise ValueError(
-                "Gemma4 MTP target_hidden_states must be row-major "
-                f"[num_tokens, hidden] or [1, num_tokens, hidden], got "
-                f"{target_hidden_states.shape}"
-            )
-
-        for seed in seeds:
-            if seed.target_hidden_row < 0 or seed.target_hidden_row >= num_rows:
-                raise IndexError(
-                    "Gemma4 MTP draft seed target_hidden_row is out of range: "
-                    f"row={seed.target_hidden_row}, num_rows={num_rows}"
-                )
-            if seed.target_position < 0:
-                raise ValueError(
-                    "Gemma4 MTP draft seed target_position must be non-negative, "
-                    f"got {seed.target_position}"
-                )
-            if not seed.block_ids:
-                raise ValueError("Gemma4 MTP draft seed requires target block ids")
-
-    @staticmethod
-    def _select_target_hidden_rows(
-        target_hidden_states: mx.array,
-        seeds: Sequence[Gemma4MTPDraftSeed],
-    ) -> mx.array:
-        import mlx.core as mx
-
-        row_indices = mx.array(
-            [seed.target_hidden_row for seed in seeds],
-            dtype=mx.int32,
-        )
-        if len(target_hidden_states.shape) == 3:
-            return mx.take(target_hidden_states[0], row_indices, axis=0)[None, :, :]
-        return mx.take(target_hidden_states, row_indices, axis=0)[None, :, :]
 
 
 @dataclass(frozen=True, slots=True)
