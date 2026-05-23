@@ -23,7 +23,12 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 vllm-metal supports a growing set of text-only language models on Apple Silicon. See the full matrix in [docs/supported_models.md](docs/supported_models.md).
 
 ## Installation
-Using the install script, the following will be installed under the `~/.venv-vllm-metal` directory (the default).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+```
+
+Using the install script above, the following will be installed under the `~/.venv-vllm-metal` directory (the default).
 - vllm-metal plugin
 - vllm core
 - Related libraries
@@ -32,10 +37,6 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the official vLLM guide.
 https://docs.vllm.ai/en/latest/cli/
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-```
 
 ### Optional: Rust frontend (experimental)
 
