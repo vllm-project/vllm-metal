@@ -75,7 +75,7 @@ from vllm_metal.v1.pooling import (
     forward_sequence_hidden_states,
     has_paged_pooling_work,
     pooling_dummy_forward_outputs,
-    supports_embed_pooling,
+    supported_pooling_tasks,
     validate_pooling_request,
 )
 from vllm_metal.v1.sampling_batch import (
@@ -413,9 +413,9 @@ class MetalModelRunner:
         if self._is_pooling:
             if self._paged_attention_backend is None:
                 return ()
-            if supports_embed_pooling(self._forward_model, self.model_config):
-                return ("embed",)
-            return ()
+            return supported_pooling_tasks(
+                self._forward_model, self.model_config, self.tokenizer
+            )
         return ("generate",)
 
     def load_model(self) -> None:
@@ -1069,6 +1069,8 @@ class MetalModelRunner:
                 pooling_hidden_states,
                 cu_seqlens=cu_seqlens,
                 num_decode_segments=num_decode_segments,
+                model=self._forward_model,
+                tokenizer=self.tokenizer,
                 model_config=self.model_config,
             )
             return batch, scheduler_output

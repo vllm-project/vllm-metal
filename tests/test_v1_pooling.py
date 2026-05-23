@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""High-value contract tests for Metal V1 text embedding pooling."""
+"""High-value contract tests for Metal V1 text pooling."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams  # noqa: E4
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
+from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
 
 class _SequenceModel:
@@ -30,6 +31,45 @@ class _SequenceModel:
         token_ids = np.array(input_ids).reshape(-1).tolist()
         rows = [[float(tok), float(tok + 1), 1.0] for tok in token_ids]
         return mx.array([rows], dtype=mx.float32)
+
+
+class _TiedEmbedding:
+    def as_linear(self, vector):
+        logits = mx.zeros((8,), dtype=mx.float32)
+        return mx.concatenate(
+            [
+                mx.stack([vector[0], vector[0] * 2.0]),
+                logits[2:],
+            ]
+        )
+
+
+class _UntiedLmHead:
+    def __call__(self, vector):
+        logits = mx.zeros((8,), dtype=mx.float32)
+        return mx.concatenate(
+            [
+                mx.stack([vector[0] * 0.0, vector[0] + 10.0]),
+                logits[2:],
+            ]
+        )
+
+
+class _BadTiedEmbedding:
+    def as_linear(self, vector):
+        return mx.zeros((2, 2), dtype=mx.float32)
+
+
+class _ClassifierSequenceModel(_SequenceModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = _TiedEmbedding()
+
+
+class _BadClassifierSequenceModel(_SequenceModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = _BadTiedEmbedding()
 
 
 class _RecordingSequenceModel(_SequenceModel):
@@ -47,6 +87,23 @@ class _PoolingModel:
         self.model = sequence_model or _SequenceModel()
 
 
+class _UntiedClassifierModel(_PoolingModel):
+    def __init__(self) -> None:
+        super().__init__(_ClassifierSequenceModel())
+        self.args = SimpleNamespace(tie_word_embeddings=False)
+        self.lm_head = _UntiedLmHead()
+
+
+class _ClassifierTokenizer:
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return {"no": 0, "yes": 1}.get(token)
+
+    def encode(self, token: str, add_special_tokens: bool = False) -> list[int]:
+        assert not add_special_tokens
+        token_id = self.convert_tokens_to_ids(token)
+        return [] if token_id is None else [token_id]
+
+
 def _hf_config(**overrides):
     values = {
         "architectures": ["Qwen3ForCausalLM"],
@@ -54,6 +111,18 @@ def _hf_config(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _qwen3_reranker_hf_config(**overrides):
+    values = {
+        "architectures": ["Qwen3ForSequenceClassification"],
+        "classifier_from_token": ["no", "yes"],
+        "is_original_qwen3_reranker": True,
+        "num_labels": 1,
+        "tie_word_embeddings": True,
+    }
+    values.update(overrides)
+    return _hf_config(**values)
 
 
 def _pooler_config(**overrides):
@@ -80,15 +149,26 @@ def _pooling_model_config(**overrides):
     return SimpleNamespace(**values)
 
 
+def _classification_model_config(**overrides):
+    values = {
+        "hf_config": _qwen3_reranker_hf_config(),
+        "pooler_config": _pooler_config(),
+    }
+    values.update(overrides)
+    return _pooling_model_config(**values)
+
+
 def _make_runner(
     *,
     paged: bool = True,
     model: object | None = None,
     model_config: object | None = None,
+    tokenizer: object | None = None,
 ):
     return make_stub_runner(
         model=model or _PoolingModel(),
         model_config=model_config or _pooling_model_config(),
+        tokenizer=tokenizer,
         _paged_attention_backend=object() if paged else None,
         _paged_block_size=4,
         num_layers=1,
@@ -183,6 +263,23 @@ def _assert_embedding(tensor: torch.Tensor | None, token_id: int) -> None:
     assert torch.allclose(tensor, _expected_embedding(token_id), atol=1e-6)
 
 
+def _expected_score(token_id: int, *, activated: bool = True) -> torch.Tensor:
+    raw = torch.tensor([float(token_id)])
+    return torch.sigmoid(raw) if activated else raw
+
+
+def _assert_score(
+    tensor: torch.Tensor | None,
+    token_id: int,
+    *,
+    activated: bool = True,
+) -> None:
+    assert tensor is not None
+    assert tensor.device.type == "cpu"
+    assert tensor.shape == (1,)
+    assert torch.allclose(tensor, _expected_score(token_id, activated=activated))
+
+
 def _execute_pooling(runner, sched):
     out = runner.execute_model(sched)
     assert out is not None
@@ -199,6 +296,97 @@ class TestMetalPoolingCapabilities:
         runner = make_stub_runner(
             model=object(),
             model_config=_pooling_model_config(),
+        )
+
+        assert runner.supported_worker_tasks() == ()
+
+    def test_supported_worker_tasks_for_qwen3_reranker_classify_model(self) -> None:
+        runner = _make_runner(
+            model=_PoolingModel(_ClassifierSequenceModel()),
+            model_config=_classification_model_config(),
+            tokenizer=_ClassifierTokenizer(),
+        )
+
+        assert runner.supported_worker_tasks() == ("classify",)
+
+    def test_supported_worker_tasks_for_untied_qwen3_reranker_model(self) -> None:
+        runner = _make_runner(
+            model=_UntiedClassifierModel(),
+            model_config=_classification_model_config(
+                hf_config=_qwen3_reranker_hf_config(tie_word_embeddings=False)
+            ),
+            tokenizer=_ClassifierTokenizer(),
+        )
+
+        assert runner.supported_worker_tasks() == ("classify",)
+
+    @pytest.mark.parametrize(
+        ("model", "model_config", "tokenizer"),
+        [
+            (
+                _PoolingModel(_ClassifierSequenceModel()),
+                _classification_model_config(
+                    hf_config=_qwen3_reranker_hf_config(
+                        classifier_from_token=["no", "maybe"],
+                    )
+                ),
+                _ClassifierTokenizer(),
+            ),
+            (
+                _PoolingModel(_ClassifierSequenceModel()),
+                _classification_model_config(
+                    hf_config=_qwen3_reranker_hf_config(
+                        is_original_qwen3_reranker=False,
+                    )
+                ),
+                _ClassifierTokenizer(),
+            ),
+            (
+                _PoolingModel(_ClassifierSequenceModel()),
+                _classification_model_config(
+                    hf_config=_qwen3_reranker_hf_config(tie_word_embeddings=False)
+                ),
+                _ClassifierTokenizer(),
+            ),
+            (
+                _PoolingModel(_ClassifierSequenceModel()),
+                _classification_model_config(
+                    hf_config=_qwen3_reranker_hf_config(tie_word_embeddings=None)
+                ),
+                _ClassifierTokenizer(),
+            ),
+            (
+                SimpleNamespace(
+                    model=_ClassifierSequenceModel(),
+                    lm_head=_UntiedLmHead(),
+                ),
+                _classification_model_config(
+                    hf_config=_qwen3_reranker_hf_config(tie_word_embeddings=None)
+                ),
+                _ClassifierTokenizer(),
+            ),
+            (
+                _PoolingModel(_SequenceModel()),
+                _classification_model_config(),
+                _ClassifierTokenizer(),
+            ),
+            (
+                _PoolingModel(_ClassifierSequenceModel()),
+                _classification_model_config(),
+                object(),
+            ),
+        ],
+    )
+    def test_supported_worker_tasks_rejects_incomplete_qwen3_reranker_contract(
+        self,
+        model: object,
+        model_config: object,
+        tokenizer: object,
+    ) -> None:
+        runner = _make_runner(
+            model=model,
+            model_config=model_config,
+            tokenizer=tokenizer,
         )
 
         assert runner.supported_worker_tasks() == ()
@@ -273,6 +461,97 @@ class TestMetalPoolingRunnerOutput:
         assert final.pooler_output is not None
         _assert_embedding(final.pooler_output[0], 4)
 
+    def test_paged_classify_returns_qwen3_reranker_scores(self) -> None:
+        runner = _make_runner(
+            model=_PoolingModel(_ClassifierSequenceModel()),
+            model_config=_classification_model_config(),
+            tokenizer=_ClassifierTokenizer(),
+        )
+        req_b = _new_req("req-b", [4, 5], task="classify")
+        req_a = _new_req("req-a", [7, 8, 9], task="classify")
+        sched = _scheduler_output(new_reqs=[req_b, req_a])
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, sched)
+
+        assert out.req_ids == ["req-b", "req-a"]
+        assert out.sampled_token_ids == [[], []]
+        assert out.pooler_output is not None
+        _assert_score(out.pooler_output[0], 5)
+        _assert_score(out.pooler_output[1], 9)
+
+    def test_paged_classify_can_return_raw_qwen3_reranker_scores(self) -> None:
+        runner = _make_runner(
+            model=_PoolingModel(_ClassifierSequenceModel()),
+            model_config=_classification_model_config(),
+            tokenizer=_ClassifierTokenizer(),
+        )
+        req = _new_req(
+            "req-0",
+            [2, 3],
+            pooling_params=_pooling_params(task="classify", use_activation=False),
+        )
+        sched = _scheduler_output(new_reqs=[req])
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, sched)
+
+        assert out.pooler_output is not None
+        _assert_score(out.pooler_output[0], 3, activated=False)
+
+    def test_paged_classify_uses_lm_head_for_untied_qwen3_reranker(self) -> None:
+        runner = _make_runner(
+            model=_UntiedClassifierModel(),
+            model_config=_classification_model_config(
+                hf_config=_qwen3_reranker_hf_config(tie_word_embeddings=False)
+            ),
+            tokenizer=_ClassifierTokenizer(),
+        )
+        req = _new_req(
+            "req-0",
+            [2, 3],
+            pooling_params=_pooling_params(task="classify", use_activation=False),
+        )
+        sched = _scheduler_output(new_reqs=[req])
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, sched)
+
+        assert out.pooler_output is not None
+        assert torch.allclose(out.pooler_output[0], torch.tensor([13.0]))
+
+    def test_paged_classify_applies_logit_calibration(self) -> None:
+        runner = _make_runner(
+            model=_PoolingModel(_ClassifierSequenceModel()),
+            model_config=_classification_model_config(
+                pooler_config=_pooler_config(logit_mean=1.0, logit_sigma=2.0)
+            ),
+            tokenizer=_ClassifierTokenizer(),
+        )
+        req = _new_req("req-0", [2, 3], task="classify")
+        sched = _scheduler_output(new_reqs=[req])
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, sched)
+
+        assert out.pooler_output is not None
+        assert torch.allclose(
+            out.pooler_output[0],
+            torch.sigmoid(torch.tensor([(3.0 - 1.0) / 2.0])),
+        )
+
 
 class TestMetalPoolingFailFast:
     def test_non_decoder_pooling_models_fail_fast_on_execute(
@@ -297,7 +576,7 @@ class TestMetalPoolingFailFast:
 
     @pytest.mark.parametrize(
         "task",
-        ["classify", "score"],
+        ["score", "token_embed", "token_classify", "plugin"],
     )
     def test_unsupported_pooling_tasks_fail_fast(self, task: str) -> None:
         runner = _make_runner()
@@ -305,6 +584,28 @@ class TestMetalPoolingFailFast:
 
         with pytest.raises(NotImplementedError, match="task"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
+
+    def test_classify_hidden_state_shape_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="hidden states with shape"):
+            pool_sequence_classification(
+                mx.array([[1.0, 2.0]], dtype=mx.float32),
+                token_index=0,
+                model=_PoolingModel(_ClassifierSequenceModel()),
+                tokenizer=_ClassifierTokenizer(),
+                pooling_params=_pooling_params(task="classify"),
+                model_config=_classification_model_config(),
+            )
+
+    def test_classify_logits_shape_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="classifier logits with shape"):
+            pool_sequence_classification(
+                mx.array([[[1.0, 2.0, 3.0]]], dtype=mx.float32),
+                token_index=0,
+                model=_PoolingModel(_BadClassifierSequenceModel()),
+                tokenizer=_ClassifierTokenizer(),
+                pooling_params=_pooling_params(task="classify"),
+                model_config=_classification_model_config(),
+            )
 
     @pytest.mark.parametrize(
         ("attr", "pooling_type"),
