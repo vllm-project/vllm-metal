@@ -467,6 +467,173 @@ class TestPrefixCacheEviction:
         assert mgr._current_bytes == bytes_after_first
 
 
+class TestPrefixCacheEvictionPolicy:
+    """Lock in the current eviction-order behavior.
+
+    ``PrefixCacheManager`` uses ``CachedPrefix.ref_count`` as its eviction
+    key. The name suggests pin-during-use semantics but the field is only
+    ever incremented (initialised to 1 on insert, ``+= 1`` on every
+    ``lookup`` hit, never decremented). The resulting policy is therefore
+    *LFU-forever*: an entry that accumulates many hits early in a run
+    cannot be displaced by a more recently-popular prefix.
+
+    These tests pin that behavior down so any future change to the policy
+    (e.g. switching to LRU, or introducing an actual pin counter) is
+    intentional and shows up as a test update rather than a silent
+    behavioral shift. See ``docs/design/prefix_cache_eviction.md`` for the
+    full discussion of options.
+    """
+
+    def _make_kv(self, value: float = 0.0) -> contiguous_cache.KVCache:
+        kv = contiguous_cache.KVCache()
+        kv.state = [
+            mx.full((1, 1, 1, 8), value, dtype=mx.float32),
+            mx.full((1, 1, 1, 8), value, dtype=mx.float32),
+        ]
+        return kv
+
+    def _entry_bytes(self) -> int:
+        kv = self._make_kv()
+        return kv.state[0].nbytes + kv.state[1].nbytes
+
+    def _two_slot_mgr(self) -> contiguous_cache.PrefixCacheManager:
+        # Sized for exactly 2 entries: a third insert must evict.
+        return contiguous_cache.PrefixCacheManager(
+            max_bytes=2 * self._entry_bytes() + 1
+        )
+
+    @staticmethod
+    def _cache_entry(
+        mgr: contiguous_cache.PrefixCacheManager,
+        token_ids: list[int],
+    ) -> contiguous_cache.CachedPrefix | None:
+        """Peek at the cache without bumping ``ref_count`` via ``lookup``."""
+        return mgr._cache.get(contiguous_cache._compute_prefix_hash(token_ids))
+
+    def test_insert_initializes_ref_count_to_one(self) -> None:
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        entry = self._cache_entry(mgr, [1])
+        assert entry is not None
+        assert entry.ref_count == 1
+
+    def test_lookup_hit_increments_ref_count(self) -> None:
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        for expected in range(2, 5):
+            assert mgr.lookup([1]) is not None
+            entry = self._cache_entry(mgr, [1])
+            assert entry is not None
+            assert entry.ref_count == expected
+
+    def test_lookup_miss_does_not_touch_ref_count(self) -> None:
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        before = self._cache_entry(mgr, [1])
+        assert before is not None
+        rc_before = before.ref_count
+
+        assert mgr.lookup([99]) is None  # miss
+
+        after = self._cache_entry(mgr, [1])
+        assert after is not None
+        assert after.ref_count == rc_before
+
+    def test_restore_cache_does_not_decrement_ref_count(self, monkeypatch) -> None:
+        """``restore_cache`` is purely read-side; entries are not "released".
+
+        If anyone later wires a release path (e.g. decrement on request
+        completion), they MUST also revisit the eviction policy and the
+        zero-copy contract on ``CachedPrefix.cache_state`` — see the design
+        note for details.
+        """
+        # Patch make_prompt_cache to a no-op so restore_cache exercises only
+        # its own bookkeeping without depending on a real mlx_lm model.
+        monkeypatch.setattr(
+            "vllm_metal.v1.contiguous_cache.make_prompt_cache",
+            lambda _model: [],
+        )
+
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        cached = mgr.lookup([1])
+        assert cached is not None
+        rc_after_lookup = cached.ref_count
+
+        mgr.restore_cache(cached, model=MagicMock(), is_vlm=False)
+
+        entry = self._cache_entry(mgr, [1])
+        assert entry is not None
+        assert entry.ref_count == rc_after_lookup
+
+    def test_eviction_drops_lowest_ref_count_entry(self) -> None:
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        mgr.insert([2], [self._make_kv()])
+
+        # Bump entry [1] so it has strictly higher ref_count than [2].
+        for _ in range(5):
+            assert mgr.lookup([1]) is not None
+
+        # Third insert forces one eviction. Entry [2] has the lowest
+        # ref_count and must be the one to go.
+        mgr.insert([3], [self._make_kv()])
+
+        assert self._cache_entry(mgr, [1]) is not None
+        assert self._cache_entry(mgr, [2]) is None
+        assert self._cache_entry(mgr, [3]) is not None
+
+    def test_hot_prefix_pins_out_cold_prefixes(self) -> None:
+        """Hot entry survives indefinitely; cold slot rotates per miss.
+
+        Demonstrates the *LFU-forever* pathology: a hot prefix established
+        early in the run accumulates a ``ref_count`` that no later prefix
+        can ever match before being evicted on the next miss. The remaining
+        capacity behaves as a single rotating slot.
+        """
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+        for _ in range(100):
+            mgr.lookup([1])  # ref_count: 1 -> 101
+
+        # Second entry fits without eviction.
+        mgr.insert([2], [self._make_kv()])
+        assert self._cache_entry(mgr, [1]) is not None
+        assert self._cache_entry(mgr, [2]) is not None
+
+        # Subsequent misses each evict the most-recently-inserted cold
+        # entry; [1] is never touched.
+        for token in (3, 4, 5, 6):
+            mgr.insert([token], [self._make_kv()])
+            assert self._cache_entry(mgr, [1]) is not None
+            assert self._cache_entry(mgr, [token]) is not None
+            # Only [1] and [token] live; all prior cold entries are gone.
+            for evicted in {2, 3, 4, 5, 6} - {token}:
+                assert self._cache_entry(mgr, [evicted]) is None
+
+    def test_ref_count_is_unbounded_monotonic(self) -> None:
+        """Sanity-check the 'never decrements' invariant under churn.
+
+        Repeated hits + insertions must not surface a code path that
+        decrements ``ref_count``. If one ever appears, the contract that
+        ``CachedPrefix.cache_state`` arrays are not aliased by live
+        requests (see ``PrefixCacheManager.restore_cache``) needs to be
+        re-examined to avoid use-after-free on eviction.
+        """
+        mgr = self._two_slot_mgr()
+        mgr.insert([1], [self._make_kv()])
+
+        for i in range(20):
+            assert mgr.lookup([1]) is not None
+            # Churn the cold slot to exercise the eviction loop.
+            mgr.insert([100 + i], [self._make_kv()])
+
+        entry = self._cache_entry(mgr, [1])
+        assert entry is not None
+        # 1 (insert) + 20 (one lookup per iteration) = 21.
+        assert entry.ref_count == 21
+
+
 class TestPrefixCacheEnableFlag:
     """Verify VLLM_METAL_PREFIX_CACHE presence-based enabling."""
 
