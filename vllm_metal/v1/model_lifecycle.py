@@ -17,7 +17,6 @@ from vllm_metal.compat import apply_compat_patches
 from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
-from vllm_metal.stt.detection import is_stt_model
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
@@ -65,6 +64,37 @@ def _stt_cache_key(model_name: str) -> tuple[str, str]:
     return (model_name, "stt")
 
 
+def load_stt_model(model_name: str) -> Any:
+    """Load an STT model, reusing the process-level model cache.
+
+    Returns the loaded STT model. The caller (``STTModelRunner``) builds the
+    per-model runtime adapter and wires it onto the runner. Shares
+    ``_MODEL_CACHE`` with generation loads so ``reset_model_cache`` clears it.
+    """
+    start_time = time.time()
+    cache_key = _stt_cache_key(model_name)
+
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        model, _ = cached
+        logger.info(
+            "STT model loaded from cache in %.3fs: %s",
+            time.time() - start_time,
+            model_name,
+        )
+        return model
+
+    from vllm_metal.stt.loader import load_model as stt_load_model
+
+    logger.info("Loading STT model: %s", model_name)
+    model = stt_load_model(model_name)
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE[cache_key] = (model, None)
+    logger.info("STT model loaded in %.2fs: %s", time.time() - start_time, model_name)
+    return model
+
+
 class ModelLifecycle:
     def __init__(
         self,
@@ -77,9 +107,6 @@ class ModelLifecycle:
     def load(self) -> None:
         runner = self._runner
         model_name = get_model_download_path(runner.model_config.model)
-        if is_stt_model(model_name):
-            self._load_stt(model_name)
-            return
 
         model_config = runner.model_config
         # vLLM model_config shape varies across backends.
@@ -93,8 +120,6 @@ class ModelLifecycle:
         runner.model = model
         runner.tokenizer = tokenizer
         runner._is_vlm = is_vlm
-        runner._is_stt = False
-        runner._stt_runtime_adapter = None
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(model, hf_config)
             if is_vlm
@@ -186,41 +211,6 @@ class ModelLifecycle:
             _MODEL_CACHE[cache_key] = (model, tokenizer)
         logger.info("Model loaded in %.2fs: %s", time.time() - start_time, model_name)
         return model, tokenizer
-
-    def _load_stt(self, model_name: str) -> None:
-        start_time = time.time()
-        cache_key = _stt_cache_key(model_name)
-
-        with _MODEL_CACHE_LOCK:
-            cached = _MODEL_CACHE.get(cache_key)
-        if cached is not None:
-            model, _ = cached
-            load_time = time.time() - start_time
-            logger.info(
-                "STT model loaded from cache in %.3fs: %s",
-                load_time,
-                model_name,
-            )
-        else:
-            from vllm_metal.stt.loader import load_model as stt_load_model
-
-            logger.info("Loading STT model: %s", model_name)
-            model = stt_load_model(model_name)
-            with _MODEL_CACHE_LOCK:
-                _MODEL_CACHE[cache_key] = (model, None)
-            load_time = time.time() - start_time
-            logger.info("STT model loaded in %.2fs: %s", load_time, model_name)
-
-        self._runner.model = model
-        self._runner.tokenizer = None
-        self._runner.model_args = {}
-        self._runner.kv_cache_dtype = None
-        self._runner._is_vlm = False
-        self._runner._is_stt = True
-        self._runner._stt_runtime_adapter = model.create_runtime_adapter(model_name)
-        self._runner._multimodal_adapter = None
-        self._runner._gemma4_mtp_assistant = None
-        self._runner.encoder_cache = None
 
     def resolve_model_dims(self) -> None:
         args = self._runner.model_args

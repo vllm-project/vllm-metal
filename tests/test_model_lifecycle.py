@@ -711,31 +711,20 @@ class TestModelLifecycle:
         assert runner.num_layers == 32
         assert runner.head_dim == 128
 
-    def test_load_reuses_cached_stt_model(
+    def test_load_stt_model_reuses_cached_model(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        adapter = object()
         fake_model = SimpleNamespace(
-            create_runtime_adapter=lambda model_name: (adapter, model_name)
+            create_runtime_adapter=lambda model_name: (object(), model_name)
         )
         monkeypatch.setattr(
             model_lifecycle,
             "_MODEL_CACHE",
             {model_lifecycle._stt_cache_key("stub-model"): (fake_model, None)},
         )
-        monkeypatch.setattr(model_lifecycle, "is_stt_model", lambda _model_name: True)
-        lifecycle, runner = _make_lifecycle()
 
-        lifecycle.load()
-
-        assert runner.model is fake_model
-        assert runner.tokenizer is None
-        assert runner.model_args == {}
-        assert runner.kv_cache_dtype is None
-        assert runner._is_vlm is False
-        assert runner._is_stt is True
-        assert runner._stt_runtime_adapter == (adapter, "stub-model")
+        assert model_lifecycle.load_stt_model("stub-model") is fake_model
 
     @pytest.mark.parametrize(
         "is_awq", [True, False], ids=["awq-checkpoint", "non-awq-checkpoint"]

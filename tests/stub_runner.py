@@ -34,7 +34,6 @@ def make_stub_runner(
         "vllm_config": SimpleNamespace(speculative_config=None),
         "model_config": SimpleNamespace(runner_type="generate"),
         "model": object(),
-        "_is_stt": False,
         "_is_vlm": False,
         "_multimodal_adapter": None,
         "_gemma4_mtp_assistant": None,

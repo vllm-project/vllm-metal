@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for v1 STT integration in MetalModelRunner."""
+"""Tests for v1 STT integration in STTModelRunner."""
 
 from __future__ import annotations
 
@@ -25,29 +25,24 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
-from vllm_metal.v1.cache_policy import ModelCachePolicy
-from vllm_metal.v1.model_adapter import DefaultModelAdapter
-from vllm_metal.v1.model_runner import MetalModelRunner
+from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 
 class _StubRunner:
-    """Lightweight concrete test double for MetalModelRunner (STT path only).
+    """Lightweight concrete test double for STTModelRunner (one-shot path).
 
     Inherits ``_execute_stt`` from the real class so class invariants
     (assert, attribute access) are exercised without MagicMock rebinding.
     Only the fields consumed by ``_execute_stt`` are initialised.
     """
 
-    _execute_stt = MetalModelRunner._execute_stt
+    _execute_stt = STTModelRunner._execute_stt
 
     def __init__(self, runtime_adapter: STTRuntimeAdapter) -> None:
-        self._is_stt = True
         self.model = runtime_adapter.model
         self._request_states: dict = {}
         self._pending_output = None
         self._stt_runtime_adapter = runtime_adapter
-        self._model_adapter = DefaultModelAdapter()
-        self._cache_policy = ModelCachePolicy(self, self._model_adapter)
 
 
 def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:
@@ -389,7 +384,7 @@ class TestKVCacheSTT:
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = 16
 
-        runner.get_kv_cache_spec = MetalModelRunner.get_kv_cache_spec.__get__(runner)
+        runner.get_kv_cache_spec = STTModelRunner.get_kv_cache_spec.__get__(runner)
         spec = runner.get_kv_cache_spec()
 
         assert len(spec) == 1
@@ -400,9 +395,36 @@ class TestKVCacheSTT:
         runner = _make_runner()
 
         runner.get_cache_block_size_bytes = (
-            MetalModelRunner.get_cache_block_size_bytes.__get__(runner)
+            STTModelRunner.get_cache_block_size_bytes.__get__(runner)
         )
         assert runner.get_cache_block_size_bytes() == STT_SCHED_BLOCK_BYTES
+
+
+class TestSTTRunnerWorkerContract:
+    """STTModelRunner worker-facing contract (task reporting + load wiring)."""
+
+    def test_supported_worker_tasks_returns_transcription(self) -> None:
+        runner = _make_runner()
+        bound = STTModelRunner.supported_worker_tasks.__get__(runner)
+        assert bound() == ("transcription",)
+
+    def test_load_model_wires_model_and_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vllm_metal.v1.stt_model_runner as smr
+
+        adapter = object()
+        fake_model = SimpleNamespace(create_runtime_adapter=lambda _name: adapter)
+        monkeypatch.setattr(smr, "load_stt_model", lambda _name: fake_model)
+        monkeypatch.setattr(smr, "get_model_download_path", lambda _m: "resolved-path")
+
+        runner = smr.STTModelRunner.__new__(smr.STTModelRunner)
+        runner.model_config = SimpleNamespace(model="some-model")
+        runner.load_model()
+
+        assert runner.model is fake_model
+        assert runner.tokenizer is None
+        assert runner._stt_runtime_adapter is adapter
 
 
 class TestWhisperRuntimeAdapterTranscriberCaching:

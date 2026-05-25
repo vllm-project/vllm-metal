@@ -33,11 +33,7 @@ from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
 from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
-from vllm_metal.stt.policy import (
-    STT_SCHED_AVAILABLE_BYTES,
-    STT_SCHED_BLOCK_BYTES,
-    STT_SCHED_NOMINAL_HEAD_SIZE,
-)
+from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
@@ -195,7 +191,7 @@ class ModelCachePolicy:
 
     def should_setup_paged_attention(self) -> bool:
         """Whether worker-side paged-attention setup should run."""
-        return not self._runner._is_stt
+        return True
 
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
@@ -216,26 +212,14 @@ class ModelCachePolicy:
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
-    ) -> Literal["stt_nominal", "paged_attention_capacity", "single_sequence_estimate"]:
+    ) -> Literal["paged_attention_capacity", "single_sequence_estimate"]:
         """Return which scheduler memory-reporting mode worker should use."""
-        if self._runner._is_stt:
-            return "stt_nominal"
         if paged_attention_enabled:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
-        if self._runner._is_stt:
-            return {
-                "layers.0.self_attn": FullAttentionSpec(
-                    block_size=self._runner.cache_config.block_size,
-                    num_kv_heads=1,
-                    head_size=STT_SCHED_NOMINAL_HEAD_SIZE,
-                    dtype=torch.float16,
-                ),
-            }
-
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
@@ -305,9 +289,6 @@ class ModelCachePolicy:
         For per-layer shapes, sums each layer's contribution individually.
         For uniform shapes, reduces to the existing product formula.
         """
-        if self._runner._is_stt:
-            return STT_SCHED_BLOCK_BYTES
-
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size

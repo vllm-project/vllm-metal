@@ -30,6 +30,7 @@ from vllm_metal.v1.cache_policy import WorkerCachePlanner
 if TYPE_CHECKING:
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
+    from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 logger = init_logger(__name__)
 
@@ -65,7 +66,7 @@ class MetalWorker(WorkerBase):
     """
 
     # Override model_runner type from base class
-    model_runner: MetalModelRunner  # type: ignore[assignment]
+    model_runner: MetalModelRunner | STTModelRunner  # type: ignore[assignment]
 
     def __init__(
         self,
@@ -133,14 +134,27 @@ class MetalWorker(WorkerBase):
         # Set random seed
         set_random_seed(self.model_config.seed)
 
-        # Import here to avoid circular imports
-        from vllm_metal.v1.model_runner import MetalModelRunner
+        # STT checkpoints run a one-shot transcribe that shares none of the
+        # generation runner's machinery, so they use a dedicated runner. Detect
+        # here using the same predicate as the generation load path and pick the
+        # runner before construction. Imports are local to avoid circular imports.
+        from vllm_metal.stt.detection import is_stt_model
+        from vllm_metal.utils import get_model_download_path
 
-        # Create model runner
-        self.model_runner = MetalModelRunner(
-            vllm_config=self.vllm_config,
-            device=self.device,
-        )
+        if is_stt_model(get_model_download_path(self.model_config.model)):
+            from vllm_metal.v1.stt_model_runner import STTModelRunner
+
+            self.model_runner = STTModelRunner(
+                vllm_config=self.vllm_config,
+                device=self.device,
+            )
+        else:
+            from vllm_metal.v1.model_runner import MetalModelRunner
+
+            self.model_runner = MetalModelRunner(
+                vllm_config=self.vllm_config,
+                device=self.device,
+            )
 
     def load_model(self) -> None:
         """Load the model onto the Metal device."""

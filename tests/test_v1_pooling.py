@@ -396,17 +396,12 @@ class TestMetalPoolingCapabilities:
 
         assert runner.supported_worker_tasks() == ()
 
-    def test_supported_worker_tasks_preserves_generation_and_stt(self) -> None:
+    def test_supported_worker_tasks_preserves_generation(self) -> None:
         gen_runner = make_stub_runner(
             model_config=SimpleNamespace(runner_type="generate")
         )
-        stt_runner = make_stub_runner(
-            _is_stt=True,
-            model_config=SimpleNamespace(runner_type="generate"),
-        )
 
         assert gen_runner.supported_worker_tasks() == ("generate",)
-        assert stt_runner.supported_worker_tasks() == ("transcription",)
 
 
 class TestMetalPoolingRunnerOutput:

@@ -49,8 +49,6 @@ from vllm_metal.paged_attention_common import (
     get_context,
     prepare_unified,
 )
-from vllm_metal.stt.runtime import STTRuntimeAdapter
-from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1 import contiguous_cache
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.contiguous_cache import (
@@ -270,12 +268,8 @@ class MetalModelRunner:
         self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
-        self._is_stt: bool = False  # Will be set during model loading
         self._is_pooling: bool = (
             getattr(self.model_config, "runner_type", None) == "pooling"
-        )
-        self._stt_runtime_adapter: STTRuntimeAdapter | None = (
-            None  # Set during STT loading
         )
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
@@ -411,8 +405,6 @@ class MetalModelRunner:
 
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
-        if self._is_stt:
-            return ("transcription",)
         if self._is_pooling:
             if self._paged_attention_backend is None:
                 return ()
@@ -651,13 +643,6 @@ class MetalModelRunner:
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
-            return
-
-        if self._is_stt:
-            assert self._stt_runtime_adapter is not None
-            logger.info("Warming up STT model...")
-            self._stt_runtime_adapter.warm_up()
-            logger.info("STT model warm-up complete")
             return
 
         logger.info("Warming up model...")
@@ -2090,9 +2075,6 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
-        if self._is_stt:
-            return self._execute_stt(scheduler_output)
-
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
@@ -2218,81 +2200,6 @@ class MetalModelRunner:
         logger.error(
             "sample_tokens called with no pending state — "
             "neither _execute_model_state nor _pending_output was set."
-        )
-        return None
-
-    # ------------------------------------------------------------------
-    # STT (Speech-to-Text) helpers
-    # ------------------------------------------------------------------
-
-    def _execute_stt(
-        self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | None:
-        """Execute STT inference for all new requests in the batch.
-
-        Raises:
-            ValueError: If a request uses non-greedy sampling params.
-        """
-        assert self._stt_runtime_adapter is not None
-
-        req_ids: list[str] = []
-        req_id_to_index: dict[str, int] = {}
-        sampled_tokens: list[list[int]] = []
-
-        eot_token = self._stt_runtime_adapter.eot_token
-
-        for new_req in scheduler_output.scheduled_new_reqs:
-            stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
-            sampling_params = new_req.sampling_params or SamplingParams()
-
-            # Only greedy decoding is supported for STT
-            if sampling_params.temperature > 0:
-                raise ValueError(
-                    "STT models only support greedy decoding (temperature=0). "
-                    f"Got temperature={sampling_params.temperature}"
-                )
-
-            audio_features = self._stt_runtime_adapter.extract_audio_features(
-                stt_request.input_features
-            )
-            tokens = self._stt_runtime_adapter.decode_tokens(
-                audio_features, list(stt_request.prompt_token_ids)
-            )
-
-            req_ids.append(stt_request.req_id)
-            req_id_to_index[stt_request.req_id] = len(req_ids) - 1
-            sampled_tokens.append(tokens)
-
-        # Handle cached requests: STT processes everything in one shot,
-        # so any "cached" (decode-phase) request just gets an EOT to finish.
-        cached_req_ids = list(scheduler_output.scheduled_cached_reqs.req_ids)
-        for req_id in cached_req_ids:
-            req_ids.append(req_id)
-            req_id_to_index[req_id] = len(req_ids) - 1
-            sampled_tokens.append([eot_token])
-
-        # Clean up finished requests
-        if scheduler_output.finished_req_ids:
-            for req_id in scheduler_output.finished_req_ids:
-                self._request_states.pop(req_id, None)
-
-        if not req_ids:
-            return ModelRunnerOutput(
-                req_ids=[],
-                req_id_to_index={},
-                sampled_token_ids=[],
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[],
-            )
-
-        self._pending_output = ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-            sampled_token_ids=sampled_tokens,
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[None] * len(req_ids),
         )
         return None
 
