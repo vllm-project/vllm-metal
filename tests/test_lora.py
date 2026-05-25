@@ -873,3 +873,124 @@ def test_activate_adapter_rejects_zero_module_match() -> None:
     # Slot must be rolled back so a later valid activation can use it.
     assert all(sid is None for sid in manager.lora_index_to_id)
     assert 1 not in manager._active
+
+
+def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
+    """If two adapter keys both suffix-match a wrapped module, fail loudly."""
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+
+    def _w(name: str) -> peft_loader_mod.LoRALayerWeightsMLX:
+        return peft_loader_mod.LoRALayerWeightsMLX(
+            module_name=name,
+            rank=1,
+            lora_a=mx.array(np.zeros((1, 2), dtype=np.float32)),
+            lora_b=mx.array(np.zeros((2, 1), dtype=np.float32)),
+            scaling=1.0,
+        )
+
+    # Both keys end with ".fc1" so they both suffix-match the wrapped "fc1".
+    ambiguous = peft_loader_mod.LoadedLoRA(
+        lora_id=42,
+        rank=1,
+        weights={
+            "language_model.fc1": _w("language_model.fc1"),
+            "vision_model.fc1": _w("vision_model.fc1"),
+            "fc2": _w("fc2"),
+        },
+    )
+    manager.add_adapter(ambiguous)
+    with pytest.raises(ValueError, match="ambiguous suffix matches"):
+        manager.activate_adapter(42)
+    assert all(sid is None for sid in manager.lora_index_to_id)
+    assert 42 not in manager._active
+
+
+def _stub_lora_request(
+    lora_id: int, *, load_inplace: bool = False
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        lora_int_id=lora_id,
+        lora_path=f"/fake/adapter-{lora_id}",
+        load_inplace=load_inplace,
+    )
+
+
+def _make_worker_manager() -> worker_manager_mod.MetalWorkerLoRAManager:
+    return worker_manager_mod.MetalWorkerLoRAManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1),
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+
+
+def _patch_loader(monkeypatch, adapters: dict[int, peft_loader_mod.LoadedLoRA]) -> None:
+    monkeypatch.setattr(
+        "vllm.lora.utils.get_adapter_absolute_path", lambda p: p
+    )
+
+    def _fake_load(path, *, lora_id, max_position_embeddings, lora_config):
+        return adapters[lora_id]
+
+    monkeypatch.setattr(worker_manager_mod, "load_peft_adapter", _fake_load)
+
+
+def test_worker_manager_empty_batch_deactivates_stale_adapters(monkeypatch) -> None:
+    """An empty lora_requests set must clear previously active slots so a
+    subsequent load is not blocked by stale state."""
+    manager = _make_worker_manager()
+    a = _make_adapter(
+        1,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
+    )
+    _patch_loader(monkeypatch, {1: a})
+
+    assert manager.add_adapter(_stub_lora_request(1)) is True
+    assert 1 in {sid for sid in manager._mm.lora_index_to_id if sid is not None}
+
+    # Empty batch — must deactivate adapter 1 instead of silently skipping.
+    manager.set_active_adapters(set(), None)
+    assert all(sid is None for sid in manager._mm.lora_index_to_id)
+
+
+def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -> None:
+    """Re-adding the same lora_int_id with load_inplace=True must swap weights."""
+    manager = _make_worker_manager()
+    v1 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
+    )
+    v2 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[5.0], [0.0]], dtype=np.float32),
+    )
+    state: dict[int, peft_loader_mod.LoadedLoRA] = {7: v1}
+    _patch_loader(monkeypatch, state)
+
+    assert manager.add_adapter(_stub_lora_request(7)) is True
+    slot = manager._mm.lora_index_to_id.index(7)
+    np.testing.assert_array_equal(
+        np.array(manager._mm.modules["fc1"].lora_b_stacked[slot])[:, 0], [3.0, 0.0]
+    )
+
+    # Without load_inplace, the duplicate add is a no-op.
+    assert manager.add_adapter(_stub_lora_request(7)) is False
+
+    # With load_inplace=True, the new weights must replace the old in the slot.
+    state[7] = v2
+    assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
+    slot = manager._mm.lora_index_to_id.index(7)
+    np.testing.assert_array_equal(
+        np.array(manager._mm.modules["fc1"].lora_b_stacked[slot])[:, 0], [5.0, 0.0]
+    )

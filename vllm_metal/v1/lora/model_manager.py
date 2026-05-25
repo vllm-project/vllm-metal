@@ -128,6 +128,19 @@ class MLXLoRAModelManager:
             return False
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
+        adapter = self._registered[lora_id]
+        resolved = [
+            (w, _lookup_weights_for_module(adapter, name))
+            for name, w in self.modules.items()
+        ]
+        loaded = sum(1 for _, mw in resolved if mw is not None)
+        if loaded == 0:
+            raise ValueError(
+                f"LoRA adapter {lora_id} matched 0 wrapped modules "
+                f"(wrapped: {sorted(self.modules)}). The adapter targets "
+                "modules this model does not expose under LoRA; check "
+                "target_modules / the adapter's base model."
+            )
         try:
             slot = next(i for i, sid in enumerate(self.lora_index_to_id) if sid is None)
         except StopIteration as exc:
@@ -137,25 +150,12 @@ class MLXLoRAModelManager:
 
         self.lora_index_to_id[slot] = lora_id
         self._active.add(lora_id)
-        adapter = self._registered[lora_id]
-        loaded = 0
-        for name, w in self.modules.items():
-            mw = _lookup_weights_for_module(adapter, name)
+        for w, mw in resolved:
             if mw is None:
                 w.reset_lora(slot)
                 continue
             # Fold scaling into B once so the kernel stays scale=1.0.
             w.set_lora(slot, mw.lora_a, mw.lora_b * mw.scaling)
-            loaded += 1
-        if loaded == 0:
-            self.lora_index_to_id[slot] = None
-            self._active.discard(lora_id)
-            raise ValueError(
-                f"LoRA adapter {lora_id} matched 0 wrapped modules "
-                f"(wrapped: {sorted(self.modules)}). The adapter targets "
-                "modules this model does not expose under LoRA; check "
-                "target_modules / the adapter's base model."
-            )
         logger.info("Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded)
         self._last_mapping = None
         return True
@@ -193,9 +193,18 @@ def _lookup_weights_for_module(
     if (w := adapter.weights.get(module_name)) is not None:
         return w
     suffix = "." + module_name
-    cands = [
-        w
+    matches = [
+        (n, w)
         for n, w in adapter.weights.items()
         if n.endswith(suffix) or module_name.endswith("." + n)
     ]
-    return cands[0] if len(cands) == 1 else None
+    if len(matches) == 1:
+        return matches[0][1]
+    if len(matches) > 1:
+        raise ValueError(
+            f"LoRA adapter {adapter.lora_id} has ambiguous suffix matches for "
+            f"wrapped module {module_name!r}: {sorted(n for n, _ in matches)}. "
+            "Rename the adapter weights or narrow target_modules so exactly "
+            "one candidate matches."
+        )
+    return None
