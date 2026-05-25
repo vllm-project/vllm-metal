@@ -40,7 +40,6 @@ class _StubRunner:
 
     def __init__(self, runtime_adapter: STTRuntimeAdapter) -> None:
         self.model = runtime_adapter.model
-        self._request_states: dict = {}
         self._pending_output = None
         self._stt_runtime_adapter = runtime_adapter
 
@@ -270,20 +269,6 @@ class TestExecuteSTTProtocol:
         # Both cached requests should get EOT
         for tokens in output.sampled_token_ids:
             assert tokens == [50257]
-
-    def test_finished_reqs_cleaned_from_state(self) -> None:
-        """finished_req_ids should be removed from _request_states."""
-        runner = _make_runner()
-        runner._request_states = {"old-1": "state", "old-2": "state"}
-        sched = _make_scheduler_output(
-            new_reqs=[_make_new_req(mm_features=_make_valid_mm_features())],
-            finished_req_ids={"old-1"},
-        )
-
-        self._run_stt(runner, sched)
-
-        assert "old-1" not in runner._request_states
-        assert "old-2" in runner._request_states
 
     def test_empty_batch_returns_empty_output(self) -> None:
         """No new and no cached requests should return empty ModelRunnerOutput."""

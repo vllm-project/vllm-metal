@@ -53,9 +53,6 @@ class STTModelRunner:
         self.tokenizer: Any = None
         self._stt_runtime_adapter: STTRuntimeAdapter | None = None
 
-        # STT transcribes a request in one shot; request state is only used to
-        # drop finished ids, mirroring the generation runner's bookkeeping.
-        self._request_states: dict[str, Any] = {}
         # execute_model stashes the output here; sample_tokens returns it,
         # matching the engine's execute -> sample handoff.
         self._pending_output: ModelRunnerOutput | None = None
@@ -89,10 +86,6 @@ class STTModelRunner:
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """STT models only serve transcription."""
         return ("transcription",)
-
-    def should_setup_paged_attention(self) -> bool:
-        """STT owns its runtime path and never uses paged attention."""
-        return False
 
     def validate_paged_attention_support(self) -> None:
         """No-op: STT does not run on the paged-attention path."""
@@ -216,11 +209,6 @@ class STTModelRunner:
             req_ids.append(req_id)
             req_id_to_index[req_id] = len(req_ids) - 1
             sampled_tokens.append([eot_token])
-
-        # Clean up finished requests
-        if scheduler_output.finished_req_ids:
-            for req_id in scheduler_output.finished_req_ids:
-                self._request_states.pop(req_id, None)
 
         if not req_ids:
             return ModelRunnerOutput(

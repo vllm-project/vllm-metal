@@ -189,10 +189,6 @@ class ModelCachePolicy:
         self._runner = runner
         self._model_adapter = model_adapter
 
-    def should_setup_paged_attention(self) -> bool:
-        """Whether worker-side paged-attention setup should run."""
-        return True
-
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
