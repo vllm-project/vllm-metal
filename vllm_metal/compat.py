@@ -90,9 +90,9 @@ def _patch_vllm_gemma4_mtp_config_loading() -> None:
         return
 
     config_cls = _gemma4_assistant_config_class()
-    # TODO(transformers): remove once the pinned Transformers/vLLM stack can
-    # parse raw ``model_type=gemma4_assistant`` checkpoints without this local
-    # registration.
+    # TODO: remove once the supported dependency stack parses raw
+    # ``model_type=gemma4_assistant`` configs before vLLM's Gemma4 MTP
+    # override runs.
     AutoConfig.register("gemma4_assistant", config_cls, exist_ok=True)
     logger.debug("Registered Gemma4 assistant config compatibility")
 
