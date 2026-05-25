@@ -58,6 +58,18 @@ class TestWorkerRunnerBoundaryDelegation:
 
         model_runner.reset_encoder_cache.assert_called_once_with()
 
+    def test_take_draft_token_ids_delegates_to_runner(self) -> None:
+        draft_token_ids = object()
+        model_runner = SimpleNamespace(
+            take_draft_token_ids=MagicMock(return_value=draft_token_ids),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=True)
+
+        out = MetalWorker.take_draft_token_ids(worker)
+
+        assert out is draft_token_ids
+        model_runner.take_draft_token_ids.assert_called_once_with()
+
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(return_value="stt_nominal"),

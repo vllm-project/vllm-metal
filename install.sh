@@ -167,7 +167,11 @@ EOF
     rm -f "$lib_tmp"
   fi
 
-  is_apple_silicon
+  if ! is_apple_silicon; then
+    error "vllm-metal requires Apple Silicon arm64. Detected: $(uname -m)."
+    exit 1
+  fi
+
   if ! ensure_uv; then
     exit 1
   fi
@@ -178,6 +182,9 @@ EOF
   fi
 
   ensure_venv "$venv"
+  if ! require_arm64_python python; then
+    exit 1
+  fi
 
   local vllm_v="0.21.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"

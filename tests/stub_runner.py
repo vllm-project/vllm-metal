@@ -33,6 +33,7 @@ def make_stub_runner(
 
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(speculative_config=None),
+        "model_config": SimpleNamespace(runner_type="generate"),
         "model": object(),
         "_is_stt": False,
         "_is_vlm": False,
@@ -47,6 +48,7 @@ def make_stub_runner(
         "_paged_request_seq_lens": {},
         "_prefix_cache": None,
         "_pending_output": None,
+        "_draft_token_ids": None,
         "_execute_model_state": None,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
@@ -66,6 +68,10 @@ def make_stub_runner(
         setattr(runner, k, v)
     for k, v in attrs.items():
         setattr(runner, k, v)
+    if "_is_pooling" not in attrs:
+        runner._is_pooling = (
+            getattr(runner.model_config, "runner_type", None) == "pooling"
+        )
 
     runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
 

@@ -21,6 +21,22 @@ is_apple_silicon() {
   [ "$(uname -m)" = "arm64" ]
 }
 
+# Require a native arm64 Python interpreter.
+require_arm64_python() {
+  local python_bin="${1:-python}"
+  local machine
+
+  if ! machine=$("$python_bin" -c "import platform; print(platform.machine())"); then
+    error "Failed to inspect Python architecture using ${python_bin}."
+    return 1
+  fi
+
+  if [ "$machine" != "arm64" ]; then
+    error "vllm-metal requires native arm64 Python, got ${machine}. Remove the venv and rerun install.sh from an arm64 Python."
+    return 1
+  fi
+}
+
 # Ensure uv is installed
 ensure_uv() {
   if ! command -v uv &> /dev/null; then

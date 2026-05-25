@@ -8,13 +8,14 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 
 
 class _HybridBackendStub(HybridPagedAttentionBackend):
@@ -125,6 +126,16 @@ class TestV1MetalModelRunnerSampleTokens:
         assert out is pending
         assert runner._pending_output is None
 
+    def test_take_draft_token_ids_returns_and_clears_state(self) -> None:
+        runner = self._make_runner()
+        draft_token_ids = DraftTokenIds(["req-0"], [[123]])
+        runner._draft_token_ids = draft_token_ids
+
+        out = runner.take_draft_token_ids()
+
+        assert out is draft_token_ids
+        assert runner._draft_token_ids is None
+
     def test_returns_none_when_no_pending_output(self) -> None:
         runner = self._make_runner()
         out = runner.sample_tokens(grammar_output=None)
@@ -223,6 +234,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         decode_segments: tuple[mr.PagedDecodeSegment, ...],
         logits: mx.array,
         scheduler_output: SimpleNamespace,
+        target_hidden_states: mx.array | None = None,
     ) -> None:
         batch = mr._ExecutionBatch()
         batch.paged_decode_reqs = decode_reqs
@@ -232,7 +244,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
             logits=logits,
-            target_hidden_states=None,
+            target_hidden_states=target_hidden_states,
             cu_seqlens=[
                 0,
                 *[s.start_row + s.num_query_tokens for s in decode_segments],
@@ -524,6 +536,150 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert req_state.token_ids == [1, 6, 7, 8, 9]
         assert req_state.generated_tokens == 4
         assert runner._paged_request_seq_lens["r0"] == 4
+
+    def test_sample_paged_batch_stashes_gemma4_decode_drafts(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Assistant:
+            forward_ready = True
+
+            def propose_draft_token_ids(
+                self,
+                *,
+                seeds,
+                target_hidden_states,
+                target_input_embeddings,
+            ):
+                captured["seeds"] = seeds
+                captured["hidden_states"] = target_hidden_states.tolist()
+                captured["embeddings"] = target_input_embeddings.tolist()
+                return [[42]]
+
+        class Adapter:
+            def target_input_embeddings(self, model, input_ids):
+                del model
+                captured["input_ids"] = input_ids.tolist()
+                return mx.ones((*input_ids.shape, 4))
+
+        runner = self._make_runner()
+        runner._gemma4_mtp_assistant = Assistant()
+        runner._model_adapter = Adapter()
+        req_state = self._make_state([1, 6])
+        decode_reqs = [("r0", req_state)]
+        segment = mr.PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6, 7),
+            start_row=0,
+            num_query_tokens=2,
+            draft_token_ids=(7,),
+            cache_start_pos=1,
+            block_ids=(0,),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 2},
+            {"r0": [7]},
+        )
+        self._install_paged_state(
+            runner,
+            decode_reqs,
+            (segment,),
+            self._make_logits([7, 9]),
+            scheduler_output,
+            target_hidden_states=mx.array([[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]),
+        )
+
+        output = runner.sample_tokens(grammar_output=None)
+        draft_token_ids = runner.take_draft_token_ids()
+
+        assert output is not None
+        assert output.sampled_token_ids == [[7, 9]]
+        assert captured["input_ids"] == [[9]]
+        assert captured["hidden_states"] == [
+            [1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0],
+        ]
+        assert captured["embeddings"] == [[[1.0, 1.0, 1.0, 1.0]]]
+        seeds = captured["seeds"]
+        assert len(seeds) == 1
+        assert seeds[0] == Gemma4MTPDraftSeed(
+            req_id="r0",
+            token_id=9,
+            target_hidden_row=1,
+            target_position=2,
+            block_ids=(0,),
+        )
+        assert draft_token_ids == DraftTokenIds(["r0"], [[42]])
+
+    def test_sample_paged_batch_stashes_gemma4_prefill_drafts(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Assistant:
+            forward_ready = True
+
+            def propose_draft_token_ids(
+                self,
+                *,
+                seeds,
+                target_hidden_states,
+                target_input_embeddings,
+            ):
+                del target_hidden_states, target_input_embeddings
+                captured["seeds"] = seeds
+                return [[43]]
+
+        class Adapter:
+            def target_input_embeddings(self, model, input_ids):
+                del model
+                captured["input_ids"] = input_ids.tolist()
+                return mx.ones((*input_ids.shape, 4))
+
+        runner = self._make_runner()
+        runner._gemma4_mtp_assistant = Assistant()
+        runner._model_adapter = Adapter()
+        prefill = mr.PrefillRequest(
+            req_id="p0",
+            token_ids=[5, 6],
+            sampling_params=SamplingParams(temperature=0.0),
+            block_ids=[0],
+            generator=None,
+            prompt_len=2,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        batch = mr._ExecutionBatch()
+        output_idx = batch.add_output("p0", [])
+        batch.paged_prefill_entries = [
+            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+        ]
+        runner._execute_model_state = mr._PagedForwardState(
+            batch=batch,
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=self._make_scheduler_output({"p0": 2}, {}),
+            logits=self._make_logits([0, 7]),
+            target_hidden_states=mx.array([[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]),
+            cu_seqlens=[0, 2],
+            decode_segments=(),
+            num_decode_tokens=0,
+            mm_prefill_deltas={},
+        )
+
+        output = runner.sample_tokens(grammar_output=None)
+        draft_token_ids = runner.take_draft_token_ids()
+
+        assert output is not None
+        assert output.sampled_token_ids == [[7]]
+        assert captured["input_ids"] == [[7]]
+        seeds = captured["seeds"]
+        assert len(seeds) == 1
+        assert seeds[0] == Gemma4MTPDraftSeed(
+            req_id="p0",
+            token_id=7,
+            target_hidden_row=1,
+            target_position=1,
+            block_ids=(0,),
+        )
+        assert draft_token_ids == DraftTokenIds(["p0"], [[43]])
 
     def test_rejects_first_mismatched_draft_and_stops_before_bonus(self) -> None:
         runner = self._make_runner()
@@ -925,6 +1081,29 @@ class TestV1MetalModelRunnerExecuteModel:
             runner.execute_model(scheduler_output)
 
         assert req_state.block_ids == [0]
+        assert "new" not in runner._request_states
+
+    def test_gemma4_mtp_async_scheduling_fails_before_request_setup(self) -> None:
+        runner = self._make_runner()
+        runner.use_async_scheduling = True
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type="gemma4_assistant",
+                        architectures=["Gemma4AssistantForCausalLM"],
+                    )
+                ),
+            )
+        )
+        scheduler_output = self._make_scheduler_output(
+            scheduled_new_reqs=[SimpleNamespace(req_id="new")]
+        )
+
+        with pytest.raises(NotImplementedError, match="no-async-scheduling"):
+            runner.execute_model(scheduler_output)
+
         assert "new" not in runner._request_states
 
 

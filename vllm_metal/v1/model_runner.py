@@ -21,6 +21,7 @@ import torch
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -31,7 +32,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -61,6 +62,7 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantRuntime
 from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
@@ -70,6 +72,14 @@ from vllm_metal.v1.model_adapter import (
     TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.pooling import (
+    finish_paged_pooling_batch,
+    forward_sequence_hidden_states,
+    has_paged_pooling_work,
+    pooling_dummy_forward_outputs,
+    supported_pooling_tasks,
+    validate_pooling_request,
+)
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
@@ -130,6 +140,7 @@ class RequestState:
     prompt_len: int
     cache: list[AnyCache]  # Per-layer caches (KVCache, RotatingKVCache, or ArraysCache)
     sampling_params: SamplingParams  # Sampling parameters for this request
+    pooling_params: PoolingParams | None = None
     generator: torch.Generator | None = None
     generated_tokens: int = 0
     block_ids: list[int] = field(
@@ -152,7 +163,8 @@ class PrefillRequest(NamedTuple):
     prompt_len: int | None  # full prompt length (None for intermediate chunks)
     start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
     full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
-    lora_id: int | None = None
+    lora_id: int | None = None  # None = no LoRA adapter for this request
+    pooling_params: PoolingParams | None = None
 
 
 @dataclass
@@ -172,6 +184,7 @@ class _ExecutionBatch:
     req_id_to_index: dict[str, int] = field(default_factory=dict)
     sampled_tokens: list[list[int]] = field(default_factory=list)
     sample_logprobs: list[LogprobsLists | None] = field(default_factory=list)
+    pooler_outputs: list[torch.Tensor | None] = field(default_factory=list)
     new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
@@ -183,6 +196,7 @@ class _ExecutionBatch:
         req_id: str,
         token_ids: list[int],
         logprobs: LogprobsLists | None = None,
+        pooler_output: torch.Tensor | None = None,
     ) -> int:
         """Append one output slot and return its index."""
         self.req_ids.append(req_id)
@@ -190,6 +204,7 @@ class _ExecutionBatch:
         self.req_id_to_index[req_id] = output_idx
         self.sampled_tokens.append(token_ids)
         self.sample_logprobs.append(logprobs)
+        self.pooler_outputs.append(pooler_output)
         return output_idx
 
     def set_output(
@@ -197,10 +212,12 @@ class _ExecutionBatch:
         output_idx: int,
         token_ids: list[int],
         logprobs: LogprobsLists | None = None,
+        pooler_output: torch.Tensor | None = None,
     ) -> None:
         """Set tokens and logprobs for an existing output slot."""
         self.sampled_tokens[output_idx] = token_ids
         self.sample_logprobs[output_idx] = logprobs
+        self.pooler_outputs[output_idx] = pooler_output
 
     def merged_logprobs(self) -> LogprobsLists | None:
         """Merge per-output-slot logprobs for ``ModelRunnerOutput``."""
@@ -218,7 +235,7 @@ class _PagedForwardState(NamedTuple):
     prefill_reqs: list[PrefillRequest]
     decode_reqs: list[tuple[str, RequestState]]
     scheduler_output: SchedulerOutput
-    logits: mx.array
+    logits: mx.array | None
     target_hidden_states: mx.array | None
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
@@ -226,6 +243,7 @@ class _PagedForwardState(NamedTuple):
     # ``{req_id: mrope_position_delta}`` from paged mm prefill;
     # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
+    pooling_hidden_states: mx.array | None = None
 
 
 class MetalModelRunner:
@@ -264,10 +282,14 @@ class MetalModelRunner:
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_stt: bool = False  # Will be set during model loading
+        self._is_pooling: bool = (
+            getattr(self.model_config, "runner_type", None) == "pooling"
+        )
         self._stt_runtime_adapter: STTRuntimeAdapter | None = (
             None  # Set during STT loading
         )
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
+        self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
@@ -283,7 +305,6 @@ class MetalModelRunner:
         self._sampler = Sampler()
 
         # Build logits processors (includes custom plugins from entry-points)
-        is_pooling_model = getattr(self.model_config, "runner_type", None) == "pooling"
         pin_memory = is_pin_memory_available()
         custom_lp = vllm_config.model_config.logits_processors
         custom_logitsprocs = tuple(custom_lp) if custom_lp is not None else ()
@@ -291,13 +312,14 @@ class MetalModelRunner:
             vllm_config,
             device,
             pin_memory,
-            is_pooling_model,
+            self._is_pooling,
             custom_logitsprocs,
         )
 
         # vLLM v1 async scheduling calls sample_tokens after execute_model.
         # Keep the latest execution output so sample_tokens can return it.
         self._pending_output: ModelRunnerOutput | None = None
+        self._draft_token_ids: DraftTokenIds | None = None
 
         # Prefix cache for shared prompt reuse
         self._prefix_cache: PrefixCacheManager | None = None
@@ -402,6 +424,12 @@ class MetalModelRunner:
         """Return worker task capabilities for the loaded model."""
         if self._is_stt:
             return ("transcription",)
+        if self._is_pooling:
+            if self._paged_attention_backend is None:
+                return ()
+            return supported_pooling_tasks(
+                self._forward_model, self.model_config, self.tokenizer
+            )
         return ("generate",)
 
     def load_model(self) -> None:
@@ -435,6 +463,21 @@ class MetalModelRunner:
 
     def list_loras(self) -> set[int]:
         return self._lora.list_adapters()
+
+    def _paged_lora_routing(
+        self,
+        decode_reqs: list[tuple[str, RequestState]],
+        prefill_pack: list[PrefillRequest],
+    ) -> list[tuple[int | None, int]]:
+        # One decode query row per request: speculative decode (which forwards
+        # multiple draft rows per request) is rejected at MetalLoRARuntime.setup,
+        # so this 1:1 contract holds. Revisit if spec-decode + LoRA is enabled.
+        entries: list[tuple[int | None, int]] = []
+        for _, state in decode_reqs:
+            entries.append((state.lora_id, 1))
+        for pr in prefill_pack:
+            entries.append((pr.lora_id, len(pr.token_ids)))
+        return entries
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
@@ -560,6 +603,17 @@ class MetalModelRunner:
             collect_hidden_states=collect_hidden_states,
         )
 
+    def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
+        return self._model_adapter.target_input_embeddings(
+            self._forward_model, input_ids
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """Return and clear draft tokens generated by the last sampled step."""
+        draft_token_ids = self._draft_token_ids
+        self._draft_token_ids = None
+        return draft_token_ids
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
@@ -610,10 +664,22 @@ class MetalModelRunner:
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
-        mx.eval(self._extract_logits(self._forward_model(dummy_tokens)))
+        mx.eval(*self._dummy_forward_outputs(dummy_tokens))
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
+
+    def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
+        if self._is_pooling:
+            return pooling_dummy_forward_outputs(
+                self._forward_model,
+                input_ids,
+                model_config=self.model_config,
+            )
+
+        output = self._forward_model(input_ids)
+        logits = self._extract_logits(output)
+        return [logits]
 
     def build_paged_attention_backend(
         self, *, block_size: int
@@ -653,9 +719,7 @@ class MetalModelRunner:
         # Run a small dummy inference (standard MLX path)
         try:
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            output = self._forward_model(dummy_tokens)
-            logits = self._extract_logits(output)
-            mx.eval(logits)
+            mx.eval(*self._dummy_forward_outputs(dummy_tokens))
             logger.info("Model warm-up complete")
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
@@ -893,10 +957,15 @@ class MetalModelRunner:
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
+        has_pooling_work = has_paged_pooling_work(prefill_reqs, decode_reqs)
+
         # prompt_len=None marks an intermediate prefill chunk; only final
-        # prefill rows can seed the next Gemma4 MTP draft step.
+        # prefill rows can seed the next Gemma4 MTP draft step. Pooling batches
+        # do not sample or draft tokens, so they never request target hidden
+        # states here.
         collect_target_hidden_states = (
-            self._spec_decode_controller.needs_target_hidden_states(
+            not has_pooling_work
+            and self._spec_decode_controller.needs_target_hidden_states(
                 decode_segments,
                 has_final_prefill=any(pr.prompt_len is not None for pr in prefill_reqs),
                 speculative_config=self.vllm_config.speculative_config,
@@ -964,9 +1033,19 @@ class MetalModelRunner:
         # ---- forward (lazy graph + async submit) ----
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
+        logits: mx.array | None = None
+        target_hidden_states: mx.array | None = None
+        pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
         try:
-            if has_mm:
+            if has_pooling_work:
+                pooling_hidden_states = forward_sequence_hidden_states(
+                    self._forward_model,
+                    input_ids,
+                    cache=offset_caches,
+                    model_config=self.model_config,
+                )
+            elif has_mm:
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
@@ -989,14 +1068,19 @@ class MetalModelRunner:
             clear_context()
 
         # Submit to GPU — returns immediately, GPU runs in background.
-        # For GDN prefill, state-cache updates are side effects that the logits
-        # graph does not necessarily force. Submit them with logits and any
-        # target hidden states retained for assistant decoding.
-        self._submit_paged_forward_outputs(
-            logits,
-            target_hidden_states=target_hidden_states,
-            has_prefill=bool(prefill_reqs),
-        )
+        if has_pooling_work:
+            assert pooling_hidden_states is not None
+            mx.async_eval(pooling_hidden_states)
+        else:
+            assert logits is not None
+            # For GDN prefill, state-cache updates are side effects that the
+            # logits graph does not necessarily force. Submit them with logits
+            # and any target hidden states retained for assistant decoding.
+            self._submit_paged_forward_outputs(
+                logits,
+                target_hidden_states=target_hidden_states,
+                has_prefill=bool(prefill_reqs),
+            )
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -1012,6 +1096,7 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             target_hidden_states=target_hidden_states,
+            pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
@@ -1036,6 +1121,7 @@ class MetalModelRunner:
         scheduler_output = paged_state.scheduler_output
         logits = paged_state.logits
         target_hidden_states = paged_state.target_hidden_states
+        pooling_hidden_states = paged_state.pooling_hidden_states
         cu_seqlens = paged_state.cu_seqlens
         decode_segments = paged_state.decode_segments
         num_decode_segments = len(decode_segments)
@@ -1044,6 +1130,21 @@ class MetalModelRunner:
         has_scheduled_drafts = any(
             segment.draft_token_ids for segment in decode_segments
         )
+        self._draft_token_ids = None
+
+        if pooling_hidden_states is not None:
+            finish_paged_pooling_batch(
+                batch,
+                pooling_hidden_states,
+                cu_seqlens=cu_seqlens,
+                num_decode_segments=num_decode_segments,
+                model=self._forward_model,
+                tokenizer=self.tokenizer,
+                model_config=self.model_config,
+            )
+            return batch, scheduler_output
+
+        assert logits is not None
 
         # ---- wait for MLX forward to complete ----
         if target_hidden_states is not None:
@@ -1209,6 +1310,7 @@ class MetalModelRunner:
                     prompt_len=prompt_len,
                     cache=[],
                     sampling_params=prefill.sampling_params,
+                    pooling_params=prefill.pooling_params,
                     generator=prefill.generator,
                     generated_tokens=1,
                     block_ids=prefill.block_ids,
@@ -1233,19 +1335,72 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
+        self._prepare_gemma4_mtp_draft_tokens(
+            target_hidden_states=target_hidden_states,
+            decode_reqs=decode_reqs,
+            decode_segments=decode_segments,
+            decode_token_ids=decode_token_ids,
+            prefill_reqs=prefill_reqs,
+            prefill_token_ids=prefill_result.token_ids,
+            batch=batch,
+            cu_seqlens=cu_seqlens,
+            num_decode_segments=num_decode_segments,
+        )
+
         return batch, scheduler_output
 
-    def _paged_lora_routing(
+    def _prepare_gemma4_mtp_draft_tokens(
         self,
+        *,
+        target_hidden_states: mx.array | None,
         decode_reqs: list[tuple[str, RequestState]],
-        prefill_pack: list[PrefillRequest],
-    ) -> list[tuple[int | None, int]]:
-        entries: list[tuple[int | None, int]] = []
-        for _, state in decode_reqs:
-            entries.append((state.lora_id, 1))
-        for pr in prefill_pack:
-            entries.append((pr.lora_id, len(pr.token_ids)))
-        return entries
+        decode_segments: tuple[PagedDecodeSegment, ...],
+        decode_token_ids: list[list[int]],
+        prefill_reqs: list[PrefillRequest],
+        prefill_token_ids: list[int],
+        batch: _ExecutionBatch,
+        cu_seqlens: list[int],
+        num_decode_segments: int,
+    ) -> None:
+        """Ask the Gemma4 MTP assistant for drafts after target sampling."""
+        assistant = self._gemma4_mtp_assistant
+        if (
+            assistant is None
+            or not assistant.forward_ready
+            or target_hidden_states is None
+        ):
+            return
+
+        seeds = self._spec_decode_controller.build_gemma4_mtp_draft_seeds(
+            decode_reqs=decode_reqs,
+            decode_segments=decode_segments,
+            decode_token_ids=decode_token_ids,
+            prefill_reqs=prefill_reqs,
+            prefill_token_ids=prefill_token_ids,
+            prefill_result_modes=[
+                entry.result_mode for entry in batch.paged_prefill_entries
+            ],
+            request_states=self._request_states,
+            cu_seqlens=cu_seqlens,
+            num_decode_segments=num_decode_segments,
+            logitsprocs=self._logitsprocs,
+        )
+        if not seeds:
+            return
+
+        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
+        target_input_embeddings = self._target_input_embeddings(input_ids)
+        draft_token_ids = assistant.propose_draft_token_ids(
+            seeds=seeds,
+            target_hidden_states=target_hidden_states,
+            target_input_embeddings=target_input_embeddings,
+        )
+        if not draft_token_ids:
+            return
+        self._draft_token_ids = DraftTokenIds(
+            req_ids=[seed.req_id for seed in seeds],
+            draft_token_ids=draft_token_ids,
+        )
 
     def _register_new_request_mm_features(
         self, req_id: str, new_req: NewRequestData
@@ -1345,6 +1500,8 @@ class MetalModelRunner:
             paged_attention_enabled=self._paged_attention_backend is not None,
             is_hybrid=self.is_hybrid,
             logitsprocs=self._logitsprocs,
+            use_async_scheduling=self.use_async_scheduling,
+            speculative_config=self.vllm_config.speculative_config,
         )
 
     def _run_vision_encoders(
@@ -1622,6 +1779,13 @@ class MetalModelRunner:
 
         for new_req in new_reqs:
             req_id = new_req.req_id
+            pooling_params = new_req.pooling_params
+            validate_pooling_request(
+                new_req,
+                self.model_config,
+                paged_attention_enabled=self._paged_attention_backend is not None,
+            )
+
             # mm_features were pre-registered before encoder dispatch in
             # ``execute_model``; no further bookkeeping needed here.
             token_ids = new_req.prompt_token_ids or []
@@ -1640,6 +1804,7 @@ class MetalModelRunner:
                 prompt_len = len(token_ids)
                 cur_len = computed_tokens + scheduled_tokens
                 is_intermediate = cur_len < prompt_len
+
                 output_idx = batch.add_output(req_id, [])
 
                 batch.paged_prefill_entries.append(
@@ -1649,6 +1814,7 @@ class MetalModelRunner:
                             req_id=req_id,
                             token_ids=token_ids[computed_tokens:cur_len],
                             sampling_params=sampling_params,
+                            pooling_params=pooling_params,
                             block_ids=sched_block_ids,
                             generator=generator,
                             prompt_len=prompt_len if not is_intermediate else None,
@@ -1668,6 +1834,7 @@ class MetalModelRunner:
                         prompt_len=prompt_len,
                         cache=[],
                         sampling_params=sampling_params,
+                        pooling_params=pooling_params,
                         generator=generator,
                         generated_tokens=0,
                         block_ids=sched_block_ids,
@@ -1687,6 +1854,7 @@ class MetalModelRunner:
                 prompt_len=len(token_ids),
                 cache=cache,
                 sampling_params=sampling_params,
+                pooling_params=None,
                 generator=generator,
                 generated_tokens=1,
                 block_ids=[],
@@ -1753,6 +1921,7 @@ class MetalModelRunner:
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 target_len = computed_tokens + scheduled_tokens
                 is_intermediate = target_len < len(state.token_ids)
+
                 output_idx = batch.add_output(req_id, [])
 
                 batch.paged_prefill_entries.append(
@@ -1762,6 +1931,7 @@ class MetalModelRunner:
                             req_id=req_id,
                             token_ids=state.token_ids[computed_tokens:target_len],
                             sampling_params=state.sampling_params,
+                            pooling_params=state.pooling_params,
                             block_ids=state.block_ids,
                             generator=state.generator,
                             prompt_len=(
@@ -1838,6 +2008,7 @@ class MetalModelRunner:
                     req_id=prefill.req_id,
                     token_ids=prefill.token_ids,
                     sampling_params=prefill.sampling_params,
+                    pooling_params=prefill.pooling_params,
                     block_ids=prefill.block_ids,
                     generator=prefill.generator,
                     prompt_len=prefill.prompt_len,
@@ -1858,7 +2029,7 @@ class MetalModelRunner:
             sampled_token_ids=batch.sampled_tokens,
             logprobs=batch.merged_logprobs(),
             prompt_logprobs_dict={},
-            pooler_output=[None] * len(batch.req_ids),
+            pooler_output=batch.pooler_outputs,
         )
 
     def _run_non_paged_decode_batch(
@@ -1901,7 +2072,10 @@ class MetalModelRunner:
                 missing_req_ids.append(req_id)
                 continue
 
-            if batch.sampled_tokens[output_idx]:
+            if (
+                batch.sampled_tokens[output_idx]
+                or batch.pooler_outputs[output_idx] is not None
+            ):
                 continue
 
             state = self._request_states.get(req_id)
@@ -2043,6 +2217,11 @@ class MetalModelRunner:
                 batch.paged_decode_reqs,
                 scheduler_output,
             )
+            if self._is_pooling:
+                batch, scheduler_output = self._sample_paged_batch(None)
+                self._gdn_materialize_pending_state_cache()
+                self._validate_scheduled_outputs(batch, scheduler_output)
+                return self._build_output(batch)
             return None
 
         # Defensive invariant: the vLLM scheduler sets has_structured_output_requests
@@ -2068,7 +2247,10 @@ class MetalModelRunner:
         self._validate_scheduled_outputs(batch, scheduler_output)
         if not batch.req_ids:
             return self._build_output(batch)
-        self._pending_output = self._build_output(batch)
+        output = self._build_output(batch)
+        if self._is_pooling:
+            return output
+        self._pending_output = output
         return None
 
     def sample_tokens(

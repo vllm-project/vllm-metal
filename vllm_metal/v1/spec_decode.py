@@ -12,7 +12,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
-from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantSource
+from vllm_metal.v1.gemma4_mtp import (
+    Gemma4MTPAssistantSource,
+    Gemma4MTPDraftSeed,
+)
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 
 if TYPE_CHECKING:
@@ -27,6 +30,13 @@ class _PagedDecodeStateLike(Protocol):
 class _SpecDecodeRequestStateLike(Protocol):
     sampling_params: Any
     generated_tokens: int
+
+
+class _SpecDecodePrefillLike(Protocol):
+    req_id: str
+    token_ids: Sequence[int]
+    block_ids: Sequence[int]
+    start_pos: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +87,19 @@ class SpeculativeDecodeController:
         paged_attention_enabled: bool,
         is_hybrid: bool,
         logitsprocs: LogitsProcessors | None,
+        use_async_scheduling: bool = False,
+        speculative_config: SpeculativeConfig | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
+        if use_async_scheduling and Gemma4MTPAssistantSource.is_gemma4_mtp(
+            speculative_config
+        ):
+            raise NotImplementedError(
+                "Gemma4 MTP speculative decoding on Metal requires synchronous "
+                "scheduling so take_draft_token_ids() can hand drafts back to "
+                "the scheduler. Use --no-async-scheduling."
+            )
+
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
         if not spec_tokens and not invalid_counts:
@@ -258,6 +279,86 @@ class SpeculativeDecodeController:
             sampled_token_ids.append(output_ids)
 
         return sampled_token_ids
+
+    def build_gemma4_mtp_draft_seeds(
+        self,
+        *,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        decode_segments: Sequence[PagedDecodeSegment],
+        decode_token_ids: Sequence[Sequence[int]],
+        prefill_reqs: Sequence[_SpecDecodePrefillLike],
+        prefill_token_ids: Sequence[int],
+        prefill_result_modes: Sequence[str],
+        request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        cu_seqlens: Sequence[int],
+        num_decode_segments: int,
+        logitsprocs: LogitsProcessors | None,
+    ) -> tuple[Gemma4MTPDraftSeed, ...]:
+        """Build target-row seeds for one-token Gemma4 MTP drafts."""
+        seeds: list[Gemma4MTPDraftSeed] = []
+        for (req_id, state), segment, sampled_ids in zip(
+            decode_reqs,
+            decode_segments,
+            decode_token_ids,
+            strict=True,
+        ):
+            if not sampled_ids or not self._can_draft_greedy(
+                req_id,
+                state,
+                logitsprocs=logitsprocs,
+            ):
+                continue
+            accepted_offset = len(sampled_ids) - 1
+            seeds.append(
+                Gemma4MTPDraftSeed(
+                    req_id=req_id,
+                    token_id=sampled_ids[-1],
+                    target_hidden_row=segment.start_row + accepted_offset,
+                    target_position=segment.cache_start_pos + accepted_offset,
+                    block_ids=segment.block_ids,
+                )
+            )
+
+        for i, (prefill, token_id, result_mode) in enumerate(
+            zip(prefill_reqs, prefill_token_ids, prefill_result_modes, strict=True)
+        ):
+            if result_mode == "intermediate":
+                continue
+            state = request_states.get(prefill.req_id)
+            if state is None or not self._can_draft_greedy(
+                prefill.req_id,
+                state,
+                logitsprocs=logitsprocs,
+            ):
+                continue
+            prefill_end = cu_seqlens[num_decode_segments + i + 1]
+            seeds.append(
+                Gemma4MTPDraftSeed(
+                    req_id=prefill.req_id,
+                    token_id=token_id,
+                    target_hidden_row=prefill_end - 1,
+                    target_position=prefill.start_pos + len(prefill.token_ids) - 1,
+                    block_ids=tuple(prefill.block_ids),
+                )
+            )
+
+        return tuple(seeds)
+
+    def _can_draft_greedy(
+        self,
+        req_id: str,
+        request_state: _SpecDecodeRequestStateLike,
+        *,
+        logitsprocs: LogitsProcessors | None,
+    ) -> bool:
+        try:
+            self._validate_greedy_sampling(
+                [(req_id, request_state)],
+                logitsprocs=logitsprocs,
+            )
+        except NotImplementedError:
+            return False
+        return True
 
     def _validate_greedy_sampling(
         self,

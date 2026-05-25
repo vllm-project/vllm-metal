@@ -12,8 +12,10 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar
 
+import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.paged_attention_common import clear_context, prepare_unified
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
@@ -44,9 +46,9 @@ _ASSISTANT_DOWNLOAD_ALLOW_PATTERNS = [
 class Gemma4MTPAssistantRuntime:
     """Loaded assistant runtime owned by the model lifecycle.
 
-    KV sharing can be installed before the assistant forward/scheduler handoff
-    is enabled; ``forward_ready`` remains false until that later runtime path
-    lands.
+    The process-wide loader cache owns the raw model.  Per-runner target KV
+    sharing lives in ``kv_sharing`` on copied runtime values, so draft forward
+    state never mutates the cached model.
     """
 
     model_name: str
@@ -83,7 +85,79 @@ class Gemma4MTPAssistantRuntime:
                 target_kv_cache=target_kv_cache,
                 block_size=block_size,
             ),
+            forward_ready=hasattr(self.model, "draft_token_ids"),
         )
+
+    def propose_draft_token_ids(
+        self,
+        *,
+        seeds: Sequence[Gemma4MTPDraftSeed],
+        target_hidden_states: mx.array,
+        target_input_embeddings: mx.array,
+    ) -> list[list[int]]:
+        """Run the assistant and return one draft token per seed."""
+        if not seeds:
+            return []
+        if self.kv_sharing is None:
+            raise RuntimeError("Gemma4 MTP assistant requires target KV sharing")
+        if not self.forward_ready:
+            raise RuntimeError("Gemma4 MTP assistant forward is not ready")
+
+        if len(target_hidden_states.shape) == 3:
+            if target_hidden_states.shape[0] != 1:
+                raise ValueError(
+                    "Gemma4 MTP target_hidden_states must use a single batch"
+                )
+            target_hidden_states = target_hidden_states[0]
+        elif len(target_hidden_states.shape) != 2:
+            raise ValueError(
+                "Gemma4 MTP target_hidden_states must be row-major "
+                f"[num_tokens, hidden], got {target_hidden_states.shape}"
+            )
+        row_indices = mx.array(
+            [seed.target_hidden_row for seed in seeds],
+            dtype=mx.int32,
+        )
+        hidden_rows = mx.take(target_hidden_states, row_indices, axis=0)[None, :, :]
+        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
+
+        prepare_unified(
+            [(list(seed.block_ids), seed.target_position, 1) for seed in seeds],
+            [],
+            self.kv_sharing.block_size,
+        )
+        try:
+            draft_token_ids = self.model.draft_token_ids(
+                input_ids,
+                target_hidden_states=hidden_rows,
+                target_input_embeddings=target_input_embeddings,
+                target_kv_cache=self.kv_sharing.target_kv_cache,
+                target_cache_indices=(
+                    self.kv_sharing.plan.assistant_layer_to_target_cache_idx
+                ),
+            )
+        finally:
+            clear_context()
+
+        mx.eval(draft_token_ids)
+        token_ids: list[int] = draft_token_ids.tolist()  # type: ignore[assignment]
+        if len(token_ids) != len(seeds):
+            raise RuntimeError(
+                "Gemma4 MTP assistant returned the wrong number of draft tokens: "
+                f"got {len(token_ids)}, expected {len(seeds)}"
+            )
+        return [[int(token_id)] for token_id in token_ids]
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4MTPDraftSeed:
+    """Target row metadata that seeds one Gemma4 MTP draft token."""
+
+    req_id: str
+    token_id: int
+    target_hidden_row: int
+    target_position: int
+    block_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
