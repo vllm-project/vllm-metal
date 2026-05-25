@@ -912,9 +912,7 @@ def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
     assert 42 not in manager._active
 
 
-def _stub_lora_request(
-    lora_id: int, *, load_inplace: bool = False
-) -> SimpleNamespace:
+def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         lora_int_id=lora_id,
         lora_path=f"/fake/adapter-{lora_id}",
@@ -933,9 +931,7 @@ def _make_worker_manager() -> worker_manager_mod.MetalWorkerLoRAManager:
 
 
 def _patch_loader(monkeypatch, adapters: dict[int, peft_loader_mod.LoadedLoRA]) -> None:
-    monkeypatch.setattr(
-        "vllm.lora.utils.get_adapter_absolute_path", lambda p: p
-    )
+    monkeypatch.setattr("vllm.lora.utils.get_adapter_absolute_path", lambda p: p)
 
     def _fake_load(path, *, lora_id, max_position_embeddings, lora_config):
         return adapters[lora_id]
