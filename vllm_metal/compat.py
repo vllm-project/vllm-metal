@@ -27,9 +27,74 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+
+
+def _gemma4_assistant_config_class() -> type[Any]:
+    """Return a minimal Transformers config for raw Gemma4 assistant metadata."""
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    class Gemma4AssistantCompatConfig(PretrainedConfig):
+        model_type = "gemma4_assistant"
+        sub_configs = {"text_config": Gemma4TextConfig}
+
+        def __init__(self, text_config: Any | None = None, **kwargs: Any) -> None:
+            if text_config is None:
+                self.text_config = Gemma4TextConfig()
+            elif isinstance(text_config, Gemma4TextConfig):
+                self.text_config = text_config
+            elif isinstance(text_config, Mapping):
+                self.text_config = Gemma4TextConfig(**text_config)
+            else:
+                self.text_config = text_config
+            super().__init__(**kwargs)
+
+        def get_text_config(self, decoder: bool = False) -> Any:
+            # Match Transformers' ``PretrainedConfig.get_text_config`` API.
+            return self.text_config
+
+    return Gemma4AssistantCompatConfig
+
+
+def _transformers_knows_gemma4_assistant(auto_config: Any) -> bool:
+    try:
+        auto_config.for_model("gemma4_assistant")
+    except ValueError:
+        return False
+    return True
+
+
+def _patch_vllm_gemma4_mtp_config_loading() -> None:
+    """Register raw Gemma4 assistant config parsing for the pinned stack.
+
+    vLLM 0.21 already knows how to normalize ``gemma4_assistant`` into the
+    ``gemma4_mtp`` draft wrapper, but the pinned Transformers release cannot
+    parse the raw assistant checkpoint's ``model_type`` before that override
+    runs. Keep the shim to config loading only; model construction remains owned
+    by vLLM/vllm-metal Gemma4 MTP modules.
+    """
+    try:
+        from transformers import AutoConfig
+    except ImportError as exc:
+        logger.warning(
+            "Could not install Gemma4 MTP config compatibility patch: %s",
+            exc,
+        )
+        return
+
+    if _transformers_knows_gemma4_assistant(AutoConfig):
+        return
+
+    config_cls = _gemma4_assistant_config_class()
+    # TODO(transformers): remove once the pinned Transformers/vLLM stack can
+    # parse raw ``model_type=gemma4_assistant`` checkpoints without this local
+    # registration.
+    AutoConfig.register("gemma4_assistant", config_cls, exist_ok=True)
+    logger.debug("Registered Gemma4 assistant config compatibility")
 
 
 def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:

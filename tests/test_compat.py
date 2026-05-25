@@ -67,6 +67,33 @@ def _write_mismatched_bytelevel_tokenizer_repo(path) -> None:
     )
 
 
+def _write_gemma4_assistant_config(path) -> None:
+    config = {
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "backbone_hidden_size": 1536,
+        "model_type": "gemma4_assistant",
+        "text_config": {
+            "hidden_size": 256,
+            "hidden_size_per_layer_input": 0,
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "model_type": "gemma4_text",
+            "num_attention_heads": 4,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 4,
+            "vocab_size_per_layer_input": 0,
+        },
+        "tie_word_embeddings": True,
+        "use_ordered_embeddings": True,
+    }
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 class _ByteLevelBackend:
     decoder = "ByteLevel(add_prefix_space=False, trim_offsets=False, use_regex=False)"
 
@@ -176,6 +203,48 @@ class TestByteLevelTokenizerCompatPatch:
         assert captured_kwargs["user_agent"] == {"vllm-metal": "test"}
         assert captured_kwargs["token"] == "secret"
         assert captured_kwargs["_commit_hash"] == "abc123"
+
+
+class TestGemma4MTPConfigCompatPatch:
+    def test_transformers_autoconfig_loads_raw_assistant_config(
+        self,
+        tmp_path,
+    ) -> None:
+        from transformers import AutoConfig
+
+        _write_gemma4_assistant_config(tmp_path)
+        compat._patch_vllm_gemma4_mtp_config_loading()
+
+        config = AutoConfig.from_pretrained(tmp_path)
+
+        assert config.model_type == "gemma4_assistant"
+        assert config.architectures == ["Gemma4AssistantForCausalLM"]
+        assert config.backbone_hidden_size == 1536
+        assert config.text_config.model_type == "gemma4_text"
+        assert config.text_config.num_hidden_layers == 4
+        assert config.get_text_config() is config.text_config
+
+    def test_vllm_get_config_applies_existing_gemma4_mtp_override(
+        self,
+        tmp_path,
+    ) -> None:
+        from vllm.config.speculative import SpeculativeConfig
+        from vllm.transformers_utils.config import get_config, get_hf_text_config
+
+        _write_gemma4_assistant_config(tmp_path)
+        compat._patch_vllm_gemma4_mtp_config_loading()
+
+        config = get_config(
+            tmp_path,
+            trust_remote_code=False,
+            hf_overrides_fn=SpeculativeConfig.hf_config_override,
+        )
+
+        assert config.model_type == "gemma4_mtp"
+        assert config.architectures == ["Gemma4MTPModel"]
+        assert config.n_predict == 1
+        assert config.text_config.num_kv_shared_layers == 0
+        assert get_hf_text_config(config).model_type == "gemma4_text"
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
