@@ -89,7 +89,16 @@ def _patch_vllm_gemma4_mtp_config_loading() -> None:
     if _transformers_knows_gemma4_assistant(AutoConfig):
         return
 
-    config_cls = _gemma4_assistant_config_class()
+    try:
+        config_cls = _gemma4_assistant_config_class()
+    except ImportError as exc:
+        logger.warning(
+            "Could not install Gemma4 MTP config compatibility patch because "
+            "Gemma4 config classes are unavailable: %s",
+            exc,
+        )
+        return
+
     # TODO: remove once the supported dependency stack parses raw
     # ``model_type=gemma4_assistant`` configs before vLLM's Gemma4 MTP
     # override runs.

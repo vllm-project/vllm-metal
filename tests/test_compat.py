@@ -246,6 +246,47 @@ class TestGemma4MTPConfigCompatPatch:
         assert config.text_config.num_kv_shared_layers == 0
         assert get_hf_text_config(config).model_type == "gemma4_text"
 
+    def test_missing_gemma4_config_module_does_not_stop_other_patches(
+        self,
+        monkeypatch,
+    ) -> None:
+        calls: list[str] = []
+
+        monkeypatch.setattr(compat, "_APPLIED", False)
+        monkeypatch.setattr(
+            compat,
+            "_transformers_knows_gemma4_assistant",
+            lambda _auto_config: False,
+        )
+
+        def _raise_missing_gemma4_config():
+            raise ModuleNotFoundError("No module named 'transformers.models.gemma4'")
+
+        monkeypatch.setattr(
+            compat,
+            "_gemma4_assistant_config_class",
+            _raise_missing_gemma4_config,
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_vllm_bytelevel_tokenizer_loading",
+            lambda: calls.append("bytelevel"),
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_lm_qwen35_fp8_sanitize",
+            lambda: calls.append("qwen35_fp8"),
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_lm_gemma4_kv_shared_sanitize",
+            lambda: calls.append("gemma4_kv"),
+        )
+
+        compat.apply_compat_patches()
+
+        assert calls == ["bytelevel", "qwen35_fp8", "gemma4_kv"]
+
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_pkg = ModuleType("mlx")
