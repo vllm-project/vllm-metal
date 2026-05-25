@@ -30,7 +30,6 @@ from vllm_metal.v1.cache_policy import WorkerCachePlanner
 if TYPE_CHECKING:
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
-    from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 logger = init_logger(__name__)
 
@@ -65,8 +64,10 @@ class MetalWorker(WorkerBase):
     using MLX as the primary compute backend.
     """
 
-    # Override model_runner type from base class
-    model_runner: MetalModelRunner | STTModelRunner  # type: ignore[assignment]
+    # Override model_runner type from base class. Typed as MetalModelRunner
+    # because its worker-facing method set is a superset of STTModelRunner's;
+    # STT models are assigned an STTModelRunner at runtime (see init_device).
+    model_runner: MetalModelRunner  # type: ignore[assignment]
 
     def __init__(
         self,
