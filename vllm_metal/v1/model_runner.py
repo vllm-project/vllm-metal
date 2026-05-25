@@ -469,9 +469,6 @@ class MetalModelRunner:
         decode_reqs: list[tuple[str, RequestState]],
         prefill_pack: list[PrefillRequest],
     ) -> list[tuple[int | None, int]]:
-        # One decode query row per request: speculative decode (which forwards
-        # multiple draft rows per request) is rejected at MetalLoRARuntime.setup,
-        # so this 1:1 contract holds. Revisit if spec-decode + LoRA is enabled.
         entries: list[tuple[int | None, int]] = []
         for _, state in decode_reqs:
             entries.append((state.lora_id, 1))
