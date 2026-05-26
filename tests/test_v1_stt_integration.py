@@ -403,8 +403,12 @@ class TestSTTRunnerWorkerContract:
         monkeypatch.setattr(smr, "load_stt_model", lambda _name: fake_model)
         monkeypatch.setattr(smr, "get_model_download_path", lambda _m: "resolved-path")
 
-        runner = smr.STTModelRunner.__new__(smr.STTModelRunner)
-        runner.model_config = SimpleNamespace(model="some-model")
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(model="some-model"),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(),
+        )
+        runner = smr.STTModelRunner(vllm_config, device=torch.device("cpu"))
         runner.load_model()
 
         assert runner.model is fake_model
