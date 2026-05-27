@@ -14,7 +14,10 @@ pytest.importorskip("vllm", reason="vllm not installed")
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
-from vllm_metal.v1.cache_policy import ModelCachePolicy  # noqa: E402
+from vllm_metal.v1.cache_policy import (  # noqa: E402
+    ModelCachePolicy,
+    WorkerCachePlanner,
+)
 from vllm_metal.v1.model_adapter import DefaultModelAdapter  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
@@ -308,3 +311,88 @@ class TestOneSequenceKvBytes:
 
         expected = 2 * 24 * 2048 * 4 * 256 * 2
         assert result == expected
+
+
+class TestPagedAttentionPlanDiagnostics:
+    def _make_planner(
+        self,
+        model_runner: object,
+        *,
+        memory_fraction: float,
+        block_size: int = 16,
+        per_block_bytes: int = 1,
+    ) -> WorkerCachePlanner:
+        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker.cache_config.block_size = block_size
+        worker.metal_config.is_auto_memory = False
+        worker.metal_config.memory_fraction = memory_fraction
+        worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
+        return WorkerCachePlanner(worker)
+
+    def test_hybrid_oom_error_reports_gdn_reservation(self, monkeypatch) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_memory_reporting_mode=MagicMock(
+                return_value="paged_attention_capacity"
+            ),
+            profile_run=MagicMock(return_value=500_000_000),
+            validate_paged_attention_support=MagicMock(),
+            scheduler_config=SimpleNamespace(max_num_seqs=256),
+            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+        )
+        worker = _make_worker(runner, use_paged_attention=True)
+        worker.metal_config.is_auto_memory = False
+        worker.metal_config.memory_fraction = 0.5
+        worker.get_cache_block_size_bytes = MagicMock(return_value=1)
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 1_000_000_000,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            MetalWorker.determine_available_memory(worker)
+
+        message = str(exc_info.value)
+        assert "kv_budget_before_hybrid=3.50GB" in message
+        assert "hybrid_gdn_state=16.49GB" in message
+        assert "(64.4MB/seq * max_num_seqs=256)" in message
+        assert "kv_budget=-12.99GB" in message
+        assert (
+            "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
+            in message
+        )
+        assert "increase VLLM_METAL_MEMORY_FRACTION" in message
+        runner.scheduler_memory_reporting_mode.assert_called_once_with(
+            paged_attention_enabled=True
+        )
+        runner.profile_run.assert_called_once_with()
+        runner.validate_paged_attention_support.assert_called_once_with()
+
+    def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
+        runner = SimpleNamespace(is_hybrid=False)
+        planner = self._make_planner(runner, memory_fraction=0.1)
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 2_000_000_000,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            planner._paged_attention_plan(overhead=100_000_000)
+
+        message = str(exc_info.value)
+        assert "hybrid_gdn_state" not in message
+        assert "kv_budget_before_hybrid" not in message
+        assert "--max-num-seqs" not in message
+        assert "kv_budget=-1.10GB" in message
