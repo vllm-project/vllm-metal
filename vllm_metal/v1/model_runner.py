@@ -9,7 +9,6 @@ backend modules. Keep this file thin and stable.
 Key contracts:
 - execute_model()/sample_tokens() handoff remains unchanged.
 - Outputs align with scheduler expectations for paged and non-paged paths.
-- Prefix-cache hits reconstruct full prompts for sampling metadata.
 """
 
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ import mlx.core as mx
 import numpy as np
 import torch
 from mlx_lm import stream_generate
+from mlx_lm.models.cache import make_prompt_cache
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
@@ -49,14 +49,11 @@ from vllm_metal.paged_attention_common import (
     get_context,
     prepare_unified,
 )
-from vllm_metal.v1 import contiguous_cache
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
-    _PREFIX_CACHE_ENABLED,
     AnyCache,
     KVCache,
-    PrefixCacheManager,
     _extract_kv_cache,
     _merge_kv_caches,
 )
@@ -303,11 +300,6 @@ class MetalModelRunner:
         # Keep the latest execution output so sample_tokens can return it.
         self._pending_output: ModelRunnerOutput | None = None
         self._draft_token_ids: DraftTokenIds | None = None
-
-        # Prefix cache for shared prompt reuse
-        self._prefix_cache: PrefixCacheManager | None = None
-        if _PREFIX_CACHE_ENABLED:
-            self._prefix_cache = PrefixCacheManager(model_adapter=self._model_adapter)
 
         # Paged attention state (set by worker when enabled)
         self._paged_attention_backend: PagedAttentionBackend | None = None
@@ -685,36 +677,9 @@ class MetalModelRunner:
         Returns:
             Tuple of (next_token, cache)
         """
-        cache: list[KVCache]
-        cached_prefix_len = 0
+        cache: list[KVCache] = make_prompt_cache(self._forward_model)
 
-        # Prefix caching: cache KV for tokens[:-1], always process last token
-        prefix = token_ids[:-1] if len(token_ids) > 1 else []
-
-        # Create cache to check if model supports prefix caching
-        cache = contiguous_cache.make_prompt_cache(self._forward_model)
-        # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
-        supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
-
-        # Try to reuse cached prefix
-        if supports_prefix_cache and self._prefix_cache is not None and len(prefix) > 0:
-            cached = self._prefix_cache.lookup(prefix)
-            if cached is not None:
-                # Cache hit: restore KV for prefix, process only last token
-                cache = self._prefix_cache.restore_cache(
-                    cached, self.model, self._is_vlm
-                )
-                cached_prefix_len = len(cached.token_ids)
-            else:
-                # Cache miss: process prefix first, cache it, then last token
-                prefix_ids = mx.array([prefix], dtype=mx.int32)
-                _ = self._forward_model(prefix_ids, cache=cache)
-                self._prefix_cache.insert(prefix, cache)
-                cached_prefix_len = len(prefix)
-
-        # Prefill: process remaining tokens (always at least the last token)
-        tokens_to_process = token_ids[cached_prefix_len:]
-        input_ids = mx.array([tokens_to_process], dtype=mx.int32)
+        input_ids = mx.array([token_ids], dtype=mx.int32)
         model_output = self._forward_model(input_ids, cache=cache)
 
         logits = self._extract_logits(model_output)

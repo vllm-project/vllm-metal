@@ -26,8 +26,6 @@ if TYPE_CHECKING:
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
     VLLM_METAL_KV_SHARING_FAST_PREFILL: bool = True
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
-    VLLM_METAL_PREFIX_CACHE: bool = False
-    VLLM_METAL_PREFIX_CACHE_FRACTION: str = ""
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
@@ -62,14 +60,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "multimodal-native": keep native multimodal loading enabled.
     "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
         "VLLM_METAL_MULTIMODAL_MODE", "auto"
-    ),
-    # Enable content-hash prefix caching (presence-based: set to any
-    # value to enable, unset to disable).
-    "VLLM_METAL_PREFIX_CACHE": lambda: "VLLM_METAL_PREFIX_CACHE" in os.environ,
-    # Fraction of MLX working set for the prefix cache (raw string;
-    # the consumer in model_runner.py validates and applies a default).
-    "VLLM_METAL_PREFIX_CACHE_FRACTION": lambda: os.getenv(
-        "VLLM_METAL_PREFIX_CACHE_FRACTION", ""
     ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),

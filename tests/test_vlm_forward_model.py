@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for VLM forward-model dispatch and prefix-cache restore routing."""
+"""Tests for VLM forward-model dispatch."""
 
 from __future__ import annotations
 
@@ -54,51 +54,3 @@ class TestValidatePagedAttentionSupport:
         runner.validate_paged_attention_support()
 
         assert calls == [(model_args, 8)]
-
-
-class TestRestoreCacheRouting:
-    def _make_cached_prefix(self, num_layers: int = 2):
-        from vllm_metal.v1.contiguous_cache import CachedPrefix
-
-        cp = CachedPrefix.__new__(CachedPrefix)
-        cp.token_ids = [1, 2, 3]
-        cp.cache_state = [None] * num_layers
-        cp.size_bytes = 0
-        cp.ref_count = 1
-        return cp
-
-    def test_non_vlm_uses_model_directly(self, monkeypatch) -> None:
-        from vllm_metal.v1.contiguous_cache import PrefixCacheManager
-
-        model = MagicMock()
-        captured = {}
-
-        def fake_make_prompt_cache(m):
-            captured["model"] = m
-            return []
-
-        monkeypatch.setattr(
-            "vllm_metal.v1.contiguous_cache.make_prompt_cache", fake_make_prompt_cache
-        )
-        mgr = PrefixCacheManager.__new__(PrefixCacheManager)
-        mgr.restore_cache(self._make_cached_prefix(), model=model, is_vlm=False)
-        assert captured["model"] is model
-
-    def test_vlm_uses_language_model(self, monkeypatch) -> None:
-        from vllm_metal.v1.contiguous_cache import PrefixCacheManager
-
-        lang = MagicMock()
-        vlm = MagicMock()
-        vlm.language_model = lang
-        captured = {}
-
-        def fake_make_prompt_cache(m):
-            captured["model"] = m
-            return []
-
-        monkeypatch.setattr(
-            "vllm_metal.v1.contiguous_cache.make_prompt_cache", fake_make_prompt_cache
-        )
-        mgr = PrefixCacheManager(max_bytes=1024)
-        mgr.restore_cache(self._make_cached_prefix(), model=vlm, is_vlm=True)
-        assert captured["model"] is lang

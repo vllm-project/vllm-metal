@@ -44,7 +44,6 @@ def make_stub_runner(
         "_gdn_needs_materialize": False,
         "_request_states": {},
         "_paged_request_seq_lens": {},
-        "_prefix_cache": None,
         "_pending_output": None,
         "_draft_token_ids": None,
         "_execute_model_state": None,
