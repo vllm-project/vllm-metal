@@ -46,20 +46,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _turboquant_page_size_bytes(
-    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
-) -> int:
-    """Calculate TurboQuant-compressed page size for one layer."""
-    k_bits = QUANT_PARAMS[k_quant]["bits"]
-    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
-    k_packed = packed_dim(head_dim, k_bits)
-    v_packed = packed_dim(head_dim, v_bits)
-    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
-    scale_groups = head_dim // TQ_BLOCK_SIZE
-    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
-    return kv_bytes + scale_bytes
-
-
 @dataclass(frozen=True, kw_only=True)
 class TurboQuantAttentionSpec(FullAttentionSpec):
     """FullAttentionSpec for TurboQuant-compressed KV cache.
@@ -128,6 +114,20 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
             k_quant=k_set.pop(),
             v_quant=v_set.pop(),
         )
+
+
+def _turboquant_page_size_bytes(
+    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
+) -> int:
+    """Calculate TurboQuant-compressed page size for one layer."""
+    k_bits = QUANT_PARAMS[k_quant]["bits"]
+    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
+    k_packed = packed_dim(head_dim, k_bits)
+    v_packed = packed_dim(head_dim, v_bits)
+    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
+    scale_groups = head_dim // TQ_BLOCK_SIZE
+    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
+    return kv_bytes + scale_bytes
 
 
 def _build_turboquant_attention_spec(
