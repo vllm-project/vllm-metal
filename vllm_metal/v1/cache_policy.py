@@ -184,15 +184,20 @@ _register_turboquant_spec_manager()
 @dataclass(frozen=True)
 class _HybridGDNReservation:
     bytes_per_slot: int = 0
+    reserved_slots: int = 0
     max_num_seqs: int = 0
 
     @property
     def total_bytes(self) -> int:
-        return self.bytes_per_slot * self.max_num_seqs
+        return self.bytes_per_slot * self.reserved_slots
 
     @property
     def enabled(self) -> bool:
         return self.total_bytes > 0
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.bytes_per_slot > 0 and self.max_num_seqs > 0
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,7 @@ class _PagedAttentionPlan:
         ]
         if self.hybrid_gdn_reservation.enabled:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
+        if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
@@ -241,11 +247,18 @@ class _PagedAttentionPlan:
 
     def _hybrid_gdn_detail(self) -> str:
         reservation = self.hybrid_gdn_reservation
-        if not reservation.enabled:
+        if not reservation.is_hybrid:
             return ""
+        if reservation.enabled:
+            return (
+                f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
+                f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+                f"reserved_slots={reservation.reserved_slots}/"
+                f"max_num_seqs={reservation.max_num_seqs})"
+            )
         return (
-            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
-            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+            "hybrid_gdn_state=lazy "
+            f"(startup=0.00GB, {reservation.bytes_per_slot / 1e6:.1f}MB/seq, "
             f"max_num_seqs={reservation.max_num_seqs})"
         )
 
@@ -748,6 +761,7 @@ class WorkerCachePlanner:
             return _HybridGDNReservation()
         return _HybridGDNReservation(
             bytes_per_slot=runner.linear_cache_bytes_per_slot(),
+            reserved_slots=0,
             max_num_seqs=runner.scheduler_config.max_num_seqs,
         )
 

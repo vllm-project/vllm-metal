@@ -405,30 +405,30 @@ class MetalModelRunner:
         """Allocate a stable GDN state pool slot for a request."""
         if req_id in self._gdn_req_to_slot:
             return self._gdn_req_to_slot[req_id]
-        reused = False
+
         if self._gdn_free_slots:
-            slot = self._gdn_free_slots.pop()
+            slot = self._gdn_free_slots[-1]
             reused = True
         else:
             slot = len(self._gdn_req_to_slot)
-        self._gdn_req_to_slot[req_id] = slot
+
+            reused = False
+        backend = self._paged_attention_backend
+        if not isinstance(backend, HybridPagedAttentionBackend):
+            raise RuntimeError("GDN slot allocation requires hybrid paged backend")
+        sc = backend._state_cache
+        if sc is None:
+            raise RuntimeError("GDN state cache is not initialized")
+
+        sc.ensure_capacity(slot + 1)
         # Zero state for reused slots so the new request starts clean.
         # Done at alloc time (inside the forward-pass graph) rather than
         # at free time to avoid mx.eval synchronisation issues.
         if reused:
-            backend = self._paged_attention_backend
-            if not isinstance(backend, HybridPagedAttentionBackend):
-                raise RuntimeError("GDN slot allocation requires hybrid paged backend")
-            sc = backend._state_cache
-            if sc is None:
-                raise RuntimeError("GDN state cache is not initialized")
-            for layer_idx in range(sc.num_layers):
-                conv = sc.conv_states[layer_idx]
-                conv[slot] = mx.zeros_like(conv[slot])
-                sc.conv_states[layer_idx] = conv
-                rec = sc.recurrent_states[layer_idx]
-                rec[slot] = mx.zeros_like(rec[slot])
-                sc.recurrent_states[layer_idx] = rec
+            sc.reset_slot(slot)
+            self._gdn_free_slots.pop()
+
+        self._gdn_req_to_slot[req_id] = slot
         return slot
 
     def _gdn_materialize_state_cache(self) -> None:
