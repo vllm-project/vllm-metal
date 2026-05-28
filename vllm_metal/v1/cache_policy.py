@@ -292,9 +292,7 @@ class ModelCachePolicy:
         config = get_config()
         use_turboquant = self._use_turboquant(config)
 
-        kv_heads_list = self._runner.kv_heads_per_layer
-        head_dim_list = self._runner.head_dim_per_layer
-        has_per_layer = kv_heads_list is not None and head_dim_list is not None
+        kv_heads, head_dims = self._cache_layer_shapes(self._runner.num_layers)
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
             if (
@@ -322,19 +320,11 @@ class ModelCachePolicy:
                     v_quant=config.v_quant,
                 )
             else:
-                kv_h = (
-                    kv_heads_list[layer_idx]
-                    if has_per_layer
-                    else self._runner.num_kv_heads
-                )
-                hd = (
-                    head_dim_list[layer_idx] if has_per_layer else self._runner.head_dim
-                )
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
                     block_size=block_size,
-                    num_kv_heads=kv_h,
-                    head_size=hd,
+                    num_kv_heads=kv_heads[layer_idx],
+                    head_size=head_dims[layer_idx],
                     dtype=torch_dtype,
                 )
 
