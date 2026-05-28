@@ -2751,7 +2751,7 @@ def test_tq_spec_merge_rejects_mixed_quant():
     b = _build_turboquant_attention_spec(
         block_size=16, num_kv_heads=4, head_dim=128, k_quant="q4_0", v_quant="q3_0"
     )
-    with pytest.raises(AssertionError, match="same .k_quant, v_quant."):
+    with pytest.raises(ValueError, match=r"same \(k_quant, v_quant\)"):
         TurboQuantAttentionSpec.merge([a, b])
 
 
