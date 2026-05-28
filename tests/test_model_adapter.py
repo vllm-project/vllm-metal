@@ -539,7 +539,7 @@ class TestResolveMaxHeadDim:
 class TestYocoCacheIntegration:
     """Integration tests for YOCO KV cache sharing.
 
-    Verifies reduced cache-byte accounting, _make_backend wiring, and
+    Verifies reduced cache-byte accounting, backend wiring, and
     shared layers reusing the remapped cache slot.
     """
 
@@ -616,12 +616,11 @@ class TestYocoCacheIntegration:
         )
         assert block_bytes == expected
 
-    def test_make_backend_uses_compact_layer_count(self) -> None:
-        """_make_backend should create MHA backend with reduced num_layers."""
+    def test_backend_uses_compact_layer_count(self) -> None:
+        """Runner backend factory should create MHA backend with reduced num_layers."""
         import mlx.core as mx
 
         from tests.stub_runner import make_stub_runner
-        from vllm_metal.v1.worker import MetalWorker
 
         adapter = DefaultModelAdapter()
         args = self._gemma4_args()
@@ -638,7 +637,7 @@ class TestYocoCacheIntegration:
             num_kv_cache_layers=yoco[0],
         )
 
-        backend = MetalWorker._make_backend(runner, block_size=self._BLOCK_SIZE)
+        backend = runner.build_paged_attention_backend(block_size=self._BLOCK_SIZE)
 
         assert backend._num_layers == self._NUM_UNIQUE
         assert backend._cache_idx_map is not None

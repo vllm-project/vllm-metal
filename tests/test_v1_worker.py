@@ -34,17 +34,6 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should delegate STT capability decisions to model runner."""
 
-    def test_load_model_does_not_setup_paged_attention(self) -> None:
-        """Paged attention setup moved to determine_available_memory (issue #234)."""
-        model_runner = MagicMock()
-        worker = _make_worker(model_runner, use_paged_attention=True)
-        worker._setup_paged_attention = MagicMock()
-
-        MetalWorker.load_model(worker)
-
-        model_runner.load_model.assert_called_once_with()
-        worker._setup_paged_attention.assert_not_called()
-
     def test_reset_mm_cache_delegates_to_runner(self) -> None:
         model_runner = MagicMock()
         worker = _make_worker(model_runner, use_paged_attention=True)

@@ -161,49 +161,6 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-    @staticmethod
-    def _kv_budget_bytes(
-        metal_limit: int,
-        model_memory: int,
-        fraction: float,
-        overhead: int,
-    ) -> int:
-        """KV cache budget = fraction of Metal limit minus model and overhead.
-
-        All three quantities live in the same domain: Metal-managed memory.
-        psutil.available is intentionally excluded — it reflects OS page-cache
-        state and is blind to MLX wired buffers holding model weights.
-        """
-        return WorkerCachePlanner.base_kv_budget_bytes(
-            metal_limit,
-            model_memory,
-            fraction,
-            overhead,
-        )
-
-    def _setup_paged_attention(self, overhead: int) -> None:
-        """Allocate paged KV cache and patch model attention layers.
-
-        Computes num_blocks from Metal memory headroom, model weight size, and
-        a configurable memory fraction, rather than blindly scaling from
-        max_model_len.  ``overhead`` is the measured intermediate-buffer
-        footprint from :pymeth:`MetalModelRunner.profile_run`.
-        """
-        WorkerCachePlanner(self).setup_paged_attention(overhead=overhead)
-
-    @staticmethod
-    def _make_backend(runner: MetalModelRunner, block_size: int) -> Any:
-        """Create the right paged attention backend for the model type."""
-        return runner.build_paged_attention_backend(block_size=block_size)
-
-    def _get_model_memory_usage(self) -> int:
-        """Get current model memory usage from MLX.
-
-        Returns:
-            Memory usage in bytes
-        """
-        return WorkerCachePlanner(self).get_model_memory_usage()
-
     def _one_sequence_kv_bytes(self) -> int:
         """Bytes for one max-length sequence of cache state.
 
