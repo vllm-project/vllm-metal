@@ -40,11 +40,10 @@ https://docs.vllm.ai/en/latest/cli/
 
 ### Optional: Rust frontend (experimental)
 
-Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](https://github.com/Inferact/vllm-frontend-rs), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain (https://rustup.rs):
+Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain (https://rustup.rs):
 
 ```bash
 ./install.sh --with-vllm-rs
 ```
 
 See [docs/rust_frontend.md](docs/rust_frontend.md) for usage and architecture.
-

@@ -78,6 +78,8 @@ download_and_install_wheel() {
 }
 
 install_vllm_rs() {
+  local vllm_src_dir="$1"
+
   section "Installing vllm-rs (experimental Rust frontend)"
 
   if ! command -v cargo &> /dev/null || ! command -v rustup &> /dev/null; then
@@ -85,21 +87,15 @@ install_vllm_rs() {
     exit 1
   fi
 
-  local repo_url="https://github.com/inferact/vllm-frontend-rs"
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp_dir'" RETURN
-
-  echo "Cloning $repo_url ..."
-  if ! git clone --depth 1 "$repo_url" "$tmp_dir/vllm-frontend-rs"; then
-    error "Failed to clone vllm-frontend-rs."
+  if [[ ! -d "$vllm_src_dir/rust/src/cmd" ]]; then
+    error "Rust frontend source not found under $vllm_src_dir/rust."
     exit 1
   fi
 
-  # Run cargo from inside the tree so rustup honors rust-toolchain.toml;
-  # `cargo install --git` would ignore it and use the system default toolchain.
-  if ! ( cd "$tmp_dir/vllm-frontend-rs" && cargo install --path src/cmd --bin vllm-rs ); then
+  echo "Installing vllm-rs from vLLM source: $vllm_src_dir/rust"
+
+  # Run cargo from the vLLM repository root so rustup honors rust-toolchain.toml.
+  if ! ( cd "$vllm_src_dir" && cargo install --path rust/src/cmd --bin vllm-rs ); then
     error "Failed to install vllm-rs."
     exit 1
   fi
@@ -125,8 +121,8 @@ main() {
 Usage: install.sh [--with-vllm-rs]
 
 Options:
-  --with-vllm-rs    Also install vllm-rs (experimental Rust frontend) via
-                    cargo from https://github.com/inferact/vllm-frontend-rs.
+  --with-vllm-rs    Also install vllm-rs (experimental Rust frontend) from
+                    the bundled vLLM release source.
                     Requires the Rust toolchain on PATH (https://rustup.rs).
   -h, --help        Show this help.
 EOF
@@ -186,17 +182,17 @@ EOF
     exit 1
   fi
 
-  local vllm_v="0.21.0"
+  local vllm_v="0.22.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
+  local vllm_src_dir="vllm-$vllm_v"
   curl -OL $url_base/v$vllm_v/$filename
   tar xf $filename
-  cd vllm-$vllm_v
+  cd "$vllm_src_dir"
 
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
   CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
-  rm -rf vllm-$vllm_v*
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
@@ -216,8 +212,10 @@ EOF
   fi
 
   if [[ "$with_vllm_rs" == "1" ]]; then
-    install_vllm_rs
+    install_vllm_rs "$vllm_src_dir"
   fi
+
+  rm -rf vllm-$vllm_v*
 
   echo ""
   success "Installation complete!"
@@ -231,7 +229,7 @@ EOF
   if [[ "$with_vllm_rs" == "1" ]]; then
     echo ""
     echo "vllm-rs is installed to ~/.cargo/bin. Make sure that directory is on your PATH."
-    echo "Activate the venv, then run: vllm-rs serve <MODEL>"
+    echo "Activate the venv, then run: VLLM_USE_RUST_FRONTEND=1 vllm serve <MODEL>"
   fi
 }
 

@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/instal
 
 ### Optional: Rust frontend
 
-Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](rust_frontend.md), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain on `PATH` (install from <https://rustup.rs>):
+Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain on `PATH` (install from <https://rustup.rs>):
 
 ```bash
 ./install.sh --with-vllm-rs
