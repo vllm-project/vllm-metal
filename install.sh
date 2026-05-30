@@ -95,7 +95,7 @@ install_vllm_rs() {
   echo "Installing vllm-rs from vLLM source: $vllm_src_dir/rust"
 
   # Run cargo from the vLLM repository root so rustup honors rust-toolchain.toml.
-  if ! ( cd "$vllm_src_dir" && cargo install --path rust/src/cmd --bin vllm-rs ); then
+  if ! ( cd "$vllm_src_dir" && cargo install --locked --path rust/src/cmd --bin vllm-rs ); then
     error "Failed to install vllm-rs."
     exit 1
   fi
