@@ -229,7 +229,8 @@ EOF
   if [[ "$with_vllm_rs" == "1" ]]; then
     echo ""
     echo "vllm-rs is installed to ~/.cargo/bin. Make sure that directory is on your PATH."
-    echo "Activate the venv, then run: VLLM_USE_RUST_FRONTEND=1 vllm serve <MODEL>"
+    echo "Activate the venv, then run:"
+    echo "  VLLM_USE_RUST_FRONTEND=1 VLLM_RUST_FRONTEND_PATH=\"$HOME/.cargo/bin/vllm-rs\" vllm serve <MODEL>"
   fi
 }
 

@@ -20,7 +20,9 @@ Activate the venv first so the spawned headless Python engine inherits vllm-meta
 
 ```bash
 source ~/.venv-vllm-metal/bin/activate
-VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B
+VLLM_USE_RUST_FRONTEND=1 \
+  VLLM_RUST_FRONTEND_PATH="$HOME/.cargo/bin/vllm-rs" \
+  vllm serve Qwen/Qwen3-0.6B
 ```
 
 ## Standalone frontend
