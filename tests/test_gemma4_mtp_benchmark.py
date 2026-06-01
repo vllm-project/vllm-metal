@@ -103,6 +103,7 @@ def test_build_llm_kwargs_adds_mtp_assistant_config() -> None:
 
     assert kwargs["gpu_memory_utilization"] == 0.5
     assert kwargs["speculative_config"] == {
+        "method": "mtp",
         "model": "assistant",
         "num_speculative_tokens": 1,
         "revision": "rev",

@@ -203,6 +203,7 @@ def _build_llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.assistant_model is not None:
         speculative_config: dict[str, Any] = {
+            "method": "mtp",
             "model": args.assistant_model,
             "num_speculative_tokens": args.num_speculative_tokens,
         }
@@ -263,6 +264,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "speculative_method": "mtp" if args.assistant_model else None,
             "num_speculative_tokens": (
                 args.num_speculative_tokens if args.assistant_model else None
             ),

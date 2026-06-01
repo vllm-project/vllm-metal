@@ -39,7 +39,7 @@ VLLM_METAL_MEMORY_FRACTION=0.5 \
     --max-num-batched-tokens 1024 \
     --max-num-seqs 4 \
     --no-async-scheduling \
-    --speculative-config "{\"model\":\"$ASSISTANT\",\"num_speculative_tokens\":1}"
+    --speculative-config "{\"method\":\"mtp\",\"model\":\"$ASSISTANT\",\"num_speculative_tokens\":1}"
 ```
 
 For remote Hugging Face checkpoints, use the same shape and set `model` to the
