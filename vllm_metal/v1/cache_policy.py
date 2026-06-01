@@ -235,7 +235,11 @@ class _PagedAttentionPlan:
             "use a smaller or more quantized model",
         ]
         reservation = self.hybrid_gdn_reservation
-        if reservation.enabled and reservation.max_num_seqs > 1:
+        if (
+            reservation.enabled
+            and reservation.reserved_slots == reservation.max_num_seqs
+            and reservation.max_num_seqs > 1
+        ):
             seq_mitigation = (
                 "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
             )
@@ -251,14 +255,16 @@ class _PagedAttentionPlan:
             return ""
         if reservation.enabled:
             return (
-                f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
-                f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+                f"hybrid_gdn_state=lazy "
+                f"(first_slot_reserve={reservation.total_bytes / 1e9:.2f}GB, "
+                f"{reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
                 f"reserved_slots={reservation.reserved_slots}/"
                 f"max_num_seqs={reservation.max_num_seqs})"
             )
         return (
             "hybrid_gdn_state=lazy "
-            f"(startup=0.00GB, {reservation.bytes_per_slot / 1e6:.1f}MB/seq, "
+            f"(first_slot_reserve=0.00GB, "
+            f"{reservation.bytes_per_slot / 1e6:.1f}MB/seq, "
             f"max_num_seqs={reservation.max_num_seqs})"
         )
 
@@ -755,14 +761,15 @@ class WorkerCachePlanner:
             )
 
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
-        """Return startup GDN state reserved outside the paged KV pool."""
+        """Return lazy GDN headroom reserved outside the paged KV pool."""
         runner = self._worker.model_runner
         if not runner.is_hybrid:
             return _HybridGDNReservation()
+        max_num_seqs = runner.scheduler_config.max_num_seqs
         return _HybridGDNReservation(
             bytes_per_slot=runner.linear_cache_bytes_per_slot(),
-            reserved_slots=0,
-            max_num_seqs=runner.scheduler_config.max_num_seqs,
+            reserved_slots=1 if max_num_seqs > 0 else 0,
+            max_num_seqs=max_num_seqs,
         )
 
     def _memory_fraction(self) -> float:
