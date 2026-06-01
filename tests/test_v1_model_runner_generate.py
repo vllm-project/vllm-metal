@@ -347,6 +347,64 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state.target_hidden_states is None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
 
+    def test_start_paged_forward_clears_context_on_gdn_slot_error(self) -> None:
+        state_cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=1,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        backend = _HybridBackendStub.__new__(_HybridBackendStub)
+        backend._state_cache = state_cache
+        runner = make_stub_runner(
+            tokenizer=object(),
+            model_args={"full_attention_interval": 2},
+            _paged_attention_backend=backend,
+        )
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        scheduler_output = self._make_scheduler_output({"p0": 1, "p1": 1}, {})
+        prefill_reqs = [
+            mr.PrefillRequest(
+                req_id="p0",
+                token_ids=[5],
+                sampling_params=SamplingParams(),
+                block_ids=[0],
+                generator=None,
+                prompt_len=1,
+                start_pos=0,
+                full_prompt_token_ids=None,
+            ),
+            mr.PrefillRequest(
+                req_id="p1",
+                token_ids=[6],
+                sampling_params=SamplingParams(),
+                block_ids=[1],
+                generator=None,
+                prompt_len=1,
+                start_pos=0,
+                full_prompt_token_ids=None,
+            ),
+        ]
+
+        mr.clear_context()
+        with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
+            runner._start_paged_forward(
+                mr._ExecutionBatch(),
+                prefill_reqs=prefill_reqs,
+                decode_reqs=[],
+                scheduler_output=scheduler_output,
+            )
+
+        assert mr.get_context() is None
+        assert runner._gdn_req_to_slot == {"p0": 0}
+        assert "p1" not in runner._gdn_req_to_slot
+
     def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp(
         self, monkeypatch
     ) -> None:

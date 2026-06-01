@@ -931,28 +931,28 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
-
-        # ---- GDN slot mapping (hybrid models) ----
-        if self.is_hybrid:
-            ctx = get_context()
-            if ctx is not None:
-                gdn_slots = []
-                # Decode requests come first, then prefill
-                for req_id, _ in decode_reqs:
-                    gdn_slots.append(self._gdn_alloc_slot(req_id))
-                for pr in prefill_reqs:
-                    gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
-                ctx.gdn_slot_mapping = gdn_slots
-
-        # ---- forward (lazy graph + async submit) ----
-        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
-        input_ids = mx.array([all_token_ids], dtype=mx.int32)
         logits: mx.array | None = None
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
+
+        prepare_unified(decode_info, prefill_info, self._paged_block_size)
         try:
+            # ---- GDN slot mapping (hybrid models) ----
+            if self.is_hybrid:
+                ctx = get_context()
+                if ctx is not None:
+                    gdn_slots = []
+                    # Decode requests come first, then prefill
+                    for req_id, _ in decode_reqs:
+                        gdn_slots.append(self._gdn_alloc_slot(req_id))
+                    for pr in prefill_reqs:
+                        gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
+                    ctx.gdn_slot_mapping = gdn_slots
+
+            # ---- forward (lazy graph + async submit) ----
+            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            input_ids = mx.array([all_token_ids], dtype=mx.int32)
             if has_pooling_work:
                 pooling_hidden_states = forward_sequence_hidden_states(
                     self._forward_model,
