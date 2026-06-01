@@ -67,6 +67,7 @@ nav:
     - Configuration: configuration.md
   - Models:
     - Supported Models: supported_models.md
+    - Gemma4 MTP: gemma4_mtp.md
   - Features:
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md

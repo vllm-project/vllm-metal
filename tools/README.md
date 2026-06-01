@@ -100,3 +100,32 @@ vllm bench serve \
 
 For a cache-off baseline, restart the server with
 `--no-enable-prefix-caching` and re-run with `--label baseline`.
+
+## Gemma4 MTP Benchmark
+
+Compares a Gemma4 target-only baseline with the same target plus a Gemma4 MTP
+assistant. Run one mode per process so model state does not leak between runs:
+
+```bash
+source .venv-vllm-metal/bin/activate
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_METAL_MEMORY_FRACTION=0.5
+
+python -m tools.benchmark.gemma4_mtp_benchmark \
+  --model /path/to/gemma-4-E2B-it \
+  --batch-size 4 --max-tokens 64 --repeats 1 --warmup 0 \
+  --ignore-eos --max-model-len 1024 --max-num-batched-tokens 512 \
+  --label e2b-baseline-bs4-64 \
+  --output-json /tmp/gemma4-e2b-baseline-bs4-64.json
+
+python -m tools.benchmark.gemma4_mtp_benchmark \
+  --model /path/to/gemma-4-E2B-it \
+  --assistant-model /path/to/gemma-4-E2B-it-assistant-bf16 \
+  --batch-size 4 --max-tokens 64 --repeats 1 --warmup 0 \
+  --ignore-eos --max-model-len 1024 --max-num-batched-tokens 512 \
+  --label e2b-mtp-bs4-64 \
+  --output-json /tmp/gemma4-e2b-mtp-bs4-64.json
+```
+
+The output JSON includes package versions, relevant environment variables,
+prompts, generated token IDs, elapsed time, and output tokens per second.
