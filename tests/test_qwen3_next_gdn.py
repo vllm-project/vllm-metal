@@ -188,6 +188,27 @@ class TestGDNSlotLifecycle:
         assert sc.conv_states[0].shape == (2, 3, 64)
         assert sc.recurrent_states[0].shape == (2, 4, 16, 16)
 
+    def test_step_slot_assignment_grows_once_for_multiple_requests(self):
+        runner, sc = self._make_runner_stub(max_seqs=3)
+
+        with patch.object(sc, "ensure_capacity", wraps=sc.ensure_capacity) as grow:
+            slots = runner._gdn_assign_slots_for_step(["req-A", "req-B"])
+
+        assert slots == [0, 1]
+        assert sc.allocated_seqs == 2
+        grow.assert_called_once_with(2)
+        assert runner._gdn_req_to_slot == {"req-A": 0, "req-B": 1}
+
+    def test_step_slot_assignment_failure_is_atomic(self):
+        runner, sc = self._make_runner_stub(max_seqs=1)
+
+        with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
+            runner._gdn_assign_slots_for_step(["req-A", "req-B"])
+
+        assert sc.allocated_seqs == 0
+        assert runner._gdn_req_to_slot == {}
+        assert runner._gdn_free_slots == []
+
     def test_capacity_failure_does_not_record_request_mapping(self):
         runner, sc = self._make_runner_stub(max_seqs=1)
 

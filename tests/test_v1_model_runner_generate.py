@@ -402,8 +402,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             )
 
         assert mr.get_context() is None
-        assert runner._gdn_req_to_slot == {"p0": 0}
-        assert "p1" not in runner._gdn_req_to_slot
+        assert runner._gdn_req_to_slot == {}
 
     def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp(
         self, monkeypatch

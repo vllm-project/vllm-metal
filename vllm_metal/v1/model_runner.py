@@ -403,16 +403,15 @@ class MetalModelRunner:
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
-        if req_id in self._gdn_req_to_slot:
-            return self._gdn_req_to_slot[req_id]
+        return self._gdn_assign_slots_for_step([req_id])[0]
 
-        if self._gdn_free_slots:
-            slot = self._gdn_free_slots[-1]
-            reused = True
-        else:
-            slot = len(self._gdn_req_to_slot)
+    def _gdn_assign_slots_for_step(self, req_ids: list[str]) -> list[int]:
+        """Assign all GDN state slots needed by one scheduler step.
 
-            reused = False
+        Capacity growth happens once for the whole step before request mappings
+        are mutated, so a later allocation failure cannot leave a partial
+        request-to-slot assignment behind.
+        """
         backend = self._paged_attention_backend
         if not isinstance(backend, HybridPagedAttentionBackend):
             raise RuntimeError("GDN slot allocation requires hybrid paged backend")
@@ -420,16 +419,50 @@ class MetalModelRunner:
         if sc is None:
             raise RuntimeError("GDN state cache is not initialized")
 
-        sc.ensure_capacity(slot + 1)
+        assigned_slots: list[int] = []
+        planned_by_req: dict[str, int] = {}
+        planned_new: list[tuple[str, int, bool]] = []
+        free_slots = list(self._gdn_free_slots)
+        next_new_slot = sc.allocated_seqs
+
+        for req_id in req_ids:
+            existing = self._gdn_req_to_slot.get(req_id)
+            if existing is not None:
+                assigned_slots.append(existing)
+                continue
+            planned = planned_by_req.get(req_id)
+            if planned is not None:
+                assigned_slots.append(planned)
+                continue
+
+            if free_slots:
+                slot = free_slots.pop()
+                reused = True
+            else:
+                slot = next_new_slot
+                next_new_slot += 1
+                reused = False
+            planned_by_req[req_id] = slot
+            planned_new.append((req_id, slot, reused))
+            assigned_slots.append(slot)
+
+        if not planned_new:
+            return assigned_slots
+
+        target_capacity = max(slot for _, slot, _ in planned_new) + 1
+        sc.ensure_capacity(target_capacity)
+
         # Zero state for reused slots so the new request starts clean.
         # Done at alloc time (inside the forward-pass graph) rather than
         # at free time to avoid mx.eval synchronisation issues.
-        if reused:
-            sc.reset_slot(slot)
-            self._gdn_free_slots.pop()
+        for _, slot, reused in planned_new:
+            if reused:
+                sc.reset_slot(slot)
 
-        self._gdn_req_to_slot[req_id] = slot
-        return slot
+        for req_id, slot, _ in planned_new:
+            self._gdn_req_to_slot[req_id] = slot
+        self._gdn_free_slots = free_slots
+        return assigned_slots
 
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
@@ -942,13 +975,10 @@ class MetalModelRunner:
             if self.is_hybrid:
                 ctx = get_context()
                 if ctx is not None:
-                    gdn_slots = []
-                    # Decode requests come first, then prefill
-                    for req_id, _ in decode_reqs:
-                        gdn_slots.append(self._gdn_alloc_slot(req_id))
-                    for pr in prefill_reqs:
-                        gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
-                    ctx.gdn_slot_mapping = gdn_slots
+                    # Decode requests come first, then prefill.
+                    gdn_req_ids = [req_id for req_id, _ in decode_reqs]
+                    gdn_req_ids.extend(pr.req_id for pr in prefill_reqs)
+                    ctx.gdn_slot_mapping = self._gdn_assign_slots_for_step(gdn_req_ids)
 
             # ---- forward (lazy graph + async submit) ----
             offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
