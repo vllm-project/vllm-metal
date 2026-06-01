@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
+
 
 @dataclass(frozen=True, kw_only=True)
 class TurboQuantAttentionSpec(FullAttentionSpec):
@@ -757,13 +759,14 @@ class WorkerCachePlanner:
         max_num_seqs = runner.scheduler_config.max_num_seqs
         if max_num_seqs <= 0:
             return _HybridGDNReservation()
+        cushion_slots = min(max_num_seqs, HYBRID_GDN_GROWTH_CUSHION_SLOTS)
         return _HybridGDNReservation(
             bytes_per_slot=runner.linear_cache_bytes_per_slot(),
             # ``ensure_capacity`` grows by allocating a larger state pool and
-            # copying the old pool into it.  The worst exact-growth step is
-            # (max_num_seqs - 1) -> max_num_seqs, whose transient peak keeps
-            # both old and new GDN pools live.
-            reserved_slots=(2 * max_num_seqs) - 1,
+            # copying the old pool into it. Reserve a bounded growth cushion
+            # instead of the full scheduler cap so large max_num_seqs values
+            # still benefit from lazy GDN allocation.
+            reserved_slots=(2 * cushion_slots) - 1,
             max_num_seqs=max_num_seqs,
         )
 
