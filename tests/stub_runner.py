@@ -38,7 +38,7 @@ def make_stub_runner(
         "_multimodal_adapter": None,
         "_gemma4_mtp_assistant": None,
         "encoder_cache": None,
-        "_paged_attention_backend": None,
+        "_paged_attention_runtime": None,
         "_gdn_req_to_slot": {},
         "_gdn_free_slots": [],
         "_gdn_needs_materialize": False,

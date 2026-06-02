@@ -10,8 +10,8 @@ from typing import Any, ClassVar
 import mlx.core as mx
 
 import vllm_metal.envs as envs
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.metal import _read_v2_metal_source
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
 _GDN_CONV1D_PREFILL_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_prefill.metal")

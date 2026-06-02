@@ -86,13 +86,13 @@ class TestWorkerRunnerBoundaryDelegation:
                 return_value="paged_attention_capacity"
             ),
             profile_run=MagicMock(return_value=measured_overhead),
-            paged_attention_backend=None,
+            paged_attention_runtime=None,
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
 
         def _fake_setup(*, overhead: int) -> None:
-            model_runner.paged_attention_backend = SimpleNamespace(
+            model_runner.paged_attention_runtime = SimpleNamespace(
                 num_blocks=lambda: num_blocks
             )
 

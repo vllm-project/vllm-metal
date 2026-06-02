@@ -13,8 +13,8 @@ from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
+from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
-from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path

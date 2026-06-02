@@ -13,9 +13,9 @@ import torch
 
 import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
-from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache

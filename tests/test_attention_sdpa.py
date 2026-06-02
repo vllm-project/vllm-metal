@@ -18,15 +18,15 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
-import vllm_metal.metal_kernel_backend.attention_sdpa as sdpa_mod
-from vllm_metal.metal_kernel_backend.attention_sdpa import (
+import vllm_metal.attention.impls.sdpa as sdpa_mod
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.sdpa import (
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
     sdpa_forward,
     truncate_padded_output,
 )
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Test fixtures (shared shapes) ===
 

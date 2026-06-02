@@ -11,9 +11,9 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.context import get_context
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLVisionEncodeResult
-from vllm_metal.paged_attention_common import get_context
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
@@ -118,7 +118,7 @@ def _runner(adapter: _MmAdapter, *, num_layers: int = 1):
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
         _is_vlm=True,
-        _paged_attention_backend=MagicMock(),
+        _paged_attention_runtime=MagicMock(),
         _paged_block_size=16,
         num_layers=num_layers,
         model_args={"vocab_size": adapter.vocab_size},

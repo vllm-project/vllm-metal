@@ -10,15 +10,15 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-import vllm_metal.metal_kernel_backend.attention_linear as attention_linear
-from vllm_metal.metal_kernel_backend.attention_linear import GDNPagedAttentionWrapper
-from vllm_metal.metal_kernel_backend.gdn_lazy import GDNLazyKernels
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_common import (
+import vllm_metal.attention.impls.linear as attention_linear
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.context import (
     PagedAttentionContext,
     clear_context,
     set_context,
 )
+from vllm_metal.attention.impls.gdn_lazy import GDNLazyKernels
+from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
 
 
 @pytest.fixture(autouse=True)

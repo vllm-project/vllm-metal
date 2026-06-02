@@ -20,7 +20,7 @@ from __future__ import annotations
 import mlx.core as mx
 from vllm.logger import init_logger
 
-from vllm_metal.metal_kernel_backend.turboquant import (
+from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,

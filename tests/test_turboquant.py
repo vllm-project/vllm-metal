@@ -42,10 +42,8 @@ import pytest
 import torch
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.config import get_config, reset_config
-from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.turboquant import (
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
@@ -58,6 +56,8 @@ from vllm_metal.metal_kernel_backend.turboquant import (
     turbo_quant_encode,
     unpack_bits,
 )
+from vllm_metal.config import get_config, reset_config
+from vllm_metal.metal import get_ops
 from vllm_metal.v1.cache_policy import (
     TurboQuantAttentionSpec,
     _build_turboquant_attention_spec,
@@ -733,7 +733,7 @@ def section_metal_encode_parity() -> int:
 
         # ---- Compare dequantized V (FWHT fp32 vs fp16 → boundary flips OK) ----
         # Unpack V indices from both caches, dequant via centroids, compare.
-        from vllm_metal.metal_kernel_backend.turboquant import lloyd_max_centroids
+        from vllm_metal.attention.caches.turboquant import lloyd_max_centroids
 
         centroids, _ = lloyd_max_centroids(v_bits)
         v_packed_dim = cache_py.value_caches[0].shape[-1]
@@ -2264,7 +2264,7 @@ def _parse_metal_sign_table(head_size: int) -> np.ndarray:
 
 def _python_signs(head_size: int) -> np.ndarray:
     """Reproduce the Python sign vector using the same RNG recipe as ``fwht``."""
-    from vllm_metal.metal_kernel_backend.turboquant import _RNG_KEY
+    from vllm_metal.attention.caches.turboquant import _RNG_KEY
 
     sign01 = mx.random.randint(0, 2, shape=(head_size,), key=_RNG_KEY)
     signs = (1 - 2 * sign01).astype(mx.float32)
@@ -2596,7 +2596,7 @@ def test_turboquant_per_layer_shapes_raise_early() -> None:
         with pytest.raises(
             NotImplementedError, match="TurboQuant with per-layer KV shapes"
         ):
-            runner.build_paged_attention_backend(block_size=16)
+            runner.build_paged_attention_runtime(block_size=16)
     finally:
         reset_config()
 

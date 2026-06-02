@@ -637,7 +637,7 @@ class TestYocoCacheIntegration:
             num_kv_cache_layers=yoco[0],
         )
 
-        backend = runner.build_paged_attention_backend(block_size=self._BLOCK_SIZE)
+        backend = runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
 
         assert backend._num_layers == self._NUM_UNIQUE
         assert backend._cache_idx_map is not None

@@ -16,8 +16,8 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
-from vllm_metal.paged_attention_common import PagedAttentionContext
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import RequestState
 
@@ -47,7 +47,7 @@ class TestStartPagedForwardMmFailFast:
         runner = make_stub_runner(
             encoder_cache=EncoderCache(),
             _is_vlm=True,
-            _paged_attention_backend=MagicMock(),
+            _paged_attention_runtime=MagicMock(),
             _paged_block_size=16,
         )
         runner._multimodal_adapter = adapter

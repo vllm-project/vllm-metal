@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_metal.paged_attention_common import (
+from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     get_context,
@@ -143,7 +143,7 @@ class TestPackedRoPE:
         """Each packed request's RoPE should start from position 0."""
         import mlx.core as mx
 
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+        from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 
@@ -170,7 +170,7 @@ class TestPackedRoPE:
         """Caller-provided positions are only valid on the M-RoPE path."""
         import mlx.core as mx
 
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+        from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 
@@ -196,7 +196,7 @@ class TestPackedRoPE:
 
         import mlx.core as mx
 
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+        from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 
@@ -242,7 +242,7 @@ class TestPackedRoPE:
 
         import mlx.core as mx
 
-        from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+        from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 

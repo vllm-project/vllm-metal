@@ -37,18 +37,18 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_metal.config import get_config
-from vllm_metal.multimodal import merge_multimodal_embeddings
-from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
-from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
-from vllm_metal.paged_attention_common import (
+from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     get_context,
     prepare_unified,
 )
+from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
+from vllm_metal.config import get_config
+from vllm_metal.multimodal import merge_multimodal_embeddings
+from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
@@ -302,7 +302,7 @@ class MetalModelRunner:
         self._draft_token_ids: DraftTokenIds | None = None
 
         # Paged attention state (set by worker when enabled)
-        self._paged_attention_backend: PagedAttentionBackend | None = None
+        self._paged_attention_runtime: PagedAttentionRuntime | None = None
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
@@ -390,7 +390,7 @@ class MetalModelRunner:
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
         if self._is_pooling:
-            if self._paged_attention_backend is None:
+            if self._paged_attention_runtime is None:
                 return ()
             return supported_pooling_tasks(
                 self._forward_model, self.model_config, self.tokenizer
@@ -412,8 +412,8 @@ class MetalModelRunner:
         are mutated, so a later allocation failure cannot leave a partial
         request-to-slot assignment behind.
         """
-        backend = self._paged_attention_backend
-        if not isinstance(backend, HybridPagedAttentionBackend):
+        backend = self._paged_attention_runtime
+        if not isinstance(backend, HybridPagedAttentionRuntime):
             raise RuntimeError("GDN slot allocation requires hybrid paged backend")
         sc = backend._state_cache
         if sc is None:
@@ -466,8 +466,8 @@ class MetalModelRunner:
 
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
-        backend = self._paged_attention_backend
-        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+        backend = self._paged_attention_runtime
+        if isinstance(backend, HybridPagedAttentionRuntime) and backend._state_cache:
             backend._state_cache.apply_pending_states()
         mx.eval(*self._gdn_updated_state_arrays())
 
@@ -481,8 +481,8 @@ class MetalModelRunner:
         updates when present, otherwise the stable pools.
         """
 
-        backend = self._paged_attention_backend
-        if not isinstance(backend, HybridPagedAttentionBackend):
+        backend = self._paged_attention_runtime
+        if not isinstance(backend, HybridPagedAttentionRuntime):
             raise RuntimeError("GDN state cache requires hybrid paged backend")
         sc = backend._state_cache
         if sc is None:
@@ -501,7 +501,7 @@ class MetalModelRunner:
         if target_hidden_states is not None:
             outputs.append(target_hidden_states)
         if has_prefill and isinstance(
-            self._paged_attention_backend, HybridPagedAttentionBackend
+            self._paged_attention_runtime, HybridPagedAttentionRuntime
         ):
             outputs.extend(self._gdn_updated_state_arrays())
         mx.async_eval(*outputs)
@@ -517,8 +517,8 @@ class MetalModelRunner:
         if not freed_slots:
             return
 
-        backend = self._paged_attention_backend
-        if isinstance(backend, HybridPagedAttentionBackend) and backend._state_cache:
+        backend = self._paged_attention_runtime
+        if isinstance(backend, HybridPagedAttentionRuntime) and backend._state_cache:
             backend._state_cache.apply_pending_states()
         self._gdn_needs_materialize = True
         self._gdn_free_slots.extend(freed_slots)
@@ -636,30 +636,30 @@ class MetalModelRunner:
         logits = self._extract_logits(output)
         return [logits]
 
-    def build_paged_attention_backend(
+    def build_paged_attention_runtime(
         self, *, block_size: int
-    ) -> PagedAttentionBackend:
+    ) -> PagedAttentionRuntime:
         """Build the paged-attention backend for the loaded model."""
-        return self._cache_policy.build_paged_attention_backend(block_size=block_size)
+        return self._cache_policy.build_paged_attention_runtime(block_size=block_size)
 
     @property
-    def paged_attention_backend(self) -> PagedAttentionBackend | None:
+    def paged_attention_runtime(self) -> PagedAttentionRuntime | None:
         """Return the installed paged-attention backend, if any."""
-        return self._paged_attention_backend
+        return self._paged_attention_runtime
 
-    def install_paged_attention_backend(
+    def install_paged_attention_runtime(
         self,
-        backend: PagedAttentionBackend,
+        backend: PagedAttentionRuntime,
         *,
         block_size: int,
     ) -> None:
         """Record the initialized paged-attention backend owned by this runner."""
-        self._paged_attention_backend = backend
+        self._paged_attention_runtime = backend
         self._paged_block_size = block_size
 
     def install_gemma4_mtp_kv_sharing(
         self,
-        backend: PagedAttentionBackend,
+        backend: PagedAttentionRuntime,
         *,
         block_size: int,
     ) -> None:
@@ -699,8 +699,8 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-        if self._paged_attention_backend is not None:
-            self._paged_attention_backend.warm_up()
+        if self._paged_attention_runtime is not None:
+            self._paged_attention_runtime.warm_up()
 
     def _make_sampling_metadata(
         self,
@@ -1424,7 +1424,7 @@ class MetalModelRunner:
         scheduler_output: SchedulerOutput,
     ) -> tuple[tuple[str, RequestState], ...]:
         """Return current decode requests without mutating runner state."""
-        if self._paged_attention_backend is None:
+        if self._paged_attention_runtime is None:
             return ()
 
         decode_reqs: list[tuple[str, RequestState]] = []
@@ -1441,7 +1441,7 @@ class MetalModelRunner:
         self._spec_decode_controller.validate_supported(
             scheduler_output,
             self._spec_decode_preflight_reqs(scheduler_output),
-            paged_attention_enabled=self._paged_attention_backend is not None,
+            paged_attention_enabled=self._paged_attention_runtime is not None,
             is_hybrid=self.is_hybrid,
             logitsprocs=self._logitsprocs,
             use_async_scheduling=self.use_async_scheduling,
@@ -1727,7 +1727,7 @@ class MetalModelRunner:
             validate_pooling_request(
                 new_req,
                 self.model_config,
-                paged_attention_enabled=self._paged_attention_backend is not None,
+                paged_attention_enabled=self._paged_attention_runtime is not None,
             )
 
             # mm_features were pre-registered before encoder dispatch in
@@ -1741,7 +1741,7 @@ class MetalModelRunner:
 
             generator = _create_request_generator(self.device, sampling_params)
 
-            if self._paged_attention_backend is not None:
+            if self._paged_attention_runtime is not None:
                 sched_block_ids = list(new_req.block_ids[0])
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
@@ -1807,7 +1807,7 @@ class MetalModelRunner:
         cached_reqs: CachedRequestData,
     ) -> None:
         """Apply scheduler-provided block updates for paged cached requests."""
-        if self._paged_attention_backend is None:
+        if self._paged_attention_runtime is None:
             return
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1837,7 +1837,7 @@ class MetalModelRunner:
         if not cached_reqs.req_ids:
             return
 
-        if self._paged_attention_backend is None:
+        if self._paged_attention_runtime is None:
             batch.scheduled_cached_req_ids.extend(cached_reqs.req_ids)
             for req_id in cached_reqs.req_ids:
                 state = self._request_states.get(req_id)
@@ -2098,7 +2098,7 @@ class MetalModelRunner:
         except (NotImplementedError, ValueError) as exc:
             spec_decode_error = exc
         has_unsupported_non_paged_structured_output = (
-            self._paged_attention_backend is None
+            self._paged_attention_runtime is None
             and scheduler_output.has_structured_output_requests
         )
         will_fail_fast_before_model_work = (
@@ -2142,7 +2142,7 @@ class MetalModelRunner:
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
-        if self._paged_attention_backend is not None and batch.has_paged_work():
+        if self._paged_attention_runtime is not None and batch.has_paged_work():
             prefill_pack = self._build_prefill_pack(batch)
             self._start_paged_forward(
                 batch,
@@ -2164,7 +2164,7 @@ class MetalModelRunner:
         # True. If this fires, a scheduler change broke that contract and the
         # bitmask would have been silently skipped on the synchronous tail.
         if (
-            self._paged_attention_backend is not None
+            self._paged_attention_runtime is not None
             and scheduler_output.has_structured_output_requests
         ):
             raise RuntimeError(
@@ -2172,7 +2172,7 @@ class MetalModelRunner:
                 "invariant violated."
             )
 
-        if self._paged_attention_backend is None:
+        if self._paged_attention_runtime is None:
             self._run_non_paged_decode_batch(batch)
 
         # Non-paged path: complete synchronously

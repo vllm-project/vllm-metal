@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_metal.metal_kernel_backend.attention_sdpa import (
+from vllm_metal.attention.impls.sdpa import (
     _KERNEL_BLOCK_SIZES,
     _build_block_tables,
     _pick_kernel_block_size,

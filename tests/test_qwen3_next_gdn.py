@@ -27,11 +27,11 @@ import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 
 
-class _HybridBackendStub(HybridPagedAttentionBackend):
+class _HybridBackendStub(HybridPagedAttentionRuntime):
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
         self._state_cache = state_cache
 
@@ -157,7 +157,7 @@ class TestGDNSlotLifecycle:
 
     def _make_runner_stub(self, max_seqs: int = 2):
         """Build a minimal stub with GDN slot management wired up."""
-        from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+        from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 
         sc = GDNPagedStateCache(
             num_layers=2,
@@ -172,7 +172,7 @@ class TestGDNSlotLifecycle:
         )
         backend = _HybridBackendStub(sc)
 
-        runner = make_stub_runner(_paged_attention_backend=backend)
+        runner = make_stub_runner(_paged_attention_runtime=backend)
         return runner, sc
 
     def test_new_slots_grow_state_cache_lazily(self):

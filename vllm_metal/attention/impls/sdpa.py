@@ -30,12 +30,12 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_packed_rope,
 )
-from vllm_metal.paged_attention_common import PagedAttentionContext
+from vllm_metal.metal import get_ops
 
 # === Metal kernel block-size support ===
 # The paged attention Metal kernel is template-instantiated for these block
@@ -73,7 +73,7 @@ def is_sdpa(module: nn.Module) -> bool:
       and RoPE exposure via ``rope`` or ``rotary_emb``.
 
     Keeping this classifier tight matters because
-    :meth:`HybridPagedAttentionBackend.patch_model` uses ``is_sdpa`` as
+    :meth:`HybridPagedAttentionRuntime.patch_model` uses ``is_sdpa`` as
     the dispatch predicate — loose matching would send arbitrary Q/K/O
     modules through the SDPA path.
     """
@@ -484,7 +484,7 @@ def sdpa_forward(
         # Supports the full QUANT_PARAMS matrix: signed q8_0/int8 at k_bits=8
         # and unsigned uint8/q5_0/q4_0/int4/uint4/int2/uint2 at k_bits in
         # {2, 3, 4, 5, 8}.
-        from vllm_metal.metal_kernel_backend.turboquant import (
+        from vllm_metal.attention.caches.turboquant import (
             QUANT_PARAMS,
             get_v_centroids,
         )
@@ -584,7 +584,7 @@ def sdpa_forward(
                 -1, kernel_block_size, kv_cache.num_kv_heads, sg
             )
         # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
-        from vllm_metal.metal_kernel_backend.turboquant import get_v_centroids
+        from vllm_metal.attention.caches.turboquant import get_v_centroids
 
         v_centroids = get_v_centroids(kv_cache.v_bits)
         ops.paged_attention_primitive(

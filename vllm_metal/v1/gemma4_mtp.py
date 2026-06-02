@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import mlx.core as mx
 from vllm.logger import init_logger
 
-from vllm_metal.paged_attention_common import clear_context, prepare_unified
+from vllm_metal.attention.context import clear_context, prepare_unified
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
 GEMMA4_MTP_DEFAULT_CENTROID_TOP_K = 32

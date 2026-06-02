@@ -9,10 +9,9 @@ import mlx.nn as nn
 from mlx_lm.models.base import scaled_dot_product_attention
 
 from vllm_metal import envs
-from vllm_metal.metal import warm_up_kernels
-from vllm_metal.metal_kernel_backend.packed_prefill_compat import apply_packed_rope
-from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
-from vllm_metal.paged_attention_common import find_attn_attr, find_layers, get_context
+from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+from vllm_metal.attention.context import get_context
+from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
@@ -469,77 +468,3 @@ class MLAPagedAttentionWrapper(nn.Module):
 
         final = mx.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
         return inner.o_proj(final)
-
-
-class MLAPagedAttentionBackend:
-    """Paged attention backend for MLA models.
-
-    Implements the PagedAttentionBackend protocol. Uses MLX-native
-    scatter/gather (cache I/O only; attention is MLX SDPA by default
-    or an opt-in single-pass Metal kernel, RFC #360) because MLA
-    latents do not fit the standard (num_heads, head_dim) kernel
-    layout.
-    """
-
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        latent_dim: int,
-        block_size: int,
-        dtype: mx.Dtype,
-    ) -> None:
-        self._num_layers = num_layers
-        self._latent_dim = latent_dim
-        self._block_size = block_size
-        self._dtype = dtype
-        self._cache: MLAPagedLatentCache | None = None
-
-    def _require_initialized(self, caller: str) -> MLAPagedLatentCache:
-        if self._cache is None:
-            raise RuntimeError(f"{caller}() called before initialize()")
-        return self._cache
-
-    def initialize(self, num_blocks: int) -> None:
-        self._cache = MLAPagedLatentCache(
-            num_layers=self._num_layers,
-            latent_dim=self._latent_dim,
-            num_blocks=num_blocks,
-            block_size=self._block_size,
-            dtype=self._dtype,
-        )
-
-    def patch_model(self, model: Any) -> int:
-        cache = self._require_initialized("patch_model")
-        return self._patch_model(model, cache)
-
-    def _patch_model(self, model: Any, latent_cache: MLAPagedLatentCache) -> int:
-        patched = 0
-
-        for layer_idx, layer in enumerate(find_layers(model)):
-            attn_attr = find_attn_attr(layer)
-            if attn_attr is None:
-                continue
-
-            attn = getattr(layer, attn_attr)
-            if isinstance(attn, MLAPagedAttentionWrapper):
-                # Already patched — refresh cache reference (e.g. after re-initialisation)
-                object.__setattr__(attn, "_mla_latent_cache", latent_cache)
-                patched += 1
-                continue
-
-            setattr(
-                layer,
-                attn_attr,
-                MLAPagedAttentionWrapper(attn, layer_idx, latent_cache),
-            )
-            patched += 1
-
-        return patched
-
-    def warm_up(self) -> None:
-        self._require_initialized("warm_up")
-        warm_up_kernels()
-
-    def num_blocks(self) -> int:
-        return self._require_initialized("num_blocks").num_blocks

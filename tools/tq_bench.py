@@ -34,9 +34,9 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.turboquant import get_v_centroids
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.turboquant import get_v_centroids
 
 # -----------------------------------------------------------------------------
 # Config — Qwen3-0.6B shape (28 layers, 4 KV heads, head_dim=128).

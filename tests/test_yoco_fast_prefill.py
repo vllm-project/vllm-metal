@@ -12,7 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_metal.yoco_fast_prefill import (
+from vllm_metal.attention.yoco import (
     build_yoco_reduced_context_from_full_metadata,
     try_enable_gemma4_yoco_fast_prefill,
 )
@@ -159,7 +159,7 @@ def test_try_enable_skips_ineligible_gemma4_yoco_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -177,8 +177,8 @@ def test_try_enable_can_skip_ineligible_model_without_warning(
 ) -> None:
     warning = Mock()
     debug = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.debug", debug)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -198,7 +198,7 @@ def test_try_enable_logs_without_paged_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -220,7 +220,7 @@ def test_try_enable_logs_missing_num_hidden_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -238,7 +238,7 @@ def test_try_enable_logs_when_not_all_layers_are_paged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = Mock()
-    monkeypatch.setattr("vllm_metal.yoco_fast_prefill.logger.warning", warning)
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -322,7 +322,7 @@ def test_reduced_context_from_empty_full_paged_metadata() -> None:
 def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> None:
     import mlx.core as mx
 
-    from vllm_metal.paged_attention_common import (
+    from vllm_metal.attention.context import (
         PagedAttentionContext,
         clear_context,
         get_context,

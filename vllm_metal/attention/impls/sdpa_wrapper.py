@@ -21,22 +21,19 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal_kernel_backend.attention_sdpa import (
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import get_context
+from vllm_metal.attention.impls.sdpa import (
     sdpa_forward,
 )
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.paged_attention_common import (
-    find_attn_attr,
-    find_layers,
-    get_context,
-)
+from vllm_metal.attention.patching import walk_and_wrap
 
 # ---------------------------------------------------------------------------
 # Wrapper nn.Module
 # ---------------------------------------------------------------------------
 
 
-class MetalKernelPagedAttentionWrapper(nn.Module):
+class SDPAPagedAttentionWrapper(nn.Module):
     """Wraps an mlx_lm Attention module to use native Metal paged KV.
 
     Uses ``object.__setattr__`` to bypass MLX nn.Module's ``__setattr__``.
@@ -138,7 +135,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def patch_model_attention_metal_kernel(
+def patch_sdpa_attention(
     model: Any,
     kv_cache: MetalPagedKVCache,
     block_size: int,
@@ -147,7 +144,7 @@ def patch_model_attention_metal_kernel(
     only_layers: list[int] | None = None,
 ) -> int:
     """Walk model layers and replace each attention module with a
-    ``MetalKernelPagedAttentionWrapper``.
+    ``SDPAPagedAttentionWrapper``.
 
     Supports hybrid models (e.g. Qwen3.5) where different layers use
     different attribute names (``self_attn``, ``linear_attn``, etc.).
@@ -163,34 +160,19 @@ def patch_model_attention_metal_kernel(
 
     Returns the number of patched layers.
     """
-    layer_list = find_layers(model)
-    only_set = set(only_layers) if only_layers is not None else None
-    patched = 0
 
-    for layer_idx, layer in enumerate(layer_list):
-        if only_set is not None and layer_idx not in only_set:
-            continue
-
-        attn_attr = find_attn_attr(layer)
-        if attn_attr is None:
-            continue
-
-        attn = getattr(layer, attn_attr)
+    def wrap_layer(layer_idx: int, attn: Any) -> Any:
         cache_idx = (
             cache_idx_map[layer_idx]
             if cache_idx_map is not None and layer_idx in cache_idx_map
             else layer_idx
         )
-        if isinstance(attn, MetalKernelPagedAttentionWrapper):
-            # Already patched — update cache reference
+        if isinstance(attn, SDPAPagedAttentionWrapper):
+            # Already patched — refresh cache reference in place.
             attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx)
-            patched += 1
-            continue
-
-        wrapper = MetalKernelPagedAttentionWrapper(
+            return attn
+        return SDPAPagedAttentionWrapper(
             attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
         )
-        setattr(layer, attn_attr, wrapper)
-        patched += 1
 
-    return patched
+    return walk_and_wrap(model, wrap_layer, only_layers=only_layers)

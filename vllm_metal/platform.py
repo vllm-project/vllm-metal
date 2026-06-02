@@ -343,7 +343,7 @@ class MetalPlatform(Platform):
         the synthetic MetalBackend, which advertises Metal's MultipleOf(16)
         kernel alignment to the framework's hybrid-block-size math.
         """
-        from vllm_metal.metal_backend import MetalBackend
+        from vllm_metal.attention.synthetic_backend import MetalBackend
 
         return MetalBackend
 

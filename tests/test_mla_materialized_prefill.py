@@ -11,9 +11,9 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-import vllm_metal.paged_attention_common as pac
-from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
-from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention import context as pac
+from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 
 MultiLinear = pytest.importorskip("mlx_lm.models.mla").MultiLinear
 

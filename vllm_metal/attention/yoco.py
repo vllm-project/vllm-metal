@@ -321,7 +321,7 @@ def _gemma4_text_fast_prefill_call(
     try:
         import mlx.core as mx
 
-        from vllm_metal.paged_attention_common import (
+        from vllm_metal.attention.context import (
             PagedAttentionContext,
             get_context,
             set_context,

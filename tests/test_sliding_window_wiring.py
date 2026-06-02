@@ -7,7 +7,7 @@ Verifies the full chain from model config to Metal KV cache:
       -> DefaultModelAdapter.build_sliding_window_per_layer
       -> MetalModelRunner.sliding_window_per_layer
       -> ModelCachePolicy._build_mha_backend (slice to num_cache_layers)
-      -> MHAPagedAttentionBackend (kwarg)
+      -> MHAPagedAttentionRuntime (kwarg)
       -> MetalPagedKVCache.sliding_window_per_layer
 
 Kernel-level correctness (that a ``sliding_window`` value actually
@@ -86,7 +86,7 @@ class TestNonYocoSlidingWindowWiring:
 
         # Act: build the backend, which constructs the KV cache with the
         # per-layer window list sliced by the cache policy.
-        backend = runner.build_paged_attention_backend(block_size=_BLOCK_SIZE)
+        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
         backend.initialize(num_blocks=_NUM_BLOCKS)
 
         # Assert
@@ -120,7 +120,7 @@ class TestNonYocoSlidingWindowWiring:
         )
 
         # Act
-        backend = runner.build_paged_attention_backend(block_size=_BLOCK_SIZE)
+        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
         backend.initialize(num_blocks=_NUM_BLOCKS)
 
         # Assert: all disabled (preserves pre-PR behaviour for non-sliding models)
@@ -184,7 +184,7 @@ class TestYocoSlidingWindowWiring:
         )
 
         # Act
-        backend = runner.build_paged_attention_backend(block_size=_BLOCK_SIZE)
+        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
         backend.initialize(num_blocks=_NUM_BLOCKS)
 
         # Assert #1: cache stores one entry per unique layer, matching the

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_metal.metal_kernel_backend.attention_linear import is_linear_attention
-from vllm_metal.metal_kernel_backend.attention_sdpa import is_sdpa
-from vllm_metal.paged_attention_common import find_attn_attr, find_layers
+from vllm_metal.attention.impls.linear import is_linear_attention
+from vllm_metal.attention.impls.sdpa import is_sdpa
+from vllm_metal.attention.patching import find_attn_attr, find_layers
 
 # ---------------------------------------------------------------------------
 # Minimal ModelArgs for real mlx_lm module instantiation (no weights needed)

@@ -12,13 +12,13 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
-from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 
 
-class _HybridBackendStub(HybridPagedAttentionBackend):
+class _HybridBackendStub(HybridPagedAttentionRuntime):
     pass
 
 
@@ -364,7 +364,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         runner = make_stub_runner(
             tokenizer=object(),
             model_args={"full_attention_interval": 2},
-            _paged_attention_backend=backend,
+            _paged_attention_runtime=backend,
         )
         runner.num_layers = 0
         runner._paged_block_size = 4
@@ -1113,7 +1113,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
-        runner._paged_attention_backend = object()
+        runner._paged_attention_runtime = object()
         req_state = mr.RequestState(
             token_ids=[1, 6],
             prompt_len=1,
@@ -1165,7 +1165,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
 
 class TestV1MetalModelRunnerGDNSubmit:
-    def _make_hybrid_backend(self) -> HybridPagedAttentionBackend:
+    def _make_hybrid_backend(self) -> HybridPagedAttentionRuntime:
         backend = _HybridBackendStub.__new__(_HybridBackendStub)
         conv_states = [
             mx.array([1], dtype=mx.float32),
@@ -1187,7 +1187,7 @@ class TestV1MetalModelRunnerGDNSubmit:
     ) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_backend=self._make_hybrid_backend())
+        runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())
         logits = mx.array([0], dtype=mx.float32)
         expected_states = runner._gdn_updated_state_arrays()
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
@@ -1223,7 +1223,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         cache.set_pending_recurrent_state(0, [1], pending_recurrent)
         backend = _HybridBackendStub.__new__(_HybridBackendStub)
         backend._state_cache = cache
-        runner = make_stub_runner(_paged_attention_backend=backend)
+        runner = make_stub_runner(_paged_attention_runtime=backend)
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
@@ -1240,7 +1240,7 @@ class TestV1MetalModelRunnerGDNSubmit:
     def test_decode_only_hybrid_submits_logits_only(self, monkeypatch) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_backend=self._make_hybrid_backend())
+        runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
@@ -1253,7 +1253,7 @@ class TestV1MetalModelRunnerGDNSubmit:
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_backend=object())
+        runner = make_stub_runner(_paged_attention_runtime=object())
         logits = mx.array([0], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
@@ -1281,7 +1281,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         )
         backend = _HybridBackendStub.__new__(_HybridBackendStub)
         backend._state_cache = cache
-        runner = make_stub_runner(_paged_attention_backend=backend)
+        runner = make_stub_runner(_paged_attention_runtime=backend)
         runner._gdn_req_to_slot = {"done": 1}
         runner._gdn_free_slots = []
 

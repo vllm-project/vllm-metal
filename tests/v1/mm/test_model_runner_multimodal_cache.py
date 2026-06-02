@@ -94,7 +94,7 @@ def _runner_with_encoder_cache():
 def _paged_runner_with_encoder_cache():
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
-        _paged_attention_backend=MagicMock(),
+        _paged_attention_runtime=MagicMock(),
         _paged_block_size=16,
     )
     runner._start_paged_forward = MagicMock()
