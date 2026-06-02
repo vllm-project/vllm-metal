@@ -403,33 +403,66 @@ class MetalModelRunner:
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
-        if req_id in self._gdn_req_to_slot:
-            return self._gdn_req_to_slot[req_id]
-        reused = False
-        if self._gdn_free_slots:
-            slot = self._gdn_free_slots.pop()
-            reused = True
-        else:
-            slot = len(self._gdn_req_to_slot)
-        self._gdn_req_to_slot[req_id] = slot
+        return self._gdn_assign_slots_for_step([req_id])[0]
+
+    def _gdn_assign_slots_for_step(self, req_ids: list[str]) -> list[int]:
+        """Assign all GDN state slots needed by one scheduler step.
+
+        Capacity growth happens once for the whole step before request mappings
+        are mutated, so a later allocation failure cannot leave a partial
+        request-to-slot assignment behind.
+        """
+        backend = self._paged_attention_backend
+        if not isinstance(backend, HybridPagedAttentionBackend):
+            raise RuntimeError("GDN slot allocation requires hybrid paged backend")
+        sc = backend._state_cache
+        if sc is None:
+            raise RuntimeError("GDN state cache is not initialized")
+
+        assigned_slots: list[int] = []
+        planned_by_req: dict[str, int] = {}
+        planned_new: list[tuple[str, int, bool]] = []
+        free_slots = list(self._gdn_free_slots)
+        next_new_slot = sc.allocated_seqs
+
+        for req_id in req_ids:
+            existing = self._gdn_req_to_slot.get(req_id)
+            if existing is not None:
+                assigned_slots.append(existing)
+                continue
+            planned = planned_by_req.get(req_id)
+            if planned is not None:
+                assigned_slots.append(planned)
+                continue
+
+            if free_slots:
+                slot = free_slots.pop()
+                reused = True
+            else:
+                slot = next_new_slot
+                next_new_slot += 1
+                reused = False
+            planned_by_req[req_id] = slot
+            planned_new.append((req_id, slot, reused))
+            assigned_slots.append(slot)
+
+        if not planned_new:
+            return assigned_slots
+
+        target_capacity = max(slot for _, slot, _ in planned_new) + 1
+        sc.ensure_capacity(target_capacity)
+
         # Zero state for reused slots so the new request starts clean.
         # Done at alloc time (inside the forward-pass graph) rather than
         # at free time to avoid mx.eval synchronisation issues.
-        if reused:
-            backend = self._paged_attention_backend
-            if not isinstance(backend, HybridPagedAttentionBackend):
-                raise RuntimeError("GDN slot allocation requires hybrid paged backend")
-            sc = backend._state_cache
-            if sc is None:
-                raise RuntimeError("GDN state cache is not initialized")
-            for layer_idx in range(sc.num_layers):
-                conv = sc.conv_states[layer_idx]
-                conv[slot] = mx.zeros_like(conv[slot])
-                sc.conv_states[layer_idx] = conv
-                rec = sc.recurrent_states[layer_idx]
-                rec[slot] = mx.zeros_like(rec[slot])
-                sc.recurrent_states[layer_idx] = rec
-        return slot
+        for _, slot, reused in planned_new:
+            if reused:
+                sc.reset_slot(slot)
+
+        for req_id, slot, _ in planned_new:
+            self._gdn_req_to_slot[req_id] = slot
+        self._gdn_free_slots = free_slots
+        return assigned_slots
 
     def _gdn_materialize_state_cache(self) -> None:
         """Detach GDN state arrays from the lazy graph to prevent growth."""
@@ -931,28 +964,25 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
-
-        # ---- GDN slot mapping (hybrid models) ----
-        if self.is_hybrid:
-            ctx = get_context()
-            if ctx is not None:
-                gdn_slots = []
-                # Decode requests come first, then prefill
-                for req_id, _ in decode_reqs:
-                    gdn_slots.append(self._gdn_alloc_slot(req_id))
-                for pr in prefill_reqs:
-                    gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
-                ctx.gdn_slot_mapping = gdn_slots
-
-        # ---- forward (lazy graph + async submit) ----
-        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
-        input_ids = mx.array([all_token_ids], dtype=mx.int32)
         logits: mx.array | None = None
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
+
+        prepare_unified(decode_info, prefill_info, self._paged_block_size)
         try:
+            # ---- GDN slot mapping (hybrid models) ----
+            if self.is_hybrid:
+                ctx = get_context()
+                if ctx is not None:
+                    # Decode requests come first, then prefill.
+                    gdn_req_ids = [req_id for req_id, _ in decode_reqs]
+                    gdn_req_ids.extend(pr.req_id for pr in prefill_reqs)
+                    ctx.gdn_slot_mapping = self._gdn_assign_slots_for_step(gdn_req_ids)
+
+            # ---- forward (lazy graph + async submit) ----
+            offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+            input_ids = mx.array([all_token_ids], dtype=mx.int32)
             if has_pooling_work:
                 pooling_hidden_states = forward_sequence_hidden_states(
                     self._forward_model,

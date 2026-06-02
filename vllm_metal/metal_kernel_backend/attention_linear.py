@@ -164,8 +164,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):
             raise RuntimeError("GDN wrapper requires unique slots per request")
-        if any(slot < 0 or slot >= self._gdn_state_cache.max_seqs for slot in slot_ids):
-            raise RuntimeError("GDN wrapper received out-of-range slot mapping")
+        self._gdn_state_cache.require_allocated_slots(slot_ids)
 
         return _GDNForwardState(
             x=x,

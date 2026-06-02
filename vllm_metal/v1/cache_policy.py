@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
+
 
 @dataclass(frozen=True, kw_only=True)
 class TurboQuantAttentionSpec(FullAttentionSpec):
@@ -184,15 +186,20 @@ _register_turboquant_spec_manager()
 @dataclass(frozen=True)
 class _HybridGDNReservation:
     bytes_per_slot: int = 0
+    reserved_slots: int = 0
     max_num_seqs: int = 0
 
     @property
     def total_bytes(self) -> int:
-        return self.bytes_per_slot * self.max_num_seqs
+        return self.bytes_per_slot * self.reserved_slots
 
     @property
     def enabled(self) -> bool:
         return self.total_bytes > 0
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.bytes_per_slot > 0 and self.max_num_seqs > 0
 
 
 @dataclass(frozen=True)
@@ -219,6 +226,7 @@ class _PagedAttentionPlan:
         ]
         if self.hybrid_gdn_reservation.enabled:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
+        if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
@@ -241,11 +249,13 @@ class _PagedAttentionPlan:
 
     def _hybrid_gdn_detail(self) -> str:
         reservation = self.hybrid_gdn_reservation
-        if not reservation.enabled:
+        if not reservation.is_hybrid:
             return ""
         return (
-            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
-            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+            "hybrid_gdn_state=lazy "
+            f"(growth_peak_reserve={reservation.total_bytes / 1e9:.2f}GB, "
+            f"{reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+            f"peak_slots={reservation.reserved_slots}/"
             f"max_num_seqs={reservation.max_num_seqs})"
         )
 
@@ -742,13 +752,22 @@ class WorkerCachePlanner:
             )
 
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
-        """Return startup GDN state reserved outside the paged KV pool."""
+        """Return lazy GDN headroom reserved outside the paged KV pool."""
         runner = self._worker.model_runner
         if not runner.is_hybrid:
             return _HybridGDNReservation()
+        max_num_seqs = runner.scheduler_config.max_num_seqs
+        if max_num_seqs <= 0:
+            return _HybridGDNReservation()
+        cushion_slots = min(max_num_seqs, HYBRID_GDN_GROWTH_CUSHION_SLOTS)
         return _HybridGDNReservation(
             bytes_per_slot=runner.linear_cache_bytes_per_slot(),
-            max_num_seqs=runner.scheduler_config.max_num_seqs,
+            # ``ensure_capacity`` grows by allocating a larger state pool and
+            # copying the old pool into it. Reserve a bounded growth cushion
+            # instead of the full scheduler cap so large max_num_seqs values
+            # still benefit from lazy GDN allocation.
+            reserved_slots=(2 * cushion_slots) - 1,
+            max_num_seqs=max_num_seqs,
         )
 
     def _memory_fraction(self) -> float:

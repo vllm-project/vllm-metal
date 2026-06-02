@@ -23,6 +23,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from tests.stub_runner import make_stub_runner
@@ -166,12 +167,91 @@ class TestGDNSlotLifecycle:
             num_v_heads=4,
             value_head_dim=16,
             key_head_dim=16,
+            initial_seqs=0,
             dtype=mx.float16,
         )
         backend = _HybridBackendStub(sc)
 
         runner = make_stub_runner(_paged_attention_backend=backend)
         return runner, sc
+
+    def test_new_slots_grow_state_cache_lazily(self):
+        runner, sc = self._make_runner_stub(max_seqs=2)
+
+        assert sc.allocated_seqs == 0
+        slot_a = runner._gdn_alloc_slot("req-A")
+        slot_b = runner._gdn_alloc_slot("req-B")
+
+        assert slot_a == 0
+        assert slot_b == 1
+        assert sc.allocated_seqs == 2
+        assert sc.conv_states[0].shape == (2, 3, 64)
+        assert sc.recurrent_states[0].shape == (2, 4, 16, 16)
+
+    def test_step_slot_assignment_grows_once_for_multiple_requests(self):
+        runner, sc = self._make_runner_stub(max_seqs=3)
+
+        with patch.object(sc, "ensure_capacity", wraps=sc.ensure_capacity) as grow:
+            slots = runner._gdn_assign_slots_for_step(["req-A", "req-B"])
+
+        assert slots == [0, 1]
+        assert sc.allocated_seqs == 2
+        grow.assert_called_once_with(2)
+        assert runner._gdn_req_to_slot == {"req-A": 0, "req-B": 1}
+
+    def test_step_slot_assignment_failure_is_atomic(self):
+        runner, sc = self._make_runner_stub(max_seqs=1)
+
+        with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
+            runner._gdn_assign_slots_for_step(["req-A", "req-B"])
+
+        assert sc.allocated_seqs == 0
+        assert runner._gdn_req_to_slot == {}
+        assert runner._gdn_free_slots == []
+
+    def test_capacity_failure_does_not_record_request_mapping(self):
+        runner, sc = self._make_runner_stub(max_seqs=1)
+
+        assert runner._gdn_alloc_slot("req-A") == 0
+        with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
+            runner._gdn_alloc_slot("req-B")
+
+        assert sc.allocated_seqs == 1
+        assert runner._gdn_req_to_slot == {"req-A": 0}
+        assert runner._gdn_free_slots == []
+
+    def test_grow_materializes_pending_state_before_replacing_arrays(self):
+        sc = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=16,
+            key_head_dim=16,
+            initial_seqs=1,
+            dtype=mx.float16,
+        )
+        sc.set_pending_conv_state(0, [0], mx.full((1, 3, 64), 7, dtype=mx.float16))
+        sc.set_pending_recurrent_state(
+            0, [0], mx.full((1, 4, 16, 16), 9, dtype=mx.float32)
+        )
+
+        sc.ensure_capacity(2)
+
+        assert sc.allocated_seqs == 2
+        assert not sc.has_pending_conv_state(0)
+        assert not sc.has_pending_recurrent_state(0)
+        mx.eval(sc.conv_states[0], sc.recurrent_states[0])
+        assert mx.allclose(sc.conv_states[0][0], mx.full((3, 64), 7, dtype=mx.float16))
+        assert mx.allclose(
+            sc.recurrent_states[0][0],
+            mx.full((4, 16, 16), 9, dtype=mx.float32),
+        )
+        assert mx.array_equal(sc.conv_states[0][1], mx.zeros((3, 64), dtype=mx.float16))
+        assert mx.array_equal(
+            sc.recurrent_states[0][1], mx.zeros((4, 16, 16), dtype=mx.float32)
+        )
 
     def test_reused_slot_is_zeroed(self):
         """A slot returned to the free list and re-allocated must have

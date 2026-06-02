@@ -152,15 +152,17 @@ class HybridPagedAttentionBackend:
             num_v_heads=self._linear_num_v_heads,
             value_head_dim=self._linear_value_head_dim,
             key_head_dim=self._linear_key_head_dim,
+            initial_seqs=0,
             dtype=self._dtype,
         )
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d linear layers (%d slots)",
+            "%d linear layers (%d/%d GDN slots allocated)",
             len(self._sdpa_indices),
             num_blocks,
             len(self._linear_indices),
+            self._state_cache.allocated_seqs,
             self._max_num_seqs,
         )
 

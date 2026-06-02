@@ -323,15 +323,15 @@ class TestPagedAttentionPlanDiagnostics:
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
-    def test_hybrid_oom_error_reports_gdn_reservation(self, monkeypatch) -> None:
+    def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_capacity"
             ),
-            profile_run=MagicMock(return_value=500_000_000),
+            profile_run=MagicMock(return_value=3_900_000_000),
             validate_paged_attention_support=MagicMock(),
-            scheduler_config=SimpleNamespace(max_num_seqs=256),
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         worker = _make_worker(runner, use_paged_attention=True)
@@ -353,20 +353,87 @@ class TestPagedAttentionPlanDiagnostics:
             MetalWorker.determine_available_memory(worker)
 
         message = str(exc_info.value)
-        assert "kv_budget_before_hybrid=3.50GB" in message
-        assert "hybrid_gdn_state=16.49GB" in message
-        assert "(64.4MB/seq * max_num_seqs=256)" in message
-        assert "kv_budget=-12.99GB" in message
+        assert "kv_budget_before_hybrid=0.10GB" in message
+        assert "hybrid_gdn_state=lazy" in message
         assert (
-            "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
-            in message
-        )
+            "growth_peak_reserve=0.19GB, 64.4MB/seq * peak_slots=3/max_num_seqs=2"
+        ) in message
+        assert "kv_budget=-0.09GB" in message
+        assert "lower --max-num-seqs" in message
         assert "increase VLLM_METAL_MEMORY_FRACTION" in message
         runner.scheduler_memory_reporting_mode.assert_called_once_with(
             paged_attention_enabled=True
         )
         runner.profile_run.assert_called_once_with()
         runner.validate_paged_attention_support.assert_called_once_with()
+
+    def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_config=SimpleNamespace(max_num_seqs=256),
+            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+        )
+        planner = self._make_planner(
+            runner,
+            memory_fraction=0.5,
+            per_block_bytes=100_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 1_000_000_000,
+        )
+
+        plan = planner._paged_attention_plan(overhead=500_000_000)
+
+        assert plan.base_kv_budget == 3_500_000_000
+        assert plan.hybrid_gdn_reservation.bytes_per_slot == 64_400_000
+        assert plan.hybrid_gdn_reservation.reserved_slots == 3
+        assert plan.hybrid_gdn_reservation.max_num_seqs == 256
+        assert plan.hybrid_gdn_reservation.total_bytes == 193_200_000
+        assert plan.kv_budget == 3_306_800_000
+        assert plan.num_blocks == 33
+        breakdown = plan.format_breakdown()
+        assert "hybrid_gdn_state=lazy" in breakdown
+        assert "kv_budget_before_hybrid=3.50GB" in breakdown
+        assert (
+            "growth_peak_reserve=0.19GB, 64.4MB/seq * peak_slots=3/max_num_seqs=256"
+        ) in breakdown
+
+    def test_hybrid_plan_reserves_one_peak_slot_for_single_sequence(
+        self, monkeypatch
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_config=SimpleNamespace(max_num_seqs=1),
+            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+        )
+        planner = self._make_planner(
+            runner,
+            memory_fraction=0.5,
+            per_block_bytes=100_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 1_000_000_000,
+        )
+
+        plan = planner._paged_attention_plan(overhead=500_000_000)
+
+        assert plan.hybrid_gdn_reservation.reserved_slots == 1
+        assert plan.hybrid_gdn_reservation.total_bytes == 64_400_000
+        assert plan.num_blocks == 34
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(is_hybrid=False)
