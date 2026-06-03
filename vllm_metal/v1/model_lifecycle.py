@@ -187,11 +187,6 @@ class ModelLifecycle:
         }
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
-            logger.warning(
-                "VLM loaded via mlx-vlm; Metal multimodal encoder execution "
-                "is not wired yet. Text-only requests continue through the "
-                "language model."
-            )
             model, tokenizer = mlx_vlm_load(model_name)
         elif awq_loader is not None:
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:

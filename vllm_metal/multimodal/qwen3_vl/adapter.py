@@ -29,8 +29,9 @@ class Qwen3VLVisionEncodeResult:
 class Qwen3VLMultimodalAdapter:
     """Model-owned multimodal helpers for the Qwen3-VL execution path."""
 
-    forward_ready: bool = False
-    """Closed until parity against ``mlx_vlm.Model.__call__`` passes."""
+    forward_ready: bool = True
+    """Runner gate for the multimodal forward path; False forces the runner
+    to reject mm requests rather than invoke an incomplete adapter."""
 
     _SUPPORTED_EMBEDS_KWARGS: tuple[str, ...] = (
         "inputs_embeds",

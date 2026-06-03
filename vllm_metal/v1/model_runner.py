@@ -1400,24 +1400,32 @@ class MetalModelRunner:
     ) -> None:
         """Dispatch to vision encoders or fail fast based on adapter state.
 
-        When the active adapter signals ``forward_ready``, scheduled encoder
-        inputs are routed to :meth:`_run_vision_encoders`.  Until Phase 4
-        flips that flag for the parity-tested model, the gate raises so
-        partial work on a new model never disturbs models already in
-        production.  Phase 5+ adapters land at ``False`` and route through
-        this guard until each one's parity test passes.
+        When the active adapter signals ``forward_ready`` *and* the paged
+        attention backend is active, scheduled encoder inputs are routed to
+        :meth:`_run_vision_encoders`.  Otherwise the gate raises so that mm
+        requests never reach a misconfigured adapter or the non-paged path —
+        only the paged path splices encoded image embeddings, so the legacy
+        path would run the language model on raw image placeholder tokens.
         """
         if not scheduled_encoder_inputs:
             return
         adapter = self._multimodal_adapter
-        if adapter is not None and adapter.forward_ready:
-            self._run_vision_encoders(scheduled_encoder_inputs)
-            return
-        raise NotImplementedError(
-            "Multimodal encoder execution is not wired on Metal yet. "
-            "Metal currently registers multimodal runtime state, but image "
-            "encoding and embedding splice are not connected to the runner."
-        )
+        if adapter is None or not adapter.forward_ready:
+            raise RuntimeError(
+                "Multimodal encoder dispatch requested but adapter is missing "
+                "or not forward_ready; mm requests cannot run on this "
+                "configuration."
+            )
+        if self._paged_attention_backend is None:
+            raise NotImplementedError(
+                "Multimodal requests require the paged attention backend. "
+                "Set VLLM_METAL_USE_PAGED_ATTENTION=1: only the paged path "
+                "splices encoded image embeddings via _run_mm_paged_forward; "
+                "the non-paged legacy path would run the language model on raw "
+                "image placeholder tokens (RFC #319 hard rule 4: multimodal "
+                "is paged-only)."
+            )
+        self._run_vision_encoders(scheduled_encoder_inputs)
 
     def _spec_decode_preflight_reqs(
         self,
@@ -1460,6 +1468,14 @@ class MetalModelRunner:
         ``adapter.encode_multimodal`` one feature at a time so a single bad
         feature is reported with a precise req_id+idx rather than poisoning
         a whole request batch.
+
+        TODO(multimodal-batching): batch scheduled features into a single
+        ``adapter.encode_multimodal`` call.  Upstream vLLM stacks pixel_values
+        and image_grid_thw across requests so the vision tower runs once per
+        step; we serialize, which inflates TTFT under concurrency (e.g.,
+        conc=8 + 384x384 measured ~3.5s p50 TTFT).  Requires per-feature
+        slicing of returned hidden_states + deepstack residuals by
+        ``grid_thw.prod()``.
         """
         adapter = self._multimodal_adapter
         cache = self.encoder_cache

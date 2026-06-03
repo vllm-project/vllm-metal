@@ -203,7 +203,7 @@ def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast(
     assert runner.encoder_cache is not None
     runner.encoder_cache.encoder_outputs["drop"] = fake_encode_result(mx.array([[1.0]]))
 
-    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+    with pytest.raises(RuntimeError, match="not forward_ready"):
         runner.execute_model(
             _scheduler_output(
                 scheduled_encoder_inputs={"req-0": [0]},
@@ -226,7 +226,7 @@ def test_execute_model_cleans_finished_requests_before_encoder_fail_fast() -> No
         sampling_params=SamplingParams(),
     )
 
-    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+    with pytest.raises(RuntimeError, match="not forward_ready"):
         runner.execute_model(
             _scheduler_output(
                 finished_req_ids={"done"},
@@ -238,14 +238,16 @@ def test_execute_model_cleans_finished_requests_before_encoder_fail_fast() -> No
     assert "done" not in runner._request_states
 
 
-def test_execute_model_rejects_encoder_inputs_until_forward_is_wired() -> None:
+def test_execute_model_rejects_encoder_inputs_when_adapter_not_forward_ready() -> None:
     runner = _runner_with_encoder_cache()
-    runner._multimodal_adapter = Qwen3VLMultimodalAdapter(
+    adapter = Qwen3VLMultimodalAdapter(
         spatial_merge_size=2,
         language_model=object(),
     )
+    adapter.forward_ready = False
+    runner._multimodal_adapter = adapter
 
-    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+    with pytest.raises(RuntimeError, match="not forward_ready"):
         runner.execute_model(_scheduler_output(scheduled_encoder_inputs={"req-0": [0]}))
 
 
@@ -328,7 +330,8 @@ class _RecordingAdapter:
 def test_reject_scheduled_encoder_inputs_dispatches_when_adapter_is_forward_ready() -> (
     None
 ):
-    runner = _runner_with_encoder_cache()
+    # Dispatch only happens on the paged backend; mm is paged-only (RFC #319).
+    runner = _paged_runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
     features = [_feature("image-0")]
@@ -342,11 +345,33 @@ def test_reject_scheduled_encoder_inputs_dispatches_when_adapter_is_forward_read
     assert "image-0" in runner.encoder_cache.encoder_outputs
 
 
+def test_reject_scheduled_encoder_inputs_raises_on_non_paged_backend() -> None:
+    """forward_ready=True but no paged backend must fail fast.
+
+    The non-paged legacy path never splices encoded image embeddings, so
+    running the encoder and falling through to _prefill_single would silently
+    drop image conditioning (or feed raw placeholder IDs to the LM).
+    """
+    runner = _runner_with_encoder_cache()  # _paged_attention_backend is None
+    adapter = _RecordingAdapter()  # forward_ready = True
+    runner._multimodal_adapter = adapter
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", [_feature("image-0")])
+
+    with pytest.raises(NotImplementedError, match="paged attention backend"):
+        runner._reject_scheduled_encoder_inputs({"req-0": [0]})
+
+    # The encoder must not run when the request is going to be rejected.
+    assert adapter.encode_calls == []
+
+
 def test_reject_scheduled_encoder_inputs_raises_when_adapter_not_ready() -> None:
     runner = _runner_with_encoder_cache()
-    runner._multimodal_adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=2)
+    adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=2)
+    adapter.forward_ready = False
+    runner._multimodal_adapter = adapter
 
-    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+    with pytest.raises(RuntimeError, match="not forward_ready"):
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
 
@@ -354,7 +379,7 @@ def test_reject_scheduled_encoder_inputs_raises_when_no_adapter() -> None:
     runner = _runner_with_encoder_cache()
     runner._multimodal_adapter = None
 
-    with pytest.raises(NotImplementedError, match="Multimodal encoder execution"):
+    with pytest.raises(RuntimeError, match="not forward_ready"):
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
 
