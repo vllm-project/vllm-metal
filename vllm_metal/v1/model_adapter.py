@@ -227,19 +227,12 @@ class DefaultModelAdapter(ModelAdapter):
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
 
-        Modes:
-        - ``multimodal-native``: never force compatibility; keep native VLM
-          loading active so multimodal support can be developed/tested.
-        - ``text-only-compat``: force the text-only path only for the
-          known-safe compatibility allowlist.
-        - ``auto``: apply the compatibility path only for known-incompatible
-          checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 wrappers.
+        ``multimodal-native`` disables compatibility overrides. ``auto`` and
+        ``text-only-compat`` share the same compatibility allowlist.
         """
         multimodal_mode = self._multimodal_mode()
         if multimodal_mode == "multimodal-native":
             return False
-        if multimodal_mode == "text-only-compat":
-            return self._matches_auto_text_backbone_override(hf_config)
         return self._matches_auto_text_backbone_override(hf_config)
 
     def normalize_model_config(self, model_config: ModelConfig) -> None:
