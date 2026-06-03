@@ -33,6 +33,15 @@ from vllm_metal.attention.patching import walk_and_wrap
 # ---------------------------------------------------------------------------
 
 
+def _is_position_embeddings(value: Any) -> bool:
+    """Return True for PaddleOCR-VL ``(cos, sin)`` position embeddings."""
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(isinstance(item, mx.array) for item in value)
+    )
+
+
 class SDPAPagedAttentionWrapper(nn.Module):
     """Wraps an mlx_lm Attention module to use native Metal paged KV.
 
@@ -93,9 +102,26 @@ class SDPAPagedAttentionWrapper(nn.Module):
         position_ids: mx.array | None = None,
         **kwargs: Any,
     ) -> Any:
+        position_embeddings = kwargs.pop("position_embeddings", None)
+        if _is_position_embeddings(position_ids):
+            # PaddleOCRDecoderLayer calls
+            # ``self_attn(x, mask, cache, position_embeddings)`` positionally.
+            # Preserve that fourth argument instead of treating it as
+            # Qwen-style ``position_ids``.
+            position_embeddings = position_ids
+            position_ids = None
+
         ctx = get_context()
         if ctx is None:
             # No paged context → delegate to original attention.
+            if position_embeddings is not None:
+                return self._inner(
+                    x,
+                    mask=mask,
+                    cache=cache,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             # Only pass position_ids when provided (mlx_vlm models);
             # mlx_lm models (e.g. Gemma4) use offset via **kwargs instead.
             if position_ids is not None:
@@ -119,6 +145,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
             self._mk_kv_cache,
             self._mk_cache_idx,
             shared_kv=shared_kv,
+            position_embeddings=position_embeddings,
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.

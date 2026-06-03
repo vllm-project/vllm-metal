@@ -7,6 +7,7 @@ Run with:
 
 from __future__ import annotations
 
+import mlx.core as mx
 import pytest
 
 from vllm_metal.attention.context import (
@@ -15,6 +16,7 @@ from vllm_metal.attention.context import (
     get_context,
     prepare_unified,
 )
+from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 
 
 class TestOffsetCache:
@@ -29,6 +31,54 @@ class TestOffsetCache:
     def test_make_mask_multi_token(self):
         c = OffsetCache(0)
         assert c.make_mask(5) == "causal"
+
+
+class TestSDPAPagedAttentionWrapper:
+    def teardown_method(self):
+        clear_context()
+
+    def test_forwards_paddleocr_position_embeddings_without_context(self):
+        class _Inner:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(
+                self,
+                x,
+                mask=None,
+                cache=None,
+                position_embeddings=None,
+                **kwargs,
+            ):
+                self.calls.append(
+                    {
+                        "x": x,
+                        "mask": mask,
+                        "cache": cache,
+                        "position_embeddings": position_embeddings,
+                        "kwargs": kwargs,
+                    }
+                )
+                return x
+
+        inner = _Inner()
+        wrapper = SDPAPagedAttentionWrapper(
+            inner,
+            layer_idx=0,
+            kv_cache=object(),
+            block_size=16,
+        )
+        x = mx.ones((1, 2, 4), dtype=mx.float32)
+        position_embeddings = (
+            mx.ones((3, 1, 2, 4), dtype=mx.float32),
+            mx.zeros((3, 1, 2, 4), dtype=mx.float32),
+        )
+
+        out = wrapper(x, None, None, position_embeddings)
+
+        assert out is x
+        assert inner.calls[0]["position_embeddings"] is position_embeddings
+        assert inner.calls[0]["kwargs"] == {}
 
 
 class TestPrepare:

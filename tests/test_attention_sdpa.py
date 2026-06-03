@@ -481,6 +481,40 @@ class TestPrepareSDPAQKV:
                 shared_kv=(shared_k, shared_v),
             )
 
+    def test_position_embeddings_path_does_not_require_rope_attribute(self) -> None:
+        # Arrange — PaddleOCR-VL precomputes ``(cos, sin)`` at the model level
+        # and passes those embeddings into ``self_attn`` positionally.
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        inner.rope_parameters = {"mrope_section": [1, 1, 1]}
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        cos = mx.ones((3, _BATCH, _SEQ_LEN, _HEAD_DIM), dtype=mx.float32)
+        sin = mx.zeros((3, _BATCH, _SEQ_LEN, _HEAD_DIM), dtype=mx.float32)
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), 5.0)
+        expected_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 7.0)
+
+        with patch.object(
+            sdpa_mod,
+            "_apply_paddleocr_position_embeddings",
+            return_value=(expected_q, expected_k),
+        ) as apply_position_embeddings:
+            queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
+                inner,
+                x,
+                ctx,
+                _N_HEADS,
+                _N_KV_HEADS,
+                position_embeddings=(cos, sin),
+            )
+
+        assert apply_position_embeddings.call_count == 1
+        assert queries is expected_q
+        assert keys is expected_k
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert gate is None
+        assert kv_for_sharing == (expected_k, values)
+
 
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""

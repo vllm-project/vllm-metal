@@ -44,6 +44,16 @@ class MultimodalRuntimeAdapter(Protocol):
     model already in production.
     """
 
+    requires_explicit_positions: bool
+    """Whether text-only batches must also run the multimodal forward.
+
+    True for models whose language model derives rotary embeddings from
+    model-level position state (PaddleOCR-VL): on the paged text path the
+    runner supplies zero-offset caches and no ``position_ids``, so the LM
+    would re-derive every position from 0.  Routing through ``call_lm``
+    keeps positions explicit on every batch.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 
@@ -182,6 +192,10 @@ _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
     }
+)
+_PADDLEOCR_VL_MODEL_TYPES: frozenset[str] = frozenset({"paddleocr_vl"})
+_PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
+    {"PaddleOCRVLForConditionalGeneration"}
 )
 
 
@@ -445,17 +459,29 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type not in _QWEN3_VL_MODEL_TYPES and not any(
+        if model_type in _QWEN3_VL_MODEL_TYPES or any(
             arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
         ):
-            return None
+            from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
-        from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+            return cast(
+                MultimodalRuntimeAdapter,
+                Qwen3VLMultimodalAdapter.from_loaded_model(model),
+            )
 
-        return cast(
-            MultimodalRuntimeAdapter,
-            Qwen3VLMultimodalAdapter.from_loaded_model(model),
-        )
+        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
+            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
+        ):
+            from vllm_metal.multimodal.paddleocr_vl import (
+                PaddleOCRVLMultimodalAdapter,
+            )
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        return None
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]
