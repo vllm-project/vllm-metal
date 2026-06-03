@@ -1416,7 +1416,7 @@ class MetalModelRunner:
                 "or not forward_ready; mm requests cannot run on this "
                 "configuration."
             )
-        if self._paged_attention_backend is None:
+        if self._paged_attention_runtime is None:
             raise NotImplementedError(
                 "Multimodal requests require the paged attention backend. "
                 "Set VLLM_METAL_USE_PAGED_ATTENTION=1: only the paged path "

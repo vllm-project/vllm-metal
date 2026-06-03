@@ -352,7 +352,7 @@ def test_reject_scheduled_encoder_inputs_raises_on_non_paged_backend() -> None:
     running the encoder and falling through to _prefill_single would silently
     drop image conditioning (or feed raw placeholder IDs to the LM).
     """
-    runner = _runner_with_encoder_cache()  # _paged_attention_backend is None
+    runner = _runner_with_encoder_cache()  # _paged_attention_runtime is None
     adapter = _RecordingAdapter()  # forward_ready = True
     runner._multimodal_adapter = adapter
     assert runner.encoder_cache is not None
