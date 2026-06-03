@@ -1,5 +1,21 @@
 #!/bin/bash
 
+_cleanup_dirs=()
+
+register_cleanup_dir() {
+  _cleanup_dirs+=("$1")
+}
+
+cleanup_tmp_dirs() {
+  local dir
+  if [[ ${#_cleanup_dirs[@]} -eq 0 ]]; then
+    return
+  fi
+  for dir in "${_cleanup_dirs[@]}"; do
+    rm -rf "$dir"
+  done
+}
+
 fetch_latest_release() {
   local repo_owner="$1"
   local repo_name="$2"
@@ -54,8 +70,7 @@ download_and_install_wheel() {
 
   local tmp_dir
   tmp_dir=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp_dir'" EXIT
+  register_cleanup_dir "$tmp_dir"
 
   echo ""
   echo "Downloading wheel..."
@@ -105,6 +120,7 @@ install_vllm_rs() {
 
 main() {
   set -eu -o pipefail
+  trap cleanup_tmp_dirs EXIT
 
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"
@@ -185,9 +201,13 @@ EOF
   local vllm_v="0.22.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
-  local vllm_src_dir="vllm-$vllm_v"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
+  local vllm_tmp_dir
+  vllm_tmp_dir=$(mktemp -d)
+  register_cleanup_dir "$vllm_tmp_dir"
+  local vllm_src_dir="$vllm_tmp_dir/vllm-$vllm_v"
+
+  curl -fSL "$url_base/v$vllm_v/$filename" -o "$vllm_tmp_dir/$filename"
+  tar xf "$vllm_tmp_dir/$filename" -C "$vllm_tmp_dir"
   cd "$vllm_src_dir"
 
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
@@ -214,8 +234,6 @@ EOF
   if [[ "$with_vllm_rs" == "1" ]]; then
     install_vllm_rs "$vllm_src_dir"
   fi
-
-  rm -rf vllm-$vllm_v*
 
   echo ""
   success "Installation complete!"
