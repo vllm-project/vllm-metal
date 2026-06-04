@@ -2,6 +2,7 @@
 """Metal Platform implementation for vLLM."""
 
 import logging
+import os
 import platform as py_platform
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,17 @@ class MetalPlatform(Platform):
     device_name: str = "cpu"  # PyTorch device name (use CPU for compatibility)
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
+
+    # --- Ray distributed executor support (Phase 1) ---
+    # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
+    # is not "GPU", vLLM's Ray executor uses the generic
+    # resources={ray_device_key: n} placement path instead of the CUDA num_gpus
+    # path.  Each node must be launched with `ray start --resources='{"mlx": 1}'`.
+    ray_device_key: str = "mlx"
+    # Per-worker visible-device env var (the CUDA_VISIBLE_DEVICES analog).  With
+    # one Apple GPU per node this is effectively a no-op, but it must be a unique
+    # name that does not collide with CUDA_VISIBLE_DEVICES.
+    device_control_env_var: str = "VLLM_METAL_VISIBLE_DEVICES"
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -137,14 +149,20 @@ class MetalPlatform(Platform):
         return 1
 
     @classmethod
-    def set_device(cls, device_id: int) -> None:
+    def set_device(cls, device: "torch.device | int | None" = 0) -> None:
         """Set the current device.
 
+        vLLM's base contract (and the Ray compiled-DAG path) passes a
+        ``torch.device``; some internal callers pass an int index.  Apple
+        Silicon exposes a single GPU, so anything other than index 0 (or a
+        deviceless ``torch.device("cpu")`` whose index is ``None``) is invalid.
+
         Args:
-            device_id: Device index (must be 0 for Metal)
+            device: A ``torch.device`` or integer index; must resolve to 0.
         """
-        if device_id != 0:
-            msg = f"Metal only supports device 0, got {device_id}"
+        index = device.index if isinstance(device, torch.device) else device
+        if index not in (0, None):
+            msg = f"Metal only supports device 0, got {device!r}"
             raise ValueError(msg)
 
         config = get_config()
@@ -246,9 +264,50 @@ class MetalPlatform(Platform):
         # Set executor backend (use uniproc for single device)
         if parallel_config.distributed_executor_backend in ("auto", None):
             parallel_config.distributed_executor_backend = "uni"
+        elif parallel_config.distributed_executor_backend == "ray":
+            # Ray compiled-DAG (pipeline-parallel) transport defaults to a
+            # CUDA/NCCL channel for out-of-tree platforms; force shared memory
+            # so Metal does not pull in cupy/NCCL.
+            os.environ.setdefault("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm")
+
+            # Apple GPUs are not a Ray accelerator family, so vLLM's
+            # RayWorkerWrapper.get_node_and_gpu_ids would KeyError on
+            # get_accelerator_ids()[ray_device_key].  We override that method
+            # (see vllm_metal._patch_ray_distributed), but the patch must be
+            # applied in each Ray *worker* process before its first actor call.
+            # A worker_process_setup_hook runs at worker startup and is the only
+            # reliable point for that; the lazy plugin-load path is too late.
+            try:
+                from ray.runtime_env import RuntimeEnv
+
+                hook = "vllm_metal.compat._patch_ray_distributed"
+                existing = parallel_config.ray_runtime_env
+                if existing is None:
+                    parallel_config.ray_runtime_env = RuntimeEnv(
+                        worker_process_setup_hook=hook
+                    )
+                elif "worker_process_setup_hook" not in existing:
+                    existing["worker_process_setup_hook"] = hook
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "vllm_metal: failed to set Ray worker_process_setup_hook; "
+                    "RayWorkerWrapper.get_node_and_gpu_ids patch may not apply "
+                    "in workers",
+                    exc_info=True,
+                )
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
+
+        # Pipeline parallelism is not supported on Metal/MLX yet: the MLX model
+        # runner has no cross-stage activation hand-off (see
+        # MetalModelRunner.execute_model). Fail fast at config time rather than
+        # deep inside a Ray actor on the first decode step.
+        if parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Metal/MLX does not support pipeline parallelism yet "
+                "(pipeline_parallel_size > 1)."
+            )
 
         scheduler_config = vllm_config.scheduler_config
         if getattr(scheduler_config, "enable_chunked_prefill", False):

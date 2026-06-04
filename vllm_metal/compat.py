@@ -31,6 +31,57 @@ def apply_compat_patches() -> None:
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+    _patch_ray_distributed()
+
+
+def _patch_ray_distributed() -> None:
+    """Override vLLM's ``RayWorkerWrapper.get_node_and_gpu_ids`` for Metal.
+
+    Apple GPUs are not a Ray-recognized accelerator family, so a custom Ray
+    resource ("mlx") never appears in
+    ``ray.get_runtime_context().get_accelerator_ids()`` — only in
+    ``get_assigned_resources()``.  The stock method indexes
+    ``get_accelerator_ids()[ray_device_key]`` and would ``KeyError``.  We read
+    the assigned custom resource instead (one Apple GPU per node -> local index
+    ``[0]``), failing loud if a worker was not scheduled onto an "mlx" resource.
+
+    Installed both at registration time (via ``apply_compat_patches``) and, for
+    Ray worker processes, via the ``worker_process_setup_hook`` wired in
+    ``MetalPlatform.check_and_update_config``.  The hook is required because the
+    lazy registration path runs too late — the first ``current_platform`` access
+    that would trigger it happens *inside* the unpatched method's first call.
+    """
+    try:
+        from vllm.v1.executor import ray_utils
+    except Exception:  # noqa: BLE001 - ray not installed / import failure
+        return
+    wrapper = getattr(ray_utils, "RayWorkerWrapper", None)
+    if wrapper is None or getattr(wrapper, "_metal_patched", False):
+        return
+
+    def get_node_and_gpu_ids(self):  # noqa: ANN001, ANN202
+        import ray as _ray
+        from vllm.platforms import current_platform
+
+        rc = _ray.get_runtime_context()
+        node_id = rc.get_node_id()
+        key = current_platform.ray_device_key
+        assigned = rc.get_assigned_resources() or {}
+        count = int(assigned.get(key, 0))
+        if count < 1:
+            raise RuntimeError(
+                f"Metal Ray worker on node {node_id} was not assigned a {key!r} "
+                f"resource (assigned={assigned}). Start each node with "
+                f"ray start --resources='{{\"{key}\": 1}}'"
+            )
+        return node_id, list(range(count))
+
+    wrapper.get_node_and_gpu_ids = get_node_and_gpu_ids
+    wrapper._metal_patched = True
+    logger.info(
+        "vllm_metal: patched RayWorkerWrapper.get_node_and_gpu_ids "
+        "(Apple-GPU custom Ray resource)"
+    )
 
 
 def _gemma4_assistant_config_class() -> type[Any]:

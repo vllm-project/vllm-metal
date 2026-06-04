@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_VISIBLE_DEVICES: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -76,6 +77,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Per-worker visible-device list set by vLLM's Ray executor (the
+    # CUDA_VISIBLE_DEVICES analog for Metal; see MetalPlatform.device_control_env_var).
+    # Registered here only so validate_environ() does not warn — vLLM reads it
+    # from os.environ directly.
+    "VLLM_METAL_VISIBLE_DEVICES": lambda: os.getenv("VLLM_METAL_VISIBLE_DEVICES"),
 }
 
 
