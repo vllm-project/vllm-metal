@@ -8,6 +8,7 @@ diagnosable.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -35,7 +36,7 @@ def apply_compat_patches() -> None:
 
 
 def _patch_ray_distributed() -> None:
-    """Override vLLM's ``RayWorkerWrapper.get_node_and_gpu_ids`` for Metal.
+    """Override the Ray worker actor's ``get_node_and_gpu_ids`` for Metal.
 
     Apple GPUs are not a Ray-recognized accelerator family, so a custom Ray
     resource ("mlx") never appears in
@@ -45,19 +46,17 @@ def _patch_ray_distributed() -> None:
     the assigned custom resource instead (one Apple GPU per node -> local index
     ``[0]``), failing loud if a worker was not scheduled onto an "mlx" resource.
 
+    Each vLLM Ray executor ships its own worker-actor wrapper with an identical
+    ``get_node_and_gpu_ids``; we patch whichever are importable —
+    ``RayWorkerProc`` (RayExecutorV2, the default) and ``RayWorkerWrapper`` (the
+    legacy RayDistributedExecutor).
+
     Installed both at registration time (via ``apply_compat_patches``) and, for
     Ray worker processes, via the ``worker_process_setup_hook`` wired in
     ``MetalPlatform.check_and_update_config``.  The hook is required because the
     lazy registration path runs too late — the first ``current_platform`` access
     that would trigger it happens *inside* the unpatched method's first call.
     """
-    try:
-        from vllm.v1.executor import ray_utils
-    except Exception:  # noqa: BLE001 - ray not installed / import failure
-        return
-    wrapper = getattr(ray_utils, "RayWorkerWrapper", None)
-    if wrapper is None or getattr(wrapper, "_metal_patched", False):
-        return
 
     def get_node_and_gpu_ids(self):  # noqa: ANN001, ANN202
         import ray as _ray
@@ -76,12 +75,28 @@ def _patch_ray_distributed() -> None:
             )
         return node_id, list(range(count))
 
-    wrapper.get_node_and_gpu_ids = get_node_and_gpu_ids
-    wrapper._metal_patched = True
-    logger.info(
-        "vllm_metal: patched RayWorkerWrapper.get_node_and_gpu_ids "
-        "(Apple-GPU custom Ray resource)"
+    targets = (
+        ("vllm.v1.executor.ray_executor_v2", "RayWorkerProc"),
+        ("vllm.v1.executor.ray_utils", "RayWorkerWrapper"),
     )
+    patched = []
+    for module_name, class_name in targets:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 - ray not installed / optional path
+            continue
+        cls = getattr(module, class_name, None)
+        if cls is None or getattr(cls, "_metal_patched", False):
+            continue
+        cls.get_node_and_gpu_ids = get_node_and_gpu_ids
+        cls._metal_patched = True
+        patched.append(class_name)
+    if patched:
+        logger.info(
+            "vllm_metal: patched Ray worker get_node_and_gpu_ids on %s "
+            "(Apple-GPU custom Ray resource)",
+            ", ".join(patched),
+        )
 
 
 def _gemma4_assistant_config_class() -> type[Any]:

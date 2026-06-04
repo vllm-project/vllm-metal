@@ -270,10 +270,10 @@ class MetalPlatform(Platform):
             # so Metal does not pull in cupy/NCCL.
             os.environ.setdefault("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm")
 
-            # Apple GPUs are not a Ray accelerator family, so vLLM's
-            # RayWorkerWrapper.get_node_and_gpu_ids would KeyError on
-            # get_accelerator_ids()[ray_device_key].  We override that method
-            # (see vllm_metal._patch_ray_distributed), but the patch must be
+            # Apple GPUs are not a Ray accelerator family, so the Ray worker
+            # actor's get_node_and_gpu_ids would KeyError on
+            # get_accelerator_ids()[ray_device_key].  We override it (see
+            # vllm_metal.compat._patch_ray_distributed), but the patch must be
             # applied in each Ray *worker* process before its first actor call.
             # A worker_process_setup_hook runs at worker startup and is the only
             # reliable point for that; the lazy plugin-load path is too late.
