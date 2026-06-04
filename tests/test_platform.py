@@ -184,6 +184,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -232,6 +233,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -278,6 +280,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -321,6 +324,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -368,6 +372,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -407,6 +412,7 @@ class TestMetalPlatform:
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
             cache_config=SimpleNamespace(block_size=None),
@@ -437,6 +443,7 @@ class TestMetalPlatform:
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
             cache_config=SimpleNamespace(block_size=None),
@@ -485,6 +492,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -529,6 +537,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -571,6 +580,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -617,6 +627,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -659,6 +670,7 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(

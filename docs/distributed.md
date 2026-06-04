@@ -1,0 +1,39 @@
+# Distributed Inference with Ray
+
+vllm-metal can run under vLLM's **Ray distributed executor**, placing each Apple-Silicon worker as a Ray actor. This is the groundwork for multi-Mac serving; today the **single-node** path (one Mac, `--tensor-parallel-size 1`) is supported and validated. Multi-node tensor / pipeline parallelism is in progress (see [Limitations](#limitations)).
+
+Apple GPUs are not a Ray-recognized accelerator type (unlike CUDA or TPU), so each node advertises a **custom Ray resource named `mlx`**, and vLLM's executor places one worker per `mlx` unit.
+
+## Requirements
+
+- `ray` installed alongside vllm-metal: `uv pip install ray` (or `pip install ray`).
+- Each node started with one `mlx` resource (one Apple GPU per Mac).
+- The Ray node IP must match the address vLLM resolves via `get_ip()` — do not mix loopback and LAN addresses.
+
+## Quick start (single node)
+
+```bash
+# 1. Start a Ray head node advertising the Apple GPU as the "mlx" resource.
+#    Pin the node IP to the address vLLM uses so placement-group binding matches.
+IP=$(python -c "from vllm.utils.network_utils import get_ip; print(get_ip())")
+ray start --head --node-ip-address="$IP" --resources='{"mlx": 1}'
+
+# 2. Serve through the Ray executor (connects to the running cluster).
+RAY_ADDRESS=auto vllm serve Qwen/Qwen3-0.6B \
+  --distributed-executor-backend ray \
+  --tensor-parallel-size 1
+```
+
+If the `mlx` resource is missing, startup aborts with `ValueError: current platform cpu does not support ray.` — that means the node is not advertising the resource (step 1).
+
+## How it works
+
+- `MetalPlatform` sets `ray_device_key = "mlx"` and `device_control_env_var = "VLLM_METAL_VISIBLE_DEVICES"`, so vLLM's Ray executor takes its generic custom-resource placement path (the same one TPU uses) instead of the CUDA `num_gpus` path.
+- A compatibility shim overrides the Ray worker's `get_node_and_gpu_ids` to read the assigned `mlx` resource — Ray never lists custom resources in `get_accelerator_ids()` — installed in each worker via a Ray `worker_process_setup_hook`.
+
+## Limitations
+
+- **Single node, `--tensor-parallel-size 1`** is what is validated today. Multi-node tensor / pipeline parallelism — where the cross-Mac collectives run through MLX (`mx.distributed`) — is not yet implemented.
+- **Pipeline parallelism is rejected**: `--pipeline-parallel-size > 1` raises at startup until cross-stage activation hand-off lands.
+- One `mlx` resource per Mac (a single Apple GPU per machine).
+- On a multi-NIC host, set the Ray node IP and vLLM's `get_ip()` consistently (e.g. `ray start --node-ip-address=...`).
