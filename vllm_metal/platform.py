@@ -272,29 +272,29 @@ class MetalPlatform(Platform):
 
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
             # actor's get_node_and_gpu_ids would KeyError on
-            # get_accelerator_ids()[ray_device_key].  We override it (see
-            # vllm_metal.compat._patch_ray_distributed), but the patch must be
-            # applied in each Ray *worker* process before its first actor call.
-            # A worker_process_setup_hook runs at worker startup and is the only
-            # reliable point for that; the lazy plugin-load path is too late.
-            try:
-                from ray.runtime_env import RuntimeEnv
+            # get_accelerator_ids()[ray_device_key].  Install our override (see
+            # vllm_metal.compat._patch_ray_distributed) in every Ray worker via a
+            # worker_process_setup_hook, which runs at worker startup before the
+            # first actor call (the lazy plugin-load path is too late).  Fail
+            # loud rather than warn-and-continue: the user asked for Ray.
+            from ray.runtime_env import RuntimeEnv
 
-                hook = "vllm_metal.compat._patch_ray_distributed"
-                existing = parallel_config.ray_runtime_env
-                if existing is None:
-                    parallel_config.ray_runtime_env = RuntimeEnv(
-                        worker_process_setup_hook=hook
-                    )
-                elif "worker_process_setup_hook" not in existing:
-                    existing["worker_process_setup_hook"] = hook
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "vllm_metal: failed to set Ray worker_process_setup_hook; "
-                    "RayWorkerWrapper.get_node_and_gpu_ids patch may not apply "
-                    "in workers",
-                    exc_info=True,
+            hook = "vllm_metal.compat._patch_ray_distributed"
+            runtime_env = parallel_config.ray_runtime_env
+            if runtime_env is None:
+                parallel_config.ray_runtime_env = RuntimeEnv(
+                    worker_process_setup_hook=hook
                 )
+            else:
+                existing_hook = runtime_env.get("worker_process_setup_hook")
+                if existing_hook not in (None, hook):
+                    raise ValueError(
+                        "Metal must install a Ray worker_process_setup_hook for "
+                        "the 'ray' executor, but one is already set "
+                        f"({existing_hook!r}); chaining is not supported. Unset "
+                        "ray_runtime_env's worker_process_setup_hook."
+                    )
+                runtime_env["worker_process_setup_hook"] = hook
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True

@@ -32,7 +32,6 @@ def apply_compat_patches() -> None:
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
-    _patch_ray_distributed()
 
 
 def _patch_ray_distributed() -> None:
@@ -51,11 +50,12 @@ def _patch_ray_distributed() -> None:
     ``RayWorkerProc`` (RayExecutorV2, the default) and ``RayWorkerWrapper`` (the
     legacy RayDistributedExecutor).
 
-    Installed both at registration time (via ``apply_compat_patches``) and, for
-    Ray worker processes, via the ``worker_process_setup_hook`` wired in
-    ``MetalPlatform.check_and_update_config``.  The hook is required because the
-    lazy registration path runs too late — the first ``current_platform`` access
-    that would trigger it happens *inside* the unpatched method's first call.
+    Installed in each Ray worker via the ``worker_process_setup_hook`` wired in
+    ``MetalPlatform.check_and_update_config`` — it runs at worker startup, before
+    the first actor call.  This is the only mechanism that works for real Ray: the
+    driver never calls ``get_node_and_gpu_ids`` locally, actors re-import the class
+    fresh in their own processes, and the lazy plugin-load path inside a worker
+    runs too late (it would fire *inside* the unpatched method's first call).
     """
 
     def get_node_and_gpu_ids(self):  # noqa: ANN001, ANN202
