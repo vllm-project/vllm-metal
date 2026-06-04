@@ -22,12 +22,23 @@ IP=$(python -c "from vllm.utils.network_utils import get_ip; print(get_ip())")
 ray start --head --node-ip-address="$IP" --resources='{"mlx": 1}'
 
 # 2. Serve through the Ray executor (connects to the running cluster).
+#    Plain `--distributed-executor-backend ray` uses the default Ray V2 executor.
 RAY_ADDRESS=auto vllm serve Qwen/Qwen3-0.6B \
   --distributed-executor-backend ray \
   --tensor-parallel-size 1
+
+# 3. Verify generation runs through Ray.
+curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-0.6B","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+# → " Paris. The capital of Italy is Rome. The capital of Spain is Madrid."
+
+# Tear down when done.
+ray stop
 ```
 
 If a node isn't advertising the `mlx` resource, the engine can't place workers: the Ray executor logs `No available node types can fulfill resource request {'mlx': 1.0, ...}` and hangs while creating the placement group. (A separate `current platform cpu does not support ray` error instead means the Metal plugin isn't active or `ray_device_key` is unset — not a missing resource.)
+
+On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_and_gpu_ids on RayWorkerProc (Apple-GPU custom Ray resource)` — confirming the custom-resource override fired inside the Ray actor.
 
 ## How it works
 
