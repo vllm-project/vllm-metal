@@ -11,24 +11,28 @@ main() {
 
   setup_dev_env
 
-  local version
-  version=$(get_version)
+  local base_version version
+  base_version=$(get_version)
+  # Per-commit dev version, e.g. 0.3.0.dev20260603184500 — unique and PEP 440.
+  version="${base_version}.dev$(date -u +%Y%m%d%H%M%S)"
   echo "Building version: $version"
+
+  # Stamp the build version into pyproject.toml so the wheel carries it. maturin
+  # reads [project].version and does not consult Cargo.toml when version is not
+  # dynamic. The runner checkout is ephemeral, so the committed file is untouched.
+  sed -i '' -E "s/^version = .*/version = \"${version}\"/" pyproject.toml
 
   section "Building wheel"
   uv build
 
   local tag
-  tag="v${version}-$(date +%Y%m%d-%H%M%S)"
+  tag="v${version}"
   echo "Generated tag: $tag"
-
-  local commit_sha
-  commit_sha="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 
   section "Creating GitHub release"
   gh release create "$tag" \
-    --title "Release $tag" \
-    --notes "Automated release for commit $commit_sha" \
+    --title "$tag" \
+    --generate-notes \
     dist/*.whl
 }
 
