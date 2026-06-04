@@ -3,7 +3,7 @@
 
 ``find_layers`` / ``find_attn_attr`` locate the attention submodule inside an
 mlx_lm (or mlx-vlm) model; ``walk_and_wrap`` is the single loop every paged
-attention backend uses to install its wrappers — fail-loud, no silent skip.
+attention runtime uses to install its wrappers — fail-loud, no silent skip.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def walk_and_wrap(
 ) -> int:
     """Walk a model's attention layers and install paged-attention wrappers.
 
-    This is the single patch loop shared by every paged attention backend.  For
+    This is the single patch loop shared by every paged attention runtime.  For
     each transformer layer that has an attention submodule, it calls
     ``wrap_layer(layer_idx, attn)`` and installs the returned wrapper.
 

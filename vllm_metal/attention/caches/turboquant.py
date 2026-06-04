@@ -45,7 +45,7 @@ BOUNDARIES_3BIT = mx.array(
 
 # Quantization block size: number of elements per scale group.
 # Must match the Metal kernel's compile-time SCALE_GROUP_SIZE constant (also 32)
-# and the scale cache allocation in cache.py (head_dim // 32 groups).
+# and the scale cache allocation in kv_cache.py (head_dim // 32 groups).
 BLOCK_SIZE = 32
 
 # === Quantization parameters ===

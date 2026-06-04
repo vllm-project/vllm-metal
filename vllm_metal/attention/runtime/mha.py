@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 
 class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention backend for standard MHA models.
+    """Paged attention runtime for standard MHA models.
 
-    Orchestrates metal_kernel_backend: allocates MetalPagedKVCache, patches
+    Orchestrates native Metal SDPA attention: allocates MetalPagedKVCache, patches
     model attention layers with the vendored C++/Metal kernel, and warms up
     the kernel before the first request.
     """

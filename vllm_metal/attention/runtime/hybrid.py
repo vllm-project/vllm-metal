@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention backend for hybrid models (SDPA + linear attention).
+"""Paged attention runtime for hybrid models (SDPA + linear attention).
 
 Handles models like Qwen3.5 where some layers use standard dot-product
 attention (paged KV cache) and others use GDN linear attention (fixed-size
 recurrent state).
 
-SDPA layers use the Metal kernel backend (same as ``MHAPagedAttentionRuntime``).
+SDPA layers use the native Metal SDPA kernel (same as ``MHAPagedAttentionRuntime``).
 GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
 """
 
@@ -67,7 +67,7 @@ def _build_linear_layer_spec(
 
 
 class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention backend for hybrid SDPA + linear attention models.
+    """Paged attention runtime for hybrid SDPA + linear attention models.
 
     SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
     GDN layers: MLX-native state management (via GDNPagedAttentionWrapper)

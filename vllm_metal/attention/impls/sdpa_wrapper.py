@@ -2,16 +2,16 @@
 """Paged attention wrapper and dispatch for native Metal kernels.
 
 The wrapper intercepts mlx_lm attention modules and dispatches to the
-appropriate Metal attention backend based on the module's structure:
+appropriate Metal attention impl based on the module's structure:
 
-- SDPA (Qwen3, Llama, Mistral, …) → ``attention_sdpa.py``
-- Linear attention (Qwen3.5 GatedDeltaNet, …) → ``attention_linear.py`` (stub)
+- SDPA (Qwen3, Llama, Mistral, …) → ``sdpa.py``
+- Linear attention (Qwen3.5 GatedDeltaNet, …) → ``linear.py`` (stub)
 - Future attention types (MLA, …) → add detection + forward function
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
-``clear_context`` from ``paged_attention_common``.
+``clear_context`` from ``context``.
 """
 
 from __future__ import annotations
@@ -155,7 +155,7 @@ def patch_sdpa_attention(
             ``MetalPagedKVCache`` (SDPA layers only) is indexed correctly.
             When ``None``, ``layer_idx`` is used directly.
         only_layers: If provided, only patch these layer indices and skip
-            the rest.  Used by hybrid backend to avoid wrapping linear
+            the rest.  Used by hybrid runtime to avoid wrapping linear
             attention layers that have no kernel implementation yet.
 
     Returns the number of patched layers.

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared lifecycle base for the paged attention backends.
+"""Shared lifecycle base for the paged attention runtimes.
 
-The three concrete backends (MHA, MLA, hybrid) differ only in which caches they
+The three concrete runtimes (MHA, MLA, hybrid) differ only in which caches they
 allocate and how they wrap layers; their initialise-guard, warm-up, and
 block-count plumbing is identical.  That shared plumbing lives here so there is
 one copy instead of three.
@@ -15,7 +15,7 @@ from vllm_metal.metal import warm_up_kernels
 
 
 class PagedAttentionRuntimeBase:
-    """Common lifecycle for paged attention backends.
+    """Common lifecycle for paged attention runtimes.
 
     Subclasses allocate their primary paged cache onto ``self._cache`` in
     ``initialize()``.  The primary cache must expose ``num_blocks``.  Secondary

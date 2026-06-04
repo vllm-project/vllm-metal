@@ -12,7 +12,7 @@ from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 
 
 class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention backend for MLA models.
+    """Paged attention runtime for MLA models.
 
     Implements the PagedAttentionRuntime protocol. Uses MLX-native
     scatter/gather (cache I/O only; attention is MLX SDPA by default

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Gemma4-specific branches in attention_sdpa.
+"""Unit tests for Gemma4-specific branches in sdpa.
 
 Covers:
 - ``pad_qkv_to_cache_head_dim`` / ``truncate_padded_output`` pure helpers.

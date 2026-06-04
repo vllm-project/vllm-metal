@@ -1162,7 +1162,7 @@ def section_latency() -> int:
       * the legacy Python encode + 5-scatter path (for speedup A/B), and
       * a plain fp16 cache scatter (the uncompressed baseline).
     The fused kernel is the hot-path substitute wired into
-    ``attention_sdpa.py``; this section is the place to measure its cost.
+    ``sdpa.py``; this section is the place to measure its cost.
     """
     sep("Section 7: Quantization Latency")
     ops = get_ops()

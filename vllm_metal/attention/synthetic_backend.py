@@ -21,7 +21,7 @@ class MetalBackend(AttentionBackend):
     block_size=16; advertising MultipleOf(16) makes vLLM's selector default
     to 16 and lets hybrid models align to multiples of 16. It is never
     dispatched to as a real attention backend — the actual Metal paged
-    attention lives in metal_kernel_backend/paged_attention.py. The
+    attention lives in attention/impls/sdpa_wrapper.py. The
     unimplemented methods below intentionally raise: a loud failure is the
     correct behavior if upstream ever tries to use this as a real backend.
     """
