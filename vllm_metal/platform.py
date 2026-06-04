@@ -2,7 +2,6 @@
 """Metal Platform implementation for vLLM."""
 
 import logging
-import os
 import platform as py_platform
 from typing import TYPE_CHECKING
 
@@ -265,11 +264,6 @@ class MetalPlatform(Platform):
         if parallel_config.distributed_executor_backend in ("auto", None):
             parallel_config.distributed_executor_backend = "uni"
         elif parallel_config.distributed_executor_backend == "ray":
-            # Ray compiled-DAG (pipeline-parallel) transport defaults to a
-            # CUDA/NCCL channel for out-of-tree platforms; force shared memory
-            # so Metal does not pull in cupy/NCCL.
-            os.environ.setdefault("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm")
-
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
             # actor's get_node_and_gpu_ids would KeyError on
             # get_accelerator_ids()[ray_device_key].  Install our override (see

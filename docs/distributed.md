@@ -27,7 +27,7 @@ RAY_ADDRESS=auto vllm serve Qwen/Qwen3-0.6B \
   --tensor-parallel-size 1
 ```
 
-If a node isn't advertising the `mlx` resource, the engine can't place workers: the default (V2) executor logs `No available node types can fulfill resource request {'mlx': 1.0, ...}` and hangs while creating the placement group, while the legacy V1 executor raises `ValueError: Current node has no 'mlx' available`. (A separate `current platform cpu does not support ray` error instead means the Metal plugin isn't active or `ray_device_key` is unset — not a missing resource.)
+If a node isn't advertising the `mlx` resource, the engine can't place workers: the Ray executor logs `No available node types can fulfill resource request {'mlx': 1.0, ...}` and hangs while creating the placement group. (A separate `current platform cpu does not support ray` error instead means the Metal plugin isn't active or `ray_device_key` is unset — not a missing resource.)
 
 ## How it works
 

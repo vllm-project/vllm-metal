@@ -23,7 +23,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import (
@@ -2079,28 +2078,14 @@ class MetalModelRunner:
             self._gdn_materialize_pending_state_cache()
 
     def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors | None = None,
+        self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
         """Execute model forward pass and submit to GPU.
 
         For the paged attention path, the forward pass is submitted
         asynchronously — sampling and postprocessing are deferred to
         ``sample_tokens`` so the scheduler can run while the GPU computes.
-
-        ``intermediate_tensors`` is accepted for compatibility with vLLM's Ray
-        executor, which calls ``execute_model(scheduler_output,
-        intermediate_tensors)``.  It is ``None`` for single-stage execution
-        (pipeline_parallel_size == 1); pipeline-parallel activation hand-off is
-        not yet supported on Metal.
         """
-        if intermediate_tensors is not None:
-            raise NotImplementedError(
-                "MetalModelRunner does not support pipeline-parallel "
-                "intermediate tensors yet (pipeline_parallel_size > 1). "
-                "Use pipeline_parallel_size=1."
-            )
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
