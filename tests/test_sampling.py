@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal sampling with vLLM Sampler integration."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -11,8 +13,9 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.sampler import Sampler
 
 from tests.stub_runner import make_stub_runner
@@ -23,7 +26,15 @@ from vllm_metal.v1.model_runner import (
     _create_request_generator,
     _ExecutionBatch,
 )
-from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
+from vllm_metal.v1.sampling_batch import (
+    SamplingBatch,
+    _mlx_apply_min_p,
+    _mlx_apply_top_k_top_p,
+    _mlx_top_k_subset_sample,
+    sample_decode_tokens,
+    sample_from_logits,
+    sample_prefill_tokens,
+)
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -304,14 +315,105 @@ class TestV1SeededSamplingGenerator:
 
 class TestV1SamplingBatch:
     @staticmethod
-    def _batch(params_list: list[SamplingParams]) -> SamplingBatch:
+    def _batch(
+        params_list: list[SamplingParams],
+        *,
+        enable_native_random_sampling: bool = False,
+        generators: dict[int, torch.Generator] | None = None,
+        logitsprocs: LogitsProcessors | None = None,
+    ) -> SamplingBatch:
         return SamplingBatch(
             params_list,
             [[1]] * len(params_list),
             [[]] * len(params_list),
             vocab_size=VOCAB_SIZE,
             device=torch.device("cpu"),
+            logitsprocs=logitsprocs,
+            generators=generators,
+            enable_native_random_sampling=enable_native_random_sampling,
         )
+
+    @staticmethod
+    def _default_logitsprocs() -> LogitsProcessors:
+        config = SimpleNamespace(
+            reasoning_config=None,
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+        )
+        return build_logitsprocs(
+            config,
+            torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+        )
+
+    @staticmethod
+    def _forbid_torch_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+        def fail_bridge(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("native MLX sampling should not call mlx_to_torch")
+
+        monkeypatch.setattr("vllm_metal.v1.sampling_batch.mlx_to_torch", fail_bridge)
+
+    @staticmethod
+    def _spy_torch_bridge(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+        calls = []
+
+        from vllm_metal.v1 import sampling_batch as sampling_batch_module
+
+        original_bridge = sampling_batch_module.mlx_to_torch
+
+        def wrapped_bridge(*args, **kwargs):  # noqa: ANN002, ANN003
+            calls.append(True)
+            return original_bridge(*args, **kwargs)
+
+        monkeypatch.setattr(sampling_batch_module, "mlx_to_torch", wrapped_bridge)
+        return calls
+
+    @staticmethod
+    def _finite_token_ids(row: np.ndarray) -> set[int]:
+        return {int(token_id) for token_id in np.flatnonzero(np.isfinite(row))}
+
+    @staticmethod
+    def _torch_reference_candidate_sets(
+        logits: torch.Tensor,
+        params_list: list[SamplingParams],
+    ) -> list[set[int]]:
+        vocab_size = logits.shape[-1]
+        filtered = logits.to(torch.float32).clone()
+        temperatures = torch.tensor(
+            [sp.temperature if sp.temperature >= 1e-5 else 1.0 for sp in params_list],
+            dtype=torch.float32,
+        )
+        filtered.div_(temperatures.unsqueeze(1))
+
+        min_p = torch.tensor(
+            [sp.min_p for sp in params_list],
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        if torch.any(min_p > 1e-5):
+            probabilities = torch.nn.functional.softmax(filtered, dim=-1)
+            max_probabilities = torch.amax(probabilities, dim=-1, keepdim=True)
+            filtered.masked_fill_(
+                probabilities < max_probabilities * min_p, -float("inf")
+            )
+
+        top_k_values = [
+            vocab_size if sp.top_k <= 0 or sp.top_k >= vocab_size else sp.top_k
+            for sp in params_list
+        ]
+        top_p_values = [sp.top_p for sp in params_list]
+        top_k = None
+        top_p = None
+        if any(top_k != vocab_size for top_k in top_k_values):
+            top_k = torch.tensor(top_k_values, dtype=torch.int32)
+        if any(top_p_value != 1.0 for top_p_value in top_p_values):
+            top_p = torch.tensor(top_p_values, dtype=torch.float32)
+
+        filtered = apply_top_k_top_p_pytorch(filtered, top_k, top_p)
+        return [
+            {int(token_id) for token_id in torch.nonzero(torch.isfinite(row)).view(-1)}
+            for row in filtered
+        ]
 
     def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
         assert self._batch([SamplingParams(temperature=0.0)]).can_use_native_greedy()
@@ -404,6 +506,368 @@ class TestV1SamplingBatch:
         assert not self._batch(
             [SamplingParams(temperature=0.0), SamplingParams(temperature=0.8, top_k=4)]
         ).can_use_native_greedy()
+
+    def test_native_random_requires_decode_flag_and_safe_params(self) -> None:
+        safe = [SamplingParams(temperature=0.8, top_p=0.9, top_k=4, min_p=0.05)]
+        assert not self._batch(safe).can_use_native_random()
+        assert self._batch(
+            safe, enable_native_random_sampling=True
+        ).can_use_native_random()
+
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, logprobs=1)],
+            enable_native_random_sampling=True,
+        ).can_use_native_random()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, presence_penalty=0.5)],
+            enable_native_random_sampling=True,
+        ).can_use_native_random()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, allowed_token_ids=[1, 2])],
+            enable_native_random_sampling=True,
+        ).can_use_native_random()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, min_tokens=1)],
+            enable_native_random_sampling=True,
+            logitsprocs=self._default_logitsprocs(),
+        ).can_use_native_random()
+
+        bad_sp = SamplingParams(temperature=0.8)
+        bad_sp._bad_words_token_ids = [[99]]
+        assert not self._batch(
+            [bad_sp],
+            enable_native_random_sampling=True,
+        ).can_use_native_random()
+        assert not self._batch(
+            [SamplingParams(temperature=0.8, seed=1)],
+            enable_native_random_sampling=True,
+            generators={0: torch.Generator().manual_seed(1)},
+        ).can_use_native_random()
+
+    def test_native_random_rejects_custom_logits_processor(self) -> None:
+        class ArgmaxInvariantProcessor:
+            def is_argmax_invariant(self) -> bool:
+                return True
+
+            def apply(self, logits):  # noqa: ANN001
+                return logits
+
+        assert not self._batch(
+            [SamplingParams(temperature=0.8)],
+            enable_native_random_sampling=True,
+            logitsprocs=LogitsProcessors([ArgmaxInvariantProcessor()]),
+        ).can_use_native_random()
+
+    def test_native_random_filter_masks_match_torch_reference(self) -> None:
+        params_list = [
+            SamplingParams(temperature=0.8, top_k=4, top_p=0.9, min_p=0.03),
+            SamplingParams(temperature=1.2, top_k=3, top_p=0.75, min_p=0.1),
+            SamplingParams(temperature=0.7, top_k=0, top_p=0.8, min_p=0.05),
+        ]
+        torch_logits = torch.tensor(
+            [
+                [4.0, 3.0, 2.0, 1.0, 0.0, -1.0],
+                [0.0, 2.0, 4.0, 3.0, 1.0, -1.0],
+                [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        batch = SamplingBatch(
+            params_list,
+            [[1], [2], [3]],
+            [[], [], []],
+            vocab_size=6,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+        temperatures = mx.array(
+            [sp.temperature for sp in params_list],
+            dtype=mx.float32,
+        )[:, None]
+        mlx_logits = mx.array(torch_logits.numpy(), dtype=mx.float32) / temperatures
+        mlx_filtered = _mlx_apply_top_k_top_p(
+            _mlx_apply_min_p(mlx_logits, batch), batch
+        )
+
+        assert [
+            self._finite_token_ids(row) for row in np.array(mlx_filtered)
+        ] == self._torch_reference_candidate_sets(torch_logits, params_list)
+
+    def test_native_random_allows_inactive_builtin_logits_processors(self) -> None:
+        logitsprocs = self._default_logitsprocs()
+        processor_names = [type(p).__name__ for p in logitsprocs.non_argmax_invariant]
+        assert "MinTokensLogitsProcessor" in processor_names
+        assert "LogitBiasLogitsProcessor" in processor_names
+        assert self._batch(
+            [SamplingParams(temperature=0.8, top_p=0.9, top_k=4, min_p=0.05)],
+            enable_native_random_sampling=True,
+            logitsprocs=logitsprocs,
+        ).can_use_native_random()
+
+    def test_direct_sample_from_logits_keeps_random_torch_fallback_by_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+
+        result = sample_from_logits(
+            mx.array([[4.0, 1.0, 0.0]], dtype=mx.float32),
+            self._batch([SamplingParams(temperature=0.8, top_k=1)]),
+            Sampler(),
+            torch.device("cpu"),
+        )
+
+        assert result.token_ids == [0]
+        assert calls
+
+    def test_all_greedy_but_processor_forces_torch_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+
+        class NoOpNotArgmaxInvariantProcessor:
+            def is_argmax_invariant(self) -> bool:
+                return False
+
+            def apply(self, logits):  # noqa: ANN001
+                return logits
+
+        result = sample_from_logits(
+            mx.array([[4.0, 1.0, 0.0]], dtype=mx.float32),
+            self._batch(
+                [SamplingParams(temperature=0.0)],
+                logitsprocs=LogitsProcessors([NoOpNotArgmaxInvariantProcessor()]),
+            ),
+            Sampler(),
+            torch.device("cpu"),
+        )
+
+        assert result.token_ids == [0]
+        assert calls
+
+    def test_native_random_combined_filters_candidate_set_no_torch_bridge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._forbid_torch_bridge(monkeypatch)
+        logits = mx.array(
+            [[5.0, 4.0, 0.0, -1.0], [0.0, -1.0, 5.0, 4.0]],
+            dtype=mx.float32,
+        )
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.8, top_k=3, top_p=0.9, min_p=0.05),
+                SamplingParams(temperature=0.8, top_k=2, top_p=0.8, min_p=0.05),
+            ],
+            [[1], [2]],
+            [[], []],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+
+        for _ in range(10):
+            result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+            assert len(result.token_ids) == 2
+            assert all(isinstance(token_id, int) for token_id in result.token_ids)
+            assert result.token_ids[0] in {0, 1}
+            assert result.token_ids[1] in {2, 3}
+            assert result.logprobs is None
+
+    def test_native_random_top_k_subset_preserves_boundary_ties(self) -> None:
+        logits = mx.array([[0.0, 0.0, 0.0, -100.0]], dtype=mx.float32)
+
+        assert _mlx_top_k_subset_sample(logits, [2], [1.0]) is None
+
+        batch = SamplingBatch(
+            [SamplingParams(temperature=1.0, top_k=2)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+        mlx_filtered = _mlx_apply_top_k_top_p(logits, batch)
+
+        assert self._finite_token_ids(np.array(mlx_filtered)[0]) == {0, 1, 2}
+
+    def test_native_random_keeps_mixed_greedy_rows_greedy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._forbid_torch_bridge(monkeypatch)
+        logits = mx.array(
+            [[0.0, 7.0, 6.0, 1.0], [10.0, 9.0, 0.0, -1.0]],
+            dtype=mx.float32,
+        )
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=0.8, top_k=2),
+            ],
+            [[1], [2]],
+            [[], []],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+
+        for _ in range(20):
+            result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+            assert result.token_ids[0] == 1
+            assert result.token_ids[1] in {0, 1}
+
+    def test_native_random_falls_back_for_logprobs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.8, top_k=1, logprobs=1)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+
+        result = sample_from_logits(
+            mx.array([[5.0, 1.0, 0.0, -1.0]], dtype=mx.float32),
+            batch,
+            Sampler(),
+            torch.device("cpu"),
+        )
+
+        assert result.token_ids == [0]
+        assert result.logprobs is not None
+        assert calls
+
+    def test_native_random_falls_back_for_mixed_penalty_batch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.8, top_k=1, presence_penalty=1.0),
+                SamplingParams(temperature=0.8, top_k=1),
+            ],
+            [[1], [2]],
+            [[], []],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+
+        result = sample_from_logits(
+            mx.array([[5.0, 1.0, 0.0, -1.0], [0.0, 1.0, 2.0, 5.0]], dtype=mx.float32),
+            batch,
+            Sampler(),
+            torch.device("cpu"),
+        )
+
+        assert result.token_ids == [0, 3]
+        assert calls
+
+    def test_native_random_falls_back_for_seeded_sampling_params(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.8, top_k=2, seed=123)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+            device=torch.device("cpu"),
+            enable_native_random_sampling=True,
+        )
+
+        result = sample_from_logits(
+            mx.array([[5.0, 1.0, 0.0, -1.0]], dtype=mx.float32),
+            batch,
+            Sampler(),
+            torch.device("cpu"),
+        )
+
+        assert result.token_ids == [0]
+        assert calls
+
+    def test_sample_decode_tokens_enables_native_random_for_paged_decode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_NATIVE_RANDOM_SAMPLING", "1")
+        self._forbid_torch_bridge(monkeypatch)
+        logits = mx.array(
+            [[[10.0, 9.0, 0.0, -1.0], [0.0, 1.0, 2.0, 3.0]]],
+            dtype=mx.float32,
+        )
+        decode_reqs = [
+            (
+                "r1",
+                SimpleNamespace(
+                    sampling_params=SamplingParams(temperature=0.8, top_k=2),
+                    token_ids=[11],
+                    prompt_len=1,
+                    generator=None,
+                ),
+            ),
+            (
+                "r2",
+                SimpleNamespace(
+                    sampling_params=SamplingParams(temperature=0.8, top_k=1),
+                    token_ids=[12],
+                    prompt_len=1,
+                    generator=None,
+                ),
+            ),
+        ]
+
+        result = sample_decode_tokens(
+            logits,
+            decode_reqs,
+            num_decode=2,
+            sampler=Sampler(),
+            device=torch.device("cpu"),
+            vocab_size=4,
+            logitsprocs=self._default_logitsprocs(),
+        )
+
+        assert result.token_ids[0] in {0, 1}
+        assert result.token_ids[1] == 3
+        assert result.logprobs is None
+
+    def test_sample_prefill_tokens_keeps_random_torch_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = self._spy_torch_bridge(monkeypatch)
+        logits = mx.array([[[10.0, 9.0, 0.0, -1.0]]], dtype=mx.float32)
+        prefill_reqs = [
+            SimpleNamespace(
+                sampling_params=SamplingParams(temperature=0.8, top_k=1),
+                token_ids=[11],
+                prompt_len=1,
+                full_prompt_token_ids=None,
+                generator=None,
+            )
+        ]
+
+        result = sample_prefill_tokens(
+            logits,
+            prefill_reqs,
+            cu_seqlens=[0, 1],
+            num_decode=0,
+            sampler=Sampler(),
+            device=torch.device("cpu"),
+            vocab_size=4,
+            logitsprocs=self._default_logitsprocs(),
+        )
+
+        assert result.token_ids == [0]
+        assert calls
 
     def test_sampling_metadata_skips_penalty_allocation_when_no_penalties(
         self,

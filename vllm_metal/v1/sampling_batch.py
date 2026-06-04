@@ -13,10 +13,16 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import (
+    LogitBiasLogitsProcessor,
+    LogitsProcessors,
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+import vllm_metal.envs as envs
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
 GREEDY_TEMPERATURE_EPS = 1e-5
@@ -53,6 +59,7 @@ class SamplingBatch:
         device: torch.device,
         logitsprocs: LogitsProcessors | None = None,
         generators: dict[int, torch.Generator] | None = None,
+        enable_native_random_sampling: bool = False,
     ) -> None:
         batch_size = len(sampling_params_list)
         if len(prompt_token_id_lists) != batch_size:
@@ -75,6 +82,7 @@ class SamplingBatch:
         self.device = device
         self.logitsprocs = logitsprocs or LogitsProcessors()
         self.generators = {} if generators is None else generators
+        self.enable_native_random_sampling = enable_native_random_sampling
         self.all_greedy = all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             for sampling_params in self.sampling_params_list
@@ -178,6 +186,44 @@ class SamplingBatch:
             and sampling_params.logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
+            for sampling_params in self.sampling_params_list
+        )
+
+    def can_use_native_random(self) -> bool:
+        """Return whether MLX categorical sampling covers this batch exactly."""
+        if not self.enable_native_random_sampling:
+            return False
+        if self.needs_logprobs or self.generators:
+            return False
+        if any(
+            not isinstance(processor, MinPLogitsProcessor)
+            for processor in self.logitsprocs.argmax_invariant
+        ):
+            return False
+        for processor in self.logitsprocs.non_argmax_invariant:
+            if isinstance(processor, MinTokensLogitsProcessor):
+                if getattr(processor, "min_toks", None):
+                    return False
+                continue
+            if isinstance(processor, LogitBiasLogitsProcessor):
+                if getattr(processor, "biases", None):
+                    return False
+                continue
+            return False
+
+        return any(
+            sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
+            for sampling_params in self.sampling_params_list
+        ) and all(
+            sampling_params.frequency_penalty == 0.0
+            and sampling_params.presence_penalty == 0.0
+            and sampling_params.repetition_penalty == 1.0
+            and sampling_params.logprobs is None
+            and sampling_params.seed is None
+            and not sampling_params.allowed_token_ids
+            and not sampling_params.bad_words_token_ids
+            and getattr(sampling_params, "min_tokens", 0) == 0
+            and not getattr(sampling_params, "logit_bias", None)
             for sampling_params in self.sampling_params_list
         )
 
@@ -333,6 +379,154 @@ def _mlx_greedy_sample(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
 
 
+def _mlx_apply_min_p(logits: mx.array, batch: SamplingBatch) -> mx.array:
+    min_p_values = [
+        sampling_params.min_p for sampling_params in batch.sampling_params_list
+    ]
+    if all(min_p <= GREEDY_TEMPERATURE_EPS for min_p in min_p_values):
+        return logits
+
+    probabilities = mx.softmax(logits, axis=-1)
+    max_probabilities = mx.max(probabilities, axis=-1, keepdims=True)
+    adjusted_min_p = (
+        max_probabilities * mx.array(min_p_values, dtype=mx.float32)[:, None]
+    )
+    return mx.where(probabilities < adjusted_min_p, -float("inf"), logits)
+
+
+def _mlx_apply_top_p_to_logits(
+    logits: mx.array,
+    top_p_values: Sequence[float],
+) -> mx.array:
+    vocab_size = logits.shape[-1]
+    sorted_indices = mx.argsort(logits, axis=-1)
+    sorted_logits = mx.sort(logits, axis=-1)
+    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    sorted_probs_sum = mx.cumsum(sorted_probs, axis=-1)
+    top_p = mx.array(top_p_values, dtype=mx.float32)[:, None]
+    # Match vLLM's ascending-sort implementation: drop the low-probability
+    # tail whose cumulative mass is <= 1 - top_p, always keeping the max token.
+    top_p_mask = sorted_probs_sum <= (1.0 - top_p)
+    keep_highest_token = mx.arange(vocab_size)[None, :] == (vocab_size - 1)
+    sorted_logits = mx.where(
+        mx.logical_and(top_p_mask, mx.logical_not(keep_highest_token)),
+        -float("inf"),
+        sorted_logits,
+    )
+    return mx.put_along_axis(
+        mx.zeros_like(logits),
+        sorted_indices,
+        sorted_logits,
+        axis=-1,
+    )
+
+
+def _mlx_top_k_subset_sample(
+    logits: mx.array,
+    top_k_values: Sequence[int],
+    top_p_values: Sequence[float],
+) -> mx.array | None:
+    """Sample from the top-k subset when every row uses the same active k."""
+    vocab_size = logits.shape[-1]
+    first_top_k = top_k_values[0]
+    if first_top_k <= 0 or first_top_k >= vocab_size:
+        return None
+    if any(top_k != first_top_k for top_k in top_k_values):
+        return None
+
+    top_indices = mx.argpartition(-logits, kth=first_top_k - 1, axis=-1)[
+        :, :first_top_k
+    ]
+    top_logits = mx.take_along_axis(logits, top_indices, axis=-1)
+    # vLLM top-k keeps every token tied with the kth largest logit.
+    top_k_threshold = mx.min(top_logits, axis=-1, keepdims=True)
+    candidate_counts = mx.sum(logits >= top_k_threshold, axis=-1)
+    if bool(mx.any(candidate_counts > first_top_k).item()):
+        return None
+
+    if any(top_p != 1.0 for top_p in top_p_values):
+        top_logits = _mlx_apply_top_p_to_logits(top_logits, top_p_values)
+
+    sampled_offsets = mx.random.categorical(top_logits, axis=-1)
+    return mx.take_along_axis(top_indices, sampled_offsets[:, None], axis=-1)[:, 0]
+
+
+def _mlx_apply_top_k_top_p(logits: mx.array, batch: SamplingBatch) -> mx.array:
+    vocab_size = logits.shape[-1]
+    top_k_values = [
+        vocab_size
+        if sampling_params.top_k <= 0 or sampling_params.top_k >= vocab_size
+        else sampling_params.top_k
+        for sampling_params in batch.sampling_params_list
+    ]
+    top_p_values = [
+        sampling_params.top_p for sampling_params in batch.sampling_params_list
+    ]
+    if all(top_k == vocab_size for top_k in top_k_values) and all(
+        top_p == 1.0 for top_p in top_p_values
+    ):
+        return logits
+
+    sorted_indices = mx.argsort(logits, axis=-1)
+    sorted_logits = mx.sort(logits, axis=-1)
+
+    if any(top_k != vocab_size for top_k in top_k_values):
+        top_k = mx.array(top_k_values, dtype=mx.int32)
+        threshold_indices = (vocab_size - top_k)[:, None]
+        top_k_threshold = mx.take_along_axis(sorted_logits, threshold_indices, axis=-1)
+        sorted_logits = mx.where(
+            sorted_logits < top_k_threshold,
+            -float("inf"),
+            sorted_logits,
+        )
+
+    filtered_logits = mx.put_along_axis(
+        mx.zeros_like(logits),
+        sorted_indices,
+        sorted_logits,
+        axis=-1,
+    )
+    if any(top_p != 1.0 for top_p in top_p_values):
+        filtered_logits = _mlx_apply_top_p_to_logits(filtered_logits, top_p_values)
+    return filtered_logits
+
+
+def _mlx_random_sample(logits: mx.array, batch: SamplingBatch) -> mx.array:
+    logits = logits.astype(mx.float32)
+    greedy_tokens = _mlx_greedy_sample(logits)
+
+    temperatures = mx.array(
+        [sampling_params.temperature for sampling_params in batch.sampling_params_list],
+        dtype=mx.float32,
+    )
+    safe_temperatures = mx.where(
+        temperatures < GREEDY_TEMPERATURE_EPS, 1.0, temperatures
+    )
+    logits = logits / safe_temperatures[:, None]
+    logits = _mlx_apply_min_p(logits, batch)
+
+    top_k_values = [
+        sampling_params.top_k for sampling_params in batch.sampling_params_list
+    ]
+    top_p_values = [
+        sampling_params.top_p for sampling_params in batch.sampling_params_list
+    ]
+    random_tokens = _mlx_top_k_subset_sample(
+        logits,
+        top_k_values,
+        top_p_values,
+    )
+    if random_tokens is None:
+        logits = _mlx_apply_top_k_top_p(logits, batch)
+        random_tokens = mx.random.categorical(logits, axis=-1)
+
+    return mx.where(
+        temperatures < GREEDY_TEMPERATURE_EPS,
+        greedy_tokens,
+        random_tokens,
+    )
+
+
 def sample_from_logits(
     logits_2d: mx.array,
     batch: SamplingBatch,
@@ -348,6 +542,13 @@ def sample_from_logits(
     """
     if batch.can_use_native_greedy() and not batch.needs_logprobs:
         tokens = _mlx_greedy_sample(logits_2d)
+        mx.eval(tokens)
+        if tokens.ndim == 0:
+            return _SamplingResult([int(tokens.item())])
+        return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
+
+    if batch.can_use_native_random():
+        tokens = _mlx_random_sample(logits_2d, batch)
         mx.eval(tokens)
         if tokens.ndim == 0:
             return _SamplingResult([int(tokens.item())])
@@ -415,6 +616,7 @@ def sample_decode_tokens(
         device=device,
         logitsprocs=logitsprocs,
         generators=generators,
+        enable_native_random_sampling=envs.VLLM_METAL_NATIVE_RANDOM_SAMPLING,
     )
     return sample_from_logits(decode_logits, batch, sampler, device)
 
@@ -465,6 +667,8 @@ def sample_prefill_tokens(
         )
         generators = {} if pr.generator is None else {0: pr.generator}
 
+        # This first native random slice is decode-only; prefill keeps the
+        # vLLM torch sampler until its semantics and e2e value are proven.
         batch = SamplingBatch(
             [pr.sampling_params],
             [prompt_for_meta[:prompt_len]],

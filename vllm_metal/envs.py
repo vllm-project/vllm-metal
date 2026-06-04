@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_NATIVE_RANDOM_SAMPLING: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -76,6 +77,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Native MLX no-logprobs random sampling for the paged decode path.
+    # Experimental opt-in until end-to-end throughput gains are stable.
+    "VLLM_METAL_NATIVE_RANDOM_SAMPLING": lambda: (
+        os.getenv("VLLM_METAL_NATIVE_RANDOM_SAMPLING", "0") == "1"
+    ),
 }
 
 
