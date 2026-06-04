@@ -174,7 +174,7 @@ class Qwen3VLMultimodalAdapter:
         self,
         features: list[MultiModalFeatureSpec],
     ) -> list[Qwen3VLVisionEncodeResult]:
-        """Run the vision tower per feature; return one result per feature.
+        """Run the vision tower for a feature batch; return one result per feature.
 
         Calls ``vision_tower`` directly rather than ``mlx_vlm.Model.__call__``
         so the LM is not re-entered through the top-level VLM dispatch.
@@ -193,7 +193,9 @@ class Qwen3VLMultimodalAdapter:
         # fp16/bf16 weights, so we align dtypes once per encode batch.
         target_dtype = self._vision_tower.patch_embed.proj.weight.dtype
 
-        outputs: list[Qwen3VLVisionEncodeResult] = []
+        pixel_values_parts: list[mx.array] = []
+        grid_thw_parts: list[mx.array] = []
+        feature_lengths: list[int] = []
         for feature in features:
             if feature.modality != "image":
                 raise ValueError(
@@ -206,23 +208,65 @@ class Qwen3VLMultimodalAdapter:
             pixel_values = self._as_mlx(
                 self._feature_value(feature.data, "pixel_values")
             ).astype(target_dtype)
-            # vLLM delivers per-feature grid_thw as a 1D ``(3,)`` row, but
-            # the mlx_vlm vision tower indexes ``grid_thw[i, 1:]`` and reads
-            # ``grid_thw.shape[0]``; reshape back to ``(1, 3)``.
             image_grid_thw = self._as_mlx(
                 self._feature_value(feature.data, "image_grid_thw")
             ).reshape(1, 3)
+            t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+            feature_length = t * h * w // (self._spatial_merge_size**2)
+            num_embeds = feature.mm_position.get_num_embeds()
+            if num_embeds != feature_length:
+                raise ValueError(
+                    "image_grid_thw implies "
+                    f"{feature_length} multimodal embeddings, got "
+                    f"mm_position.get_num_embeds()={num_embeds}"
+                )
+            feature_lengths.append(feature_length)
+            pixel_values_parts.append(pixel_values)
+            grid_thw_parts.append(image_grid_thw)
 
-            hidden_states, deepstack_visual_embeds = self._vision_tower(
-                pixel_values,
-                image_grid_thw,
+        if not pixel_values_parts:
+            return []
+
+        pixel_values_batch = mx.concatenate(pixel_values_parts, axis=0)
+        image_grid_thw_batch = mx.concatenate(grid_thw_parts, axis=0)
+
+        hidden_states, deepstack_visual_embeds = self._vision_tower(
+            pixel_values_batch,
+            image_grid_thw_batch,
+        )
+
+        expected_rows = sum(feature_lengths)
+        if int(hidden_states.shape[0]) != expected_rows:
+            raise ValueError(
+                "vision_tower returned hidden states with "
+                f"{hidden_states.shape[0]} rows, expected {expected_rows} "
+                "from image_grid_thw and spatial_merge_size."
             )
+        if deepstack_visual_embeds is not None:
+            for layer in deepstack_visual_embeds:
+                if int(layer.shape[0]) != expected_rows:
+                    raise ValueError(
+                        "vision_tower returned deepstack layer with "
+                        f"{layer.shape[0]} rows, expected {expected_rows}."
+                    )
+
+        outputs: list[Qwen3VLVisionEncodeResult] = []
+        start = 0
+        for feature_length in feature_lengths:
+            end = start + feature_length
+            feature_deepstack: Sequence[mx.array] | None = None
+            if deepstack_visual_embeds is not None:
+                feature_deepstack = tuple(
+                    layer[start:end] for layer in deepstack_visual_embeds
+                )
+
             outputs.append(
                 Qwen3VLVisionEncodeResult(
-                    hidden_states=hidden_states,
-                    deepstack_visual_embeds=deepstack_visual_embeds,
+                    hidden_states=hidden_states[start:end],
+                    deepstack_visual_embeds=feature_deepstack,
                 )
             )
+            start = end
 
         return outputs
 

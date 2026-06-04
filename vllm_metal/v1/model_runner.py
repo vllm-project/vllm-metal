@@ -1460,27 +1460,21 @@ class MetalModelRunner:
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
-        """Run the vision encoder for each scheduled feature, stash by identifier.
+        """Run the vision encoder for scheduled features, stash by identifier.
 
         Skips features whose ``identifier`` already lives in
         ``encoder_cache.encoder_outputs`` (cache hit; the scheduler may
-        re-list a feature across chunks).  Calls
-        ``adapter.encode_multimodal`` one feature at a time so a single bad
-        feature is reported with a precise req_id+idx rather than poisoning
-        a whole request batch.
-
-        TODO(multimodal-batching): batch scheduled features into a single
-        ``adapter.encode_multimodal`` call.  Upstream vLLM stacks pixel_values
-        and image_grid_thw across requests so the vision tower runs once per
-        step; we serialize, which inflates TTFT under concurrency (e.g.,
-        conc=8 + 384x384 measured ~3.5s p50 TTFT).  Requires per-feature
-        slicing of returned hidden_states + deepstack residuals by
-        ``grid_thw.prod()``.
+        re-list a feature across chunks).  Uncached features are batched into
+        one ``adapter.encode_multimodal`` call so the vision tower runs once per
+        scheduler step instead of once per feature.
         """
         adapter = self._multimodal_adapter
         cache = self.encoder_cache
         if adapter is None or cache is None:
             return
+
+        features_to_encode: list[MultiModalFeatureSpec] = []
+        feature_ids_to_encode: set[str] = set()
         for req_id, feature_indices in scheduled_encoder_inputs.items():
             mm_features = cache.mm_features.get(req_id)
             if mm_features is None:
@@ -1495,16 +1489,26 @@ class MetalModelRunner:
                         f"request {req_id!r} with {len(mm_features)} features."
                     )
                 feature = mm_features[idx]
-                if feature.identifier in cache.encoder_outputs:
+                if (
+                    feature.identifier in cache.encoder_outputs
+                    or feature.identifier in feature_ids_to_encode
+                ):
                     continue
-                outputs = adapter.encode_multimodal([feature])
-                if len(outputs) != 1:
-                    raise RuntimeError(
-                        f"encode_multimodal returned {len(outputs)} outputs "
-                        "for 1 feature; adapter must return one result per "
-                        "feature."
-                    )
-                cache.encoder_outputs[feature.identifier] = outputs[0]
+                features_to_encode.append(feature)
+                feature_ids_to_encode.add(feature.identifier)
+
+        if not features_to_encode:
+            return
+
+        outputs = adapter.encode_multimodal(features_to_encode)
+        if len(outputs) != len(features_to_encode):
+            raise RuntimeError(
+                f"encode_multimodal returned {len(outputs)} outputs for "
+                f"{len(features_to_encode)} features; adapter must return one "
+                "result per feature."
+            )
+        for feature, output in zip(features_to_encode, outputs, strict=True):
+            cache.encoder_outputs[feature.identifier] = output
 
     def _run_mm_paged_forward(
         self,

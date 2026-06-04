@@ -302,26 +302,90 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         assert len(outputs) == 1
         assert outputs[0].hidden_states.shape == (4, 8)
         assert outputs[0].hidden_states.tolist() == [[0.0] * 8] * 4
-        assert outputs[0].deepstack_visual_embeds is deepstack
+        assert outputs[0].deepstack_visual_embeds is not None
+        assert outputs[0].deepstack_visual_embeds[0].tolist() == deepstack[0].tolist()
         assert len(tower.calls) == 1
 
-    def test_returns_one_output_per_feature(self) -> None:
+    def test_batches_inputs_and_slices_outputs_per_feature(self) -> None:
+        hidden = mx.concatenate(
+            [
+                mx.full((4, 8), 1.0, dtype=mx.float32),
+                mx.full((4, 8), 2.0, dtype=mx.float32),
+            ],
+            axis=0,
+        )
+        deepstack = [
+            mx.concatenate(
+                [
+                    mx.full((4, 8), 3.0, dtype=mx.float32),
+                    mx.full((4, 8), 4.0, dtype=mx.float32),
+                ],
+                axis=0,
+            )
+        ]
+        tower = _RecordingVisionTower(
+            hidden_factory=lambda _: hidden,
+            deepstack_factory=lambda _: deepstack,
+        )
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+
+        outputs = adapter.encode_multimodal(
+            [
+                _vision_feature(offset=0, pixel_rows=4),
+                _vision_feature(offset=10, pixel_rows=4),
+            ]
+        )
+
+        assert len(outputs) == 2
+        assert outputs[0].hidden_states.tolist() == [[1.0] * 8] * 4
+        assert outputs[1].hidden_states.tolist() == [[2.0] * 8] * 4
+        assert outputs[0].deepstack_visual_embeds is not None
+        assert outputs[1].deepstack_visual_embeds is not None
+        assert outputs[0].deepstack_visual_embeds[0].tolist() == [[3.0] * 8] * 4
+        assert outputs[1].deepstack_visual_embeds[0].tolist() == [[4.0] * 8] * 4
+        assert len(tower.calls) == 1
+        pixel_values, grid_thw = tower.calls[0]
+        assert pixel_values.shape == (8, 8)
+        assert grid_thw.shape == (2, 3)
+        assert grid_thw.tolist() == [
+            list(_IMAGE_GRID_THW_2X2),
+            list(_IMAGE_GRID_THW_2X2),
+        ]
+
+    def test_raises_when_batched_hidden_rows_do_not_match_features(self) -> None:
+        tower = _RecordingVisionTower(
+            hidden_factory=lambda _: mx.zeros((7, 8), dtype=mx.float32)
+        )
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE,
+            vision_tower=tower,
+        )
+
+        with pytest.raises(ValueError, match="expected 8"):
+            adapter.encode_multimodal(
+                [
+                    _vision_feature(offset=0),
+                    _vision_feature(offset=10),
+                ]
+            )
+
+    def test_raises_when_grid_tokens_do_not_match_placeholder_length(self) -> None:
         tower = _RecordingVisionTower()
         adapter = Qwen3VLMultimodalAdapter(
             spatial_merge_size=_SPATIAL_MERGE_SIZE,
             vision_tower=tower,
         )
-        features = [
-            _vision_feature(offset=0),
-            _vision_feature(offset=10),
-        ]
 
-        outputs = adapter.encode_multimodal(features)
-
-        assert len(outputs) == 2
-        assert outputs[0].hidden_states.tolist()[0][0] == 0.0
-        assert outputs[1].hidden_states.tolist()[0][0] == 1.0
-        assert len(tower.calls) == 2
+        with pytest.raises(ValueError, match="mm_position.get_num_embeds"):
+            adapter.encode_multimodal(
+                [
+                    _vision_feature(length=_IMAGE_TOKEN_COUNT_2X2 - 1),
+                ]
+            )
+        assert tower.calls == []
 
     def test_passes_mlx_arrays_to_vision_tower(self) -> None:
         tower = _RecordingVisionTower()

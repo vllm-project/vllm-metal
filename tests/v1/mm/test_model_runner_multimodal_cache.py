@@ -383,7 +383,7 @@ def test_reject_scheduled_encoder_inputs_raises_when_no_adapter() -> None:
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
 
-def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
+def test_run_vision_encoders_batches_uncached_features() -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
@@ -411,22 +411,6 @@ def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
     assert mx.allclose(stored.deepstack_visual_embeds[0], mx.array([[3.0, 4.0]])).item()
 
 
-def test_run_vision_encoders_skips_cached_features(fake_encode_result) -> None:
-    runner = _runner_with_encoder_cache()
-    adapter = _RecordingAdapter()
-    runner._multimodal_adapter = adapter
-    features = [_feature("image-0")]
-    assert runner.encoder_cache is not None
-    runner.encoder_cache.add_request("req-0", features)
-    cached = fake_encode_result(mx.array([[7.0]]))
-    runner.encoder_cache.encoder_outputs["image-0"] = cached
-
-    runner._run_vision_encoders({"req-0": [0]})
-
-    assert adapter.encode_calls == []
-    assert runner.encoder_cache.encoder_outputs["image-0"] is cached
-
-
 def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
@@ -439,10 +423,49 @@ def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:
 
     runner._run_vision_encoders({"req-0": [0, 1], "req-1": [0]})
 
-    assert len(adapter.encode_calls) == 3
-    encoded_identifiers = [call[0].identifier for call in adapter.encode_calls]
+    assert len(adapter.encode_calls) == 1
+    encoded_identifiers = [feature.identifier for feature in adapter.encode_calls[0]]
     assert encoded_identifiers == ["img-a", "img-b", "img-c"]
     assert set(runner.encoder_cache.encoder_outputs) == {"img-a", "img-b", "img-c"}
+
+
+def test_run_vision_encoders_skips_cached_and_batches_only_uncached_features(
+    fake_encode_result,
+) -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("cached-image"), _feature("fresh-image")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+    cached = fake_encode_result(mx.array([[7.0]]))
+    runner.encoder_cache.encoder_outputs["cached-image"] = cached
+
+    runner._run_vision_encoders({"req-0": [0, 1]})
+
+    assert len(adapter.encode_calls) == 1
+    assert [feature.identifier for feature in adapter.encode_calls[0]] == [
+        "fresh-image"
+    ]
+    assert runner.encoder_cache.encoder_outputs["cached-image"] is cached
+    assert "fresh-image" in runner.encoder_cache.encoder_outputs
+
+
+def test_run_vision_encoders_deduplicates_repeated_feature_identifier() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("shared-image"), _feature("shared-image")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+
+    runner._run_vision_encoders({"req-0": [0, 1]})
+
+    assert len(adapter.encode_calls) == 1
+    assert [feature.identifier for feature in adapter.encode_calls[0]] == [
+        "shared-image"
+    ]
+    assert set(runner.encoder_cache.encoder_outputs) == {"shared-image"}
 
 
 def test_run_vision_encoders_raises_for_unregistered_request() -> None:
