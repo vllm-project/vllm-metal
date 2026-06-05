@@ -80,6 +80,15 @@ void init_v2_library(const std::string& v2_src) {
       [&]() { return v2_paged_attention_source_; });
 }
 
+// Load a precompiled .metallib instead of compiling source. Uses the
+// get_library(name, path) overload, which loads the library and caches it
+// under "paged_attention_v2_kern"; later dispatch calls
+// get_library("paged_attention_v2_kern") (no path) return the cached library.
+void init_v2_library_path(const std::string& path) {
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_attention_v2_kern", path);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
@@ -689,6 +698,13 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
+// Load a precompiled .metallib instead of compiling source (see
+// init_v2_library_path); caches the library under "gdn_kern".
+void init_gdn_library_path(const std::string& path) {
+  auto& d = metal::device(Device::gpu);
+  d.get_library("gdn_kern", path);
+}
+
 // ---------------------------------------------------------------------------
 // MLA paged attention (RFC #360)
 // ---------------------------------------------------------------------------
@@ -699,6 +715,13 @@ void init_mla_library(const std::string& src) {
   mla_source_ = src;
   auto& d = metal::device(Device::gpu);
   d.get_library("paged_mla_kern", [&]() { return mla_source_; });
+}
+
+// Load a precompiled .metallib instead of compiling source (see
+// init_v2_library_path); caches the library under "paged_mla_kern".
+void init_mla_library_path(const std::string& path) {
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_mla_kern", path);
 }
 
 // Dispatch the MLA paged attention kernel.
@@ -980,9 +1003,17 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("v2_src"),
         "JIT-compile the v2 online-softmax Metal shader.");
 
+  m.def("init_v2_library_path", &init_v2_library_path,
+        nb::arg("path"),
+        "Load a precompiled v2 online-softmax .metallib from disk.");
+
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),
         "JIT-compile the GDN linear attention Metal shader.");
+
+  m.def("init_gdn_library_path", &init_gdn_library_path,
+        nb::arg("path"),
+        "Load a precompiled GDN linear attention .metallib from disk.");
 
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
@@ -1115,6 +1146,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_mla_library", &init_mla_library,
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
+
+  m.def("init_mla_library_path", &init_mla_library_path,
+        nb::arg("path"),
+        "Load a precompiled MLA paged attention .metallib (RFC #360).");
 
   m.def("mla_paged_attention_primitive",
         [](nb::handle q_nope_h,

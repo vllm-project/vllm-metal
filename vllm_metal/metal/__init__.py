@@ -25,12 +25,14 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
-# Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
-# and held in MLX's library cache for the lifetime of the process.  Editing
-# .metal source files requires restarting the Python interpreter to pick up
-# changes.  The .cpp extension itself is loaded prebuilt from the package by
-# default; set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile it from source (for
-# kernel developers iterating on paged_ops.cpp).
+# Cached after first get_ops() call.  By default both the .cpp extension and
+# the three Metal shader libraries are loaded prebuilt from the package (the
+# .so plus precompiled .metallib files), so there is no first-request shader
+# compile.  Set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile the .so from source
+# AND compile the shaders in-process from .metal (for kernel developers
+# iterating on paged_ops.cpp or the .metal sources); editing .metal then
+# requires restarting the interpreter to pick up changes.  Either way the
+# libraries are held in MLX's cache for the lifetime of the process.
 _ops_module: ModuleType | None = None
 
 
@@ -139,11 +141,14 @@ def metal_mla_paged_attention(
 
 
 def get_ops() -> ModuleType:
-    """JIT-build and import the native paged_ops extension.
+    """Import the native paged_ops extension and initialise its Metal libraries.
 
-    The Metal shader sources are read, pre-processed (includes inlined),
-    and passed to the C++ extension which JIT-compiles them via
-    ``mlx::core::metal::Device::get_library()``.
+    By default the prebuilt ``.so`` is loaded and the three precompiled
+    ``.metallib`` shader libraries are loaded by path via MLX
+    (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
+    is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
+    (includes inlined) and JIT-compiled in-process via
+    ``mlx::core::metal::Device::get_library(name, builder)`` instead.
 
     Returns:
         The ``_paged_ops`` module with ``paged_attention_primitive()`` and
@@ -182,17 +187,29 @@ def get_ops() -> ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 3. Initialise v2 library (online softmax kernel)
-    v2_src = _build_v2_paged_attention_source()
-    mod.init_v2_library(v2_src)
+    # 3. Initialise the three Metal shader libraries (v2 online-softmax, GDN
+    #    linear attention, MLA paged attention).  By default we load the
+    #    precompiled .metallib files shipped in the wheel (no first-request
+    #    shader compile); only compile the shaders in-process when the developer
+    #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        mod.init_v2_library(_build_v2_paged_attention_source())
+        mod.init_gdn_library(_build_gdn_source())
+        mod.init_mla_library(_build_mla_paged_attention_source())
+    else:
+        from vllm_metal.metal.build import metallib_path
 
-    # 4. Initialise GDN linear attention library
-    gdn_src = _build_gdn_source()
-    mod.init_gdn_library(gdn_src)
-
-    # 5. Initialise MLA paged-attention library (RFC #360)
-    mla_src = _build_mla_paged_attention_source()
-    mod.init_mla_library(mla_src)
+        names = ["paged_attention_v2_kern", "gdn_kern", "paged_mla_kern"]
+        missing = [n for n in names if not metallib_path(n).exists()]
+        if missing:
+            raise RuntimeError(
+                f"Prebuilt Metal libraries missing: {missing} (expected in "
+                f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
+                f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
+            )
+        mod.init_v2_library_path(str(metallib_path("paged_attention_v2_kern")))
+        mod.init_gdn_library_path(str(metallib_path("gdn_kern")))
+        mod.init_mla_library_path(str(metallib_path("paged_mla_kern")))
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
@@ -200,16 +217,17 @@ def get_ops() -> ModuleType:
 
 
 def warm_up_kernels() -> None:
-    """Front-load v2 / GDN / MLA Metal kernel compilation at startup.
+    """Front-load v2 / GDN / MLA Metal library loading at startup.
 
-    :func:`get_ops` JIT-builds the C++ ``_paged_ops`` extension and eagerly
-    compiles the v2 / GDN / MLA Metal libraries: MLX's
-    ``Device::get_library`` compiles the source synchronously inside each
-    ``init_*_library`` call. Calling it here moves that cost off the first
-    request and fails fast at startup if the kernels cannot compile on this
-    macOS (e.g. an unsupported Metal language version).
+    :func:`get_ops` imports the C++ ``_paged_ops`` extension and initialises the
+    v2 / GDN / MLA Metal libraries — by default loading the precompiled
+    ``.metallib`` files, or (under ``VLLM_METAL_BUILD_FROM_SOURCE``) compiling
+    the shader source synchronously inside each ``init_*_library`` call. Calling
+    it here moves that cost off the first request and fails fast at startup if
+    the libraries are missing or the shaders cannot compile on this macOS (e.g.
+    an unsupported Metal language version).
 
-    The compile is process-wide with no per-cache state, which is why this
+    The load/compile is process-wide with no per-cache state, which is why this
     takes no arguments.
     """
     macos_version = platform.mac_ver()[0]

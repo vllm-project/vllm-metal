@@ -11,6 +11,7 @@ import hashlib
 import logging
 import subprocess
 import sysconfig
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,10 +30,85 @@ _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 _OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
 _HASH = _OUT.with_suffix(_OUT.suffix + ".sha256")
 
+# Names of the three precompiled Metal shader libraries.  These are the same
+# cache-key names the C++ extension registers each library under
+# (init_*_library_path in paged_ops.cpp), so a later dispatch's
+# ``get_library(name)`` returns the .metallib loaded at startup.
+METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
+
 
 def output_path() -> Path:
     """Path to the prebuilt native extension (whether or not it exists yet)."""
     return _OUT
+
+
+def metallib_path(name: str) -> Path:
+    """Path to a precompiled Metal shader library (whether or not it exists)."""
+    return _THIS_DIR / f"{name}.metallib"
+
+
+def _compile_metallib(name: str, source: str) -> Path:
+    """Compile Metal *source* to ``<name>.metallib`` inside the package dir.
+
+    ``-fno-fast-math`` is REQUIRED so the precompiled library matches MLX's
+    runtime ``newLibrary`` (which sets ``setFastMathEnabled(false)``); without
+    it the kernel numerics drift away from the in-process source compile.
+    """
+    out = metallib_path(name)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".metal", delete=False, dir=_THIS_DIR
+    )
+    try:
+        tmp.write(source)
+        tmp.close()
+        cmd = [
+            "xcrun",
+            "-sdk",
+            "macosx",
+            "metal",
+            "-O3",
+            "-fno-fast-math",
+            tmp.name,
+            "-o",
+            str(out),
+        ]
+        logger.info("  %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to compile Metal library '{name}':\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+    return out
+
+
+def build_metallibs() -> list[Path]:
+    """Precompile the three Metal shader libraries to ``.metallib`` files.
+
+    PACKAGING-only (CI + release.sh): the default runtime path loads these
+    prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
+    compiles the shaders in-process via MLX, so a source-install dev without
+    the Metal toolchain never reaches this code.
+
+    The source builders are imported at call time (function-level) to avoid any
+    import-order coupling with :mod:`vllm_metal.metal`.
+    """
+    from vllm_metal.metal import (
+        _build_gdn_source,
+        _build_mla_paged_attention_source,
+        _build_v2_paged_attention_source,
+    )
+
+    builders = {
+        "paged_attention_v2_kern": _build_v2_paged_attention_source,
+        "gdn_kern": _build_gdn_source,
+        "paged_mla_kern": _build_mla_paged_attention_source,
+    }
+    logger.info("Building Metal shader libraries ...")
+    return [_compile_metallib(name, builder()) for name, builder in builders.items()]
 
 
 def _find_package_path(name: str) -> Path:
@@ -190,4 +266,7 @@ if __name__ == "__main__":
     import logging
 
     logging.basicConfig(level=logging.INFO)
-    print(build())
+    so = build()
+    print(so)
+    for lib in build_metallibs():
+        print(lib)
