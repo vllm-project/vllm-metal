@@ -23,10 +23,16 @@ _SRC = _THIS_DIR / "paged_ops.cpp"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-_CACHE_DIR = Path.home() / ".cache" / "vllm-metal"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_OUT = _CACHE_DIR / f"_paged_ops{_EXT_SUFFIX}"
+# The built extension lives inside the package directory so packaging
+# (maturin ``include``) bundles it into the wheel and the runtime loads it
+# without ever invoking clang++ on the end-user machine.
+_OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
 _HASH = _OUT.with_suffix(_OUT.suffix + ".sha256")
+
+
+def output_path() -> Path:
+    """Path to the prebuilt native extension (whether or not it exists yet)."""
+    return _OUT
 
 
 def _find_package_path(name: str) -> Path:
@@ -90,7 +96,11 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
-        f"-Wl,-rpath,{mlx_lib}",
+        # No absolute "-Wl,-rpath,{mlx_lib}": baking the build machine's MLX
+        # path into a prebuilt wheel is wrong (it won't exist on the user's
+        # machine). Symbol resolution relies on "-undefined dynamic_lookup"
+        # plus MLX being imported first at load time (see metal/__init__.py),
+        # so libmlx is already resident when this .so is dlopen'd.
         "-D_METAL_",
         "-DACCELERATE_NEW_LAPACK",
         f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
@@ -174,3 +184,10 @@ def build() -> Path:
     _HASH.write_text(expected_hash)
     logger.info("Built %s", _OUT)
     return _OUT
+
+
+if __name__ == "__main__":
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    print(build())

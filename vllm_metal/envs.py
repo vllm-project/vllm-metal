@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_BUILD_FROM_SOURCE: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -76,6 +77,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # When set, compile the native _paged_ops extension from source at runtime
+    # instead of loading the prebuilt artifact shipped in the wheel. Intended
+    # for kernel developers / source installs; requires Xcode command-line
+    # tools (clang++). Default off — release wheels ship the .so prebuilt.
+    "VLLM_METAL_BUILD_FROM_SOURCE": lambda: (
+        os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
+    ),
 }
 
 

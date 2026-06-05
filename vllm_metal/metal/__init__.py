@@ -28,8 +28,9 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 # Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
 # and held in MLX's library cache for the lifetime of the process.  Editing
 # .metal source files requires restarting the Python interpreter to pick up
-# changes (the .cpp extension itself is rebuilt automatically by build.py when
-# paged_ops.cpp is newer than the .so).
+# changes.  The .cpp extension itself is loaded prebuilt from the package by
+# default; set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile it from source (for
+# kernel developers iterating on paged_ops.cpp).
 _ops_module: ModuleType | None = None
 
 
@@ -152,10 +153,27 @@ def get_ops() -> ModuleType:
     if _ops_module is not None:
         return _ops_module
 
-    # 1. JIT-build the C++ extension if needed
-    from vllm_metal.metal.build import build
+    # Preload libmlx so the prebuilt extension's @rpath/libmlx.dylib symbols
+    # resolve against the already-loaded image, regardless of any rpath baked
+    # in at build time. Must happen before the .so is dlopen'd below.
+    import mlx.core  # noqa: F401
 
-    so_path = build()
+    # 1. Locate the native extension: load the prebuilt artifact by default;
+    #    only compile from source when explicitly opted in (no silent fallback).
+    from vllm_metal import envs
+    from vllm_metal.metal.build import build, output_path
+
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        so_path = build()
+    else:
+        so_path = output_path()
+        if not so_path.exists():
+            raise RuntimeError(
+                f"Prebuilt native extension not found at {so_path}. Install a "
+                f"vllm-metal release wheel (which ships it prebuilt), or set "
+                f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
+                f"(requires Xcode command-line tools)."
+            )
 
     # 2. Import the built extension
     spec = importlib.util.spec_from_file_location("_paged_ops", str(so_path))
