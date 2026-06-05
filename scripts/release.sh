@@ -11,6 +11,13 @@ main() {
 
   setup_dev_env
 
+  # Build the prebuilt native extension (.so) and the three precompiled
+  # .metallib shader libraries into vllm_metal/metal/ before `uv build`, so the
+  # wheel ships them (via the maturin `include` directive) and end users never
+  # invoke clang++ or `xcrun metal` at runtime.
+  ensure_metal_toolchain
+  build_native_artifacts
+
   local base_version version
   base_version=$(get_version)
   # Per-commit dev version, e.g. 0.3.0.dev20260603184500 — unique and PEP 440.

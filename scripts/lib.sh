@@ -79,3 +79,48 @@ setup_dev_env() {
 get_version() {
   uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
 }
+
+# Ensure `xcrun metal` can actually compile a .metallib.
+#
+# Producing a .metallib needs the Metal toolchain. On Xcode 26+ it is a
+# separate downloadable component; older Xcode bundles it. Rather than guess,
+# trial-compile a trivial shader: if that succeeds the toolchain is already
+# present (no slow download), otherwise download MetalToolchain and re-check.
+ensure_metal_toolchain() {
+  section "Ensuring Metal toolchain"
+
+  local tmpdir metal_src metal_lib
+  tmpdir=$(mktemp -d)
+  metal_src="${tmpdir}/probe.metal"
+  metal_lib="${tmpdir}/probe.metallib"
+  printf '[[kernel]] void _t() {}\n' > "${metal_src}"
+
+  if xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}" &> /dev/null; then
+    success "Metal toolchain present"
+    rm -rf "${tmpdir}"
+    return 0
+  fi
+
+  echo "Metal toolchain not available, downloading via xcodebuild..."
+  xcodebuild -downloadComponent MetalToolchain
+
+  if ! xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}" &> /dev/null; then
+    error "Metal toolchain still unavailable after download; cannot compile .metallib."
+    rm -rf "${tmpdir}"
+    return 1
+  fi
+
+  success "Metal toolchain ready"
+  rm -rf "${tmpdir}"
+}
+
+# Build the in-package native artifacts (the _paged_ops*.so and the three
+# precompiled .metallib shader libraries) into vllm_metal/metal/ so that
+# `uv build` can bundle them into the wheel via the maturin `include` directive.
+#
+# `python` here is the venv interpreter activated by setup_dev_env, so mlx and
+# nanobind are importable.
+build_native_artifacts() {
+  section "Building native Metal artifacts"
+  python -m vllm_metal.metal.build
+}

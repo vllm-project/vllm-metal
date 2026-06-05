@@ -18,6 +18,36 @@ source .venv-vllm-metal/bin/activate
 pip install -e ".[dev]"
 ```
 
+## Editing the Metal kernels
+
+Release wheels ship the native paged-attention extension and its Metal shader
+libraries **prebuilt**, so end users never compile them. To edit the kernels —
+the `.metal` shaders or `paged_ops.cpp` — and run from your local source, set:
+
+```bash
+VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve ...   # or: pytest, your script, etc.
+```
+
+In this mode the C++ extension is recompiled when its inputs change (the build
+is hash-checked, so unchanged sources are skipped) and the shaders are compiled
+in-process by MLX from the `.metal` source at runtime. There is **no manual
+`.metallib` rebuild step**: edit a kernel, restart the Python process, and the
+change is picked up.
+
+Requirements:
+
+- **Xcode Command Line Tools** (`xcode-select --install`) — provides `clang++`
+  for the C++ extension.
+- For shader (`.metal`) work, the **Metal toolchain**. Recent Xcode bundles it;
+  on Xcode 26+ it is a separate download:
+
+  ```bash
+  xcodebuild -downloadComponent MetalToolchain
+  ```
+
+Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts from the wheel
+are loaded as-is and your kernel edits have no effect.
+
 ## Run lint locally
 
 Mirrors the `lint` job in CI (`ruff`, `ruff format --check`, `mypy`, `shellcheck`):
