@@ -208,10 +208,9 @@ def get_ops() -> ModuleType:
         mod.init_gdn_library(_build_gdn_source())
         mod.init_mla_library(_build_mla_paged_attention_source())
     else:
-        from vllm_metal.metal.build import metallib_path
+        from vllm_metal.metal.build import METALLIB_NAMES, metallib_path
 
-        names = ["paged_attention_v2_kern", "gdn_kern", "paged_mla_kern"]
-        missing = [n for n in names if not metallib_path(n).exists()]
+        missing = [n for n in METALLIB_NAMES if not metallib_path(n).exists()]
         if missing:
             raise RuntimeError(
                 f"Prebuilt Metal libraries missing: {missing} (expected in "

@@ -28,7 +28,15 @@ _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 # (maturin ``include``) bundles it into the wheel and the runtime loads it
 # without ever invoking clang++ on the end-user machine.
 _OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
-_HASH = _OUT.with_suffix(_OUT.suffix + ".sha256")
+
+
+def _stamp_path(artifact: Path) -> Path:
+    """The ``.sha256`` sidecar recording the inputs an artifact was built from."""
+    return artifact.with_suffix(artifact.suffix + ".sha256")
+
+
+# The .so's stamp; identical mechanism to each .metallib's (see is_stale).
+_HASH = _stamp_path(_OUT)
 
 # Names of the three precompiled Metal shader libraries.  These are the same
 # cache-key names the C++ extension registers each library under
@@ -84,6 +92,16 @@ def _metallib_digest(source: str) -> str:
     return h.hexdigest()
 
 
+def _run_or_raise(cmd: list[str], what: str) -> None:
+    """Log and run a compiler command, raising with both streams on failure."""
+    logger.info("  %s", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to {what}:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
 def _compile_metallib(name: str, source: str) -> Path:
     """Compile Metal *source* to ``<name>.metallib`` in the package dir and write
     its ``.sha256`` staleness stamp."""
@@ -94,15 +112,10 @@ def _compile_metallib(name: str, source: str) -> Path:
     try:
         tmp.write(source)
         tmp.close()
-        cmd = [*_METALLIB_FLAGS, tmp.name, "-o", str(out)]
-        logger.info("  %s", " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to compile Metal library '{name}':\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
+        _run_or_raise(
+            [*_METALLIB_FLAGS, tmp.name, "-o", str(out)],
+            f"compile Metal library '{name}'",
+        )
     finally:
         Path(tmp.name).unlink(missing_ok=True)
     _stamp_path(out).write_text(_metallib_digest(source))
@@ -235,11 +248,6 @@ def needs_rebuild() -> bool:
         return True
 
 
-def _stamp_path(artifact: Path) -> Path:
-    """The ``.sha256`` sidecar recording the inputs an artifact was built from."""
-    return artifact.with_suffix(artifact.suffix + ".sha256")
-
-
 def is_stale(artifact: Path, expected_digest: str) -> bool:
     """One staleness primitive for every prebuilt artifact (the ``.so`` and each
     ``.metallib``). True only if ``artifact`` and its ``.sha256`` stamp both
@@ -276,16 +284,14 @@ def stale_artifacts() -> list[Path]:
 
 
 def build() -> Path:
-    """JIT-build the native extension, returning the path to the .so."""
+    """JIT-build the native extension, returning the path to the .so.
+
+    Skips the compile when the prebuilt .so is already current (needs_rebuild)."""
+    if not needs_rebuild():
+        return _OUT
+
     spec = _build_spec()
     expected_hash = _input_hash(spec)
-    if _OUT.exists() and _HASH.exists():
-        try:
-            if _HASH.read_text().strip() == expected_hash:
-                return _OUT
-        except OSError:
-            pass
-
     logger.info("Building native paged-attention extension ...")
 
     for p, label in [
@@ -297,15 +303,7 @@ def build() -> Path:
         if not Path(p).exists():
             raise FileNotFoundError(f"{label} not found: {p}")
 
-    logger.info("  %s", " ".join(spec.cmd))
-    result = subprocess.run(spec.cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to build paged_ops extension:\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+    _run_or_raise(spec.cmd, "build paged_ops extension")
 
     _HASH.write_text(expected_hash)
     logger.info("Built %s", _OUT)
