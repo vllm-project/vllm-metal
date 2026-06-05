@@ -57,11 +57,17 @@ def metallib_path(name: str) -> Path:
 
 # Stable parts of the metallib compile command (the per-build temp input and
 # output paths are appended in _compile_metallib). One constant so the actual
-# compile and the staleness digest agree on the flags. ``-fno-fast-math`` is
-# REQUIRED so the precompiled library matches MLX's runtime ``newLibrary`` (which
-# sets ``setFastMathEnabled(false)``); without it the kernel numerics drift away
-# from the in-process source compile.
-_METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-O3", "-fno-fast-math")
+# compile and the staleness digest agree on the flags. We mirror the flags MLX
+# uses to build its own shader libraries (share/cmake/MLX/extension.cmake:
+# ``MTLLIB_COMPILE_OPTIONS = -Wall -Wextra -fno-fast-math -Wno-c++17-extensions``;
+# the -W* flags only affect diagnostics). ``-fno-fast-math`` is the
+# numerics-critical one: the metal compiler defaults to fast-math ON, but MLX's
+# runtime ``newLibrary`` sets ``setFastMathEnabled(false)``, so without it the
+# precompiled kernels diverge from the in-process source compile. We deliberately
+# do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
+# (already enabled), so matching keeps the prebuilt path numerically and
+# behaviourally identical to what users get today.
+_METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
 
 
 def _metallib_source(name: str) -> str:
@@ -195,11 +201,15 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
-        # No absolute "-Wl,-rpath,{mlx_lib}": baking the build machine's MLX
-        # path into a prebuilt wheel is wrong (it won't exist on the user's
-        # machine). Symbol resolution relies on "-undefined dynamic_lookup"
-        # plus MLX being imported first at load time (see metal/__init__.py),
-        # so libmlx is already resident when this .so is dlopen'd.
+        # "-lmlx" above validates our MLX symbols at link time and records a
+        # dependency on "@rpath/libmlx.dylib" (libmlx's install name). We add NO
+        # "-Wl,-rpath": baking the build machine's MLX path into a prebuilt wheel
+        # is wrong (it won't exist on the user's machine). So that recorded
+        # dependency is resolved not via an rpath but against an already-resident
+        # libmlx, which dyld matches by install name; "-undefined dynamic_lookup"
+        # resolves any remaining symbols the same way. Both require libmlx to be
+        # loaded first, which metal/__init__.py guarantees by importing mlx.core
+        # before this .so is dlopen'd.
         "-D_METAL_",
         "-DACCELERATE_NEW_LAPACK",
         f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",

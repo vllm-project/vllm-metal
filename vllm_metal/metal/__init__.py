@@ -165,10 +165,12 @@ def get_ops() -> ModuleType:
     if _ops_module is not None:
         return _ops_module
 
-    # The prebuilt .so is linked with `-undefined dynamic_lookup` and carries no
-    # libmlx load command or rpath (see build.py), so its undefined MLX symbols
-    # are resolved at load time against images already in the process. Import
-    # mlx.core first so libmlx is resident before the .so is dlopen'd below.
+    # The prebuilt .so links `-lmlx` with no rpath, so it records a dependency on
+    # `@rpath/libmlx.dylib` (libmlx's install name) that it cannot resolve on its
+    # own; dyld instead satisfies it against an already-resident libmlx, matched
+    # by install name (`-undefined dynamic_lookup` resolves any stragglers the
+    # same way; see build.py). Both need libmlx loaded first, so import mlx.core
+    # now to make it resident before the .so is dlopen'd below.
     import mlx.core  # noqa: F401
 
     # 1. Locate the native extension: load the prebuilt artifact by default;
