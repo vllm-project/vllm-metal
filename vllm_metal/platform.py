@@ -303,6 +303,19 @@ class MetalPlatform(Platform):
                 "(pipeline_parallel_size > 1)."
             )
 
+        # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
+        # GPU per node cannot shard a TP>1 model, and there is no cross-device
+        # collective wired in (mx.distributed). Only TP=1 is validated. Reject
+        # at config time rather than hang on Ray placement-group creation (one
+        # "mlx" resource per node) or silently misbehave. This is executor-
+        # agnostic: uni/mp are equally unable to run TP>1 on one device.
+        # Remove when mx.distributed tensor parallelism lands.
+        if parallel_config.tensor_parallel_size > 1:
+            raise NotImplementedError(
+                "Metal/MLX does not support tensor parallelism yet "
+                "(tensor_parallel_size > 1); only TP=1 is validated."
+            )
+
         scheduler_config = vllm_config.scheduler_config
         if getattr(scheduler_config, "enable_chunked_prefill", False):
             if config.use_paged_attention:

@@ -762,3 +762,35 @@ class TestWrapModelSanitize:
 
         assert applied is False
         assert not hasattr(ModelWithoutSanitize, "sanitize")
+
+
+class TestMetalRayLocalGpuIds:
+    """Pure-logic coverage for the Ray V2 worker resource resolver.
+
+    Exercises the decision the ``get_node_and_gpu_ids`` override delegates to —
+    no Ray, no cluster — so it runs in CI on the validated single-node path.
+    """
+
+    def test_single_mlx_resource_maps_to_local_index_zero(self) -> None:
+        assert compat._metal_ray_local_gpu_ids("node-1", {"mlx": 1}, "mlx") == (
+            "node-1",
+            [0],
+        )
+
+    def test_multiple_units_enumerate_local_indices(self) -> None:
+        assert compat._metal_ray_local_gpu_ids("node-1", {"mlx": 2}, "mlx") == (
+            "node-1",
+            [0, 1],
+        )
+
+    def test_missing_resource_fails_loud(self) -> None:
+        with pytest.raises(RuntimeError, match="was not assigned"):
+            compat._metal_ray_local_gpu_ids("node-1", {"CPU": 1.0}, "mlx")
+
+    def test_empty_assignment_fails_loud(self) -> None:
+        with pytest.raises(RuntimeError, match="was not assigned"):
+            compat._metal_ray_local_gpu_ids("node-1", {}, "mlx")
+
+    def test_none_assignment_fails_loud(self) -> None:
+        with pytest.raises(RuntimeError, match="was not assigned"):
+            compat._metal_ray_local_gpu_ids("node-1", None, "mlx")
