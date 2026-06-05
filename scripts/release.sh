@@ -32,6 +32,17 @@ main() {
   section "Building wheel"
   uv build
 
+  # Guard: never publish a wheel that doesn't actually bundle the prebuilt
+  # native artifacts (maturin `include`). Abort here — before the tag and
+  # release — rather than ship a wheel that fails with "Prebuilt native
+  # extension not found" on the user's first run.
+  local wheels=(dist/*.whl)
+  if [ ! -f "${wheels[0]}" ]; then
+    error "No wheel found in dist/ after uv build."
+    exit 1
+  fi
+  verify_wheel_artifacts "${wheels[0]}"
+
   local tag
   tag="v${version}"
   echo "Generated tag: $tag"

@@ -45,8 +45,12 @@ Requirements:
   xcodebuild -downloadComponent MetalToolchain
   ```
 
-Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts from the wheel
-are loaded as-is and your kernel edits have no effect.
+Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts are loaded as-is.
+If you edited a kernel source after building them locally, loading **fails
+loudly** on the stale-hash mismatch rather than silently running the old kernel —
+set the variable, or rerun `python -m vllm_metal.metal.build` to refresh the
+prebuilt artifacts. (A plain wheel install ships no hash stamps, so end users
+never hit this.)
 
 ## Run lint locally
 

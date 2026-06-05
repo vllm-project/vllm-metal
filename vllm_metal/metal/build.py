@@ -38,9 +38,9 @@ def _stamp_path(artifact: Path) -> Path:
 # The .so's stamp; identical mechanism to each .metallib's (see is_stale).
 _HASH = _stamp_path(_OUT)
 
-# Names of the three precompiled Metal shader libraries.  These are the same
-# cache-key names the C++ extension registers each library under
-# (init_*_library_path in paged_ops.cpp), so a later dispatch's
+# Names of the three precompiled Metal shader libraries.  Each is the cache-key
+# name the C++ extension registers the library under (passed to
+# ``init_library_path(name, path)`` in paged_ops.cpp), so a later dispatch's
 # ``get_library(name)`` returns the .metallib loaded at startup.
 METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
 
@@ -224,10 +224,13 @@ def _build_spec() -> _BuildSpec:
 
 def _input_hash(spec: _BuildSpec) -> str:
     h = hashlib.sha256()
-    # Resolved compile invocation captures MLX/nanobind/Python paths and
-    # compile-time defines like PARTITION_SIZE.
-    h.update("\0".join(spec.cmd).encode())
-    h.update(b"\0")
+    # Hash the inputs that change the produced .so, but NOT the machine-specific
+    # include/lib paths in spec.cmd: with `-undefined dynamic_lookup` the .so
+    # bakes in no absolute path, so the same sources + MLX/nanobind versions give
+    # an equivalent binary wherever the venv lives (moving it must not flag the
+    # artifact stale). The compile flags and defines (e.g. PARTITION_SIZE) come
+    # from build.py / constants.py, whose contents are hashed in the loop below,
+    # so editing a flag still busts the hash.
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
     for p in (_SRC, _BUILD, _CONSTANTS, spec.nb_src):
@@ -311,8 +314,6 @@ def build() -> Path:
 
 
 if __name__ == "__main__":
-    import logging
-
     logging.basicConfig(level=logging.INFO)
     so = build()
     print(so)

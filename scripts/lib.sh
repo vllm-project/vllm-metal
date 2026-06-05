@@ -124,3 +124,42 @@ build_native_artifacts() {
   section "Building native Metal artifacts"
   python -m vllm_metal.metal.build
 }
+
+# Fail unless the freshly built wheel actually bundles the prebuilt native
+# artifacts: the _paged_ops*.so extension and the three .metallib shader
+# libraries. maturin's `include` directive is what pulls these (gitignored)
+# files in; if that ever regresses, the wheel would install fine but fail at
+# first run with "Prebuilt native extension not found". The expected filenames
+# are read from build.py so this guard never drifts from the runtime loader.
+#
+# Usage: verify_wheel_artifacts <path-to-wheel>
+verify_wheel_artifacts() {
+  local wheel="$1"
+  section "Verifying wheel bundles native artifacts"
+
+  local expected
+  if ! expected=$(python -c "
+from vllm_metal.metal.build import METALLIB_NAMES, metallib_path, output_path
+print(output_path().name)
+for _name in METALLIB_NAMES:
+    print(metallib_path(_name).name)
+"); then
+    error "Failed to resolve expected native artifact names from build.py."
+    return 1
+  fi
+
+  local contents name
+  contents=$(unzip -l "$wheel")
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    if grep -qF "$name" <<< "$contents"; then
+      success "bundled: ${name}"
+    else
+      error "Wheel ${wheel} is missing native artifact: ${name}"
+      error "maturin [tool.maturin] 'include' likely failed to bundle it."
+      return 1
+    fi
+  done <<< "$expected"
+
+  success "Wheel bundles all native artifacts"
+}

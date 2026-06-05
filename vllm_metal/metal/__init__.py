@@ -10,6 +10,7 @@ Usage::
 
 from __future__ import annotations
 
+import functools
 import importlib
 import importlib.util
 import logging
@@ -36,8 +37,14 @@ _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 _ops_module: ModuleType | None = None
 
 
+@functools.cache
 def _read_metal_source(path: Path) -> str:
-    """Read a .metal file and strip local #include directives."""
+    """Read a .metal file and strip local #include directives.
+
+    Cached for the process lifetime: the three library source builders all pull
+    in shared shaders (e.g. utils.metal), so without this each staleness check
+    or source-mode init would re-read and re-strip the same files several times.
+    """
     text = path.read_text()
     # Remove #include "..." for our vendored files (keep <metal_stdlib> etc.)
     text = re.sub(r'#include\s+"[^"]*"', "", text)
@@ -158,9 +165,10 @@ def get_ops() -> ModuleType:
     if _ops_module is not None:
         return _ops_module
 
-    # Preload libmlx so the prebuilt extension's @rpath/libmlx.dylib symbols
-    # resolve against the already-loaded image, regardless of any rpath baked
-    # in at build time. Must happen before the .so is dlopen'd below.
+    # The prebuilt .so is linked with `-undefined dynamic_lookup` and carries no
+    # libmlx load command or rpath (see build.py), so its undefined MLX symbols
+    # are resolved at load time against images already in the process. Import
+    # mlx.core first so libmlx is resident before the .so is dlopen'd below.
     import mlx.core  # noqa: F401
 
     # 1. Locate the native extension: load the prebuilt artifact by default;
@@ -180,15 +188,18 @@ def get_ops() -> ModuleType:
                 f"(requires Xcode command-line tools)."
             )
         # Locally-built artifacts (the .so and the .metallib shaders) drift if a
-        # developer edits paged_ops.cpp or a .metal file without rebuilding. Warn
-        # loudly — but do NOT auto-build, which would reintroduce the silent
-        # fallback this design removed. No-op for wheel installs (no stamps).
+        # developer edits paged_ops.cpp or a .metal file without rebuilding. Fail
+        # loudly rather than run stale kernels — but do NOT auto-build, which
+        # would reintroduce the silent compile this design removed. No-op for
+        # wheel installs (no stamps), so end users are never affected.
         stale = stale_artifacts()
         if stale:
-            logger.warning(
-                "Prebuilt Metal artifacts are stale vs the current sources "
-                "(%s); set VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild them.",
-                ", ".join(p.name for p in stale),
+            raise RuntimeError(
+                f"Prebuilt Metal artifacts are stale vs the current sources "
+                f"({', '.join(p.name for p in stale)}): a kernel source was "
+                f"edited without rebuilding. Set VLLM_METAL_BUILD_FROM_SOURCE=1 "
+                f"to build from source, or run `python -m vllm_metal.metal.build` "
+                f"to refresh the prebuilt artifacts."
             )
 
     # 2. Import the built extension
@@ -217,9 +228,8 @@ def get_ops() -> ModuleType:
                 f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
             )
-        mod.init_v2_library_path(str(metallib_path("paged_attention_v2_kern")))
-        mod.init_gdn_library_path(str(metallib_path("gdn_kern")))
-        mod.init_mla_library_path(str(metallib_path("paged_mla_kern")))
+        for name in METALLIB_NAMES:
+            mod.init_library_path(name, str(metallib_path(name)))
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
