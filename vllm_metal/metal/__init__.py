@@ -166,7 +166,7 @@ def get_ops() -> ModuleType:
     # 1. Locate the native extension: load the prebuilt artifact by default;
     #    only compile from source when explicitly opted in (no silent fallback).
     from vllm_metal import envs
-    from vllm_metal.metal.build import build, output_path
+    from vllm_metal.metal.build import build, output_path, stale_artifacts
 
     if envs.VLLM_METAL_BUILD_FROM_SOURCE:
         so_path = build()
@@ -178,6 +178,17 @@ def get_ops() -> ModuleType:
                 f"vllm-metal release wheel (which ships it prebuilt), or set "
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
                 f"(requires Xcode command-line tools)."
+            )
+        # Locally-built artifacts (the .so and the .metallib shaders) drift if a
+        # developer edits paged_ops.cpp or a .metal file without rebuilding. Warn
+        # loudly — but do NOT auto-build, which would reintroduce the silent
+        # fallback this design removed. No-op for wheel installs (no stamps).
+        stale = stale_artifacts()
+        if stale:
+            logger.warning(
+                "Prebuilt Metal artifacts are stale vs the current sources "
+                "(%s); set VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild them.",
+                ", ".join(p.name for p in stale),
             )
 
     # 2. Import the built extension
