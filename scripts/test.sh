@@ -147,6 +147,11 @@ main() {
   setup_dev_env
 
   if [ "$(uname)" == "Darwin" ]; then
+    # Build the native artifacts (.so + .metallib) into the package tree before
+    # install.sh's `uv pip install .`, so the wheel bundles them (maturin
+    # `include`) and CI exercises the prebuilt path users get, like release.sh.
+    ensure_metal_toolchain
+    build_native_artifacts
     installs
     # shellcheck source=/dev/null
     source .venv-vllm-metal/bin/activate
