@@ -33,8 +33,8 @@ from vllm_metal.attention.patching import walk_and_wrap
 # ---------------------------------------------------------------------------
 
 
-def _is_position_embeddings(value: Any) -> bool:
-    """Return True for PaddleOCR-VL ``(cos, sin)`` position embeddings."""
+def _is_rope_embedding_pair(value: Any) -> bool:
+    """Return True for caller-precomputed RoPE ``(cos, sin)`` embeddings."""
     return (
         isinstance(value, (tuple, list))
         and len(value) == 2
@@ -103,11 +103,10 @@ class SDPAPagedAttentionWrapper(nn.Module):
         **kwargs: Any,
     ) -> Any:
         position_embeddings = kwargs.pop("position_embeddings", None)
-        if _is_position_embeddings(position_ids):
-            # PaddleOCRDecoderLayer calls
-            # ``self_attn(x, mask, cache, position_embeddings)`` positionally.
-            # Preserve that fourth argument instead of treating it as
-            # Qwen-style ``position_ids``.
+        if _is_rope_embedding_pair(position_ids):
+            # Some attention contracts pass precomputed ``(cos, sin)`` RoPE
+            # embeddings positionally as the fourth argument. Preserve that
+            # payload instead of treating it as Qwen-style ``position_ids``.
             position_embeddings = position_ids
             position_ids = None
 

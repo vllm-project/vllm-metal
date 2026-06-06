@@ -48,10 +48,10 @@ class MultimodalRuntimeAdapter(Protocol):
     """Whether text-only batches must also run the multimodal forward.
 
     True for models whose language model derives rotary embeddings from
-    model-level position state (PaddleOCR-VL): on the paged text path the
-    runner supplies zero-offset caches and no ``position_ids``, so the LM
-    would re-derive every position from 0.  Routing through ``call_lm``
-    keeps positions explicit on every batch.
+    model-level position state: on the paged text path the runner supplies
+    zero-offset caches and no ``position_ids``, so the LM would re-derive
+    every position from 0.  Routing through ``call_lm`` keeps positions
+    explicit on every batch.
     """
 
     def text_model(self) -> Any:

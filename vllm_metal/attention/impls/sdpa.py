@@ -8,8 +8,8 @@ transparently by the Metal paged attention kernel.
 Handles models whose attention module exposes:
 - ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
   see K-eq-V variant below)
-- ``rope`` / ``rotary_emb`` for rotary position embeddings, or caller-provided
-  ``position_embeddings`` for PaddleOCR-VL
+- ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
+  ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
 - Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
 
@@ -34,7 +34,7 @@ import mlx.nn as nn
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.varlen_rope_compat import (
-    apply_packed_rope,
+    apply_attention_rope,
 )
 from vllm_metal.metal import get_ops
 
@@ -43,34 +43,6 @@ from vllm_metal.metal import get_ops
 # sizes only.  Sorted descending so _pick_kernel_block_size selects the
 # largest valid divisor first, minimising the block-table expansion ratio.
 _KERNEL_BLOCK_SIZES = (32, 16, 8)
-
-
-def _apply_paddleocr_position_embeddings(
-    attn_module: nn.Module,
-    queries: mx.array,
-    keys: mx.array,
-    position_embeddings: tuple[mx.array, mx.array],
-) -> tuple[mx.array, mx.array]:
-    """Apply PaddleOCR-VL's precomputed M-RoPE position embeddings."""
-    from mlx_vlm.models.paddleocr_vl.language import (
-        apply_multimodal_rotary_pos_emb,
-    )
-
-    rope_parameters = getattr(attn_module, "rope_parameters", None)
-    if rope_parameters is None or "mrope_section" not in rope_parameters:
-        raise NotImplementedError(
-            f"Attention module {type(attn_module).__name__} received "
-            "position_embeddings but does not expose rope_parameters"
-            "['mrope_section']."
-        )
-    cos, sin = position_embeddings
-    return apply_multimodal_rotary_pos_emb(
-        queries,
-        keys,
-        cos,
-        sin,
-        rope_parameters["mrope_section"],
-    )
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -283,25 +255,16 @@ def prepare_sdpa_qkv(
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         queries = queries.transpose(0, 2, 1, 3)
-        if position_embeddings is not None:
-            queries, _ = _apply_paddleocr_position_embeddings(
-                inner, queries, keys, position_embeddings
-            )
-        else:
-            if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-                raise NotImplementedError(
-                    f"Attention module {type(inner).__name__} does not have a "
-                    "'rope' or 'rotary_emb' attribute."
-                )
-            queries, _ = apply_packed_rope(
-                inner,
-                queries,
-                keys,
-                ctx.cu_seqlens,
-                offsets=ctx.offsets if ctx.offsets else None,
-                apply_keys=False,
-                positions=ctx.segment_positions,
-            )
+        queries, _ = apply_attention_rope(
+            inner,
+            queries,
+            keys,
+            ctx.cu_seqlens,
+            offsets=ctx.offsets if ctx.offsets else None,
+            apply_keys=False,
+            positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
+        )
     else:
         if not packed_qkv:
             keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
@@ -324,24 +287,15 @@ def prepare_sdpa_qkv(
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        if position_embeddings is not None:
-            queries, keys = _apply_paddleocr_position_embeddings(
-                inner, queries, keys, position_embeddings
-            )
-        elif not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-            raise NotImplementedError(
-                f"Attention module {type(inner).__name__} does not have a "
-                "'rope' or 'rotary_emb' attribute."
-            )
-        else:
-            queries, keys = apply_packed_rope(
-                inner,
-                queries,
-                keys,
-                ctx.cu_seqlens,
-                offsets=ctx.offsets if ctx.offsets else None,
-                positions=ctx.segment_positions,
-            )
+        queries, keys = apply_attention_rope(
+            inner,
+            queries,
+            keys,
+            ctx.cu_seqlens,
+            offsets=ctx.offsets if ctx.offsets else None,
+            positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
+        )
 
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing

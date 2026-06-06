@@ -938,11 +938,11 @@ class MetalModelRunner:
                 "let mm requests reach paged forward."
             )
 
-        # PaddleOCR-VL derives RoPE from model-level position state: on the
-        # text path the LM would re-derive positions against the zero-offset
-        # paged caches (arange from 0), corrupting decode/packed/chunked text
-        # batches.  Adapters flag ``requires_explicit_positions`` so text-only
-        # batches also run the mm forward, which always passes position_ids.
+        # Some VLM LMs derive RoPE from model-level position state.  On the
+        # text path they would re-derive positions against zero-offset paged
+        # caches, corrupting decode/packed/chunked text batches.  Adapters flag
+        # ``requires_explicit_positions`` so text-only batches also run the mm
+        # forward, which always passes position_ids.
         use_mm_forward = has_mm or (
             adapter is not None
             and adapter.forward_ready
