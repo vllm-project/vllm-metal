@@ -873,3 +873,11 @@ class TestQwen3VLMultimodalAdapterEmbedTokens:
 
         with pytest.raises(RuntimeError, match="embed_tokens_fn not resolved"):
             adapter.embed_tokens(mx.array([[1]], dtype=mx.int32))
+
+
+class TestAdapterCapabilities:
+    def test_requires_explicit_positions_defaults_false(self) -> None:
+        # Qwen3-VL applies RoPE inside attention from the paged context
+        # (apply_packed_rope + ctx.offsets), so text-only batches stay on
+        # the plain text path.
+        assert Qwen3VLMultimodalAdapter.requires_explicit_positions is False

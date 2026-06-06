@@ -8,7 +8,8 @@ transparently by the Metal paged attention kernel.
 Handles models whose attention module exposes:
 - ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
   see K-eq-V variant below)
-- ``rope`` or ``rotary_emb`` for rotary position embeddings
+- ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
+  ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
 - Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
 
@@ -33,7 +34,7 @@ import mlx.nn as nn
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.varlen_rope_compat import (
-    apply_packed_rope,
+    apply_attention_rope,
 )
 from vllm_metal.metal import get_ops
 
@@ -154,6 +155,7 @@ def prepare_sdpa_qkv(
     shared_kv: tuple[mx.array, mx.array] | None = None,
     *,
     read_existing_kv: bool = False,
+    position_embeddings: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
     """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
 
@@ -253,12 +255,7 @@ def prepare_sdpa_qkv(
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         queries = queries.transpose(0, 2, 1, 3)
-        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-            raise NotImplementedError(
-                f"Attention module {type(inner).__name__} does not have a "
-                "'rope' or 'rotary_emb' attribute."
-            )
-        queries, _ = apply_packed_rope(
+        queries, _ = apply_attention_rope(
             inner,
             queries,
             keys,
@@ -266,6 +263,7 @@ def prepare_sdpa_qkv(
             offsets=ctx.offsets if ctx.offsets else None,
             apply_keys=False,
             positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
         )
     else:
         if not packed_qkv:
@@ -289,18 +287,14 @@ def prepare_sdpa_qkv(
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-            raise NotImplementedError(
-                f"Attention module {type(inner).__name__} does not have a "
-                "'rope' or 'rotary_emb' attribute."
-            )
-        queries, keys = apply_packed_rope(
+        queries, keys = apply_attention_rope(
             inner,
             queries,
             keys,
             ctx.cu_seqlens,
             offsets=ctx.offsets if ctx.offsets else None,
             positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
         )
 
     kv_for_sharing = (keys, values)
@@ -405,6 +399,7 @@ def sdpa_forward(
     shared_kv: tuple[mx.array, mx.array] | None = None,
     *,
     read_existing_kv: bool = False,
+    position_embeddings: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
@@ -432,6 +427,7 @@ def sdpa_forward(
         n_kv_heads,
         shared_kv,
         read_existing_kv=read_existing_kv,
+        position_embeddings=position_embeddings,
     )
 
     # --- Metal kernel dispatch ---

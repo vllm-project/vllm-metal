@@ -936,6 +936,17 @@ class MetalModelRunner:
                 "let mm requests reach paged forward."
             )
 
+        # Some VLM LMs derive RoPE from model-level position state.  On the
+        # text path they would re-derive positions against zero-offset paged
+        # caches, corrupting decode/packed/chunked text batches.  Adapters flag
+        # ``requires_explicit_positions`` so text-only batches also run the mm
+        # forward, which always passes position_ids.
+        use_mm_forward = has_mm or (
+            adapter is not None
+            and adapter.forward_ready
+            and adapter.requires_explicit_positions
+        )
+
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
 
@@ -988,7 +999,7 @@ class MetalModelRunner:
                     cache=offset_caches,
                     model_config=self.model_config,
                 )
-            elif has_mm:
+            elif use_mm_forward:
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
