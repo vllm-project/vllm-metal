@@ -194,9 +194,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         out_unembedded = inner.unembed_out(out_for_unembed)
         return out_unembedded.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
 
-    def _materialized_prefill_ok(
-        self, inner: nn.Module, latent_cache: MLAPagedLatentCache, ctx: Any
-    ) -> bool:
+    def _materialized_prefill_ok(self, inner: nn.Module, ctx: Any) -> bool:
         """Gate for the materialized-prefill fast path (RFC #360 Phase 2): an
         absorbed model with MultiLinear ``embed_q``/``unembed_out`` and pure
         prefill (past=0). On by default — bitwise-equal to the absorbed
@@ -402,7 +400,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         # Materialized-prefill fast path (opt-in; absorbed model, past=0).
         # Materializes full K/V and runs standard MHA via MLX SDPA instead of the
         # absorbed 512-wide MQA loop (RFC #360 Phase 2). Falls through otherwise.
-        if self._materialized_prefill_ok(inner, latent_cache, ctx):
+        if self._materialized_prefill_ok(inner, ctx):
             final = self._materialized_prefill(
                 inner, q_nope, q_pe, kv_norm, k_pe, ctx, seq_len
             )

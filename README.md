@@ -21,7 +21,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 
 ## Supported Models
 
-vllm-metal supports a growing set of text-only language models on Apple Silicon. See the full matrix in [docs/supported_models.md](docs/supported_models.md).
+vllm-metal supports a growing set of models on Apple Silicon. See the full matrix in [docs/supported_models.md](docs/supported_models.md).
 
 ## Installation
 

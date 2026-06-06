@@ -56,6 +56,42 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="only supports device 0"):
             MetalPlatform.set_device(1)
 
+    def test_set_device_accepts_torch_device(self) -> None:
+        """Ray's compiled-DAG path passes a torch.device, not an int."""
+        MetalPlatform.set_device(torch.device("cpu"))  # index None -> ok
+        MetalPlatform.set_device(torch.device("cpu", 0))  # index 0 -> ok
+        with pytest.raises(ValueError, match="only supports device 0"):
+            MetalPlatform.set_device(torch.device("cpu", 1))
+
+    def test_check_and_update_config_rejects_pipeline_parallel(self) -> None:
+        """Pipeline parallelism is unsupported on Metal; reject it at config time."""
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="uni",
+                pipeline_parallel_size=2,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
+        """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="uni",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=2,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(NotImplementedError, match="tensor parallelism"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
     def test_device_capability(self) -> None:
         """Test device capability."""
         major, minor = MetalPlatform.get_device_capability()
@@ -184,6 +220,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -232,6 +270,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -278,6 +318,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -321,6 +363,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -368,6 +412,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(block_size=None),
@@ -407,6 +453,8 @@ class TestMetalPlatform:
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
             cache_config=SimpleNamespace(block_size=None),
@@ -437,6 +485,8 @@ class TestMetalPlatform:
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
             cache_config=SimpleNamespace(block_size=None),
@@ -485,6 +535,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -529,6 +581,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -571,6 +625,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -617,6 +673,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
@@ -659,6 +717,8 @@ class TestMetalPlatform:
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(

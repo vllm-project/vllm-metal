@@ -120,11 +120,10 @@ def test_materialized_prefill_matches_absorbed_loop(
 def test_materialized_prefill_gate() -> None:
     """The gate engages for an absorbed model on pure prefill (past=0) and falls
     back to the absorbed loop for chunked prefill (past>0)."""
-    inner, cache, wrapper = _make()
+    inner, _, wrapper = _make()
     # pure prefill (past=0): ctx_len == num_new → engage
     assert wrapper._materialized_prefill_ok(
         inner,
-        cache,
         pac.PagedAttentionContext(
             slot_mapping=[0, 1],
             block_tables=[[0]],
@@ -136,7 +135,6 @@ def test_materialized_prefill_gate() -> None:
     # past>0 (ctx_len 4 > num_new 2): chunked prefill → fall back
     assert not wrapper._materialized_prefill_ok(
         inner,
-        cache,
         pac.PagedAttentionContext(
             slot_mapping=[0, 1],
             block_tables=[[0]],

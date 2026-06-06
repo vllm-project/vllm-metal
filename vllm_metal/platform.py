@@ -32,6 +32,17 @@ class MetalPlatform(Platform):
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
 
+    # --- Ray distributed executor support (Phase 1) ---
+    # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
+    # is not "GPU", vLLM's Ray executor uses the generic
+    # resources={ray_device_key: n} placement path instead of the CUDA num_gpus
+    # path.  Each node must be launched with `ray start --resources='{"mlx": 1}'`.
+    ray_device_key: str = "mlx"
+    # Per-worker visible-device env var (the CUDA_VISIBLE_DEVICES analog).  With
+    # one Apple GPU per node this is effectively a no-op, but it must be a unique
+    # name that does not collide with CUDA_VISIBLE_DEVICES.
+    device_control_env_var: str = "VLLM_METAL_VISIBLE_DEVICES"
+
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """Get the name of the Metal device.
@@ -137,14 +148,20 @@ class MetalPlatform(Platform):
         return 1
 
     @classmethod
-    def set_device(cls, device_id: int) -> None:
+    def set_device(cls, device: "torch.device | int | None" = 0) -> None:
         """Set the current device.
 
+        vLLM's base contract (and the Ray compiled-DAG path) passes a
+        ``torch.device``; some internal callers pass an int index.  Apple
+        Silicon exposes a single GPU, so anything other than index 0 (or a
+        deviceless ``torch.device("cpu")`` whose index is ``None``) is invalid.
+
         Args:
-            device_id: Device index (must be 0 for Metal)
+            device: A ``torch.device`` or integer index; must resolve to 0.
         """
-        if device_id != 0:
-            msg = f"Metal only supports device 0, got {device_id}"
+        index = device.index if isinstance(device, torch.device) else device
+        if index not in (0, None):
+            msg = f"Metal only supports device 0, got {device!r}"
             raise ValueError(msg)
 
         config = get_config()
@@ -246,9 +263,58 @@ class MetalPlatform(Platform):
         # Set executor backend (use uniproc for single device)
         if parallel_config.distributed_executor_backend in ("auto", None):
             parallel_config.distributed_executor_backend = "uni"
+        elif parallel_config.distributed_executor_backend == "ray":
+            # Apple GPUs are not a Ray accelerator family, so the Ray worker
+            # actor's get_node_and_gpu_ids would KeyError on
+            # get_accelerator_ids()[ray_device_key].  Install our override (see
+            # vllm_metal.compat._patch_ray_distributed) in every Ray worker via a
+            # worker_process_setup_hook, which runs at worker startup before the
+            # first actor call (the lazy plugin-load path is too late).  Fail
+            # loud rather than warn-and-continue: the user asked for Ray.
+            from ray.runtime_env import RuntimeEnv
+
+            hook = "vllm_metal.compat._patch_ray_distributed"
+            runtime_env = parallel_config.ray_runtime_env
+            if runtime_env is None:
+                parallel_config.ray_runtime_env = RuntimeEnv(
+                    worker_process_setup_hook=hook
+                )
+            else:
+                existing_hook = runtime_env.get("worker_process_setup_hook")
+                if existing_hook not in (None, hook):
+                    raise ValueError(
+                        "Metal must install a Ray worker_process_setup_hook for "
+                        "the 'ray' executor, but one is already set "
+                        f"({existing_hook!r}); chaining is not supported. Unset "
+                        "ray_runtime_env's worker_process_setup_hook."
+                    )
+                runtime_env["worker_process_setup_hook"] = hook
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
+
+        # Pipeline parallelism is not supported on Metal/MLX yet: the MLX model
+        # runner has no cross-stage activation hand-off (see
+        # MetalModelRunner.execute_model). Fail fast at config time rather than
+        # deep inside a Ray actor on the first decode step.
+        if parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Metal/MLX does not support pipeline parallelism yet "
+                "(pipeline_parallel_size > 1)."
+            )
+
+        # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
+        # GPU per node cannot shard a TP>1 model, and there is no cross-device
+        # collective wired in (mx.distributed). Only TP=1 is validated. Reject
+        # at config time rather than hang on Ray placement-group creation (one
+        # "mlx" resource per node) or silently misbehave. This is executor-
+        # agnostic: uni/mp are equally unable to run TP>1 on one device.
+        # Remove when mx.distributed tensor parallelism lands.
+        if parallel_config.tensor_parallel_size > 1:
+            raise NotImplementedError(
+                "Metal/MLX does not support tensor parallelism yet "
+                "(tensor_parallel_size > 1); only TP=1 is validated."
+            )
 
         scheduler_config = vllm_config.scheduler_config
         if getattr(scheduler_config, "enable_chunked_prefill", False):

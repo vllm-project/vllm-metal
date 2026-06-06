@@ -52,6 +52,76 @@ def _apply_mrope_segment_with_positions(
     return apply_multimodal_rotary_pos_emb(q_seg, k_seg, cos, sin)
 
 
+def apply_precomputed_mrope(
+    attn_module: object,
+    queries: mx.array,
+    keys: mx.array,
+    position_embeddings: tuple[mx.array, mx.array],
+) -> tuple[mx.array, mx.array]:
+    """Apply caller-precomputed M-RoPE ``(cos, sin)`` embeddings to Q/K.
+
+    Some VLM attention modules receive the rotary embeddings from their parent
+    language model instead of exposing a ``rope`` or ``rotary_emb`` callable on
+    the attention layer itself.  Keep that model-specific apply policy in this
+    compat module so SDPA projection/cache code can stay model-agnostic.
+    """
+    from mlx_vlm.models.paddleocr_vl.language import (
+        apply_multimodal_rotary_pos_emb,
+    )
+
+    rope_parameters = getattr(attn_module, "rope_parameters", None)
+    if rope_parameters is None or "mrope_section" not in rope_parameters:
+        raise NotImplementedError(
+            f"Attention module {type(attn_module).__name__} received "
+            "precomputed M-RoPE embeddings but does not expose "
+            "rope_parameters['mrope_section']."
+        )
+
+    cos, sin = position_embeddings
+    return apply_multimodal_rotary_pos_emb(
+        queries,
+        keys,
+        cos,
+        sin,
+        rope_parameters["mrope_section"],
+    )
+
+
+def apply_attention_rope(
+    attn_module: object,
+    queries: mx.array,
+    keys: mx.array,
+    cu_seqlens: list[int],
+    offsets: list[int] | None = None,
+    apply_keys: bool = True,
+    *,
+    positions: list[mx.array | None] | None = None,
+    position_embeddings: tuple[mx.array, mx.array] | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Apply the attention module's RoPE contract to packed Q/K tensors."""
+    if position_embeddings is not None:
+        rotated_q, rotated_k = apply_precomputed_mrope(
+            attn_module, queries, keys, position_embeddings
+        )
+        return rotated_q, (rotated_k if apply_keys else keys)
+
+    if not hasattr(attn_module, "rope") and not hasattr(attn_module, "rotary_emb"):
+        raise NotImplementedError(
+            f"Attention module {type(attn_module).__name__} does not have a "
+            "'rope' or 'rotary_emb' attribute."
+        )
+
+    return apply_packed_rope(
+        attn_module,
+        queries,
+        keys,
+        cu_seqlens,
+        offsets=offsets,
+        apply_keys=apply_keys,
+        positions=positions,
+    )
+
+
 def apply_packed_rope(
     attn_module: object,
     queries: mx.array,

@@ -722,7 +722,6 @@ class MetalModelRunner:
 
     def _prefill_single(
         self,
-        req_id: str,
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
@@ -730,7 +729,6 @@ class MetalModelRunner:
         """Process a single prefill request.
 
         Args:
-            req_id: Request ID
             token_ids: Prompt token IDs
             sampling_params: Sampling parameters for this request
 
@@ -938,6 +936,17 @@ class MetalModelRunner:
                 "let mm requests reach paged forward."
             )
 
+        # Some VLM LMs derive RoPE from model-level position state.  On the
+        # text path they would re-derive positions against zero-offset paged
+        # caches, corrupting decode/packed/chunked text batches.  Adapters flag
+        # ``requires_explicit_positions`` so text-only batches also run the mm
+        # forward, which always passes position_ids.
+        use_mm_forward = has_mm or (
+            adapter is not None
+            and adapter.forward_ready
+            and adapter.requires_explicit_positions
+        )
+
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
 
@@ -990,7 +999,7 @@ class MetalModelRunner:
                     cache=offset_caches,
                     model_config=self.model_config,
                 )
-            elif has_mm:
+            elif use_mm_forward:
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
@@ -1801,7 +1810,6 @@ class MetalModelRunner:
                 continue
 
             next_token, cache, logprobs = self._prefill_single(
-                req_id,
                 token_ids,
                 sampling_params,
                 generator=generator,

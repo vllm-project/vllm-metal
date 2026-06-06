@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -28,6 +27,7 @@ from vllm_metal.attention.runtime.hybrid import (
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
+from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
@@ -625,16 +625,12 @@ class WorkerCachePlanner:
         )
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
-        if config.kv_sharing_fast_prefill:
-            from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 
-            try_enable_gemma4_yoco_fast_prefill(
-                self._worker.model_runner.model,
-                self._worker.model_runner.model_args,
-                use_paged_attention=config.use_paged_attention,
-                num_paged_layers=n_patched,
-                warn_on_skip="VLLM_METAL_KV_SHARING_FAST_PREFILL" in os.environ,
-            )
+        try_enable_gemma4_yoco_fast_prefill(
+            self._worker.model_runner.model,
+            self._worker.model_runner.model_args,
+            num_paged_layers=n_patched,
+        )
         logger.info(
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",

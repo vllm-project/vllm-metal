@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Configuration for vLLM Metal plugin via environment variables."""
 
-import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -44,7 +43,6 @@ class MetalConfig:
     mlx_device: Literal["gpu", "cpu"]
     debug: bool
     use_paged_attention: bool = True
-    kv_sharing_fast_prefill: bool = False
     multimodal_mode: MultimodalMode = "auto"
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
@@ -57,13 +55,6 @@ class MetalConfig:
                 "supported with paged attention (the default). "
                 "The MLX KV cache path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
                 "requires VLLM_METAL_MEMORY_FRACTION=auto."
-            )
-
-        if self.kv_sharing_fast_prefill and not self.use_paged_attention:
-            raise ValueError(
-                "VLLM_METAL_KV_SHARING_FAST_PREFILL requires paged attention. "
-                "Enable VLLM_METAL_USE_PAGED_ATTENTION=1 or set "
-                "VLLM_METAL_KV_SHARING_FAST_PREFILL=0."
             )
 
         if self.use_paged_attention and not self.is_auto_memory:
@@ -123,14 +114,6 @@ class MetalConfig:
                     "Must be 'auto' or a numeric value in (0, 1]."
                 ) from e
 
-        use_paged_attention = envs.VLLM_METAL_USE_PAGED_ATTENTION
-        kv_sharing_fast_prefill = envs.VLLM_METAL_KV_SHARING_FAST_PREFILL
-        if (
-            not use_paged_attention
-            and "VLLM_METAL_KV_SHARING_FAST_PREFILL" not in os.environ
-        ):
-            kv_sharing_fast_prefill = False
-
         # TurboQuant config is set via --additional-config, not env vars.
         # See MetalPlatform.check_and_update_config() for how it's applied.
         return cls(
@@ -138,8 +121,7 @@ class MetalConfig:
             use_mlx=envs.VLLM_METAL_USE_MLX,
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
             debug=envs.VLLM_METAL_DEBUG,
-            use_paged_attention=use_paged_attention,
-            kv_sharing_fast_prefill=kv_sharing_fast_prefill,
+            use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
         )
 

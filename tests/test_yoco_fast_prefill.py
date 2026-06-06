@@ -29,9 +29,9 @@ _FAST_PREFILL_ENABLED_ATTR = "_vllm_metal_yoco_fast_prefill_enabled"
 _REAL_RESULT_MARKER = "VLLM_METAL_YOCO_FAST_PREFILL_RESULT="
 
 
-def _logged_warning_text(warning: Mock) -> str:
+def _logged_call_text(log_method: Mock) -> str:
     rendered = []
-    for call in warning.call_args_list:
+    for call in log_method.call_args_list:
         if not call.args:
             continue
         fmt = str(call.args[0])
@@ -42,7 +42,7 @@ def _logged_warning_text(warning: Mock) -> str:
 def _run_real_gemma4_paged_path(
     model_path: str,
     *,
-    fast_prefill: bool,
+    skip_fast_prefill_hook: bool = False,
 ) -> tuple[dict[str, list[int]], bool]:
     memory_fraction = os.environ.get(
         "GEMMA4_FAST_PREFILL_MEMORY_FRACTION",
@@ -53,26 +53,35 @@ def _run_real_gemma4_paged_path(
         {
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
             "VLLM_METAL_USE_PAGED_ATTENTION": "1",
-            "VLLM_METAL_KV_SHARING_FAST_PREFILL": "1" if fast_prefill else "0",
             "VLLM_METAL_MEMORY_FRACTION": memory_fraction,
         }
     )
 
     script = f"""
 import json
-from contextlib import suppress
+from contextlib import nullcontext, suppress
+from unittest.mock import patch
 
 from vllm import LLM, SamplingParams
 
 model_path = {model_path!r}
 prompts = {json.dumps(_REAL_GEMMA4_PROMPTS)}
 enabled_attr = {_FAST_PREFILL_ENABLED_ATTR!r}
-llm = LLM(
-    model=model_path,
-    max_model_len={_REAL_GEMMA4_MAX_MODEL_LEN},
-    max_num_seqs={len(_REAL_GEMMA4_PROMPTS)},
-    enable_prefix_caching=False,
+fast_prefill_hook = (
+    patch(
+        "vllm_metal.v1.cache_policy.try_enable_gemma4_yoco_fast_prefill",
+        return_value=False,
+    )
+    if {skip_fast_prefill_hook!r}
+    else nullcontext()
 )
+with fast_prefill_hook:
+    llm = LLM(
+        model=model_path,
+        max_model_len={_REAL_GEMMA4_MAX_MODEL_LEN},
+        max_num_seqs={len(_REAL_GEMMA4_PROMPTS)},
+        enable_prefix_caching=False,
+    )
 runner = llm.llm_engine.model_executor.driver_worker.model_runner
 model = runner.model
 language_model = getattr(model, "language_model", None)
@@ -119,7 +128,8 @@ if callable(shutdown):
     if result.returncode != 0:
         raise AssertionError(
             "real Gemma4 paged-path subprocess failed "
-            f"(fast_prefill={fast_prefill}, code={result.returncode})\n"
+            f"(skip_fast_prefill_hook={skip_fast_prefill_hook}, "
+            f"code={result.returncode})\n"
             f"{output[-8000:]}"
         )
     for line in output.splitlines():
@@ -158,26 +168,20 @@ def test_try_enable_skips_ineligible_gemma4_yoco_shape(
     model_args,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    warning = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
+    debug = Mock()
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
         model_args,
-        use_paged_attention=True,
-        warn_on_skip=True,
     )
-    warning_text = _logged_warning_text(warning)
-    assert "Gemma4 YOCO fast prefill is enabled" in warning_text
-    assert "continuing without fast prefill" in warning_text
+    assert "Gemma4 YOCO fast prefill skipped" in _logged_call_text(debug)
 
 
-def test_try_enable_can_skip_ineligible_model_without_warning(
+def test_try_enable_logs_skip_at_debug(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    warning = Mock()
     debug = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
     monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
@@ -187,40 +191,16 @@ def test_try_enable_can_skip_ineligible_model_without_warning(
             "num_hidden_layers": 32,
             "num_kv_shared_layers": 8,
         },
-        use_paged_attention=True,
-        warn_on_skip=False,
     )
-    warning.assert_not_called()
     debug.assert_called_once()
-
-
-def test_try_enable_logs_without_paged_attention(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    warning = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
-
-    assert not try_enable_gemma4_yoco_fast_prefill(
-        object(),
-        {
-            "model_type": "gemma4",
-            "num_hidden_layers": 42,
-            "num_kv_shared_layers": 18,
-        },
-        use_paged_attention=False,
-        warn_on_skip=True,
-    )
-    warning_text = _logged_warning_text(warning)
-    assert "Gemma4 YOCO fast prefill is enabled" in warning_text
-    assert "paged attention is disabled" in warning_text
-    assert "continuing without fast prefill" in warning_text
+    assert "model_type='qwen3' is not Gemma4" in _logged_call_text(debug)
 
 
 def test_try_enable_logs_missing_num_hidden_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    warning = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
+    debug = Mock()
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -228,17 +208,15 @@ def test_try_enable_logs_missing_num_hidden_layers(
             "model_type": "gemma4",
             "num_kv_shared_layers": 18,
         },
-        use_paged_attention=True,
-        warn_on_skip=True,
     )
-    assert "num_hidden_layers is missing or not an int" in _logged_warning_text(warning)
+    assert "num_hidden_layers is missing or not an int" in _logged_call_text(debug)
 
 
 def test_try_enable_logs_when_not_all_layers_are_paged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    warning = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.warning", warning)
+    debug = Mock()
+    monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
 
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
@@ -247,11 +225,9 @@ def test_try_enable_logs_when_not_all_layers_are_paged(
             "num_hidden_layers": 4,
             "num_kv_shared_layers": 2,
         },
-        use_paged_attention=True,
         num_paged_layers=3,
-        warn_on_skip=True,
     )
-    assert "only 3/4 layers use paged attention" in _logged_warning_text(warning)
+    assert "only 3/4 layers use paged attention" in _logged_call_text(debug)
 
 
 def test_reduced_context_from_full_paged_metadata() -> None:
@@ -398,7 +374,6 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
             "num_hidden_layers": 4,
             "num_kv_shared_layers": 2,
         },
-        use_paged_attention=True,
         num_paged_layers=4,
     )
 
@@ -434,7 +409,7 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
 
 
 @pytest.mark.slow
-def test_real_gemma4_paged_path_matches_with_fast_prefill_off_on() -> None:
+def test_real_gemma4_paged_path_default_fast_prefill_matches_original() -> None:
     model_path = os.environ.get(_REAL_GEMMA4_MODEL_ENV) or os.environ.get(
         _REAL_GEMMA4_FALLBACK_MODEL_ENV
     )
@@ -446,19 +421,17 @@ def test_real_gemma4_paged_path_matches_with_fast_prefill_off_on() -> None:
     if not os.path.isdir(model_path):
         pytest.skip(f"{model_path} is not a directory")
 
-    off_tokens, off_enabled = _run_real_gemma4_paged_path(
+    original_tokens, original_enabled = _run_real_gemma4_paged_path(
         model_path,
-        fast_prefill=False,
+        skip_fast_prefill_hook=True,
     )
-    assert not off_enabled
+    assert not original_enabled
 
-    on_tokens, on_enabled = _run_real_gemma4_paged_path(
+    fast_tokens, fast_enabled = _run_real_gemma4_paged_path(
         model_path,
-        fast_prefill=True,
     )
-
-    assert on_enabled
-    assert on_tokens == off_tokens
+    assert fast_enabled
+    assert fast_tokens == original_tokens
 
 
 @pytest.mark.parametrize(
