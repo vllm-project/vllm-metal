@@ -629,7 +629,6 @@ class WorkerCachePlanner:
         try_enable_gemma4_yoco_fast_prefill(
             self._worker.model_runner.model,
             self._worker.model_runner.model_args,
-            use_paged_attention=config.use_paged_attention,
             num_paged_layers=n_patched,
         )
         logger.info(

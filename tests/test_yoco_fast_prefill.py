@@ -174,7 +174,6 @@ def test_try_enable_skips_ineligible_gemma4_yoco_shape(
     assert not try_enable_gemma4_yoco_fast_prefill(
         object(),
         model_args,
-        use_paged_attention=True,
     )
     assert "Gemma4 YOCO fast prefill skipped" in _logged_call_text(debug)
 
@@ -192,28 +191,9 @@ def test_try_enable_logs_skip_at_debug(
             "num_hidden_layers": 32,
             "num_kv_shared_layers": 8,
         },
-        use_paged_attention=True,
     )
     debug.assert_called_once()
     assert "model_type='qwen3' is not Gemma4" in _logged_call_text(debug)
-
-
-def test_try_enable_logs_without_paged_attention(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    debug = Mock()
-    monkeypatch.setattr("vllm_metal.attention.yoco.logger.debug", debug)
-
-    assert not try_enable_gemma4_yoco_fast_prefill(
-        object(),
-        {
-            "model_type": "gemma4",
-            "num_hidden_layers": 42,
-            "num_kv_shared_layers": 18,
-        },
-        use_paged_attention=False,
-    )
-    assert "paged attention is disabled" in _logged_call_text(debug)
 
 
 def test_try_enable_logs_missing_num_hidden_layers(
@@ -228,7 +208,6 @@ def test_try_enable_logs_missing_num_hidden_layers(
             "model_type": "gemma4",
             "num_kv_shared_layers": 18,
         },
-        use_paged_attention=True,
     )
     assert "num_hidden_layers is missing or not an int" in _logged_call_text(debug)
 
@@ -246,7 +225,6 @@ def test_try_enable_logs_when_not_all_layers_are_paged(
             "num_hidden_layers": 4,
             "num_kv_shared_layers": 2,
         },
-        use_paged_attention=True,
         num_paged_layers=3,
     )
     assert "only 3/4 layers use paged attention" in _logged_call_text(debug)
@@ -396,7 +374,6 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
             "num_hidden_layers": 4,
             "num_kv_shared_layers": 2,
         },
-        use_paged_attention=True,
         num_paged_layers=4,
     )
 

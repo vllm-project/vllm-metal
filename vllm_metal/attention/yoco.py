@@ -33,13 +33,11 @@ def try_enable_gemma4_yoco_fast_prefill(
     model: Any,
     model_args: Mapping[str, object],
     *,
-    use_paged_attention: bool,
     num_paged_layers: int | None = None,
 ) -> bool:
     """Enable Gemma4 YOCO fast prefill when the loaded model is eligible."""
     reason = _yoco_fast_prefill_skip_reason(
         model_args,
-        use_paged_attention=use_paged_attention,
         num_paged_layers=num_paged_layers,
     )
     if reason is not None:
@@ -57,12 +55,8 @@ def try_enable_gemma4_yoco_fast_prefill(
 def _yoco_fast_prefill_skip_reason(
     model_args: Mapping[str, object],
     *,
-    use_paged_attention: bool,
     num_paged_layers: int | None,
 ) -> str | None:
-    if not use_paged_attention:
-        return "paged attention is disabled"
-
     model_type = model_args.get("model_type")
     if model_type not in _GEMMA4_MODEL_TYPES:
         return f"model_type={model_type!r} is not Gemma4"
