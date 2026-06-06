@@ -39,15 +39,12 @@ validation guidance. The reranker requires Qwen3 sequence-classification
 
 ## Multimodal Language Models
 
-Native multimodal support currently targets vision-language requests on the
-paged backend. The first supported family is PaddleOCR-VL; it uses the
-model-level M-RoPE position policy exposed by mlx-vlm and is limited to one image
-per request until the pinned mlx-vlm dependency includes multi-image
-`get_rope_index` fixes.
+Native multimodal support currently targets image-only vision-language requests on the paged backend.
 
 | Model | Support | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- |
-| PaddleOCR-VL | 🔵 | native multimodal paged generation | vision input, one image per request | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
+| PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, one image per request | `PaddlePaddle/PaddleOCR-VL-1.6` |
 
 ## Text-Only Language Models
 
