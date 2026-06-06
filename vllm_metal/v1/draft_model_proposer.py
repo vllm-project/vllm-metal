@@ -4,11 +4,17 @@
 A :class:`DraftModelProposer` drafts with a *separate* full model (vLLM
 ``method="draft_model"``). It owns:
 
-- its own MLX draft model (loaded independently of the target), and
+- its own MLX draft model (loaded independently of the target),
 - its own physical :class:`MetalPagedKVCache`, sized to the *target's*
-  ``num_blocks`` and indexed by the *same* scheduler-allocated ``block_ids``
-  (token positions are identical between draft and target, so the block layout
-  is shared and no separate block allocator is needed).
+  ``num_blocks`` (a second KV store), and
+- its own block allocator over that ``num_blocks`` pool. The draft *cannot*
+  reuse the target's scheduler-allocated ``block_ids``: it drafts
+  ``num_speculative_tokens`` positions AHEAD of the committed length, while the
+  target's block table is exact-fit for that committed length and runs out at
+  the next block boundary (regression-pinned by
+  ``test_long_prompt_crosses_block_boundary``). K/V values still line up
+  position-for-position across the two caches; only the block table is owned
+  separately.
 
 Each scheduler step ``propose()`` runs, batched over the dynamic mixed batch:
 
@@ -95,10 +101,13 @@ class DraftModelProposer:
     ) -> None:
         self._model = model
         self._block_size = block_size
-        self._num_layers = num_layers
         self._num_speculative_tokens = num_speculative_tokens
         self._controller = controller
         self._extract_logits = extract_logits
+        # Stateless RoPE/mask shims for the draft forward (one per layer). The
+        # real per-request offsets come from the paged context, so these carry
+        # no state — allocate once and reuse across steps, not per propose().
+        self._offset_caches = [OffsetCache(0) for _ in range(num_layers)]
         # Committed positions written into the draft cache, per request.
         self._draft_seq_lens: dict[str, int] = {}
         # The draft owns its block allocation: it drafts K positions AHEAD of
@@ -169,16 +178,16 @@ class DraftModelProposer:
         if not plans:
             return None
 
-        offset_caches = [OffsetCache(0) for _ in range(self._num_layers)]
-
         # Step 1: ingest committed suffixes; first draft token per request.
         draft_cols: list[mx.array] = [
-            self._ingest_and_draft_first(plans, offset_caches)
+            self._ingest_and_draft_first(plans, self._offset_caches)
         ]
         # Steps 2..K: single-token decode per request.
         for draft_index in range(1, self._num_speculative_tokens):
             draft_cols.append(
-                self._draft_step(plans, draft_cols[-1], draft_index, offset_caches)
+                self._draft_step(
+                    plans, draft_cols[-1], draft_index, self._offset_caches
+                )
             )
 
         drafts = mx.stack(draft_cols, axis=1)  # [num_plans, K]

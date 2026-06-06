@@ -57,7 +57,10 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
-from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantRuntime
+from vllm_metal.v1.gemma4_mtp import (
+    Gemma4MTPAssistantRuntime,
+    Gemma4MTPAssistantSource,
+)
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -678,15 +681,18 @@ class MetalModelRunner:
     def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
         """Construct the polymorphic drafter once the paged cache is ready.
 
-        One factory for both speculative methods. Gemma4 MTP uses the in-model
-        assistant loaded in ``ModelLifecycle`` (read lazily); draft-model SD
-        loads its own model + a paged cache sized to the target's ``num_blocks``
-        — which is why this runs after the paged backend exists.
+        One factory for both speculative methods, keyed on the speculative
+        method. Gemma4 MTP uses the in-model assistant loaded in
+        ``ModelLifecycle`` (read lazily by the proposer); draft-model SD loads
+        its own model + a paged cache sized to the target's ``num_blocks`` —
+        which is why this runs after the paged backend exists. A configured but
+        unsupported method fails loud rather than silently degrading to plain
+        decode (which would look like a drafter that never accepts anything).
         """
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
-        if self._gemma4_mtp_assistant is not None:
+        if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
@@ -698,6 +704,11 @@ class MetalModelRunner:
                 num_blocks=num_blocks,
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
+            )
+        else:
+            raise NotImplementedError(
+                f"Speculative method {spec.method!r} is not supported on Metal "
+                "(supported: Gemma4 MTP, draft_model)."
             )
 
     def estimate_one_sequence_kv_bytes(

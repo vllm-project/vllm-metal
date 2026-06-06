@@ -208,3 +208,53 @@ class TestDraftModelSpecDecode:
             f"expected {max_tokens} tokens, got {len(ids)} — draft likely "
             "crossed a KV block boundary (own-block-allocator regression)"
         )
+
+    @pytest.mark.slow
+    def test_draft_acceptance_rate_is_total(self, sd_engine):
+        """Single-stream draft acceptance must be 100% when draft == target.
+
+        Output correctness does NOT prove drafting works: verification corrects
+        every rejected draft, so an inert or garbage drafter still reproduces
+        greedy output and passes the tests above. Acceptance is the only signal
+        that the draft model is genuinely proposing the *target's* tokens.
+
+        Fed one prompt at a time (batch size 1), every draft token equals the
+        target's verify argmax — measured 54/54 — so the rate is exactly 100%.
+        A mixed batch dips slightly (~51/54): cross-request GEMM batching shifts
+        a near-tie argmax (the documented MLX batch-size FP behavior), which is
+        why the continuous-batching test does not require full identity. That
+        dip is FP, not a drafter bug — the same prompts accept every draft in
+        isolation here.
+        """
+        runner = sd_engine.llm_engine.model_executor.driver_worker.model_runner
+        controller = runner._spec_decode_controller
+        original_verify = controller.verify_greedy
+        counts = {"accepted": 0, "drafted": 0}
+
+        def counting_verify(logits, decode_reqs, decode_segments, *, logitsprocs):
+            # Each verified row is (accepted drafts) + 1 trailing token: the
+            # bonus token when all drafts are accepted, else the target's
+            # correction at the first rejection. So accepted == len(row) - 1.
+            result = original_verify(
+                logits, decode_reqs, decode_segments, logitsprocs=logitsprocs
+            )
+            for segment, output_ids in zip(decode_segments, result, strict=True):
+                counts["drafted"] += len(segment.draft_token_ids)
+                counts["accepted"] += len(output_ids) - 1
+            return result
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(controller, "verify_greedy", counting_verify)
+            for prompt in PROMPTS:  # one at a time => batch size 1
+                _greedy(sd_engine, [prompt])
+
+        print(f"\n  single-stream acceptance: {counts['accepted']}/{counts['drafted']}")
+        assert counts["drafted"] > 0, (
+            "no drafts were proposed — the draft model never ran (inert drafter)"
+        )
+        assert counts["accepted"] == counts["drafted"], (
+            f"draft == target greedy must accept every draft in single-stream, "
+            f"got {counts['accepted']}/{counts['drafted']}. A shortfall means "
+            "drafts diverge from the target's argmax — stale draft KV or a wrong "
+            "block table — not the batch-size FP that only appears for B > 1."
+        )

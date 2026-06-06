@@ -91,23 +91,16 @@ class SpeculativeDecodeController:
         speculative_config: SpeculativeConfig | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
-        if use_async_scheduling and Gemma4MTPAssistantSource.is_gemma4_mtp(
-            speculative_config
-        ):
-            raise NotImplementedError(
-                "Gemma4 MTP speculative decoding on Metal requires synchronous "
-                "scheduling so take_draft_token_ids() can hand drafts back to "
-                "the scheduler. Use --no-async-scheduling."
+        if use_async_scheduling and (
+            Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
+            or (
+                speculative_config is not None and speculative_config.uses_draft_model()
             )
-        if (
-            use_async_scheduling
-            and speculative_config is not None
-            and speculative_config.uses_draft_model()
         ):
             raise NotImplementedError(
-                "Draft-model speculative decoding on Metal requires synchronous "
-                "scheduling so take_draft_token_ids() can hand drafts back to "
-                "the scheduler. Use --no-async-scheduling."
+                "Speculative decoding on Metal requires synchronous scheduling "
+                "so take_draft_token_ids() can hand drafts back to the "
+                "scheduler. Use --no-async-scheduling."
             )
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
