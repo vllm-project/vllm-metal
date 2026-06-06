@@ -281,3 +281,14 @@ def test_stale_artifacts_swallows_digest_errors(stale_env, monkeypatch):
     build._stamp_path(build._OUT).write_text("STALE")
     monkeypatch.setattr(build, "_input_hash", _raise(RuntimeError("boom")))
     assert build.stale_artifacts() == []
+
+
+def test_stale_artifacts_propagates_builder_drift(stale_env, monkeypatch):
+    # A KeyError means METALLIB_NAMES drifted from the source-builder map in
+    # _metallib_source -- a code bug. stale_artifacts() must let it surface, not
+    # swallow it to [] (which would hide the bug); only environmental failures
+    # (OSError/ImportError/RuntimeError) are swallowed.
+    _seed_fresh()  # stamps exist -> past the no-stamps short-circuit, into the try
+    monkeypatch.setattr(build, "_metallib_source", _raise(KeyError("gdn_kern")))
+    with pytest.raises(KeyError):
+        build.stale_artifacts()

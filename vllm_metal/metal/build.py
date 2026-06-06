@@ -282,8 +282,14 @@ def stale_artifacts() -> list[Path]:
     the ``_paged_ops`` ``.so`` (vs ``paged_ops.cpp`` et al.) and each
     ``.metallib`` (vs its ``.metal`` shaders) — checked through the single
     :func:`is_stale` mechanism. Returns ``[]`` for wheel installs (no stamps)
-    without importing the build deps, and never raises: a staleness check must
-    not break loading."""
+    without importing the build deps.
+
+    Environmental failures — mlx/nanobind not importable, a source file that
+    cannot be read — are swallowed (logged at debug) so a staleness check never
+    breaks loading. A programming error such as a ``METALLIB_NAMES`` entry with
+    no source builder (a ``KeyError`` from :func:`_metallib_source`) is
+    deliberately left to propagate: that is a bug to fix, not a condition to
+    hide behind ``[]``."""
     artifacts = (_OUT, *(metallib_path(n) for n in METALLIB_NAMES))
     if not any(_stamp_path(a).exists() for a in artifacts):
         return []
@@ -291,7 +297,10 @@ def stale_artifacts() -> list[Path]:
         digests = {_OUT: _input_hash(_build_spec())}
         for name in METALLIB_NAMES:
             digests[metallib_path(name)] = _metallib_digest(_metallib_source(name))
-    except (OSError, ImportError, RuntimeError, KeyError):
+    except (OSError, ImportError, RuntimeError) as exc:
+        # The check couldn't run (not a verdict on the artifacts); don't block a
+        # loadable install, but leave a breadcrumb instead of failing silently.
+        logger.debug("staleness check skipped (%s): %s", type(exc).__name__, exc)
         return []
     return [a for a in artifacts if is_stale(a, digests[a])]
 
