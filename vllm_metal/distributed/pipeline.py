@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import tempfile
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -186,3 +187,37 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
             f"got shape {tuple(h.shape)}"
         )
     return mx.distributed.send(h[0], pp.rank + 1, group=pp.group)
+
+
+class PipelinedModel:
+    """PP-aware forward wrapper: runs an mlx_lm model as a single pipeline stage.
+
+    Owns the stage *forward*: the first stage embeds ``input_ids``; every later
+    stage receives the upstream hidden state and feeds it in as
+    ``input_embeddings``; the local (already-sliced) layers run, and the last
+    stage applies the final norm + head. Returns this stage's raw model output
+    on the last rank (the caller extracts logits), otherwise the raw hidden
+    state for the caller to send downstream.
+
+    vLLM's own models carry this contract internally (``make_layers`` +
+    ``forward(intermediate_tensors=...)``); here we wrap instead, because the
+    mlx_lm model files stay untouched. The matching *send* is owned by the
+    caller (the runner), so the lazy transfer is evaluated alongside its other
+    forward evals.
+    """
+
+    def __init__(self, model: Any, pp: PipelineGroup) -> None:
+        self._model = model
+        self._pp = pp
+
+    def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
+        pp = self._pp
+        h_in: mx.array | None = None
+        if not pp.is_first:
+            embed = self._model.model.embed_tokens.weight
+            h_in = pipeline_recv(pp, input_ids.shape[1], embed.shape[-1], embed.dtype)
+        if pp.is_last:
+            # full backbone + final norm + tied/explicit head -> model output
+            return self._model(input_ids, cache=cache, input_embeddings=h_in)
+        # backbone only (norm is nn.Identity on non-last) -> raw hidden state
+        return self._model.model(input_ids, cache=cache, input_embeddings=h_in)

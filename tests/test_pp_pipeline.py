@@ -13,6 +13,7 @@ import pytest
 
 from vllm_metal.distributed.pipeline import (
     _MLX_RING_BASE_PORT,
+    PipelinedModel,
     PipelineGroup,
     _ring_hosts,
     apply_pipeline_split,
@@ -140,3 +141,22 @@ class TestRingHosts:
         ports = [int(h[0].rsplit(":", 1)[1]) for h in hosts]
         assert ports == [_MLX_RING_BASE_PORT + i for i in range(3)]
         assert len(set(ports)) == 3  # distinct ports avoid bind conflicts
+
+
+class TestPipelinedModel:
+    def test_singleton_runs_full_model_without_recv(self) -> None:
+        # size-1 group: is_first and is_last are both true, so the wrapper runs
+        # the full model (no recv) and passes input_embeddings=None — the model
+        # embeds the tokens itself.
+        class _Stub:
+            def __init__(self) -> None:
+                self.input_embeddings: object = "unset"
+
+            def __call__(self, input_ids, *, cache=None, input_embeddings=None):
+                self.input_embeddings = input_embeddings
+                return "logits"
+
+        stub = _Stub()
+        out = PipelinedModel(stub, _pp(0, 1))("ids", cache=None)
+        assert out == "logits"
+        assert stub.input_embeddings is None

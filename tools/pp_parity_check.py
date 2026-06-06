@@ -27,9 +27,9 @@ import numpy as np
 from mlx_lm import load
 
 from vllm_metal.distributed.pipeline import (
+    PipelinedModel,
     PipelineGroup,
     apply_pipeline_split,
-    pipeline_recv,
     pipeline_send,
 )
 
@@ -75,28 +75,20 @@ def run_pipeline(model, tokenizer, model_id: str, pp: PipelineGroup) -> None:
     span = apply_pipeline_split(model, pp)
     ids = _token_ids(tokenizer, PROMPT)
     input_ids = mx.array([ids])
-    n_tokens = len(ids)
-    hidden = _hidden_size(model)
-    dtype = model.model.embed_tokens.weight.dtype
 
     print(
         f"[rank {pp.rank}/{pp.size}] is_first={pp.is_first} is_last={pp.is_last} "
-        f"layers={span} n_tokens={n_tokens} hidden={hidden} dtype={dtype}"
+        f"layers={span} n_tokens={len(ids)} hidden={_hidden_size(model)}"
     )
 
-    # pipeline_send/recv own the batch-axis squeeze/unsqueeze, so the model
-    # forward always sees the batched (1, n_tokens, hidden) while the wire
-    # carries the compact 2D (n_tokens, hidden).
-    if pp.is_first:
-        h_in = None
-    else:
-        h_in = pipeline_recv(pp, n_tokens, hidden, dtype)
+    # Drive the real PP wrapper the engine runner uses: it owns the stage forward
+    # (recv -> local layers -> final norm + head on the last stage). The caller
+    # owns the send, exactly as the runner does.
+    stage_output = PipelinedModel(model, pp)(input_ids, cache=None)
 
     if pp.is_last:
-        # Full backbone (norm intact) + tied/explicit head -> logits.
-        logits = model(input_ids, cache=None, input_embeddings=h_in)
-        mx.eval(logits)
-        logits_last = np.array(logits[0, -1].astype(mx.float32))
+        mx.eval(stage_output)
+        logits_last = np.array(stage_output[0, -1].astype(mx.float32))
 
         ref = np.load(_ref_path(model_id))
         max_abs_diff = float(np.max(np.abs(logits_last - ref)))
@@ -111,12 +103,12 @@ def run_pipeline(model, tokenizer, model_id: str, pp: PipelineGroup) -> None:
         else:
             print(f"PARITY FAIL max_abs_diff={max_abs_diff:.3e}")
     else:
-        # Raw hidden (norm == Identity on non-last) -> send downstream. The
-        # wrapper drops the batch axis for the compact 2D wire.
-        h_out = model.model(input_ids, cache=None, input_embeddings=h_in)
-        sent = pipeline_send(h_out, pp)
+        # Runner owns the send: push the raw hidden state to the next stage.
+        sent = pipeline_send(stage_output, pp)
         mx.eval(sent)
-        print(f"[rank {pp.rank}] sent hidden {h_out.shape} -> rank {pp.rank + 1}")
+        print(
+            f"[rank {pp.rank}] sent hidden {stage_output.shape} -> rank {pp.rank + 1}"
+        )
 
 
 def main() -> None:
