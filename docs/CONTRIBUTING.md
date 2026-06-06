@@ -8,7 +8,8 @@ Thanks for your interest in contributing! This plugin targets **Apple Silicon Ma
 git clone https://github.com/vllm-project/vllm-metal.git
 cd vllm-metal
 
-# Creates ./.venv-vllm-metal/ and installs vLLM core + the plugin
+# Creates ./.venv-vllm-metal/, installs vLLM core + the plugin, and
+# prebuilds the native Metal kernels from your checkout
 ./install.sh
 
 # Activate the virtualenv
@@ -36,14 +37,9 @@ change is picked up.
 
 Requirements:
 
-- **Xcode Command Line Tools** (`xcode-select --install`) — provides `clang++`
-  for the C++ extension.
-- For shader (`.metal`) work, the **Metal toolchain**. Recent Xcode bundles it;
-  on Xcode 26+ it is a separate download:
-
-  ```bash
-  xcodebuild -downloadComponent MetalToolchain
-  ```
+- **Xcode Command Line Tools** (`xcode-select --install`) — `clang++` rebuilds
+  the `.so`; keep it current enough for the pinned MLX headers.
+- No Metal toolchain needed: MLX compiles the `.metal` shaders in-process.
 
 Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts are loaded as-is.
 If you edited a kernel source after building them locally, loading **fails

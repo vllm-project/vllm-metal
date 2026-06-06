@@ -4,7 +4,7 @@
 
 - macOS on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
-- Up-to-date Xcode Command Line Tools (`xcode-select --install`). The installer compiles vLLM from source via `clang++`; an outdated toolchain fails to compile. If a build fails on an existing install, update to the latest.
+- Xcode Command Line Tools (`xcode-select --install`). The installer compiles vLLM core from source via `clang++`.
 
 > **Metal kernels are prebuilt.** Release wheels ship the native paged-attention
 > extension (`_paged_ops*.so`) and its precompiled Metal shader libraries
