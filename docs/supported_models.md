@@ -1,6 +1,8 @@
 # Supported Models
 
-vllm-metal currently focuses on text-only language models on Apple Silicon. Multi-modal (vision / audio input) models are not yet supported.
+vllm-metal supports text language models and a small set of native multimodal
+models on Apple Silicon. Multimodal support is currently vision-only and runs on
+the paged backend.
 
 ## Legend
 
@@ -34,6 +36,18 @@ validation guidance. The reranker requires Qwen3 sequence-classification
 | --- | --- | --- | --- |
 | Qwen3-Embedding | 🔵 | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
 | Qwen3-Reranker | 🔵 | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
+
+## Multimodal Language Models
+
+Native multimodal support currently targets vision-language requests on the
+paged backend. The first supported family is PaddleOCR-VL; it uses the
+model-level M-RoPE position policy exposed by mlx-vlm and is limited to one image
+per request until the pinned mlx-vlm dependency includes multi-image
+`get_rope_index` fixes.
+
+| Model | Support | Runner | Scope | Example checkpoint |
+| --- | --- | --- | --- | --- |
+| PaddleOCR-VL | 🔵 | native multimodal paged generation | vision input, one image per request | `PaddlePaddle/PaddleOCR-VL-1.6` |
 
 ## Text-Only Language Models
 
