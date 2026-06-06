@@ -99,6 +99,16 @@ class SpeculativeDecodeController:
                 "scheduling so take_draft_token_ids() can hand drafts back to "
                 "the scheduler. Use --no-async-scheduling."
             )
+        if (
+            use_async_scheduling
+            and speculative_config is not None
+            and speculative_config.uses_draft_model()
+        ):
+            raise NotImplementedError(
+                "Draft-model speculative decoding on Metal requires synchronous "
+                "scheduling so take_draft_token_ids() can hand drafts back to "
+                "the scheduler. Use --no-async-scheduling."
+            )
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
@@ -302,7 +312,7 @@ class SpeculativeDecodeController:
             decode_token_ids,
             strict=True,
         ):
-            if not sampled_ids or not self._can_draft_greedy(
+            if not sampled_ids or not self.can_draft_greedy(
                 req_id,
                 state,
                 logitsprocs=logitsprocs,
@@ -325,7 +335,7 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate":
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self._can_draft_greedy(
+            if state is None or not self.can_draft_greedy(
                 prefill.req_id,
                 state,
                 logitsprocs=logitsprocs,
@@ -344,13 +354,14 @@ class SpeculativeDecodeController:
 
         return tuple(seeds)
 
-    def _can_draft_greedy(
+    def can_draft_greedy(
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
         *,
         logitsprocs: LogitsProcessors | None,
     ) -> bool:
+        """Whether a request may be drafted under greedy-only spec decode."""
         try:
             self._validate_greedy_sampling(
                 [(req_id, request_state)],

@@ -624,6 +624,10 @@ class WorkerCachePlanner:
             block_size=plan.block_size,
         )
         n_patched = backend.patch_model(self._worker.model_runner.model)
+        self._worker.model_runner.install_drafter(
+            num_blocks=plan.num_blocks,
+            block_size=plan.block_size,
+        )
         config = get_config()
         if config.kv_sharing_fast_prefill:
             from vllm_metal.yoco_fast_prefill import try_enable_gemma4_yoco_fast_prefill

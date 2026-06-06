@@ -16,6 +16,7 @@ from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.paged_attention_backend.hybrid import HybridPagedAttentionBackend
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
+from vllm_metal.v1.proposer import Gemma4MTPProposer
 
 
 class _HybridBackendStub(HybridPagedAttentionBackend):
@@ -257,6 +258,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     def test_start_paged_forward_includes_scheduled_drafts(self, monkeypatch) -> None:
         runner = self._make_runner()
         runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._paged_request_seq_lens["r0"] = 1
@@ -409,6 +411,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     ) -> None:
         runner = self._make_runner()
         runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._paged_request_seq_lens["r0"] = 1
@@ -457,6 +460,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     ) -> None:
         runner = self._make_runner()
         runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
         runner.num_layers = 0
         runner._paged_block_size = 4
 
@@ -513,6 +517,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
     ) -> None:
         runner = self._make_runner()
         runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
         runner.num_layers = 0
         runner._paged_block_size = 4
 
@@ -621,6 +626,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         runner = self._make_runner()
         runner._gemma4_mtp_assistant = Assistant()
         runner._model_adapter = Adapter()
+        runner._drafter = Gemma4MTPProposer(runner)
         req_state = self._make_state([1, 6])
         decode_reqs = [("r0", req_state)]
         segment = mr.PagedDecodeSegment(
@@ -693,6 +699,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         runner = self._make_runner()
         runner._gemma4_mtp_assistant = Assistant()
         runner._model_adapter = Adapter()
+        runner._drafter = Gemma4MTPProposer(runner)
         prefill = mr.PrefillRequest(
             req_id="p0",
             token_ids=[5, 6],

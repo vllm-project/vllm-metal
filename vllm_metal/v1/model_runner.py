@@ -74,6 +74,11 @@ from vllm_metal.v1.pooling import (
     supported_pooling_tasks,
     validate_pooling_request,
 )
+from vllm_metal.v1.proposer import (
+    Gemma4MTPProposer,
+    MetalProposer,
+    ProposeContext,
+)
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
@@ -270,6 +275,7 @@ class MetalModelRunner:
         )
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
+        self._drafter: MetalProposer | None = None
         self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
@@ -669,6 +675,31 @@ class MetalModelRunner:
             block_size=block_size,
         )
 
+    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+        """Construct the polymorphic drafter once the paged cache is ready.
+
+        One factory for both speculative methods. Gemma4 MTP uses the in-model
+        assistant loaded in ``ModelLifecycle`` (read lazily); draft-model SD
+        loads its own model + a paged cache sized to the target's ``num_blocks``
+        — which is why this runs after the paged backend exists.
+        """
+        spec = self.vllm_config.speculative_config
+        if spec is None:
+            return
+        if self._gemma4_mtp_assistant is not None:
+            self._drafter = Gemma4MTPProposer(self)
+        elif spec.uses_draft_model():
+            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
+            self._drafter = DraftModelProposer.build(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                extract_logits=self._model_adapter.extract_logits,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                dtype=self.kv_cache_dtype,
+            )
+
     def estimate_one_sequence_kv_bytes(
         self, *, max_model_len: int, block_size: int
     ) -> int:
@@ -913,10 +944,10 @@ class MetalModelRunner:
         # states here.
         collect_target_hidden_states = (
             not has_pooling_work
-            and self._spec_decode_controller.needs_target_hidden_states(
+            and self._drafter is not None
+            and self._drafter.needs_target_hidden_states(
                 decode_segments,
                 has_final_prefill=any(pr.prompt_len is not None for pr in prefill_reqs),
-                speculative_config=self.vllm_config.speculative_config,
             )
         )
 
@@ -1279,48 +1310,13 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
-        self._prepare_gemma4_mtp_draft_tokens(
+        draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,
             prefill_reqs=prefill_reqs,
             prefill_token_ids=prefill_result.token_ids,
-            batch=batch,
-            cu_seqlens=cu_seqlens,
-            num_decode_segments=num_decode_segments,
-        )
-
-        return batch, scheduler_output
-
-    def _prepare_gemma4_mtp_draft_tokens(
-        self,
-        *,
-        target_hidden_states: mx.array | None,
-        decode_reqs: list[tuple[str, RequestState]],
-        decode_segments: tuple[PagedDecodeSegment, ...],
-        decode_token_ids: list[list[int]],
-        prefill_reqs: list[PrefillRequest],
-        prefill_token_ids: list[int],
-        batch: _ExecutionBatch,
-        cu_seqlens: list[int],
-        num_decode_segments: int,
-    ) -> None:
-        """Ask the Gemma4 MTP assistant for drafts after target sampling."""
-        assistant = self._gemma4_mtp_assistant
-        if (
-            assistant is None
-            or not assistant.forward_ready
-            or target_hidden_states is None
-        ):
-            return
-
-        seeds = self._spec_decode_controller.build_gemma4_mtp_draft_seeds(
-            decode_reqs=decode_reqs,
-            decode_segments=decode_segments,
-            decode_token_ids=decode_token_ids,
-            prefill_reqs=prefill_reqs,
-            prefill_token_ids=prefill_token_ids,
             prefill_result_modes=[
                 entry.result_mode for entry in batch.paged_prefill_entries
             ],
@@ -1329,22 +1325,11 @@ class MetalModelRunner:
             num_decode_segments=num_decode_segments,
             logitsprocs=self._logitsprocs,
         )
-        if not seeds:
-            return
+        self._draft_token_ids = (
+            self._drafter.propose(draft_ctx) if self._drafter is not None else None
+        )
 
-        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
-        target_input_embeddings = self._target_input_embeddings(input_ids)
-        draft_token_ids = assistant.propose_draft_token_ids(
-            seeds=seeds,
-            target_hidden_states=target_hidden_states,
-            target_input_embeddings=target_input_embeddings,
-        )
-        if not draft_token_ids:
-            return
-        self._draft_token_ids = DraftTokenIds(
-            req_ids=[seed.req_id for seed in seeds],
-            draft_token_ids=draft_token_ids,
-        )
+        return batch, scheduler_output
 
     def _register_new_request_mm_features(
         self, req_id: str, new_req: NewRequestData
