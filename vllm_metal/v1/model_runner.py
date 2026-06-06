@@ -32,7 +32,12 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -47,6 +52,7 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
+from vllm_metal.distributed import PipelineGroup, pipeline_recv, pipeline_send
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -307,6 +313,12 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
+        # Layer counts derived from the model config by ModelLifecycle after
+        # load (declared here so the type is fixed; apply_pipeline_split resets
+        # both to this stage's local slice under pipeline parallelism).
+        self.num_layers: int = 0
+        self.num_kv_cache_layers: int = 0
+
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
         self.head_dim_per_layer: list[int] | None = None
@@ -316,6 +328,11 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+
+        # Pipeline-parallel group (set by the worker when pipeline_parallel_size
+        # > 1). None means single-stage: the forward and sampling paths run
+        # exactly as before, with no cross-stage send/recv.
+        self.pp: PipelineGroup | None = None
 
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
@@ -400,6 +417,45 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
+
+    def apply_pipeline_split(self, pp: PipelineGroup) -> None:
+        """Slice the loaded model to this pipeline stage and fix layer counts.
+
+        Called by the worker after ``load_model`` (Phase 0 load-then-slice).
+        Delegates the in-place backbone slice to the adapter, then resets the
+        runner's layer accounting to the LOCAL slice so per-layer offset caches
+        (``_start_paged_forward``) and the KV-cache spec size only this stage's
+        layers — not the full model.
+
+        Only the validated path (uniform MHA, e.g. Qwen3) is supported under
+        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
+        KV-cache layer accounting does not map cleanly onto a contiguous layer
+        slice yet.
+        """
+        if pp.size == 1:
+            return
+
+        unsupported = (
+            self._yoco_cache_mapping is not None
+            or self.is_hybrid
+            or self.is_mla
+            or self._is_pooling
+            or not self.metal_config.use_paged_attention
+        )
+        if unsupported:
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal is validated only for uniform-"
+                "attention generation on the paged path (e.g. Qwen3 with "
+                "VLLM_METAL_USE_PAGED_ATTENTION=1); YOCO / hybrid (GDN) / MLA / "
+                "pooling / non-paged configs are not supported under PP yet."
+            )
+
+        self._model_adapter.apply_pipeline_split(self.model, pp)
+        # Mirror the sliced backbone's local layer count onto the runner so
+        # offset_caches and KV-cache sizing cover only this stage's layers.
+        local_num_layers = len(self._forward_model.model.layers)
+        self.num_layers = local_num_layers
+        self.num_kv_cache_layers = local_num_layers
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
@@ -562,6 +618,45 @@ class MetalModelRunner:
         return self._model_adapter.target_input_embeddings(
             self._forward_model, input_ids
         )
+
+    def _pp_stage_forward(
+        self, input_ids: mx.array, cache: list[OffsetCache]
+    ) -> tuple[mx.array | None, mx.array | None]:
+        """Run one pipeline stage: recv -> local layers -> send.
+
+        Returns ``(logits, send_handle)``:
+        - last stage  -> ``(logits, None)`` (full backbone + norm + head);
+        - other stage -> ``(None, send_handle)`` (raw hidden state piped on).
+
+        The first stage embeds ``input_ids`` itself (``input_embeddings=None``);
+        every later stage consumes the hidden state received from its
+        predecessor. ``input_ids`` is ``(1, n_tokens)``; the piped activation is
+        ``(n_tokens, hidden)`` in the model's activation dtype (taken from the
+        shared embedding weight, identical on every stage under load-then-slice).
+        """
+        pp = self.pp
+        assert pp is not None and pp.size > 1
+        assert self.hidden_size is not None, (
+            "pipeline parallelism requires a known hidden size; "
+            "self.hidden_size is None for this model/config"
+        )
+        backbone = self._forward_model.model
+
+        if pp.is_first:
+            h_in: mx.array | None = None
+        else:
+            n_tokens = input_ids.shape[1]
+            dtype = backbone.embed_tokens.weight.dtype
+            h_in = pipeline_recv(pp, n_tokens, self.hidden_size, dtype)
+
+        if pp.is_last:
+            output = self._forward_model(input_ids, cache=cache, input_embeddings=h_in)
+            return self._extract_logits(output), None
+
+        # Non-last stage: backbone only (norm is nn.Identity here), then pipe the
+        # raw hidden state to the next stage. No logits on this stage.
+        h_out = backbone(input_ids, cache=cache, input_embeddings=h_in)
+        return None, pipeline_send(h_out, pp)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Return and clear draft tokens generated by the last sampled step."""
@@ -966,6 +1061,8 @@ class MetalModelRunner:
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
+        # Lazy send op for the non-last pipeline stage (None otherwise).
+        pp_send_handle: mx.array | None = None
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
         try:
@@ -998,6 +1095,16 @@ class MetalModelRunner:
                 logits = self._extract_logits(model_output)
                 target_hidden_states = None
                 del model_output
+            elif self.pp is not None and self.pp.size > 1:
+                # Pipeline-parallel stage forward: receive the upstream hidden
+                # state (if not the first stage), run this stage's layer slice,
+                # and send the result downstream (if not the last stage). Only
+                # the last stage produces logits. ``pp_send_handle`` is the lazy
+                # send op that must be evaluated for the transfer to run.
+                logits, pp_send_handle = self._pp_stage_forward(
+                    input_ids, offset_caches
+                )
+                target_hidden_states = None
             else:
                 target_output = self._target_forward(
                     input_ids,
@@ -1014,6 +1121,12 @@ class MetalModelRunner:
         if has_pooling_work:
             assert pooling_hidden_states is not None
             mx.async_eval(pooling_hidden_states)
+        elif pp_send_handle is not None:
+            # Non-last pipeline stage: no logits, just push the hidden state to
+            # the next stage. async_eval on the send forces both the transfer
+            # and (transitively, via the sent activations) this stage's paged
+            # KV-cache writes.
+            mx.async_eval(pp_send_handle)
         else:
             assert logits is not None
             # For GDN prefill, state-cache updates are side effects that the
@@ -2211,6 +2324,13 @@ class MetalModelRunner:
         """
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
+            # Pipeline parallelism: only the last stage holds logits and samples.
+            # Non-last stages produced no logits (they piped their hidden state
+            # downstream), so clear the stash and return an empty output — the
+            # engine collects results from the last stage only.
+            if self.pp is not None and self.pp.size > 1 and not self.pp.is_last:
+                self._execute_model_state = None
+                return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             self._gdn_materialize_pending_state_cache()
             self._validate_scheduled_outputs(batch, scheduler_output)

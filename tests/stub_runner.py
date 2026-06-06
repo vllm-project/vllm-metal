@@ -47,6 +47,7 @@ def make_stub_runner(
         "_pending_output": None,
         "_draft_token_ids": None,
         "_execute_model_state": None,
+        "pp": None,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
         "kv_heads_per_layer": None,

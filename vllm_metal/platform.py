@@ -260,9 +260,17 @@ class MetalPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
-        # Set executor backend (use uniproc for single device)
+        # Resolve the executor backend. vLLM's ParallelConfig already defaults an
+        # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
+        # config/parallel.py), so for the common PP>1 case mp is selected upstream
+        # before this hook runs. This branch only covers what vLLM leaves unset:
+        # the PP==1 default of "uni" (a single in-process worker), and the
+        # explicit "auto" string ("uni" cannot host PP's per-stage processes).
         if parallel_config.distributed_executor_backend in ("auto", None):
-            parallel_config.distributed_executor_backend = "uni"
+            if parallel_config.pipeline_parallel_size > 1:
+                parallel_config.distributed_executor_backend = "mp"
+            else:
+                parallel_config.distributed_executor_backend = "uni"
         elif parallel_config.distributed_executor_backend == "ray":
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
             # actor's get_node_and_gpu_ids would KeyError on
@@ -293,14 +301,25 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
-        # Pipeline parallelism is not supported on Metal/MLX yet: the MLX model
-        # runner has no cross-stage activation hand-off (see
-        # MetalModelRunner.execute_model). Fail fast at config time rather than
-        # deep inside a Ray actor on the first decode step.
-        if parallel_config.pipeline_parallel_size > 1:
+        # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
+        # own worker process and the inter-stage activations cross the
+        # mx.distributed data plane (point-to-point send/recv), wired in the
+        # model runner (see MetalModelRunner._start_paged_forward). The control
+        # plane stays on vLLM's gloo group; the two transports coexist.
+        #
+        # Only PP with TP==1 is validated: world_size = PP * TP, so forcing
+        # TP==1 keeps the invariant global_rank == pipeline stage index that the
+        # PipelineGroup relies on. Reject the un-validated PP+TP combination
+        # loudly here (the TP>1 block below also rejects it, but fail fast on the
+        # PP path too rather than depend on block ordering).
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and parallel_config.tensor_parallel_size > 1
+        ):
             raise NotImplementedError(
-                "Metal/MLX does not support pipeline parallelism yet "
-                "(pipeline_parallel_size > 1)."
+                "Metal/MLX does not support combining pipeline and tensor "
+                "parallelism (pipeline_parallel_size > 1 with "
+                "tensor_parallel_size > 1); only PP with TP=1 is validated."
             )
 
         # Tensor parallelism is not supported on Metal/MLX yet: a single Apple

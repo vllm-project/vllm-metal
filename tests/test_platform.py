@@ -63,19 +63,69 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="only supports device 0"):
             MetalPlatform.set_device(torch.device("cpu", 1))
 
-    def test_check_and_update_config_rejects_pipeline_parallel(self) -> None:
-        """Pipeline parallelism is unsupported on Metal; reject it at config time."""
+    def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
+        self,
+    ) -> None:
+        """PP is allowed, but combining PP>1 with TP>1 is rejected at config time."""
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="uni",
                 pipeline_parallel_size=2,
+                tensor_parallel_size=2,
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
         )
-        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        with pytest.raises(
+            NotImplementedError, match="pipeline and tensor parallelism"
+        ):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_allows_pipeline_parallel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PP>1 with TP=1 is allowed and selects the multiproc executor."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=2,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            # Does not raise: PP>1 with TP=1 falls through the guard.
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            # "uni" cannot host two stages, so PP>1 defaults to the mp executor.
+            assert vllm_config.parallel_config.distributed_executor_backend == "mp"
+            assert (
+                vllm_config.parallel_config.worker_cls
+                == "vllm_metal.v1.worker.MetalWorker"
+            )
+        finally:
+            reset_config()
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
