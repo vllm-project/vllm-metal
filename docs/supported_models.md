@@ -44,7 +44,7 @@ Native multimodal support currently targets image-only vision-language requests 
 | Model | Support | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
-| PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, one image per request | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 
 ## Text-Only Language Models
 

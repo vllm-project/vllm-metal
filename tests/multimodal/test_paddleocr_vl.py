@@ -18,6 +18,9 @@ _SPATIAL_MERGE_SIZE = 2
 _IMAGE_GRID_THW_2X2 = (1, 4, 4)
 _IMAGE_TOKEN_COUNT_2X2 = 4
 _RAW_PATCH_COUNT_2X2 = 16
+_TEXT_TOKEN_ID = 10
+_VISION_START_TOKEN_ID = 20
+_IMAGE_PLACEHOLDER_TOKEN_ID = 30
 
 
 class _RecordingLanguageModel:
@@ -176,16 +179,26 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
         with pytest.raises(error_type, match=match):
             _adapter().get_mrope_input_positions([1, 2, 3], [feature])
 
-    def test_multiple_images_per_request_rejected(self) -> None:
-        # Guard against mlx-vlm < 0.6 multi-image position corruption; see
-        # mlx-vlm#1282.  Remove together with the adapter guard on bump.
+    def test_multiple_images_per_request_delegated_in_offset_order(self) -> None:
+        language_model = _RecordingLanguageModel()
+        adapter = _adapter(language_model=language_model)
         features = [
-            _feature(offset=1, grid_thw=(1, 4, 4), length=4, raw_patches=16),
             _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
+            _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
         ]
+        input_tokens = (
+            [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+            + [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * 6
+            + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
+        )
 
-        with pytest.raises(NotImplementedError, match="mlx-vlm#1282"):
-            _adapter().get_mrope_input_positions([1] * 12, features)
+        adapter.get_mrope_input_positions(input_tokens, features)
+
+        call = language_model.rope_calls[0]
+        assert call["input_ids"].tolist() == [input_tokens]
+        assert call["image_grid_thw"].tolist() == [[1, 4, 4], [1, 6, 4]]
 
 
 class TestPaddleOCRVLMultimodalAdapterPositions:
@@ -237,6 +250,23 @@ class TestPaddleOCRVLMultimodalAdapterEncodeMultimodal:
         assert call["pixel_values"].shape == (1, _RAW_PATCH_COUNT_2X2, 3, 14, 14)
         assert call["image_grid_thw"].tolist() == [[1, 4, 4]]
         assert call["output_hidden_states"] is False
+
+    def test_encodes_multiple_image_features(self) -> None:
+        visual = _RecordingVisual()
+        adapter = _adapter(visual=visual)
+        features = [
+            _feature(offset=1, grid_thw=(1, 4, 4), raw_patches=16),
+            _feature(offset=8, grid_thw=(1, 6, 4), raw_patches=24),
+        ]
+
+        outputs = adapter.encode_multimodal(features)
+
+        assert len(outputs) == 2
+        assert [call["image_grid_thw"].tolist() for call in visual.calls] == [
+            [[1, 4, 4]],
+            [[1, 6, 4]],
+        ]
+        assert visual.calls[1]["pixel_values"].shape == (1, 24, 3, 14, 14)
 
     @pytest.mark.parametrize("weight_dtype", [mx.float16, mx.bfloat16, mx.float32])
     def test_casts_pixel_values_to_visual_weight_dtype(

@@ -157,18 +157,13 @@ class PaddleOCRVLMultimodalAdapter:
                 "Construct via PaddleOCRVLMultimodalAdapter.from_loaded_model."
             )
 
-        self._validate_image_features(mm_features)
+        sorted_features = sorted(mm_features, key=lambda f: f.mm_position.offset)
+        image_grid_thw_values = self._validate_image_features_and_collect_grids(
+            sorted_features
+        )
         image_grid_thw = (
-            mx.array(
-                [
-                    self._grid_thw(feature.data, "image_grid_thw")
-                    for feature in sorted(
-                        mm_features, key=lambda f: f.mm_position.offset
-                    )
-                ],
-                dtype=mx.int32,
-            )
-            if mm_features
+            mx.array(image_grid_thw_values, dtype=mx.int32)
+            if image_grid_thw_values
             else None
         )
         input_ids = mx.array([input_tokens], dtype=mx.int32)
@@ -208,21 +203,12 @@ class PaddleOCRVLMultimodalAdapter:
             position_ids=position_ids,
         )
 
-    def _validate_image_features(
+    def _validate_image_features_and_collect_grids(
         self,
         features: list[MultiModalFeatureSpec],
-    ) -> None:
-        # mlx-vlm < 0.6 mis-counts vision blocks for prompts with more than
-        # one image (mx.sum collapse of vision-start indices), silently
-        # corrupting M-RoPE positions.  Fixed upstream in mlx-vlm#1282; drop
-        # this guard once the pinned mlx-vlm includes that fix.
-        if len(features) > 1:
-            raise NotImplementedError(
-                "Multiple images per request are not yet supported: the "
-                "installed mlx-vlm get_rope_index mis-counts multi-image "
-                "prompts (fixed upstream in mlx-vlm#1282)."
-            )
-        for feature in sorted(features, key=lambda feature: feature.mm_position.offset):
+    ) -> list[tuple[int, int, int]]:
+        image_grid_thw_values: list[tuple[int, int, int]] = []
+        for feature in features:
             modality = feature.modality
             if modality == "video":
                 raise NotImplementedError(
@@ -248,6 +234,9 @@ class PaddleOCRVLMultimodalAdapter:
                     f"{num_grid_tokens} multimodal embeddings, got "
                     f"mm_position.get_num_embeds()={num_embeds}"
                 )
+            image_grid_thw_values.append((t, h, w))
+
+        return image_grid_thw_values
 
     @classmethod
     def _grid_thw(cls, data: MultiModalKwargsItem, key: str) -> tuple[int, int, int]:
