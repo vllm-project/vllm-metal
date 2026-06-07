@@ -40,49 +40,69 @@ If a node isn't advertising the `mlx` resource, the engine can't place workers: 
 
 On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_and_gpu_ids on RayWorkerProc (Apple-GPU custom Ray resource)` — confirming the custom-resource override fired inside the Ray actor.
 
-## Quick start (two Macs)
+## Quick start (two Macs over Thunderbolt)
 
-Run one model split across two Macs with [pipeline parallelism](#pipeline-parallelism): **stage 0** (first layers) on Mac A, **stage 1** (last layers + sampling) on Mac B. Ray is the control plane; the cross-stage activations travel over the MLX ring.
+Run one model split across two Macs with [pipeline parallelism](#pipeline-parallelism): **stage 0** (first layers) on Mac A, **stage 1** (last layers + sampling) on Mac B. Ray is the control plane; the cross-stage activations travel over the **MLX ring** on a direct **Thunderbolt cable**. That high-bandwidth, low-latency link is what makes PP across machines worthwhile — Wi-Fi / Ethernet is too slow to serve over, so Thunderbolt is the supported transport.
 
 !!! note
-    Multi-Mac serving is new and not yet validated end-to-end — start with the small model below to check the plumbing, then scale up. Both Macs must have the model cached, be reachable on the same network, and allow the MLX ring ports (`32323`/`32324` here) between them.
+    Multi-Mac serving is new and **not yet validated end-to-end** — start with the small model below to check the plumbing, then scale up. Both Macs must have the model cached, the Thunderbolt bridge reachable, and each Mac's firewall must allow the MLX ring ports (`32323`/`32324`).
 
-**Mac A** — start the Ray head (pin the IP to what vLLM resolves):
+!!! note
+    A multi-node Ray cluster on **macOS** needs two extra env vars on every node, both exported in the commands below: `RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` (macOS clustering is gated behind it), and — only if the two Macs aren't on the identical Python build — `RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor` (Ray otherwise refuses to join nodes whose Python differs even at the *patch* level; the same minor version is wire-compatible).
+
+Connect the two Macs with a Thunderbolt / USB4 cable — macOS auto-creates a "Thunderbolt Bridge" interface — and give it a static IP on each (same subnet, different last octet):
+
+```bash
+# Mac A
+sudo networksetup -setmanual "Thunderbolt Bridge" 10.0.0.1 255.255.255.0
+# Mac B
+sudo networksetup -setmanual "Thunderbolt Bridge" 10.0.0.2 255.255.255.0
+```
+
+From Mac A, confirm the cable is up: `ping -c3 10.0.0.2`.
+
+**Mac A** — start the Ray head, pinned to its Thunderbolt IP:
 
 ```bash
 source .venv-vllm-metal/bin/activate
-IP_A=$(python -c "from vllm.utils.network_utils import get_ip; print(get_ip())")
-ray start --head --node-ip-address="$IP_A" --resources='{"mlx": 1}'
-echo "Mac A IP: $IP_A"   # hand this to Mac B
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1            # multi-node Ray on macOS
+export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor   # only if the Macs' Python patch versions differ
+VLLM_HOST_IP=10.0.0.1 ray start --head \
+  --node-ip-address=10.0.0.1 --resources='{"mlx": 1}'
 ```
 
-**Mac B** — join the cluster (use Mac A's IP printed above):
+**Mac B** — join over Mac A's Thunderbolt IP:
 
 ```bash
 source .venv-vllm-metal/bin/activate
-ray start --address="<IP_A>:6379" --resources='{"mlx": 1}'
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor   # only if the Macs' Python patch versions differ
+VLLM_HOST_IP=10.0.0.2 ray start --address=10.0.0.1:6379 \
+  --node-ip-address=10.0.0.2 --resources='{"mlx": 1}'
 ```
 
-**Mac A** — serve across both Macs as two pipeline stages:
+**Mac A** — serve across both stages:
 
 ```bash
-RAY_ADDRESS=auto VLLM_METAL_USE_PAGED_ATTENTION=1 \
+RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_USE_PAGED_ATTENTION=1 \
   vllm serve Qwen/Qwen3-0.6B \
     --distributed-executor-backend ray \
     --pipeline-parallel-size 2 \
     --tensor-parallel-size 1
 ```
 
-On a healthy boot each worker logs its stage — `Pipeline stage 0/2 (is_first=True, is_last=False)` and `Pipeline stage 1/2 (is_first=False, is_last=True)` — and the MLX ring bootstrap lists both Macs' IPs.
+On a healthy boot each worker logs its stage — `Pipeline stage 0/2 (is_first=True, is_last=False)` and `Pipeline stage 1/2 (is_first=False, is_last=True)` — and the MLX ring bootstrap lists both Macs' Thunderbolt IPs.
 
-**Query** (from either Mac):
+**Query** (from Mac A):
 
 ```bash
-curl -s http://<IP_A>:8000/v1/completions -H 'Content-Type: application/json' \
+curl -s http://10.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
   -d '{"model":"Qwen/Qwen3-0.6B","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
 ```
 
-Tear down with `ray stop` on **both** Macs. Once the small model works end to end, serve a model too large for a single Mac — that is the point of pipeline parallelism.
+Tear down with `ray stop` on **both** Macs, then revert the bridge: `sudo networksetup -setdhcp "Thunderbolt Bridge"`. Once the small model works end to end, serve a model too large for a single Mac — that is the point of pipeline parallelism.
+
+`VLLM_HOST_IP` is the load-bearing piece: it makes vLLM's `get_ip()` return the Thunderbolt address, so the cross-stage hand-off forms over the cable.
 
 ## How it works
 
