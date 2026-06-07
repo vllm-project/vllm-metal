@@ -383,35 +383,89 @@ def test_reject_scheduled_encoder_inputs_raises_when_no_adapter() -> None:
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
 
-def test_run_vision_encoders_calls_adapter_per_uncached_feature() -> None:
+def test_run_vision_encoders_batches_uncached_features() -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
-    features = [_feature("image-0")]
+    features = [_feature("image-0"), _feature("image-1")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
-    expected = mx.array([[1.0, 2.0]])
+    expected0 = mx.array([[1.0, 2.0]])
+    expected1 = mx.array([[5.0, 6.0]])
     adapter.queue_outputs(
         [
             [
                 Qwen3VLVisionEncodeResult(
-                    hidden_states=expected,
+                    hidden_states=expected0,
                     deepstack_visual_embeds=[mx.array([[3.0, 4.0]])],
-                )
+                ),
+                Qwen3VLVisionEncodeResult(
+                    hidden_states=expected1,
+                    deepstack_visual_embeds=None,
+                ),
             ]
         ]
     )
 
-    runner._run_vision_encoders({"req-0": [0]})
+    runner._run_vision_encoders({"req-0": [0, 1]})
 
     assert adapter.encode_calls == [features]
     stored = runner.encoder_cache.encoder_outputs["image-0"]
-    assert mx.allclose(stored.hidden_states, expected).item()
+    assert mx.allclose(stored.hidden_states, expected0).item()
     assert stored.deepstack_visual_embeds is not None
     assert mx.allclose(stored.deepstack_visual_embeds[0], mx.array([[3.0, 4.0]])).item()
+    assert mx.allclose(
+        runner.encoder_cache.encoder_outputs["image-1"].hidden_states,
+        expected1,
+    ).item()
+    assert (
+        runner.encoder_cache.encoder_outputs["image-1"].deepstack_visual_embeds is None
+    )
 
 
-def test_run_vision_encoders_skips_cached_features(fake_encode_result) -> None:
+def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    req0_features = [_feature("img-a"), _feature("img-b")]
+    req1_features = [_feature("img-c")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", req0_features)
+    runner.encoder_cache.add_request("req-1", req1_features)
+
+    runner._run_vision_encoders({"req-0": [0, 1], "req-1": [0]})
+
+    assert len(adapter.encode_calls) == 1
+    encoded_identifiers = [feature.identifier for feature in adapter.encode_calls[0]]
+    assert encoded_identifiers == ["img-a", "img-b", "img-c"]
+    assert set(runner.encoder_cache.encoder_outputs) == {"img-a", "img-b", "img-c"}
+
+
+def test_run_vision_encoders_skips_cached_and_batches_only_uncached_features(
+    fake_encode_result,
+) -> None:
+    runner = _runner_with_encoder_cache()
+    adapter = _RecordingAdapter()
+    runner._multimodal_adapter = adapter
+    features = [_feature("cached-image"), _feature("fresh-image")]
+    assert runner.encoder_cache is not None
+    runner.encoder_cache.add_request("req-0", features)
+    cached = fake_encode_result(mx.array([[7.0]]))
+    runner.encoder_cache.encoder_outputs["cached-image"] = cached
+
+    runner._run_vision_encoders({"req-0": [0, 1]})
+
+    assert len(adapter.encode_calls) == 1
+    assert [feature.identifier for feature in adapter.encode_calls[0]] == [
+        "fresh-image"
+    ]
+    assert runner.encoder_cache.encoder_outputs["cached-image"] is cached
+    assert "fresh-image" in runner.encoder_cache.encoder_outputs
+
+
+def test_run_vision_encoders_skips_adapter_call_when_all_features_cached(
+    fake_encode_result,
+) -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
@@ -427,22 +481,25 @@ def test_run_vision_encoders_skips_cached_features(fake_encode_result) -> None:
     assert runner.encoder_cache.encoder_outputs["image-0"] is cached
 
 
-def test_run_vision_encoders_iterates_multiple_requests_and_indices() -> None:
+def test_run_vision_encoders_deduplicates_repeated_feature_identifier_across_requests() -> (
+    None
+):
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
-    req0_features = [_feature("img-a"), _feature("img-b")]
-    req1_features = [_feature("img-c")]
+    req0_features = [_feature("shared-image")]
+    req1_features = [_feature("shared-image")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", req0_features)
     runner.encoder_cache.add_request("req-1", req1_features)
 
-    runner._run_vision_encoders({"req-0": [0, 1], "req-1": [0]})
+    runner._run_vision_encoders({"req-0": [0], "req-1": [0]})
 
-    assert len(adapter.encode_calls) == 3
-    encoded_identifiers = [call[0].identifier for call in adapter.encode_calls]
-    assert encoded_identifiers == ["img-a", "img-b", "img-c"]
-    assert set(runner.encoder_cache.encoder_outputs) == {"img-a", "img-b", "img-c"}
+    assert len(adapter.encode_calls) == 1
+    assert [feature.identifier for feature in adapter.encode_calls[0]] == [
+        "shared-image"
+    ]
+    assert set(runner.encoder_cache.encoder_outputs) == {"shared-image"}
 
 
 def test_run_vision_encoders_raises_for_unregistered_request() -> None:
@@ -463,11 +520,14 @@ def test_run_vision_encoders_raises_for_out_of_range_index() -> None:
         runner._run_vision_encoders({"req-0": [3]})
 
 
-def test_run_vision_encoders_raises_when_adapter_returns_wrong_count() -> None:
+@pytest.mark.parametrize("output_count", [1, 3])
+def test_run_vision_encoders_raises_when_adapter_returns_wrong_count(
+    output_count,
+) -> None:
     runner = _runner_with_encoder_cache()
     adapter = _RecordingAdapter()
     runner._multimodal_adapter = adapter
-    features = [_feature("image-0")]
+    features = [_feature("image-0"), _feature("image-1")]
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", features)
     adapter.queue_outputs(
@@ -476,17 +536,17 @@ def test_run_vision_encoders_raises_when_adapter_returns_wrong_count() -> None:
                 Qwen3VLVisionEncodeResult(
                     hidden_states=mx.zeros((1,)),
                     deepstack_visual_embeds=None,
-                ),
-                Qwen3VLVisionEncodeResult(
-                    hidden_states=mx.zeros((1,)),
-                    deepstack_visual_embeds=None,
-                ),
+                )
+                for _ in range(output_count)
             ]
         ]
     )
 
-    with pytest.raises(RuntimeError, match="encode_multimodal returned 2"):
-        runner._run_vision_encoders({"req-0": [0]})
+    with pytest.raises(
+        RuntimeError,
+        match=f"encode_multimodal returned {output_count}",
+    ):
+        runner._run_vision_encoders({"req-0": [0, 1]})
 
 
 def test_run_vision_encoders_no_op_when_no_adapter() -> None:
