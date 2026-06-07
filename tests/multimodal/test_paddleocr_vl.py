@@ -95,6 +95,54 @@ class _RecordingVisual:
         return mx.ones((_IMAGE_TOKEN_COUNT_2X2, 8), dtype=mx.float32)
 
 
+class _RealPaddleOCRVLGetRopeIndexLanguageModel:
+    def __init__(self) -> None:
+        try:
+            from mlx_vlm.models.paddleocr_vl.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
+            from mlx_vlm.models.paddleocr_vl.language import LanguageModel
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("mlx_vlm"):
+                pytest.skip("mlx-vlm is only installed on Darwin/arm64")
+            raise
+        except RuntimeError as exc:
+            if "No Metal device available" in str(exc):
+                pytest.skip("mlx-vlm import requires a Metal device")
+            raise
+
+        self._language_model_cls = LanguageModel
+        self.config = ModelConfig(
+            text_config=TextConfig(), vision_config=VisionConfig()
+        )
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids + 1)
+
+    @property
+    def image_token_id(self) -> int:
+        return int(self.config.image_token_id)
+
+    @property
+    def vision_start_token_id(self) -> int:
+        return int(self.config.vision_start_token_id)
+
+    def get_rope_index(
+        self,
+        input_ids: mx.array,
+        image_grid_thw: mx.array | None = None,
+        video_grid_thw: mx.array | None = None,
+        attention_mask: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        return self._language_model_cls.get_rope_index(
+            self,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+        )
+
+
 def _adapter(
     *,
     visual: Any | None = None,
@@ -199,6 +247,31 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
         call = language_model.rope_calls[0]
         assert call["input_ids"].tolist() == [input_tokens]
         assert call["image_grid_thw"].tolist() == [[1, 4, 4], [1, 6, 4]]
+
+    def test_multiple_images_exercise_real_mlx_vlm_rope_index(self) -> None:
+        language_model = _RealPaddleOCRVLGetRopeIndexLanguageModel()
+        adapter = _adapter(language_model=language_model)
+        features = [
+            _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
+            _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
+        ]
+        input_tokens = (
+            [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
+            + [language_model.image_token_id] * _IMAGE_TOKEN_COUNT_2X2
+            + [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
+            + [language_model.image_token_id] * 6
+            + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
+        )
+
+        positions, delta = adapter.get_mrope_input_positions(input_tokens, features)
+
+        assert positions.shape == (3, 1, 16)
+        assert delta == -5
+        assert positions[:, 0, :].tolist() == [
+            [0, 1, 2, 2, 2, 2, 4, 5, 6, 6, 6, 6, 6, 6, 9, 10],
+            [0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 10],
+            [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 6, 7, 6, 7, 9, 10],
+        ]
 
 
 class TestPaddleOCRVLMultimodalAdapterPositions:

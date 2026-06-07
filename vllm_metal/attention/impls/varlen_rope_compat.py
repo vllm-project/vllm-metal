@@ -65,25 +65,38 @@ def apply_precomputed_mrope(
     the attention layer itself.  Keep that model-specific apply policy in this
     compat module so SDPA projection/cache code can stay model-agnostic.
     """
-    from mlx_vlm.models.paddleocr_vl.language import (
-        apply_multimodal_rotary_pos_emb,
-    )
+    cos, sin = position_embeddings
+
+    rotary_emb = getattr(attn_module, "rotary_emb", None)
+    if rotary_emb is not None and getattr(rotary_emb, "style", None) == "interleaved":
+        from mlx_vlm.models.qwen3_5.language import apply_multimodal_rotary_pos_emb
+
+        return apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
     rope_parameters = getattr(attn_module, "rope_parameters", None)
-    if rope_parameters is None or "mrope_section" not in rope_parameters:
-        raise NotImplementedError(
-            f"Attention module {type(attn_module).__name__} received "
-            "precomputed M-RoPE embeddings but does not expose "
-            "rope_parameters['mrope_section']."
+    if rope_parameters is not None and "mrope_section" in rope_parameters:
+        from mlx_vlm.models.paddleocr_vl.language import (
+            apply_multimodal_rotary_pos_emb,
         )
 
-    cos, sin = position_embeddings
-    return apply_multimodal_rotary_pos_emb(
-        queries,
-        keys,
-        cos,
-        sin,
-        rope_parameters["mrope_section"],
+        return apply_multimodal_rotary_pos_emb(
+            queries,
+            keys,
+            cos,
+            sin,
+            rope_parameters["mrope_section"],
+        )
+
+    if rotary_emb is not None:
+        raise NotImplementedError(
+            f"Attention module {type(attn_module).__name__} received "
+            "precomputed M-RoPE embeddings but its rotary_emb style "
+            f"{getattr(rotary_emb, 'style', None)!r} is not supported."
+        )
+    raise NotImplementedError(
+        f"Attention module {type(attn_module).__name__} received precomputed "
+        "M-RoPE embeddings but does not expose a supported `rotary_emb` or "
+        "rope_parameters['mrope_section']."
     )
 
 
