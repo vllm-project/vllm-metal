@@ -43,19 +43,19 @@ fetch_latest_release() {
 extract_wheel_url() {
   local release_data="$1"
 
-  python3 -c "
-import sys
-import json
-try:
-    data = json.loads('''$release_data''')
-    assets = data.get('assets', [])
-    for asset in assets:
-        name = asset.get('name', '')
-        if name.endswith('.whl'):
-            print(asset.get('browser_download_url', ''))
-            break
-except Exception as e:
-    print('', file=sys.stderr)
+  # Pipe the JSON to Python on stdin as DATA. Do NOT interpolate it into the
+  # program text: embedding it in a source-string literal (json.loads('''...'''))
+  # lets Python's parser mangle the backslash/control sequences in the
+  # release-notes body, so json parsing throws and the wheel URL comes back
+  # empty -- surfacing as a misleading "No wheel file found in the latest
+  # release" even when the wheel is present.
+  printf '%s' "$release_data" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for asset in data.get('assets', []):
+    if asset.get('name', '').endswith('.whl'):
+        print(asset.get('browser_download_url', ''))
+        break
 "
 }
 
