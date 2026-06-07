@@ -47,7 +47,7 @@ extract_wheel_url() {
 import sys
 import json
 try:
-    data = json.loads('''$release_data''')
+    data = json.loads('''$release_data''', strict=False)
     assets = data.get('assets', [])
     for asset in assets:
         name = asset.get('name', '')
