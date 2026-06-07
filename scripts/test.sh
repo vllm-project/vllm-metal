@@ -147,6 +147,26 @@ main() {
   setup_dev_env
 
   if [ "$(uname)" == "Darwin" ]; then
+    # Build the native artifacts (.so + .metallib) into the package tree before
+    # install.sh's `uv pip install .`, so the wheel bundles them (maturin
+    # `include`) and CI exercises the prebuilt path users get, like release.sh.
+    ensure_metal_toolchain
+    build_native_artifacts
+
+    # Shift-left the release wheel guard. The pytest run below imports the source
+    # tree, which shadows the installed wheel, so a maturin `include` regression
+    # (artifacts silently dropped from the wheel) would pass CI here and only
+    # surface when release.sh runs on main. Build the wheel and assert it bundles
+    # the prebuilt artifacts now — the same check release.sh runs before publish.
+    section "Building wheel"
+    uv build
+    local wheels=(dist/*.whl)
+    if [ ! -f "${wheels[0]}" ]; then
+      error "No wheel found in dist/ after uv build."
+      exit 1
+    fi
+    verify_wheel_artifacts "${wheels[0]}"
+
     installs
     # shellcheck source=/dev/null
     source .venv-vllm-metal/bin/activate

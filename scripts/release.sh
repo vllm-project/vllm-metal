@@ -11,6 +11,13 @@ main() {
 
   setup_dev_env
 
+  # Build the prebuilt native extension (.so) and the three precompiled
+  # .metallib shader libraries into vllm_metal/metal/ before `uv build`, so the
+  # wheel ships them (via the maturin `include` directive) and end users never
+  # invoke clang++ or `xcrun metal` at runtime.
+  ensure_metal_toolchain
+  build_native_artifacts
+
   local base_version version
   base_version=$(get_version)
   # Per-commit dev version, e.g. 0.3.0.dev20260603184500 — unique and PEP 440.
@@ -24,6 +31,17 @@ main() {
 
   section "Building wheel"
   uv build
+
+  # Guard: never publish a wheel that doesn't actually bundle the prebuilt
+  # native artifacts (maturin `include`). Abort here — before the tag and
+  # release — rather than ship a wheel that fails with "Prebuilt native
+  # extension not found" on the user's first run.
+  local wheels=(dist/*.whl)
+  if [ ! -f "${wheels[0]}" ]; then
+    error "No wheel found in dist/ after uv build."
+    exit 1
+  fi
+  verify_wheel_artifacts "${wheels[0]}"
 
   local tag
   tag="v${version}"

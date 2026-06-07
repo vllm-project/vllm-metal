@@ -80,6 +80,16 @@ void init_v2_library(const std::string& v2_src) {
       [&]() { return v2_paged_attention_source_; });
 }
 
+// Load a precompiled .metallib instead of compiling its source. Uses MLX's
+// get_library(name, path) overload, which loads the library at `path` and
+// caches it under `name`; a later dispatch's get_library(name) (no path) then
+// returns this cached library. One generic loader for every shader library —
+// the cache-key name is passed in, so there is no per-library variant.
+void init_library_path(const std::string& name, const std::string& path) {
+  auto& d = metal::device(Device::gpu);
+  d.get_library(name, path);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
@@ -979,6 +989,10 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),
         "JIT-compile the v2 online-softmax Metal shader.");
+
+  m.def("init_library_path", &init_library_path,
+        nb::arg("name"), nb::arg("path"),
+        "Load a precompiled .metallib from disk, cached under `name`.");
 
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),

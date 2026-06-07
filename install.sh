@@ -215,7 +215,19 @@ EOF
   cd -
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    uv pip install .
+    # Local source install (running ./install.sh from a checkout). Prebuild the
+    # native paged-attention artifacts from this tree — the _paged_ops .so and
+    # the precompiled .metallib shaders — so the kernels load with no runtime
+    # compile, exactly like a release wheel; otherwise get_ops() fails loud
+    # ("Prebuilt native extension not found") the first time paged attention is
+    # used. build_native_artifacts needs the build deps (mlx, nanobind)
+    # importable, so the editable install pulls them in first and points the
+    # install at this tree, where the artifacts land. The remote (curl | bash)
+    # branch below installs a prebuilt release wheel instead and needs no
+    # toolchain. Mirrors scripts/release.sh / scripts/test.sh.
+    uv pip install -e .
+    ensure_metal_toolchain
+    build_native_artifacts
   else
     local release_data
     release_data=$(fetch_latest_release "$repo_owner" "$repo_name")

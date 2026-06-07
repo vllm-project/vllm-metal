@@ -33,6 +33,15 @@ from vllm_metal.attention.patching import walk_and_wrap
 # ---------------------------------------------------------------------------
 
 
+def _is_rope_embedding_pair(value: Any) -> bool:
+    """Return True for caller-precomputed RoPE ``(cos, sin)`` embeddings."""
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(isinstance(item, mx.array) for item in value)
+    )
+
+
 class SDPAPagedAttentionWrapper(nn.Module):
     """Wraps an mlx_lm Attention module to use native Metal paged KV.
 
@@ -69,6 +78,16 @@ class SDPAPagedAttentionWrapper(nn.Module):
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
 
+    @property
+    def rotary_emb(self) -> Any:
+        """Expose the wrapped attention's M-RoPE module."""
+        return self._inner.rotary_emb
+
+    @property
+    def rope(self) -> Any:
+        """Expose the wrapped attention's RoPE module."""
+        return self._inner.rope
+
     def rebind_cache(
         self,
         kv_cache: MetalPagedKVCache,
@@ -93,9 +112,25 @@ class SDPAPagedAttentionWrapper(nn.Module):
         position_ids: mx.array | None = None,
         **kwargs: Any,
     ) -> Any:
+        position_embeddings = kwargs.pop("position_embeddings", None)
+        if _is_rope_embedding_pair(position_ids):
+            # Some attention contracts pass precomputed ``(cos, sin)`` RoPE
+            # embeddings positionally as the fourth argument. Preserve that
+            # payload instead of treating it as Qwen-style ``position_ids``.
+            position_embeddings = position_ids
+            position_ids = None
+
         ctx = get_context()
         if ctx is None:
             # No paged context → delegate to original attention.
+            if position_embeddings is not None:
+                return self._inner(
+                    x,
+                    mask=mask,
+                    cache=cache,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             # Only pass position_ids when provided (mlx_vlm models);
             # mlx_lm models (e.g. Gemma4) use offset via **kwargs instead.
             if position_ids is not None:
@@ -119,6 +154,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
             self._mk_kv_cache,
             self._mk_cache_idx,
             shared_kv=shared_kv,
+            position_embeddings=position_embeddings,
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.

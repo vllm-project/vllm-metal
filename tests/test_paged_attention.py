@@ -7,6 +7,7 @@ Run with:
 
 from __future__ import annotations
 
+import mlx.core as mx
 import pytest
 
 from vllm_metal.attention.context import (
@@ -15,6 +16,7 @@ from vllm_metal.attention.context import (
     get_context,
     prepare_unified,
 )
+from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 
 
 class TestOffsetCache:
@@ -29,6 +31,71 @@ class TestOffsetCache:
     def test_make_mask_multi_token(self):
         c = OffsetCache(0)
         assert c.make_mask(5) == "causal"
+
+
+class TestSDPAPagedAttentionWrapper:
+    def teardown_method(self):
+        clear_context()
+
+    def test_exposes_inner_rope_attributes(self):
+        class _Inner:
+            def __init__(self):
+                self.rotary_emb = object()
+                self.rope = object()
+
+        inner = _Inner()
+        wrapper = SDPAPagedAttentionWrapper(
+            inner,
+            layer_idx=0,
+            kv_cache=object(),
+            block_size=16,
+        )
+
+        assert wrapper.rotary_emb is inner.rotary_emb
+        assert wrapper.rope is inner.rope
+
+    def test_forwards_precomputed_rope_embeddings_without_context(self):
+        class _Inner:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(
+                self,
+                x,
+                mask=None,
+                cache=None,
+                position_embeddings=None,
+                **kwargs,
+            ):
+                self.calls.append(
+                    {
+                        "x": x,
+                        "mask": mask,
+                        "cache": cache,
+                        "position_embeddings": position_embeddings,
+                        "kwargs": kwargs,
+                    }
+                )
+                return x
+
+        inner = _Inner()
+        wrapper = SDPAPagedAttentionWrapper(
+            inner,
+            layer_idx=0,
+            kv_cache=object(),
+            block_size=16,
+        )
+        x = mx.ones((1, 2, 4), dtype=mx.float32)
+        position_embeddings = (
+            mx.ones((3, 1, 2, 4), dtype=mx.float32),
+            mx.zeros((3, 1, 2, 4), dtype=mx.float32),
+        )
+
+        out = wrapper(x, None, None, position_embeddings)
+
+        assert out is x
+        assert inner.calls[0]["position_embeddings"] is position_embeddings
+        assert inner.calls[0]["kwargs"] == {}
 
 
 class TestPrepare:
@@ -188,6 +255,107 @@ class TestPackedRoPE:
                 [0, 3],
                 positions=[mx.zeros((3, 1, 3), dtype=mx.int32)],
             )
+
+    def test_attention_rope_uses_precomputed_mrope_payload(self, monkeypatch):
+        """Precomputed M-RoPE apply policy lives in the compat layer."""
+        import sys
+        import types
+
+        import mlx.core as mx
+
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_attention_rope,
+        )
+
+        recorded: dict[str, object] = {}
+
+        def fake_apply(q, k, cos, sin, mrope_section):
+            recorded["q"] = q
+            recorded["k"] = k
+            recorded["cos"] = cos
+            recorded["sin"] = sin
+            recorded["mrope_section"] = mrope_section
+            return q + 1, k + 2
+
+        fake_mod = types.ModuleType("mlx_vlm.models.paddleocr_vl.language")
+        fake_mod.apply_multimodal_rotary_pos_emb = fake_apply
+        monkeypatch.setitem(
+            sys.modules, "mlx_vlm.models.paddleocr_vl.language", fake_mod
+        )
+
+        class FakePrecomputedMRoPE:
+            rope_parameters = {"mrope_section": [1, 1, 1]}
+
+        q = mx.zeros((1, 1, 3, 2), dtype=mx.float32)
+        k = mx.zeros((1, 1, 3, 2), dtype=mx.float32)
+        cos = mx.ones((3, 1, 3, 2), dtype=mx.float32)
+        sin = mx.zeros((3, 1, 3, 2), dtype=mx.float32)
+
+        q_out, k_out = apply_attention_rope(
+            FakePrecomputedMRoPE(),
+            q,
+            k,
+            [0, 3],
+            position_embeddings=(cos, sin),
+        )
+
+        assert recorded["q"] is q
+        assert recorded["k"] is k
+        assert recorded["cos"] is cos
+        assert recorded["sin"] is sin
+        assert recorded["mrope_section"] == [1, 1, 1]
+        assert mx.allclose(q_out, q + 1).item()
+        assert mx.allclose(k_out, k + 2).item()
+
+    def test_attention_rope_uses_qwen35_precomputed_mrope_payload(self, monkeypatch):
+        """Qwen3.5 non-fused M-RoPE fallback uses the interleaved apply path."""
+        import sys
+        import types
+
+        import mlx.core as mx
+
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_attention_rope,
+        )
+
+        recorded: dict[str, object] = {}
+
+        def fake_apply(q, k, cos, sin):
+            recorded["q"] = q
+            recorded["k"] = k
+            recorded["cos"] = cos
+            recorded["sin"] = sin
+            return q + 3, k + 4
+
+        fake_mod = types.ModuleType("mlx_vlm.models.qwen3_5.language")
+        fake_mod.apply_multimodal_rotary_pos_emb = fake_apply
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_mod)
+
+        class FakeRotaryEmbedding:
+            style = "interleaved"
+
+        class FakeQwen35PrecomputedMRoPE:
+            rotary_emb = FakeRotaryEmbedding()
+
+        q = mx.zeros((1, 1, 3, 2), dtype=mx.float32)
+        k = mx.zeros((1, 1, 3, 2), dtype=mx.float32)
+        cos = mx.ones((3, 1, 3, 2), dtype=mx.float32)
+        sin = mx.zeros((3, 1, 3, 2), dtype=mx.float32)
+
+        q_out, k_out = apply_attention_rope(
+            FakeQwen35PrecomputedMRoPE(),
+            q,
+            k,
+            [0, 3],
+            position_embeddings=(cos, sin),
+        )
+
+        assert recorded["q"] is q
+        assert recorded["k"] is k
+        assert recorded["cos"] is cos
+        assert recorded["sin"] is sin
+        assert mx.allclose(q_out, q + 3).item()
+        assert mx.allclose(k_out, k + 4).item()
 
     def test_mrope_uses_caller_positions_when_provided(self, monkeypatch):
         """When ``positions[i]`` is an array, M-RoPE consumes it directly."""
