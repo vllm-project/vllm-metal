@@ -1913,6 +1913,54 @@ class MetalModelRunner:
                 block_ids=[],
             )
 
+    def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
+        """Maintain ``_request_states`` on a non-last pipeline stage.
+
+        Only the last stage samples, and that is where the normal request-state
+        lifecycle is built (``_sample_paged_batch`` needs the sampled token). A
+        non-last stage would otherwise have no state and emit a placeholder for
+        every cached step in :meth:`_collect_cached_requests`, skipping the
+        forward + ``pipeline_send`` the downstream stage is blocked on (its ring
+        ``recv`` then trips the Metal command-buffer watchdog and aborts).
+
+        Mirror upstream vLLM's ``_update_states`` (``gpu_model_runner.py``, the
+        ``if not is_last_rank`` branch): seed state from the scheduler's
+        ``NewRequestData`` and advance it with the sampled tokens the scheduler
+        broadcasts in ``CachedRequestData.new_token_ids`` — the first stage never
+        samples, it reconstructs the token stream from the scheduler. Block ids
+        are left to :meth:`_update_cached_request_blocks`, which runs next and
+        already guards a missing state.
+        """
+        for new_req in scheduler_output.scheduled_new_reqs:
+            token_ids = list(new_req.prompt_token_ids or [])
+            self._request_states[new_req.req_id] = RequestState(
+                token_ids=token_ids,
+                prompt_len=len(token_ids),
+                cache=[],
+                sampling_params=new_req.sampling_params or SamplingParams(),
+                pooling_params=new_req.pooling_params,
+                block_ids=list(new_req.block_ids[0]) if new_req.block_ids else [],
+            )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        if not cached.new_token_ids:
+            return
+        for i, req_id in enumerate(cached.req_ids):
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
+            new_token_ids = cached.new_token_ids[i]
+            # Append only the tokens not already reflected in token_ids (mirrors
+            # upstream's num_new_tokens; tolerates >1 sampled token per step).
+            num_new = (
+                cached.num_computed_tokens[i]
+                + len(new_token_ids)
+                - len(state.token_ids)
+            )
+            if num_new > 0:
+                state.token_ids.extend(new_token_ids[-num_new:])
+                state.generated_tokens = len(state.token_ids) - state.prompt_len
+
     def _update_cached_request_blocks(
         self,
         cached_reqs: CachedRequestData,
@@ -2248,6 +2296,14 @@ class MetalModelRunner:
         self._handle_new_requests(
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
         )
+
+        # Non-last PP stages have no sampler, so the request-state lifecycle that
+        # _sample_paged_batch builds from the sampled token never runs for them.
+        # Seed/advance their state from the scheduler's broadcast instead, so the
+        # forward + pipeline_send have live state to work from. No-op on the last
+        # stage and the single-process path.
+        if self.pp is not None and self.pp.size > 1 and not self.pp.is_last:
+            self._update_pp_stage_states(scheduler_output)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         self._update_cached_request_blocks(cached_reqs)
