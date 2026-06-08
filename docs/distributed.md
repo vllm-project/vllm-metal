@@ -1,9 +1,9 @@
 # Distributed Inference with Ray
 
 !!! note
-    For normal single-Mac serving you don't need any of this — use the default in-process executor. The Ray executor and pipeline parallelism below are for **multi-Mac** serving (running one model across several Macs). Single-node serving and the pipeline-parallel forward are validated; **end-to-end multi-Mac serving is new — validate it for your setup before relying on it.**
+    For normal single-Mac serving you don't need any of this — use the default in-process executor. The Ray executor and pipeline parallelism below are for **multi-Mac** serving (running one model across several Macs). Single-node serving, the pipeline-parallel forward, and a two-Mac end-to-end run (Qwen3-0.6B over Thunderbolt) are validated; multi-Mac serving is still new — **verify it for your own models and setup before relying on it.**
 
-vllm-metal can run under vLLM's **Ray distributed executor**, placing each Apple-Silicon worker as a Ray actor. This is the groundwork for multi-Mac serving; today the **single-node** path (one Mac, `--tensor-parallel-size 1`) is supported and validated. **Pipeline parallelism** — splitting a model across stages — is numerically validated on a single node (see [Pipeline parallelism](#pipeline-parallelism)); end-to-end multi-Mac serving is in progress (see [Limitations](#limitations)).
+vllm-metal can run under vLLM's **Ray distributed executor**, placing each Apple-Silicon worker as a Ray actor. This is the groundwork for multi-Mac serving; today the **single-node** path (one Mac, `--tensor-parallel-size 1`) is supported and validated. **Pipeline parallelism** — splitting a model across stages — is numerically validated on a single node (see [Pipeline parallelism](#pipeline-parallelism)) and has served a model end-to-end across two Macs over Thunderbolt (see [Limitations](#limitations)).
 
 Apple GPUs are not a Ray-recognized accelerator type (unlike CUDA or TPU), so each node advertises a **custom Ray resource named `mlx`**, and vLLM's executor places one worker per `mlx` unit.
 
@@ -45,7 +45,7 @@ On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_
 Run one model split across two Macs with [pipeline parallelism](#pipeline-parallelism): **stage 0** (first layers) on Mac A, **stage 1** (last layers + sampling) on Mac B. Ray is the control plane; the cross-stage activations travel over the **MLX ring** on a direct **Thunderbolt cable**. That high-bandwidth, low-latency link is what makes PP across machines worthwhile — Wi-Fi / Ethernet is too slow to serve over, so Thunderbolt is the supported transport.
 
 !!! note
-    Multi-Mac serving is new and **not yet validated end-to-end** — start with the small model below to check the plumbing, then scale up. Both Macs must have the model cached, the Thunderbolt bridge reachable, and each Mac's firewall must allow the MLX ring ports (`32323`/`32324`).
+    Multi-Mac serving is new — validated end-to-end on Qwen3-0.6B; start with that small model to check the plumbing, then scale up. Both Macs must have the model cached, the Thunderbolt bridge reachable, and each Mac's firewall must allow the MLX ring ports (`32323`/`32324`).
 
 !!! note
     A multi-node Ray cluster on **macOS** needs two extra env vars on every node, both exported in the commands below: `RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` (macOS clustering is gated behind it), and — only if the two Macs aren't on the identical Python build — `RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor` (Ray otherwise refuses to join nodes whose Python differs even at the *patch* level; the same minor version is wire-compatible).
@@ -158,7 +158,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 
 ## Limitations
 
-- **Pipeline parallelism is new — single-node validated, a full multi-Mac run not yet confirmed.** The PP forward is numerically validated bit-exact via `tools/pp_parity_check.py`, and the engine path (executor → ranked workers → MLX ring across real per-node IPs → per-stage forward → last-rank sampling) is wired and forms the ring correctly on a single node. A complete two-Mac generation has not yet been validated end-to-end — verify output for your setup and confirm the ring ports are reachable between Macs.
+- **Pipeline parallelism is new — validated end-to-end on two Macs (Qwen3-0.6B over Thunderbolt), but exercised on a narrow set of models and setups.** The PP forward is numerically validated bit-exact via `tools/pp_parity_check.py`, and the full engine path (executor → ranked workers → MLX ring across real per-node IPs → per-stage forward → last-rank sampling) has served a complete two-Mac generation. Verify output for your own models and confirm the ring ports are reachable between Macs.
 - **Single-node co-located stages contend for memory.** With `N` stages on one Mac, each worker reserves a full-machine KV budget and the Metal wired limit ignores `VLLM_METAL_MEMORY_FRACTION` — lower `VLLM_METAL_MEMORY_FRACTION` when stacking stages on one machine. Separate Macs each own their RAM, so this does not affect true multi-node runs.
 - **PP combined with tensor parallelism is rejected**: only `--pipeline-parallel-size > 1` with `--tensor-parallel-size 1` is supported.
 - **Tensor parallelism (`--tensor-parallel-size > 1`) is not implemented** — the per-layer MLX collective is not wired yet.
