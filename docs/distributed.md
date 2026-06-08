@@ -61,6 +61,17 @@ sudo networksetup -setmanual "Thunderbolt Bridge" 10.0.0.2 255.255.255.0
 
 From Mac A, confirm the cable is up: `ping -c3 10.0.0.2`.
 
+gloo (vLLM's control plane) advertises whatever each node's **hostname** resolves to — and a macOS `.local` hostname resolves to loopback, which can't be reached from the other Mac. Map each node's hostname to its bridge IP, and leave `GLOO_SOCKET_IFNAME` unset:
+
+```bash
+# Mac A
+sudo scutil --set HostName maca && echo "10.0.0.1  maca" | sudo tee -a /etc/hosts
+# Mac B
+sudo scutil --set HostName macb && echo "10.0.0.2  macb" | sudo tee -a /etc/hosts
+# verify on each — must print the bridge IP, not 127.0.0.1:
+python -c "import socket; print(socket.gethostbyname(socket.gethostname()))"
+```
+
 **Mac A** — start the Ray head, pinned to its Thunderbolt IP:
 
 ```bash
