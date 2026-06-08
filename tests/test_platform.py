@@ -107,15 +107,18 @@ class TestMetalPlatform:
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
                 ),
+                # PP requires synchronous scheduling: the first stage has no
+                # sampler and rebuilds tokens from the scheduler, so a valid PP
+                # config sets async_scheduling False (see the reject test below).
                 scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
+                    async_scheduling=False,
                     enable_chunked_prefill=True,
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
             )
 
-            # Does not raise: PP>1 with TP=1 falls through the guard.
+            # Does not raise: PP>1 with TP=1 and sync scheduling falls through.
             MetalPlatform.check_and_update_config(vllm_config)
 
             # "uni" cannot host two stages, so PP>1 defaults to the mp executor.
@@ -126,6 +129,30 @@ class TestMetalPlatform:
             )
         finally:
             reset_config()
+
+    def test_check_and_update_config_rejects_pipeline_with_async_scheduling(
+        self,
+    ) -> None:
+        """PP>1 requires synchronous scheduling; async scheduling is rejected.
+
+        The first stage has no sampler and rebuilds the token stream from the
+        scheduler's new_token_ids, which async scheduling leaves empty (sampled
+        tokens would travel a GPU broadcast we do not implement). Fail loud
+        rather than silently flip the user's scheduler config.
+        """
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        )
+        with pytest.raises(NotImplementedError, match="synchronous scheduling"):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
