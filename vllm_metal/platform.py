@@ -336,6 +336,25 @@ class MetalPlatform(Platform):
             )
 
         scheduler_config = vllm_config.scheduler_config
+
+        # Pipeline parallelism relays each sampled token to the first stage via the
+        # scheduler's CachedRequestData.new_token_ids — the first stage has no
+        # sampler and rebuilds the token stream from the scheduler (see
+        # MetalModelRunner._update_pp_stage_states). Async scheduling instead routes
+        # those tokens through a GPU broadcast we do not implement, which leaves
+        # new_token_ids empty. Fail loud rather than silently flip the user's
+        # scheduler config.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and scheduler_config.async_scheduling
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal requires synchronous scheduling. "
+                "Async scheduling delivers each sampled token to the first stage "
+                "through a GPU broadcast that is not implemented, so the stage "
+                "would starve. Re-run with --no-async-scheduling."
+            )
+
         if getattr(scheduler_config, "enable_chunked_prefill", False):
             if config.use_paged_attention:
                 # The paged path uses a unified varlen Metal kernel that

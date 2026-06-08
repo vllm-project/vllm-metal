@@ -99,8 +99,11 @@ RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_USE_PAGED_ATTENTION=1 \
   vllm serve Qwen/Qwen3-0.6B \
     --distributed-executor-backend ray \
     --pipeline-parallel-size 2 \
-    --tensor-parallel-size 1
+    --tensor-parallel-size 1 \
+    --no-async-scheduling
 ```
+
+`--no-async-scheduling` is required for PP — the first stage has no sampler and rebuilds the token stream from the scheduler, which async scheduling would leave empty (the engine fails loud if you omit it).
 
 On a healthy boot each worker logs its stage — `Pipeline stage 0/2 (is_first=True, is_last=False)` and `Pipeline stage 1/2 (is_first=False, is_last=True)` — and the MLX ring bootstrap lists both Macs' Thunderbolt IPs.
 
