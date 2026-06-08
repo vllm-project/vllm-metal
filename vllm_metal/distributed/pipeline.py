@@ -62,15 +62,6 @@ class PipelineGroup:
         self.is_last: bool = self.rank == self.size - 1
 
     @classmethod
-    def from_init(cls) -> PipelineGroup:
-        """Create from ``mx.distributed.init()`` (backend auto).
-
-        Under ``mlx.launch`` this returns the real ring group; in plain python
-        it degrades to a singleton size-1 group.
-        """
-        return cls(mx.distributed.init())
-
-    @classmethod
     def bootstrap_ring(cls, rank: int, peer_ips: list[str]) -> PipelineGroup:
         """Form the MLX ring across ``peer_ips`` (one per rank), then init.
 
@@ -106,7 +97,9 @@ class PipelineGroup:
             path,
         )
 
-        pp = cls.from_init()
+        # mx.distributed.init() forms the real ring group from the MLX_RANK /
+        # MLX_HOSTFILE env set above (a singleton size-1 group in plain python).
+        pp = cls(mx.distributed.init())
         if pp.size != world_size:
             raise RuntimeError(
                 "MLX ring did not form the expected pipeline group: "
@@ -115,6 +108,20 @@ class PipelineGroup:
                 "node IP in the hostfile is reachable."
             )
         return pp
+
+
+def is_non_last_stage(pp: PipelineGroup | None) -> bool:
+    """Whether the caller runs a non-last stage of a *multi-stage* pipeline.
+
+    Stage role lives on :class:`PipelineGroup` (``rank``/``is_first``/``is_last``),
+    mirroring how upstream vLLM exposes ``get_pp_group().is_last_rank`` on the
+    group rather than on the model runner. The runner holds an *optional* group
+    (``None`` on the single-stage path, where no group is created), so fold that
+    case in here: no group -> the only stage -> the last stage -> not a non-last
+    stage. ``not is_last`` also already excludes a size-1 group, so no size check
+    is needed. The one canonical "is there a stage downstream of me?" test.
+    """
+    return pp is not None and not pp.is_last
 
 
 def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int] | None:

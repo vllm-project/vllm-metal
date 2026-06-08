@@ -17,6 +17,7 @@ from vllm_metal.distributed.pipeline import (
     PipelineGroup,
     _ring_hosts,
     apply_pipeline_split,
+    is_non_last_stage,
 )
 
 
@@ -70,6 +71,21 @@ class TestPipelineGroupRankFlags:
         pp = _pp(2, 3)
         assert pp.is_first is False
         assert pp.is_last is True
+
+
+class TestIsNonLastStage:
+    def test_none_group_is_not_non_last(self) -> None:
+        # Single-stage path: the runner holds no group, so the only stage is last.
+        assert is_non_last_stage(None) is False
+
+    def test_singleton_group_is_not_non_last(self) -> None:
+        assert is_non_last_stage(_pp(0, 1)) is False
+
+    def test_first_of_two_is_non_last(self) -> None:
+        assert is_non_last_stage(_pp(0, 2)) is True
+
+    def test_last_of_two_is_not_non_last(self) -> None:
+        assert is_non_last_stage(_pp(1, 2)) is False
 
 
 class TestApplyPipelineSplit:

@@ -52,7 +52,12 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
-from vllm_metal.distributed import PipelinedModel, PipelineGroup, pipeline_send
+from vllm_metal.distributed import (
+    PipelinedModel,
+    PipelineGroup,
+    is_non_last_stage,
+    pipeline_send,
+)
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -2302,7 +2307,7 @@ class MetalModelRunner:
         # Seed/advance their state from the scheduler's broadcast instead, so the
         # forward + pipeline_send have live state to work from. No-op on the last
         # stage and the single-process path.
-        if self.pp is not None and self.pp.size > 1 and not self.pp.is_last:
+        if is_non_last_stage(self.pp):
             self._update_pp_stage_states(scheduler_output)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -2369,7 +2374,7 @@ class MetalModelRunner:
             # Non-last stages produced no logits (they piped their hidden state
             # downstream), so clear the stash and return an empty output — the
             # engine collects results from the last stage only.
-            if self.pp is not None and self.pp.size > 1 and not self.pp.is_last:
+            if is_non_last_stage(self.pp):
                 self._execute_model_state = None
                 return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
