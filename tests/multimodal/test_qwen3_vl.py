@@ -124,8 +124,9 @@ class TestQwen3VLMultimodalAdapterValidation:
     ) -> None:
         tokens = [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
 
-        with pytest.raises(error_type, match=match):
+        with pytest.raises(error_type, match=match) as exc_info:
             _adapter().get_mrope_input_positions(tokens, [feature])
+        assert feature.identifier in str(exc_info.value)
 
 
 class TestQwen3VLMultimodalAdapterPositions:
@@ -383,8 +384,9 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
             mm_position=feature.mm_position,
         )
 
-        with pytest.raises(ValueError, match="image features"):
+        with pytest.raises(ValueError, match="image features") as exc_info:
             adapter.encode_multimodal([feature])
+        assert feature.identifier in str(exc_info.value)
 
     def test_raises_when_vision_tower_is_none(self) -> None:
         adapter = Qwen3VLMultimodalAdapter(spatial_merge_size=_SPATIAL_MERGE_SIZE)
@@ -405,8 +407,9 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
             mm_position=PlaceholderRange(offset=0, length=4),
         )
 
-        with pytest.raises(ValueError, match="feature.data is required"):
+        with pytest.raises(ValueError, match="feature.data is required") as exc_info:
             adapter.encode_multimodal([feature])
+        assert feature.identifier in str(exc_info.value)
 
 
 class _RecordingLanguageModel:
