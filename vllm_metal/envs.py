@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
+    VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -84,6 +85,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Registered here only so validate_environ() does not warn — vLLM reads it
     # from os.environ directly.
     "VLLM_METAL_VISIBLE_DEVICES": lambda: os.getenv("VLLM_METAL_VISIBLE_DEVICES"),
+    # Base TCP port for the MLX ring data plane under pipeline parallelism;
+    # stage r binds base + r (default 32323/32324 for two stages). Set the same
+    # value on every node to move the ring off a busy port. Default matches
+    # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
+    "VLLM_METAL_RING_BASE_PORT": lambda: int(
+        os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
+    ),
 }
 
 

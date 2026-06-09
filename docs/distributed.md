@@ -45,7 +45,7 @@ On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_
 Run one model split across two Macs with [pipeline parallelism](#pipeline-parallelism): **stage 0** (first layers) on Mac A, **stage 1** (last layers + sampling) on Mac B. Ray is the control plane; the cross-stage activations travel over the **MLX ring** on a direct **Thunderbolt cable**. That high-bandwidth, low-latency link is what makes PP across machines worthwhile — Wi-Fi / Ethernet is too slow to serve over, so Thunderbolt is the supported transport.
 
 !!! note
-    Multi-Mac serving is new — validated end-to-end on Qwen3-0.6B; start with that small model to check the plumbing, then scale up. Both Macs must have the model cached, the Thunderbolt bridge reachable, and each Mac's firewall must allow the MLX ring ports (`32323`/`32324`).
+    Multi-Mac serving is new — validated end-to-end on Qwen3-0.6B; start with that small model to check the plumbing, then scale up. Both Macs must have the model cached, the Thunderbolt bridge reachable, and each Mac's firewall must allow the MLX ring ports (`32323`/`32324` by default; stage *r* uses `base + r`). If those ports are busy — an `mlx.launch` job, a quick restart still in `TIME_WAIT`, or a second PP job — set `VLLM_METAL_RING_BASE_PORT` to the same base on **every** node to shift the whole block.
 
 !!! note
     A multi-node Ray cluster on **macOS** needs two extra env vars on every node, both exported in the commands below: `RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1` (macOS clustering is gated behind it), and — only if the two Macs aren't on the identical Python build — `RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor` (Ray otherwise refuses to join nodes whose Python differs even at the *patch* level; the same minor version is wire-compatible).
@@ -114,7 +114,7 @@ curl -s http://10.0.0.1:8000/v1/completions -H 'Content-Type: application/json' 
   -d '{"model":"Qwen/Qwen3-0.6B","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
 ```
 
-Tear down with `ray stop` on **both** Macs, then revert the bridge: `sudo networksetup -setdhcp "Thunderbolt Bridge"`. Once the small model works end to end, serve a model too large for a single Mac — that is the point of pipeline parallelism.
+Tear down with `ray stop` on **both** Macs, then revert the bridge: `sudo networksetup -setdhcp "Thunderbolt Bridge"`. Once the small model works end to end, try larger models across the two Macs (each stage still loads the full model first — see [Limitations](#limitations)).
 
 `VLLM_HOST_IP` is the load-bearing piece: it makes vLLM's `get_ip()` return the Thunderbolt address, so the cross-stage hand-off forms over the cable.
 
@@ -158,9 +158,8 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 
 ## Limitations
 
-- **Pipeline parallelism is new — validated end-to-end on two Macs (Qwen3-0.6B over Thunderbolt), but exercised on a narrow set of models and setups.** The PP forward is numerically validated bit-exact via `tools/pp_parity_check.py`, and the full engine path (executor → ranked workers → MLX ring across real per-node IPs → per-stage forward → last-rank sampling) has served a complete two-Mac generation. Verify output for your own models and confirm the ring ports are reachable between Macs.
-- **Single-node co-located stages contend for memory.** With `N` stages on one Mac, each worker reserves a full-machine KV budget and the Metal wired limit ignores `VLLM_METAL_MEMORY_FRACTION` — lower `VLLM_METAL_MEMORY_FRACTION` when stacking stages on one machine. Separate Macs each own their RAM, so this does not affect true multi-node runs.
-- **PP combined with tensor parallelism is rejected**: only `--pipeline-parallel-size > 1` with `--tensor-parallel-size 1` is supported.
-- **Tensor parallelism (`--tensor-parallel-size > 1`) is not implemented** — the per-layer MLX collective is not wired yet.
-- One `mlx` resource per Mac (a single Apple GPU per machine).
-- On a multi-NIC host, set the Ray node IP and vLLM's `get_ip()` consistently (e.g. `ray start --node-ip-address=...`).
+- **Peak memory = full model per node.** Each stage loads the whole model before dropping its non-owned layers, so Phase 0 splits compute, not load-time memory — it can't serve a model too large for one Mac.
+- **Co-located stages share the KV budget.** Two stages on one Mac ignore `VLLM_METAL_MEMORY_FRACTION`; lower it when stacking. Separate Macs are unaffected.
+- **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
+- **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
+- **Model support.** YOCO / hybrid / MLA / pooling / VLM / non-paged are rejected; other shapes (sliding-window, MoE) are untested.

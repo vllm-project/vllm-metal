@@ -28,12 +28,17 @@ import mlx.nn as nn
 from mlx.core.distributed import Group
 from vllm.distributed.utils import get_pp_indices
 
+import vllm_metal.envs as envs
+
 logger = logging.getLogger(__name__)
 
-# Base TCP port for the MLX ring data plane (matches the mlx.launch default
-# ``starting_port``). Rank ``r`` listens on ``_MLX_RING_BASE_PORT + r`` so
-# co-located ranks (multiple stages on one Mac) still get distinct ports.
-_MLX_RING_BASE_PORT = 32323
+# Base TCP port for the MLX ring data plane. Sourced from the registered
+# ``VLLM_METAL_RING_BASE_PORT`` env var (default 32323, the mlx.launch
+# ``starting_port``); set the same value on every node to move the ring off a
+# busy port — e.g. when an mlx.launch job, a restart still in TIME_WAIT, or
+# another PP job holds 32323. Rank ``r`` listens on ``_MLX_RING_BASE_PORT + r``
+# so co-located ranks (multiple stages on one Mac) still get distinct ports.
+_MLX_RING_BASE_PORT = envs.VLLM_METAL_RING_BASE_PORT
 
 
 def _ring_hosts(peer_ips: list[str]) -> list[list[str]]:
