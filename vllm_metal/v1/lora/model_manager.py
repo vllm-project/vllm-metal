@@ -130,6 +130,7 @@ class MLXLoRAModelManager:
         self._registered.clear()
 
     def pin_adapter(self, lora_id: int) -> bool:
+        """Acknowledge upstream pin_lora; Metal has no LoRA cache tier to pin."""
         return lora_id in self._registered
 
     def list_adapters(self) -> set[int]:
