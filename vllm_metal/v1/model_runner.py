@@ -444,7 +444,7 @@ class MetalModelRunner:
         self._lora.setup(
             model=self._forward_model,
             lora_config=getattr(self.vllm_config, "lora_config", None),
-            is_stt=self._is_stt,
+            is_stt=False,
             paged_attention_enabled=self.metal_config.use_paged_attention,
             speculative_decode_enabled=self.vllm_config.speculative_config is not None,
             max_num_seqs=self.scheduler_config.max_num_seqs,
