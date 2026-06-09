@@ -105,10 +105,6 @@ class MetalLoRARuntime:
             return set()
         return self._manager.list_adapters()
 
-    def lookup(self, lora_id: int) -> LoRARequest | None:
-        """Resolve a loaded ``LoRARequest`` by integer id, or ``None``."""
-        return self._loaded.get(lora_id)
-
     def prepare_step(self, routing_entries: Iterable[tuple[int | None, int]]) -> None:
         # Push the per-step active set and token routing to the manager.
         if self._manager is None:

@@ -62,10 +62,6 @@ class MLXLoRAModelManager:
         return self.lora_config.max_loras
 
     @property
-    def adapter_slots(self) -> int:
-        return self.lora_slots
-
-    @property
     def capacity(self) -> int:
         return self.lora_config.max_cpu_loras or self.lora_slots
 

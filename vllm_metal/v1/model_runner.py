@@ -21,6 +21,7 @@ import torch
 from mlx_lm import stream_generate
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -452,7 +453,7 @@ class MetalModelRunner:
             max_position_embeddings=max_position_embeddings,
         )
 
-    def add_lora(self, lora_request: Any) -> bool:
+    def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
