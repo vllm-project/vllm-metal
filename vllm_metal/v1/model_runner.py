@@ -448,6 +448,7 @@ class MetalModelRunner:
             or self.is_hybrid
             or self.is_mla
             or self._is_pooling
+            or self._is_vlm
             or not self.metal_config.use_paged_attention
         )
         if unsupported:
@@ -455,7 +456,8 @@ class MetalModelRunner:
                 "Pipeline parallelism on Metal is validated only for uniform-"
                 "attention generation on the paged path (e.g. Qwen3 with "
                 "VLLM_METAL_USE_PAGED_ATTENTION=1); YOCO / hybrid (GDN) / MLA / "
-                "pooling / non-paged configs are not supported under PP yet."
+                "pooling / VLM (multimodal) / non-paged configs are not "
+                "supported under PP yet."
             )
 
         self._model_adapter.apply_pipeline_split(self.model, pp)

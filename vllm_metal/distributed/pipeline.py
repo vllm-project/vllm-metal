@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import tempfile
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -100,6 +101,9 @@ class PipelineGroup:
         # mx.distributed.init() forms the real ring group from the MLX_RANK /
         # MLX_HOSTFILE env set above (a singleton size-1 group in plain python).
         pp = cls(mx.distributed.init())
+        # init() consumed the hostfile synchronously; drop the temp file now
+        # (before the size check, so the raise path is cleaned up too).
+        Path(path).unlink(missing_ok=True)
         if pp.size != world_size:
             raise RuntimeError(
                 "MLX ring did not form the expected pipeline group: "
@@ -226,5 +230,14 @@ class PipelinedModel:
         if pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
-        # backbone only (norm is nn.Identity on non-last) -> raw hidden state
-        return self._model.model(input_ids, cache=cache, input_embeddings=h_in)
+        # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
+        # The downstream stage receives at its embed-weight dtype (pipeline_recv);
+        # a mismatch deadlocks the ring, which does not validate across peers.
+        h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
+        embed_dtype = self._model.model.embed_tokens.weight.dtype
+        if h_out.dtype != embed_dtype:
+            raise TypeError(
+                f"PP stage produced hidden {h_out.dtype}, but the wire dtype is "
+                f"the embed-weight dtype {embed_dtype}; mismatch deadlocks the ring."
+            )
+        return h_out
