@@ -512,9 +512,13 @@ def _patch_vllm_gguf_speculator_detection() -> None:
                 return model, tokenizer, vllm_speculative_config
             raise
 
-    config_utils.maybe_override_with_speculators = _patched_maybe_override_with_speculators
+    config_utils.maybe_override_with_speculators = (
+        _patched_maybe_override_with_speculators
+    )
     if arg_utils is not None:
-        arg_utils.maybe_override_with_speculators = _patched_maybe_override_with_speculators
+        arg_utils.maybe_override_with_speculators = (
+            _patched_maybe_override_with_speculators
+        )
     setattr(config_utils, sentinel, True)
 
 
