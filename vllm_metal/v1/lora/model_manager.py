@@ -40,7 +40,6 @@ class MLXLoRAModelManager:
 
         self._registered: dict[int, LoadedLoRA] = {}
         self._active: set[int] = set()
-        self._pinned: set[int] = set()
         self.lora_index_to_id: list[int | None] = [None] * self.lora_slots
 
         self.modules: dict[str, MLXLinearWithLoRA] = {}
@@ -102,28 +101,23 @@ class MLXLoRAModelManager:
 
     def replace_adapter(self, adapter: LoadedLoRA) -> None:
         lora_id = adapter.lora_id
-        if lora_id in self._pinned:
-            raise RuntimeError(f"Cannot replace pinned LoRA adapter {lora_id}")
         previous = self._registered.get(lora_id)
         if previous is None:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
 
-        was_active = lora_id in self._active
-        if was_active:
-            self.deactivate_adapter(lora_id)
+        was_active = self.deactivate_adapter(lora_id)
         self._registered[lora_id] = adapter
         try:
             self.activate_adapter(lora_id)
-        except ValueError:
+        except Exception:
+            # Replacement is transactional: any activation failure keeps the
+            # previously loaded adapter visible and active.
             self._registered[lora_id] = previous
             if was_active:
                 self.activate_adapter(lora_id)
             raise
 
     def remove_adapter(self, lora_id: int) -> bool:
-        if lora_id in self._pinned:
-            logger.warning("Cannot remove pinned LoRA adapter %d", lora_id)
-            return False
         self.deactivate_adapter(lora_id)
         return self._registered.pop(lora_id, None) is not None
 
@@ -131,13 +125,9 @@ class MLXLoRAModelManager:
         for lid in list(self._active):
             self.deactivate_adapter(lid)
         self._registered.clear()
-        self._pinned.clear()
 
     def pin_adapter(self, lora_id: int) -> bool:
-        if lora_id not in self._registered:
-            return False
-        self._pinned.add(lora_id)
-        return True
+        return lora_id in self._registered
 
     def list_adapters(self) -> set[int]:
         return set(self._registered)

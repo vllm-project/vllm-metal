@@ -717,7 +717,7 @@ def test_manager_add_adapter_over_capacity_raises() -> None:
         manager.add_adapter(b)
 
 
-def test_manager_pin_blocks_remove() -> None:
+def test_manager_pin_tracks_existing_adapter_only() -> None:
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
         model=model,
@@ -732,9 +732,10 @@ def test_manager_pin_blocks_remove() -> None:
         fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
     )
     manager.add_adapter(adapter)
-    manager.pin_adapter(7)
-    assert manager.remove_adapter(7) is False
-    assert 7 in manager.list_adapters()
+    assert manager.pin_adapter(7) is True
+    assert manager.pin_adapter(8) is False
+    assert manager.remove_adapter(7) is True
+    assert 7 not in manager.list_adapters()
 
 
 def test_manager_target_modules_filter_excludes_unmatched() -> None:
@@ -1030,8 +1031,8 @@ def test_worker_manager_load_inplace_failure_restores_previous_adapter(
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
 
 
-def test_worker_manager_load_inplace_rejects_pinned_adapter(monkeypatch) -> None:
-    """Pinned adapters must fail loudly instead of turning reload into a no-op."""
+def test_worker_manager_load_inplace_replaces_pinned_adapter(monkeypatch) -> None:
+    """Pinning prevents cache eviction upstream, not explicit replacement."""
     manager = _make_worker_manager()
     v1 = _make_adapter(
         7,
@@ -1050,7 +1051,5 @@ def test_worker_manager_load_inplace_rejects_pinned_adapter(monkeypatch) -> None
     assert manager.pin_adapter(7) is True
 
     state[7] = v2
-    with pytest.raises(RuntimeError, match="Cannot replace pinned LoRA adapter 7"):
-        manager.add_adapter(_stub_lora_request(7, load_inplace=True))
-
-    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
+    assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [5.0, 0.0])
