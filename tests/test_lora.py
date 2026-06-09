@@ -1031,6 +1031,50 @@ def test_worker_manager_load_inplace_failure_restores_previous_adapter(
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
 
 
+def test_worker_manager_load_inplace_shape_failure_restores_previous_adapter(
+    monkeypatch,
+) -> None:
+    """Validation must finish before any replacement weights are installed."""
+    manager = _make_worker_manager()
+    v1 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
+    )
+    bad = peft_loader_mod.LoadedLoRA(
+        lora_id=7,
+        rank=1,
+        weights={
+            "fc1": peft_loader_mod.LoRALayerWeightsMLX(
+                module_name="fc1",
+                rank=1,
+                lora_a=mx.array(np.array([[1.0, 0.0]], dtype=np.float32)),
+                lora_b=mx.array(np.array([[5.0], [0.0]], dtype=np.float32)),
+                scaling=1.0,
+            ),
+            "fc2": peft_loader_mod.LoRALayerWeightsMLX(
+                module_name="fc2",
+                rank=1,
+                lora_a=mx.array(np.array([[1.0, 0.0, 0.0]], dtype=np.float32)),
+                lora_b=mx.array(np.array([[1.0], [0.0]], dtype=np.float32)),
+                scaling=1.0,
+            ),
+        },
+    )
+    state: dict[int, peft_loader_mod.LoadedLoRA] = {7: v1}
+    _patch_loader(monkeypatch, state)
+
+    assert manager.add_adapter(_stub_lora_request(7)) is True
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
+
+    state[7] = bad
+    with pytest.raises(ValueError, match="LoRA weight shape mismatch"):
+        manager.add_adapter(_stub_lora_request(7, load_inplace=True))
+
+    assert manager.list_adapters() == {7}
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
+
+
 def test_worker_manager_load_inplace_replaces_pinned_adapter(monkeypatch) -> None:
     """Pinning prevents cache eviction upstream, not explicit replacement."""
     manager = _make_worker_manager()

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from vllm.config.lora import LoRAConfig
 
 logger = logging.getLogger(__name__)
+
+_PreparedLoRAWeights = tuple[mx.array, mx.array]
+_PreparedModuleUpdate = tuple[MLXLinearWithLoRA, _PreparedLoRAWeights | None]
+
+
+class _PreparedAdapterUpdate(NamedTuple):
+    module_updates: list[_PreparedModuleUpdate]
+    loaded_modules: int
 
 
 class MLXLoRAModelManager:
@@ -101,21 +109,16 @@ class MLXLoRAModelManager:
 
     def replace_adapter(self, adapter: LoadedLoRA) -> None:
         lora_id = adapter.lora_id
-        previous = self._registered.get(lora_id)
-        if previous is None:
+        if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
 
-        was_active = self.deactivate_adapter(lora_id)
+        slot = self._slot_for_adapter(lora_id)
+        if slot is None:
+            slot = self._next_free_slot()
+        prepared = self._prepare_adapter_update(adapter, slot)
+
         self._registered[lora_id] = adapter
-        try:
-            self.activate_adapter(lora_id)
-        except Exception:
-            # Replacement is transactional: any activation failure keeps the
-            # previously loaded adapter visible and active.
-            self._registered[lora_id] = previous
-            if was_active:
-                self.activate_adapter(lora_id)
-            raise
+        self._commit_adapter_update(lora_id, slot, prepared)
 
     def remove_adapter(self, lora_id: int) -> bool:
         self.deactivate_adapter(lora_id)
@@ -138,35 +141,15 @@ class MLXLoRAModelManager:
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
         adapter = self._registered[lora_id]
-        resolved = [
-            (w, _lookup_weights_for_module(adapter, name))
-            for name, w in self.modules.items()
-        ]
-        loaded = sum(1 for _, mw in resolved if mw is not None)
-        if loaded == 0:
-            raise ValueError(
-                f"LoRA adapter {lora_id} matched 0 wrapped modules "
-                f"(wrapped: {sorted(self.modules)}). The adapter targets "
-                "modules this model does not expose under LoRA; check "
-                "target_modules / the adapter's base model."
-            )
-        try:
-            slot = next(i for i, sid in enumerate(self.lora_index_to_id) if sid is None)
-        except StopIteration as exc:
-            raise ValueError(
-                f"No free LoRA slots; raise --max-loras (current: {self.lora_slots})."
-            ) from exc
-
-        self.lora_index_to_id[slot] = lora_id
-        self._active.add(lora_id)
-        for w, mw in resolved:
-            if mw is None:
-                w.reset_lora(slot)
-                continue
-            # Fold scaling into B once so the kernel stays scale=1.0.
-            w.set_lora(slot, mw.lora_a, mw.lora_b * mw.scaling)
-        logger.info("Activated LoRA %d in slot %d (%d modules)", lora_id, slot, loaded)
-        self._last_mapping = None
+        slot = self._next_free_slot()
+        prepared = self._prepare_adapter_update(adapter, slot)
+        self._commit_adapter_update(lora_id, slot, prepared)
+        logger.info(
+            "Activated LoRA %d in slot %d (%d modules)",
+            lora_id,
+            slot,
+            prepared.loaded_modules,
+        )
         return True
 
     def deactivate_adapter(self, lora_id: int) -> bool:
@@ -189,6 +172,66 @@ class MLXLoRAModelManager:
             return
         self.punica_wrapper.update_metadata(mapping, self.lora_index_to_id)
         self._last_mapping = mapping
+
+    def _slot_for_adapter(self, lora_id: int) -> int | None:
+        try:
+            return self.lora_index_to_id.index(lora_id)
+        except ValueError:
+            return None
+
+    def _next_free_slot(self) -> int:
+        try:
+            return next(i for i, sid in enumerate(self.lora_index_to_id) if sid is None)
+        except StopIteration as exc:
+            raise ValueError(
+                f"No free LoRA slots; raise --max-loras (current: {self.lora_slots})."
+            ) from exc
+
+    def _prepare_adapter_update(
+        self, adapter: LoadedLoRA, slot: int
+    ) -> _PreparedAdapterUpdate:
+        updates: list[_PreparedModuleUpdate] = []
+        loaded = 0
+        for name, module in self.modules.items():
+            weights = _lookup_weights_for_module(adapter, name)
+            if weights is None:
+                updates.append((module, None))
+                continue
+            loaded += 1
+            updates.append(
+                (
+                    module,
+                    module.prepare_lora_weights(
+                        slot,
+                        weights.lora_a,
+                        weights.lora_b * weights.scaling,
+                    ),
+                )
+            )
+        if loaded == 0:
+            raise ValueError(
+                f"LoRA adapter {adapter.lora_id} matched 0 wrapped modules "
+                f"(wrapped: {sorted(self.modules)}). The adapter targets "
+                "modules this model does not expose under LoRA; check "
+                "target_modules / the adapter's base model."
+            )
+        return _PreparedAdapterUpdate(updates, loaded)
+
+    def _commit_adapter_update(
+        self,
+        lora_id: int,
+        slot: int,
+        prepared: _PreparedAdapterUpdate,
+    ) -> None:
+        for module, weights in prepared.module_updates:
+            if weights is None:
+                module.reset_lora(slot)
+                continue
+            lora_a, lora_b = weights
+            module.set_prepared_lora(slot, lora_a, lora_b)
+        self.lora_index_to_id[slot] = lora_id
+        self._active.add(lora_id)
+        self._last_mapping = None
 
 
 def _lookup_weights_for_module(

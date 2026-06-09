@@ -36,7 +36,9 @@ class MLXLinearWithLoRA(nn.Module):
     def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
         self.punica_wrapper = punica_wrapper
 
-    def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
+    def prepare_lora_weights(
+        self, slot: int, lora_a: mx.array, lora_b: mx.array
+    ) -> tuple[mx.array, mx.array]:
         if lora_a.ndim != 2 or lora_b.ndim != 2:
             raise ValueError(
                 f"LoRA weight shape mismatch for slot {slot}: A and B must be "
@@ -64,7 +66,14 @@ class MLXLinearWithLoRA(nn.Module):
         b = mx.zeros_like(self.lora_b_stacked[slot])
         a[:rank, :] = lora_a.astype(a.dtype)
         b[:, :rank] = lora_b.astype(b.dtype)
-        self.lora_a_stacked[slot], self.lora_b_stacked[slot] = a, b
+        return a, b
+
+    def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
+        a, b = self.prepare_lora_weights(slot, lora_a, lora_b)
+        self.set_prepared_lora(slot, a, b)
+
+    def set_prepared_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
+        self.lora_a_stacked[slot], self.lora_b_stacked[slot] = lora_a, lora_b
 
     def reset_lora(self, slot: int) -> None:
         self.lora_a_stacked[slot] = mx.zeros_like(self.lora_a_stacked[slot])
