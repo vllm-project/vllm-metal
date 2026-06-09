@@ -939,6 +939,13 @@ def _patch_loader(monkeypatch, adapters: dict[int, peft_loader_mod.LoadedLoRA]) 
     monkeypatch.setattr(worker_manager_mod, "load_peft_adapter", _fake_load)
 
 
+def _active_fc1_lora_b(
+    manager: worker_manager_mod.MetalWorkerLoRAManager, lora_id: int
+) -> np.ndarray:
+    slot = manager._mm.lora_index_to_id.index(lora_id)
+    return np.array(manager._mm.modules["fc1"].lora_b_stacked[slot])[:, 0]
+
+
 def test_worker_manager_empty_batch_deactivates_stale_adapters(monkeypatch) -> None:
     """An empty lora_requests set must clear previously active slots so a
     subsequent load is not blocked by stale state."""
@@ -975,10 +982,7 @@ def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -
     _patch_loader(monkeypatch, state)
 
     assert manager.add_adapter(_stub_lora_request(7)) is True
-    slot = manager._mm.lora_index_to_id.index(7)
-    np.testing.assert_array_equal(
-        np.array(manager._mm.modules["fc1"].lora_b_stacked[slot])[:, 0], [3.0, 0.0]
-    )
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
 
     # Without load_inplace, the duplicate add is a no-op.
     assert manager.add_adapter(_stub_lora_request(7)) is False
@@ -986,7 +990,67 @@ def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -
     # With load_inplace=True, the new weights must replace the old in the slot.
     state[7] = v2
     assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
-    slot = manager._mm.lora_index_to_id.index(7)
-    np.testing.assert_array_equal(
-        np.array(manager._mm.modules["fc1"].lora_b_stacked[slot])[:, 0], [5.0, 0.0]
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [5.0, 0.0])
+
+
+def test_worker_manager_load_inplace_failure_restores_previous_adapter(
+    monkeypatch,
+) -> None:
+    """A failed replacement must not drop the previous working adapter."""
+    manager = _make_worker_manager()
+    v1 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
     )
+    bad = peft_loader_mod.LoadedLoRA(
+        lora_id=7,
+        rank=1,
+        weights={
+            "does.not.exist": peft_loader_mod.LoRALayerWeightsMLX(
+                module_name="does.not.exist",
+                rank=1,
+                lora_a=mx.array(np.zeros((1, 2), dtype=np.float32)),
+                lora_b=mx.array(np.zeros((2, 1), dtype=np.float32)),
+                scaling=1.0,
+            )
+        },
+    )
+    state: dict[int, peft_loader_mod.LoadedLoRA] = {7: v1}
+    _patch_loader(monkeypatch, state)
+
+    assert manager.add_adapter(_stub_lora_request(7)) is True
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
+
+    state[7] = bad
+    with pytest.raises(ValueError, match="matched 0 wrapped modules"):
+        manager.add_adapter(_stub_lora_request(7, load_inplace=True))
+
+    assert manager.list_adapters() == {7}
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
+
+
+def test_worker_manager_load_inplace_rejects_pinned_adapter(monkeypatch) -> None:
+    """Pinned adapters must fail loudly instead of turning reload into a no-op."""
+    manager = _make_worker_manager()
+    v1 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
+    )
+    v2 = _make_adapter(
+        7,
+        fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+        fc1_b=np.array([[5.0], [0.0]], dtype=np.float32),
+    )
+    state: dict[int, peft_loader_mod.LoadedLoRA] = {7: v1}
+    _patch_loader(monkeypatch, state)
+
+    assert manager.add_adapter(_stub_lora_request(7)) is True
+    assert manager.pin_adapter(7) is True
+
+    state[7] = v2
+    with pytest.raises(RuntimeError, match="Cannot replace pinned LoRA adapter 7"):
+        manager.add_adapter(_stub_lora_request(7, load_inplace=True))
+
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])

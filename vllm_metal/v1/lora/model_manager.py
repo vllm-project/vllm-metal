@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
+from vllm.lora.utils import is_in_target_modules
 
 from .layers import MLXLinearWithLoRA, can_wrap
 from .mapping import LoRAMapping
@@ -65,8 +66,6 @@ class MLXLoRAModelManager:
         return len(self._registered)
 
     def _wrap_target_modules(self) -> None:
-        from vllm.lora.utils import is_in_target_modules
-
         targets = self.lora_config.target_modules
         repls = [
             (
@@ -100,6 +99,26 @@ class MLXLoRAModelManager:
             )
         self._registered[adapter.lora_id] = adapter
         return True
+
+    def replace_adapter(self, adapter: LoadedLoRA) -> None:
+        lora_id = adapter.lora_id
+        if lora_id in self._pinned:
+            raise RuntimeError(f"Cannot replace pinned LoRA adapter {lora_id}")
+        previous = self._registered.get(lora_id)
+        if previous is None:
+            raise ValueError(f"LoRA adapter {lora_id} is not registered")
+
+        was_active = lora_id in self._active
+        if was_active:
+            self.deactivate_adapter(lora_id)
+        self._registered[lora_id] = adapter
+        try:
+            self.activate_adapter(lora_id)
+        except ValueError:
+            self._registered[lora_id] = previous
+            if was_active:
+                self.activate_adapter(lora_id)
+            raise
 
     def remove_adapter(self, lora_id: int) -> bool:
         if lora_id in self._pinned:

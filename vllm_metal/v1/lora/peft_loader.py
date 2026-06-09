@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 from safetensors import safe_open
+from vllm.lora.peft_helper import PEFTHelper
+from vllm.lora.utils import parse_fine_tuned_lora_name
 
 if TYPE_CHECKING:
     from vllm.config.lora import LoRAConfig
@@ -42,9 +44,6 @@ def load_peft_adapter(
     max_position_embeddings: int | None = None,
     lora_config: LoRAConfig | None = None,
 ) -> LoadedLoRA:
-    from vllm.lora.peft_helper import PEFTHelper
-    from vllm.lora.utils import parse_fine_tuned_lora_name
-
     adapter_path = Path(adapter_path)
     if not adapter_path.is_dir():
         raise FileNotFoundError(f"LoRA adapter path is not a directory: {adapter_path}")

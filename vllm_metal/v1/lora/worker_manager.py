@@ -6,10 +6,11 @@ import logging
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from vllm.lora.utils import get_adapter_absolute_path
 
 from .mapping import LoRAMapping
 from .model_manager import MLXLoRAModelManager
-from .peft_loader import load_peft_adapter
+from .peft_loader import LoadedLoRA, load_peft_adapter
 
 if TYPE_CHECKING:
     import mlx.nn as nn
@@ -45,8 +46,6 @@ class MetalWorkerLoRAManager:
         )
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
-        from vllm.lora.utils import get_adapter_absolute_path
-
         lora_id = lora_request.lora_int_id
         already_loaded = lora_id in self._mm.list_adapters()
         if already_loaded and not lora_request.load_inplace:
@@ -58,14 +57,17 @@ class MetalWorkerLoRAManager:
             lora_config=self.lora_config,
         )
         if already_loaded:
-            self._mm.remove_adapter(lora_id)
+            self._mm.replace_adapter(adapter)
+            return True
+        return self._add_and_activate(adapter)
+
+    def _add_and_activate(self, adapter: LoadedLoRA) -> bool:
         if not self._mm.add_adapter(adapter):
             return False
         try:
-            self._mm.activate_adapter(lora_id)
+            self._mm.activate_adapter(adapter.lora_id)
         except ValueError:
-            # Slot table full — unwind so add+activate stay atomic.
-            self._mm.remove_adapter(lora_id)
+            self._mm.remove_adapter(adapter.lora_id)
             raise
         return True
 
