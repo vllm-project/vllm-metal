@@ -801,7 +801,12 @@ def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
             return True
 
     spy_lora = SpyLoRA()
-    runner = make_stub_runner(_paged_attention_backend=object(), _lora=spy_lora)
+    paged_attention = object()
+    runner = make_stub_runner(
+        _paged_attention_backend=paged_attention,
+        _paged_attention_runtime=paged_attention,
+        _lora=spy_lora,
+    )
     lora_request = SimpleNamespace(lora_int_id=17)
     new_req = SimpleNamespace(
         req_id="req-lora",
