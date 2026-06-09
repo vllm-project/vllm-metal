@@ -145,6 +145,18 @@ class MetalWorker(WorkerBase):
         # single-stage path creates no group and is byte-for-byte unchanged.
         pp_size = self.parallel_config.pipeline_parallel_size
         if pp_size > 1:
+            # STT checkpoints use a dedicated STTModelRunner with no pipeline-
+            # split path. Reject here — before the ring rendezvous below blocks —
+            # rather than AttributeError after startup in load_model.
+            from vllm_metal.stt.detection import is_stt_model
+            from vllm_metal.utils import get_model_download_path
+
+            if is_stt_model(get_model_download_path(self.model_config.model)):
+                raise NotImplementedError(
+                    "Pipeline parallelism (pipeline_parallel_size > 1) is not "
+                    "supported for speech-to-text models."
+                )
+
             # Discover every stage's node IP over the gloo control plane (already
             # initialized above) so the MLX ring spans real hosts — the same path
             # works single- or multi-node. peer_ips[r] is the IP of global rank r;

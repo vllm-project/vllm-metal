@@ -271,6 +271,20 @@ class MetalPlatform(Platform):
                 parallel_config.distributed_executor_backend = "mp"
             else:
                 parallel_config.distributed_executor_backend = "uni"
+        elif (
+            parallel_config.distributed_executor_backend == "uni"
+            and parallel_config.pipeline_parallel_size > 1
+        ):
+            # uni builds only rank 0, but PP needs one worker per stage. vLLM's
+            # UniProcExecutor does not reject this, so the lone worker would hang
+            # in gloo/ring rendezvous waiting for a stage that never spawns. Fail
+            # loud rather than silently flip the user's explicit executor choice.
+            raise NotImplementedError(
+                "Pipeline parallelism (pipeline_parallel_size > 1) requires the "
+                "'mp' or 'ray' executor; 'uni' runs a single process and cannot "
+                "place per-stage workers. Re-run with "
+                "--distributed-executor-backend mp (single node) or ray."
+            )
         elif parallel_config.distributed_executor_backend == "ray":
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
             # actor's get_node_and_gpu_ids would KeyError on

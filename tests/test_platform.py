@@ -70,7 +70,9 @@ class TestMetalPlatform:
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
-                distributed_executor_backend="uni",
+                # "mp", not "uni": uni+PP>1 short-circuits to the uni-executor
+                # guard; "mp" reaches the PP+TP check this test targets.
+                distributed_executor_backend="mp",
                 pipeline_parallel_size=2,
                 tensor_parallel_size=2,
                 disable_custom_all_reduce=False,
@@ -152,6 +154,28 @@ class TestMetalPlatform:
             scheduler_config=SimpleNamespace(async_scheduling=True),
         )
         with pytest.raises(NotImplementedError, match="synchronous scheduling"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
+        self,
+    ) -> None:
+        """The single-process 'uni' executor cannot host PP's per-stage workers.
+
+        vLLM's UniProcExecutor builds only rank 0, so without this guard the lone
+        worker hangs in gloo/ring rendezvous waiting for a stage that never
+        spawns. Reject the explicit combination rather than flip it silently.
+        """
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="uni",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:

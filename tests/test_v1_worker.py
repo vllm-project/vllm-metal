@@ -34,6 +34,38 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should delegate STT capability decisions to model runner."""
 
+    def test_init_device_rejects_pipeline_parallel_for_stt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STT checkpoints use a dedicated runner with no pipeline-split path, so
+        PP>1 must be rejected in init_device — before the ring rendezvous blocks —
+        rather than AttributeError in load_model after startup."""
+        worker = MetalWorker.__new__(MetalWorker)
+        worker.metal_config = SimpleNamespace(use_mlx=False)
+        worker.vllm_config = SimpleNamespace()
+        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=2, world_size=2)
+        worker.model_config = SimpleNamespace(model="stub-stt-model", seed=0)
+        worker.rank = 0
+        worker.local_rank = 0
+        worker.distributed_init_method = "tcp://127.0.0.1:12345"
+        worker.pp = None
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.worker.MetalPlatform.get_torch_device",
+            staticmethod(lambda *a, **k: SimpleNamespace()),
+        )
+        monkeypatch.setattr(
+            "vllm_metal.v1.worker.init_worker_distributed_environment",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr("vllm_metal.stt.detection.is_stt_model", lambda _p: True)
+        monkeypatch.setattr(
+            "vllm_metal.utils.get_model_download_path", lambda _m: "/tmp/stt"
+        )
+
+        with pytest.raises(NotImplementedError, match="speech-to-text"):
+            MetalWorker.init_device(worker)
+
     def test_reset_mm_cache_delegates_to_runner(self) -> None:
         model_runner = MagicMock()
         worker = _make_worker(model_runner, use_paged_attention=True)

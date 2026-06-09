@@ -288,6 +288,28 @@ class ModelLifecycle:
             )
         )
 
+        # Pipeline parallelism slices layers by index but leaves these per-layer
+        # KV lists at full length, so a non-first stage would index them by LOCAL
+        # layer and read the wrong global layer. They are non-None only for non-
+        # uniform models (e.g. Gemma4 interleaved sliding/full attention); reject
+        # PP for them until the split slices the lists too. ``pp`` is the runner's
+        # canonical PP signal (set by the worker before load, mirroring the
+        # forward path's ``self.pp`` checks).
+        if (
+            self._runner.pp is not None
+            and self._runner.pp.size > 1
+            and (
+                self._runner.sliding_window_per_layer is not None
+                or self._runner.kv_heads_per_layer is not None
+                or self._runner.head_dim_per_layer is not None
+            )
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported for models with non-uniform "
+                "per-layer KV (interleaved sliding-window / per-layer KV heads or "
+                "head dims, e.g. Gemma4)."
+            )
+
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
