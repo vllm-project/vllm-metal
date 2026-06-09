@@ -64,6 +64,9 @@ def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     wrapper = layers_mod.MLXLinearWithLoRA(
         base_layer=base, max_loras=2, max_lora_rank=4, dtype=mx.float32
     )
+    assert wrapper.weight is base.weight
+    assert not hasattr(wrapper, "bias")
+
     lora_a = mx.array(np.ones((2, 3), dtype=np.float32))
     lora_b = mx.array(np.ones((4, 2), dtype=np.float32))
 

@@ -33,6 +33,22 @@ class MLXLinearWithLoRA(nn.Module):
         self.lora_b_stacked = mx.zeros((slots, self.output_size, max_lora_rank), dtype)
         self.punica_wrapper: PunicaWrapperMLX | None = None
 
+    @property
+    def weight(self) -> mx.array:
+        return self.base_layer.weight
+
+    @weight.setter
+    def weight(self, value: mx.array) -> None:
+        self.base_layer.weight = value
+
+    @property
+    def bias(self) -> mx.array:
+        return self.base_layer.bias
+
+    @bias.setter
+    def bias(self, value: mx.array) -> None:
+        self.base_layer.bias = value
+
     def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
         self.punica_wrapper = punica_wrapper
 
