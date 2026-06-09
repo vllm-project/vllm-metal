@@ -159,7 +159,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 ## Limitations
 
 - **Peak memory = full model per node.** Each stage loads the whole model before dropping its non-owned layers, so Phase 0 splits compute, not load-time memory — it can't serve a model too large for one Mac.
-- **Co-located stages share the KV budget.** Two stages on one Mac ignore `VLLM_METAL_MEMORY_FRACTION`; lower it when stacking. Separate Macs are unaffected.
+- **Co-located stages oversubscribe the KV budget.** Each stage applies `VLLM_METAL_MEMORY_FRACTION` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
-- **Model support.** YOCO / hybrid / MLA / pooling / VLM / non-paged are rejected; other shapes (sliding-window, MoE) are untested.
+- **Model support.** YOCO / hybrid / MLA / pooling / VLM / non-paged / speculative decoding are rejected; other shapes (sliding-window, MoE) are untested.

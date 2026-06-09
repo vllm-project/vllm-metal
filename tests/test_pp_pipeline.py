@@ -12,7 +12,6 @@ import mlx.nn as nn
 import pytest
 
 from vllm_metal.distributed.pipeline import (
-    _MLX_RING_BASE_PORT,
     PipelinedModel,
     PipelineGroup,
     _ring_hosts,
@@ -141,22 +140,24 @@ class TestApplyPipelineSplit:
 
 
 class TestRingHosts:
-    def test_single_node_distinct_ports(self) -> None:
-        # Two stages co-located on one Mac: same IP, distinct port per rank.
+    def test_single_node_distinct_ports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Two stages co-located on one Mac: same IP, distinct port per rank
+        # (default base port 32323).
+        monkeypatch.delenv("VLLM_METAL_RING_BASE_PORT", raising=False)
         hosts = _ring_hosts(["10.0.0.5", "10.0.0.5"])
-        assert hosts == [
-            [f"10.0.0.5:{_MLX_RING_BASE_PORT}"],
-            [f"10.0.0.5:{_MLX_RING_BASE_PORT + 1}"],
-        ]
+        assert hosts == [["10.0.0.5:32323"], ["10.0.0.5:32324"]]
 
-    def test_multi_node_real_ips(self) -> None:
+    def test_multi_node_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Each stage on its own Mac: real per-rank IPs, one entry per rank.
-        ips = ["10.0.0.5", "10.0.0.6", "10.0.0.7"]
-        hosts = _ring_hosts(ips)
-        assert [h[0].rsplit(":", 1)[0] for h in hosts] == ips
-        ports = [int(h[0].rsplit(":", 1)[1]) for h in hosts]
-        assert ports == [_MLX_RING_BASE_PORT + i for i in range(3)]
-        assert len(set(ports)) == 3  # distinct ports avoid bind conflicts
+        # The base port is read per call, so the env override takes effect
+        # without reimporting the module.
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "40000")
+        hosts = _ring_hosts(["10.0.0.5", "10.0.0.6", "10.0.0.7"])
+        assert hosts == [
+            ["10.0.0.5:40000"],
+            ["10.0.0.6:40001"],
+            ["10.0.0.7:40002"],
+        ]
 
 
 class TestPipelinedModel:
@@ -167,6 +168,7 @@ class TestPipelinedModel:
         class _Stub:
             def __init__(self) -> None:
                 self.input_embeddings: object = "unset"
+                self.model = SimpleNamespace(embed_tokens=nn.Embedding(4, 8))
 
             def __call__(self, input_ids, *, cache=None, input_embeddings=None):
                 self.input_embeddings = input_embeddings
@@ -176,3 +178,17 @@ class TestPipelinedModel:
         out = PipelinedModel(stub, _pp(0, 1))("ids", cache=None)
         assert out == "logits"
         assert stub.input_embeddings is None
+
+    def test_wire_descriptor_from_embedding_output(self) -> None:
+        # The wire descriptor must come from the embedding *output*: a quantized
+        # checkpoint packs the weight (uint32, hidden folded by the bit width),
+        # so weight.shape[-1] / weight.dtype would declare a wrong recv and
+        # deadlock the ring.
+        embed = nn.QuantizedEmbedding(64, 32, group_size=32, bits=4)
+        assert embed.weight.shape[-1] != 32  # really packed
+        model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+
+        wrapper = PipelinedModel(model, _pp(0, 2))
+
+        assert wrapper._wire_hidden == 32
+        assert wrapper._wire_dtype == embed.scales.dtype

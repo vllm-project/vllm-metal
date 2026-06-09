@@ -369,6 +369,20 @@ class MetalPlatform(Platform):
                 "would starve. Re-run with --no-async-scheduling."
             )
 
+        # Speculative decoding is not implemented under pipeline parallelism:
+        # the PP forward path produces no target hidden states and draft
+        # proposal runs only on the sampling (last) stage; no method has been
+        # validated. Reject loudly rather than run an untested combination.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal does not support speculative "
+                "decoding; remove --speculative-config or run with "
+                "pipeline_parallel_size=1."
+            )
+
         if getattr(scheduler_config, "enable_chunked_prefill", False):
             if config.use_paged_attention:
                 # The paged path uses a unified varlen Metal kernel that

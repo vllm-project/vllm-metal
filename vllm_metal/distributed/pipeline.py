@@ -32,23 +32,20 @@ import vllm_metal.envs as envs
 
 logger = logging.getLogger(__name__)
 
-# Base TCP port for the MLX ring data plane. Sourced from the registered
-# ``VLLM_METAL_RING_BASE_PORT`` env var (default 32323, the mlx.launch
-# ``starting_port``); set the same value on every node to move the ring off a
-# busy port — e.g. when an mlx.launch job, a restart still in TIME_WAIT, or
-# another PP job holds 32323. Rank ``r`` listens on ``_MLX_RING_BASE_PORT + r``
-# so co-located ranks (multiple stages on one Mac) still get distinct ports.
-_MLX_RING_BASE_PORT = envs.VLLM_METAL_RING_BASE_PORT
-
 
 def _ring_hosts(peer_ips: list[str]) -> list[list[str]]:
     """Build the MLX ring hostfile body from per-rank node IPs.
 
     ``peer_ips[r]`` is the IP of the node hosting rank ``r`` — identical on a
     single node, distinct across Macs. The ring backend wants a bare list of
-    ``["ip:port"]`` lists, one per rank in rank order.
+    ``["ip:port"]`` lists, one per rank in rank order. Rank ``r`` listens on
+    ``VLLM_METAL_RING_BASE_PORT + r`` (default base 32323, the mlx.launch
+    ``starting_port``), so co-located ranks still get distinct ports; set the
+    same base on every node to move the ring off a busy port. The env var is
+    read per call, like every other vllm_metal env knob.
     """
-    return [[f"{ip}:{_MLX_RING_BASE_PORT + r}"] for r, ip in enumerate(peer_ips)]
+    base_port = envs.VLLM_METAL_RING_BASE_PORT
+    return [[f"{ip}:{base_port + r}"] for r, ip in enumerate(peer_ips)]
 
 
 class PipelineGroup:
@@ -103,9 +100,12 @@ class PipelineGroup:
             path,
         )
 
-        # mx.distributed.init() forms the real ring group from the MLX_RANK /
-        # MLX_HOSTFILE env set above (a singleton size-1 group in plain python).
-        pp = cls(mx.distributed.init())
+        # Form the real ring group from the MLX_RANK / MLX_HOSTFILE env set
+        # above. backend="ring" pins the transport: the default "any" takes the
+        # first backend that initializes (e.g. a singleton MPI group when
+        # libmpi is present), which would fail the size check below with a
+        # misleading hint.
+        pp = cls(mx.distributed.init(backend="ring"))
         # init() consumed the hostfile synchronously; drop the temp file now
         # (before the size check, so the raise path is cleaned up too).
         Path(path).unlink(missing_ok=True)
@@ -225,24 +225,33 @@ class PipelinedModel:
     def __init__(self, model: Any, pp: PipelineGroup) -> None:
         self._model = model
         self._pp = pp
+        # Wire descriptor: (hidden, dtype) of the activation that crosses
+        # stages, taken from the embedding *output*. The embedding weight is
+        # the wrong source: quantized checkpoints pack it (uint32, hidden
+        # folded by the bit width). Shape/dtype inference is lazy — nothing is
+        # evaluated here.
+        probe = model.model.embed_tokens(mx.array([0]))
+        self._wire_hidden: int = probe.shape[-1]
+        self._wire_dtype: mx.Dtype = probe.dtype
 
     def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
         pp = self._pp
         h_in: mx.array | None = None
         if not pp.is_first:
-            embed = self._model.model.embed_tokens.weight
-            h_in = pipeline_recv(pp, input_ids.shape[1], embed.shape[-1], embed.dtype)
+            h_in = pipeline_recv(
+                pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
+            )
         if pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
-        # The downstream stage receives at its embed-weight dtype (pipeline_recv);
-        # a mismatch deadlocks the ring, which does not validate across peers.
+        # The downstream stage receives at the wire dtype (pipeline_recv); a
+        # mismatch deadlocks the ring, which does not validate across peers.
         h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
-        embed_dtype = self._model.model.embed_tokens.weight.dtype
-        if h_out.dtype != embed_dtype:
+        if h_out.dtype != self._wire_dtype:
             raise TypeError(
-                f"PP stage produced hidden {h_out.dtype}, but the wire dtype is "
-                f"the embed-weight dtype {embed_dtype}; mismatch deadlocks the ring."
+                f"PP stage produced hidden {h_out.dtype}, but the wire dtype "
+                f"(embedding output dtype) is {self._wire_dtype}; mismatch "
+                f"deadlocks the ring."
             )
         return h_out

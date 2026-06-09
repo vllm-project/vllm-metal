@@ -118,6 +118,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             # Does not raise: PP>1 with TP=1 and sync scheduling falls through.
@@ -154,6 +155,30 @@ class TestMetalPlatform:
             scheduler_config=SimpleNamespace(async_scheduling=True),
         )
         with pytest.raises(NotImplementedError, match="synchronous scheduling"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_pipeline_with_speculative_decoding(
+        self,
+    ) -> None:
+        """PP>1 with speculative decoding is rejected at config time.
+
+        The PP forward path produces no target hidden states and draft proposal
+        runs only on the sampling (last) stage, so no speculative method is
+        implemented under PP. Reject loudly rather than run it unvalidated.
+        """
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=SimpleNamespace(method="ngram"),
+        )
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
