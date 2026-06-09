@@ -20,7 +20,7 @@ class LoRAMappingBuilder:
     _is_prefill: bool = False
 
     def add_request(self, lora_id: int | None, num_tokens: int) -> None:
-        token_id = int(lora_id) if lora_id else 0
+        token_id = 0 if lora_id is None else int(lora_id)
         self._idx += [token_id] * num_tokens
         self._prompt.append(token_id)
         self._is_prefill |= num_tokens > 1
