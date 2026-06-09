@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm.sampling_params import SamplingParams
 
+import vllm_metal.v1.model_runner as model_runner_mod
 from tests.stub_runner import make_stub_runner
 from vllm_metal.v1.lora import layers as layers_mod
 from vllm_metal.v1.lora import mapping as mapping_mod
@@ -785,6 +787,38 @@ def test_paged_lora_routing_orders_decode_before_prefill() -> None:
     assert mapping.index_mapping == (11, 22, 22, 22, 22)
     assert mapping.prompt_mapping == (11, 22)
     assert mapping.is_prefill is True
+
+
+def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
+    """Paged requests must load their LoRA before prepare_step routes by id."""
+
+    class SpyLoRA:
+        def __init__(self) -> None:
+            self.added: list[SimpleNamespace] = []
+
+        def add_adapter(self, lora_request: SimpleNamespace) -> bool:
+            self.added.append(lora_request)
+            return True
+
+    spy_lora = SpyLoRA()
+    runner = make_stub_runner(_paged_attention_backend=object(), _lora=spy_lora)
+    lora_request = SimpleNamespace(lora_int_id=17)
+    new_req = SimpleNamespace(
+        req_id="req-lora",
+        pooling_params=None,
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(temperature=0, max_tokens=1),
+        block_ids=([4],),
+        num_computed_tokens=0,
+        lora_request=lora_request,
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-lora": 3})
+    batch = model_runner_mod._ExecutionBatch()
+
+    runner._handle_new_requests(batch, [new_req], scheduler_output)
+
+    assert spy_lora.added == [lora_request]
+    assert batch.paged_prefill_entries[0].prefill.lora_id == 17
 
 
 # MetalLoRARuntime guards

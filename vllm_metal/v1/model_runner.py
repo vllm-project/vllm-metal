@@ -1787,6 +1787,9 @@ class MetalModelRunner:
             # ``execute_model``; no further bookkeeping needed here.
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
+            lora_id = _lora_id_from_request_data(new_req)
+            if new_req.lora_request is not None:
+                self._lora.add_adapter(new_req.lora_request)
 
             if not token_ids:
                 batch.add_output(req_id, [0])
@@ -1817,7 +1820,7 @@ class MetalModelRunner:
                             prompt_len=prompt_len if not is_intermediate else None,
                             start_pos=computed_tokens,
                             full_prompt_token_ids=None,
-                            lora_id=_lora_id_from_request_data(new_req),
+                            lora_id=lora_id,
                         ),
                         result_mode="intermediate" if is_intermediate else "new_final",
                     )
@@ -1835,7 +1838,7 @@ class MetalModelRunner:
                         generator=generator,
                         generated_tokens=0,
                         block_ids=sched_block_ids,
-                        lora_id=_lora_id_from_request_data(new_req),
+                        lora_id=lora_id,
                     )
                 continue
 
@@ -1855,7 +1858,7 @@ class MetalModelRunner:
                 generator=generator,
                 generated_tokens=1,
                 block_ids=[],
-                lora_id=_lora_id_from_request_data(new_req),
+                lora_id=lora_id,
             )
 
     def _update_cached_request_blocks(
