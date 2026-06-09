@@ -113,18 +113,18 @@ def test_model_config_candidates_take_precedence(tmp_path: Path) -> None:
     assert reference.model_path == model_dir
 
 
-def test_cache_key_includes_all_local_shards(tmp_path: Path) -> None:
+def test_dense_cache_key_includes_all_local_shards_and_dtype(tmp_path: Path) -> None:
     shards = (
         tmp_path / "model-00001-of-00002.gguf",
         tmp_path / "model-00002-of-00002.gguf",
     )
     reference = GGUFReference(shards[0], tmp_path / "model", shards)
 
-    cache_key = reference.cache_key()
+    cache_key = reference.dense_cache_key(target_dtype=mx.float16)
 
     assert str(shards[0]) in cache_key[0]
     assert str(shards[1]) in cache_key[0]
-    assert cache_key[1] == f"gguf-dense:{tmp_path / 'model'}"
+    assert cache_key[1] == f"gguf-dense:{tmp_path / 'model'}:{mx.float16}"
 
 
 def test_load_gguf_generation_model_uses_cache_and_loader(
@@ -169,7 +169,10 @@ def test_load_gguf_generation_model_uses_cache_and_loader(
     assert captured["reference"].model_path == model_dir
     assert captured["target_dtype"] == mx.float16
     assert captured["tokenizer_config"] == {"trust_remote_code": True}
-    assert cache[captured["reference"].cache_key()] == (loaded_model, loaded_tokenizer)
+    assert cache[captured["reference"].dense_cache_key(target_dtype=mx.float16)] == (
+        loaded_model,
+        loaded_tokenizer,
+    )
 
     cached_model, cached_tokenizer = gguf_lifecycle.load_gguf_generation_model(
         str(gguf_path),
@@ -182,6 +185,50 @@ def test_load_gguf_generation_model_uses_cache_and_loader(
     assert cached_model is loaded_model
     assert cached_tokenizer is loaded_tokenizer
     assert captured["load_count"] == 1
+
+
+def test_load_gguf_generation_model_cache_is_scoped_by_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "model"
+    _write_config(model_dir)
+    gguf_path = tmp_path / "model-Q8_0.gguf"
+    _write_gguf_header(gguf_path)
+
+    loaded_dtypes: list[mx.Dtype] = []
+
+    class FakeGGUFLoader:
+        def __init__(self, _reference, *, target_dtype, tokenizer_config):
+            self.target_dtype = target_dtype
+
+        def load(self):
+            loaded_dtypes.append(self.target_dtype)
+            return object(), object()
+
+    monkeypatch.setattr(gguf_lifecycle, "GGUFMLXLoader", FakeGGUFLoader)
+    cache: dict[tuple[str, str], tuple[object, object]] = {}
+    cache_lock = Lock()
+
+    first_model, first_tokenizer = gguf_lifecycle.load_gguf_generation_model(
+        str(gguf_path),
+        model_config=SimpleNamespace(dtype=torch.float16, trust_remote_code=False),
+        model_cache=cache,
+        model_cache_lock=cache_lock,
+        start_time=0.0,
+    )
+    second_model, second_tokenizer = gguf_lifecycle.load_gguf_generation_model(
+        str(gguf_path),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, trust_remote_code=False),
+        model_cache=cache,
+        model_cache_lock=cache_lock,
+        start_time=0.0,
+    )
+
+    assert first_model is not second_model
+    assert first_tokenizer is not second_tokenizer
+    assert loaded_dtypes == [mx.float16, mx.bfloat16]
+    assert len(cache) == 2
 
 
 def test_translate_prefers_upstream_name_map() -> None:

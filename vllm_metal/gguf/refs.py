@@ -34,9 +34,15 @@ class GGUFReference:
     def all_gguf_paths(self) -> tuple[Path, ...]:
         return self.gguf_paths or (self.gguf_path,)
 
-    def cache_key(self) -> tuple[str, str]:
+    def dense_cache_key(self, *, target_dtype: Any) -> tuple[str, str]:
+        """Cache key for dense GGUF loads.
+
+        The dense loader casts decoded tensors to ``target_dtype`` before
+        caching the model. Keep dtype in the loader segment so a bf16 request
+        cannot reuse an earlier fp16 model for the same GGUF files.
+        """
         gguf_key = "\x1f".join(str(path) for path in self.all_gguf_paths)
-        return (gguf_key, f"gguf-dense:{self.model_path}")
+        return (gguf_key, f"gguf-dense:{self.model_path}:{target_dtype}")
 
 
 def is_local_gguf(model_name: str | Path) -> bool:

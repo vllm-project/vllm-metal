@@ -27,7 +27,7 @@ def load_gguf_generation_model(
 ) -> tuple[Any, Any]:
     target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
     reference = resolve_gguf_reference(model_name, model_config=model_config)
-    cache_key = reference.cache_key()
+    cache_key = reference.dense_cache_key(target_dtype=target_dtype)
 
     with model_cache_lock:
         cached = model_cache.get(cache_key)

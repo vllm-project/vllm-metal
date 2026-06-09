@@ -8,6 +8,7 @@ diagnosable.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import sys
@@ -462,17 +463,20 @@ def _patch_vllm_gguf_speculator_detection() -> None:
     a GGUF feature we support in vllm-metal's experimental path, so falling back
     to the original model/tokenizer/speculative config is the narrowest fix.
     """
-    config_utils = sys.modules.get("vllm.transformers_utils.config")
-    arg_utils = sys.modules.get("vllm.engine.arg_utils")
-    if config_utils is None:
+    config_utils_module: Any | None = sys.modules.get("vllm.transformers_utils.config")
+    arg_utils: Any | None = sys.modules.get("vllm.engine.arg_utils")
+    if config_utils_module is None:
         try:
-            import vllm.transformers_utils.config as config_utils
+            config_utils_module = importlib.import_module(
+                "vllm.transformers_utils.config"
+            )
         except ImportError as exc:
             logger.warning(
                 "Could not install local GGUF speculator compatibility patch: %s",
                 exc,
             )
             return
+    config_utils: Any = config_utils_module
 
     sentinel = "_vllm_metal_gguf_speculator_patch"
     if getattr(config_utils, sentinel, False):
@@ -524,7 +528,7 @@ def _patch_vllm_gguf_speculator_detection() -> None:
 
 def _patch_vllm_local_gguf_engine_args() -> None:
     """Infer config/tokenizer paths for local GGUF files before ModelConfig."""
-    arg_utils = sys.modules.get("vllm.engine.arg_utils")
+    arg_utils: Any | None = sys.modules.get("vllm.engine.arg_utils")
     if arg_utils is None:
         return
 
