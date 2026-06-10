@@ -399,9 +399,12 @@ static void dispatch_paged_attention_v2_online(
   const int base_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
   const int max_num_partitions =
       (max_seq_len + kPartitionSize - 1) / kPartitionSize;
-  // TurboQuant and sliding-window batches stay on the single-pass path until
-  // their interaction with the split is validated (deferred to a follow-up).
-  const bool partition = pure_decode && !use_turboquant && sliding_window < 0
+  // TurboQuant and sliding-window batches take the split too.  TQ partials
+  // stay in the rotated domain with one inverse FWHT in the reduce (measured
+  // -23% TPOT at conc=1/8K); windowed batches mask per partition, and a
+  // fully-masked partition contributes exact zeros — epsilon-normalized
+  // partial, zero merge weight (Gemma-4 E2B measured -35% TPOT at conc=1).
+  const bool partition = pure_decode
       && base_grid < min_decode_grid() && max_num_partitions >= 2;
 
   std::string kname =
@@ -515,11 +518,12 @@ static void dispatch_paged_attention_v2_online(
       "paged_attention_v2_reduce_" + dt + "_hs" + std::to_string(head_size) +
       "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
-  // other function constants are inert for it.  Both are pinned false on this
-  // path today (the gate excludes TurboQuant, sinks are unsupported), but the
-  // cache key MUST encode every constant the pipeline is specialized on —
-  // otherwise the first compile wins and a later caller with different
-  // constants silently reuses the wrong pipeline.
+  // other function constants are inert for it.  TurboQuant batches take this
+  // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
+  // sinks are unsupported and stay false.  The cache key MUST encode every
+  // constant the pipeline is specialized on — otherwise the first compile
+  // wins and a later caller with different constants silently reuses the
+  // wrong pipeline.
   std::string rhash = rname + "_v2reduce"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_sk" + (use_sinks ? "1" : "0");
