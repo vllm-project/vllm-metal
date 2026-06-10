@@ -13,6 +13,9 @@
 #include <string>
 #include <unordered_map>
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
@@ -33,6 +36,63 @@ using namespace mlx::core;
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
+
+// ---------------------------------------------------------------------------
+// Split-KV (flash-decoding) decode gate
+// ---------------------------------------------------------------------------
+// Decode runs one threadgroup per (q-head, query-token).  At low concurrency
+// with a long context the base grid (num_q_heads * num_decode_tokens) leaves
+// GPU cores idle while each threadgroup serially crawls the whole KV.  The
+// (already-compiled) paged_attention_v2 split path partitions the KV across
+// grid.z + a reduce pass to manufacture the missing parallelism.  Engages only
+// when the base grid underfills the GPU, so saturated high-concurrency serving
+// is untouched.
+
+// GPU core count via IORegistry.  Metal/MLX expose no core-count API, but the
+// split-KV gate needs to scale per machine — a small laptop GPU and a large
+// desktop one saturate at very different grid sizes.  Read once; falls back to
+// a modest default if the query ever fails (future macOS / service tree).
+static int gpu_core_count() {
+  static const int v = []() {
+    int cores = 0;
+    io_iterator_t it;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("AGXAccelerator"),
+                                     &it) == KERN_SUCCESS) {
+      io_object_t obj;
+      while ((obj = IOIteratorNext(it))) {
+        CFTypeRef p = IORegistryEntrySearchCFProperty(
+            obj, kIOServicePlane, CFSTR("gpu-core-count"),
+            kCFAllocatorDefault, kIORegistryIterateRecursively);
+        if (p) {
+          if (CFGetTypeID(p) == CFNumberGetTypeID())
+            CFNumberGetValue((CFNumberRef)p, kCFNumberIntType, &cores);
+          CFRelease(p);
+        }
+        IOObjectRelease(obj);
+        if (cores > 0) break;
+      }
+      IOObjectRelease(it);
+    }
+    return cores > 0 ? cores : 14;
+  }();
+  return v;
+}
+
+// Engage the split while the base decode grid (num_q_heads * num_seqs) stays
+// below ~8 threadgroups per GPU core.  On a 14-core M1 Pro that is 112.  At 8K
+// context with the fixed 512-token (16-way) split, this regime measured:
+// conc=1 -33%, conc=2 -6.7%, conc=4 -5.3%, fading to ~-1.6% (noise) by conc=8 —
+// so the split stays on through ~conc 6 and disengages beyond, where it stops
+// paying.  Scales with core count.
+// (An adaptive runtime split count was tried and reverted: this kernel is
+// memory-bound, so it likes oversubscription — fewer splits hurt, and ~512-token
+// partitions are the sweet spot, so a fixed size + a wider gate is simpler and
+// just as fast.)
+static int min_decode_grid() {
+  static const int v = gpu_core_count() * 8;
+  return v;
+}
 
 // MLX 0.31.2 moved stream-scoped encoder/temporary management from
 // ``metal::Device`` onto ``metal::CommandEncoder`` plus a free
@@ -334,13 +394,23 @@ static void dispatch_paged_attention_v2_online(
   auto dt        = dtype_to_metal(query.dtype());
   auto k_cache_dt = dtype_to_metal(key_cache.dtype());
   auto v_cache_dt = dtype_to_metal(value_cache.dtype());
+  // ----- Split-KV (flash-decoding) occupancy gate ------------------------
+  const bool pure_decode = !has_prefill;  // every seq has exactly 1 query token
+  const int base_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
+  const int max_num_partitions =
+      (max_seq_len + kPartitionSize - 1) / kPartitionSize;
+  // TurboQuant and sliding-window batches stay on the single-pass path until
+  // their interaction with the split is validated (deferred to a follow-up).
+  const bool partition = pure_decode && !use_turboquant && sliding_window < 0
+      && base_grid < min_decode_grid() && max_num_partitions >= 2;
+
   std::string kname =
       "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps0";
+      "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
 
-  bool use_partitioning  = false;
+  bool use_partitioning  = partition;
   bool use_alibi         = false;
   bool use_fp8           = false;
   bool use_sinks         = false;
@@ -349,8 +419,8 @@ static void dispatch_paged_attention_v2_online(
   int  v_bits_i          = v_bits;
 
   // The hash name is MLX's cache key.  It MUST encode every function-constant
-  // value that varies across calls — otherwise the first compilation wins and
-  // subsequent calls with different constants silently reuse the wrong kernel.
+  // value that varies across calls.  ``kname`` already encodes the partition
+  // suffix (_ps0 vs _ps512), which is 1:1 with use_partitioning.
   std::string hash_name = kname + "_v2"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_kb" + std::to_string(k_bits_i)
@@ -374,20 +444,13 @@ static void dispatch_paged_attention_v2_online(
                           * static_cast<int>(sizeof(float));
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
-  // TurboQuant V uses register-only FWHT (no threadgroup workspace needed).
-  (void)use_turboquant;
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
   auto& enc = get_command_encoder_compat(d, s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_threadgroup_memory_length(shmem, 0);
 
-  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
-                          num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, sliding_window);
-  enc.set_bytes(scale, 9);
-
-  if (use_turboquant) {
+  // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
+  auto bind_turboquant = [&]() {
+    if (!use_turboquant) return;
     enc.set_input_array(*key_scale_cache,   22);
     enc.set_input_array(*value_scale_cache, 23);
     int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
@@ -396,8 +459,92 @@ static void dispatch_paged_attention_v2_online(
     enc.set_bytes(v_head_stride_i,  25);
     enc.set_input_array(*key_zero_cache, 26);
     enc.set_input_array(*v_centroids, 27);
+  };
+
+  if (!partition) {
+    // Single-pass path (grid.z = 1): the original decode/per-token kernel.
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_threadgroup_memory_length(shmem, 0);
+    bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                            num_kv_heads, softcap, block_tables, seq_lens,
+                            cu_seqlens_q, sliding_window);
+    enc.set_bytes(scale, 9);
+    bind_turboquant();
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_heads, total_q_tokens, 1),
+        MTL::Size::Make(NUM_THREADS, 1, 1));
+    return;
   }
 
+  // ----- Split-KV path: paged_attention(_ps512) -> paged_attention_v2_reduce.
+  // Per-partition scratch: partial output + softmax (max, exp-sum) stats.
+  // Tiny (~64 KB tmp_out @ conc=1/8K).  add_temporary keeps them alive until
+  // the command buffer completes; MLX auto-inserts a barrier between the two
+  // dispatches via input/output dependency tracking (set_output here ->
+  // set_input below), mirroring MLX's own sdpa_vector_2pass.
+  auto make_temp = [&](Shape shape, Dtype dtype) {
+    array a(std::move(shape), dtype, nullptr, {});
+    a.set_data(allocator::malloc(a.nbytes()));
+    add_temporary_compat(enc, a, d, s);
+    return a;
+  };
+  array tmp_out = make_temp(
+      Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
+      query.dtype());
+  array exp_sums =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+  array max_logits =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+
+  // Pass 1: partitioned kernel writes partials.  Out slot (2) = tmp_out scratch.
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+  bind_paged_attn_buffers(enc, tmp_out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
+  enc.set_bytes(scale, 9);
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  bind_turboquant();
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, max_num_partitions),
+      MTL::Size::Make(NUM_THREADS, 1, 1));
+
+  // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
+  std::string rname =
+      "paged_attention_v2_reduce_" + dt + "_hs" + std::to_string(head_size) +
+      "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
+  // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
+  // other function constants are inert for it.  Both are pinned false on this
+  // path today (the gate excludes TurboQuant, sinks are unsupported), but the
+  // cache key MUST encode every constant the pipeline is specialized on —
+  // otherwise the first compile wins and a later caller with different
+  // constants silently reuses the wrong pipeline.
+  std::string rhash = rname + "_v2reduce"
+      + "_tq" + (use_tq_fc ? "1" : "0")
+      + "_sk" + (use_sinks ? "1" : "0");
+  auto* rkernel = d.get_kernel(
+      rname, lib, rhash,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+  enc.set_compute_pipeline_state(rkernel);
+  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
+  // (odd partition counts would yield 8 mod 16 and trip the API-validation
+  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
+  // is never touched.
+  size_t reduce_shmem =
+      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(seq_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+  enc.set_input_array(cu_seqlens_q, 7);
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  enc.set_bytes(num_seqs_i, 8);
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(NUM_THREADS, 1, 1));
@@ -985,6 +1132,9 @@ void gdn_linear_attention_impl(
 
 NB_MODULE(_paged_ops, m) {
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
+  m.def("min_decode_grid", &min_decode_grid,
+        "Decode-grid threshold (threadgroups) below which split-KV decode "
+        "engages on this machine.");
 
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),

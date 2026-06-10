@@ -201,6 +201,14 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
+        # IOKit + CoreFoundation: gpu_core_count() in paged_ops.cpp queries the
+        # IORegistry. Explicit -framework is load-bearing — "-undefined
+        # dynamic_lookup" below resolves only against already-loaded images,
+        # and nothing else loads IOKit.
+        "-framework",
+        "IOKit",
+        "-framework",
+        "CoreFoundation",
         # "-lmlx" above validates our MLX symbols at link time and records a
         # dependency on "@rpath/libmlx.dylib" (libmlx's install name). We add NO
         # "-Wl,-rpath": baking the build machine's MLX path into a prebuilt wheel
