@@ -43,11 +43,13 @@ fetch_latest_release() {
 extract_wheel_url() {
   local release_data="$1"
 
-  python3 -c "
+  printf '%s' "$release_data" | python3 -c "
 import sys
 import json
+
 try:
-    data = json.loads('''$release_data''', strict=False)
+    data = json.load(sys.stdin)
+
     assets = data.get('assets', [])
     for asset in assets:
         name = asset.get('name', '')
@@ -55,7 +57,7 @@ try:
             print(asset.get('browser_download_url', ''))
             break
 except Exception as e:
-    print('', file=sys.stderr)
+    print(f'Failed to parse release JSON: {e}', file=sys.stderr)
 "
 }
 
@@ -108,7 +110,6 @@ install_vllm_rs() {
   fi
 
   echo "Installing vllm-rs from vLLM source: $vllm_src_dir/rust"
-
   # Run cargo from the vLLM repository root so rustup honors rust-toolchain.toml.
   if ! ( cd "$vllm_src_dir" && cargo install --locked --path rust/src/cmd --bin vllm-rs ); then
     error "Failed to install vllm-rs."
@@ -214,34 +215,18 @@ EOF
   CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
 
-  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    # Local source install (running ./install.sh from a checkout). Prebuild the
-    # native paged-attention artifacts from this tree — the _paged_ops .so and
-    # the precompiled .metallib shaders — so the kernels load with no runtime
-    # compile, exactly like a release wheel; otherwise get_ops() fails loud
-    # ("Prebuilt native extension not found") the first time paged attention is
-    # used. build_native_artifacts needs the build deps (mlx, nanobind)
-    # importable, so the editable install pulls them in first and points the
-    # install at this tree, where the artifacts land. The remote (curl | bash)
-    # branch below installs a prebuilt release wheel instead and needs no
-    # toolchain. Mirrors scripts/release.sh / scripts/test.sh.
-    uv pip install -e .
-    ensure_metal_toolchain
-    build_native_artifacts
-  else
-    local release_data
-    release_data=$(fetch_latest_release "$repo_owner" "$repo_name")
+  local release_data
+  release_data=$(fetch_latest_release "$repo_owner" "$repo_name")
 
-    local wheel_url
-    wheel_url=$(extract_wheel_url "$release_data")
+  local wheel_url
+  wheel_url=$(extract_wheel_url "$release_data")
 
-    if [[ -z "$wheel_url" ]]; then
-      error "No wheel file found in the latest release."
-      exit 1
-    fi
-
-    download_and_install_wheel "$wheel_url" "$package_name"
+  if [[ -z "$wheel_url" ]]; then
+    error "No wheel file found in the latest release."
+    exit 1
   fi
+
+  download_and_install_wheel "$wheel_url" "$package_name"
 
   if [[ "$with_vllm_rs" == "1" ]]; then
     install_vllm_rs "$vllm_src_dir"

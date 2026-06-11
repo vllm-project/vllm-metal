@@ -8,15 +8,19 @@ Thanks for your interest in contributing! This plugin targets **Apple Silicon Ma
 git clone https://github.com/vllm-project/vllm-metal.git
 cd vllm-metal
 
-# Creates ./.venv-vllm-metal/, installs vLLM core + the plugin, and
-# prebuilds the native Metal kernels from your checkout
+# Creates ./.venv-vllm-metal/ and installs vLLM core + the latest release wheel
 ./install.sh
 
 # Activate the virtualenv
 source .venv-vllm-metal/bin/activate
 
-# Install dev dependencies (pytest, ruff, mypy, ...)
+# Replace the release wheel with an editable install from your checkout
+# and pull in dev dependencies (pytest, ruff, mypy, ...)
 pip install -e ".[dev]"
+
+# Build the native kernels from your checkout (the editable install
+# removes the wheel's prebuilt ones)
+python -m vllm_metal.metal.build
 ```
 
 ## Editing the Metal kernels
