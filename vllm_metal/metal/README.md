@@ -19,19 +19,21 @@ vLLM-project Apache-2.0 sources.
 The shader set is defined explicitly in Python — the `.metal` files are
 concatenated by name, never globbed, so source order matters (e.g.
 `float8.metal` must precede `utils.metal`, which `#include`s it; the loader
-strips local `#include "…"` directives). There are **four** library outputs
+strips local `#include "…"` directives). There are **five** library outputs
 across **two** compile mechanisms:
 
 ### 1. C++ `_paged_ops` extension — `__init__.py`
 
-`get_ops()` builds the nanobind extension, then initializes three JIT
-Metal libraries from concatenated source:
+`get_ops()` builds the nanobind extension, then initializes three core JIT
+Metal libraries from concatenated source. GGUF Q8_0 kernels are initialized
+lazily through `ensure_gguf_ops()` when the raw GGUF primitive is used:
 
 | Library | Builder → init | Concatenated sources (in order) |
 |---------|----------------|----------------------------------|
 | **v2 paged attention** | `_build_v2_paged_attention_source` → `init_v2_library` | `#define VLLM_METAL_PARTITION_SIZE` · `float8.metal` · `utils.metal` · `turboquant.metal` · `pagedattention.metal` · `pagedattention_tiled.metal` |
 | **GDN linear attention** | `_build_gdn_source` → `init_gdn_library` | `utils.metal` · `gdn_linear_attention.metal` |
 | **MLA** | `_build_mla_paged_attention_source` → `init_mla_library` | `utils.metal` · `mla.metal` |
+| **GGUF Q8_0** | `_build_gguf_source` → `init_gguf_library` via `ensure_gguf_ops()` | `utils.metal` · `gguf_quant.metal` |
 
 ### 2. `mx.fast.metal_kernel` snippets — `attention/impls/gdn_lazy.py`
 
@@ -53,6 +55,7 @@ The lazy GDN decode fast path compiles two shaders directly through MLX
 | `pagedattention_tiled.metal` | Tiled Flash-Attention-style kernel using simdgroup 8×8 MMA; independent of the per-token kernel, same library. |
 | `turboquant.metal` | TurboQuant KV-cache compression (K: asymmetric uniform int8 / sub-8-bit; V: 3-bit Lloyd-Max + FWHT). Must be concatenated **after** `pagedattention.metal` declares `Vec<>`. |
 | `mla.metal` | Paged Multi-head Latent Attention kernel (RFC #360). Single-pass mode is wired today; partitioned 2-pass mode is scaffolded but inactive. |
+| `gguf_quant.metal` | Raw GGUF Q8_0 matmul primitive. Activations are internally quantized to Q8_1 blocks before multiplying against raw Q8_0 weight blocks. |
 | `gdn_linear_attention.metal` | GDN (gated delta-net) linear-attention kernel for hybrid models (prefill / chunked path). |
 | `gdn_conv1d_silu_decode.metal` | Lazy GDN decode: causal conv1d + SiLU. Compiled via `mx.fast.metal_kernel`. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. Compiled via `mx.fast.metal_kernel`. |
@@ -60,7 +63,7 @@ The lazy GDN decode fast path compiles two shaders directly through MLX
 ## Unwired leftover shaders
 
 These files exist in `kernels_v2/` but are **not referenced** by any build
-or dispatch path (`__init__.py`, `paged_ops.cpp`, `build.py`,
+or dispatch path (`__init__.py`, `paged_ops.cpp`, `gguf_ops.cpp`, `build.py`,
 `gdn_lazy.py`, or any shader `#include`). They are v2-directory
 copies of old v1 kernels whose functionality is now handled MLX-natively.
 PR #378 only removed `kernels_v1/`, so it does not touch these:

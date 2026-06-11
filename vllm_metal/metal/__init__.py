@@ -27,14 +27,15 @@ _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
 # Cached after first get_ops() call.  By default both the .cpp extension and
-# the three Metal shader libraries are loaded prebuilt from the package (the
+# the core Metal shader libraries are loaded prebuilt from the package (the
 # .so plus precompiled .metallib files), so there is no first-request shader
-# compile.  Set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile the .so from source
-# AND compile the shaders in-process from .metal (for kernel developers
-# iterating on paged_ops.cpp or the .metal sources); editing .metal then
-# requires restarting the interpreter to pick up changes.  Either way the
+# compile for normal serving. Set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile
+# the .so from source AND compile the shaders in-process from .metal (for
+# kernel developers iterating on C++ or .metal sources); editing .metal then
+# requires restarting the interpreter to pick up changes. Either way the
 # libraries are held in MLX's cache for the lifetime of the process.
 _ops_module: ModuleType | None = None
+_gguf_ops_ready = False
 
 
 @functools.cache
@@ -85,6 +86,43 @@ def _build_mla_paged_attention_source() -> str:
         _read_metal_source(_KERNELS_V2_DIR / "mla.metal"),
     ]
     return "\n".join(parts)
+
+
+def _build_gguf_source() -> str:
+    """Concatenate utils + GGUF quant kernels into a single source."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "gguf_quant.metal"),
+    ]
+    return "\n".join(parts)
+
+
+def ensure_gguf_ops() -> ModuleType:
+    """Return ``_paged_ops`` after lazily loading GGUF Metal kernels."""
+    global _gguf_ops_ready
+    mod = get_ops()
+    if _gguf_ops_ready:
+        return mod
+
+    from vllm_metal import envs
+    from vllm_metal.metal.build import GGUF_METALLIB_NAME, metallib_path
+
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        mod.init_gguf_library(_build_gguf_source())
+    else:
+        path = metallib_path(GGUF_METALLIB_NAME)
+        if not path.exists():
+            raise RuntimeError(
+                f"Prebuilt GGUF Metal library missing: {path.name} "
+                f"(expected in {_THIS_DIR}). Install a vllm-metal release "
+                f"wheel, or set VLLM_METAL_BUILD_FROM_SOURCE=1 to compile "
+                f"shaders from source."
+            )
+        mod.init_library_path(GGUF_METALLIB_NAME, str(path))
+
+    _gguf_ops_ready = True
+    logger.info("Native GGUF Metal kernels loaded")
+    return mod
 
 
 def metal_mla_paged_attention(
@@ -150,7 +188,7 @@ def metal_mla_paged_attention(
 def get_ops() -> ModuleType:
     """Import the native paged_ops extension and initialise its Metal libraries.
 
-    By default the prebuilt ``.so`` is loaded and the three precompiled
+    By default the prebuilt ``.so`` is loaded and the core precompiled
     ``.metallib`` shader libraries are loaded by path via MLX
     (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
     is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
@@ -211,8 +249,8 @@ def get_ops() -> ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 3. Initialise the three Metal shader libraries (v2 online-softmax, GDN
-    #    linear attention, MLA paged attention).  By default we load the
+    # 3. Initialise the core Metal shader libraries (v2 online-softmax, GDN
+    #    linear attention, MLA paged attention). By default we load the
     #    precompiled .metallib files shipped in the wheel (no first-request
     #    shader compile); only compile the shaders in-process when the developer
     #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
@@ -221,16 +259,16 @@ def get_ops() -> ModuleType:
         mod.init_gdn_library(_build_gdn_source())
         mod.init_mla_library(_build_mla_paged_attention_source())
     else:
-        from vllm_metal.metal.build import METALLIB_NAMES, metallib_path
+        from vllm_metal.metal.build import CORE_METALLIB_NAMES, metallib_path
 
-        missing = [n for n in METALLIB_NAMES if not metallib_path(n).exists()]
+        missing = [n for n in CORE_METALLIB_NAMES if not metallib_path(n).exists()]
         if missing:
             raise RuntimeError(
                 f"Prebuilt Metal libraries missing: {missing} (expected in "
                 f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
                 f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
             )
-        for name in METALLIB_NAMES:
+        for name in CORE_METALLIB_NAMES:
             mod.init_library_path(name, str(metallib_path(name)))
 
     _ops_module = mod

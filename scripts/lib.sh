@@ -126,7 +126,7 @@ build_native_artifacts() {
 }
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
-# artifacts: the _paged_ops*.so extension and the three .metallib shader
+# artifacts: the _paged_ops*.so extension and all .metallib shader
 # libraries. maturin's `include` directive is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
 # first run with "Prebuilt native extension not found". The expected filenames

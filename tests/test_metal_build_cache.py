@@ -16,6 +16,8 @@ from vllm_metal.metal import build
 @dataclass
 class _Paths:
     src: Path
+    gguf_src: Path
+    gguf_header: Path
     bld: Path
     consts: Path
     nb_src: Path
@@ -27,6 +29,8 @@ class _Paths:
 @pytest.fixture
 def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "paged_ops.cpp"
+    gguf_src = tmp_path / "gguf_ops.cpp"
+    gguf_header = tmp_path / "gguf_ops.h"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
     nb_src = tmp_path / "nb_combined.cpp"
@@ -34,11 +38,14 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     hsh = tmp_path / "_paged_ops.so.sha256"
 
     src.write_bytes(b"// source v1")
+    gguf_src.write_bytes(b"// gguf source v1")
+    gguf_header.write_bytes(b"// gguf header v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
 
-    monkeypatch.setattr(build, "_SRC", src)
+    monkeypatch.setattr(build, "_SOURCES", (src, gguf_src))
+    monkeypatch.setattr(build, "_HEADERS", (gguf_header,))
     monkeypatch.setattr(build, "_BUILD", bld)
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
@@ -55,7 +62,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, bld, consts, nb_src, out, hsh, spec)
+    return _Paths(src, gguf_src, gguf_header, bld, consts, nb_src, out, hsh, spec)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -86,7 +93,14 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     patched.out.write_bytes(b"compiled-from-prev-branch")
     patched.hsh.write_text("hash-from-prev-branch")
     older = patched.out.stat().st_mtime - 86400
-    for p in (patched.src, patched.bld, patched.consts, patched.nb_src):
+    for p in (
+        patched.src,
+        patched.gguf_src,
+        patched.gguf_header,
+        patched.bld,
+        patched.consts,
+        patched.nb_src,
+    ):
         os.utime(p, (older, older))
     assert build.needs_rebuild() is True
 
@@ -94,6 +108,18 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
 def test_hash_changes_with_source_bytes(patched):
     h1 = build._input_hash(patched.spec)
     patched.src.write_bytes(b"// source v2")
+    assert build._input_hash(patched.spec) != h1
+
+
+def test_hash_changes_with_gguf_source_bytes(patched):
+    h1 = build._input_hash(patched.spec)
+    patched.gguf_src.write_bytes(b"// gguf source v2")
+    assert build._input_hash(patched.spec) != h1
+
+
+def test_hash_changes_with_header_bytes(patched):
+    h1 = build._input_hash(patched.spec)
+    patched.gguf_header.write_bytes(b"// gguf header v2")
     assert build._input_hash(patched.spec) != h1
 
 
@@ -161,6 +187,11 @@ def test_metallib_path_named_in_package(tmp_path, monkeypatch):
     assert build.metallib_path("gdn_kern") == tmp_path / "gdn_kern.metallib"
 
 
+def test_gguf_metallib_is_packaged_but_loaded_lazily():
+    assert build.GGUF_METALLIB_NAME in build.METALLIB_NAMES
+    assert build.GGUF_METALLIB_NAME not in build.CORE_METALLIB_NAMES
+
+
 def test_metallib_digest_changes_with_source():
     # The metallib staleness stamp is keyed on the assembled shader source, so a
     # one-byte shader edit must change the digest (else an edited kernel loads
@@ -209,7 +240,7 @@ def test_is_stale_false_when_stamp_unreadable(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# stale_artifacts: aggregates is_stale over the .so + the three .metallibs,
+# stale_artifacts: aggregates is_stale over the .so + the .metallibs,
 # with digests stubbed so no real mlx/nanobind/shader sources are touched.
 # --------------------------------------------------------------------------
 

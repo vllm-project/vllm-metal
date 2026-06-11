@@ -11,7 +11,7 @@ main() {
 
   setup_dev_env
 
-  # Build the prebuilt native extension (.so) and the three precompiled
+  # Build the prebuilt native extension (.so) and all precompiled
   # .metallib shader libraries into vllm_metal/metal/ before `uv build`, so the
   # wheel ships them (via the maturin `include` directive) and end users never
   # invoke clang++ or `xcrun metal` at runtime.

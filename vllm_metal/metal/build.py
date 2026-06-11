@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""JIT build script for the native paged-attention Metal extension.
+"""JIT build script for the native Metal extension.
 
-Compiles ``paged_ops.cpp`` + nanobind into a shared library that dispatches
-Metal shaders through MLX's own command encoder.
+Compiles nanobind plus owner-specific C++ sources into a shared library that
+dispatches Metal shaders through MLX's own command encoder.
 """
 
 from __future__ import annotations
@@ -20,7 +20,11 @@ from vllm_metal.metal.constants import PARTITION_SIZE
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
-_SRC = _THIS_DIR / "paged_ops.cpp"
+_SOURCES = (
+    _THIS_DIR / "paged_ops.cpp",
+    _THIS_DIR / "gguf_ops.cpp",
+)
+_HEADERS = (_THIS_DIR / "gguf_ops.h",)
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -38,11 +42,13 @@ def _stamp_path(artifact: Path) -> Path:
 # The .so's stamp; identical mechanism to each .metallib's (see is_stale).
 _HASH = _stamp_path(_OUT)
 
-# Names of the three precompiled Metal shader libraries.  Each is the cache-key
+# Names of the precompiled Metal shader libraries.  Each is the cache-key
 # name the C++ extension registers the library under (passed to
 # ``init_library_path(name, path)`` in paged_ops.cpp), so a later dispatch's
 # ``get_library(name)`` returns the .metallib loaded at startup.
-METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
+CORE_METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
+GGUF_METALLIB_NAME = "gguf_kern"
+METALLIB_NAMES = (*CORE_METALLIB_NAMES, GGUF_METALLIB_NAME)
 
 
 def output_path() -> Path:
@@ -76,6 +82,7 @@ def _metallib_source(name: str) -> str:
     coupling with :mod:`vllm_metal.metal`."""
     from vllm_metal.metal import (
         _build_gdn_source,
+        _build_gguf_source,
         _build_mla_paged_attention_source,
         _build_v2_paged_attention_source,
     )
@@ -84,6 +91,7 @@ def _metallib_source(name: str) -> str:
         "paged_attention_v2_kern": _build_v2_paged_attention_source,
         "gdn_kern": _build_gdn_source,
         "paged_mla_kern": _build_mla_paged_attention_source,
+        "gguf_kern": _build_gguf_source,
     }
     return builders[name]()
 
@@ -129,7 +137,7 @@ def _compile_metallib(name: str, source: str) -> Path:
 
 
 def build_metallibs() -> list[Path]:
-    """Precompile the three Metal shader libraries to ``.metallib`` files.
+    """Precompile the Metal shader libraries to ``.metallib`` files.
 
     PACKAGING-only (CI + release.sh): the default runtime path loads these
     prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
@@ -216,7 +224,7 @@ def _build_spec() -> _BuildSpec:
         "-undefined",
         "dynamic_lookup",
         str(nb_src),
-        str(_SRC),
+        *(str(src) for src in _SOURCES),
         "-o",
         str(_OUT),
     ]
@@ -243,7 +251,7 @@ def _input_hash(spec: _BuildSpec) -> str:
     # so editing a flag still busts the hash.
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
-    for p in (_SRC, _BUILD, _CONSTANTS, spec.nb_src):
+    for p in (*_SOURCES, *_HEADERS, _BUILD, _CONSTANTS, spec.nb_src):
         h.update(p.name.encode())
         h.update(b"\0")
         h.update(p.read_bytes())
@@ -314,7 +322,7 @@ def build() -> Path:
 
     spec = _build_spec()
     expected_hash = _input_hash(spec)
-    logger.info("Building native paged-attention extension ...")
+    logger.info("Building native Metal extension ...")
 
     for p, label in [
         (spec.py_include, "Python include"),
@@ -325,7 +333,7 @@ def build() -> Path:
         if not Path(p).exists():
             raise FileNotFoundError(f"{label} not found: {p}")
 
-    _run_or_raise(spec.cmd, "build paged_ops extension")
+    _run_or_raise(spec.cmd, "build native Metal extension")
 
     _HASH.write_text(expected_hash)
     logger.info("Built %s", _OUT)

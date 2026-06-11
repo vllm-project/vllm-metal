@@ -16,6 +16,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
+#include "gguf_ops.h"
+
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
@@ -993,6 +995,8 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_library_path", &init_library_path,
         nb::arg("name"), nb::arg("path"),
         "Load a precompiled .metallib from disk, cached under `name`.");
+
+  register_gguf_ops(m);
 
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),
