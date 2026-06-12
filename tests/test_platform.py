@@ -80,7 +80,7 @@ class TestMetalPlatform:
             model_config=None,
         )
         with pytest.raises(
-            NotImplementedError, match="pipeline and tensor parallelism"
+            NotImplementedError, match="alone or combined with pipeline"
         ):
             MetalPlatform.check_and_update_config(vllm_config)
 
@@ -180,6 +180,40 @@ class TestMetalPlatform:
             speculative_config=SimpleNamespace(method="ngram"),
         )
         with pytest.raises(NotImplementedError, match="speculative decoding"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_pipeline_with_stt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PP>1 with an STT model is rejected at config time.
+
+        STT checkpoints use a dedicated runner with no pipeline-split path, so
+        reject before any worker spawns rather than fail after startup.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=SimpleNamespace(
+                model="openai/whisper-tiny",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="whisper"),
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                enable_chunked_prefill=False,
+            ),
+            speculative_config=None,
+            lora_config=None,
+        )
+        with pytest.raises(NotImplementedError, match="speech-to-text"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
