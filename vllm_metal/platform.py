@@ -320,33 +320,21 @@ class MetalPlatform(Platform):
         # mx.distributed data plane (point-to-point send/recv), wired in the
         # model runner (see MetalModelRunner._start_paged_forward). The control
         # plane stays on vLLM's gloo group; the two transports coexist.
-        #
-        # Only PP with TP==1 is validated: world_size = PP * TP, so forcing
-        # TP==1 keeps the invariant global_rank == pipeline stage index that the
-        # PipelineGroup relies on. Reject the un-validated PP+TP combination
-        # loudly here (the TP>1 block below also rejects it, but fail fast on the
-        # PP path too rather than depend on block ordering).
-        if (
-            parallel_config.pipeline_parallel_size > 1
-            and parallel_config.tensor_parallel_size > 1
-        ):
-            raise NotImplementedError(
-                "Metal/MLX does not support combining pipeline and tensor "
-                "parallelism (pipeline_parallel_size > 1 with "
-                "tensor_parallel_size > 1); only PP with TP=1 is validated."
-            )
 
         # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
         # GPU per node cannot shard a TP>1 model, and there is no cross-device
         # collective wired in (mx.distributed). Only TP=1 is validated. Reject
         # at config time rather than hang on Ray placement-group creation (one
         # "mlx" resource per node) or silently misbehave. This is executor-
-        # agnostic: uni/mp are equally unable to run TP>1 on one device.
-        # Remove when mx.distributed tensor parallelism lands.
+        # agnostic: uni/mp are equally unable to run TP>1 on one device. This
+        # guard also rejects PP+TP — which must STAY rejected when TP support
+        # lands: PipelineGroup relies on global_rank == pipeline stage index,
+        # which only holds while world_size = PP * TP has TP == 1.
         if parallel_config.tensor_parallel_size > 1:
             raise NotImplementedError(
                 "Metal/MLX does not support tensor parallelism yet "
-                "(tensor_parallel_size > 1); only TP=1 is validated."
+                "(tensor_parallel_size > 1), alone or combined with pipeline "
+                "parallelism; only TP=1 is validated."
             )
 
         scheduler_config = vllm_config.scheduler_config
@@ -381,6 +369,21 @@ class MetalPlatform(Platform):
                 "Pipeline parallelism on Metal does not support speculative "
                 "decoding; remove --speculative-config or run with "
                 "pipeline_parallel_size=1."
+            )
+
+        # LoRA is not supported under pipeline parallelism: non-last stages
+        # rebuild RequestState from the scheduler broadcast without lora_id
+        # (see MetalModelRunner._update_pp_stage_states), so per-step LoRA
+        # decode routing would silently run their layer slices without the
+        # adapter while the last stage applies it. The LoRA runtime is also
+        # wired to the full model before the stage slice. Reject loudly.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and vllm_config.lora_config is not None
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal does not support LoRA; "
+                "remove --enable-lora or run with pipeline_parallel_size=1."
             )
 
         if getattr(scheduler_config, "enable_chunked_prefill", False):
@@ -444,6 +447,14 @@ class MetalPlatform(Platform):
             else None
         )
         if resolved_model is not None and is_stt_model(resolved_model):
+            # STT checkpoints use a dedicated STTModelRunner with no pipeline-
+            # split path. Reject PP here, with the other config-time PP guards,
+            # before any worker spawns.
+            if parallel_config.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "Pipeline parallelism (pipeline_parallel_size > 1) is not "
+                    "supported for speech-to-text models."
+                )
             was_async_scheduling = bool(scheduler_config.async_scheduling)
             apply_stt_scheduler_policy(model_config, scheduler_config)
             if was_async_scheduling and not scheduler_config.async_scheduling:

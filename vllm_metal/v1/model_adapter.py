@@ -146,8 +146,14 @@ class ModelAdapter(Protocol):
     def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from raw model output."""
 
-    def apply_pipeline_split(self, model: Any, pp: PipelineGroup) -> None:
-        """Slice ``model`` in place to the pipeline stage owned by ``pp``."""
+    def apply_pipeline_split(
+        self, model: Any, pp: PipelineGroup
+    ) -> tuple[int, int] | None:
+        """Slice ``model`` in place to the pipeline stage owned by ``pp``.
+
+        Returns the local ``(start, end)`` layer span (``None`` for a
+        singleton group).
+        """
 
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any
@@ -447,18 +453,21 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _target_backbone(self, model: Any) -> Any | None:
         return getattr(self.text_model(model), "model", None)
 
-    def apply_pipeline_split(self, model: Any, pp: PipelineGroup) -> None:
+    def apply_pipeline_split(
+        self, model: Any, pp: PipelineGroup
+    ) -> tuple[int, int] | None:
         """Slice the text backbone in place to the stage owned by ``pp``.
 
         Delegates to :func:`vllm_metal.distributed.apply_pipeline_split`, which
         operates on the ``.model`` backbone of the object it is handed. Passing
         ``self.text_model(model)`` reuses the same backbone resolution as
         :meth:`_target_backbone` so VLM text sub-models are sliced correctly.
-        A singleton (size-1) group is a no-op.
+        Returns the local ``(start, end)`` layer span (``None`` for a
+        singleton group, where the split is a no-op).
         """
         from vllm_metal.distributed import apply_pipeline_split
 
-        apply_pipeline_split(self.text_model(model), pp)
+        return apply_pipeline_split(self.text_model(model), pp)
 
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any

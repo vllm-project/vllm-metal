@@ -119,6 +119,7 @@ class TestMetalPlatform:
                     max_num_scheduled_tokens=None,
                 ),
                 speculative_config=None,
+                lora_config=None,
             )
 
             # Does not raise: PP>1 with TP=1 and sync scheduling falls through.
