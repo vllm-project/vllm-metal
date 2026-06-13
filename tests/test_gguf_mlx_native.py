@@ -20,8 +20,6 @@ gguf = pytest.importorskip("gguf")
 from vllm_metal.gguf.mlx_native import (  # noqa: E402
     MLX_NATIVE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
-    embedding_lookup,
-    qmatmul,
 )
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
@@ -65,11 +63,11 @@ def test_contract_matches_logical_shape(tmp_path, qtype):
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_qmatmul_matches_dense_oracle_f32(tmp_path, qtype):
+def test_matmul_matches_dense_oracle_f32(tmp_path, qtype):
     qt, oracle = _make_tensor(tmp_path, qtype)
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
-    out = qmatmul(x, qt)
+    out = qt.matmul(x)
     expected = x @ mx.array(oracle).T
     mx.eval(out, expected)
 
@@ -84,23 +82,23 @@ def test_qmatmul_matches_dense_oracle_f32(tmp_path, qtype):
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_qmatmul_output_dtype_follows_x(tmp_path, qtype, dtype):
+def test_matmul_output_dtype_follows_x(tmp_path, qtype, dtype):
     qt, _ = _make_tensor(tmp_path, qtype)
     x = mx.random.normal((4, qt.in_features)).astype(dtype)
 
-    out = qmatmul(x, qt)
+    out = qt.matmul(x)
 
     assert out.dtype == dtype
     assert out.shape == (4, qt.out_features)
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_qmatmul_preserves_leading_shape(tmp_path, qtype):
+def test_matmul_preserves_leading_shape(tmp_path, qtype):
     qt, _ = _make_tensor(tmp_path, qtype)
     x = mx.random.normal((2, 3, qt.in_features)).astype(mx.float16)
 
-    out = qmatmul(x, qt)
-    flat = qmatmul(x.reshape(-1, qt.in_features), qt)
+    out = qt.matmul(x)
+    flat = qt.matmul(x.reshape(-1, qt.in_features))
     mx.eval(out, flat)
 
     assert out.shape == (2, 3, qt.out_features)
@@ -108,21 +106,21 @@ def test_qmatmul_preserves_leading_shape(tmp_path, qtype):
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_qmatmul_empty_batch(tmp_path, qtype):
+def test_matmul_empty_batch(tmp_path, qtype):
     qt, _ = _make_tensor(tmp_path, qtype)
 
-    out = qmatmul(mx.zeros((0, qt.in_features), dtype=mx.float16), qt)
+    out = qt.matmul(mx.zeros((0, qt.in_features), dtype=mx.float16))
 
     assert out.shape == (0, qt.out_features)
     assert out.dtype == mx.float16
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_lookup_matches_oracle_rows(tmp_path, qtype):
+def test_embedding_matches_oracle_rows(tmp_path, qtype):
     qt, oracle = _make_tensor(tmp_path, qtype)
     ids = mx.array([[0, 5], [63, 0]], dtype=mx.int32)
 
-    out = embedding_lookup(ids, qt, output_dtype=mx.float32)
+    out = qt.embedding(ids, output_dtype=mx.float32)
     expected = mx.array(oracle)[ids]
     mx.eval(out, expected)
 
@@ -136,13 +134,13 @@ def test_embedding_lookup_matches_oracle_rows(tmp_path, qtype):
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_as_linear_matches_qmatmul(tmp_path, qtype):
+def test_embedding_as_linear_matches_matmul(tmp_path, qtype):
     # A tied lm_head reuses the embedding table as a linear weight; the same
-    # quantized tensor must work through qmatmul (the PR-2 tied-head path).
+    # quantized tensor must work through matmul (the PR-2 tied-head path).
     qt, oracle = _make_tensor(tmp_path, qtype, shape=(100, 64))
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
-    out = qmatmul(x, qt)
+    out = qt.matmul(x)
     expected = x @ mx.array(oracle).T
     mx.eval(out, expected)
 
@@ -276,10 +274,10 @@ def test_mx_load_layout_is_affine_group32(tmp_path, qtype):
 
 
 @pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_lookup_empty_ids(tmp_path, qtype):
+def test_embedding_empty_ids(tmp_path, qtype):
     qt, _ = _make_tensor(tmp_path, qtype)
 
-    out = embedding_lookup(mx.zeros((0,), dtype=mx.int32), qt, output_dtype=mx.float16)
+    out = qt.embedding(mx.zeros((0,), dtype=mx.int32), output_dtype=mx.float16)
     assert out.shape == (0, qt.in_features)
     assert out.dtype == mx.float16
 
@@ -289,7 +287,7 @@ def test_embedding_lookup_empty_ids(tmp_path, qtype):
 # Set VLLM_METAL_TEST_GGUF_PATHS to a comma-separated list of real .gguf files
 # (e.g. a Q8_0 and a Q4_0 model) to run these. They prove the representation and
 # primitives hold on real checkpoints — every MLX-native tensor constructs, with
-# qmatmul/embedding parity vs the gguf-py dequantize oracle and a quantized-vs-
+# matmul/embedding parity vs the gguf-py dequantize oracle and a quantized-vs-
 # dense memory comparison. Each file is checked for whichever native qtypes it
 # contains, so pointing at a Q4_0 file gives real Q4_0 coverage.
 
@@ -342,7 +340,7 @@ def test_real_file_linear_parity_vs_oracle(path):
     oracle = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
 
     x = mx.random.normal((4, qt.in_features)).astype(mx.float32)
-    out = qmatmul(x, qt)
+    out = qt.matmul(x)
     expected = x @ mx.array(oracle).T
     mx.eval(out, expected)
 
@@ -363,7 +361,7 @@ def test_real_file_embedding_parity_vs_oracle(path):
     oracle = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
 
     ids = mx.array([0, 100, qt.out_features - 1], dtype=mx.int32)
-    out = embedding_lookup(ids, qt, output_dtype=mx.float32)
+    out = qt.embedding(ids, output_dtype=mx.float32)
     expected = mx.array(oracle)[ids]
     mx.eval(out, expected)
 
@@ -393,7 +391,7 @@ def test_real_file_memory_below_dense(path):
 #
 # Set VLLM_METAL_TEST_QWEN35_PATH to a dense Qwen3.5-0.8B to run this. It quantizes
 # every Linear/Embedding to Q8_0 (the same affine triple the GGUF path produces),
-# swaps in shims that route through qmatmul/embedding_lookup, and checks greedy
+# swaps in shims that route through matmul/embedding, and checks greedy
 # generation matches the dense model token-for-token. The real-file parity tests
 # above cover the other half — that a real GGUF Q8_0 file loads into the same
 # representation. The GGUF->module name mapping that joins the two is PR 3.
@@ -434,7 +432,7 @@ def test_real_generate_matches_dense():
 
         def __call__(self, x):
             calls["linear"] += 1
-            out = qmatmul(x, self.qt)
+            out = self.qt.matmul(x)
             return out if self.bias is None else out + self.bias
 
     class QuantEmbedding(nn.Module):
@@ -445,11 +443,11 @@ def test_real_generate_matches_dense():
 
         def __call__(self, ids):
             calls["embedding"] += 1
-            return embedding_lookup(ids, self.qt, self.output_dtype)
+            return self.qt.embedding(ids, self.output_dtype)
 
         def as_linear(self, x):
             calls["embedding"] += 1
-            return qmatmul(x, self.qt)
+            return self.qt.matmul(x)
 
     def swap_to_q8(module):
         swapped = 0

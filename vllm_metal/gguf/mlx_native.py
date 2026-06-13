@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-native quantized GGUF tensors and the primitives that compute with them.
+"""MLX-native quantized GGUF tensors that compute with their packed weights.
 
 MLX's GGUF loader (``mx.load``) repacks Q8_0 and Q4_0 weights into the affine,
 group-32 representation that ``mx.quantized_matmul`` already consumes: a
 ``uint32`` packed ``qweight`` alongside ``float16`` ``scales`` and ``biases``.
-``GGUFMLXQuantizedTensor`` wraps that triple in an explicit, validated contract,
-and :func:`qmatmul` / :func:`embedding_lookup` run on it directly so supported
-weights never get expanded into a dense copy.
+``GGUFMLXQuantizedTensor`` wraps that triple in an explicit, validated contract
+and exposes :meth:`~GGUFMLXQuantizedTensor.matmul` /
+:meth:`~GGUFMLXQuantizedTensor.embedding`, which run on the packed weights so
+supported weights never get expanded into a dense copy.
 
 Q4_1 is deliberately not supported here. MLX's repack mis-decodes Q4_1 blocks
 (it skips a 2-byte block header where Q4_1 uses 4), so ``mx.load`` returns
 corrupted Q4_1 weights. Fix tracked upstream at ml-explore/mlx#3664; Q4_1 can
 join once a fixed MLX release is in our supported range. K-quants and other
-qtypes MLX does not repack natively are left for the raw-block Metal path.
+qtypes MLX does not repack natively are out of scope for this path.
 """
 
 from __future__ import annotations
@@ -46,33 +47,9 @@ _QUANT_MODE = "affine"
 _WEIGHT_SUFFIX = ".weight"
 
 
-def _as_supported_qtype(value: GGMLQuantizationType | int) -> GGMLQuantizationType:
-    """Normalize to a ``GGMLQuantizationType`` and require it to be MLX-native."""
-    try:
-        qweight_type = GGMLQuantizationType(value)
-    except ValueError as exc:
-        raise ValueError(f"Unknown GGUF quantization type: {value!r}") from exc
-    if qweight_type in MLX_NATIVE_GGUF_TYPES:
-        return qweight_type
-    supported = ", ".join(t.name for t in _BITS)
-    if qweight_type == GGMLQuantizationType.Q4_1:
-        # Remove this special case once a fixed MLX release (ml-explore/mlx#3664)
-        # is our lower bound and Q4_1 can be added to _BITS.
-        raise ValueError(
-            "GGUF Q4_1 is not supported on the MLX-native path: MLX's GGUF "
-            "repack mis-decodes Q4_1 blocks and returns corrupted weights "
-            "(ml-explore/mlx#3664). "
-            f"Supported MLX-native qtypes: {supported}."
-        )
-    raise ValueError(
-        f"Unsupported GGUF quantization type for the MLX-native path: "
-        f"{qweight_type.name}. Supported MLX-native qtypes: {supported}."
-    )
-
-
 @dataclass(frozen=True, eq=False)
 class GGUFMLXQuantizedTensor:
-    """An MLX-native quantized GGUF weight plus its originating quant type.
+    """An MLX-native quantized GGUF weight that computes with its packed data.
 
     The contract consumers can rely on:
 
@@ -83,9 +60,8 @@ class GGUFMLXQuantizedTensor:
       :data:`MLX_NATIVE_GGUF_TYPES`.
     * logical weight is ``(out_features, in_features)``; :attr:`group_size` is 32;
       :attr:`bits` is 8 for Q8_0, 4 for Q4_0.
-    * activations: :func:`qmatmul` accepts float16/bfloat16/float32 ``x`` and
-      returns ``x``'s dtype; :func:`embedding_lookup` returns an explicit
-      ``output_dtype``.
+    * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
+      returns ``x``'s dtype; :meth:`embedding` returns an explicit ``output_dtype``.
 
     Construct directly when you already hold the affine arrays (e.g. a row slice
     of another tensor), or via :meth:`from_mx_load` from an ``mx.load`` result.
@@ -97,11 +73,40 @@ class GGUFMLXQuantizedTensor:
     qweight_type: GGMLQuantizationType
 
     def __post_init__(self) -> None:
-        # Coerce ints to the enum (and reject non-native qtypes) so every error
-        # message and downstream consumer can rely on a real GGMLQuantizationType.
-        object.__setattr__(self, "qweight_type", _as_supported_qtype(self.qweight_type))
-        bits = _BITS[self.qweight_type]
+        # Coerce ints to the enum (rejecting non-native qtypes), then validate the
+        # arrays, since this is built straight from mx.load() / GGUF file data.
+        object.__setattr__(
+            self, "qweight_type", self._normalize_qtype(self.qweight_type)
+        )
+        self._validate_contract()
 
+    @staticmethod
+    def _normalize_qtype(value: GGMLQuantizationType | int) -> GGMLQuantizationType:
+        """Coerce to a ``GGMLQuantizationType`` and require it to be MLX-native."""
+        try:
+            qweight_type = GGMLQuantizationType(value)
+        except ValueError as exc:
+            raise ValueError(f"Unknown GGUF quantization type: {value!r}") from exc
+        if qweight_type in MLX_NATIVE_GGUF_TYPES:
+            return qweight_type
+        supported = ", ".join(t.name for t in _BITS)
+        if qweight_type == GGMLQuantizationType.Q4_1:
+            # Remove this special case once a fixed MLX release (ml-explore/mlx#3664)
+            # is our lower bound and Q4_1 can be added to _BITS.
+            raise ValueError(
+                "GGUF Q4_1 is not supported on the MLX-native path: MLX's GGUF "
+                "repack mis-decodes Q4_1 blocks and returns corrupted weights "
+                "(ml-explore/mlx#3664). "
+                f"Supported MLX-native qtypes: {supported}."
+            )
+        raise ValueError(
+            f"Unsupported GGUF quantization type for the MLX-native path: "
+            f"{qweight_type.name}. Supported MLX-native qtypes: {supported}."
+        )
+
+    def _validate_contract(self) -> None:
+        """Validate dtypes and the affine packing shapes against the contract."""
+        bits = _BITS[self.qweight_type]
         if self.qweight.dtype != mx.uint32:
             raise ValueError(
                 f"{self.qweight_type.name} qweight must be uint32, "
@@ -153,12 +158,12 @@ class GGUFMLXQuantizedTensor:
     ) -> GGUFMLXQuantizedTensor:
         """Build from an ``mx.load`` result.
 
-        ``weight_name`` is the original GGUF tensor name (``...​.weight``); MLX
+        ``weight_name`` is the original GGUF tensor name (``....weight``); MLX
         stores the companion scales/biases under the same prefix. ``qweight_type``
         is supplied by the caller because ``mx.load`` does not expose per-tensor
         quant types — a loader reads it from ``gguf.GGUFReader``.
         """
-        qweight_type = _as_supported_qtype(qweight_type)
+        qweight_type = cls._normalize_qtype(qweight_type)
         if not weight_name.endswith(_WEIGHT_SUFFIX):
             raise ValueError(
                 f"GGUF weight name must end with '{_WEIGHT_SUFFIX}', got "
@@ -173,8 +178,9 @@ class GGUFMLXQuantizedTensor:
         if missing:
             raise ValueError(
                 f"{qweight_type.name} tensor {weight_name!r} is missing MLX repack "
-                f"arrays {missing}; MLX did not natively repack it (expected with "
-                f"this MLX version) — load it through the raw-block path instead"
+                f"arrays {missing}; MLX did not natively repack this tensor with the "
+                f"current MLX version, so this qtype is not supported by the "
+                f"MLX-native GGUF path"
             )
         return cls(
             qweight=arrays[weight_name],
@@ -207,46 +213,40 @@ class GGUFMLXQuantizedTensor:
     def packed_shape(self) -> tuple[int, ...]:
         return tuple(self.qweight.shape)
 
+    def matmul(self, x: mx.array) -> mx.array:
+        """Compute ``x @ dequantize(self).T`` without materializing the weight.
 
-def qmatmul(x: mx.array, qt: GGUFMLXQuantizedTensor) -> mx.array:
-    """Compute ``x @ dequantize(qt).T`` without materializing the dense weight.
+        ``x`` may be float16, bfloat16, or float32, and its last dim must be
+        :attr:`in_features`; any leading shape is preserved. The result has the
+        same dtype as ``x`` (``mx.quantized_matmul`` promotes a bfloat16 ``x``
+        against the float16 scales to float32, so it is cast back).
+        """
+        out = mx.quantized_matmul(
+            x,
+            self.qweight,
+            scales=self.scales,
+            biases=self.biases,
+            transpose=True,
+            group_size=_GROUP_SIZE,
+            bits=self.bits,
+            mode=_QUANT_MODE,
+        )
+        return out.astype(x.dtype)
 
-    ``x`` may be float16, bfloat16, or float32, and its last dim must be
-    ``qt.in_features``; any leading shape is preserved. The result has the same
-    dtype as ``x`` (``mx.quantized_matmul`` promotes a bfloat16 ``x`` against the
-    float16 scales to float32, so it is cast back).
-    """
-    out = mx.quantized_matmul(
-        x,
-        qt.qweight,
-        scales=qt.scales,
-        biases=qt.biases,
-        transpose=True,
-        group_size=_GROUP_SIZE,
-        bits=qt.bits,
-        mode=_QUANT_MODE,
-    )
-    return out.astype(x.dtype)
+    def embedding(self, ids: mx.array, output_dtype: mx.Dtype) -> mx.array:
+        """Gather and dequantize embedding rows for ``ids``.
 
-
-def embedding_lookup(
-    ids: mx.array,
-    qt: GGUFMLXQuantizedTensor,
-    output_dtype: mx.Dtype,
-) -> mx.array:
-    """Gather and dequantize embedding rows for ``ids``.
-
-    Only the selected rows are dequantized; the table stays quantized. ``ids`` of
-    any rank >= 1 are accepted and a trailing ``in_features`` axis is appended.
-    Ids must be in range; out-of-range ids gather garbage rows (MLX gather has no
-    bounds check), so callers own that validation.
-    """
-    rows = mx.dequantize(
-        qt.qweight[ids],
-        qt.scales[ids],
-        qt.biases[ids],
-        group_size=_GROUP_SIZE,
-        bits=qt.bits,
-        mode=_QUANT_MODE,
-    )
-    return rows.astype(output_dtype)
+        Only the selected rows are dequantized; the table stays quantized. ``ids``
+        of any rank >= 1 are accepted and a trailing :attr:`in_features` axis is
+        appended. Ids must be in range; out-of-range ids gather garbage rows (MLX
+        gather has no bounds check), so callers own that validation.
+        """
+        rows = mx.dequantize(
+            self.qweight[ids],
+            self.scales[ids],
+            self.biases[ids],
+            group_size=_GROUP_SIZE,
+            bits=self.bits,
+            mode=_QUANT_MODE,
+        )
+        return rows.astype(output_dtype)
