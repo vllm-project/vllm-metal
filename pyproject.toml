@@ -51,6 +51,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gguf = [
+    # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
+    # unless a Metal-specific path needs a newer API.
+    "gguf>=0.17.0",
+]
 stt = [
     # Speech-to-text audio processing (Whisper models)
     "librosa>=0.10.2",
@@ -61,9 +66,10 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "ruff>=0.1.0",
     "mypy>=1.19.1",
+    "gguf>=0.17.0",
 ]
 all = [
-    "vllm-metal[stt,dev]",
+    "vllm-metal[gguf,stt,dev]",
 ]
 
 [project.urls]
