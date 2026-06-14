@@ -14,6 +14,18 @@ _FUSED_SDPA_PAD_TARGETS = (64, 80, 128)
 _PATCHED = False
 
 
+def _infer_max_segment_len(
+    cu_seqlens: mx.array,
+    *,
+    max_seqlen: int | None = None,
+) -> int:
+    """Longest segment length for kernel launch; one sync when not provided."""
+    if max_seqlen is not None:
+        return max_seqlen
+    diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+    return int(mx.max(diffs).item())
+
+
 def _baseline_segment_attention(
     q: mx.array,
     k: mx.array,
@@ -61,13 +73,13 @@ def _fused_varlen_attention(
     v: mx.array,
     cu_seqlens: mx.array,
     scale: float,
+    *,
+    max_seqlen: int | None = None,
 ) -> mx.array:
     """Single-call dense varlen encoder attention (Metal primitive).
 
     Expects Q/K/V in kernel-native ``[total_tokens, num_heads, head_dim]`` layout.
     """
-    import numpy as np
-
     from vllm_metal.metal import encoder_varlen_attention
 
     head_dim = int(q.shape[-1])
@@ -82,15 +94,14 @@ def _fused_varlen_attention(
         k = k.astype(kernel_dtype)
         v = v.astype(kernel_dtype)
 
-    bounds = [int(x) for x in np.asarray(cu_seqlens)]
-    max_seqlen = max(bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1))
+    launch_max_seqlen = _infer_max_segment_len(cu_seqlens, max_seqlen=max_seqlen)
 
     out = encoder_varlen_attention(
         q,
         k,
         v,
         cu_seqlens,
-        max_seqlen=max_seqlen,
+        max_seqlen=launch_max_seqlen,
         softmax_scale=scale,
     )
     if orig_head_dim is not None:
@@ -140,11 +151,13 @@ def _fused_rope_varlen_core(
     freqs: mx.array,
     cu_seqlens: mx.array,
     scale: float,
+    *,
+    max_seqlen: int | None = None,
 ) -> mx.array:
     """RoPE + varlen attention on ``[S, H, D]`` tensors."""
     q = _apply_rotary_pos_emb_vision_shd(q, freqs)
     k = _apply_rotary_pos_emb_vision_shd(k, freqs)
-    return _fused_varlen_attention(q, k, v, cu_seqlens, scale)
+    return _fused_varlen_attention(q, k, v, cu_seqlens, scale, max_seqlen=max_seqlen)
 
 
 def qwen3_vl_vision_attention_forward(
@@ -155,6 +168,7 @@ def qwen3_vl_vision_attention_forward(
     *,
     use_fused_varlen: bool = False,
     use_fused_rope_varlen: bool = False,
+    max_seqlen: int | None = None,
 ) -> mx.array:
     """Qwen3-VL vision ``Attention`` forward with selectable attention core."""
     from mlx_vlm.models.qwen3_vl.vision import apply_rotary_pos_emb_vision
@@ -164,12 +178,22 @@ def qwen3_vl_vision_attention_forward(
     q, k, v = _qkv_to_shd(qkv)
 
     if use_fused_varlen and use_fused_rope_varlen:
-        core = _fused_rope_varlen_core(q, k, v, rotary_pos_emb, cu_seqlens, attn.scale)
+        core = _fused_rope_varlen_core(
+            q,
+            k,
+            v,
+            rotary_pos_emb,
+            cu_seqlens,
+            attn.scale,
+            max_seqlen=max_seqlen,
+        )
         output = core.reshape(seq_length, -1)
     elif use_fused_varlen:
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
-        core = _fused_varlen_attention(q, k, v, cu_seqlens, attn.scale)
+        core = _fused_varlen_attention(
+            q, k, v, cu_seqlens, attn.scale, max_seqlen=max_seqlen
+        )
         output = core.reshape(seq_length, -1)
     else:
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
