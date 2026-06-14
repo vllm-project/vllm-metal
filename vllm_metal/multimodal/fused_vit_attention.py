@@ -126,7 +126,11 @@ def _shd_to_bhsd(
     v: mx.array,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """``[S, H, D]`` -> ``[1, H, S, D]`` for baseline SDPA."""
-    return q.transpose(1, 0, 2)[None], k.transpose(1, 0, 2)[None], v.transpose(1, 0, 2)[None]
+    return (
+        q.transpose(1, 0, 2)[None],
+        k.transpose(1, 0, 2)[None],
+        v.transpose(1, 0, 2)[None],
+    )
 
 
 def _fused_rope_varlen_core(
@@ -160,9 +164,7 @@ def qwen3_vl_vision_attention_forward(
     q, k, v = _qkv_to_shd(qkv)
 
     if use_fused_varlen and use_fused_rope_varlen:
-        core = _fused_rope_varlen_core(
-            q, k, v, rotary_pos_emb, cu_seqlens, attn.scale
-        )
+        core = _fused_rope_varlen_core(q, k, v, rotary_pos_emb, cu_seqlens, attn.scale)
         output = core.reshape(seq_length, -1)
     elif use_fused_varlen:
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
