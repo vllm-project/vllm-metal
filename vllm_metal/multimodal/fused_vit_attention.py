@@ -74,6 +74,15 @@ def _fused_varlen_attention(
     k_pack = k[0].transpose(1, 0, 2)
     v_pack = v[0].transpose(1, 0, 2)
 
+    orig_dtype = q.dtype
+    kernel_dtype = (
+        orig_dtype if orig_dtype in (mx.float16, mx.bfloat16) else mx.bfloat16
+    )
+    if q_pack.dtype != kernel_dtype:
+        q_pack = q_pack.astype(kernel_dtype)
+        k_pack = k_pack.astype(kernel_dtype)
+        v_pack = v_pack.astype(kernel_dtype)
+
     bounds = [int(x) for x in np.asarray(cu_seqlens)]
     max_seqlen = max(bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1))
 
@@ -87,6 +96,8 @@ def _fused_varlen_attention(
     )
     if orig_head_dim is not None:
         out = out[..., :orig_head_dim]
+    if out.dtype != orig_dtype:
+        out = out.astype(orig_dtype)
 
     return out.transpose(1, 0, 2)[None]
 
