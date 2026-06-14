@@ -62,7 +62,10 @@ def _fused_varlen_attention(
     cu_seqlens: mx.array,
     scale: float,
 ) -> mx.array:
-    """Single-call dense varlen encoder attention (Metal primitive)."""
+    """Single-call dense varlen encoder attention (Metal primitive).
+
+    Expects Q/K/V in kernel-native ``[total_tokens, num_heads, head_dim]`` layout.
+    """
     import numpy as np
 
     from vllm_metal.metal import encoder_varlen_attention
@@ -70,26 +73,22 @@ def _fused_varlen_attention(
     head_dim = int(q.shape[-1])
     q, k, v, head_dim, orig_head_dim = _pad_head_dim_if_needed(q, k, v, head_dim)
 
-    q_pack = q[0].transpose(1, 0, 2)
-    k_pack = k[0].transpose(1, 0, 2)
-    v_pack = v[0].transpose(1, 0, 2)
-
     orig_dtype = q.dtype
     kernel_dtype = (
         orig_dtype if orig_dtype in (mx.float16, mx.bfloat16) else mx.bfloat16
     )
-    if q_pack.dtype != kernel_dtype:
-        q_pack = q_pack.astype(kernel_dtype)
-        k_pack = k_pack.astype(kernel_dtype)
-        v_pack = v_pack.astype(kernel_dtype)
+    if q.dtype != kernel_dtype:
+        q = q.astype(kernel_dtype)
+        k = k.astype(kernel_dtype)
+        v = v.astype(kernel_dtype)
 
     bounds = [int(x) for x in np.asarray(cu_seqlens)]
     max_seqlen = max(bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1))
 
     out = encoder_varlen_attention(
-        q_pack,
-        k_pack,
-        v_pack,
+        q,
+        k,
+        v,
         cu_seqlens,
         max_seqlen=max_seqlen,
         softmax_scale=scale,
@@ -99,7 +98,21 @@ def _fused_varlen_attention(
     if out.dtype != orig_dtype:
         out = out.astype(orig_dtype)
 
-    return out.transpose(1, 0, 2)[None]
+    return out
+
+
+def _qkv_to_shd(qkv: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    """``[S, 3, H, D]`` linear output -> Q/K/V in ``[S, H, D]``."""
+    return qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+
+def _shd_to_bhsd(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """``[S, H, D]`` -> ``[1, H, S, D]`` for baseline SDPA."""
+    return q.transpose(1, 0, 2)[None], k.transpose(1, 0, 2)[None], v.transpose(1, 0, 2)[None]
 
 
 def qwen3_vl_vision_attention_forward(
@@ -114,22 +127,20 @@ def qwen3_vl_vision_attention_forward(
     from mlx_vlm.models.qwen3_vl.vision import apply_rotary_pos_emb_vision
 
     seq_length = x.shape[0]
-    qkv = attn.qkv(x).reshape(seq_length, 3, attn.num_heads, -1).transpose(1, 0, 2, 3)
-    q, k, v = mx.split(qkv, 3)
+    qkv = attn.qkv(x).reshape(seq_length, 3, attn.num_heads, -1)
+    q, k, v = _qkv_to_shd(qkv)
 
     q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
     k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
 
-    q = q.transpose(0, 2, 1, 3)
-    k = k.transpose(0, 2, 1, 3)
-    v = v.transpose(0, 2, 1, 3)
-
     if use_fused_varlen:
         core = _fused_varlen_attention(q, k, v, cu_seqlens, attn.scale)
+        output = core.reshape(seq_length, -1)
     else:
+        q, k, v = _shd_to_bhsd(q, k, v)
         core = _baseline_segment_attention(q, k, v, cu_seqlens, attn.scale)
+        output = core.transpose(0, 2, 1, 3).reshape(seq_length, -1)
 
-    output = core.transpose(0, 2, 1, 3).reshape(seq_length, -1)
     return attn.proj(output)
 
 
