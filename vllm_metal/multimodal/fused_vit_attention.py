@@ -101,6 +101,20 @@ def _fused_varlen_attention(
     return out
 
 
+def _apply_rotary_pos_emb_vision_shd(
+    tensor: mx.array,
+    freqs: mx.array,
+) -> mx.array:
+    """RoPE for ``[total_tokens, num_heads, head_dim]`` without batch dim churn."""
+    from mlx_vlm.models.qwen3_vl.vision import rotate_half
+
+    orig_dtype = tensor.dtype
+    cos = mx.tile(mx.expand_dims(mx.cos(freqs), axis=1), (1, 1, 2))
+    sin = mx.tile(mx.expand_dims(mx.sin(freqs), axis=1), (1, 1, 2))
+    output = (tensor * cos) + (rotate_half(tensor) * sin)
+    return output.astype(orig_dtype)
+
+
 def _qkv_to_shd(qkv: mx.array) -> tuple[mx.array, mx.array, mx.array]:
     """``[S, 3, H, D]`` linear output -> Q/K/V in ``[S, H, D]``."""
     return qkv[:, 0], qkv[:, 1], qkv[:, 2]
@@ -115,6 +129,20 @@ def _shd_to_bhsd(
     return q.transpose(1, 0, 2)[None], k.transpose(1, 0, 2)[None], v.transpose(1, 0, 2)[None]
 
 
+def _fused_rope_varlen_core(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    freqs: mx.array,
+    cu_seqlens: mx.array,
+    scale: float,
+) -> mx.array:
+    """RoPE + varlen attention on ``[S, H, D]`` tensors."""
+    q = _apply_rotary_pos_emb_vision_shd(q, freqs)
+    k = _apply_rotary_pos_emb_vision_shd(k, freqs)
+    return _fused_varlen_attention(q, k, v, cu_seqlens, scale)
+
+
 def qwen3_vl_vision_attention_forward(
     attn,
     x: mx.array,
@@ -122,6 +150,7 @@ def qwen3_vl_vision_attention_forward(
     rotary_pos_emb: mx.array | None = None,
     *,
     use_fused_varlen: bool = False,
+    use_fused_rope_varlen: bool = False,
 ) -> mx.array:
     """Qwen3-VL vision ``Attention`` forward with selectable attention core."""
     from mlx_vlm.models.qwen3_vl.vision import apply_rotary_pos_emb_vision
@@ -130,13 +159,19 @@ def qwen3_vl_vision_attention_forward(
     qkv = attn.qkv(x).reshape(seq_length, 3, attn.num_heads, -1)
     q, k, v = _qkv_to_shd(qkv)
 
-    q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
-    k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
-
-    if use_fused_varlen:
+    if use_fused_varlen and use_fused_rope_varlen:
+        core = _fused_rope_varlen_core(
+            q, k, v, rotary_pos_emb, cu_seqlens, attn.scale
+        )
+        output = core.reshape(seq_length, -1)
+    elif use_fused_varlen:
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
         core = _fused_varlen_attention(q, k, v, cu_seqlens, attn.scale)
         output = core.reshape(seq_length, -1)
     else:
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
         q, k, v = _shd_to_bhsd(q, k, v)
         core = _baseline_segment_attention(q, k, v, cu_seqlens, attn.scale)
         output = core.transpose(0, 2, 1, 3).reshape(seq_length, -1)
@@ -164,6 +199,7 @@ def patch_qwen3_vl_vision_attention() -> None:
             cu_seqlens,
             rotary_pos_emb,
             use_fused_varlen=True,
+            use_fused_rope_varlen=True,
         )
 
     vision.Attention.__call__ = _patched_call

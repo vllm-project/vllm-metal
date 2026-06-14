@@ -88,7 +88,7 @@ def _run_config(cfg: BenchConfig, *, warmup: int, iters: int) -> None:
 
     def fused() -> mx.array:
         return qwen3_vl_vision_attention_forward(
-            attn, x, cu, rope, use_fused_varlen=True
+            attn, x, cu, rope, use_fused_varlen=True, use_fused_rope_varlen=True
         )
 
     out_a = baseline()
