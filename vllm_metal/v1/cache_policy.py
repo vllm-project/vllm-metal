@@ -155,34 +155,6 @@ def _build_turboquant_attention_spec(
     )
 
 
-def _register_turboquant_spec_manager() -> None:
-    """Register ``TurboQuantAttentionSpec`` in vLLM's spec→manager map.
-
-    vLLM's ``get_manager_for_kv_cache_spec`` uses strict-type lookup
-    (``spec_manager_map[type(spec)]``), not ``isinstance``, so the
-    ``FullAttentionSpec`` entry does not cover subclasses.  We reuse
-    ``FullAttentionManager`` because a TurboQuant cache is accessed
-    like a regular KV page from the scheduler's POV — block indexing,
-    no special slot math (per-element byte layout is handled entirely
-    inside the Metal kernel).
-
-    Mirrors the upstream registration for ``MLAAttentionSpec`` (which
-    vLLM also maps to ``FullAttentionManager``).
-    """
-    try:
-        from vllm.v1.core.single_type_kv_cache_manager import (
-            FullAttentionManager,
-            spec_manager_map,
-        )
-    except ImportError:
-        # vLLM shape changed; let the scheduler raise its own clearer error.
-        return
-    spec_manager_map.setdefault(TurboQuantAttentionSpec, FullAttentionManager)
-
-
-_register_turboquant_spec_manager()
-
-
 @dataclass(frozen=True)
 class _HybridGDNReservation:
     bytes_per_slot: int = 0

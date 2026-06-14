@@ -2724,24 +2724,26 @@ def test_tq_spec_merge_uniform_specs():
     assert merged.page_size_bytes == specs[0].page_size_bytes
 
 
-def test_tq_spec_registered_in_vllm_spec_manager_map():
-    """Importing ``cache_policy`` must register our subclass with vLLM.
+def test_tq_spec_resolves_to_full_attention_manager():
+    """TurboQuant specs must resolve to vLLM's full-attention manager.
 
-    vLLM's ``get_manager_for_kv_cache_spec`` uses strict-type lookup
-    (``spec_manager_map[type(spec)]``), not isinstance. If this assertion
-    fails the engine-core will crash at startup with ``KeyError:
-    TurboQuantAttentionSpec`` the moment TurboQuant is enabled.
+    vLLM 0.23 resolves ``FullAttentionSpec`` subclasses through
+    ``KVCacheSpecRegistry`` MRO fallback.
     """
-    from vllm.v1.core.single_type_kv_cache_manager import (
-        FullAttentionManager,
-        spec_manager_map,
+    spec = _build_turboquant_attention_spec(
+        block_size=16,
+        num_kv_heads=4,
+        head_dim=128,
+        k_quant="q8_0",
+        v_quant="q3_0",
     )
 
-    assert TurboQuantAttentionSpec in spec_manager_map, (
-        "TurboQuantAttentionSpec missing from vLLM's spec_manager_map — "
-        "engine-core will KeyError at startup."
-    )
-    assert spec_manager_map[TurboQuantAttentionSpec] is FullAttentionManager
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+    assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+    assert KVCacheSpecRegistry.get_uniform_type_base_spec(spec) is FullAttentionSpec
 
 
 def test_tq_spec_merge_rejects_mixed_quant():

@@ -39,7 +39,7 @@ dependencies = [
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
-    # First allowed Transformers v5 release per vLLM 0.22.1's exclude list.
+    # First allowed Transformers v5 release per vLLM 0.23.0's exclude list.
     "transformers>=5.5.1",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",

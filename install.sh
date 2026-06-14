@@ -198,7 +198,7 @@ EOF
     exit 1
   fi
 
-  local vllm_v="0.22.1"
+  local vllm_v="0.23.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
   local vllm_tmp_dir
