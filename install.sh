@@ -212,6 +212,10 @@ EOF
 
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
   CXXFLAGS="-Wno-parentheses" uv pip install .
+  # FastAPI 0.137+ stores included routers as _IncludedRouter without .path,
+  # which breaks prometheus-fastapi-instrumentator route naming and vLLM /health.
+  # See https://github.com/trallnag/prometheus-fastapi-instrumentator/issues/370
+  uv pip install 'fastapi>=0.115.0,<0.137'
   cd -
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then

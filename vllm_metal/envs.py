@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_USE_FUSED_VIT_ATTENTION: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -73,6 +74,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Route mlx_vlm Qwen3-VL vision-tower attention through the Metal
+    # encoder_varlen_attention primitive instead of the per-segment SDPA loop.
+    "VLLM_METAL_USE_FUSED_VIT_ATTENTION": lambda: (
+        os.getenv("VLLM_METAL_USE_FUSED_VIT_ATTENTION", "0") == "1"
+    ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
     # for kernel developers / source installs; requires Xcode command-line

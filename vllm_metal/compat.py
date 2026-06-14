@@ -31,6 +31,22 @@ def apply_compat_patches() -> None:
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+    _maybe_patch_fused_vit_attention()
+
+
+def _maybe_patch_fused_vit_attention() -> None:
+    from vllm_metal import envs
+
+    if not envs.VLLM_METAL_USE_FUSED_VIT_ATTENTION:
+        return
+    try:
+        from vllm_metal.multimodal.fused_vit_attention import (
+            patch_qwen3_vl_vision_attention,
+        )
+
+        patch_qwen3_vl_vision_attention()
+    except ImportError as exc:
+        logger.warning("Fused ViT attention patch skipped: %s", exc)
 
 
 def _metal_ray_local_gpu_ids(

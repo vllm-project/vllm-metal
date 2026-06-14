@@ -87,6 +87,167 @@ def _build_mla_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
+def _build_encoder_varlen_source() -> str:
+    """Concatenate utils + encoder_varlen_attention into a single source."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "encoder_varlen_attention.metal"),
+    ]
+    return "\n".join(parts)
+
+
+_ENCODER_VARLEN_HEAD_DIMS = frozenset({64, 80, 96, 128})
+_encoder_varlen_loaded = False
+
+
+def _validate_encoder_cu_seqlens(cu_seqlens, *, total_tokens: int) -> None:
+    import mlx.core as mx
+    import numpy as np
+
+    if cu_seqlens.dtype != mx.int32:
+        raise ValueError(
+            "encoder_varlen_attention: cu_seqlens must have dtype int32 "
+            f"(got {cu_seqlens.dtype})."
+        )
+    if cu_seqlens.ndim != 1:
+        raise ValueError(
+            "encoder_varlen_attention: cu_seqlens must be 1-D "
+            f"(got ndim={cu_seqlens.ndim})."
+        )
+    if int(cu_seqlens.shape[0]) < 2:
+        raise ValueError(
+            "encoder_varlen_attention: cu_seqlens must have at least 2 entries "
+            f"(got shape={cu_seqlens.shape})."
+        )
+
+    bounds = [int(x) for x in np.asarray(cu_seqlens)]
+    if bounds[0] != 0:
+        raise ValueError(
+            f"encoder_varlen_attention: cu_seqlens[0] must be 0 (got {bounds[0]})."
+        )
+    for prev, cur in zip(bounds, bounds[1:], strict=False):
+        if cur < prev:
+            raise ValueError(
+                "encoder_varlen_attention: cu_seqlens must be non-decreasing "
+                f"(saw {prev} followed by {cur})."
+            )
+    if bounds[-1] != total_tokens:
+        raise ValueError(
+            "encoder_varlen_attention: cu_seqlens[-1] must equal total_tokens "
+            f"(got {bounds[-1]}, expected {total_tokens})."
+        )
+
+
+def _ensure_encoder_varlen_library() -> ModuleType:
+    """Return ops with the encoder-varlen Metal library compiled (lazy)."""
+    global _encoder_varlen_loaded
+    ops = get_ops()
+    if not _encoder_varlen_loaded:
+        ops.init_encoder_varlen_library(_build_encoder_varlen_source())
+        _encoder_varlen_loaded = True
+    return ops
+
+
+def encoder_varlen_attention(
+    query,
+    key,
+    value,
+    cu_seqlens,
+    *,
+    max_seqlen: int,
+    softmax_scale: float | None = None,
+    sequence_lengths=None,
+):
+    """Dense non-causal varlen encoder attention on packed Q/K/V.
+
+    Each ``cu_seqlens`` segment ``[start, end)`` attends bidirectionally
+    within itself.  RoPE and flatten/repack are the caller's responsibility.
+
+    Args:
+        query: ``[total_tokens, num_heads, head_dim]``
+        key: same shape as ``query`` (v1 requires equal Q/KV head count)
+        value: same shape as ``query``
+        cu_seqlens: ``[num_segments + 1]`` int32 prefix sums, starting at 0
+        max_seqlen: launch hint; must be >= the longest segment length
+        softmax_scale: defaults to ``head_dim ** -0.5``
+        sequence_lengths: accepted for MMEncoderAttention API parity; ignored
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    del sequence_lengths  # API parity only for the Metal path.
+
+    for name, arr in (("query", query), ("key", key), ("value", value)):
+        if arr.ndim != 3:
+            raise ValueError(
+                f"encoder_varlen_attention: {name} must be 3-D "
+                f"[total_tokens, num_heads, head_dim] (got shape={arr.shape})."
+            )
+
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError(
+            "encoder_varlen_attention: query, key, value must share shape "
+            f"(got query={query.shape}, key={key.shape}, value={value.shape})."
+        )
+
+    supported_dtypes = (mx.float16, mx.bfloat16, mx.float32)
+    if query.dtype not in supported_dtypes:
+        raise ValueError(
+            "encoder_varlen_attention: unsupported dtype "
+            f"{query.dtype} (supported: float16, bfloat16, float32)."
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError(
+            "encoder_varlen_attention: query, key, value must share dtype."
+        )
+
+    total_tokens = int(query.shape[0])
+    num_heads = int(query.shape[1])
+    head_dim = int(query.shape[2])
+    if head_dim not in _ENCODER_VARLEN_HEAD_DIMS:
+        raise ValueError(
+            "encoder_varlen_attention: unsupported head_dim "
+            f"{head_dim} (supported: {sorted(_ENCODER_VARLEN_HEAD_DIMS)})."
+        )
+
+    _validate_encoder_cu_seqlens(cu_seqlens, total_tokens=total_tokens)
+
+    if max_seqlen < 1:
+        raise ValueError(
+            f"encoder_varlen_attention: max_seqlen must be >= 1 (got {max_seqlen})."
+        )
+    bounds = [int(x) for x in np.asarray(cu_seqlens)]
+    segment_lens = [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)]
+    observed_max = max(segment_lens) if segment_lens else 0
+    if max_seqlen < observed_max:
+        raise ValueError(
+            "encoder_varlen_attention: max_seqlen must be >= the longest "
+            f"segment length (got max_seqlen={max_seqlen}, "
+            f"longest_segment={observed_max})."
+        )
+
+    scale = float(head_dim**-0.5 if softmax_scale is None else softmax_scale)
+
+    q = mx.contiguous(query)
+    k = mx.contiguous(key)
+    v = mx.contiguous(value)
+    seqlens = mx.contiguous(cu_seqlens)
+
+    out = mx.array(0)
+    ops = _ensure_encoder_varlen_library()
+    ops._encoder_varlen_attention_primitive(
+        q,
+        k,
+        v,
+        seqlens,
+        num_heads,
+        scale,
+        int(max_seqlen),
+        out,
+    )
+    return out
+
+
 def metal_mla_paged_attention(
     q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
     q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
