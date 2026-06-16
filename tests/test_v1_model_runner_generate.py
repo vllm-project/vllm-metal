@@ -1182,26 +1182,6 @@ class TestV1MetalModelRunnerGDNSubmit:
         )
         return backend
 
-    def test_prefill_hybrid_submits_logits_and_updated_gdn_states(
-        self, monkeypatch
-    ) -> None:
-        # Arrange
-        submitted: list[tuple[object, ...]] = []
-        runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())
-        logits = mx.array([0], dtype=mx.float32)
-        expected_states = runner._gdn_updated_state_arrays()
-        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
-
-        # Act
-        runner._submit_paged_forward_outputs(logits, has_prefill=True)
-
-        # Assert
-        assert len(submitted) == 1
-        assert submitted[0][0] is logits
-        assert len(submitted[0][1:]) == len(expected_states)
-        for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
-            assert actual is expected
-
     def test_prefill_hybrid_submits_pending_compact_gdn_states(
         self, monkeypatch
     ) -> None:
@@ -1228,7 +1208,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
         # Act
-        runner._submit_paged_forward_outputs(logits, has_prefill=True)
+        runner._submit_paged_forward_outputs(logits)
 
         # Assert
         assert len(submitted) == 1
@@ -1237,18 +1217,25 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 
-    def test_decode_only_hybrid_submits_logits_only(self, monkeypatch) -> None:
+    def test_decode_only_hybrid_submits_logits_and_updated_gdn_states(
+        self, monkeypatch
+    ) -> None:
         # Arrange
         submitted: list[tuple[object, ...]] = []
         runner = make_stub_runner(_paged_attention_runtime=self._make_hybrid_backend())
         logits = mx.array([0], dtype=mx.float32)
+        expected_states = runner._gdn_updated_state_arrays()
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
         # Act
-        runner._submit_paged_forward_outputs(logits, has_prefill=False)
+        runner._submit_paged_forward_outputs(logits)
 
         # Assert
-        assert submitted == [(logits,)]
+        assert len(submitted) == 1
+        assert submitted[0][0] is logits
+        assert len(submitted[0][1:]) == len(expected_states)
+        for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
+            assert actual is expected
 
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
         # Arrange
@@ -1258,7 +1245,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
         # Act
-        runner._submit_paged_forward_outputs(logits, has_prefill=True)
+        runner._submit_paged_forward_outputs(logits)
 
         # Assert
         assert submitted == [(logits,)]

@@ -616,16 +616,13 @@ class MetalModelRunner:
         self,
         logits: mx.array,
         *,
-        has_prefill: bool,
         target_hidden_states: mx.array | None = None,
     ) -> None:
         """Submit logits, hidden states, and GDN state side effects."""
         outputs = [logits]
         if target_hidden_states is not None:
             outputs.append(target_hidden_states)
-        if has_prefill and isinstance(
-            self._paged_attention_runtime, HybridPagedAttentionRuntime
-        ):
+        if isinstance(self._paged_attention_runtime, HybridPagedAttentionRuntime):
             outputs.extend(self._gdn_updated_state_arrays())
         mx.async_eval(*outputs)
 
@@ -1173,13 +1170,9 @@ class MetalModelRunner:
             mx.async_eval(pp_send_handle)
         else:
             assert logits is not None
-            # For GDN prefill, state-cache updates are side effects that the
-            # logits graph does not necessarily force. Submit them with logits
-            # and any target hidden states retained for assistant decoding.
             self._submit_paged_forward_outputs(
                 logits,
                 target_hidden_states=target_hidden_states,
-                has_prefill=bool(prefill_reqs),
             )
 
         # ---- build cu_seqlens for logit extraction ----
