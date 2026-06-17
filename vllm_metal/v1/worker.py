@@ -23,6 +23,7 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_metal.config import get_config
+from vllm_metal.distributed import PipelineGroup
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -104,6 +105,11 @@ class MetalWorker(WorkerBase):
         # profile(is_start=True) call so we pay zero cost when unused.
         self._metal_profiler: MetalProfilerWrapper | None = None
 
+        # Pipeline-parallel group over the mx.distributed data plane. Created in
+        # init_device only when pipeline_parallel_size > 1; stays None on the
+        # default single-stage path (no group object, no behavior change).
+        self.pp: PipelineGroup | None = None
+
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
         # Set up MLX device
@@ -124,13 +130,40 @@ class MetalWorker(WorkerBase):
         self.device = MetalPlatform.get_torch_device(0)
         logger.info(f"PyTorch device set to: {self.device}")
 
-        # Initialize distributed environment
+        # Initialize distributed environment (vLLM gloo control plane).
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
             self.distributed_init_method,
             self.local_rank,
         )
+
+        # Pipeline parallelism: bring up the mx.distributed ring (the activation
+        # data plane, separate from gloo) and wrap it in a PipelineGroup. With
+        # TP forced to 1, the global rank IS the pipeline stage index, so we use
+        # self.rank directly. Gated on pipeline_parallel_size > 1 so the default
+        # single-stage path creates no group and is byte-for-byte unchanged.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            # PP+STT is rejected at config time (platform.check_and_update_config,
+            # with the other PP guards), so only generation models reach here.
+            # Discover every stage's node IP over the gloo control plane (already
+            # initialized above) so the MLX ring spans real hosts — the same path
+            # works single- or multi-node. peer_ips[r] is the IP of global rank r;
+            # with TP forced to 1 the global rank is the pipeline-stage index.
+            import torch.distributed as dist
+            from vllm.utils.network_utils import get_ip
+
+            peer_ips: list[str] = [""] * self.parallel_config.world_size
+            dist.all_gather_object(peer_ips, get_ip())
+            self.pp = PipelineGroup.bootstrap_ring(self.rank, peer_ips)
+            logger.info(
+                "Pipeline stage %d/%d (is_first=%s, is_last=%s)",
+                self.pp.rank,
+                self.pp.size,
+                self.pp.is_first,
+                self.pp.is_last,
+            )
 
         # Set random seed
         set_random_seed(self.model_config.seed)
@@ -156,10 +189,18 @@ class MetalWorker(WorkerBase):
                 vllm_config=self.vllm_config,
                 device=self.device,
             )
+            # Hand the pipeline group to the runner so its forward path can pipe
+            # activations stage-to-stage. None on the default single-stage path.
+            self.model_runner.pp = self.pp
 
     def load_model(self) -> None:
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
+        # Phase 0 = load-then-slice: every stage loaded full weights above; now
+        # drop the layers (and, off the last stage, the final norm) this stage
+        # does not own. No-op when self.pp is None (single-stage path).
+        if self.pp is not None:
+            self.model_runner.apply_pipeline_split(self.pp)
 
     def _one_sequence_kv_bytes(self) -> int:
         """Bytes for one max-length sequence of cache state.
@@ -273,46 +314,20 @@ class MetalWorker(WorkerBase):
         return self.model_runner.get_cache_block_size_bytes()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Add a LoRA adapter.
-
-        Args:
-            lora_request: LoRA request
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        logger.warning("LoRA is not supported on Metal platform")
-        return False
+        """Add a LoRA/QLoRA adapter."""
+        return self.model_runner.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        """Remove a LoRA adapter.
-
-        Args:
-            lora_id: LoRA adapter ID
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        return False
+        """Remove a LoRA adapter."""
+        return self.model_runner.remove_lora(lora_id)
 
     def pin_lora(self, lora_id: int) -> bool:
-        """Pin a LoRA adapter.
-
-        Args:
-            lora_id: LoRA adapter ID
-
-        Returns:
-            False (LoRA not supported on Metal yet)
-        """
-        return False
+        """Pin a LoRA adapter."""
+        return self.model_runner.pin_lora(lora_id)
 
     def list_loras(self) -> set[int]:
-        """List loaded LoRA adapters.
-
-        Returns:
-            Empty set (LoRA not supported)
-        """
-        return set()
+        """List loaded LoRA adapter IDs."""
+        return self.model_runner.list_loras()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks for this worker.

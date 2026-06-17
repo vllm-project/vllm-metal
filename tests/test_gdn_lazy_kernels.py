@@ -12,13 +12,13 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.gdn_lazy import (
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
     GDNRecurrentDecodeRequest,
     GDNRecurrentPrefillRequest,
 )
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
+from vllm_metal.metal import get_ops
 
 
 @pytest.fixture(autouse=True)

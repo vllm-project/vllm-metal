@@ -10,13 +10,13 @@ import mlx.core as mx
 import pytest
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.paged_attention import (
-    MetalKernelPagedAttentionWrapper,
-    patch_model_attention_metal_kernel,
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import get_context
+from vllm_metal.attention.impls.sdpa_wrapper import (
+    SDPAPagedAttentionWrapper,
+    patch_sdpa_attention,
 )
-from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
-from vllm_metal.paged_attention_common import get_context
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantMetadata,
     Gemma4MTPAssistantRuntime,
@@ -221,7 +221,7 @@ def test_runtime_keeps_cached_assistant_model_unpatched() -> None:
         for idx, layer in enumerate(model.model.layers)
     )
     assert not any(
-        isinstance(layer.self_attn, MetalKernelPagedAttentionWrapper)
+        isinstance(layer.self_attn, SDPAPagedAttentionWrapper)
         for layer in model.model.layers
     )
 
@@ -258,7 +258,7 @@ def test_runtime_kv_binding_is_not_process_global() -> None:
     assert wired2.kv_sharing.target_kv_cache is cache2
     assert not isinstance(
         model.model.layers[0].self_attn,
-        MetalKernelPagedAttentionWrapper,
+        SDPAPagedAttentionWrapper,
     )
 
 
@@ -432,7 +432,7 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
 def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:
     old_cache = _target_cache(num_layers=2)
     new_cache = _target_cache(num_layers=2)
-    wrapper = MetalKernelPagedAttentionWrapper(
+    wrapper = SDPAPagedAttentionWrapper(
         object(),
         layer_idx=0,
         kv_cache=old_cache,
@@ -443,7 +443,7 @@ def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:
         model=SimpleNamespace(layers=[SimpleNamespace(self_attn=wrapper)])
     )
 
-    patched = patch_model_attention_metal_kernel(
+    patched = patch_sdpa_attention(
         model,
         new_cache,
         _BLOCK_SIZE,
@@ -456,7 +456,7 @@ def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:
 
 
 def test_cache_policy_installs_gemma4_mtp_kv_sharing() -> None:
-    backend = MHAPagedAttentionBackend(
+    backend = MHAPagedAttentionRuntime(
         num_layers=3,
         num_kv_heads=1,
         head_dim=4,

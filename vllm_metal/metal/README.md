@@ -33,7 +33,7 @@ Metal libraries from concatenated source:
 | **GDN linear attention** | `_build_gdn_source` → `init_gdn_library` | `utils.metal` · `gdn_linear_attention.metal` |
 | **MLA** | `_build_mla_paged_attention_source` → `init_mla_library` | `utils.metal` · `mla.metal` |
 
-### 2. `mx.fast.metal_kernel` snippets — `metal_kernel_backend/gdn_lazy_decode.py`
+### 2. `mx.fast.metal_kernel` snippets — `attention/impls/gdn_lazy.py`
 
 The lazy GDN decode fast path compiles two shaders directly through MLX
 (not the C++ extension), via `_read_v2_metal_source`:
@@ -61,7 +61,7 @@ The lazy GDN decode fast path compiles two shaders directly through MLX
 
 These files exist in `kernels_v2/` but are **not referenced** by any build
 or dispatch path (`__init__.py`, `paged_ops.cpp`, `build.py`,
-`gdn_lazy_decode.py`, or any shader `#include`). They are v2-directory
+`gdn_lazy.py`, or any shader `#include`). They are v2-directory
 copies of old v1 kernels whose functionality is now handled MLX-natively.
 PR #378 only removed `kernels_v1/`, so it does not touch these:
 

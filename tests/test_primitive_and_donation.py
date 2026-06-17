@@ -17,8 +17,8 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
 
 # ── Shared fixtures ──────────────────────────────────────────────────────────
 

@@ -33,6 +33,79 @@ def apply_compat_patches() -> None:
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
 
 
+def _metal_ray_local_gpu_ids(
+    node_id: str,
+    assigned: Mapping[str, float] | None,
+    key: str,
+) -> tuple[str, list[int]]:
+    """Resolve a Metal Ray worker's ``(node_id, local_gpu_ids)`` from its resources.
+
+    The Apple GPU is advertised as a custom Ray resource (``key``, e.g. "mlx")
+    that never appears in ``get_accelerator_ids()`` — only in the worker's
+    assigned resources. One Apple GPU per node means the local index list is
+    ``[0]``. Fails loud if the worker was not scheduled onto a ``key`` resource:
+    that is the only way the override is reachable in a correct setup, so a miss
+    means a misconfigured ``ray start`` rather than a recoverable state.
+
+    Kept module-level (rather than nested in the override) so the resolution
+    logic is unit-testable without a live Ray cluster.
+    """
+    count = int((assigned or {}).get(key, 0))
+    if count < 1:
+        raise RuntimeError(
+            f"Metal Ray worker on node {node_id} was not assigned a {key!r} "
+            f"resource (assigned={assigned}). Start each node with "
+            f"ray start --resources='{{\"{key}\": 1}}'"
+        )
+    return node_id, list(range(count))
+
+
+def _patch_ray_distributed() -> None:
+    """Override the Ray V2 worker actor's ``get_node_and_gpu_ids`` for Metal.
+
+    Apple GPUs are not a Ray-recognized accelerator family, so a custom Ray
+    resource ("mlx") never appears in
+    ``ray.get_runtime_context().get_accelerator_ids()`` — only in
+    ``get_assigned_resources()``.  The stock method indexes
+    ``get_accelerator_ids()[ray_device_key]`` and would ``KeyError``.  We read
+    the assigned custom resource instead (one Apple GPU per node -> local index
+    ``[0]``), failing loud if a worker was not scheduled onto an "mlx" resource.
+
+    vllm-metal supports only the default Ray V2 executor, whose worker actor is
+    ``RayWorkerProc``.
+
+    Installed in each Ray worker via the ``worker_process_setup_hook`` wired in
+    ``MetalPlatform.check_and_update_config`` — it runs at worker startup, before
+    the first actor call.  This is the only mechanism that works for real Ray: the
+    driver never calls ``get_node_and_gpu_ids`` locally, actors re-import the class
+    fresh in their own processes, and the lazy plugin-load path inside a worker
+    runs too late (it would fire *inside* the unpatched method's first call).
+    """
+    from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+    cls: Any = RayWorkerProc
+    if getattr(cls, "_metal_patched", False):
+        return
+
+    def get_node_and_gpu_ids(self):  # noqa: ANN001, ANN202
+        import ray as _ray
+        from vllm.platforms import current_platform
+
+        rc = _ray.get_runtime_context()
+        return _metal_ray_local_gpu_ids(
+            rc.get_node_id(),
+            rc.get_assigned_resources(),
+            current_platform.ray_device_key,
+        )
+
+    cls.get_node_and_gpu_ids = get_node_and_gpu_ids
+    cls._metal_patched = True
+    logger.info(
+        "vllm_metal: patched Ray V2 worker get_node_and_gpu_ids on RayWorkerProc "
+        "(Apple-GPU custom Ray resource)"
+    )
+
+
 def _gemma4_assistant_config_class() -> type[Any]:
     """Return a minimal Transformers config for raw Gemma4 assistant metadata."""
     from transformers.configuration_utils import PretrainedConfig

@@ -134,15 +134,15 @@ def vllm_outputs():
 
     if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1":
         runner = llm.llm_engine.model_executor.driver_worker.model_runner
-        assert runner._paged_attention_backend is not None, (
+        assert runner._paged_attention_runtime is not None, (
             "Paged attention backend not initialised"
         )
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            MetalKernelPagedAttentionWrapper,
+        from vllm_metal.attention.impls.sdpa_wrapper import (
+            SDPAPagedAttentionWrapper,
         )
 
         attn = runner.model.model.layers[0].self_attn
-        assert isinstance(attn, MetalKernelPagedAttentionWrapper)
+        assert isinstance(attn, SDPAPagedAttentionWrapper)
 
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
     outputs = llm.generate(PROMPTS, sp)

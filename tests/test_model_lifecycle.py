@@ -13,9 +13,9 @@ import torch
 
 import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
-from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
@@ -880,6 +880,34 @@ class TestResolveModelDims:
 
         with pytest.raises(ValueError, match="Cannot resolve model dimensions"):
             lifecycle.resolve_model_dims()
+
+    # Gemma4-style interleaved sliding/full attention -> non-None per-layer KV.
+    _NON_UNIFORM_ARGS: dict[str, object] = {
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "hidden_size": 256,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 128,
+    }
+
+    def test_non_uniform_per_layer_kv_rejects_pipeline_parallel(self) -> None:
+        """PP is rejected for non-uniform per-layer KV models: the split only
+        rebinds num_layers, so a stage would index the full-length per-layer
+        lists by LOCAL layer and read the wrong global layer."""
+        lifecycle, runner = _make_lifecycle(model_args=dict(self._NON_UNIFORM_ARGS))
+        runner.pp = SimpleNamespace(size=2)  # worker sets the PP group before load
+
+        with pytest.raises(NotImplementedError, match="non-uniform per-layer KV"):
+            lifecycle.resolve_model_dims()
+
+    def test_non_uniform_per_layer_kv_allowed_without_pipeline_parallel(self) -> None:
+        """The same model loads on the single-stage path (pp=1, stub default)."""
+        lifecycle, runner = _make_lifecycle(model_args=dict(self._NON_UNIFORM_ARGS))
+
+        lifecycle.resolve_model_dims()  # must not raise
+
+        assert runner.sliding_window_per_layer == [128, -1]
 
     def test_uniform_model_leaves_per_layer_shapes_none(self) -> None:
         runner = self._resolve(

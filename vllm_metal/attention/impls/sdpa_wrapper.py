@@ -2,16 +2,16 @@
 """Paged attention wrapper and dispatch for native Metal kernels.
 
 The wrapper intercepts mlx_lm attention modules and dispatches to the
-appropriate Metal attention backend based on the module's structure:
+appropriate Metal attention impl based on the module's structure:
 
-- SDPA (Qwen3, Llama, Mistral, …) → ``attention_sdpa.py``
-- Linear attention (Qwen3.5 GatedDeltaNet, …) → ``attention_linear.py`` (stub)
+- SDPA (Qwen3, Llama, Mistral, …) → ``sdpa.py``
+- Linear attention (Qwen3.5 GatedDeltaNet, …) → ``linear.py`` (stub)
 - Future attention types (MLA, …) → add detection + forward function
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
-``clear_context`` from ``paged_attention_common``.
+``clear_context`` from ``context``.
 """
 
 from __future__ import annotations
@@ -21,22 +21,28 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal_kernel_backend.attention_sdpa import (
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import get_context
+from vllm_metal.attention.impls.sdpa import (
     sdpa_forward,
 )
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.paged_attention_common import (
-    find_attn_attr,
-    find_layers,
-    get_context,
-)
+from vllm_metal.attention.patching import walk_and_wrap
 
 # ---------------------------------------------------------------------------
 # Wrapper nn.Module
 # ---------------------------------------------------------------------------
 
 
-class MetalKernelPagedAttentionWrapper(nn.Module):
+def _is_rope_embedding_pair(value: Any) -> bool:
+    """Return True for caller-precomputed RoPE ``(cos, sin)`` embeddings."""
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 2
+        and all(isinstance(item, mx.array) for item in value)
+    )
+
+
+class SDPAPagedAttentionWrapper(nn.Module):
     """Wraps an mlx_lm Attention module to use native Metal paged KV.
 
     Uses ``object.__setattr__`` to bypass MLX nn.Module's ``__setattr__``.
@@ -72,6 +78,16 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
 
+    @property
+    def rotary_emb(self) -> Any:
+        """Expose the wrapped attention's M-RoPE module."""
+        return self._inner.rotary_emb
+
+    @property
+    def rope(self) -> Any:
+        """Expose the wrapped attention's RoPE module."""
+        return self._inner.rope
+
     def rebind_cache(
         self,
         kv_cache: MetalPagedKVCache,
@@ -96,9 +112,25 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         position_ids: mx.array | None = None,
         **kwargs: Any,
     ) -> Any:
+        position_embeddings = kwargs.pop("position_embeddings", None)
+        if _is_rope_embedding_pair(position_ids):
+            # Some attention contracts pass precomputed ``(cos, sin)`` RoPE
+            # embeddings positionally as the fourth argument. Preserve that
+            # payload instead of treating it as Qwen-style ``position_ids``.
+            position_embeddings = position_ids
+            position_ids = None
+
         ctx = get_context()
         if ctx is None:
             # No paged context → delegate to original attention.
+            if position_embeddings is not None:
+                return self._inner(
+                    x,
+                    mask=mask,
+                    cache=cache,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             # Only pass position_ids when provided (mlx_vlm models);
             # mlx_lm models (e.g. Gemma4) use offset via **kwargs instead.
             if position_ids is not None:
@@ -122,6 +154,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
             self._mk_kv_cache,
             self._mk_cache_idx,
             shared_kv=shared_kv,
+            position_embeddings=position_embeddings,
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.
@@ -138,7 +171,7 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def patch_model_attention_metal_kernel(
+def patch_sdpa_attention(
     model: Any,
     kv_cache: MetalPagedKVCache,
     block_size: int,
@@ -147,7 +180,7 @@ def patch_model_attention_metal_kernel(
     only_layers: list[int] | None = None,
 ) -> int:
     """Walk model layers and replace each attention module with a
-    ``MetalKernelPagedAttentionWrapper``.
+    ``SDPAPagedAttentionWrapper``.
 
     Supports hybrid models (e.g. Qwen3.5) where different layers use
     different attribute names (``self_attn``, ``linear_attn``, etc.).
@@ -158,39 +191,24 @@ def patch_model_attention_metal_kernel(
             ``MetalPagedKVCache`` (SDPA layers only) is indexed correctly.
             When ``None``, ``layer_idx`` is used directly.
         only_layers: If provided, only patch these layer indices and skip
-            the rest.  Used by hybrid backend to avoid wrapping linear
+            the rest.  Used by hybrid runtime to avoid wrapping linear
             attention layers that have no kernel implementation yet.
 
     Returns the number of patched layers.
     """
-    layer_list = find_layers(model)
-    only_set = set(only_layers) if only_layers is not None else None
-    patched = 0
 
-    for layer_idx, layer in enumerate(layer_list):
-        if only_set is not None and layer_idx not in only_set:
-            continue
-
-        attn_attr = find_attn_attr(layer)
-        if attn_attr is None:
-            continue
-
-        attn = getattr(layer, attn_attr)
+    def wrap_layer(layer_idx: int, attn: Any) -> Any:
         cache_idx = (
             cache_idx_map[layer_idx]
             if cache_idx_map is not None and layer_idx in cache_idx_map
             else layer_idx
         )
-        if isinstance(attn, MetalKernelPagedAttentionWrapper):
-            # Already patched — update cache reference
+        if isinstance(attn, SDPAPagedAttentionWrapper):
+            # Already patched — refresh cache reference in place.
             attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx)
-            patched += 1
-            continue
-
-        wrapper = MetalKernelPagedAttentionWrapper(
+            return attn
+        return SDPAPagedAttentionWrapper(
             attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
         )
-        setattr(layer, attn_attr, wrapper)
-        patched += 1
 
-    return patched
+    return walk_and_wrap(model, wrap_layer, only_layers=only_layers)

@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention backend for hybrid models (SDPA + linear attention).
+"""Paged attention runtime for hybrid models (SDPA + linear attention).
 
 Handles models like Qwen3.5 where some layers use standard dot-product
 attention (paged KV cache) and others use GDN linear attention (fixed-size
 recurrent state).
 
-SDPA layers use the Metal kernel backend (same as ``MHAPagedAttentionBackend``).
+SDPA layers use the native Metal SDPA kernel (same as ``MHAPagedAttentionRuntime``).
 GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,18 +19,18 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm_metal.metal import warm_up_kernels
-from vllm_metal.metal_kernel_backend.attention_linear import (
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.impls.linear import (
     GDNPagedAttentionWrapper,
     is_linear_attention,
 )
-from vllm_metal.metal_kernel_backend.attention_sdpa import is_sdpa
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.paged_attention import (
-    MetalKernelPagedAttentionWrapper,
+from vllm_metal.attention.impls.sdpa import is_sdpa
+from vllm_metal.attention.impls.sdpa_wrapper import (
+    SDPAPagedAttentionWrapper,
 )
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_common import find_attn_attr, find_layers
+from vllm_metal.attention.patching import walk_and_wrap
+from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 
 logger = init_logger(__name__)
 
@@ -64,10 +66,10 @@ def _build_linear_layer_spec(
     )
 
 
-class HybridPagedAttentionBackend:
-    """Paged attention backend for hybrid SDPA + linear attention models.
+class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
+    """Paged attention runtime for hybrid SDPA + linear attention models.
 
-    SDPA layers: paged Metal kernel (via MetalKernelPagedAttentionWrapper)
+    SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
     GDN layers: MLX-native state management (via GDNPagedAttentionWrapper)
     """
 
@@ -123,16 +125,11 @@ class HybridPagedAttentionBackend:
             else:
                 self._linear_indices.append(i)
 
-        self._kv_cache: MetalPagedKVCache | None = None
+        self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
 
-    def _require_initialized(self, caller: str) -> MetalPagedKVCache:
-        if self._kv_cache is None:
-            raise RuntimeError(f"{caller}() called before initialize()")
-        return self._kv_cache
-
     def initialize(self, num_blocks: int) -> None:
-        self._kv_cache = MetalPagedKVCache(
+        self._cache = MetalPagedKVCache(
             num_layers=len(self._sdpa_indices),
             num_kv_heads=self._num_kv_heads,
             head_dim=self._head_dim,
@@ -170,6 +167,7 @@ class HybridPagedAttentionBackend:
         kv_cache = self._require_initialized("patch_model")
         if self._state_cache is None:
             raise RuntimeError("patch_model() called before initialize()")
+        state_cache = self._state_cache
 
         sdpa_cache_map = {
             layer_idx: cache_idx
@@ -180,48 +178,33 @@ class HybridPagedAttentionBackend:
             for cache_idx, layer_idx in enumerate(self._linear_indices)
         }
 
-        patched = 0
-        for layer_idx, layer in enumerate(find_layers(model)):
-            attn_attr = find_attn_attr(layer)
-            if attn_attr is None:
-                continue
-
-            attn = getattr(layer, attn_attr)
-
-            if isinstance(attn, MetalKernelPagedAttentionWrapper):
-                # Already patched (cached model reuse) — refresh cache refs
+        def wrap_layer(layer_idx: int, attn: Any) -> Any:
+            if isinstance(attn, SDPAPagedAttentionWrapper):
+                # Already patched (cached model reuse) — refresh cache refs.
                 cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
                 attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
-                patched += 1
-            elif isinstance(attn, GDNPagedAttentionWrapper):
-                # Already patched — refresh state cache ref
+                return attn
+            if isinstance(attn, GDNPagedAttentionWrapper):
+                # Already patched — refresh state cache ref.
                 cache_idx = linear_cache_map.get(layer_idx, layer_idx)
                 object.__setattr__(attn, "_gdn_cache_idx", cache_idx)
-                object.__setattr__(attn, "_gdn_state_cache", self._state_cache)
-                patched += 1
-            elif is_sdpa(attn):
+                object.__setattr__(attn, "_gdn_state_cache", state_cache)
+                return attn
+            if is_sdpa(attn):
                 cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
-                wrapper = MetalKernelPagedAttentionWrapper(
+                return SDPAPagedAttentionWrapper(
                     attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
                 )
-                setattr(layer, attn_attr, wrapper)
-                patched += 1
-            elif is_linear_attention(attn):
+            if is_linear_attention(attn):
                 cache_idx = linear_cache_map.get(layer_idx, layer_idx)
-                wrapper = GDNPagedAttentionWrapper(
-                    attn, layer_idx, cache_idx, self._state_cache
-                )
-                setattr(layer, attn_attr, wrapper)
-                patched += 1
+                return GDNPagedAttentionWrapper(attn, layer_idx, cache_idx, state_cache)
+            raise RuntimeError(
+                f"Hybrid patch_model: layer {layer_idx} attention "
+                f"{type(attn).__name__} is neither SDPA nor linear attention; "
+                "refusing to leave it unpatched (it would silently run unpaged)."
+            )
 
-        return patched
-
-    def warm_up(self) -> None:
-        self._require_initialized("warm_up")
-        warm_up_kernels()
-
-    def num_blocks(self) -> int:
-        return self._require_initialized("num_blocks").num_blocks
+        return walk_and_wrap(model, wrap_layer)
 
     @property
     def kv_cache(self) -> MetalPagedKVCache:

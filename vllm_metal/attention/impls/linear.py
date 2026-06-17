@@ -15,14 +15,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
-from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.gdn_lazy import (
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.context import PagedAttentionContext, get_context
+from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
     GDNRecurrentDecodeRequest,
     GDNRecurrentPrefillRequest,
 )
-from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
-from vllm_metal.paged_attention_common import PagedAttentionContext, get_context
+from vllm_metal.metal import get_ops
 
 _DEFAULT_RECURRENT_DECODE_THREADGROUP_DV = 4
 _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV = 8

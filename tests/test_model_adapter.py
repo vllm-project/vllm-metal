@@ -8,6 +8,7 @@ import pytest
 
 import vllm_metal.envs as envs
 from vllm_metal.config import reset_config
+from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -460,6 +461,21 @@ class _Qwen35LanguageModelStub:
         return None
 
 
+class _PaddleOCRLanguageModelStub:
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+
+    def __call__(
+        self,
+        inputs: object,
+        inputs_embeds: object | None = None,
+        cache: object | None = None,
+        position_ids: object | None = None,
+        mask: object | None = None,
+    ) -> None:
+        return None
+
+
 class TestBuildMultimodalAdapter:
     def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
         vision_tower = object()
@@ -494,6 +510,39 @@ class TestBuildMultimodalAdapter:
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
         assert isinstance(adapter, Qwen3VLMultimodalAdapter)
+
+    def test_builds_paddleocr_vl_adapter_from_model_type(self) -> None:
+        language_model = _PaddleOCRLanguageModelStub()
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            ),
+            visual=object(),
+            language_model=language_model,
+        )
+        hf_config = SimpleNamespace(model_type="paddleocr_vl")
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, PaddleOCRVLMultimodalAdapter)
+        assert adapter.text_model() is language_model
+
+    def test_builds_paddleocr_vl_adapter_from_architecture(self) -> None:
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            ),
+            visual=object(),
+            language_model=_PaddleOCRLanguageModelStub(),
+        )
+        hf_config = SimpleNamespace(
+            model_type="custom",
+            architectures=["PaddleOCRVLForConditionalGeneration"],
+        )
+
+        adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
+
+        assert isinstance(adapter, PaddleOCRVLMultimodalAdapter)
 
     def test_generic_vlm_has_no_model_owned_adapter(self) -> None:
         model = SimpleNamespace()
@@ -637,7 +686,7 @@ class TestYocoCacheIntegration:
             num_kv_cache_layers=yoco[0],
         )
 
-        backend = runner.build_paged_attention_backend(block_size=self._BLOCK_SIZE)
+        backend = runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
 
         assert backend._num_layers == self._NUM_UNIQUE
         assert backend._cache_idx_map is not None

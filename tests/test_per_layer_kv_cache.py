@@ -9,11 +9,11 @@ import mlx.core as mx
 import pytest
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.paged_attention_backend.mha import (
-    MHAPagedAttentionBackend,
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.runtime.mha import (
+    MHAPagedAttentionRuntime,
 )
+from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 
 
 class TestMetalPagedKVCachePerLayer:
@@ -86,13 +86,13 @@ class TestMetalPagedKVCachePerLayer:
 
 
 class TestMHABackendPerLayer:
-    """MHAPagedAttentionBackend passes per-layer shapes to cache."""
+    """MHAPagedAttentionRuntime passes per-layer shapes to cache."""
 
     def test_backend_propagates_per_layer_shapes(self) -> None:
         kv_heads = [16, 4]
         head_dims = [256, 512]
 
-        backend = MHAPagedAttentionBackend(
+        backend = MHAPagedAttentionRuntime(
             num_layers=2,
             num_kv_heads=kv_heads[0],
             head_dim=head_dims[0],
@@ -203,7 +203,7 @@ class TestCachePolicyPerLayerBytes:
         with pytest.raises(
             NotImplementedError, match="Per-layer KV shapes with hybrid models"
         ):
-            runner.build_paged_attention_backend(block_size=self._BLOCK_SIZE)
+            runner.build_paged_attention_runtime(block_size=self._BLOCK_SIZE)
 
     def test_turboquant_per_layer_shapes_raise_early(
         self, monkeypatch: pytest.MonkeyPatch

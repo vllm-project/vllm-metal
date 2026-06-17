@@ -169,7 +169,7 @@ def _make_runner(
         model=model or _PoolingModel(),
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
-        _paged_attention_backend=object() if paged else None,
+        _paged_attention_runtime=object() if paged else None,
         _paged_block_size=4,
         num_layers=1,
     )

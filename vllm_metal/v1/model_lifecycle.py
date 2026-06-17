@@ -13,8 +13,8 @@ from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
+from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
-from vllm_metal.paged_attention_backend.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
@@ -187,11 +187,6 @@ class ModelLifecycle:
         }
         if is_vlm:
             logger.info("Using mlx-vlm for vision-language model")
-            logger.warning(
-                "VLM loaded via mlx-vlm; Metal multimodal encoder execution "
-                "is not wired yet. Text-only requests continue through the "
-                "language model."
-            )
             model, tokenizer = mlx_vlm_load(model_name)
         elif awq_loader is not None:
             with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
@@ -292,6 +287,28 @@ class ModelLifecycle:
                 args, self._runner.num_layers
             )
         )
+
+        # Pipeline parallelism slices layers by index but leaves these per-layer
+        # KV lists at full length, so a non-first stage would index them by LOCAL
+        # layer and read the wrong global layer. They are non-None only for non-
+        # uniform models (e.g. Gemma4 interleaved sliding/full attention); reject
+        # PP for them until the split slices the lists too. ``pp`` is the runner's
+        # canonical PP signal (set by the worker before load, mirroring the
+        # forward path's ``self.pp`` checks).
+        if (
+            self._runner.pp is not None
+            and self._runner.pp.size > 1
+            and (
+                self._runner.sliding_window_per_layer is not None
+                or self._runner.kv_heads_per_layer is not None
+                or self._runner.head_dim_per_layer is not None
+            )
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported for models with non-uniform "
+                "per-layer KV (interleaved sliding-window / per-layer KV heads or "
+                "head dims, e.g. Gemma4)."
+            )
 
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])

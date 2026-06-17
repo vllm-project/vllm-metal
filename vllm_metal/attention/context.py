@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention shared utilities — context, prepare functions, and helpers.
+"""Per-step paged-attention context.
 
-Provides the thread-local ``PagedAttentionContext`` and ``OffsetCache`` used by
-both the Metal kernel paged attention backend and the model runner.
+The thread-local ``PagedAttentionContext`` carries per-request metadata
+(slot_mapping, block_tables, cu_seqlens, …) to the attention wrappers buried
+inside the model; ``OffsetCache`` is the shim that keeps mlx_lm's RoPE and
+masking working with no real K/V; ``prepare_unified`` stages the context before
+a forward pass.
 
 Usage:
     1. Before each forward pass call ``prepare_unified()``
@@ -115,45 +118,6 @@ class OffsetCache:
         if return_array:
             return create_causal_mask(N, self.offset, window_size=window_size)
         return "causal"
-
-
-# ---------------------------------------------------------------------------
-# Model introspection
-# ---------------------------------------------------------------------------
-
-
-def find_layers(model: Any) -> list[Any]:
-    """Find transformer layers in an mlx_lm / mlx-vlm model.
-
-    Supports model structures like:
-        model.language_model.model.layers   (VLMs)
-        model.model.layers
-        model.layers
-    """
-    # Unwrap VLM wrapper (e.g. LLaVA, Pixtral via mlx-vlm)
-    root = getattr(model, "language_model", model)
-    # Try root.model.layers (Qwen3 Model wrapper)
-    layers_container = getattr(root, "model", root)
-    if hasattr(layers_container, "layers"):
-        return layers_container.layers
-    elif hasattr(root, "layers"):
-        return root.layers
-    else:
-        raise ValueError(
-            f"Cannot find transformer layers in model of type {type(model)}"
-        )
-
-
-# Attribute names to probe on each layer, in priority order.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention")
-
-
-def find_attn_attr(layer: Any) -> str | None:
-    """Return the attention attribute name for a single layer, or None."""
-    for name in _ATTN_ATTR_NAMES:
-        if hasattr(layer, name):
-            return name
-    return None
 
 
 # ---------------------------------------------------------------------------

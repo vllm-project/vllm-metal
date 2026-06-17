@@ -8,7 +8,8 @@ Thanks for your interest in contributing! This plugin targets **Apple Silicon Ma
 git clone https://github.com/vllm-project/vllm-metal.git
 cd vllm-metal
 
-# Creates ./.venv-vllm-metal/ and installs vLLM core + the plugin
+# Creates ./.venv-vllm-metal/, installs vLLM core + the plugin, and
+# prebuilds the native Metal kernels from your checkout
 ./install.sh
 
 # Activate the virtualenv
@@ -17,6 +18,35 @@ source .venv-vllm-metal/bin/activate
 # Install dev dependencies (pytest, ruff, mypy, ...)
 pip install -e ".[dev]"
 ```
+
+## Editing the Metal kernels
+
+Release wheels ship the native paged-attention extension and its Metal shader
+libraries **prebuilt**, so end users never compile them. To edit the kernels —
+the `.metal` shaders or `paged_ops.cpp` — and run from your local source, set:
+
+```bash
+VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve ...   # or: pytest, your script, etc.
+```
+
+In this mode the C++ extension is recompiled when its inputs change (the build
+is hash-checked, so unchanged sources are skipped) and the shaders are compiled
+in-process by MLX from the `.metal` source at runtime. There is **no manual
+`.metallib` rebuild step**: edit a kernel, restart the Python process, and the
+change is picked up.
+
+Requirements:
+
+- **Xcode Command Line Tools** (`xcode-select --install`) — `clang++` rebuilds
+  the `.so`; keep it current enough for the pinned MLX headers.
+- No Metal toolchain needed: MLX compiles the `.metal` shaders in-process.
+
+Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts are loaded as-is.
+If you edited a kernel source after building them locally, loading **fails
+loudly** on the stale-hash mismatch rather than silently running the old kernel —
+set the variable, or rerun `python -m vllm_metal.metal.build` to refresh the
+prebuilt artifacts. (A plain wheel install ships no hash stamps, so end users
+never hit this.)
 
 ## Run lint locally
 

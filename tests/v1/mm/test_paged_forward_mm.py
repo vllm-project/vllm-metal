@@ -11,9 +11,9 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention.context import get_context
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLVisionEncodeResult
-from vllm_metal.paged_attention_common import get_context
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
@@ -32,6 +32,7 @@ class _MmAdapter:
     """Fake adapter that records call_lm + supplies stable positions."""
 
     forward_ready = True
+    requires_explicit_positions = False
 
     def __init__(self, *, hidden_size: int = 4, vocab_size: int = 8) -> None:
         self.hidden_size = hidden_size
@@ -118,7 +119,7 @@ def _runner(adapter: _MmAdapter, *, num_layers: int = 1):
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
         _is_vlm=True,
-        _paged_attention_backend=MagicMock(),
+        _paged_attention_runtime=MagicMock(),
         _paged_block_size=16,
         num_layers=num_layers,
         model_args={"vocab_size": adapter.vocab_size},
@@ -257,6 +258,110 @@ class TestMmPrefillChunkedFeatureSlicing:
                 embeds[0, chunk_local],
                 mx.full((adapter.hidden_size,), value, dtype=mx.float32),
             ).item()
+
+
+class TestTextOnlyRoutingForExplicitPositionsAdapter:
+    """``requires_explicit_positions`` adapters (PaddleOCR-VL) route
+    text-only batches through the mm forward so the LM always receives
+    runner-built position_ids instead of re-deriving them from the
+    zero-offset paged caches."""
+
+    def test_text_only_prefill_routes_through_call_lm_with_positions(self) -> None:
+        adapter = _MmAdapter()
+        adapter.requires_explicit_positions = True
+        runner = _runner(adapter)
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+        prefill = _mm_prefill(
+            "req-text",
+            token_ids=[7, 8, 9],
+            prompt_len=3,
+            start_pos=0,
+            full_prompt=[7, 8, 9],
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        assert len(adapter.call_lm_calls) == 1
+        call = adapter.call_lm_calls[0]
+        # Explicit absolute arange — not model-derived positions.
+        assert call["position_ids"].tolist() == [[[0, 1, 2]]] * 3
+        assert call["visual_pos_masks"].tolist() == [[False, False, False]]
+        assert call["deepstack_visual_embeds"] is None
+
+    def test_text_only_decode_positions_use_cache_start_pos(self) -> None:
+        adapter = _MmAdapter()
+        adapter.requires_explicit_positions = True
+        runner = _runner(adapter)
+        # Text-only request: no mrope delta stashed.
+        state = RequestState(
+            token_ids=[1, 2, 3, 4, 5, 6],
+            prompt_len=5,
+            cache=[],
+            sampling_params=SamplingParams(),
+            mrope_position_delta=None,
+        )
+        runner._request_states["req-text"] = state
+        segment = PagedDecodeSegment(
+            req_id="req-text",
+            input_token_ids=(6,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=5,
+            block_ids=(0,),
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=(segment,)
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[],
+            decode_reqs=[("req-text", state)],
+            scheduler_output=_scheduler_output(),
+        )
+
+        call = adapter.call_lm_calls[0]
+        # Decode position = absolute cache_start_pos — exactly what the
+        # model-level re-derivation would have gotten wrong (position 0).
+        assert call["position_ids"].tolist() == [[[5]]] * 3
+
+    def test_text_only_batch_stays_on_text_path_without_flag(self) -> None:
+        adapter = _MmAdapter()  # requires_explicit_positions = False
+        runner = _runner(adapter)
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+        runner._target_forward = MagicMock(
+            return_value=MagicMock(
+                logits=mx.zeros((1, 3, adapter.vocab_size), dtype=mx.float32),
+                hidden_states=None,
+            )
+        )
+        prefill = _mm_prefill(
+            "req-text",
+            token_ids=[7, 8, 9],
+            prompt_len=3,
+            start_pos=0,
+            full_prompt=[7, 8, 9],
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        assert adapter.call_lm_calls == []
+        runner._target_forward.assert_called_once()
 
 
 class TestMmDecodeSegmentPositions:

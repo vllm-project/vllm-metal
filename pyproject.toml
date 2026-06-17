@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "vllm-metal"
-version = "0.2.0"
+version = "0.3.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -27,16 +27,19 @@ classifiers = [
 ]
 
 dependencies = [
-    # MLX - Required for Apple Silicon GPU acceleration
-    # Upper-bound: paged_ops.cpp uses mlx/backend/metal/device.h (private API).
-    # Bump after verifying the JIT build against the new MLX minor release.
-    "mlx>=0.31.0,<0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # MLX - Required for Apple Silicon GPU acceleration.
+    # EXACT pin: the prebuilt _paged_ops.so links MLX private headers and
+    # subclasses mlx::core::Primitive (mlx/backend/metal/device.h, etc.), and
+    # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
+    # a wheel built against one MLX is only ABI-safe against that exact MLX.
+    # Rebuild and re-release the wheel on every MLX bump.
+    "mlx==0.31.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
-    # mlx-vlm 0.5.x also requires llguidance>=1.7.0.
-    "mlx-vlm>=0.5.0,<0.6.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
+    "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
-    # First allowed Transformers v5 release per vLLM 0.22.0's exclude list.
+    # First allowed Transformers v5 release per vLLM 0.23.0's exclude list.
     "transformers>=5.5.1",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
@@ -48,6 +51,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gguf = [
+    # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
+    # unless a Metal-specific path needs a newer API.
+    "gguf>=0.17.0",
+]
 stt = [
     # Speech-to-text audio processing (Whisper models)
     "librosa>=0.10.2",
@@ -58,9 +66,10 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "ruff>=0.1.0",
     "mypy>=1.19.1",
+    "gguf>=0.17.0",
 ]
 all = [
-    "vllm-metal[stt,dev]",
+    "vllm-metal[gguf,stt,dev]",
 ]
 
 [project.urls]
@@ -82,6 +91,11 @@ python-source = "."
 module-name = "vllm_metal._rs"
 # Strip symbols for smaller binary
 strip = true
+# Bundle the prebuilt Metal artifacts into the wheel. These are gitignored
+# (*.so / *.metallib) so maturin's default git-tracked file walk skips them;
+# listing them explicitly ships the prebuilt native extension at packaging
+# time so the end-user machine never invokes clang++ at runtime.
+include = ["vllm_metal/metal/*.metallib", "vllm_metal/metal/_paged_ops*.so"]
 
 [tool.ruff]
 line-length = 88

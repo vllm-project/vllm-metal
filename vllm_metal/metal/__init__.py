@@ -10,6 +10,7 @@ Usage::
 
 from __future__ import annotations
 
+import functools
 import importlib
 import importlib.util
 import logging
@@ -25,16 +26,25 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = Path(__file__).resolve().parent
 _KERNELS_V2_DIR = _THIS_DIR / "kernels_v2"
 
-# Cached after first get_ops() call.  The Metal shaders are JIT-compiled once
-# and held in MLX's library cache for the lifetime of the process.  Editing
-# .metal source files requires restarting the Python interpreter to pick up
-# changes (the .cpp extension itself is rebuilt automatically by build.py when
-# paged_ops.cpp is newer than the .so).
+# Cached after first get_ops() call.  By default both the .cpp extension and
+# the three Metal shader libraries are loaded prebuilt from the package (the
+# .so plus precompiled .metallib files), so there is no first-request shader
+# compile.  Set VLLM_METAL_BUILD_FROM_SOURCE=1 to recompile the .so from source
+# AND compile the shaders in-process from .metal (for kernel developers
+# iterating on paged_ops.cpp or the .metal sources); editing .metal then
+# requires restarting the interpreter to pick up changes.  Either way the
+# libraries are held in MLX's cache for the lifetime of the process.
 _ops_module: ModuleType | None = None
 
 
+@functools.cache
 def _read_metal_source(path: Path) -> str:
-    """Read a .metal file and strip local #include directives."""
+    """Read a .metal file and strip local #include directives.
+
+    Cached for the process lifetime: the three library source builders all pull
+    in shared shaders (e.g. utils.metal), so without this each staleness check
+    or source-mode init would re-read and re-strip the same files several times.
+    """
     text = path.read_text()
     # Remove #include "..." for our vendored files (keep <metal_stdlib> etc.)
     text = re.sub(r'#include\s+"[^"]*"', "", text)
@@ -138,11 +148,14 @@ def metal_mla_paged_attention(
 
 
 def get_ops() -> ModuleType:
-    """JIT-build and import the native paged_ops extension.
+    """Import the native paged_ops extension and initialise its Metal libraries.
 
-    The Metal shader sources are read, pre-processed (includes inlined),
-    and passed to the C++ extension which JIT-compiles them via
-    ``mlx::core::metal::Device::get_library()``.
+    By default the prebuilt ``.so`` is loaded and the three precompiled
+    ``.metallib`` shader libraries are loaded by path via MLX
+    (``Device::get_library(name, path)``). When ``VLLM_METAL_BUILD_FROM_SOURCE``
+    is set, the ``.so`` is rebuilt and the shader sources are read, pre-processed
+    (includes inlined) and JIT-compiled in-process via
+    ``mlx::core::metal::Device::get_library(name, builder)`` instead.
 
     Returns:
         The ``_paged_ops`` module with ``paged_attention_primitive()`` and
@@ -152,10 +165,44 @@ def get_ops() -> ModuleType:
     if _ops_module is not None:
         return _ops_module
 
-    # 1. JIT-build the C++ extension if needed
-    from vllm_metal.metal.build import build
+    # The prebuilt .so links `-lmlx` with no rpath, so it records a dependency on
+    # `@rpath/libmlx.dylib` (libmlx's install name) that it cannot resolve on its
+    # own; dyld instead satisfies it against an already-resident libmlx, matched
+    # by install name (`-undefined dynamic_lookup` resolves any stragglers the
+    # same way; see build.py). Both need libmlx loaded first, so import mlx.core
+    # now to make it resident before the .so is dlopen'd below.
+    import mlx.core  # noqa: F401
 
-    so_path = build()
+    # 1. Locate the native extension: load the prebuilt artifact by default;
+    #    only compile from source when explicitly opted in (no silent fallback).
+    from vllm_metal import envs
+    from vllm_metal.metal.build import build, output_path, stale_artifacts
+
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        so_path = build()
+    else:
+        so_path = output_path()
+        if not so_path.exists():
+            raise RuntimeError(
+                f"Prebuilt native extension not found at {so_path}. Install a "
+                f"vllm-metal release wheel (which ships it prebuilt), or set "
+                f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile it from source "
+                f"(requires Xcode command-line tools)."
+            )
+        # Locally-built artifacts (the .so and the .metallib shaders) drift if a
+        # developer edits paged_ops.cpp or a .metal file without rebuilding. Fail
+        # loudly rather than run stale kernels — but do NOT auto-build, which
+        # would reintroduce the silent compile this design removed. No-op for
+        # wheel installs (no stamps), so end users are never affected.
+        stale = stale_artifacts()
+        if stale:
+            raise RuntimeError(
+                f"Prebuilt Metal artifacts are stale vs the current sources "
+                f"({', '.join(p.name for p in stale)}): a kernel source was "
+                f"edited without rebuilding. Set VLLM_METAL_BUILD_FROM_SOURCE=1 "
+                f"to build from source, or run `python -m vllm_metal.metal.build` "
+                f"to refresh the prebuilt artifacts."
+            )
 
     # 2. Import the built extension
     spec = importlib.util.spec_from_file_location("_paged_ops", str(so_path))
@@ -164,17 +211,27 @@ def get_ops() -> ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 3. Initialise v2 library (online softmax kernel)
-    v2_src = _build_v2_paged_attention_source()
-    mod.init_v2_library(v2_src)
+    # 3. Initialise the three Metal shader libraries (v2 online-softmax, GDN
+    #    linear attention, MLA paged attention).  By default we load the
+    #    precompiled .metallib files shipped in the wheel (no first-request
+    #    shader compile); only compile the shaders in-process when the developer
+    #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        mod.init_v2_library(_build_v2_paged_attention_source())
+        mod.init_gdn_library(_build_gdn_source())
+        mod.init_mla_library(_build_mla_paged_attention_source())
+    else:
+        from vllm_metal.metal.build import METALLIB_NAMES, metallib_path
 
-    # 4. Initialise GDN linear attention library
-    gdn_src = _build_gdn_source()
-    mod.init_gdn_library(gdn_src)
-
-    # 5. Initialise MLA paged-attention library (RFC #360)
-    mla_src = _build_mla_paged_attention_source()
-    mod.init_mla_library(mla_src)
+        missing = [n for n in METALLIB_NAMES if not metallib_path(n).exists()]
+        if missing:
+            raise RuntimeError(
+                f"Prebuilt Metal libraries missing: {missing} (expected in "
+                f"{_THIS_DIR}). Install a vllm-metal release wheel, or set "
+                f"VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders from source."
+            )
+        for name in METALLIB_NAMES:
+            mod.init_library_path(name, str(metallib_path(name)))
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
@@ -182,16 +239,17 @@ def get_ops() -> ModuleType:
 
 
 def warm_up_kernels() -> None:
-    """Front-load v2 / GDN / MLA Metal kernel compilation at startup.
+    """Front-load v2 / GDN / MLA Metal library loading at startup.
 
-    :func:`get_ops` JIT-builds the C++ ``_paged_ops`` extension and eagerly
-    compiles the v2 / GDN / MLA Metal libraries: MLX's
-    ``Device::get_library`` compiles the source synchronously inside each
-    ``init_*_library`` call. Calling it here moves that cost off the first
-    request and fails fast at startup if the kernels cannot compile on this
-    macOS (e.g. an unsupported Metal language version).
+    :func:`get_ops` imports the C++ ``_paged_ops`` extension and initialises the
+    v2 / GDN / MLA Metal libraries — by default loading the precompiled
+    ``.metallib`` files, or (under ``VLLM_METAL_BUILD_FROM_SOURCE``) compiling
+    the shader source synchronously inside each ``init_*_library`` call. Calling
+    it here moves that cost off the first request and fails fast at startup if
+    the libraries are missing or the shaders cannot compile on this macOS (e.g.
+    an unsupported Metal language version).
 
-    The compile is process-wide with no per-cache state, which is why this
+    The load/compile is process-wide with no per-cache state, which is why this
     takes no arguments.
     """
     macos_version = platform.mac_ver()[0]

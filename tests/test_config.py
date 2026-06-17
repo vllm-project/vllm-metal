@@ -34,7 +34,6 @@ class TestMetalConfig:
         assert config.mlx_device == "gpu"
         assert config.debug is False
         assert config.use_paged_attention is True
-        assert config.kv_sharing_fast_prefill is True
         assert config.multimodal_mode == "auto"
 
     def test_custom_config_from_env(self, monkeypatch) -> None:
@@ -44,7 +43,6 @@ class TestMetalConfig:
         monkeypatch.setenv("VLLM_MLX_DEVICE", "cpu")
         monkeypatch.setenv("VLLM_METAL_DEBUG", "1")
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        monkeypatch.setenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "1")
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
 
         config = MetalConfig.from_env()
@@ -53,37 +51,14 @@ class TestMetalConfig:
         assert config.use_mlx is False
         assert config.mlx_device == "cpu"
         assert config.debug is True
-        assert config.kv_sharing_fast_prefill is True
         assert config.multimodal_mode == "multimodal-native"
 
-    def test_kv_sharing_fast_prefill_can_be_disabled(self, monkeypatch) -> None:
-        monkeypatch.setenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "0")
-
-        config = MetalConfig.from_env()
-
-        assert config.kv_sharing_fast_prefill is False
-
-    def test_kv_sharing_fast_prefill_default_off_without_paged_attention(
-        self, monkeypatch
-    ) -> None:
+    def test_paged_attention_can_be_disabled(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
 
         config = MetalConfig.from_env()
 
         assert config.use_paged_attention is False
-        assert config.kv_sharing_fast_prefill is False
-
-    def test_explicit_kv_sharing_fast_prefill_requires_paged_attention_env(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        monkeypatch.setenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "1")
-
-        with pytest.raises(
-            ValueError,
-            match="VLLM_METAL_KV_SHARING_FAST_PREFILL requires paged attention",
-        ):
-            MetalConfig.from_env()
 
     def test_get_config_singleton(self) -> None:
         """Test that get_config returns a singleton."""
@@ -169,20 +144,6 @@ class TestMetalConfig:
         assert config.turboquant is False
         assert config.k_quant == "q8_0"
         assert config.v_quant == "q3_0"
-
-    def test_kv_sharing_fast_prefill_requires_paged_attention(self) -> None:
-        with pytest.raises(
-            ValueError,
-            match="VLLM_METAL_KV_SHARING_FAST_PREFILL requires paged attention",
-        ):
-            MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
-                use_mlx=True,
-                mlx_device="gpu",
-                debug=False,
-                use_paged_attention=False,
-                kv_sharing_fast_prefill=True,
-            )
 
     def test_text_only_compat_mode_is_accepted(self) -> None:
         config = MetalConfig(

@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_metal.distributed import PipelineGroup
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
 logger = init_logger(__name__)
@@ -42,6 +43,16 @@ class MultimodalRuntimeAdapter(Protocol):
     ``MetalModelRunner`` fails fast on scheduled encoder inputs when this
     is ``False``, so a new adapter can land closed without disturbing the
     model already in production.
+    """
+
+    requires_explicit_positions: bool
+    """Whether text-only batches must also run the multimodal forward.
+
+    True for models whose language model derives rotary embeddings from
+    model-level position state: on the paged text path the runner supplies
+    zero-offset caches and no ``position_ids``, so the LM would re-derive
+    every position from 0.  Routing through ``call_lm`` keeps positions
+    explicit on every batch.
     """
 
     def text_model(self) -> Any:
@@ -135,6 +146,15 @@ class ModelAdapter(Protocol):
     def extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from raw model output."""
 
+    def apply_pipeline_split(
+        self, model: Any, pp: PipelineGroup
+    ) -> tuple[int, int] | None:
+        """Slice ``model`` in place to the pipeline stage owned by ``pp``.
+
+        Returns the local ``(start, end)`` layer span (``None`` for a
+        singleton group).
+        """
+
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any
     ) -> MultimodalRuntimeAdapter | None:
@@ -183,6 +203,10 @@ _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3VLForConditionalGeneration",
     }
 )
+_PADDLEOCR_VL_MODEL_TYPES: frozenset[str] = frozenset({"paddleocr_vl"})
+_PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
+    {"PaddleOCRVLForConditionalGeneration"}
+)
 
 
 class DefaultModelAdapter(ModelAdapter):
@@ -227,19 +251,12 @@ class DefaultModelAdapter(ModelAdapter):
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
 
-        Modes:
-        - ``multimodal-native``: never force compatibility; keep native VLM
-          loading active so multimodal support can be developed/tested.
-        - ``text-only-compat``: force the text-only path only for the
-          known-safe compatibility allowlist.
-        - ``auto``: apply the compatibility path only for known-incompatible
-          checkpoints such as Gemma4 and Qwen3.5/Qwen3.6 FP8 wrappers.
+        ``multimodal-native`` disables compatibility overrides. ``auto`` and
+        ``text-only-compat`` share the same compatibility allowlist.
         """
         multimodal_mode = self._multimodal_mode()
         if multimodal_mode == "multimodal-native":
             return False
-        if multimodal_mode == "text-only-compat":
-            return self._matches_auto_text_backbone_override(hf_config)
         return self._matches_auto_text_backbone_override(hf_config)
 
     def normalize_model_config(self, model_config: ModelConfig) -> None:
@@ -436,6 +453,22 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _target_backbone(self, model: Any) -> Any | None:
         return getattr(self.text_model(model), "model", None)
 
+    def apply_pipeline_split(
+        self, model: Any, pp: PipelineGroup
+    ) -> tuple[int, int] | None:
+        """Slice the text backbone in place to the stage owned by ``pp``.
+
+        Delegates to :func:`vllm_metal.distributed.apply_pipeline_split`, which
+        operates on the ``.model`` backbone of the object it is handed. Passing
+        ``self.text_model(model)`` reuses the same backbone resolution as
+        :meth:`_target_backbone` so VLM text sub-models are sliced correctly.
+        Returns the local ``(start, end)`` layer span (``None`` for a
+        singleton group, where the split is a no-op).
+        """
+        from vllm_metal.distributed import apply_pipeline_split
+
+        return apply_pipeline_split(self.text_model(model), pp)
+
     def build_multimodal_adapter(
         self, model: Any, hf_config: Any
     ) -> MultimodalRuntimeAdapter | None:
@@ -445,17 +478,29 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type not in _QWEN3_VL_MODEL_TYPES and not any(
+        if model_type in _QWEN3_VL_MODEL_TYPES or any(
             arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
         ):
-            return None
+            from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
-        from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+            return cast(
+                MultimodalRuntimeAdapter,
+                Qwen3VLMultimodalAdapter.from_loaded_model(model),
+            )
 
-        return cast(
-            MultimodalRuntimeAdapter,
-            Qwen3VLMultimodalAdapter.from_loaded_model(model),
-        )
+        if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
+            arch in _PADDLEOCR_VL_ARCHITECTURES for arch in architectures
+        ):
+            from vllm_metal.multimodal.paddleocr_vl import (
+                PaddleOCRVLMultimodalAdapter,
+            )
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        return None
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]

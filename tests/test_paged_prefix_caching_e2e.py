@@ -71,7 +71,7 @@ def _run_prefix_cache_correctness() -> None:
 
     from vllm import LLM, SamplingParams
 
-    import vllm_metal.paged_attention_common as pac
+    from vllm_metal.attention import context as pac
 
     seen_start_pos: list[int] = []
     orig_prepare = pac.prepare_unified

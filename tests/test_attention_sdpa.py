@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Gemma4-specific branches in attention_sdpa.
+"""Unit tests for Gemma4-specific branches in sdpa.
 
 Covers:
 - ``pad_qkv_to_cache_head_dim`` / ``truncate_padded_output`` pure helpers.
@@ -18,15 +18,15 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
-import vllm_metal.metal_kernel_backend.attention_sdpa as sdpa_mod
-from vllm_metal.metal_kernel_backend.attention_sdpa import (
+import vllm_metal.attention.impls.sdpa as sdpa_mod
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.sdpa import (
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
     sdpa_forward,
     truncate_padded_output,
 )
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.paged_attention_common import PagedAttentionContext
 
 # === Test fixtures (shared shapes) ===
 
@@ -480,6 +480,43 @@ class TestPrepareSDPAQKV:
                 _N_KV_HEADS,
                 shared_kv=(shared_k, shared_v),
             )
+
+    def test_precomputed_rope_path_does_not_require_rope_attribute(self) -> None:
+        # Arrange — some VLMs precompute ``(cos, sin)`` at the model level
+        # and pass those embeddings into ``self_attn`` positionally.
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        inner.rope_parameters = {"mrope_section": [1, 1, 1]}
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        cos = mx.ones((3, _BATCH, _SEQ_LEN, _HEAD_DIM), dtype=mx.float32)
+        sin = mx.zeros((3, _BATCH, _SEQ_LEN, _HEAD_DIM), dtype=mx.float32)
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), 5.0)
+        expected_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 7.0)
+
+        with patch.object(
+            sdpa_mod,
+            "apply_attention_rope",
+            return_value=(expected_q, expected_k),
+        ) as apply_rope:
+            queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
+                inner,
+                x,
+                ctx,
+                _N_HEADS,
+                _N_KV_HEADS,
+                position_embeddings=(cos, sin),
+            )
+
+        assert apply_rope.call_count == 1
+        position_embeddings_arg = apply_rope.call_args.kwargs["position_embeddings"]
+        assert position_embeddings_arg[0] is cos
+        assert position_embeddings_arg[1] is sin
+        assert queries is expected_q
+        assert keys is expected_k
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert gate is None
+        assert kv_for_sharing == (expected_k, values)
 
 
 class TestSDPAForward:

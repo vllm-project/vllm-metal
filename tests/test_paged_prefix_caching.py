@@ -22,9 +22,9 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 
-import vllm_metal.paged_attention_common as pac
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
+from vllm_metal.attention import context as pac
 from vllm_metal.v1.sampling_batch import _SamplingResult
 
 
@@ -33,7 +33,7 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
     return make_stub_runner(
         model_args={"vocab_size": 32000},
         model=MagicMock(),
-        _paged_attention_backend=MagicMock(),
+        _paged_attention_runtime=MagicMock(),
         _paged_block_size=4,
         _gdn_req_to_slot={},
         _gdn_free_slots=[],
@@ -130,10 +130,10 @@ class TestPagedPrefixCacheHit:
                 return_value=mx.array(fake_token),
             ),
             patch(
-                "vllm_metal.paged_attention_common.prepare_unified",
+                "vllm_metal.attention.context.prepare_unified",
             ),
             patch(
-                "vllm_metal.paged_attention_common.clear_context",
+                "vllm_metal.attention.context.clear_context",
             ),
         ):
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
@@ -172,10 +172,10 @@ class TestPagedPrefixCacheHit:
                 return_value=mx.array(0),
             ),
             patch(
-                "vllm_metal.paged_attention_common.prepare_unified",
+                "vllm_metal.attention.context.prepare_unified",
             ),
             patch(
-                "vllm_metal.paged_attention_common.clear_context",
+                "vllm_metal.attention.context.clear_context",
             ),
         ):
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
@@ -208,10 +208,10 @@ class TestPagedPrefixCacheHit:
                 return_value=mx.array(0),
             ),
             patch(
-                "vllm_metal.paged_attention_common.prepare_unified",
+                "vllm_metal.attention.context.prepare_unified",
             ),
             patch(
-                "vllm_metal.paged_attention_common.clear_context",
+                "vllm_metal.attention.context.clear_context",
             ),
         ):
             new_req = _make_new_req("req-1", prompt, num_computed_tokens=num_computed)
@@ -257,10 +257,10 @@ class TestSamplingMetadataWithPenalties:
                 spy_sample,
             ),
             patch(
-                "vllm_metal.paged_attention_common.prepare_unified",
+                "vllm_metal.attention.context.prepare_unified",
             ),
             patch(
-                "vllm_metal.paged_attention_common.clear_context",
+                "vllm_metal.attention.context.clear_context",
             ),
         ):
             runner._sampler = MagicMock()

@@ -8,7 +8,8 @@ transparently by the Metal paged attention kernel.
 Handles models whose attention module exposes:
 - ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
   see K-eq-V variant below)
-- ``rope`` or ``rotary_emb`` for rotary position embeddings
+- ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
+  ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
 - Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
 
@@ -30,12 +31,12 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.metal import get_ops
-from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
-    apply_packed_rope,
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.varlen_rope_compat import (
+    apply_attention_rope,
 )
-from vllm_metal.paged_attention_common import PagedAttentionContext
+from vllm_metal.metal import get_ops
 
 # === Metal kernel block-size support ===
 # The paged attention Metal kernel is template-instantiated for these block
@@ -73,7 +74,7 @@ def is_sdpa(module: nn.Module) -> bool:
       and RoPE exposure via ``rope`` or ``rotary_emb``.
 
     Keeping this classifier tight matters because
-    :meth:`HybridPagedAttentionBackend.patch_model` uses ``is_sdpa`` as
+    :meth:`HybridPagedAttentionRuntime.patch_model` uses ``is_sdpa`` as
     the dispatch predicate — loose matching would send arbitrary Q/K/O
     modules through the SDPA path.
     """
@@ -154,6 +155,7 @@ def prepare_sdpa_qkv(
     shared_kv: tuple[mx.array, mx.array] | None = None,
     *,
     read_existing_kv: bool = False,
+    position_embeddings: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
     """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
 
@@ -253,12 +255,7 @@ def prepare_sdpa_qkv(
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
         queries = queries.transpose(0, 2, 1, 3)
-        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-            raise NotImplementedError(
-                f"Attention module {type(inner).__name__} does not have a "
-                "'rope' or 'rotary_emb' attribute."
-            )
-        queries, _ = apply_packed_rope(
+        queries, _ = apply_attention_rope(
             inner,
             queries,
             keys,
@@ -266,6 +263,7 @@ def prepare_sdpa_qkv(
             offsets=ctx.offsets if ctx.offsets else None,
             apply_keys=False,
             positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
         )
     else:
         if not packed_qkv:
@@ -289,18 +287,14 @@ def prepare_sdpa_qkv(
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        if not hasattr(inner, "rope") and not hasattr(inner, "rotary_emb"):
-            raise NotImplementedError(
-                f"Attention module {type(inner).__name__} does not have a "
-                "'rope' or 'rotary_emb' attribute."
-            )
-        queries, keys = apply_packed_rope(
+        queries, keys = apply_attention_rope(
             inner,
             queries,
             keys,
             ctx.cu_seqlens,
             offsets=ctx.offsets if ctx.offsets else None,
             positions=ctx.segment_positions,
+            position_embeddings=position_embeddings,
         )
 
     kv_for_sharing = (keys, values)
@@ -405,6 +399,7 @@ def sdpa_forward(
     shared_kv: tuple[mx.array, mx.array] | None = None,
     *,
     read_existing_kv: bool = False,
+    position_embeddings: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
 
@@ -432,6 +427,7 @@ def sdpa_forward(
         n_kv_heads,
         shared_kv,
         read_existing_kv=read_existing_kv,
+        position_embeddings=position_embeddings,
     )
 
     # --- Metal kernel dispatch ---
@@ -484,7 +480,7 @@ def sdpa_forward(
         # Supports the full QUANT_PARAMS matrix: signed q8_0/int8 at k_bits=8
         # and unsigned uint8/q5_0/q4_0/int4/uint4/int2/uint2 at k_bits in
         # {2, 3, 4, 5, 8}.
-        from vllm_metal.metal_kernel_backend.turboquant import (
+        from vllm_metal.attention.caches.turboquant import (
             QUANT_PARAMS,
             get_v_centroids,
         )
@@ -584,7 +580,7 @@ def sdpa_forward(
                 -1, kernel_block_size, kv_cache.num_kv_heads, sg
             )
         # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
-        from vllm_metal.metal_kernel_backend.turboquant import get_v_centroids
+        from vllm_metal.attention.caches.turboquant import get_v_centroids
 
         v_centroids = get_v_centroids(kv_cache.v_bits)
         ops.paged_attention_primitive(

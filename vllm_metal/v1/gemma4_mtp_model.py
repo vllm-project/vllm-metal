@@ -12,8 +12,8 @@ import mlx.nn as nn
 from mlx_lm.models import gemma4_text
 from mlx_lm.models.base import BaseModelArgs
 
-from vllm_metal.metal_kernel_backend.attention_sdpa import sdpa_forward
-from vllm_metal.paged_attention_common import get_context
+from vllm_metal.attention.context import get_context
+from vllm_metal.attention.impls.sdpa import sdpa_forward
 
 GEMMA4_MTP_DEFAULT_VOCAB_SIZE = 262144
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048

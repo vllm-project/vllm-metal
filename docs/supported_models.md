@@ -1,6 +1,8 @@
 # Supported Models
 
-vllm-metal currently focuses on text-only language models on Apple Silicon. Multi-modal (vision / audio input) models are not yet supported.
+vllm-metal supports text language models and a small set of native multimodal
+models on Apple Silicon. Multimodal support is currently vision-only and runs on
+the paged backend.
 
 ## Legend
 
@@ -11,66 +13,75 @@ vllm-metal currently focuses on text-only language models on Apple Silicon. Mult
 | ❌ | Not supported model/feature |
 | 🟡 | Not tested or verified |
 
+Each row tracks a model family. The **Example checkpoint** is one configuration
+we have actually run on Metal — a starting point, not the only checkpoint that
+works. Other sizes and quantizations of the same family generally work too;
+per-machine details (chip, RAM, macOS, reference match) and the full change
+history live in the project's PRs, not in this table. If a model or checkpoint
+does not work, please open an issue rather than adding more rows or example
+checkpoints.
+
+<!-- Keep this a high-level support matrix. Add a feature column only once at
+least one shipped model uses it (e.g. speculative decoding, tensor parallel) —
+do not add columns for unimplemented features. -->
+
 ## Text Pooling
 
 Metal V1 has experimental text-only pooling support. See
 [Text Pooling](text_embedding_pooling.md) for scope, usage, and
-validation guidance.
+validation guidance. The reranker requires Qwen3 sequence-classification
+`hf_overrides`.
 
-| Model | Support | Runner | Evidence | Notes |
+| Model | Support | Runner | Example checkpoint |
+| --- | --- | --- | --- |
+| Qwen3-Embedding | 🔵 | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
+| Qwen3-Reranker | 🔵 | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
+
+## Multimodal Language Models
+
+Native multimodal support currently targets image-only vision-language requests on the paged backend.
+
+| Model | Support | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- |
-| mlx-community/Qwen3-Embedding-0.6B-8bit | 🔵 | `pooling` / `embed` (paged) | `LLM.embed(["hello metal", "semantic search"])` -> `embedding-smoke-ok 2 1024` | Revision `b8d7100604f51da6d14eab4dd1805f596fa1ce3f`; validated on MacBook Air (Apple M5, 16 GB) with vLLM 0.21.0, MLX 0.31.2, `max_model_len=512` |
-| mku64/Qwen3-Reranker-0.6B-mlx-8Bit | 🔵 | `pooling` / `classify` (paged) | `LLM.score(...)` -> `reranker-offline-score-ok 2`; `/score` -> HTTP 200 with two scalar scores | Revision `ba80418a47fa1c4368a6c2287b0e449904063576`; requires Qwen3 sequence-classification `hf_overrides` |
+| Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
+| PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 
 ## Text-Only Language Models
 
-`Automatic Prefix Cache` describes the default behavior when the user does
-not pass `--enable-prefix-caching`. After
+`Automatic Prefix Cache` is the default behavior when you do not pass
+`--enable-prefix-caching`. Since
 [#283](https://github.com/vllm-project/vllm-metal/pull/283), unified paged-KV
-models on Metal can reuse shared prefixes by default. Upstream vLLM still
-keeps the default off for hybrid/Mamba models, so those rows remain `❌`
-unless prefix caching is explicitly forced. These values describe the
-default engine behavior, not exhaustive model-by-model benchmarking on
-Metal. Qwen3 is explicitly covered by the paged prefix-cache e2e test.
+models reuse shared prefixes by default. Upstream vLLM keeps it off for
+hybrid/Mamba models, so those rows stay `❌`. These values describe default
+engine behavior, not exhaustive per-model benchmarking on Metal.
 
-`HF AWQ checkpoints`: load through mlx-lm 0.31.3+'s built-in
-`_transform_awq_weights` repack. vllm-metal adds an entry-point preflight
-that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`, uppercase
-`"GEMM"`) and rejects unsupported variants (`gemv`, `bits != 4`,
-`group_size != 128`, `zero_point=false`) with a clear error before model
-state is constructed, plus a post-load dtype alignment so non-quantized
-floating params (embeddings, layernorms, biases) match the engine's
-runtime dtype. The preflight, dtype alignment, and
-`_transform_awq_weights` repack are architecture-agnostic.
+HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
+entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
+uppercase `"GEMM"`) and rejects unsupported variants (`gemv`, `bits != 4`,
+`group_size != 128`, `zero_point=false`) before model state is built. Verified
+for Qwen2.5, Llama 3, and Mistral
+([#340](https://github.com/vllm-project/vllm-metal/pull/340),
+[#381](https://github.com/vllm-project/vllm-metal/pull/381)).
 
-| Model | Support | Attention Kernel | Automatic Prefix Cache | PRs | Notes |
-| --- | --- | --- | --- | --- | --- |
-| Qwen3 | ✅ | GQA (paged) | ✅ | [#232](https://github.com/vllm-project/vllm-metal/pull/232), [#237](https://github.com/vllm-project/vllm-metal/pull/237), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Validated by the paged prefix-cache e2e test |
-| Qwen3.5 | ✅ | Hybrid SDPA + GDN linear | ❌ | [#210](https://github.com/vllm-project/vllm-metal/pull/210), [#226](https://github.com/vllm-project/vllm-metal/pull/226), [#230](https://github.com/vllm-project/vllm-metal/pull/230), [#235](https://github.com/vllm-project/vllm-metal/pull/235), [#239](https://github.com/vllm-project/vllm-metal/pull/239), [#243](https://github.com/vllm-project/vllm-metal/pull/243), [#259](https://github.com/vllm-project/vllm-metal/pull/259), [#265](https://github.com/vllm-project/vllm-metal/pull/265), [#194](https://github.com/vllm-project/vllm-metal/issues/194) | Upstream keeps automatic prefix caching off for hybrid/Mamba models |
-| Qwen3.6 | ✅ | Hybrid SDPA + GDN linear (MoE) | ❌ | [#312](https://github.com/vllm-project/vllm-metal/pull/312) | Verified on `Qwen/Qwen3.6-35B-A3B-FP8`. Per-expert MoE tensors stacked at sanitize. Upstream keeps automatic prefix caching off for hybrid/Mamba models |
-| Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | ❌ | [#240](https://github.com/vllm-project/vllm-metal/pull/240) | Upstream keeps automatic prefix caching off for hybrid/Mamba models |
-| Gemma 4 | 🔵 | GQA + per-layer sliding window + YOCO | ✅ | [#251](https://github.com/vllm-project/vllm-metal/pull/251), [#260](https://github.com/vllm-project/vllm-metal/pull/260), [#269](https://github.com/vllm-project/vllm-metal/pull/269), [#275](https://github.com/vllm-project/vllm-metal/pull/275), [#277](https://github.com/vllm-project/vllm-metal/pull/277), [#278](https://github.com/vllm-project/vllm-metal/pull/278), [#282](https://github.com/vllm-project/vllm-metal/pull/282), [#276](https://github.com/vllm-project/vllm-metal/issues/276), [#279](https://github.com/vllm-project/vllm-metal/pull/279), [#281](https://github.com/vllm-project/vllm-metal/issues/281), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models; overall model support remains experimental |
-| Gemma 3 | ✅ | GQA (paged) | ✅ | [#283](https://github.com/vllm-project/vllm-metal/pull/283) | tested on gemma-3-1b-it-qat-4bit; gemma-3-4b-it-4bit verified for text-only generation with VLM image inputs bypassed |
-| Llama 3 | ✅ | GQA (paged) | ✅ | [#294](https://github.com/vllm-project/vllm-metal/pull/294), [#327](https://github.com/vllm-project/vllm-metal/pull/327) | tested on llama3.2-1B; `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` verified on MacBook (Apple M3, 16 GB) on macOS 26.4.1, greedy output matches `mlx_lm` reference; also verified on M4 Mac mini (16GB) |
-| Mistral-7B-Instruct | ✅ | GQA (paged) | ✅ | [#328](https://github.com/vllm-project/vllm-metal/pull/328) | Validated on M4 Mac mini (16GB); tested with `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
-| Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | [#166](https://github.com/vllm-project/vllm-metal/pull/166), [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
-| GPT-OSS | 🔵 | Sink attention (paged) | ✅ | [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#221](https://github.com/vllm-project/vllm-metal/pull/221), [#212](https://github.com/vllm-project/vllm-metal/issues/212), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
-| GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | [#213](https://github.com/vllm-project/vllm-metal/pull/213), [#233](https://github.com/vllm-project/vllm-metal/pull/233) | Automatic prefix caching is not yet verified on the MLX MLA path |
-| MiniCPM3-4B | ✅ | MLA (paged latent cache, MiniCPM3 kv_b_proj path) | ✅ | [#322](https://github.com/vllm-project/vllm-metal/pull/322), [#346](https://github.com/vllm-project/vllm-metal/pull/346) | Validated with `mlx-community/MiniCPM3-4B-4bit` completions and automatic prefix-cache reuse on MacBook Air (Apple M4, 24 GB) |
-| GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | [#190](https://github.com/vllm-project/vllm-metal/pull/190), [#283](https://github.com/vllm-project/vllm-metal/pull/283) | Default-on for non-hybrid paged models |
-| DeepSeek-R1-Distill-Qwen-1.5B | ✅ | GQA (paged) | ✅ | [#316](https://github.com/vllm-project/vllm-metal/pull/316) | Validated on M4 Mac (16GB) and M1 Mac (16GB) |
-| DeepSeek-R1-Distill-Qwen-7B | ✅ | GQA (paged) | ✅ | [#347](https://github.com/vllm-project/vllm-metal/pull/347) | Validated on M5 MacBook Pro (16GB) with `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit`|
-| Phi-4-mini-instruct | ✅ | GQA packed qkv (paged) | ✅ | [#314](https://github.com/vllm-project/vllm-metal/pull/314) | Validated on MacBook Pro (Apple M4 Pro, 24 GB) |
-| Phi-3.5-mini-instruct | ✅ | MHA packed qkv (paged) | ✅ | [#345](https://github.com/vllm-project/vllm-metal/pull/345) | Validated on MacBook Pro (Apple M4 Max, 64 GB) on macOS 26.3.1 with `mlx-community/Phi-3.5-mini-instruct-4bit`; greedy output matches `mlx_lm` reference |
-| Qwen2.5-14B-Instruct | ✅ | GQA (paged) | ✅ | [#363](https://github.com/vllm-project/vllm-metal/pull/363) | Validated on MacBook Pro (Apple M4 Max, 64 GB) on macOS 26.3.1 with `mlx-community/Qwen2.5-14B-Instruct-4bit`; greedy output matches `mlx_lm` reference |
-| Qwen2.5-7B-Instruct | ✅ | GQA (paged) | ✅ | [#324](https://github.com/vllm-project/vllm-metal/pull/324) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-7B-Instruct-4bit` |
-| Qwen2.5-3B-Instruct | ✅ | GQA (paged) | ✅ | [#323](https://github.com/vllm-project/vllm-metal/pull/323) | Validated on MacBook Pro (Apple M1 Pro, 16 GB) on macOS 26.2; tested with `mlx-community/Qwen2.5-3B-Instruct-4bit` |
-| Qwen2.5-Coder-1.5B-Instruct | ✅ | GQA (paged) | ✅ | [#357](https://github.com/vllm-project/vllm-metal/pull/357) | Validated on M5 MacBook Pro 16 GB; tested with `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` |
-| SmolLM3-3B | ✅ | GQA (paged) | ✅ | [#334](https://github.com/vllm-project/vllm-metal/pull/334) | Validated on MacBook Air (Apple M2, 16 GB) with `mlx-community/SmolLM3-3B-4bit` |
-| Qwen2.5-1.5B-Instruct-AWQ | ✅ | GQA (paged) | ✅ | [#340](https://github.com/vllm-project/vllm-metal/pull/340) | First HF AWQ checkpoint validated on Metal; tested with `Qwen/Qwen2.5-1.5B-Instruct-AWQ` on MacBook Pro (Apple M1 Pro, 16 GB), macOS 26.2. See AWQ note above the table |
-| Qwen2.5-7B-Instruct-AWQ | ✅ | GQA (paged) | ✅ | [#381](https://github.com/vllm-project/vllm-metal/pull/381) | Tested with `Qwen/Qwen2.5-7B-Instruct-AWQ` on MacBook Pro (Apple M5 Max, 36 GB), macOS 26.4.1; greedy output matches `Qwen/Qwen2.5-7B-Instruct` bf16 reference. See AWQ note above the table |
-| Llama-3.1-8B-Instruct-AWQ | ✅ | GQA (paged) | ✅ | [#381](https://github.com/vllm-project/vllm-metal/pull/381) | Tested with `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4` on MacBook Pro (Apple M5 Max, 36 GB), macOS 26.4.1; greedy output matches `mlx-community/Meta-Llama-3.1-8B-Instruct-bf16` reference. See AWQ note above the table |
-| Mistral-7B-Instruct-v0.3-AWQ | ✅ | GQA (paged) | ✅ | [#381](https://github.com/vllm-project/vllm-metal/pull/381) | Tested with `solidrust/Mistral-7B-Instruct-v0.3-AWQ` on MacBook Pro (Apple M5 Max, 36 GB), macOS 26.4.1; greedy output matches `mlx-community/Mistral-7B-Instruct-v0.3` bf16 reference. See AWQ note above the table |
-| Qwen2-7B-Instruct | ✅ | GQA (paged) | ✅ | [#353](https://github.com/vllm-project/vllm-metal/pull/353) | Validated on MacBook Pro (Apple M5 Pro, 48 GB) on macOS 26.4.1; tested with `mlx-community/Qwen2-7B-Instruct-4bit` |
-| Yi-1.5-9B-Chat | ✅ | GQA (paged) | ✅ | [#354](https://github.com/vllm-project/vllm-metal/pull/354) | Validated on MacBook Pro (Apple M5 Pro, 48 GB) on macOS 26.4.1; tested with `mlx-community/Yi-1.5-9B-Chat-4bit` (LlamaForCausalLM architecture, reuses the Llama 3 GQA path) |
-| Granite 3.3 | 🔵 | GQA (paged) | ✅ | [#403](https://github.com/vllm-project/vllm-metal/pull/403) | Validated with `mlx-community/granite-3.3-8b-instruct-4bit`; reuses the existing GQA paged path with no Granite-specific Metal adapter |
+| Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
+| --- | --- | --- | --- | --- |
+| Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
+| Qwen3.5 / 3.6 | ✅ | Hybrid SDPA + GDN linear (3.6 adds MoE) | ❌ | `Qwen/Qwen3.5-0.8B` |
+| Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | ❌ | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
+| Gemma 4 | 🔵 | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-E2B-it` |
+| Gemma 3 | ✅ | GQA (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
+| Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
+| Mistral-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
+| Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
+| GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
+| MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
+| GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
+| DeepSeek-R1-Distill-Qwen | ✅ | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
+| Phi-4-mini | ✅ | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
+| Phi-3.5-mini | ✅ | MHA packed qkv (paged) | ✅ | `mlx-community/Phi-3.5-mini-instruct-4bit` |
+| Qwen2.5 | ✅ | GQA (paged) | ✅ | `mlx-community/Qwen2.5-7B-Instruct-4bit` |
+| Qwen2-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Qwen2-7B-Instruct-4bit` |
+| Yi-1.5-9B | ✅ | GQA (paged, LlamaForCausalLM) | ✅ | `mlx-community/Yi-1.5-9B-Chat-4bit` |
+| SmolLM3-3B | ✅ | GQA (paged) | ✅ | `mlx-community/SmolLM3-3B-4bit` |
+| Granite 3.3 | 🔵 | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |

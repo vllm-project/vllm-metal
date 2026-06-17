@@ -11,13 +11,11 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.models.base import scaled_dot_product_attention
 
-import vllm_metal.paged_attention_common as pac
-from vllm_metal.mlx_backend.mla_cache import MLAPagedLatentCache
-from vllm_metal.paged_attention_backend.mla import (
-    MLAPagedAttentionBackend,
-    MLAPagedAttentionWrapper,
-)
-from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
+from vllm_metal.attention import context as pac
+from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 
 # Fixture dimensions matching GLM/DeepSeek-V2 defaults
 _KV_LORA_RANK = 512
@@ -73,19 +71,19 @@ class TestMLAPagedLatentCache:
             )
 
 
-class TestMLAPagedAttentionBackend:
-    def _make_backend(self) -> MLAPagedAttentionBackend:
-        return MLAPagedAttentionBackend(
+class TestMLAPagedAttentionRuntime:
+    def _make_backend(self) -> MLAPagedAttentionRuntime:
+        return MLAPagedAttentionRuntime(
             num_layers=4,
             latent_dim=_LATENT_DIM,
             block_size=16,
             dtype=mx.float16,
         )
 
-    def test_implements_paged_attention_backend_protocol(self) -> None:
+    def test_implements_paged_attention_runtime_protocol(self) -> None:
         backend = self._make_backend()
 
-        assert isinstance(backend, PagedAttentionBackend)
+        assert isinstance(backend, PagedAttentionRuntime)
 
     def test_num_blocks_raises_before_initialize(self) -> None:
         backend = self._make_backend()
@@ -145,8 +143,8 @@ class _FakeModel:
 
 
 class TestPatchModelAttentionMla:
-    def _make_backend(self, num_layers: int) -> MLAPagedAttentionBackend:
-        backend = MLAPagedAttentionBackend(
+    def _make_backend(self, num_layers: int) -> MLAPagedAttentionRuntime:
+        backend = MLAPagedAttentionRuntime(
             num_layers=num_layers,
             latent_dim=_LATENT_DIM,
             block_size=16,

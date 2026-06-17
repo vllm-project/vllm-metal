@@ -24,11 +24,13 @@ if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
-    VLLM_METAL_KV_SHARING_FAST_PREFILL: bool = True
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_BUILD_FROM_SOURCE: bool = False
+    VLLM_METAL_VISIBLE_DEVICES: str | None = None
+    VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -46,11 +48,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use native Metal paged attention (default True).
     "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
         os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
-    ),
-    # Experimental YOCO/KV-sharing fast prefill. Default on for eligible
-    # paged-attention models.
-    "VLLM_METAL_KV_SHARING_FAST_PREFILL": lambda: (
-        os.getenv("VLLM_METAL_KV_SHARING_FAST_PREFILL", "1") == "1"
     ),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
@@ -76,6 +73,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # When set, compile the native _paged_ops extension from source at runtime
+    # instead of loading the prebuilt artifact shipped in the wheel. Intended
+    # for kernel developers / source installs; requires Xcode command-line
+    # tools (clang++). Default off — release wheels ship the .so prebuilt.
+    "VLLM_METAL_BUILD_FROM_SOURCE": lambda: (
+        os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
+    ),
+    # Per-worker visible-device list set by vLLM's Ray executor (the
+    # CUDA_VISIBLE_DEVICES analog for Metal; see MetalPlatform.device_control_env_var).
+    # Registered here only so validate_environ() does not warn — vLLM reads it
+    # from os.environ directly.
+    "VLLM_METAL_VISIBLE_DEVICES": lambda: os.getenv("VLLM_METAL_VISIBLE_DEVICES"),
+    # Base TCP port for the MLX ring data plane under pipeline parallelism;
+    # stage r binds base + r (default 32323/32324 for two stages). Set the same
+    # value on every node to move the ring off a busy port. Default matches
+    # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
+    "VLLM_METAL_RING_BASE_PORT": lambda: int(
+        os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
+    ),
 }
 
 

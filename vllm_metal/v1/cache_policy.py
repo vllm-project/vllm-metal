@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -13,27 +12,28 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 
+from vllm_metal.attention.caches.turboquant import (
+    BLOCK_SIZE as TQ_BLOCK_SIZE,
+)
+from vllm_metal.attention.caches.turboquant import (
+    QUANT_PARAMS,
+    V_QUANT_PARAMS,
+    packed_dim,
+)
+from vllm_metal.attention.runtime.hybrid import (
+    HybridPagedAttentionRuntime,
+    _build_linear_layer_spec,
+)
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
+from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
+from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
     get_config,
 )
-from vllm_metal.metal_kernel_backend.turboquant import (
-    BLOCK_SIZE as TQ_BLOCK_SIZE,
-)
-from vllm_metal.metal_kernel_backend.turboquant import (
-    QUANT_PARAMS,
-    V_QUANT_PARAMS,
-    packed_dim,
-)
-from vllm_metal.paged_attention_backend.hybrid import (
-    HybridPagedAttentionBackend,
-    _build_linear_layer_spec,
-)
-from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
-from vllm_metal.paged_attention_backend.mla import MLAPagedAttentionBackend
-from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
@@ -153,34 +153,6 @@ def _build_turboquant_attention_spec(
         k_quant=k_quant,
         v_quant=v_quant,
     )
-
-
-def _register_turboquant_spec_manager() -> None:
-    """Register ``TurboQuantAttentionSpec`` in vLLM's spec→manager map.
-
-    vLLM's ``get_manager_for_kv_cache_spec`` uses strict-type lookup
-    (``spec_manager_map[type(spec)]``), not ``isinstance``, so the
-    ``FullAttentionSpec`` entry does not cover subclasses.  We reuse
-    ``FullAttentionManager`` because a TurboQuant cache is accessed
-    like a regular KV page from the scheduler's POV — block indexing,
-    no special slot math (per-element byte layout is handled entirely
-    inside the Metal kernel).
-
-    Mirrors the upstream registration for ``MLAAttentionSpec`` (which
-    vLLM also maps to ``FullAttentionManager``).
-    """
-    try:
-        from vllm.v1.core.single_type_kv_cache_manager import (
-            FullAttentionManager,
-            spec_manager_map,
-        )
-    except ImportError:
-        # vLLM shape changed; let the scheduler raise its own clearer error.
-        return
-    spec_manager_map.setdefault(TurboQuantAttentionSpec, FullAttentionManager)
-
-
-_register_turboquant_spec_manager()
 
 
 @dataclass(frozen=True)
@@ -388,9 +360,9 @@ class ModelCachePolicy:
         )
         return self._runner.num_linear_layers * (conv_bytes + recurrent_bytes)
 
-    def build_paged_attention_backend(
+    def build_paged_attention_runtime(
         self, *, block_size: int
-    ) -> PagedAttentionBackend:
+    ) -> PagedAttentionRuntime:
         """Create the paged-attention backend for the loaded model."""
         self._require_supported_per_layer_shapes()
         if self._runner.is_hybrid:
@@ -401,7 +373,7 @@ class ModelCachePolicy:
 
     def install_gemma4_mtp_kv_sharing(
         self,
-        backend: PagedAttentionBackend,
+        backend: PagedAttentionRuntime,
         *,
         block_size: int,
     ) -> None:
@@ -409,7 +381,7 @@ class ModelCachePolicy:
         assistant = self._runner._gemma4_mtp_assistant
         if assistant is None:
             return
-        if not isinstance(backend, MHAPagedAttentionBackend):
+        if not isinstance(backend, MHAPagedAttentionRuntime):
             raise NotImplementedError(
                 "Gemma4 MTP assistant KV sharing requires the MHA paged "
                 "attention backend on Metal."
@@ -453,9 +425,9 @@ class ModelCachePolicy:
             return sdpa_kv_bytes + self.linear_cache_bytes_per_slot()
         return sdpa_kv_bytes
 
-    def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionBackend:
+    def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
-        return HybridPagedAttentionBackend(
+        return HybridPagedAttentionRuntime(
             num_layers=self._runner.num_layers,
             full_attention_interval=self._runner.full_attention_interval,
             max_num_seqs=self._runner.scheduler_config.max_num_seqs,
@@ -473,7 +445,7 @@ class ModelCachePolicy:
             v_quant=config.v_quant if config.turboquant else None,
         )
 
-    def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionBackend:
+    def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
         config = get_config()
         if config.turboquant:
             raise NotImplementedError(
@@ -481,14 +453,14 @@ class ModelCachePolicy:
                 "Disable `turboquant` in --additional-config or select a "
                 "non-MLA model."
             )
-        return MLAPagedAttentionBackend(
+        return MLAPagedAttentionRuntime(
             num_layers=self._runner.num_layers,
             latent_dim=self._runner.mla_latent_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
         )
 
-    def _build_mha_backend(self, block_size: int) -> MHAPagedAttentionBackend:
+    def _build_mha_backend(self, block_size: int) -> MHAPagedAttentionRuntime:
         num_layers, cache_idx_map = self._mha_cache_layout()
         config = get_config()
         kv_heads, head_dims = self._cache_layer_shapes(num_layers)
@@ -500,7 +472,7 @@ class ModelCachePolicy:
         # which points back to a same-type unique layer by construction.
         sw = self._runner.sliding_window_per_layer
         sw_list = sw[:num_layers] if sw is not None else None
-        return MHAPagedAttentionBackend(
+        return MHAPagedAttentionRuntime(
             num_layers=num_layers,
             num_kv_heads=self._runner.num_kv_heads,
             head_dim=self._runner.head_dim,
@@ -615,7 +587,7 @@ class WorkerCachePlanner:
             plan.num_blocks * plan.block_size,
         )
 
-        backend = self._worker.model_runner.build_paged_attention_backend(
+        backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
         backend.initialize(plan.num_blocks)
@@ -629,16 +601,12 @@ class WorkerCachePlanner:
             block_size=plan.block_size,
         )
         config = get_config()
-        if config.kv_sharing_fast_prefill:
-            from vllm_metal.yoco_fast_prefill import try_enable_gemma4_yoco_fast_prefill
 
-            try_enable_gemma4_yoco_fast_prefill(
-                self._worker.model_runner.model,
-                self._worker.model_runner.model_args,
-                use_paged_attention=config.use_paged_attention,
-                num_paged_layers=n_patched,
-                warn_on_skip="VLLM_METAL_KV_SHARING_FAST_PREFILL" in os.environ,
-            )
+        try_enable_gemma4_yoco_fast_prefill(
+            self._worker.model_runner.model,
+            self._worker.model_runner.model_args,
+            num_paged_layers=n_patched,
+        )
         logger.info(
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",
@@ -650,7 +618,7 @@ class WorkerCachePlanner:
             config.k_quant if config.turboquant else "N/A",
         )
 
-        self._worker.model_runner.install_paged_attention_backend(
+        self._worker.model_runner.install_paged_attention_runtime(
             backend,
             block_size=plan.block_size,
         )
@@ -673,7 +641,7 @@ class WorkerCachePlanner:
         if mode == "paged_attention_capacity":
             overhead = self._worker.model_runner.profile_run()
             self.setup_paged_attention(overhead=overhead)
-            backend = self._worker.model_runner.paged_attention_backend
+            backend = self._worker.model_runner.paged_attention_runtime
             if backend is None:
                 raise RuntimeError(
                     "Paged attention backend not initialized for capacity reporting"
