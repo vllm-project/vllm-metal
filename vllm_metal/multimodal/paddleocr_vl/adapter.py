@@ -57,6 +57,7 @@ class PaddleOCRVLMultimodalAdapter:
         language_model = model.language_model
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
         embed_tokens_fn = cls._resolve_embed_tokens(language_model)
+        cls._install_single_segment_attention_fast_path(visual)
         return cls(
             spatial_merge_size=spatial_merge_size,
             visual=visual,
@@ -80,6 +81,78 @@ class PaddleOCRVLMultimodalAdapter:
             )
         return embed_tokens
 
+    @staticmethod
+    def _install_single_segment_attention_fast_path(visual: Any) -> None:
+        """Skip PaddleOCR-VL's dense vision mask for single-image attention."""
+        try:
+            from mlx_vlm.models.paddleocr_vl import vision as paddleocr_vision
+        except (ImportError, RuntimeError):
+            return
+
+        attention_cls = getattr(paddleocr_vision, "Attention", None)
+        apply_rotary_pos_emb_vision = getattr(
+            paddleocr_vision,
+            "apply_rotary_pos_emb_vision",
+            None,
+        )
+        if attention_cls is None or apply_rotary_pos_emb_vision is None:
+            return
+
+        layers = getattr(visual, "layers", ())
+        if not any(
+            isinstance(getattr(layer, "self_attn", None), attention_cls)
+            for layer in layers
+        ):
+            return
+        if getattr(attention_cls, "_vllm_metal_single_segment_fast_path", False):
+            return
+
+        original_call = attention_cls.__call__
+
+        def fast_call(
+            self: Any,
+            x: mx.array,
+            cu_seqlens: mx.array,
+            rotary_pos_emb: mx.array | None = None,
+        ) -> mx.array:
+            seq_length = int(x.shape[0])
+            is_single_segment = (
+                int(cu_seqlens.shape[0]) == 2
+                and int(cu_seqlens[0]) == 0
+                and int(cu_seqlens[1]) == seq_length
+            )
+            if not is_single_segment:
+                return original_call(self, x, cu_seqlens, rotary_pos_emb)
+
+            qkv = (
+                self.qkv(x)
+                .reshape(seq_length, 3, self.num_heads, -1)
+                .transpose(1, 0, 2, 3)
+            )
+            q, k, v = mx.split(qkv, 3)
+
+            q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+            k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
+
+            output = mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                mask=None,
+            )
+            output = output.transpose(0, 2, 1, 3)
+            output = output.reshape(seq_length, -1)
+            return self.out_proj(output)
+
+        attention_cls._vllm_metal_original_call = original_call
+        attention_cls.__call__ = fast_call
+        attention_cls._vllm_metal_single_segment_fast_path = True
+
     def text_model(self) -> Any:
         return self._language_model
 
@@ -101,6 +174,8 @@ class PaddleOCRVLMultimodalAdapter:
                 "visual tower not loaded; encode_multimodal unavailable. "
                 "Construct via PaddleOCRVLMultimodalAdapter.from_loaded_model."
             )
+        if not features:
+            return []
 
         target_dtype = self._visual.embeddings.patch_embedding.weight.dtype
         outputs: list[PaddleOCRVLVisionEncodeResult] = []
@@ -135,6 +210,12 @@ class PaddleOCRVLMultimodalAdapter:
             except ValueError as exc:
                 raise ValueError(f"Feature {feature.identifier!r}: {exc}") from exc
             raw_patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
+            if int(pixel_values.shape[0]) != 1:
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: pixel_values batch "
+                    f"dimension must be 1 for image features; got "
+                    f"{pixel_values.shape[0]}"
+                )
             if int(pixel_values.shape[1]) != raw_patches:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: pixel_values patch "
@@ -142,7 +223,6 @@ class PaddleOCRVLMultimodalAdapter:
                     f"got {pixel_values.shape[1]}, expected {raw_patches}"
                 )
             image_grid_thw = mx.array([grid_thw], dtype=mx.int32)
-
             hidden_states = self._visual(
                 pixel_values.astype(target_dtype),
                 image_grid_thw,

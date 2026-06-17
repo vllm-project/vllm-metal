@@ -92,7 +92,12 @@ class _RecordingVisual:
                 "output_hidden_states": output_hidden_states,
             }
         )
-        return mx.ones((_IMAGE_TOKEN_COUNT_2X2, 8), dtype=mx.float32)
+        parts = []
+        for idx, grid in enumerate(image_grid_thw.tolist()):
+            t, h, w = (int(item) for item in grid)
+            tokens = t * (h // _SPATIAL_MERGE_SIZE) * (w // _SPATIAL_MERGE_SIZE)
+            parts.append(mx.full((tokens, 8), idx + 1, dtype=mx.float32))
+        return mx.concatenate(parts, axis=0)
 
 
 class _RealPaddleOCRVLGetRopeIndexLanguageModel:
