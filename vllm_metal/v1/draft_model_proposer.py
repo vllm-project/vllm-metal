@@ -46,12 +46,12 @@ from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
-from vllm_metal.paged_attention_backend.mha import MHAPagedAttentionBackend
-from vllm_metal.paged_attention_common import (
+from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     prepare_unified,
 )
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
@@ -131,7 +131,7 @@ class DraftModelProposer:
         dtype: mx.Dtype,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config)
-        backend = MHAPagedAttentionBackend(
+        backend = MHAPagedAttentionRuntime(
             num_layers=dims.num_layers,
             num_kv_heads=dims.num_kv_heads,
             head_dim=dims.head_dim,
