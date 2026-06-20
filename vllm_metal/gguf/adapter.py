@@ -58,28 +58,17 @@ class GGUFModelAdapter:
     # GGUF tensors with no MLX-LM counterpart (precomputed buffers MLX recreates).
     _KNOWN_SKIP = frozenset({"rope_freqs.weight"})
 
-    def __init__(self, *, reverse_map: dict[str, str]) -> None:
-        self._reverse_map = reverse_map
+    def __init__(self, *, translation_map: dict[str, str | None]) -> None:
+        self._translation_map = translation_map
 
     def translate(self, gguf_name: str) -> str | None:
-        """Return the live MLX-LM parameter path for a GGUF tensor name, or None.
-
-        Known skips return ``None``. Everything else must resolve through either the
-        static global override or the live-derived reverse map; an unmapped name is
-        a loader bug or an out-of-scope tensor and fails fast here.
-        """
-        if gguf_name in self._KNOWN_SKIP:
-            return None
-        override = self._STATIC_GLOBAL_OVERRIDE.get(gguf_name)
-        if override is not None:
-            return override
-        translated = self._reverse_map.get(gguf_name)
-        if translated is None:
+        """Return the live MLX-LM parameter path for a GGUF tensor name."""
+        if gguf_name not in self._translation_map:
             raise GGUFLoadError(f"Unmapped GGUF tensor {gguf_name!r}.")
-        return translated
+        return self._translation_map[gguf_name]
 
     @classmethod
-    def _resolve_arch(cls, *, gguf_arch: str, config_model_type: str) -> str:
+    def resolve_arch(cls, *, gguf_arch: str, config_model_type: str) -> str:
         """Normalize, allowlist-gate, and cross-check the GGUF vs config arch.
 
         The .gguf is the source of truth for its own architecture; reject anything
@@ -138,7 +127,11 @@ class GGUFModelAdapter:
                 f"Empty GGUF->MLX name map for arch {arch!r} "
                 f"({num_hidden_layers} layers); cannot map any weight."
             )
-        return cls(reverse_map=reverse)
+        translation_map: dict[str, str | None] = dict(reverse)
+        translation_map.update(cls._STATIC_GLOBAL_OVERRIDE)
+        for name in cls._KNOWN_SKIP:
+            translation_map[name] = None
+        return cls(translation_map=translation_map)
 
     @staticmethod
     def _normalize_arch(name: str) -> str:
