@@ -45,6 +45,8 @@ GGUFWrapper = GGUFLinear | GGUFEmbedding
 
 @dataclass(frozen=True)
 class _PartitionedTensors:
+    """GGUF tensors split by how the loader installs them."""
+
     quant: dict[str, GGUFMLXQuantizedTensor]
     plain: dict[str, mx.array]
     biases: dict[str, mx.array]
@@ -52,6 +54,8 @@ class _PartitionedTensors:
 
 @dataclass(frozen=True)
 class _InstalledWrapper:
+    """A quantized wrapper installed onto the live model tree."""
+
     module_path: str
     wrapper: GGUFWrapper
 
@@ -88,15 +92,13 @@ class GGUFModelLoader:
                 an incompletely populated model (fail fast, never silent).
         """
         reader, config = self._open_inputs()
-        arch = GGUFModelAdapter._resolve_arch(
+        arch = GGUFModelAdapter.resolve_arch(
             gguf_arch=self._gguf_arch(reader),
             config_model_type=str(config.get("model_type", "")),
         )
         self._preflight(reader)
-        # Public upstream path: with strict=False it builds the config-only model
-        # (no safetensors required) and owns get_classes + its own sanitize. The
-        # GGUF plain weights are loaded separately below and are not re-sanitized:
-        # partition already excludes the dense cases a sanitize would strip.
+        # Public upstream path: strict=False builds the config-only skeleton and
+        # keeps mlx-lm's own model-construction flow as the source of truth.
         model, _ = load_model(self._config_dir, strict=False, model_config=config)
         adapter = GGUFModelAdapter.from_model(
             model,
@@ -113,8 +115,6 @@ class GGUFModelLoader:
             eos_token_ids=config.get("eos_token_id"),
         )
         return model, tokenizer
-
-    # -- workflow steps -----------------------------------------------------
 
     def _open_inputs(self) -> tuple[Any, dict[str, Any]]:
         if self._gguf_path.suffix != ".gguf" or not self._gguf_path.is_file():
@@ -325,8 +325,6 @@ class GGUFModelLoader:
                 f"{expected}."
             )
 
-    # -- reader / model-tree helpers ----------------------------------------
-
     @staticmethod
     def _gguf_arch(reader: Any) -> str:
         field = reader.get_field("general.architecture")
@@ -359,7 +357,9 @@ class GGUFModelLoader:
     @staticmethod
     def _assign_path(root: Any, path: str, value: Any) -> None:
         parent_path, _, leaf = path.rpartition(".")
-        parent = GGUFModelLoader._resolve_path(root, parent_path) if parent_path else root
+        parent = (
+            GGUFModelLoader._resolve_path(root, parent_path) if parent_path else root
+        )
         if leaf.isdigit() and isinstance(parent, list):
             parent[int(leaf)] = value
         elif isinstance(parent, dict):

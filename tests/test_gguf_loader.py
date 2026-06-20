@@ -164,7 +164,6 @@ def _gguf_module_histogram(model: nn.Module) -> dict[str, int]:
 
     walk(model)
     return counts
-# -- synthetic end-to-end (build a tiny mlx-lm skeleton) --------------------
 
 
 @pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
@@ -294,9 +293,6 @@ def test_rejects_missing_required_bias(tmp_path):
             config_dir=cfg_dir,
             target_dtype=mx.float32,
         ).load()
-
-
-# -- preflight / rejection (fail fast before mx.load / model build) ---------
 
 
 def test_rejects_non_dense_arch(tmp_path):
