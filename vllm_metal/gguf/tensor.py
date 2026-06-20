@@ -44,3 +44,7 @@ class GGUFTensor(Protocol):
     def embedding(self, ids: mx.array, output_dtype: mx.Dtype) -> mx.array:
         """Gather and dequantize the rows selected by ``ids``; returns output_dtype."""
         ...
+
+    def eval_arrays(self) -> None:
+        """Materialize any non-parameter arrays the tensor owns."""
+        ...

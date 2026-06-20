@@ -63,6 +63,10 @@ class GGUFLinear(nn.Module):
             out = out + self["bias"].astype(out.dtype)
         return out
 
+    def eval_arrays(self) -> None:
+        """Materialize the packed quant arrays hidden behind the wrapper."""
+        self.tensor.eval_arrays()
+
     def _extra_repr(self) -> str:
         return (
             f"input_dims={self.tensor.in_features}, "
@@ -101,6 +105,10 @@ class GGUFEmbedding(nn.Module):
 
     def as_linear(self, x: mx.array) -> mx.array:
         return self.tensor.matmul(x)
+
+    def eval_arrays(self) -> None:
+        """Materialize the packed quant arrays hidden behind the wrapper."""
+        self.tensor.eval_arrays()
 
     def _extra_repr(self) -> str:
         # Bare "num_embeddings, dims" mirrors mlx.nn.QuantizedEmbedding's repr.

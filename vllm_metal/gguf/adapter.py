@@ -58,8 +58,7 @@ class GGUFModelAdapter:
     # GGUF tensors with no MLX-LM counterpart (precomputed buffers MLX recreates).
     _KNOWN_SKIP = frozenset({"rope_freqs.weight"})
 
-    def __init__(self, *, arch: str, reverse_map: dict[str, str]) -> None:
-        self.arch = arch
+    def __init__(self, *, reverse_map: dict[str, str]) -> None:
         self._reverse_map = reverse_map
 
     def translate(self, gguf_name: str) -> str | None:
@@ -78,12 +77,12 @@ class GGUFModelAdapter:
             return override
         return self._reverse_map.get(gguf_name)
 
-    def is_known_skip(self, gguf_name: str) -> bool:
+    def _is_known_skip(self, gguf_name: str) -> bool:
         """Whether a GGUF tensor has no MLX-LM counterpart and is safe to drop."""
         return gguf_name in self._KNOWN_SKIP
 
     @classmethod
-    def resolve_arch(cls, *, gguf_arch: str, config_model_type: str) -> str:
+    def _resolve_arch(cls, *, gguf_arch: str, config_model_type: str) -> str:
         """Normalize, allowlist-gate, and cross-check the GGUF vs config arch.
 
         The .gguf is the source of truth for its own architecture; reject anything
@@ -124,25 +123,16 @@ class GGUFModelAdapter:
             raise GGUFLoadError(f"Unknown GGUF architecture {arch!r}.")
         name_map = gguf.get_tensor_name_map(arch_enum, num_hidden_layers)
         reverse: dict[str, str] = {}
-        leaves = cast(
-            "list[tuple[str, nn.Module]]",
-            tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module),
-        )
-        for module_path, module in leaves:
-            params = cast("list[tuple[str, Any]]", tree_flatten(module.parameters()))
-            for param_name, _ in params:
-                mlx_name = f"{module_path}.{param_name}" if module_path else param_name
-                gguf_name = name_map.get_name(
-                    mlx_name, try_suffixes=(".weight", ".bias")
-                )
-                if gguf_name is not None:
-                    reverse.setdefault(gguf_name, mlx_name)
+        for mlx_name in cls._iter_parameter_names(model):
+            gguf_name = name_map.get_name(mlx_name, try_suffixes=(".weight", ".bias"))
+            if gguf_name is not None:
+                reverse.setdefault(gguf_name, mlx_name)
         if not reverse:
             raise GGUFLoadError(
                 f"Empty GGUF->MLX name map for arch {arch!r} "
                 f"({num_hidden_layers} layers); cannot map any weight."
             )
-        return cls(arch=arch, reverse_map=reverse)
+        return cls(reverse_map=reverse)
 
     @staticmethod
     def _normalize_arch(name: str) -> str:
@@ -154,3 +144,16 @@ class GGUFModelAdapter:
             if cls._normalize_arch(str(name)) == arch:
                 return arch_enum
         return None
+
+    @staticmethod
+    def _iter_parameter_names(model: nn.Module) -> list[str]:
+        leaves = cast(
+            "list[tuple[str, nn.Module]]",
+            tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module),
+        )
+        names: list[str] = []
+        for module_path, module in leaves:
+            params = cast("list[tuple[str, Any]]", tree_flatten(module.parameters()))
+            for param_name, _ in params:
+                names.append(f"{module_path}.{param_name}" if module_path else param_name)
+        return names

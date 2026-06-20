@@ -8,8 +8,7 @@ path; this loader layers the GGUF-specific orchestration on top: preflight, read
 partition, install the quantized wrappers, load the plain tensors, and verify
 every parameter ended up populated.
 
-``GGUFModelLoader`` is the owner; ``load_gguf_model`` is a thin convenience
-wrapper. Model-family name/scope policy lives in
+``GGUFModelLoader`` is the owner. Model-family name/scope policy lives in
 :class:`vllm_metal.gguf.adapter.GGUFModelAdapter`. Design rationale is in
 ``codex/GGUF_PR3_DESIGN.md`` §5.
 
@@ -20,6 +19,7 @@ out of scope and fail fast at the arch allowlist or in preflight.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -33,11 +33,27 @@ from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
 from vllm_metal.gguf.mlx_native import MLX_NATIVE_GGUF_TYPES, GGUFMLXQuantizedTensor
 from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
-__all__ = ["GGUFLoadError", "GGUFModelLoader", "load_gguf_model"]
+__all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
+
+
+GGUFWrapper = GGUFLinear | GGUFEmbedding
+
+
+@dataclass(frozen=True)
+class _PartitionedTensors:
+    quant: dict[str, GGUFMLXQuantizedTensor]
+    plain: dict[str, mx.array]
+    biases: dict[str, mx.array]
+
+
+@dataclass(frozen=True)
+class _InstalledWrapper:
+    module_path: str
+    wrapper: GGUFWrapper
 
 
 class GGUFModelLoader:
@@ -62,18 +78,7 @@ class GGUFModelLoader:
         self._gguf_path = Path(gguf_path)
         self._config_dir = Path(config_dir)
         self._target_dtype = target_dtype
-        self._tokenizer_config = tokenizer_config or {}
-
-        self._reader: Any = None
-        self._config: dict[str, Any] = {}
-        self._arch: str = ""
-        self._model: nn.Module | None = None
-        self._adapter: GGUFModelAdapter | None = None
-        self._quant: dict[str, GGUFMLXQuantizedTensor] = {}
-        self._plain: dict[str, mx.array] = {}
-        self._biases: dict[str, mx.array] = {}
-        self._installed: list[tuple[str, GGUFMLXQuantizedTensor, nn.Module]] = []
-        self._tokenizer: Any = None
+        self._tokenizer_config = dict(tokenizer_config or {})
 
     def load(self) -> tuple[nn.Module, Any]:
         """Run the full load workflow and return ``(model, tokenizer)``.
@@ -82,18 +87,28 @@ class GGUFModelLoader:
             GGUFLoadError: On any unsupported file, arch, qtype, shape mismatch, or
                 an incompletely populated model (fail fast, never silent).
         """
-        self._open_inputs()
-        self._preflight()
-        self._build_skeleton()
-        self._partition()
-        self._install_quant_modules()
-        self._load_plain_weights()
-        self._load_tokenizer()
-        return cast("nn.Module", self._model), self._tokenizer
+        reader, config = self._open_inputs()
+        arch = GGUFModelAdapter._resolve_arch(
+            gguf_arch=self._gguf_arch(reader),
+            config_model_type=str(config.get("model_type", "")),
+        )
+        self._preflight(reader)
+        model = self._build_skeleton(config)
+        adapter = GGUFModelAdapter.from_model(
+            model,
+            gguf=gguf,
+            arch=arch,
+            num_hidden_layers=self._num_hidden_layers(config),
+        )
+        partition = self._partition(reader, model, config, adapter)
+        installed = self._install_quant_modules(model, partition.quant, partition.biases)
+        self._load_plain_weights(model, partition.plain, installed)
+        tokenizer = self._load_tokenizer(config)
+        return model, tokenizer
 
     # -- workflow steps -----------------------------------------------------
 
-    def _open_inputs(self) -> None:
+    def _open_inputs(self) -> tuple[Any, dict[str, Any]]:
         if self._gguf_path.suffix != ".gguf" or not self._gguf_path.is_file():
             raise GGUFLoadError(f"Not a local .gguf file: {str(self._gguf_path)!r}")
         if not (self._config_dir / "config.json").is_file():
@@ -101,20 +116,14 @@ class GGUFModelLoader:
                 f"No config.json in config_dir {str(self._config_dir)!r}"
             )
         try:
-            self._reader = gguf.GGUFReader(str(self._gguf_path))
+            reader = gguf.GGUFReader(str(self._gguf_path))
         except (ValueError, OSError) as exc:
             raise GGUFLoadError(
                 f"Could not read GGUF file {str(self._gguf_path)!r}: {exc}"
             ) from exc
-        self._config = load_config(self._config_dir)
-        # The .gguf is the source of truth for its own architecture; gate it
-        # against the dense allowlist and require the config to agree.
-        self._arch = GGUFModelAdapter.resolve_arch(
-            gguf_arch=self._gguf_arch(),
-            config_model_type=str(self._config.get("model_type", "")),
-        )
+        return reader, load_config(self._config_dir)
 
-    def _preflight(self) -> None:
+    def _preflight(self, reader: Any) -> None:
         """Reject out-of-scope tensors / qtypes from the reader, before ``mx.load``."""
         plain_types = {
             gguf.GGMLQuantizationType.F32,
@@ -122,7 +131,7 @@ class GGUFModelLoader:
             gguf.GGMLQuantizationType.BF16,
         }
         allowed_weight_types = set(MLX_NATIVE_GGUF_TYPES) | plain_types
-        for tensor in self._reader.tensors:
+        for tensor in reader.tensors:
             name = tensor.name
             if any(
                 sub in name for sub in GGUFModelAdapter.OUT_OF_SCOPE_TENSOR_SUBSTRINGS
@@ -145,30 +154,31 @@ class GGUFModelLoader:
                     "additive biases must be plain F32/F16/BF16."
                 )
 
-    def _build_skeleton(self) -> None:
+    def _build_skeleton(self, config: dict[str, Any]) -> nn.Module:
         # Public upstream path: with strict=False it builds the config-only model
         # (no safetensors required) and owns get_classes + its own sanitize. The
         # GGUF plain weights are loaded separately below and are NOT re-sanitized:
         # the partition already excludes exactly what a dense sanitize would strip
         # (the tie-redundant output->lm_head, and rope_freqs via the known-skip).
-        self._model, _ = load_model(
-            self._config_dir, strict=False, model_config=self._config
-        )
-        self._adapter = GGUFModelAdapter.from_model(
-            self._model,
-            gguf=gguf,
-            arch=self._arch,
-            num_hidden_layers=self._num_hidden_layers(),
-        )
+        model, _ = load_model(self._config_dir, strict=False, model_config=config)
+        return model
 
-    def _partition(self) -> None:
+    def _partition(
+        self,
+        reader: Any,
+        model: nn.Module,
+        config: dict[str, Any],
+        adapter: GGUFModelAdapter,
+    ) -> _PartitionedTensors:
         """Route each GGUF tensor to quant-install / plain-load / bias-side-map."""
-        adapter = cast("GGUFModelAdapter", self._adapter)
-        tied = bool(self._config.get("tie_word_embeddings", False))
+        tied = bool(config.get("tie_word_embeddings", False))
         arrays = mx.load(str(self._gguf_path))
-        for tensor in self._reader.tensors:
+        quant: dict[str, GGUFMLXQuantizedTensor] = {}
+        plain: dict[str, mx.array] = {}
+        biases: dict[str, mx.array] = {}
+        for tensor in reader.tensors:
             name = tensor.name
-            if adapter.is_known_skip(name):
+            if adapter._is_known_skip(name):
                 continue
             translated = adapter.translate(name)
             if translated is None:
@@ -177,39 +187,48 @@ class GGUFModelLoader:
             suffix = _BIAS_SUFFIX if name.endswith(_BIAS_SUFFIX) else _WEIGHT_SUFFIX
             module_path = translated[: -len(suffix)]
 
-            if not self._has_module(module_path):
+            try:
+                current = self._get_module(model, module_path)
+            except (AttributeError, KeyError, IndexError) as exc:
                 if tied and translated == "lm_head.weight":
                     continue  # tie-redundant output table; the tied head uses as_linear
                 raise GGUFLoadError(
                     f"GGUF tensor {name!r} maps to {translated!r} but module "
                     f"{module_path!r} is absent from the model."
-                )
+                ) from exc
 
             if suffix == _BIAS_SUFFIX:
-                self._validate_plain_shape(translated, arrays[name], name)
-                self._biases[module_path] = arrays[name]
+                self._validate_plain_shape(model, translated, arrays[name], name)
+                biases[module_path] = arrays[name]
             elif tensor.tensor_type in MLX_NATIVE_GGUF_TYPES:
                 qt = GGUFMLXQuantizedTensor.from_mx_load(
                     arrays, name, tensor.tensor_type
                 )
-                self._validate_quant_shape(module_path, qt, name)
-                self._quant[module_path] = qt
+                self._validate_quant_shape(module_path, current, qt, name)
+                quant[module_path] = qt
             else:  # plain F32/F16/BF16
-                self._validate_plain_shape(translated, arrays[name], name)
-                self._plain[translated] = arrays[name]
+                self._validate_plain_shape(model, translated, arrays[name], name)
+                plain[translated] = arrays[name]
 
         # A bias whose weight is plain (not quantized) loads through the normal
         # path; only biases paired with a quant weight go to GGUFLinear.
-        for module_path in [p for p in self._biases if p not in self._quant]:
-            self._plain[f"{module_path}{_BIAS_SUFFIX}"] = self._biases.pop(module_path)
+        for module_path in [path for path in biases if path not in quant]:
+            plain[f"{module_path}{_BIAS_SUFFIX}"] = biases.pop(module_path)
+        return _PartitionedTensors(quant=quant, plain=plain, biases=biases)
 
-    def _install_quant_modules(self) -> None:
+    def _install_quant_modules(
+        self,
+        model: nn.Module,
+        quant: dict[str, GGUFMLXQuantizedTensor],
+        biases: dict[str, mx.array],
+    ) -> list[_InstalledWrapper]:
         """Replace each quantized module with a GGUF wrapper on the live tree."""
-        for module_path, qt in self._quant.items():
-            current = self._get_module(module_path)
-            bias = self._biases.get(module_path)
+        installed: list[_InstalledWrapper] = []
+        for module_path, qt in quant.items():
+            current = self._get_module(model, module_path)
+            bias = biases.get(module_path)
             if isinstance(current, nn.Embedding):
-                wrapper: nn.Module = GGUFEmbedding(qt, self._target_dtype)
+                wrapper: GGUFWrapper = GGUFEmbedding(qt, self._target_dtype)
             elif isinstance(current, nn.Linear):
                 # Installing the wrapper drops the original bias leaf, so a bias the
                 # model expects but the GGUF omitted would vanish before the
@@ -226,49 +245,61 @@ class GGUFModelLoader:
                     f"{type(current).__name__!r} at {module_path!r}; expected "
                     "nn.Linear or nn.Embedding."
                 )
-            self._set_module(module_path, wrapper)
-            self._installed.append((module_path, qt, wrapper))
+            self._set_module(model, module_path, wrapper)
+            installed.append(_InstalledWrapper(module_path=module_path, wrapper=wrapper))
+        return installed
 
-    def _load_plain_weights(self) -> None:
-        model = cast("nn.Module", self._model)
+    def _load_plain_weights(
+        self,
+        model: nn.Module,
+        plain: dict[str, mx.array],
+        installed: list[_InstalledWrapper],
+    ) -> None:
         model.eval()
-        model.load_weights(list(self._plain.items()), strict=False)
-        self._assert_complete()
+        model.load_weights(list(plain.items()), strict=False)
+        self._assert_complete(model, plain, installed)
         mx.eval(model.parameters())
-        for _, qt, _ in self._installed:
-            mx.eval(qt.qweight, qt.scales, qt.biases)
+        for installed_wrapper in installed:
+            installed_wrapper.wrapper.eval_arrays()
 
-    def _load_tokenizer(self) -> None:
-        self._tokenizer = load_tokenizer(
+    def _load_tokenizer(self, config: dict[str, Any]) -> Any:
+        return load_tokenizer(
             self._config_dir,
             tokenizer_config_extra=self._tokenizer_config,
-            eos_token_ids=self._config.get("eos_token_id"),
+            eos_token_ids=config.get("eos_token_id"),
         )
 
     # -- checks -------------------------------------------------------------
 
-    def _assert_complete(self) -> None:
+    def _assert_complete(
+        self,
+        model: nn.Module,
+        plain: dict[str, mx.array],
+        installed: list[_InstalledWrapper],
+    ) -> None:
         """Fail fast unless every live parameter was populated and no key orphaned.
 
         ``load_weights(strict=False)`` silently tolerates missing keys (left at
         random init), orphan/typo keys, and shape mismatches, so this replaces the
         coverage half of ``strict=True`` (shapes are validated per-tensor in
-        ``_partition``). A wrapper's bias leaf counts as owned; the wrappers' hidden
-        quant arrays are not parameter leaves.
+        ``_partition``). This exists because ``strict=True`` cannot see the wrapper-
+        installed leaves that replace the original quantized ``.weight`` parameters.
+        A wrapper's bias leaf counts as owned; the wrappers' hidden quant arrays are
+        not parameter leaves.
         """
-        model = cast("nn.Module", self._model)
-        owned = set(self._plain)
-        for module_path, _, wrapper in self._installed:
+        owned = set(plain)
+        for installed_wrapper in installed:
             wrapper_leaves = cast(
-                "list[tuple[str, Any]]", tree_flatten(wrapper.parameters())
+                "list[tuple[str, Any]]",
+                tree_flatten(installed_wrapper.wrapper.parameters()),
             )
             for leaf_name, _ in wrapper_leaves:
-                owned.add(f"{module_path}.{leaf_name}")
+                owned.add(f"{installed_wrapper.module_path}.{leaf_name}")
 
         model_leaves = cast("list[tuple[str, Any]]", tree_flatten(model.parameters()))
         live = {name for name, _ in model_leaves}
         unfed = sorted(live - owned)
-        orphan = sorted(set(self._plain) - live)
+        orphan = sorted(set(plain) - live)
         if unfed or orphan:
             raise GGUFLoadError(
                 f"Incomplete GGUF load: {len(unfed)} uninitialized "
@@ -276,9 +307,13 @@ class GGUFModelLoader:
             )
 
     def _validate_quant_shape(
-        self, module_path: str, qt: GGUFMLXQuantizedTensor, name: str
+        self,
+        module_path: str,
+        module: Any,
+        qt: GGUFMLXQuantizedTensor,
+        name: str,
     ) -> None:
-        weight = self._get_module(module_path).weight
+        weight = module.weight
         expected = tuple(int(d) for d in weight.shape)
         actual = (qt.out_features, qt.in_features)
         if actual != expected:
@@ -288,9 +323,9 @@ class GGUFModelLoader:
             )
 
     def _validate_plain_shape(
-        self, param_path: str, array: mx.array, name: str
+        self, model: nn.Module, param_path: str, array: mx.array, name: str
     ) -> None:
-        expected = tuple(int(d) for d in self._get_param(param_path).shape)
+        expected = tuple(int(d) for d in self._get_param(model, param_path).shape)
         actual = tuple(int(d) for d in array.shape)
         if actual != expected:
             raise GGUFLoadError(
@@ -300,14 +335,16 @@ class GGUFModelLoader:
 
     # -- reader / model-tree helpers ----------------------------------------
 
-    def _gguf_arch(self) -> str:
-        field = self._reader.get_field("general.architecture")
+    @staticmethod
+    def _gguf_arch(reader: Any) -> str:
+        field = reader.get_field("general.architecture")
         if field is None:
             raise GGUFLoadError("GGUF file has no general.architecture metadata.")
         return str(field.contents())
 
-    def _num_hidden_layers(self) -> int:
-        for source in (self._config, self._config.get("text_config")):
+    @staticmethod
+    def _num_hidden_layers(config: dict[str, Any]) -> int:
+        for source in (config, config.get("text_config")):
             if isinstance(source, dict):
                 for key in _NUM_LAYERS_KEYS:
                     value = source.get(key)
@@ -315,12 +352,12 @@ class GGUFModelLoader:
                         return int(value)
         raise GGUFLoadError("Could not determine num_hidden_layers from config.")
 
-    def _get_module(self, path: str) -> Any:
-        parent, leaf = self._resolve_parent(path)
+    def _get_module(self, root: Any, path: str) -> Any:
+        parent, leaf = self._resolve_parent(root, path)
         return self._step(parent, leaf)
 
-    def _set_module(self, path: str, value: Any) -> None:
-        parent, leaf = self._resolve_parent(path)
+    def _set_module(self, root: Any, path: str, value: Any) -> None:
+        parent, leaf = self._resolve_parent(root, path)
         if leaf.isdigit() and isinstance(parent, list):
             parent[int(leaf)] = value
         elif isinstance(parent, dict):
@@ -328,19 +365,12 @@ class GGUFModelLoader:
         else:
             setattr(parent, leaf, value)
 
-    def _get_param(self, param_path: str) -> mx.array:
+    def _get_param(self, root: Any, param_path: str) -> mx.array:
         module_path, _, param_name = param_path.rpartition(".")
-        return getattr(self._get_module(module_path), param_name)
+        return getattr(self._get_module(root, module_path), param_name)
 
-    def _has_module(self, path: str) -> bool:
-        try:
-            self._get_module(path)
-        except (AttributeError, KeyError, IndexError, ValueError):
-            return False
-        return True
-
-    def _resolve_parent(self, path: str) -> tuple[Any, str]:
-        obj: Any = self._model
+    def _resolve_parent(self, root: Any, path: str) -> tuple[Any, str]:
+        obj: Any = root
         parts = path.split(".")
         for part in parts[:-1]:
             obj = self._step(obj, part)
@@ -354,19 +384,3 @@ class GGUFModelLoader:
         if isinstance(obj, dict):
             return obj[part]
         return getattr(obj, part)
-
-
-def load_gguf_model(
-    gguf_path: str,
-    *,
-    config_dir: str,
-    target_dtype: mx.Dtype,
-    tokenizer_config: dict[str, Any] | None = None,
-) -> tuple[nn.Module, Any]:
-    """Load a dense GGUF checkpoint into ``(model, tokenizer)`` (thin wrapper)."""
-    return GGUFModelLoader(
-        gguf_path,
-        config_dir=config_dir,
-        target_dtype=target_dtype,
-        tokenizer_config=tokenizer_config,
-    ).load()

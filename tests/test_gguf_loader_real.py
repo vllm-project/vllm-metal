@@ -19,7 +19,7 @@ from mlx_lm.sample_utils import make_sampler
 
 gguf = pytest.importorskip("gguf")
 
-from vllm_metal.gguf.loader import GGUFLoadError, load_gguf_model  # noqa: E402
+from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 
 _QWEN3_GOLDEN_PROMPT = "The capital of France is"
 # Greedy (temp=0) continuation of the prompt from the dense Qwen/Qwen3-0.6B (bf16)
@@ -52,6 +52,19 @@ def _has_gguf_wrappers(model: nn.Module) -> bool:
     return {"GGUFLinear", "GGUFEmbedding"} <= found
 
 
+def _load_real_fixture(
+    gguf_path: str,
+    *,
+    config_dir: str,
+    target_dtype: mx.Dtype,
+) -> tuple[nn.Module, object]:
+    return GGUFModelLoader(
+        gguf_path,
+        config_dir=config_dir,
+        target_dtype=target_dtype,
+    ).load()
+
+
 @pytest.mark.skipif(
     not (_QWEN35_GGUF and _QWEN35_DIR),
     reason="set VLLM_METAL_TEST_QWEN35_GGUF + _DIR to a real Qwen3.5 hybrid GGUF",
@@ -62,7 +75,7 @@ def test_real_qwen35_rejected_as_non_dense():
     with pytest.raises(
         GGUFLoadError, match="'qwen35' is not a supported dense decoder"
     ):
-        load_gguf_model(_QWEN35_GGUF, config_dir=_QWEN35_DIR, target_dtype=mx.float32)
+        _load_real_fixture(_QWEN35_GGUF, config_dir=_QWEN35_DIR, target_dtype=mx.float32)
 
 
 @pytest.mark.skipif(
@@ -71,7 +84,7 @@ def test_real_qwen35_rejected_as_non_dense():
 )
 def test_real_k_quant_rejected_unsupported_qtype():
     with pytest.raises(GGUFLoadError, match="Unsupported qtype"):
-        load_gguf_model(
+        _load_real_fixture(
             _Q4KM_GGUF, config_dir=_QWEN3_DENSE_DIR, target_dtype=mx.float32
         )
 
@@ -82,7 +95,7 @@ def test_real_k_quant_rejected_unsupported_qtype():
     reason="set VLLM_METAL_TEST_QWEN3_GGUF + _QWEN3_DENSE_DIR",
 )
 def test_load_real_gguf_generates_with_parity():
-    model, tokenizer = load_gguf_model(
+    model, tokenizer = _load_real_fixture(
         _QWEN3_GGUF, config_dir=_QWEN3_DENSE_DIR, target_dtype=mx.bfloat16
     )
     assert _has_gguf_wrappers(model)  # production wrappers actually installed

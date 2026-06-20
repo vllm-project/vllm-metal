@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Deterministic loader-contract tests for vllm_metal.gguf.loader.
+"""Deterministic loader-contract tests for ``vllm_metal.gguf.loader``.
 
 Synthetic GGUF fixtures built with ``gguf.GGUFWriter`` + a tiny config exercise
 the loader contract offline: partition, install, tie-skip, bias side-map,
-completeness, and every fail-fast path. Real-checkpoint parity/smoke lives apart
-in ``test_gguf_loader_real.py`` (env-gated). The synthetic tests build mlx-lm
-skeletons, so this suite needs MLX (it won't collect on a machine without Metal).
+completeness, and fail-fast rejection of unsupported files.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
-from vllm_metal.gguf.loader import GGUFLoadError, load_gguf_model  # noqa: E402
+from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
 
 QT = gguf.GGMLQuantizationType
@@ -98,15 +96,19 @@ def _write_gguf(
     specs: dict,
     *,
     quant_type=QT.Q8_0,
+    quant_overrides: dict[str, QT] | None = None,
     inject: dict | None = None,
 ) -> None:
     rng = np.random.default_rng(0)
     writer = gguf.GGUFWriter(str(path), arch)
     for name, (kind, shape) in {**specs, **(inject or {})}.items():
         data = rng.standard_normal(shape).astype(np.float32)
-        if kind == "q":
-            raw = gguf.quants.quantize(data, quant_type)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=quant_type)
+        qtype = (quant_overrides or {}).get(name)
+        if kind == "q" or qtype is not None:
+            raw_dtype = qtype or quant_type
+            quant_input = data.reshape(1, -1) if data.ndim == 1 else data
+            raw = gguf.quants.quantize(quant_input, raw_dtype)
+            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=raw_dtype)
         else:
             writer.add_tensor(name, data, raw_dtype=QT.F32)
     writer.write_header_to_file()
@@ -125,12 +127,13 @@ def _build_dense_fixture(
     inject: dict | None = None,
     drop: set[str] | None = None,
     quant_type=QT.Q8_0,
+    quant_overrides: dict[str, QT] | None = None,
+    gguf_arch: str | None = None,
 ) -> tuple[str, str]:
     """Write a tiny ``config.json`` + a matching dense GGUF; return (gguf, dir).
 
-    The GGUF's ``general.architecture`` is the config's model_type, so the loader's
-    GGUF-vs-config arch cross-check passes; arch-override fixtures exercise the
-    GGUF-derived allowlist reject with the file as the source of truth.
+    By default the GGUF's ``general.architecture`` matches the config's
+    ``model_type``; tests can override it to exercise file/config mismatch paths.
     """
     config = {**_tiny_config(model_type), **(config_overrides or {})}
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -139,7 +142,12 @@ def _build_dense_fixture(
         specs.pop(name, None)
     gguf_path = tmp_path / f"{model_type}.gguf"
     _write_gguf(
-        gguf_path, config["model_type"], specs, inject=inject, quant_type=quant_type
+        gguf_path,
+        gguf_arch or config["model_type"],
+        specs,
+        quant_type=quant_type,
+        quant_overrides=quant_overrides,
+        inject=inject,
     )
     return str(gguf_path), str(tmp_path)
 
@@ -158,28 +166,28 @@ def _gguf_module_histogram(model: nn.Module) -> dict[str, int]:
     return counts
 
 
+def _load_fixture(
+    gguf_path: str,
+    *,
+    config_dir: str,
+    target_dtype: mx.Dtype = mx.float32,
+) -> tuple[nn.Module, object]:
+    return GGUFModelLoader(
+        gguf_path,
+        config_dir=config_dir,
+        target_dtype=target_dtype,
+    ).load()
+
+
 # -- synthetic end-to-end (build a tiny mlx-lm skeleton) --------------------
 
 
-def test_loads_tied_qwen3_installs_wrappers(tmp_path):
-    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    model, _ = load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
-
-    hist = _gguf_module_histogram(model)
-    assert hist.get("GGUFEmbedding") == 1
-    assert hist.get("GGUFLinear") == 2 * 7  # q,k,v,o,gate,up,down per layer
-    out = model(mx.array([[1, 2, 3]]))
-    mx.eval(out)
-    assert out.shape == (1, 3, 256)
-
-
-def test_loads_q4_0_fixture(tmp_path):
-    # The real headline file is pure Q8_0; this pins the Q4_0 native-qtype path
-    # end-to-end through from_mx_load + install.
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+def test_loads_dense_qwen3_installs_wrappers(tmp_path, quant_type):
     gguf_path, cfg_dir = _build_dense_fixture(
-        tmp_path, "qwen3", has_qk_norm=True, quant_type=QT.Q4_0
+        tmp_path, "qwen3", has_qk_norm=True, quant_type=quant_type
     )
-    model, _ = load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
     hist = _gguf_module_histogram(model)
     assert hist.get("GGUFEmbedding") == 1
     assert hist.get("GGUFLinear") == 2 * 7
@@ -198,7 +206,7 @@ def test_skips_tie_redundant_output(tmp_path):
         inject={"output.weight": ("q", (d["vocab"], d["h"]))},
     )
     # Must NOT raise (the redundant output is tie-skipped, not unmapped-failed).
-    model, _ = load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
     assert not hasattr(model, "lm_head")
     # The tied head runs through the GGUFEmbedding's as_linear.
     assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
@@ -212,7 +220,7 @@ def test_untied_qwen2_attaches_bias_and_installs_lm_head(tmp_path):
         has_qk_norm=False,
         with_bias=True,
     )
-    model, _ = load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
     # Assert through the model's own public structure, not loader internals.
     q_proj = model.model.layers[0].self_attn.q_proj
     assert isinstance(q_proj, GGUFLinear)
@@ -228,7 +236,7 @@ def test_completeness_fails_on_dropped_norm(tmp_path):
         tmp_path, "qwen3", has_qk_norm=True, drop={"blk.1.ffn_norm.weight"}
     )
     with pytest.raises(GGUFLoadError, match="Incomplete GGUF load"):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_validate_fails_on_wrong_shape(tmp_path):
@@ -240,7 +248,7 @@ def test_validate_fails_on_wrong_shape(tmp_path):
         inject={"blk.0.attn_q.weight": ("q", (d["qd"] + 16, d["h"]))},
     )
     with pytest.raises(GGUFLoadError, match="dims"):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_validate_fails_on_wrong_shape_bias(tmp_path):
@@ -254,7 +262,7 @@ def test_validate_fails_on_wrong_shape_bias(tmp_path):
         inject={"blk.0.attn_q.bias": ("f", (d["qd"] + 16,))},
     )
     with pytest.raises(GGUFLoadError, match="blk.0.attn_q.bias"):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_missing_required_bias(tmp_path):
@@ -272,7 +280,7 @@ def test_rejects_missing_required_bias(tmp_path):
         GGUFLoadError,
         match="'model.layers.0.self_attn.q_proj' expects a bias",
     ):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 # -- preflight / rejection (fail fast before mx.load / model build) ---------
@@ -286,7 +294,18 @@ def test_rejects_non_dense_arch(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="'qwen3_5' is not a supported dense decoder"
     ):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
+
+
+def test_rejects_gguf_config_arch_mismatch(tmp_path):
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen2",
+        has_qk_norm=False,
+        gguf_arch="qwen3",
+    )
+    with pytest.raises(GGUFLoadError, match="does not match config model_type"):
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_out_of_scope_tensor(tmp_path):
@@ -300,7 +319,7 @@ def test_rejects_out_of_scope_tensor(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="Out-of-scope GGUF tensor 'blk.0.attn_qkv.weight'"
     ):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_vision_tensor(tmp_path):
@@ -314,79 +333,38 @@ def test_rejects_vision_tensor(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="Out-of-scope GGUF tensor 'v.blk.0.attn_q.weight'"
     ):
-        load_gguf_model(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_unsupported_qtype(tmp_path):
-    config = _tiny_config("qwen3")
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    specs = _dense_tensor_specs(config, has_qk_norm=True, with_bias=False)
-    gguf_path = tmp_path / "q41.gguf"
-    # Write the bulk as Q8_0 but one weight as Q4_1 (unsupported by the MLX path).
-    rng = np.random.default_rng(0)
-    writer = gguf.GGUFWriter(str(gguf_path), "qwen3")
-    for name, (kind, shape) in specs.items():
-        data = rng.standard_normal(shape).astype(np.float32)
-        if name == "blk.0.ffn_up.weight":
-            raw = gguf.quants.quantize(data, QT.Q4_1)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q4_1)
-        elif kind == "q":
-            raw = gguf.quants.quantize(data, QT.Q8_0)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q8_0)
-        else:
-            writer.add_tensor(name, data, raw_dtype=QT.F32)
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen3",
+        has_qk_norm=True,
+        quant_overrides={"blk.0.ffn_up.weight": QT.Q4_1},
+    )
     with pytest.raises(
         GGUFLoadError,
         match="Unsupported qtype Q4_1 on mapped weight 'blk.0.ffn_up.weight'",
     ):
-        load_gguf_model(
-            str(gguf_path), config_dir=str(tmp_path), target_dtype=mx.float32
-        )
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_quantized_bias(tmp_path):
     # An additive bias must be plain F32/F16/BF16; a quantized bias is rejected in
     # preflight (it would otherwise slip past the weight-only qtype check).
-    config = {**_tiny_config("qwen2"), "tie_word_embeddings": False}
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    specs = _dense_tensor_specs(config, has_qk_norm=False, with_bias=True)
-    gguf_path = tmp_path / "qbias.gguf"
-    rng = np.random.default_rng(0)
-    writer = gguf.GGUFWriter(str(gguf_path), config["model_type"])
-    for name, (kind, shape) in specs.items():
-        data = rng.standard_normal(shape).astype(np.float32)
-        if name == "blk.0.attn_q.bias":
-            raw = gguf.quants.quantize(data.reshape(1, -1), QT.Q8_0)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q8_0)
-        elif kind == "q":
-            raw = gguf.quants.quantize(data, QT.Q8_0)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q8_0)
-        else:
-            writer.add_tensor(name, data, raw_dtype=QT.F32)
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen2",
+        config_overrides={"tie_word_embeddings": False},
+        has_qk_norm=False,
+        with_bias=True,
+        quant_overrides={"blk.0.attn_q.bias": QT.Q8_0},
+    )
     with pytest.raises(
         GGUFLoadError, match="Unsupported qtype Q8_0 on bias 'blk.0.attn_q.bias'"
     ):
-        load_gguf_model(
-            str(gguf_path), config_dir=str(tmp_path), target_dtype=mx.float32
-        )
-
-
-def test_rejects_non_gguf_path(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(_tiny_config("qwen3")))
-    not_gguf = tmp_path / "weights.bin"
-    not_gguf.write_bytes(b"not a gguf")
-    with pytest.raises(GGUFLoadError, match="Not a local .gguf file"):
-        load_gguf_model(
-            str(not_gguf), config_dir=str(tmp_path), target_dtype=mx.float32
-        )
+        _load_fixture(gguf_path, config_dir=cfg_dir)
 
 
 def test_rejects_missing_config(tmp_path):
@@ -394,4 +372,4 @@ def test_rejects_missing_config(tmp_path):
     empty = tmp_path / "no_config"
     empty.mkdir()
     with pytest.raises(GGUFLoadError, match="No config.json"):
-        load_gguf_model(gguf_path, config_dir=str(empty), target_dtype=mx.float32)
+        _load_fixture(gguf_path, config_dir=str(empty))
