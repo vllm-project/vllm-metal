@@ -64,22 +64,19 @@ class GGUFModelAdapter:
     def translate(self, gguf_name: str) -> str | None:
         """Return the live MLX-LM parameter path for a GGUF tensor name, or None.
 
-        Precedence: known-skip -> static global override -> live-derived map ->
-        None (unmapped). The static override is consulted before the live map so a
-        global still resolves to its canonical MLX name even when that module is
-        absent from the skeleton (tied ``lm_head``), which the loader then handles
-        as a tie-redundant skip rather than a crash.
+        Known skips return ``None``. Everything else must resolve through either the
+        static global override or the live-derived reverse map; an unmapped name is
+        a loader bug or an out-of-scope tensor and fails fast here.
         """
         if gguf_name in self._KNOWN_SKIP:
             return None
         override = self._STATIC_GLOBAL_OVERRIDE.get(gguf_name)
         if override is not None:
             return override
-        return self._reverse_map.get(gguf_name)
-
-    def _is_known_skip(self, gguf_name: str) -> bool:
-        """Whether a GGUF tensor has no MLX-LM counterpart and is safe to drop."""
-        return gguf_name in self._KNOWN_SKIP
+        translated = self._reverse_map.get(gguf_name)
+        if translated is None:
+            raise GGUFLoadError(f"Unmapped GGUF tensor {gguf_name!r}.")
+        return translated
 
     @classmethod
     def _resolve_arch(cls, *, gguf_arch: str, config_model_type: str) -> str:
@@ -123,10 +120,19 @@ class GGUFModelAdapter:
             raise GGUFLoadError(f"Unknown GGUF architecture {arch!r}.")
         name_map = gguf.get_tensor_name_map(arch_enum, num_hidden_layers)
         reverse: dict[str, str] = {}
-        for mlx_name in cls._iter_parameter_names(model):
-            gguf_name = name_map.get_name(mlx_name, try_suffixes=(".weight", ".bias"))
-            if gguf_name is not None:
-                reverse.setdefault(gguf_name, mlx_name)
+        leaves = cast(
+            "list[tuple[str, nn.Module]]",
+            tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module),
+        )
+        for module_path, module in leaves:
+            params = cast("list[tuple[str, Any]]", tree_flatten(module.parameters()))
+            for param_name, _ in params:
+                mlx_name = f"{module_path}.{param_name}" if module_path else param_name
+                gguf_name = name_map.get_name(
+                    mlx_name, try_suffixes=(".weight", ".bias")
+                )
+                if gguf_name is not None:
+                    reverse.setdefault(gguf_name, mlx_name)
         if not reverse:
             raise GGUFLoadError(
                 f"Empty GGUF->MLX name map for arch {arch!r} "
@@ -144,16 +150,3 @@ class GGUFModelAdapter:
             if cls._normalize_arch(str(name)) == arch:
                 return arch_enum
         return None
-
-    @staticmethod
-    def _iter_parameter_names(model: nn.Module) -> list[str]:
-        leaves = cast(
-            "list[tuple[str, nn.Module]]",
-            tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module),
-        )
-        names: list[str] = []
-        for module_path, module in leaves:
-            params = cast("list[tuple[str, Any]]", tree_flatten(module.parameters()))
-            for param_name, _ in params:
-                names.append(f"{module_path}.{param_name}" if module_path else param_name)
-        return names

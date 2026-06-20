@@ -93,7 +93,11 @@ class GGUFModelLoader:
             config_model_type=str(config.get("model_type", "")),
         )
         self._preflight(reader)
-        model = self._build_skeleton(config)
+        # Public upstream path: with strict=False it builds the config-only model
+        # (no safetensors required) and owns get_classes + its own sanitize. The
+        # GGUF plain weights are loaded separately below and are not re-sanitized:
+        # partition already excludes the dense cases a sanitize would strip.
+        model, _ = load_model(self._config_dir, strict=False, model_config=config)
         adapter = GGUFModelAdapter.from_model(
             model,
             gguf=gguf,
@@ -103,7 +107,11 @@ class GGUFModelLoader:
         partition = self._partition(reader, model, config, adapter)
         installed = self._install_quant_modules(model, partition.quant, partition.biases)
         self._load_plain_weights(model, partition.plain, installed)
-        tokenizer = self._load_tokenizer(config)
+        tokenizer = load_tokenizer(
+            self._config_dir,
+            tokenizer_config_extra=self._tokenizer_config,
+            eos_token_ids=config.get("eos_token_id"),
+        )
         return model, tokenizer
 
     # -- workflow steps -----------------------------------------------------
@@ -154,15 +162,6 @@ class GGUFModelLoader:
                     "additive biases must be plain F32/F16/BF16."
                 )
 
-    def _build_skeleton(self, config: dict[str, Any]) -> nn.Module:
-        # Public upstream path: with strict=False it builds the config-only model
-        # (no safetensors required) and owns get_classes + its own sanitize. The
-        # GGUF plain weights are loaded separately below and are NOT re-sanitized:
-        # the partition already excludes exactly what a dense sanitize would strip
-        # (the tie-redundant output->lm_head, and rope_freqs via the known-skip).
-        model, _ = load_model(self._config_dir, strict=False, model_config=config)
-        return model
-
     def _partition(
         self,
         reader: Any,
@@ -178,17 +177,15 @@ class GGUFModelLoader:
         biases: dict[str, mx.array] = {}
         for tensor in reader.tensors:
             name = tensor.name
-            if adapter._is_known_skip(name):
-                continue
             translated = adapter.translate(name)
             if translated is None:
-                raise GGUFLoadError(f"Unmapped GGUF tensor {name!r}.")
+                continue
 
             suffix = _BIAS_SUFFIX if name.endswith(_BIAS_SUFFIX) else _WEIGHT_SUFFIX
             module_path = translated[: -len(suffix)]
 
             try:
-                current = self._get_module(model, module_path)
+                current = self._resolve_path(model, module_path)
             except (AttributeError, KeyError, IndexError) as exc:
                 if tied and translated == "lm_head.weight":
                     continue  # tie-redundant output table; the tied head uses as_linear
@@ -225,7 +222,7 @@ class GGUFModelLoader:
         """Replace each quantized module with a GGUF wrapper on the live tree."""
         installed: list[_InstalledWrapper] = []
         for module_path, qt in quant.items():
-            current = self._get_module(model, module_path)
+            current = self._resolve_path(model, module_path)
             bias = biases.get(module_path)
             if isinstance(current, nn.Embedding):
                 wrapper: GGUFWrapper = GGUFEmbedding(qt, self._target_dtype)
@@ -245,7 +242,7 @@ class GGUFModelLoader:
                     f"{type(current).__name__!r} at {module_path!r}; expected "
                     "nn.Linear or nn.Embedding."
                 )
-            self._set_module(model, module_path, wrapper)
+            self._assign_path(model, module_path, wrapper)
             installed.append(_InstalledWrapper(module_path=module_path, wrapper=wrapper))
         return installed
 
@@ -261,15 +258,6 @@ class GGUFModelLoader:
         mx.eval(model.parameters())
         for installed_wrapper in installed:
             installed_wrapper.wrapper.eval_arrays()
-
-    def _load_tokenizer(self, config: dict[str, Any]) -> Any:
-        return load_tokenizer(
-            self._config_dir,
-            tokenizer_config_extra=self._tokenizer_config,
-            eos_token_ids=config.get("eos_token_id"),
-        )
-
-    # -- checks -------------------------------------------------------------
 
     def _assert_complete(
         self,
@@ -325,7 +313,11 @@ class GGUFModelLoader:
     def _validate_plain_shape(
         self, model: nn.Module, param_path: str, array: mx.array, name: str
     ) -> None:
-        expected = tuple(int(d) for d in self._get_param(model, param_path).shape)
+        module_path, _, param_name = param_path.rpartition(".")
+        expected = tuple(
+            int(d)
+            for d in getattr(self._resolve_path(model, module_path), param_name).shape
+        )
         actual = tuple(int(d) for d in array.shape)
         if actual != expected:
             raise GGUFLoadError(
@@ -352,35 +344,25 @@ class GGUFModelLoader:
                         return int(value)
         raise GGUFLoadError("Could not determine num_hidden_layers from config.")
 
-    def _get_module(self, root: Any, path: str) -> Any:
-        parent, leaf = self._resolve_parent(root, path)
-        return self._step(parent, leaf)
+    @staticmethod
+    def _resolve_path(root: Any, path: str) -> Any:
+        obj = root
+        for part in path.split("."):
+            if part.isdigit() and isinstance(obj, list):
+                obj = obj[int(part)]
+            elif isinstance(obj, dict):
+                obj = obj[part]
+            else:
+                obj = getattr(obj, part)
+        return obj
 
-    def _set_module(self, root: Any, path: str, value: Any) -> None:
-        parent, leaf = self._resolve_parent(root, path)
+    @staticmethod
+    def _assign_path(root: Any, path: str, value: Any) -> None:
+        parent_path, _, leaf = path.rpartition(".")
+        parent = GGUFModelLoader._resolve_path(root, parent_path) if parent_path else root
         if leaf.isdigit() and isinstance(parent, list):
             parent[int(leaf)] = value
         elif isinstance(parent, dict):
             parent[leaf] = value
         else:
             setattr(parent, leaf, value)
-
-    def _get_param(self, root: Any, param_path: str) -> mx.array:
-        module_path, _, param_name = param_path.rpartition(".")
-        return getattr(self._get_module(root, module_path), param_name)
-
-    def _resolve_parent(self, root: Any, path: str) -> tuple[Any, str]:
-        obj: Any = root
-        parts = path.split(".")
-        for part in parts[:-1]:
-            obj = self._step(obj, part)
-        return obj, parts[-1]
-
-    @staticmethod
-    def _step(obj: Any, part: str) -> Any:
-        """Descend one path component: list index, dict key, or module attribute."""
-        if part.isdigit() and isinstance(obj, list):
-            return obj[int(part)]
-        if isinstance(obj, dict):
-            return obj[part]
-        return getattr(obj, part)
