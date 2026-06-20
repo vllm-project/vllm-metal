@@ -91,24 +91,33 @@ class GGUFModelLoader:
             GGUFLoadError: On any unsupported file, arch, qtype, shape mismatch, or
                 an incompletely populated model (fail fast, never silent).
         """
+        # Open the local GGUF + companion config and validate they describe one dense arch.
         reader, config = self._open_inputs()
         arch = GGUFModelAdapter.resolve_arch(
             gguf_arch=self._gguf_arch(reader),
             config_model_type=str(config.get("model_type", "")),
         )
         self._preflight(reader)
-        # Public upstream path: strict=False builds the config-only skeleton and
-        # keeps mlx-lm's own model-construction flow as the source of truth.
+
+        # Build the mlx-lm skeleton through the public upstream loader path.
         model, _ = load_model(self._config_dir, strict=False, model_config=config)
+
+        # Derive the GGUF->MLX name translation from the live model structure.
         adapter = GGUFModelAdapter.from_model(
             model,
             gguf=gguf,
             arch=arch,
             num_hidden_layers=self._num_hidden_layers(config),
         )
+
+        # Split tensors into wrapper installs, plain weights, and side biases.
         partition = self._partition(reader, model, config, adapter)
-        installed = self._install_quant_modules(model, partition.quant, partition.biases)
+        installed = self._install_quant_modules(
+            model, partition.quant, partition.biases
+        )
         self._load_plain_weights(model, partition.plain, installed)
+
+        # Build the tokenizer from the companion config directory and return both.
         tokenizer = load_tokenizer(
             self._config_dir,
             tokenizer_config_extra=self._tokenizer_config,
@@ -243,7 +252,9 @@ class GGUFModelLoader:
                     "nn.Linear or nn.Embedding."
                 )
             self._assign_path(model, module_path, wrapper)
-            installed.append(_InstalledWrapper(module_path=module_path, wrapper=wrapper))
+            installed.append(
+                _InstalledWrapper(module_path=module_path, wrapper=wrapper)
+            )
         return installed
 
     def _load_plain_weights(
