@@ -204,6 +204,30 @@ def test_skips_tie_redundant_output(tmp_path):
     assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
 
 
+def test_skips_tie_redundant_output_when_config_omits_tie_flag(tmp_path):
+    d = _dims(_tiny_config("qwen2"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen2",
+        has_qk_norm=False,
+        with_bias=True,
+        inject={"output.weight": ("q", (d["vocab"], d["h"]))},
+    )
+    config_path = Path(cfg_dir) / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("tie_word_embeddings")
+    config_path.write_text(json.dumps(config))
+
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
+
+    assert not hasattr(model, "lm_head")
+    assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
+
+
 def test_untied_qwen2_attaches_bias_and_installs_lm_head(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,

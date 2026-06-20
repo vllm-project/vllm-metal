@@ -101,6 +101,7 @@ class GGUFModelLoader:
 
         # Build the mlx-lm skeleton through the public upstream loader path.
         model, _ = load_model(self._config_dir, strict=False, model_config=config)
+        tied = bool(getattr(model.args, "tie_word_embeddings", False))
 
         # Derive the GGUF->MLX name translation from the live model structure.
         adapter = GGUFModelAdapter.from_model(
@@ -111,7 +112,7 @@ class GGUFModelLoader:
         )
 
         # Split tensors into wrapper installs, plain weights, and side biases.
-        partition = self._partition(reader, model, config, adapter)
+        partition = self._partition(reader, model, tied, adapter)
         installed = self._install_quant_modules(
             model, partition.quant, partition.biases
         )
@@ -175,11 +176,10 @@ class GGUFModelLoader:
         self,
         reader: Any,
         model: nn.Module,
-        config: dict[str, Any],
+        tied: bool,
         adapter: GGUFModelAdapter,
     ) -> _PartitionedTensors:
         """Route each GGUF tensor to quant-install / plain-load / bias-side-map."""
-        tied = bool(config.get("tie_word_embeddings", False))
         arrays = mx.load(str(self._gguf_path))
         quant: dict[str, GGUFMLXQuantizedTensor] = {}
         plain: dict[str, mx.array] = {}
