@@ -164,21 +164,6 @@ def _gguf_module_histogram(model: nn.Module) -> dict[str, int]:
 
     walk(model)
     return counts
-
-
-def _load_fixture(
-    gguf_path: str,
-    *,
-    config_dir: str,
-    target_dtype: mx.Dtype = mx.float32,
-) -> tuple[nn.Module, object]:
-    return GGUFModelLoader(
-        gguf_path,
-        config_dir=config_dir,
-        target_dtype=target_dtype,
-    ).load()
-
-
 # -- synthetic end-to-end (build a tiny mlx-lm skeleton) --------------------
 
 
@@ -187,7 +172,11 @@ def test_loads_dense_qwen3_installs_wrappers(tmp_path, quant_type):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path, "qwen3", has_qk_norm=True, quant_type=quant_type
     )
-    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
     hist = _gguf_module_histogram(model)
     assert hist.get("GGUFEmbedding") == 1
     assert hist.get("GGUFLinear") == 2 * 7
@@ -206,7 +195,11 @@ def test_skips_tie_redundant_output(tmp_path):
         inject={"output.weight": ("q", (d["vocab"], d["h"]))},
     )
     # Must NOT raise (the redundant output is tie-skipped, not unmapped-failed).
-    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
     assert not hasattr(model, "lm_head")
     # The tied head runs through the GGUFEmbedding's as_linear.
     assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
@@ -220,7 +213,11 @@ def test_untied_qwen2_attaches_bias_and_installs_lm_head(tmp_path):
         has_qk_norm=False,
         with_bias=True,
     )
-    model, _ = _load_fixture(gguf_path, config_dir=cfg_dir)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
     # Assert through the model's own public structure, not loader internals.
     q_proj = model.model.layers[0].self_attn.q_proj
     assert isinstance(q_proj, GGUFLinear)
@@ -236,7 +233,11 @@ def test_completeness_fails_on_dropped_norm(tmp_path):
         tmp_path, "qwen3", has_qk_norm=True, drop={"blk.1.ffn_norm.weight"}
     )
     with pytest.raises(GGUFLoadError, match="Incomplete GGUF load"):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_validate_fails_on_wrong_shape(tmp_path):
@@ -248,7 +249,11 @@ def test_validate_fails_on_wrong_shape(tmp_path):
         inject={"blk.0.attn_q.weight": ("q", (d["qd"] + 16, d["h"]))},
     )
     with pytest.raises(GGUFLoadError, match="dims"):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_validate_fails_on_wrong_shape_bias(tmp_path):
@@ -262,7 +267,11 @@ def test_validate_fails_on_wrong_shape_bias(tmp_path):
         inject={"blk.0.attn_q.bias": ("f", (d["qd"] + 16,))},
     )
     with pytest.raises(GGUFLoadError, match="blk.0.attn_q.bias"):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_missing_required_bias(tmp_path):
@@ -280,7 +289,11 @@ def test_rejects_missing_required_bias(tmp_path):
         GGUFLoadError,
         match="'model.layers.0.self_attn.q_proj' expects a bias",
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 # -- preflight / rejection (fail fast before mx.load / model build) ---------
@@ -294,7 +307,11 @@ def test_rejects_non_dense_arch(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="'qwen3_5' is not a supported dense decoder"
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_gguf_config_arch_mismatch(tmp_path):
@@ -305,7 +322,11 @@ def test_rejects_gguf_config_arch_mismatch(tmp_path):
         gguf_arch="qwen3",
     )
     with pytest.raises(GGUFLoadError, match="does not match config model_type"):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_out_of_scope_tensor(tmp_path):
@@ -319,7 +340,11 @@ def test_rejects_out_of_scope_tensor(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="Out-of-scope GGUF tensor 'blk.0.attn_qkv.weight'"
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_vision_tensor(tmp_path):
@@ -333,7 +358,11 @@ def test_rejects_vision_tensor(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="Out-of-scope GGUF tensor 'v.blk.0.attn_q.weight'"
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_unsupported_qtype(tmp_path):
@@ -347,7 +376,11 @@ def test_rejects_unsupported_qtype(tmp_path):
         GGUFLoadError,
         match="Unsupported qtype Q4_1 on mapped weight 'blk.0.ffn_up.weight'",
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_quantized_bias(tmp_path):
@@ -364,7 +397,11 @@ def test_rejects_quantized_bias(tmp_path):
     with pytest.raises(
         GGUFLoadError, match="Unsupported qtype Q8_0 on bias 'blk.0.attn_q.bias'"
     ):
-        _load_fixture(gguf_path, config_dir=cfg_dir)
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 def test_rejects_missing_config(tmp_path):
@@ -372,4 +409,8 @@ def test_rejects_missing_config(tmp_path):
     empty = tmp_path / "no_config"
     empty.mkdir()
     with pytest.raises(GGUFLoadError, match="No config.json"):
-        _load_fixture(gguf_path, config_dir=str(empty))
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=str(empty),
+            target_dtype=mx.float32,
+        ).load()
