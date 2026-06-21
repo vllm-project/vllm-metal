@@ -137,14 +137,12 @@ def test_preempted_requests_keep_resume_state() -> None:
     )
     runner._request_states["req-0"] = state
     runner._paged_request_seq_lens["req-0"] = 2
-    runner._gdn_req_to_slot["req-0"] = 0
 
     runner.execute_model(_scheduler_output(preempted_req_ids={"req-0"}))
 
     assert runner.encoder_cache.mm_features["req-0"] == features
     assert runner._request_states["req-0"] is state
     assert runner._paged_request_seq_lens["req-0"] == 2
-    assert runner._gdn_req_to_slot["req-0"] == 0
 
 
 def test_resubmitted_request_keeps_new_mm_features() -> None:

@@ -35,8 +35,6 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
         model=MagicMock(),
         _paged_attention_runtime=MagicMock(),
         _paged_block_size=4,
-        _gdn_req_to_slot={},
-        _gdn_free_slots=[],
         _rust_state_manager=None,
         num_layers=num_layers,
     )
