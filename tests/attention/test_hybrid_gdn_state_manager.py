@@ -136,6 +136,44 @@ class TestHybridGDNStateManager:
         assert sorted(manager.free_slots) == [0, 1]
         assert manager.needs_materialize is False
 
+    def test_materialize_pending_state_applies_same_step_reused_slot_updates(
+        self,
+    ) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        manager = HybridGDNStateManager(cache)
+        released_slot = manager.assign_step_slots(["done"])[0]
+
+        manager.release_requests({"done"})
+        reused_slot = manager.assign_step_slots(["next"])[0]
+        assert reused_slot == released_slot
+
+        next_conv_state = mx.full((1, 1, 4), 7, dtype=mx.float32)
+        next_recurrent_state = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        cache.set_pending_conv_state(0, [reused_slot], next_conv_state)
+        cache.set_pending_recurrent_state(0, [reused_slot], next_recurrent_state)
+
+        manager.materialize_pending_state()
+
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][reused_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][reused_slot]),
+            9,
+        )
+        assert manager.needs_materialize is False
+
     def test_reused_slot_is_zeroed_before_new_request_uses_it(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=2)
         manager = HybridGDNStateManager(cache)

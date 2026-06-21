@@ -127,5 +127,6 @@ class HybridGDNStateManager:
         if not self._needs_materialize:
             return
 
+        self._state_cache.apply_pending_states()
         mx.eval(*self._state_cache.updated_state_arrays())
         self._needs_materialize = False
