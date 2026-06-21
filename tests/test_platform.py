@@ -530,13 +530,35 @@ class TestMetalPlatform:
     def test_register_dp_hook_is_idempotent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Once this process has registered the DP hook, re-registering is a no-op."""
+        """With our hook already registered and the Ray session still live,
+        re-registering is a no-op."""
         ray = pytest.importorskip("ray")
         monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", True)
+        monkeypatch.setattr(ray, "is_initialized", lambda: True)
         init_calls: list[dict] = []
         monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
         MetalPlatform._register_dp_ray_worker_setup_hook()
         assert init_calls == []
+
+    def test_register_dp_hook_reregisters_after_ray_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registered flag left True after ray.shutdown() is stale: if our Ray
+        session is gone, re-init with the hook so a second in-process DP engine still
+        gets the Metal worker patch — otherwise the DP manager rebuilds Ray with a
+        hook-less ray.init and the workers KeyError on the mlx resource."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", True)
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        MetalPlatform._register_dp_ray_worker_setup_hook()
+        assert init_calls, "stale flag + shut-down Ray must trigger a re-init"
+        assert (
+            init_calls[0]["runtime_env"]["worker_process_setup_hook"]
+            == MetalPlatform._RAY_WORKER_SETUP_HOOK
+        )
+        assert MetalPlatform._dp_ray_hook_registered is True
 
     def test_register_dp_hook_rejects_foreign_ray_init(
         self, monkeypatch: pytest.MonkeyPatch

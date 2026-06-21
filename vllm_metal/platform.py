@@ -264,8 +264,9 @@ class MetalPlatform(Platform):
 
         Fails loud if Ray was already initialized by something other than this hook
         (its job runtime_env is then fixed without our setup hook, which would
-        silently re-break the DP workers). Idempotent across repeated calls within
-        this process.
+        silently re-break the DP workers). Idempotent while our Ray session is live;
+        if that session was shut down, the now-stale flag is cleared and the hook is
+        re-registered so a second in-process DP engine still gets the patch.
         """
         # SCAFFOLDING: remove when upstream CoreEngineActorManager forwards
         # parallel_config.ray_runtime_env into its ray.init (vllm/v1/engine/utils.py),
@@ -274,9 +275,10 @@ class MetalPlatform(Platform):
         # workers and this job-level registration could be dropped.
         import ray
 
-        if cls._dp_ray_hook_registered:
-            return
         if ray.is_initialized():
+            if cls._dp_ray_hook_registered:
+                # Our hook is already in the live Ray session — idempotent no-op.
+                return
             raise RuntimeError(
                 "Ray is already initialized before vllm-metal could register the "
                 "Apple-GPU worker setup hook at the Ray job level, which data "
@@ -284,6 +286,10 @@ class MetalPlatform(Platform):
                 "from the job runtime_env). Do not initialize Ray before serving — "
                 "let vllm-metal own ray.init (remove any manual ray.init)."
             )
+        # Ray is not initialized: a fresh start, or our previous session was shut
+        # down in this process (a now-stale registered flag). Clear the flag so a
+        # second in-process DP engine re-registers instead of skipping the hook.
+        cls._dp_ray_hook_registered = False
         # Preserve a user-provided ray_runtime_env (working_dir / py_modules /
         # env_vars the remote Macs may need) and add our worker hook: the DP manager
         # reuses this job session without re-applying ray_runtime_env, so replacing
