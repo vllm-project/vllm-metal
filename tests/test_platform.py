@@ -572,6 +572,24 @@ class TestMetalPlatform:
         with pytest.raises(RuntimeError, match="already initialized"):
             MetalPlatform._register_dp_ray_worker_setup_hook()
 
+    def test_register_dp_hook_rejects_foreign_worker_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A foreign worker_process_setup_hook in ray_runtime_env is rejected
+        (chaining unsupported), matching the single-stage Ray path — the DP job-level
+        registration must not silently replace a user-set hook."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", False)
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        with pytest.raises(ValueError, match="chaining is not supported"):
+            MetalPlatform._register_dp_ray_worker_setup_hook(
+                {"worker_process_setup_hook": "some.other.hook"}
+            )
+        # Rejected before any ray.init side effect.
+        assert init_calls == []
+
     def test_dp_hook_registration_preserves_user_ray_runtime_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

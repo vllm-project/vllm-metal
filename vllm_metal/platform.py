@@ -239,6 +239,32 @@ class MetalPlatform(Platform):
         return torch.device("cpu")
 
     @classmethod
+    def _ray_runtime_env_with_metal_hook(
+        cls, ray_runtime_env: object = None
+    ) -> dict[str, object]:
+        """Return a runtime_env dict that installs the Apple-GPU worker setup hook.
+
+        The single source of the hook-install rule, shared by the single-stage Ray
+        executor and the DP job-level ``ray.init`` so the two cannot drift: it
+        preserves the caller's ``ray_runtime_env`` keys (``working_dir`` /
+        ``py_modules`` / ``env_vars``) and rejects a conflicting foreign
+        ``worker_process_setup_hook`` (chaining is unsupported) rather than silently
+        replacing it.
+        """
+        runtime_env: dict[str, object] = (
+            dict(ray_runtime_env) if isinstance(ray_runtime_env, dict) else {}
+        )
+        existing = runtime_env.get("worker_process_setup_hook")
+        if existing not in (None, cls._RAY_WORKER_SETUP_HOOK):
+            raise ValueError(
+                "Metal must install a Ray worker_process_setup_hook, but one is "
+                f"already set ({existing!r}); chaining is not supported. Unset "
+                "ray_runtime_env's worker_process_setup_hook."
+            )
+        runtime_env["worker_process_setup_hook"] = cls._RAY_WORKER_SETUP_HOOK
+        return runtime_env
+
+    @classmethod
     def _register_dp_ray_worker_setup_hook(cls, ray_runtime_env: object = None) -> None:
         """Register the Apple-GPU worker patch at the Ray JOB level for DP.
 
@@ -290,15 +316,16 @@ class MetalPlatform(Platform):
         # down in this process (a now-stale registered flag). Clear the flag so a
         # second in-process DP engine re-registers instead of skipping the hook.
         cls._dp_ray_hook_registered = False
-        # Preserve a user-provided ray_runtime_env (working_dir / py_modules /
-        # env_vars the remote Macs may need) and add our worker hook: the DP manager
-        # reuses this job session without re-applying ray_runtime_env, so replacing
-        # it with a hook-only env would drop the user's settings from remote actors.
-        runtime_env: dict[str, object] = (
-            dict(ray_runtime_env) if isinstance(ray_runtime_env, dict) else {}
+        # Install the worker hook by the same rule as the single-stage Ray path
+        # (_ray_runtime_env_with_metal_hook): preserve the user's ray_runtime_env
+        # (working_dir / py_modules / env_vars the remote Macs may need) and reject a
+        # conflicting foreign hook rather than silently replacing it. The DP manager
+        # reuses this job session without re-applying ray_runtime_env, so this is the
+        # one place the user's env reaches the remote actors.
+        ray.init(
+            address="auto",
+            runtime_env=cls._ray_runtime_env_with_metal_hook(ray_runtime_env),
         )
-        runtime_env["worker_process_setup_hook"] = cls._RAY_WORKER_SETUP_HOOK
-        ray.init(address="auto", runtime_env=runtime_env)
         cls._dp_ray_hook_registered = True
 
     @classmethod
@@ -367,22 +394,9 @@ class MetalPlatform(Platform):
             # loud rather than warn-and-continue: the user asked for Ray.
             from ray.runtime_env import RuntimeEnv
 
-            hook = cls._RAY_WORKER_SETUP_HOOK
-            runtime_env = parallel_config.ray_runtime_env
-            if runtime_env is None:
-                parallel_config.ray_runtime_env = RuntimeEnv(
-                    worker_process_setup_hook=hook
-                )
-            else:
-                existing_hook = runtime_env.get("worker_process_setup_hook")
-                if existing_hook not in (None, hook):
-                    raise ValueError(
-                        "Metal must install a Ray worker_process_setup_hook for "
-                        "the 'ray' executor, but one is already set "
-                        f"({existing_hook!r}); chaining is not supported. Unset "
-                        "ray_runtime_env's worker_process_setup_hook."
-                    )
-                runtime_env["worker_process_setup_hook"] = hook
+            parallel_config.ray_runtime_env = RuntimeEnv(
+                **cls._ray_runtime_env_with_metal_hook(parallel_config.ray_runtime_env)
+            )
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
