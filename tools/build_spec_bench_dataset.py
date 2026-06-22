@@ -38,9 +38,9 @@ from transformers import AutoTokenizer
 
 # --- knobs ------------------------------------------------------------------
 DATASET = "RedHatAI/speculator_benchmarks"  # HF dataset: one *.jsonl per category
-TOKENIZER = "Qwen/Qwen3-8B"                  # tokenizer for length filtering (the target model)
-PER_CATEGORY = 22                            # prompts per category (9 categories -> ~198)
-MAX_PROMPT_TOKENS = 1900                     # drop longer prompts (leaves room for output under max-model-len 2048)
+TOKENIZER = "Qwen/Qwen3-8B"  # tokenizer for length filtering (use the target model)
+PER_CATEGORY = 22  # prompts sampled per category (9 categories -> ~198)
+MAX_PROMPT_TOKENS = 1900  # drop prompts longer than this (fits 2048 ctx)
 SEED = 1234
 OUTPUT = "spec_bench_sample.jsonl"
 # ----------------------------------------------------------------------------
@@ -58,11 +58,12 @@ def main() -> None:
         fit = [r for r in rows if len(tok(r["prompt"]).input_ids) <= MAX_PROMPT_TOKENS]
         rng.shuffle(fit)
         for r in fit[:PER_CATEGORY]:
-            out.append({
+            record = {
                 "question_id": r.get("question_id"),
                 "category": category,
                 "turns": [r["prompt"]],
-            })
+            }
+            out.append(record)
     rng.shuffle(out)
 
     with open(OUTPUT, "w") as fh:
