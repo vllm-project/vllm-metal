@@ -1374,6 +1374,50 @@ class TestV1MetalModelRunnerGDNSubmit:
 
         assert submitted == [(logits,)]
 
+    def test_non_last_pp_sample_materializes_reused_slot_state(self) -> None:
+        cache = self.make_gdn_cache()
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner.pp = SimpleNamespace(size=2, is_last=False)
+        runner._execute_model_state = object()
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        runner._paged_request_seq_lens["done"] = 1
+
+        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        runner._cleanup_finished_requests({"done"}, materialize_runtime_state=False)
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        assert reused_slot == released_slot
+
+        cache.set_pending_conv_state(
+            0, [reused_slot], mx.full((1, 1, 4), 7, dtype=mx.float32)
+        )
+        cache.set_pending_recurrent_state(
+            0,
+            [reused_slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output is mr.EMPTY_MODEL_RUNNER_OUTPUT
+        assert runner._execute_model_state is None
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][reused_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][reused_slot]),
+            9,
+        )
+        assert runtime.gdn_state_manager.needs_materialize is False
+
 
 class TestV1MetalModelRunnerGDNLifecycle:
     def test_start_paged_forward_assigns_hybrid_slots_in_batch_order(

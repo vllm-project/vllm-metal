@@ -2321,6 +2321,9 @@ class MetalModelRunner:
             # engine collects results from the last stage only.
             if is_non_last_stage(self.pp):
                 self._execute_model_state = None
+                runtime = self._paged_attention_runtime
+                if runtime is not None:
+                    runtime.materialize_pending_state()
                 return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             runtime = self._paged_attention_runtime
