@@ -30,9 +30,11 @@ Each scheduler step ``propose()`` runs, batched over the dynamic mixed batch:
 The verify half is unchanged: drafts are handed back via ``take_draft_token_ids``
 and verified next step by ``SpeculativeDecodeController.verify_greedy``.
 
-KV-budget note: the draft cache is a second store the same size as the target's
-KV cache, and it is allocated *after* the target budget is computed, so it is
-not subtracted from the target KV budget. This is safe only with headroom
+KV-budget note: the draft cache is a second store with the *same block count*
+as the target's cache but sized for the draft model's (smaller) dimensions — so
+it is materially smaller than the target's KV cache for a small draft. It is
+allocated *after* the target budget is computed, so it is not subtracted from
+the target KV budget. This is safe only with headroom
 (``VLLM_METAL_MEMORY_FRACTION`` well below 1.0); a budget split is a follow-up.
 """
 
@@ -276,6 +278,15 @@ class DraftModelProposer:
         blocks = self._req_blocks.setdefault(req_id, [])
         while len(blocks) < needed:
             if not self._free_blocks:
+                # Draft pool drained (it shares the target's num_blocks but must
+                # cover committed_len + K). Skip drafting this request — lowers
+                # speedup, not correctness. Most likely at high concurrency or
+                # near max context; see the KV-budget note in the module docstring.
+                logger.warning_once(
+                    "Draft KV cache exhausted; speculative drafting skipped for "
+                    "some requests (acceptance/speedup will drop). Lower "
+                    "--max-num-seqs or raise VLLM_METAL_MEMORY_FRACTION."
+                )
                 return None
             blocks.append(self._free_blocks.pop())
         return blocks
