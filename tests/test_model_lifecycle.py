@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,6 +83,7 @@ def _runner_model_config(**overrides: object) -> object:
         "is_multimodal_model": False,
         "trust_remote_code": False,
         "dtype": torch.float16,
+        "quantization": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -817,6 +819,178 @@ class TestModelLifecycle:
             # The generic path must NOT pass ``model_config`` (which is
             # reserved for the AWQ owner's normalized quant config kwargs).
             assert "model_config" not in mlx_lm_load_calls[0]["kwargs"]
+
+    def test_load_routes_gguf_to_owner_on_quantization_detection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``quantization == "gguf"`` (set by vLLM core for a .gguf) delegates the
+        whole load to ``GGUFModelLoader`` (lazily imported) and never calls generic
+        ``mlx_lm.load`` — detection-routed like the AWQ branch, no env flag. The
+        lifecycle threads the resolved model path, ``--tokenizer`` dir, derived
+        dtype, and tokenizer config to the owner.
+        """
+        fake_model = SimpleNamespace(config=_text_config())
+        fake_tokenizer = object()
+        for_model_calls: list[dict[str, object]] = []
+        mlx_lm_load_calls: list[dict[str, object]] = []
+
+        class _StubGGUFLoader:
+            @classmethod
+            def for_model(
+                cls,
+                model_name: str,
+                *,
+                config_dir: str,
+                target_dtype: object,
+                tokenizer_config: dict[str, object] | None = None,
+            ) -> _StubGGUFLoader:
+                for_model_calls.append(
+                    {
+                        "model_name": model_name,
+                        "config_dir": config_dir,
+                        "target_dtype": target_dtype,
+                        "tokenizer_config": (
+                            dict(tokenizer_config) if tokenizer_config else None
+                        ),
+                    }
+                )
+                return cls()
+
+            @staticmethod
+            def cache_key(
+                model_name: str, config_dir: str, *, target_dtype: object
+            ) -> tuple[str, str]:
+                return (model_name, f"gguf:{config_dir}:{target_dtype}")
+
+            def load(self) -> tuple[object, object]:
+                return fake_model, fake_tokenizer
+
+        def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
+            mlx_lm_load_calls.append({"args": args, "kwargs": kwargs})
+            return fake_model, fake_tokenizer
+
+        # The owner is imported lazily inside the branch; inject the stub module
+        # so the `from vllm_metal.gguf.loader import GGUFModelLoader` resolves to it.
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_metal.gguf.loader",
+            SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
+        )
+        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                quantization="gguf", tokenizer="tokenizer-dir"
+            )
+        )
+        lifecycle.load()
+
+        assert runner.model is fake_model
+        assert runner.tokenizer is fake_tokenizer
+        assert mlx_lm_load_calls == [], (
+            "generic mlx_lm.load must NOT be called when the GGUF owner owns "
+            "the load path"
+        )
+        assert len(for_model_calls) == 1
+        call = for_model_calls[0]
+        assert call["model_name"] == "stub-model"
+        assert call["config_dir"] == "tokenizer-dir"
+        assert call["target_dtype"] is not None, (
+            "lifecycle must derive target_dtype from runner.model_config.dtype "
+            "and thread it to the owner"
+        )
+        assert call["tokenizer_config"] == {"trust_remote_code": False}
+
+    def test_non_gguf_model_does_not_route_or_import_gguf(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-GGUF model (``quantization != "gguf"``) is never routed to the
+        GGUF owner, and the optional ``gguf`` package is never imported.
+
+        Tripwire: block the ``gguf`` package itself (``sys.modules[...] = None``
+        raises on import). A clean load through the generic cached path proves a
+        default install with no gguf extra is unaffected — the detection guard
+        short-circuits before the lazy owner import that would pull in ``gguf``.
+        """
+        monkeypatch.setitem(sys.modules, "gguf", None)
+        _cache_generation_model(monkeypatch, config=_text_config())
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config()  # no quantization -> not gguf
+        )
+
+        lifecycle.load()  # must not raise: the gguf owner import is never reached
+
+        assert runner._is_vlm is False
+        assert runner.model_args["vocab_size"] == 32000
+
+    def test_gguf_cache_key_separates_tokenizer_dirs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two loads of the same .gguf with different ``--tokenizer`` dirs must
+        not collide in the process cache. A .gguf carries weights only, so the
+        model and tokenizer are built from the config dir; returning the first's
+        result for the second (and bypassing the config-dir fail-fast once the
+        cache is warm) would be a silent wrong load.
+        """
+        for_model_dirs: list[str] = []
+
+        class _StubGGUFLoader:
+            def __init__(self, config_dir: str) -> None:
+                self._config_dir = config_dir
+
+            @classmethod
+            def for_model(
+                cls,
+                model_name: str,
+                *,
+                config_dir: str,
+                target_dtype: object,
+                tokenizer_config: dict[str, object] | None = None,
+            ) -> _StubGGUFLoader:
+                for_model_dirs.append(config_dir)
+                return cls(config_dir)
+
+            @staticmethod
+            def cache_key(
+                model_name: str, config_dir: str, *, target_dtype: object
+            ) -> tuple[str, str]:
+                return (model_name, f"gguf:{config_dir}:{target_dtype}")
+
+            def load(self) -> tuple[object, object]:
+                return (
+                    SimpleNamespace(config=_text_config()),
+                    f"tokenizer::{self._config_dir}",
+                )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_metal.gguf.loader",
+            SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
+        )
+        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
+
+        def _load_tokenizer_for(tokenizer_dir: str) -> object:
+            lifecycle, runner = _make_lifecycle(
+                model_config=_runner_model_config(
+                    quantization="gguf", tokenizer=tokenizer_dir
+                )
+            )
+            lifecycle.load()
+            return runner.tokenizer
+
+        first = _load_tokenizer_for("/dir-a")
+        second = _load_tokenizer_for("/dir-b")
+
+        assert for_model_dirs == ["/dir-a", "/dir-b"], (
+            "for_model must run for each distinct --tokenizer dir, not be skipped "
+            "by a colliding cache key"
+        )
+        assert first == "tokenizer::/dir-a"
+        assert second == "tokenizer::/dir-b"
 
 
 class TestResolveModelDims:

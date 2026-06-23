@@ -35,6 +35,7 @@ from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
 __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
+_GGUF_SUFFIX = ".gguf"
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
@@ -84,6 +85,85 @@ class GGUFModelLoader:
         self._target_dtype = target_dtype
         self._tokenizer_config = dict(tokenizer_config or {})
 
+    @classmethod
+    def for_model(
+        cls,
+        model_name: str,
+        *,
+        config_dir: str,
+        target_dtype: mx.Dtype,
+        tokenizer_config: dict[str, Any] | None = None,
+    ) -> GGUFModelLoader:
+        """Build a loader for a GGUF model the lifecycle has already routed here.
+
+        Called only after the lifecycle confirmed ``model_config.quantization ==
+        "gguf"`` and lazily imported this module (which imports the optional
+        ``gguf`` package) — mirroring how the AWQ branch routes on detected
+        config. This factory does the GGUF-specific input validation before
+        constructing the loader.
+
+        It raises rather than returning ``None`` so a confirmed-GGUF checkpoint
+        can never silently fall through to the generic loader and bypass this
+        owner — the same contract :meth:`AWQQuantLoader.for_model` uses for GPTQ.
+
+        Args:
+            model_name: Already-resolved model path
+                (``get_model_download_path(model_config.model)``); for a local
+                GGUF this is the ``.gguf`` file.
+            config_dir: Companion config/tokenizer directory the user passes via
+                ``--tokenizer`` (``model_config.tokenizer``). A ``.gguf`` carries
+                weights only, so mlx-lm builds the model from this directory.
+            target_dtype: Compute dtype for dequantized embedding rows /
+                activations, threaded to the constructed loader.
+            tokenizer_config: Extra kwargs forwarded to mlx-lm tokenizer loading
+                (e.g. ``trust_remote_code``).
+
+        Raises:
+            GGUFLoadError: ``model_name`` is not a local ``.gguf`` file (remote
+                ``repo:quant`` / Hub references are not supported yet), or
+                ``config_dir`` has no ``config.json`` (``--tokenizer`` omitted or
+                pointing at a directory without the companion config).
+        """
+        gguf_path = Path(model_name)
+        if gguf_path.suffix != _GGUF_SUFFIX or not gguf_path.is_file():
+            raise GGUFLoadError(
+                f"{model_name!r} is a GGUF model, but it is not a local .gguf "
+                "file. Remote GGUF (repo:quant / Hub download) is not supported "
+                "yet; pass a path to a local .gguf file."
+            )
+        if not (Path(config_dir) / "config.json").is_file():
+            raise GGUFLoadError(
+                "Serving a GGUF model needs --tokenizer pointing at a directory "
+                f"with config.json and the tokenizer files; got {config_dir!r}. A "
+                ".gguf carries weights only, so mlx-lm builds the model from that "
+                "directory."
+            )
+        return cls(
+            model_name,
+            config_dir=config_dir,
+            target_dtype=target_dtype,
+            tokenizer_config=tokenizer_config,
+        )
+
+    @staticmethod
+    def cache_key(
+        model_name: str, config_dir: str, *, target_dtype: mx.Dtype
+    ) -> tuple[str, str]:
+        """Process-cache key for a GGUF load.
+
+        A ``.gguf`` carries weights only; the model skeleton and tokenizer are
+        built from ``config_dir`` (the ``--tokenizer`` dir), so the key MUST
+        include it — two LLMs for the same ``.gguf`` with different config dirs
+        are different models and must not collide (else the second is served the
+        first's tokenizer/skeleton, and the config-dir fail-fast is bypassed once
+        the cache is warm). ``target_dtype`` is encoded too, dtype-scoped like the
+        AWQ owner's: a model first served as bf16 must not be returned when fp16
+        is later requested. Static so the lifecycle can compute the key and probe
+        the shared cache before building a loader; the 2-tuple shape matches
+        ``_generation_cache_key``.
+        """
+        return (model_name, f"gguf:{config_dir}:{target_dtype}")
+
     def load(self) -> tuple[nn.Module, Any]:
         """Run the full load workflow and return ``(model, tokenizer)``.
 
@@ -127,7 +207,7 @@ class GGUFModelLoader:
         return model, tokenizer
 
     def _open_inputs(self) -> tuple[Any, dict[str, Any]]:
-        if self._gguf_path.suffix != ".gguf" or not self._gguf_path.is_file():
+        if self._gguf_path.suffix != _GGUF_SUFFIX or not self._gguf_path.is_file():
             raise GGUFLoadError(f"Not a local .gguf file: {str(self._gguf_path)!r}")
         if not (self._config_dir / "config.json").is_file():
             raise GGUFLoadError(

@@ -434,3 +434,53 @@ def test_rejects_missing_config(tmp_path):
             config_dir=str(empty),
             target_dtype=mx.float32,
         ).load()
+
+
+def test_for_model_builds_loader_that_stays_quantized(tmp_path):
+    # The lifecycle-facing factory yields a loader whose model keeps the GGUF
+    # quantized wrappers (Q8_0 in memory), not a dense dequantized fallback.
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    loader = GGUFModelLoader.for_model(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    )
+    assert isinstance(loader, GGUFModelLoader)
+    model, _ = loader.load()
+    hist = _gguf_module_histogram(model)
+    assert hist.get("GGUFEmbedding") == 1
+    assert hist.get("GGUFLinear") == 2 * 7
+
+
+def test_for_model_rejects_remote_reference(tmp_path):
+    # A non-local model id (remote repo:quant) is out of scope; for_model must
+    # fail fast rather than fall through to the generic loader.
+    _, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    with pytest.raises(GGUFLoadError, match="not a local .gguf file"):
+        GGUFModelLoader.for_model(
+            "org/qwen3-gguf:Q8_0", config_dir=cfg_dir, target_dtype=mx.float32
+        )
+
+
+def test_for_model_rejects_missing_tokenizer_dir(tmp_path):
+    # --tokenizer omitted: config_dir resolves to the .gguf itself (no config.json).
+    gguf_path, _ = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    with pytest.raises(GGUFLoadError, match="needs --tokenizer"):
+        GGUFModelLoader.for_model(
+            gguf_path, config_dir=gguf_path, target_dtype=mx.float32
+        )
+
+
+def test_cache_key_is_stable_dtype_and_config_dir_scoped(tmp_path):
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    key = GGUFModelLoader.cache_key(gguf_path, cfg_dir, target_dtype=mx.float16)
+    assert key == GGUFModelLoader.cache_key(gguf_path, cfg_dir, target_dtype=mx.float16)
+    # dtype-scoped: a different dtype must not be cross-served from cache.
+    assert key != GGUFModelLoader.cache_key(
+        gguf_path, cfg_dir, target_dtype=mx.bfloat16
+    )
+    # config_dir-scoped: the same .gguf with a different --tokenizer dir is a
+    # different model (a .gguf carries weights only) and must not collide.
+    assert key != GGUFModelLoader.cache_key(
+        gguf_path, cfg_dir + "_other", target_dtype=mx.float16
+    )
+    # Full contract: model path + config-dir + dtype-scoped loader segment.
+    assert key == (gguf_path, f"gguf:{cfg_dir}:{mx.float16}")

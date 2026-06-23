@@ -151,6 +151,11 @@ class ModelLifecycle:
         logger.info("Loading model: %s (VLM: %s)", model_name, is_vlm)
         start_time = time.time()
 
+        # EngineArgs normalizes local GGUF inputs to quantization="gguf";
+        # the GGUF owner handles format-specific validation and loading.
+        if not is_vlm and self._runner.model_config.quantization == "gguf":
+            return self._load_gguf_generation_model(model_name, start_time)
+
         # AWQ checkpoints are owned end-to-end by AWQQuantLoader
         # (preflight, mlx_lm.load invocation, dtype alignment, dtype-scoped
         # cache key). Detection involves an HF Hub config fetch on cache
@@ -205,6 +210,41 @@ class ModelLifecycle:
         with _MODEL_CACHE_LOCK:
             _MODEL_CACHE[cache_key] = (model, tokenizer)
         logger.info("Model loaded in %.2fs: %s", time.time() - start_time, model_name)
+        return model, tokenizer
+
+    def _load_gguf_generation_model(
+        self, model_name: str, start_time: float
+    ) -> tuple[Any, Any]:
+        """Load a GGUF checkpoint through the optional GGUF owner."""
+        from vllm_metal.gguf.loader import GGUFModelLoader
+
+        model_config = self._runner.model_config
+        target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
+        cache_key = GGUFModelLoader.cache_key(
+            model_name, model_config.tokenizer, target_dtype=target_dtype
+        )
+        with _MODEL_CACHE_LOCK:
+            cached = _MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            logger.info(
+                "Model loaded from cache in %.3fs: %s",
+                time.time() - start_time,
+                model_name,
+            )
+            return cached
+
+        loader = GGUFModelLoader.for_model(
+            model_name,
+            config_dir=model_config.tokenizer,
+            target_dtype=target_dtype,
+            tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
+        )
+        model, tokenizer = loader.load()
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[cache_key] = (model, tokenizer)
+        logger.info(
+            "GGUF model loaded in %.2fs: %s", time.time() - start_time, model_name
+        )
         return model, tokenizer
 
     def resolve_model_dims(self) -> None:

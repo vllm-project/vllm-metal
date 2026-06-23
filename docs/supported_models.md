@@ -63,6 +63,15 @@ for Qwen2.5, Llama 3, and Mistral
 ([#340](https://github.com/vllm-project/vllm-metal/pull/340),
 [#381](https://github.com/vllm-project/vllm-metal/pull/381)).
 
+Local GGUF checkpoints serve by detection like AWQ, with no env flag (vLLM sets
+`quantization=gguf` from the file). A `.gguf` carries weights only, so it pairs
+with a companion config dir (`--tokenizer`) and needs the `gguf` extra; the
+weights stay MLX-native quantized (Q8_0/Q4_0, not a dense fallback). Scope is dense
+`qwen2`/`qwen3` with per-tensor `Q8_0`/`Q4_0`; K-quants, `Q4_1`, fused-QKV, MoE,
+SSM/hybrid, vision, and remote `repo:quant` are rejected with a clear error.
+Verified end-to-end on Qwen3-0.6B Q8_0
+([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
+
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |

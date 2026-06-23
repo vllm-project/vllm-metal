@@ -57,6 +57,17 @@ class GGUFLinear(nn.Module):
             )
         return bias
 
+    @property
+    def out_features(self) -> int:
+        """Output feature count, surfacing the tensor's already-public value.
+
+        Lets shape-introspecting callers (e.g. the attention backend deriving
+        head_dim) read the projection's output dim without a dense ``.weight``,
+        which this wrapper does not expose (the packed weight lives on the
+        tensor).
+        """
+        return self.tensor.out_features
+
     def __call__(self, x: mx.array) -> mx.array:
         out = self.tensor.matmul(x)
         if "bias" in self:
