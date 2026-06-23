@@ -75,6 +75,23 @@ class _ExplodingPackedLinear:
         raise AssertionError(self._message)
 
 
+class _FakeQuantLinear:
+    """Quantized-wrapper-style projection (e.g. GGUFLinear).
+
+    Callable and exposes ``out_features``, but has NO dense ``.weight`` — the
+    packed weight is hidden behind the quant tensor. head_dim resolution must
+    read ``out_features``; reaching for ``.weight`` would ``AttributeError``
+    (the GGUF serve crash this exercises).
+    """
+
+    def __init__(self, weight: mx.array) -> None:
+        self._weight = weight  # private: never exposed as ``.weight``
+        self.out_features = weight.shape[0]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x @ self._weight.T
+
+
 def _make_ctx(seq_len: int) -> PagedAttentionContext:
     """Return a minimal paged context sufficient for apply_packed_rope."""
     return PagedAttentionContext(
@@ -273,6 +290,38 @@ class TestPrepareSDPAQKV:
         assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
         assert gate is None
         assert kv_for_sharing == (keys, values)
+
+    def test_resolves_head_dim_from_out_features_for_weightless_projection(
+        self,
+    ) -> None:
+        # A quantized wrapper (GGUFLinear) hides its packed weight and exposes
+        # out_features instead of a dense .weight. With no self.head_dim attr
+        # (the qwen3 path), head_dim must resolve from k_proj.out_features;
+        # reaching for k_proj.weight here would AttributeError (the crash this
+        # fixes). Mirrors test_standard_path_projects_independent_kv, which
+        # already pins the dense .weight path to the same head_dim.
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            q_proj=_FakeQuantLinear(mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN))),
+            k_proj=_FakeQuantLinear(mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))),
+            v_proj=_FakeQuantLinear(mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))),
+            rope=_identity_rope,
+        )
+        assert not hasattr(inner.k_proj, "weight")  # the weightless contract
+        assert not hasattr(inner, "head_dim")  # forces the k_proj derivation
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        queries, keys, values, _, _ = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+
+        # head_dim resolved from out_features (== _HEAD_DIM): canonical shapes.
+        assert queries.shape == (_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert keys.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
+        assert values.shape == (_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM)
 
     def test_k_eq_v_fallback_when_v_proj_missing(self) -> None:
         # Arrange — Gemma4 26B/31B style: no v_proj

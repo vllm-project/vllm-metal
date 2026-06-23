@@ -59,6 +59,22 @@ def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
     )
 
 
+def _projection_out_features(proj: nn.Module) -> int:
+    """Output feature count of an attention projection.
+
+    Prefers an explicit ``out_features`` when the projection exposes one — e.g.
+    a quantized wrapper that hides its packed weight behind a tensor and has no
+    dense ``.weight`` — and falls back to the dense weight's row count
+    otherwise. mlx ``nn.Linear`` and ``nn.QuantizedLinear`` carry no
+    ``out_features`` attribute, so dense and AWQ projections keep the
+    ``weight.shape[0]`` path unchanged.
+    """
+    out_features = getattr(proj, "out_features", None)
+    if out_features is not None:
+        return int(out_features)
+    return proj.weight.shape[0]
+
+
 def is_sdpa(module: nn.Module) -> bool:
     """Return True if *module* is an SDPA attention layer (MHA, GQA, or MQA).
 
@@ -208,14 +224,16 @@ def prepare_sdpa_qkv(
         )
     # head_dim has two architectural sources in our supported models:
     #   - self.head_dim instance attr (gemma*, llama, mistral, qwen3_5+, phi3)
-    #   - k_proj.weight.shape (qwen3, qwen3_moe never set self.head_dim)
+    #   - k_proj output features (qwen3, qwen3_moe never set self.head_dim) —
+    #     read via out_features when the projection exposes it (quantized
+    #     wrappers with no dense .weight), else from the dense weight rows.
     # KV-shared Gemma 4 layers have head_dim but no k_proj. If neither
     # is present, raise — silently propagating a wrong head_dim would
     # corrupt downstream kernel shapes.
     if hasattr(inner, "head_dim"):
         head_dim = inner.head_dim
     elif hasattr(inner, "k_proj"):
-        head_dim = inner.k_proj.weight.shape[0] // n_kv_heads
+        head_dim = _projection_out_features(inner.k_proj) // n_kv_heads
     else:
         raise AttributeError(
             f"Cannot determine head_dim for "
