@@ -519,18 +519,14 @@ class MetalModelRunner:
 
     def _submit_paged_forward_outputs(
         self,
-        logits: mx.array,
-        *,
-        target_hidden_states: mx.array | None = None,
+        *outputs: mx.array,
     ) -> None:
-        """Submit logits, hidden states, and runtime-owned forward side effects."""
-        outputs = [logits]
-        if target_hidden_states is not None:
-            outputs.append(target_hidden_states)
+        """Submit caller outputs first, then runtime-owned side effects."""
+        eval_outputs = list(outputs)
         runtime = self._paged_attention_runtime
         if runtime is not None:
-            runtime.extend_forward_eval_outputs(outputs)
-        mx.async_eval(*outputs)
+            runtime.extend_forward_eval_outputs(eval_outputs)
+        mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1041,21 +1037,19 @@ class MetalModelRunner:
         # Submit to GPU — returns immediately, GPU runs in background.
         if has_pooling_work:
             assert pooling_hidden_states is not None
-            mx.async_eval(pooling_hidden_states)
+            self._submit_paged_forward_outputs(pooling_hidden_states)
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
-            # the next stage. async_eval on the send forces both the transfer
-            # and (transitively, via the sent activations) this stage's paged
-            # KV-cache writes.
-            mx.async_eval(pp_send_handle)
+            # the next stage, plus any runtime-owned forward side effects.
+            self._submit_paged_forward_outputs(pp_send_handle)
         else:
             assert logits is not None
             # Runtime-owned forward side effects may not be forced by
             # evaluating logits alone, so submit the complete output set.
-            self._submit_paged_forward_outputs(
-                logits,
-                target_hidden_states=target_hidden_states,
-            )
+            forward_outputs = [logits]
+            if target_hidden_states is not None:
+                forward_outputs.append(target_hidden_states)
+            self._submit_paged_forward_outputs(*forward_outputs)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -2327,6 +2321,9 @@ class MetalModelRunner:
             # engine collects results from the last stage only.
             if is_non_last_stage(self.pp):
                 self._execute_model_state = None
+                runtime = self._paged_attention_runtime
+                if runtime is not None:
+                    runtime.materialize_pending_state()
                 return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             runtime = self._paged_attention_runtime

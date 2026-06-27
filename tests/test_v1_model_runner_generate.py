@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
@@ -1211,6 +1212,19 @@ class TestV1MetalModelRunnerExecuteModel:
 
 
 class TestV1MetalModelRunnerGDNSubmit:
+    def make_gdn_cache(self) -> GDNPagedStateCache:
+        return GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+
     def make_runtime_with_side_effects(self) -> ForwardOutputRuntimeStub:
         conv_states = [
             mx.array([1], dtype=mx.float32),
@@ -1226,17 +1240,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         self, monkeypatch
     ) -> None:
         submitted: list[tuple[object, ...]] = []
-        cache = GDNPagedStateCache(
-            num_layers=1,
-            max_seqs=2,
-            conv_kernel_dim=2,
-            conv_dim=4,
-            num_v_heads=1,
-            value_head_dim=4,
-            key_head_dim=32,
-            initial_seqs=0,
-            dtype=mx.float32,
-        )
+        cache = self.make_gdn_cache()
         pending_conv = mx.full((1, 1, 4), 7, dtype=mx.float32)
         pending_recurrent = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
         cache.ensure_capacity(2)
@@ -1255,20 +1259,101 @@ class TestV1MetalModelRunnerGDNSubmit:
         assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 
-    def test_hybrid_submits_logits_and_updated_gdn_states(self, monkeypatch) -> None:
+    def test_hybrid_submits_primary_outputs_before_gdn_states(
+        self, monkeypatch
+    ) -> None:
         submitted: list[tuple[object, ...]] = []
         runtime = self.make_runtime_with_side_effects()
         runner = make_stub_runner(_paged_attention_runtime=runtime)
         logits = mx.array([0], dtype=mx.float32)
-        expected_states = runtime._arrays
+        target_hidden_states = mx.array([5], dtype=mx.float32)
         monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
 
-        runner._submit_paged_forward_outputs(logits)
+        runner._submit_paged_forward_outputs(logits, target_hidden_states)
 
         assert len(submitted) == 1
         assert submitted[0][0] is logits
-        assert len(submitted[0][1:]) == len(expected_states)
-        for actual, expected in zip(submitted[0][1:], expected_states, strict=True):
+        assert submitted[0][1] is target_hidden_states
+        for actual, expected in zip(submitted[0][2:], runtime._arrays, strict=True):
+            assert actual is expected
+
+    def test_pooling_forward_submits_runtime_outputs(self, monkeypatch) -> None:
+        submitted: list[tuple[object, ...]] = []
+        runtime = self.make_runtime_with_side_effects()
+        runner = make_stub_runner(
+            _paged_attention_runtime=runtime,
+            _is_pooling=True,
+            _paged_block_size=4,
+            num_layers=0,
+        )
+        pooling_hidden_states = mx.array([[[1.0]]], dtype=mx.float32)
+        monkeypatch.setattr(
+            mr,
+            "forward_sequence_hidden_states",
+            lambda *args, **kwargs: pooling_hidden_states,
+        )
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[
+                mr.PrefillRequest(
+                    req_id="pool-0",
+                    token_ids=[1],
+                    sampling_params=SamplingParams(),
+                    block_ids=[0],
+                    generator=None,
+                    prompt_len=1,
+                    start_pos=0,
+                    full_prompt_token_ids=[1],
+                    pooling_params=PoolingParams(),
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+        )
+
+        assert len(submitted) == 1
+        assert submitted[0][0] is pooling_hidden_states
+        for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
+            assert actual is expected
+
+    def test_non_last_pp_send_submits_runtime_outputs(self, monkeypatch) -> None:
+        submitted: list[tuple[object, ...]] = []
+        runtime = self.make_runtime_with_side_effects()
+        runner = make_stub_runner(
+            _paged_attention_runtime=runtime,
+            _paged_block_size=4,
+            num_layers=0,
+        )
+        runner.pp = SimpleNamespace(size=2, is_last=False)
+        stage_output = mx.array([[[1.0]]], dtype=mx.float32)
+        send_handle = mx.array([2.0], dtype=mx.float32)
+        runner._pp_model = lambda input_ids, cache: stage_output
+        monkeypatch.setattr(mr, "pipeline_send", lambda output, pp: send_handle)
+        monkeypatch.setattr(mr.mx, "async_eval", lambda *args: submitted.append(args))
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[
+                mr.PrefillRequest(
+                    req_id="pp-0",
+                    token_ids=[1],
+                    sampling_params=SamplingParams(),
+                    block_ids=[0],
+                    generator=None,
+                    prompt_len=1,
+                    start_pos=0,
+                    full_prompt_token_ids=[1],
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+        )
+
+        assert len(submitted) == 1
+        assert submitted[0][0] is send_handle
+        for actual, expected in zip(submitted[0][1:], runtime._arrays, strict=True):
             assert actual is expected
 
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
@@ -1288,6 +1373,50 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._submit_paged_forward_outputs(logits)
 
         assert submitted == [(logits,)]
+
+    def test_non_last_pp_sample_materializes_reused_slot_state(self) -> None:
+        cache = self.make_gdn_cache()
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner.pp = SimpleNamespace(size=2, is_last=False)
+        runner._execute_model_state = object()
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        runner._paged_request_seq_lens["done"] = 1
+
+        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        runner._cleanup_finished_requests({"done"}, materialize_runtime_state=False)
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        assert reused_slot == released_slot
+
+        cache.set_pending_conv_state(
+            0, [reused_slot], mx.full((1, 1, 4), 7, dtype=mx.float32)
+        )
+        cache.set_pending_recurrent_state(
+            0,
+            [reused_slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output is mr.EMPTY_MODEL_RUNNER_OUTPUT
+        assert runner._execute_model_state is None
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][reused_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][reused_slot]),
+            9,
+        )
+        assert runtime.gdn_state_manager.needs_materialize is False
 
 
 class TestV1MetalModelRunnerGDNLifecycle:
