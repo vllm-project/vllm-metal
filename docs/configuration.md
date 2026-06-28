@@ -23,6 +23,13 @@
 - `text-only-compat`: use the same compatibility allowlist as `auto`.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 
+## Speculative Decoding
+
+Pass `--speculative-config` with a JSON object to enable speculative decoding.
+Use `--no-async-scheduling` (required for all spec-decode methods on Metal).
+See [Speculative Decoding](speculative_decoding.md) for supported methods,
+model pairing, and memory considerations.
+
 ## Paged KV vs MLX KV Memory Settings
 
 - MLX path (`VLLM_METAL_USE_PAGED_ATTENTION=0`): `VLLM_METAL_MEMORY_FRACTION` must be `auto`.
