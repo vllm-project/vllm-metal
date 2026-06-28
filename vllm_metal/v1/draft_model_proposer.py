@@ -262,8 +262,6 @@ class DraftModelProposer:
         block_ids = self._ensure_draft_blocks(
             req_id, committed_len + self._num_speculative_tokens
         )
-        if block_ids is None:
-            return None  # draft cache exhausted; skip drafting this request
         return _DraftPlan(
             req_id=req_id,
             block_ids=block_ids,
@@ -272,22 +270,18 @@ class DraftModelProposer:
             ingest_tokens=list(state.token_ids[draft_seq_len:committed_len]),
         )
 
-    def _ensure_draft_blocks(self, req_id: str, num_positions: int) -> list[int] | None:
+    def _ensure_draft_blocks(self, req_id: str, num_positions: int) -> list[int]:
         """Grow this request's draft block table to cover ``num_positions``."""
         needed = (num_positions + self._block_size - 1) // self._block_size
         blocks = self._req_blocks.setdefault(req_id, [])
         while len(blocks) < needed:
             if not self._free_blocks:
-                # Draft pool drained (it shares the target's num_blocks but must
-                # cover committed_len + K). Skip drafting this request — lowers
-                # speedup, not correctness. Most likely at high concurrency or
-                # near max context; see the KV-budget note in the module docstring.
-                logger.warning_once(
-                    "Draft KV cache exhausted; speculative drafting skipped for "
-                    "some requests (acceptance/speedup will drop). Lower "
-                    "--max-num-seqs or raise VLLM_METAL_MEMORY_FRACTION."
+                raise RuntimeError(
+                    f"Draft KV cache exhausted: request {req_id!r} needs "
+                    f"{needed} blocks but the draft pool is empty "
+                    f"({len(self._req_blocks)} active requests). "
+                    "Lower --max-num-seqs or raise VLLM_METAL_MEMORY_FRACTION."
                 )
-                return None
             blocks.append(self._free_blocks.pop())
         return blocks
 

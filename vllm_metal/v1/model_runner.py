@@ -828,6 +828,18 @@ class MetalModelRunner:
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
             )
+            max_num_seqs = self.scheduler_config.max_num_seqs
+            extra_per_req = (
+                spec.num_speculative_tokens + block_size - 1
+            ) // block_size
+            if num_blocks < max_num_seqs * extra_per_req:
+                raise ValueError(
+                    f"Draft KV cache too small: {num_blocks} blocks cannot "
+                    f"support {max_num_seqs} concurrent requests each needing "
+                    f"{extra_per_req} extra block(s) for "
+                    f"{spec.num_speculative_tokens} speculative tokens. "
+                    "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
+                )
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
