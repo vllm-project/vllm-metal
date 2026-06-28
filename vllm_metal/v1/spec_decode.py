@@ -94,7 +94,11 @@ class SpeculativeDecodeController:
         if use_async_scheduling and (
             Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
             or (
-                speculative_config is not None and speculative_config.uses_draft_model()
+                speculative_config is not None
+                and (
+                    speculative_config.uses_draft_model()
+                    or speculative_config.method == "ngram"
+                )
             )
         ):
             raise NotImplementedError(

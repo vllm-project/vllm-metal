@@ -1,17 +1,17 @@
 # Speculative Decoding
 
-vllm-metal supports two speculative decoding methods on the paged attention
-path. Both require synchronous scheduling and greedy sampling.
+vllm-metal supports three speculative decoding methods on the paged attention
+path. All require synchronous scheduling and greedy sampling.
 
-| | MTP | Draft Model |
-|---|---|---|
-| `--speculative-config` method | `mtp` | `draft_model` |
-| Target models | Gemma4 (paged) | Any paged-attention model |
-| Draft source | MTP assistant checkpoint (reads target KV cache) | Separate smaller model (own KV cache) |
-| `num_speculative_tokens` | 1 | Configurable (3–5 typical) |
-| Extra memory | None (reads target KV cache) | Second un-budgeted KV cache |
+| | MTP | Draft Model | N-gram |
+|---|---|---|---|
+| `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
+| Target models | Gemma4 (paged) | Any paged-attention model | Any paged-attention model |
+| Draft source | MTP assistant checkpoint (reads target KV cache) | Separate smaller model (own KV cache) | Prompt/output token history (no model) |
+| `num_speculative_tokens` | 1 | Configurable (3–5 typical) | Configurable (3–5 typical) |
+| Extra memory | None (reads target KV cache) | Second un-budgeted KV cache | None |
 
-Both methods:
+All three methods:
 
 - Require `--no-async-scheduling` (vLLM auto-disables async for most spec-decode
   methods; pass it explicitly to be safe).
@@ -142,3 +142,45 @@ from RedHatAI/speculator_benchmarks:
 - **Single-stream:** 1.36–1.48x TPOT improvement (K=3–5).
 - **Batched (concurrency 32):** K=3 gives +11% throughput; K=5 turns
   net-negative as draft compute exceeds the savings.
+
+---
+
+## N-gram
+
+N-gram (prompt-lookup) speculative decoding drafts with **no model at all**: each
+step it matches the longest suffix n-gram of the request's token history against
+an earlier occurrence and proposes the tokens that followed it. The match runs on
+CPU (vLLM's Numba kernel), so there is no extra GPU memory and no second cache.
+
+It shines on workloads with repeated spans — code completion, JSON/structured
+output, summarization or RAG that echoes the prompt, and agentic loops. On free-form
+prose with little repetition most drafts are rejected and it adds little.
+
+### Serve
+
+```bash
+VLLM_METAL_USE_PAGED_ATTENTION=1 \
+vllm serve Qwen/Qwen3-8B \
+  --max-model-len 2048 \
+  --no-async-scheduling \
+  --speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":3}'
+```
+
+Confirm speculative decoding is active: the server log shows
+`N-gram speculative decoding enabled (...)` at startup and periodic
+`SpecDecoding metrics ... Avg Draft acceptance rate`.
+
+### Tuning
+
+- `num_speculative_tokens` — how many tokens to copy after a match (K).
+- `prompt_lookup_min` / `prompt_lookup_max` — the n-gram length window to match.
+  Lower `prompt_lookup_min` matches more aggressively (more drafts, more
+  rejections); higher values match only longer, higher-confidence repeats.
+  Defaults to 5/5 when unset.
+
+### Limitations
+
+- Paged path only (`VLLM_METAL_USE_PAGED_ATTENTION=1`), greedy only, and
+  synchronous scheduling only — same as the other methods.
+- Acceleration depends entirely on the input having repeated token spans; there
+  is no learned drafter to generalize beyond literal repeats.

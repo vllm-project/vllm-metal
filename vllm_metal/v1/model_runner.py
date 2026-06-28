@@ -713,10 +713,19 @@ class MetalModelRunner:
                     f"{spec.num_speculative_tokens} speculative tokens. "
                     "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
                 )
+        elif spec.method == "ngram":
+            from vllm_metal.v1.ngram_proposer import NgramProposer
+
+            # N-gram drafts from token history alone — no model, no KV cache, so
+            # num_blocks/block_size are unused here.
+            self._drafter = NgramProposer.build(
+                vllm_config=self.vllm_config,
+                controller=self._spec_decode_controller,
+            )
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model)."
+                "(supported: Gemma4 MTP, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(

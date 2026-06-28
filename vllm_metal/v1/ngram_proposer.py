@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+"""N-gram (prompt-lookup) speculative decoding proposer for the Metal paged path.
+
+An :class:`NgramProposer` drafts by matching the longest suffix n-gram of each
+request's committed token history against an earlier occurrence and copying the
+tokens that followed it (vLLM ``method="ngram"``). Unlike
+:class:`vllm_metal.v1.draft_model_proposer.DraftModelProposer` it loads no model
+and keeps no KV cache: the matching is the pure-Python + Numba KMP kernel that
+vLLM ships in :mod:`vllm.v1.spec_decode.ngram_proposer`, which this class wraps.
+
+The wrapper's only job is to translate the per-step :class:`ProposeContext` into
+the three array arguments that upstream's stateless ``propose`` expects
+(``sampled_token_ids``, ``num_tokens_no_spec``, ``token_ids_cpu``) and hand the
+result back as :class:`DraftTokenIds`. The committed history lives in
+``state.token_ids`` (already updated with this step's accepted/sampled tokens by
+the time the runner builds the context), so no per-request bookkeeping is needed.
+
+The verify half is unchanged: drafts are handed back via ``take_draft_token_ids``
+and verified next step by ``SpeculativeDecodeController.verify_greedy``.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+from vllm.logger import init_logger
+from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from vllm.config import VllmConfig
+
+    from vllm_metal.v1.model_runner import RequestState
+    from vllm_metal.v1.proposer import ProposeContext
+    from vllm_metal.v1.spec_decode import (
+        PagedDecodeSegment,
+        SpeculativeDecodeController,
+    )
+
+logger = init_logger(__name__)
+
+
+class NgramProposer:
+    """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        controller: SpeculativeDecodeController,
+    ) -> None:
+        self._controller = controller
+        # Upstream reads only scalar config (prompt_lookup_min/max,
+        # num_speculative_tokens, max_model_len, max_num_seqs) and runs a one-time
+        # Numba JIT warmup in its constructor — keep that off the hot path.
+        self._ngram = VllmNgramProposer(vllm_config)
+        spec = vllm_config.speculative_config
+        assert spec is not None
+        logger.info(
+            "N-gram speculative decoding enabled "
+            "(prompt_lookup=[%d, %d], num_speculative_tokens=%d)",
+            spec.prompt_lookup_min,
+            spec.prompt_lookup_max,
+            spec.num_speculative_tokens,
+        )
+
+    # -- construction --------------------------------------------------------
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        vllm_config: VllmConfig,
+        controller: SpeculativeDecodeController,
+    ) -> NgramProposer:
+        return cls(vllm_config=vllm_config, controller=controller)
+
+    # -- MetalProposer protocol ---------------------------------------------
+
+    def needs_target_hidden_states(
+        self,
+        decode_segments: Sequence[PagedDecodeSegment],
+        *,
+        has_final_prefill: bool,
+    ) -> bool:
+        # N-gram matches token ids only; it never reads the target's hidden states.
+        return False
+
+    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        drafting = self._collect_drafting_requests(ctx)
+        if not drafting:
+            return None
+
+        # Upstream marks a row "active" by a non-empty sampled-ids entry; the
+        # match itself reads only token_ids_cpu[i, :num_tokens_no_spec[i]]. We
+        # forward exactly the requests we have decided may draft, so every row is
+        # active and num_tokens_no_spec is the committed history length.
+        num_requests = len(drafting)
+        num_tokens_no_spec = np.array(
+            [len(state.token_ids) for _, state in drafting], dtype=np.int32
+        )
+        width = max(int(num_tokens_no_spec.max()), 1)
+        token_ids_cpu = np.zeros((num_requests, width), dtype=np.int32)
+        for i, (_, state) in enumerate(drafting):
+            token_ids_cpu[i, : len(state.token_ids)] = state.token_ids
+        sampled_token_ids: list[list[int]] = [[0]] * num_requests
+
+        drafts = self._ngram.propose(
+            sampled_token_ids,
+            num_tokens_no_spec,
+            token_ids_cpu,
+        )
+
+        req_ids: list[str] = []
+        draft_token_ids: list[list[int]] = []
+        for (req_id, _), draft in zip(drafting, drafts, strict=True):
+            if not draft:
+                continue
+            req_ids.append(req_id)
+            draft_token_ids.append([int(token) for token in draft])
+
+        if not req_ids:
+            return None
+
+        return DraftTokenIds(req_ids=req_ids, draft_token_ids=draft_token_ids)
+
+    # -- internals -----------------------------------------------------------
+
+    def _collect_drafting_requests(
+        self, ctx: ProposeContext
+    ) -> list[tuple[str, RequestState]]:
+        """Greedy decode + finalized prefill requests eligible to draft.
+
+        Mirrors ``DraftModelProposer._collect_draft_plans``: skip rows that did
+        not sample, intermediate prefill chunks, and non-greedy requests.
+        """
+        drafting: list[tuple[str, RequestState]] = []
+        seen: set[str] = set()
+
+        for (req_id, state), sampled_ids in zip(
+            ctx.decode_reqs, ctx.decode_token_ids, strict=True
+        ):
+            if not sampled_ids:
+                continue
+            if not self._controller.can_draft_greedy(
+                req_id, state, logitsprocs=ctx.logitsprocs
+            ):
+                continue
+            drafting.append((req_id, state))
+            seen.add(req_id)
+
+        for prefill, result_mode in zip(
+            ctx.prefill_reqs, ctx.prefill_result_modes, strict=True
+        ):
+            if result_mode == "intermediate" or prefill.req_id in seen:
+                continue
+            state = ctx.request_states.get(prefill.req_id)
+            if state is None or not self._controller.can_draft_greedy(
+                prefill.req_id, state, logitsprocs=ctx.logitsprocs
+            ):
+                continue
+            drafting.append((prefill.req_id, state))
+
+        return drafting
