@@ -21,6 +21,8 @@ from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
+    from vllm_metal.v1.model_runner import RequestState
+
 
 class _PagedDecodeStateLike(Protocol):
     token_ids: Sequence[int]
@@ -361,6 +363,57 @@ class SpeculativeDecodeController:
         except NotImplementedError:
             return False
         return True
+
+    def draft_eligible_requests(
+        self,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        decode_token_ids: Sequence[Sequence[int]],
+        prefill_reqs: Sequence[_SpecDecodePrefillLike],
+        prefill_result_modes: Sequence[str],
+        request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        *,
+        logitsprocs: LogitsProcessors | None,
+    ) -> Sequence[tuple[str, RequestState]]:
+        """Filter ``ctx`` to requests eligible for drafting this step.
+
+        Shared eligibility filter used by every Metal proposer that drafts
+        greedily (draft-model and n-gram spec decode, plus the Gemma4 MTP
+        seed builder): skip decode rows that did not sample this step, skip
+        non-greedy requests via :meth:`can_draft_greedy`, skip intermediate
+        prefill chunks, and de-duplicate prefill rows whose ``req_id`` was
+        already admitted through decode.
+
+        Callers post-process the returned pairs (e.g. the draft-model
+        proposer maps each to its per-step ingest plan and drops rows with
+        no newly-committed tokens), but the eligibility decisions live here
+        so the three proposers cannot drift out of sync.
+        """
+        eligible: list[tuple[str, RequestState]] = []
+        seen: set[str] = set()
+
+        for (req_id, state), sampled_ids in zip(
+            decode_reqs, decode_token_ids, strict=True
+        ):
+            if not sampled_ids:
+                continue
+            if not self.can_draft_greedy(req_id, state, logitsprocs=logitsprocs):
+                continue
+            eligible.append((req_id, state))  # type: ignore[arg-type]
+            seen.add(req_id)
+
+        for prefill, result_mode in zip(
+            prefill_reqs, prefill_result_modes, strict=True
+        ):
+            if result_mode == "intermediate" or prefill.req_id in seen:
+                continue
+            state = request_states.get(prefill.req_id)
+            if state is None or not self.can_draft_greedy(
+                prefill.req_id, state, logitsprocs=logitsprocs
+            ):
+                continue
+            eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
+
+        return eligible
 
     def _validate_greedy_sampling(
         self,

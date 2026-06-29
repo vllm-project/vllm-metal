@@ -216,37 +216,23 @@ class DraftModelProposer:
                 del self._draft_seq_lens[req_id]
 
     def _collect_draft_plans(self, ctx: ProposeContext) -> list[_DraftPlan]:
+        # Eligibility filter (greedy + non-intermediate prefill + greedy-only
+        # sampling) is shared with every greedy drafter; this step then builds
+        # per-request ingest plans and drops any row with no newly-committed
+        # tokens to ingest.
+        eligible = self._controller.draft_eligible_requests(
+            ctx.decode_reqs,
+            ctx.decode_token_ids,
+            ctx.prefill_reqs,
+            ctx.prefill_result_modes,
+            ctx.request_states,
+            logitsprocs=ctx.logitsprocs,
+        )
         plans: list[_DraftPlan] = []
-        seen: set[str] = set()
-
-        for (req_id, state), sampled_ids in zip(
-            ctx.decode_reqs, ctx.decode_token_ids, strict=True
-        ):
-            if not sampled_ids:
-                continue
-            if not self._controller.can_draft_greedy(
-                req_id, state, logitsprocs=ctx.logitsprocs
-            ):
-                continue
+        for req_id, state in eligible:
             plan = self._make_plan(req_id, state)
             if plan is not None:
                 plans.append(plan)
-                seen.add(req_id)
-
-        for prefill, result_mode in zip(
-            ctx.prefill_reqs, ctx.prefill_result_modes, strict=True
-        ):
-            if result_mode == "intermediate" or prefill.req_id in seen:
-                continue
-            state = ctx.request_states.get(prefill.req_id)
-            if state is None or not self._controller.can_draft_greedy(
-                prefill.req_id, state, logitsprocs=ctx.logitsprocs
-            ):
-                continue
-            plan = self._make_plan(prefill.req_id, state)
-            if plan is not None:
-                plans.append(plan)
-
         return plans
 
     def _make_plan(self, req_id: str, state: RequestState) -> _DraftPlan | None:

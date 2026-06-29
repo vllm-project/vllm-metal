@@ -149,34 +149,18 @@ class NgramProposer:
     ) -> list[tuple[str, RequestState]]:
         """Greedy decode + finalized prefill requests eligible to draft.
 
-        Mirrors ``DraftModelProposer._collect_draft_plans``: skip rows that did
-        not sample, intermediate prefill chunks, and non-greedy requests.
+        Delegates to
+        :meth:`SpeculativeDecodeController.draft_eligible_requests` so the
+        eligibility contract lives in a single place, shared with the draft
+        model (and, in future, any other proposers that draft greedily).
         """
-        drafting: list[tuple[str, RequestState]] = []
-        seen: set[str] = set()
-
-        for (req_id, state), sampled_ids in zip(
-            ctx.decode_reqs, ctx.decode_token_ids, strict=True
-        ):
-            if not sampled_ids:
-                continue
-            if not self._controller.can_draft_greedy(
-                req_id, state, logitsprocs=ctx.logitsprocs
-            ):
-                continue
-            drafting.append((req_id, state))
-            seen.add(req_id)
-
-        for prefill, result_mode in zip(
-            ctx.prefill_reqs, ctx.prefill_result_modes, strict=True
-        ):
-            if result_mode == "intermediate" or prefill.req_id in seen:
-                continue
-            state = ctx.request_states.get(prefill.req_id)
-            if state is None or not self._controller.can_draft_greedy(
-                prefill.req_id, state, logitsprocs=ctx.logitsprocs
-            ):
-                continue
-            drafting.append((prefill.req_id, state))
-
-        return drafting
+        return list(
+            self._controller.draft_eligible_requests(
+                ctx.decode_reqs,
+                ctx.decode_token_ids,
+                ctx.prefill_reqs,
+                ctx.prefill_result_modes,
+                ctx.request_states,
+                logitsprocs=ctx.logitsprocs,
+            )
+        )
