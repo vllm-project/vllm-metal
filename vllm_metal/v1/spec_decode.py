@@ -91,16 +91,10 @@ class SpeculativeDecodeController:
         speculative_config: SpeculativeConfig | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
-        if use_async_scheduling and (
-            Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
-            or (
-                speculative_config is not None
-                and (
-                    speculative_config.uses_draft_model()
-                    or speculative_config.method == "ngram"
-                )
-            )
-        ):
+        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
+        # back to the scheduler synchronously via take_draft_token_ids(), so
+        # async scheduling is unsupported whenever SD is enabled.
+        if use_async_scheduling and speculative_config is not None:
             raise NotImplementedError(
                 "Speculative decoding on Metal requires synchronous scheduling "
                 "so take_draft_token_ids() can hand drafts back to the "

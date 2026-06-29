@@ -59,12 +59,25 @@ class NgramProposer:
         self._ngram = VllmNgramProposer(vllm_config)
         spec = vllm_config.speculative_config
         assert spec is not None
+
+        # Pre-allocate the int32 token-id buffer once. Upstream only reads
+        # ``token_ids_cpu[i, :num_tokens_no_spec[i]]`` per row, so the buffer
+        # just needs to be large enough to hold the longest any request's
+        # committed history can ever be, across every simultaneously-scheduled
+        # request. Reusing it removes a per-step ``np.zeros`` allocation.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        max_model_len = vllm_config.model_config.max_model_len
+        self._token_ids_cpu = np.zeros((max_num_seqs, max_model_len), dtype=np.int32)
         logger.info(
             "N-gram speculative decoding enabled "
-            "(prompt_lookup=[%d, %d], num_speculative_tokens=%d)",
+            "(prompt_lookup=[%d, %d], num_speculative_tokens=%d, "
+            "token_ids_cpu=(%d, %d) (%.2f MiB))",
             spec.prompt_lookup_min,
             spec.prompt_lookup_max,
             spec.num_speculative_tokens,
+            max_num_seqs,
+            max_model_len,
+            self._token_ids_cpu.nbytes / (1024 * 1024),
         )
 
     # -- construction --------------------------------------------------------
@@ -102,8 +115,8 @@ class NgramProposer:
         num_tokens_no_spec = np.array(
             [len(state.token_ids) for _, state in drafting], dtype=np.int32
         )
-        width = max(int(num_tokens_no_spec.max()), 1)
-        token_ids_cpu = np.zeros((num_requests, width), dtype=np.int32)
+        token_ids_cpu = self._token_ids_cpu[:num_requests]
+        token_ids_cpu[:, :] = 0
         for i, (_, state) in enumerate(drafting):
             token_ids_cpu[i, : len(state.token_ids)] = state.token_ids
         sampled_token_ids: list[list[int]] = [[0]] * num_requests
@@ -120,7 +133,9 @@ class NgramProposer:
             if not draft:
                 continue
             req_ids.append(req_id)
-            draft_token_ids.append([int(token) for token in draft])
+            # Upstream already yields Python ints via ndarray.tolist() — the
+            # old ``[int(t) for t in draft]`` was redundant.
+            draft_token_ids.append(list(draft))
 
         if not req_ids:
             return None
