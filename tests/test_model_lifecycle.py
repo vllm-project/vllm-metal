@@ -20,7 +20,7 @@ from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
-from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.model_lifecycle import GenerationLoadRequest, ModelLifecycle
 
 _TEXT_MODEL_ARGS = {
     "vocab_size": 32000,
@@ -230,6 +230,33 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner._is_vlm is False
+
+    def test_generation_load_request_resolves_effective_vlm_once(self) -> None:
+        hf_config = SimpleNamespace(model_type="custom")
+        calls: list[object] = []
+
+        class _Adapter:
+            def should_force_text_backbone(self, config: object) -> bool:
+                calls.append(config)
+                return True
+
+        runner = make_stub_runner(
+            metal_config=SimpleNamespace(debug=False),
+            model_config=_runner_model_config(
+                hf_config=hf_config,
+                is_multimodal_model=True,
+                trust_remote_code=True,
+            ),
+        )
+
+        request = GenerationLoadRequest.from_runner(runner, _Adapter())
+
+        assert request.model_name == "stub-model"
+        assert request.hf_config is hf_config
+        assert request.is_vlm is False
+        assert request.target_dtype is not None
+        assert request.tokenizer_config == {"trust_remote_code": True}
+        assert calls == [hf_config]
 
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
