@@ -9,6 +9,7 @@ import psutil
 import torch
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 
+import vllm_metal.envs as envs
 from vllm_metal.config import get_config
 
 if TYPE_CHECKING:
@@ -401,6 +402,17 @@ class MetalPlatform(Platform):
         # mx.distributed data plane (point-to-point send/recv), wired in the
         # model runner (see MetalModelRunner._start_paged_forward). The control
         # plane stays on vLLM's gloo group; the two transports coexist.
+        if parallel_config.pipeline_parallel_size > 1:
+            base_port = envs.VLLM_METAL_RING_BASE_PORT
+            max_port = base_port + parallel_config.pipeline_parallel_size - 1
+            if max_port > 65535:
+                raise ValueError(
+                    "VLLM_METAL_RING_BASE_PORT is too high for "
+                    "pipeline_parallel_size: "
+                    f"base {base_port} with pipeline_parallel_size="
+                    f"{parallel_config.pipeline_parallel_size} would use port "
+                    f"{max_port}"
+                )
 
         # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
         # GPU per node cannot shard a TP>1 model, and there is no cross-device

@@ -136,6 +136,23 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    def test_check_and_update_config_rejects_pipeline_ring_port_overflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
     def test_check_and_update_config_rejects_pipeline_with_async_scheduling(
         self,
     ) -> None:

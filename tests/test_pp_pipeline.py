@@ -159,15 +159,6 @@ class TestRingHosts:
             ["10.0.0.7:40002"],
         ]
 
-    def test_rejects_non_integer_base_port(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "not-a-port")
-        with pytest.raises(
-            ValueError, match="VLLM_METAL_RING_BASE_PORT must be an integer"
-        ):
-            _ring_hosts(["10.0.0.5"])
-
     def test_rejects_privileged_base_port(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

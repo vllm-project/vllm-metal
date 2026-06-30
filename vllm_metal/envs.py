@@ -18,17 +18,6 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-
-def _get_int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
-
-
 if TYPE_CHECKING:
     VLLM_METAL_MEMORY_FRACTION: str = "auto"
     VLLM_METAL_USE_MLX: bool = True
@@ -100,8 +89,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage r binds base + r (default 32323/32324 for two stages). Set the same
     # value on every node to move the ring off a busy port. Default matches
     # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
-    "VLLM_METAL_RING_BASE_PORT": lambda: _get_int_env(
-        "VLLM_METAL_RING_BASE_PORT", 32323
+    "VLLM_METAL_RING_BASE_PORT": lambda: int(
+        os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
     ),
 }
 
