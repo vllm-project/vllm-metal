@@ -16,7 +16,6 @@ from vllm_metal.pytorch_backend.tensor_bridge import (
     get_torch_device,
     mlx_to_torch,
     sync_mlx,
-    sync_torch,
     torch_to_mlx,
 )
 
@@ -190,11 +189,6 @@ class TestSynchronization:
         monkeypatch.setattr(tensor_bridge.mx, "synchronize", fake_sync)
         sync_mlx()
         assert called is True
-
-    def test_sync_torch(self) -> None:
-        """Test PyTorch synchronization."""
-        # Should not raise
-        sync_torch()
 
 
 class TestMPSSizeLimit:

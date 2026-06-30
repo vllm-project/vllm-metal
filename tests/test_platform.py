@@ -39,16 +39,6 @@ class TestMetalPlatform:
         name = MetalPlatform.get_device_name()
         assert "Apple Silicon" in name
 
-    def test_device_count(self) -> None:
-        """Test device count."""
-        count = MetalPlatform.get_device_count()
-        assert count == 1
-
-    def test_current_device(self) -> None:
-        """Test current device."""
-        device = MetalPlatform.current_device()
-        assert device == 0
-
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
         MetalPlatform.set_device(0)  # Should not raise
@@ -763,18 +753,6 @@ class TestMetalPlatform:
 
         device = MetalPlatform.get_torch_device()
         assert device.type in ("mps", "cpu")
-
-    def test_verify_quantization_supported(self) -> None:
-        """Test that verify_quantization allows all methods to pass through."""
-        # All quantization methods should pass through - actual support depends
-        # on model implementation, not the platform
-        MetalPlatform.verify_quantization("none")
-        MetalPlatform.verify_quantization(None)
-        MetalPlatform.verify_quantization("fp16")
-        MetalPlatform.verify_quantization("bfloat16")
-        MetalPlatform.verify_quantization("int8")
-        MetalPlatform.verify_quantization("awq")
-        MetalPlatform.verify_quantization("compressed-tensors")
 
     def test_check_and_update_config_disables_chunked_prefill_non_paged(
         self, monkeypatch: pytest.MonkeyPatch

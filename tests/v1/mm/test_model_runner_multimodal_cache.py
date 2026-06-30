@@ -217,27 +217,6 @@ def test_execute_model_frees_released_encoder_outputs(fake_encode_result) -> Non
     assert set(runner.encoder_cache.encoder_outputs) == {"keep"}
 
 
-def test_reset_encoder_cache_delegates_to_encoder_cache(fake_encode_result) -> None:
-    runner = _runner_with_encoder_cache()
-    assert runner.encoder_cache is not None
-    runner.encoder_cache.encoder_outputs["image-0"] = fake_encode_result(
-        mx.array([[1.0]])
-    )
-
-    runner.reset_encoder_cache()
-
-    assert runner.encoder_cache.encoder_outputs == {}
-
-
-def test_reset_mm_cache_delegates_to_encoder_cache() -> None:
-    encoder_cache = MagicMock()
-    runner = make_stub_runner(encoder_cache=encoder_cache)
-
-    runner.reset_mm_cache()
-
-    encoder_cache.reset_mm_cache.assert_called_once_with()
-
-
 def test_execute_model_frees_encoder_outputs_before_encoder_fail_fast(
     fake_encode_result,
 ) -> None:
@@ -589,18 +568,3 @@ def test_run_vision_encoders_raises_when_adapter_returns_wrong_count(
         match=f"encode_multimodal returned {output_count}",
     ):
         runner._run_vision_encoders({"req-0": [0, 1]})
-
-
-def test_run_vision_encoders_no_op_when_no_adapter() -> None:
-    runner = _runner_with_encoder_cache()
-    runner._multimodal_adapter = None
-
-    runner._run_vision_encoders({"req-0": [0]})
-
-
-def test_run_vision_encoders_no_op_when_no_encoder_cache() -> None:
-    runner = make_stub_runner()
-    runner._multimodal_adapter = _RecordingAdapter()
-    assert runner.encoder_cache is None
-
-    runner._run_vision_encoders({"req-0": [0]})

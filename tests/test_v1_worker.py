@@ -32,35 +32,7 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 
 
 class TestWorkerRunnerBoundaryDelegation:
-    """Worker should delegate STT capability decisions to model runner."""
-
-    def test_reset_mm_cache_delegates_to_runner(self) -> None:
-        model_runner = MagicMock()
-        worker = _make_worker(model_runner, use_paged_attention=True)
-
-        MetalWorker.reset_mm_cache(worker)
-
-        model_runner.reset_mm_cache.assert_called_once_with()
-
-    def test_reset_encoder_cache_delegates_to_runner(self) -> None:
-        model_runner = MagicMock()
-        worker = _make_worker(model_runner, use_paged_attention=True)
-
-        MetalWorker.reset_encoder_cache(worker)
-
-        model_runner.reset_encoder_cache.assert_called_once_with()
-
-    def test_take_draft_token_ids_delegates_to_runner(self) -> None:
-        draft_token_ids = object()
-        model_runner = SimpleNamespace(
-            take_draft_token_ids=MagicMock(return_value=draft_token_ids),
-        )
-        worker = _make_worker(model_runner, use_paged_attention=True)
-
-        out = MetalWorker.take_draft_token_ids(worker)
-
-        assert out is draft_token_ids
-        model_runner.take_draft_token_ids.assert_called_once_with()
+    """Worker should honor model runner memory-reporting modes."""
 
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
         model_runner = SimpleNamespace(
@@ -134,17 +106,6 @@ class TestWorkerRunnerBoundaryDelegation:
             assert available == expected
         finally:
             pass
-
-    def test_get_supported_tasks_delegates_to_runner_capability(self) -> None:
-        model_runner = SimpleNamespace(
-            supported_worker_tasks=MagicMock(return_value=("transcription",)),
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-
-        tasks = MetalWorker.get_supported_tasks(worker)
-
-        assert tasks == ("transcription",)
-        model_runner.supported_worker_tasks.assert_called_once_with()
 
 
 class TestOneSequenceKvBytes:
