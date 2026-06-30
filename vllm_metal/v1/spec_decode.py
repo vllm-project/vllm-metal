@@ -376,17 +376,16 @@ class SpeculativeDecodeController:
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
-        Shared eligibility filter used by every Metal proposer that drafts
-        greedily (draft-model and n-gram spec decode, plus the Gemma4 MTP
-        seed builder): skip decode rows that did not sample this step, skip
-        non-greedy requests via :meth:`can_draft_greedy`, skip intermediate
-        prefill chunks, and de-duplicate prefill rows whose ``req_id`` was
-        already admitted through decode.
+        Shared eligibility filter used by the draft-model and n-gram proposers
+        that draft greedily: skip decode rows that did not sample this step,
+        skip non-greedy requests via :meth:`can_draft_greedy`, skip
+        intermediate prefill chunks, and de-duplicate prefill rows whose
+        ``req_id`` was already admitted through decode.
 
         Callers post-process the returned pairs (e.g. the draft-model
         proposer maps each to its per-step ingest plan and drops rows with
         no newly-committed tokens), but the eligibility decisions live here
-        so the three proposers cannot drift out of sync.
+        so the two proposers cannot drift out of sync.
         """
         eligible: list[tuple[str, RequestState]] = []
         seen: set[str] = set()

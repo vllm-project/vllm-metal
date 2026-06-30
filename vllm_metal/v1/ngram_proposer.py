@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
     from vllm.config import VllmConfig
 
-    from vllm_metal.v1.model_runner import RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import (
         PagedDecodeSegment,
@@ -103,7 +102,16 @@ class NgramProposer:
         return False
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        drafting = self._collect_drafting_requests(ctx)
+        drafting = list(
+            self._controller.draft_eligible_requests(
+                ctx.decode_reqs,
+                ctx.decode_token_ids,
+                ctx.prefill_reqs,
+                ctx.prefill_result_modes,
+                ctx.request_states,
+                logitsprocs=ctx.logitsprocs,
+            )
+        )
         if not drafting:
             return None
 
@@ -141,26 +149,3 @@ class NgramProposer:
             return None
 
         return DraftTokenIds(req_ids=req_ids, draft_token_ids=draft_token_ids)
-
-    # -- internals -----------------------------------------------------------
-
-    def _collect_drafting_requests(
-        self, ctx: ProposeContext
-    ) -> list[tuple[str, RequestState]]:
-        """Greedy decode + finalized prefill requests eligible to draft.
-
-        Delegates to
-        :meth:`SpeculativeDecodeController.draft_eligible_requests` so the
-        eligibility contract lives in a single place, shared with the draft
-        model (and, in future, any other proposers that draft greedily).
-        """
-        return list(
-            self._controller.draft_eligible_requests(
-                ctx.decode_reqs,
-                ctx.decode_token_ids,
-                ctx.prefill_reqs,
-                ctx.prefill_result_modes,
-                ctx.request_states,
-                logitsprocs=ctx.logitsprocs,
-            )
-        )
