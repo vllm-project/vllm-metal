@@ -98,13 +98,11 @@ class DraftModelProposer:
         block_size: int,
         num_blocks: int,
         num_layers: int,
-        num_speculative_tokens: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
     ) -> None:
         self._model = model
         self._block_size = block_size
-        self._num_speculative_tokens = num_speculative_tokens
         self._controller = controller
         self._extract_logits = extract_logits
         # Stateless RoPE/mask shims for the draft forward (one per layer). The
@@ -158,7 +156,6 @@ class DraftModelProposer:
             block_size=block_size,
             num_blocks=num_blocks,
             num_layers=dims.num_layers,
-            num_speculative_tokens=speculative_config.num_speculative_tokens,
             controller=controller,
             extract_logits=extract_logits,
         )

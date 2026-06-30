@@ -48,10 +48,12 @@ dependencies = [
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
+    # Keep aligned with vLLM 0.24.0's FastAPI/Starlette lower bounds.
     # Temporary cap: fastapi>=0.137 adds a `_IncludedRouter` route type that
     # crashes vLLM's prometheus middleware (vllm-project/vllm#45597).
     # TODO: remove once we bump to a vLLM release that includes vllm#45629.
-    "fastapi[standard]>=0.115.0,<0.137",
+    "fastapi[standard]>=0.133.0,<0.137",
+    "starlette>=1.0.1",
 ]
 
 [project.optional-dependencies]
