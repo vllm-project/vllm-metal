@@ -120,55 +120,14 @@ class ModelLifecycle:
             request,
         )
 
-    def _install_generation_model(
-        self,
-        loaded_model: LoadedGenerationModel,
-        request: GenerationLoadRequest,
-    ) -> None:
-        """Install loaded generation state used by runner execution paths."""
-
-        runner = self._runner
-        runner.model = loaded_model.model
-        runner.tokenizer = loaded_model.tokenizer
-        runner._is_vlm = request.is_vlm
-
-        # Adapter state follows the effective VLM mode, not the raw config flag.
-        multimodal_adapter = (
-            self._model_adapter.build_multimodal_adapter(
-                loaded_model.model, request.hf_config
-            )
-            if request.is_vlm
-            else None
-        )
-        runner._multimodal_adapter = multimodal_adapter
-        runner.encoder_cache = (
-            EncoderCache() if multimodal_adapter is not None else None
-        )
-
-        # Dimension resolution reads model_args immediately after this phase.
-        runner.model_args = loaded_model.model_args
-        runner._vocab_size = int(loaded_model.model_args["vocab_size"])
-        if runner.metal_config.debug:
-            logger.info("Model args: %s", loaded_model.model_args)
-
-    def _install_runtime_extensions(
-        self,
-        model_args: Mapping[str, Any],
-        request: GenerationLoadRequest,
-    ) -> None:
-        """Install optional runtime extensions after model dimensions resolve."""
-
-        runner = self._runner
-
-        # Clear stale extension state before loading replacement extensions.
-        runner._gemma4_mtp_assistant = None
-        gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
-            speculative_config=runner.vllm_config.speculative_config,
-            target_hf_config=request.hf_config,
-            target_model_args=model_args,
-        )
-        runner.kv_cache_dtype = request.target_dtype
-        runner._gemma4_mtp_assistant = gemma4_mtp_assistant
+    def resolve_model_dims(self) -> None:
+        """Resolve loaded model args into runner attention/cache dimensions."""
+        args = self._runner.model_args
+        default_head_dim = self._install_runner_attention_dims(args)
+        self._install_yoco_cache_mapping(args)
+        self._install_per_layer_attention_metadata(args, default_head_dim)
+        self._reject_pipeline_parallel_with_per_layer_metadata()
+        self._install_hybrid_attention_dims(args)
 
     def _load_generation(
         self,
@@ -213,7 +172,6 @@ class ModelLifecycle:
         is_gguf = not is_vlm and model_config.quantization == "gguf"
         awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
 
-        # GGUF text checkpoints use the local GGUF owner.
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
@@ -223,12 +181,10 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        # VLM checkpoints use mlx-vlm directly.
         elif is_vlm:
             load_label = "MLX-VLM model"
             model, tokenizer = mlx_vlm_load(model_name)
 
-        # AWQ text checkpoints own detection, load config, and dtype alignment.
         elif awq_loader is not None:
             load_label = "AWQ model"
             model, tokenizer = self._load_awq_text_model(
@@ -238,7 +194,6 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        # Plain text checkpoints use mlx-lm with vllm-metal path adaptation.
         else:
             load_label = "MLX-LM model"
             model, tokenizer = self._load_mlx_lm_text_model(
@@ -253,6 +208,24 @@ class ModelLifecycle:
             model_name,
         )
         return model, tokenizer
+
+    def _load_gguf_text_model(
+        self,
+        model_name: str,
+        model_config: Any,
+        target_dtype: Any,
+        tokenizer_config: Mapping[str, Any],
+    ) -> tuple[Any, Any]:
+        """Load a GGUF checkpoint through the optional GGUF owner."""
+        from vllm_metal.gguf.loader import GGUFModelLoader
+
+        loader = GGUFModelLoader.for_model(
+            model_name,
+            config_dir=model_config.tokenizer,
+            target_dtype=target_dtype,
+            tokenizer_config=dict(tokenizer_config),
+        )
+        return loader.load()
 
     def _load_awq_text_model(
         self,
@@ -280,26 +253,39 @@ class ModelLifecycle:
             )
         return model, tokenizer
 
-    def _load_gguf_text_model(
+    def _install_generation_model(
         self,
-        model_name: str,
-        model_config: Any,
-        target_dtype: Any,
-        tokenizer_config: Mapping[str, Any],
-    ) -> tuple[Any, Any]:
-        """Load a GGUF checkpoint through the optional GGUF owner."""
-        from vllm_metal.gguf.loader import GGUFModelLoader
+        loaded_model: LoadedGenerationModel,
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install loaded generation state used by runner execution paths."""
 
-        loader = GGUFModelLoader.for_model(
-            model_name,
-            config_dir=model_config.tokenizer,
-            target_dtype=target_dtype,
-            tokenizer_config=dict(tokenizer_config),
+        runner = self._runner
+        runner.model = loaded_model.model
+        runner.tokenizer = loaded_model.tokenizer
+        runner._is_vlm = request.is_vlm
+
+        # Adapter state follows the effective VLM mode, not the raw config flag.
+        multimodal_adapter = (
+            self._model_adapter.build_multimodal_adapter(
+                loaded_model.model, request.hf_config
+            )
+            if request.is_vlm
+            else None
         )
-        return loader.load()
+        runner._multimodal_adapter = multimodal_adapter
+        runner.encoder_cache = (
+            EncoderCache() if multimodal_adapter is not None else None
+        )
 
-    def resolve_model_dims(self) -> None:
-        args = self._runner.model_args
+        # Dimension resolution reads model_args immediately after this phase.
+        runner.model_args = loaded_model.model_args
+        runner._vocab_size = int(loaded_model.model_args["vocab_size"])
+        if runner.metal_config.debug:
+            logger.info("Model args: %s", loaded_model.model_args)
+
+    def _install_runner_attention_dims(self, args: dict[str, Any]) -> int | None:
+        """Install runner-wide attention dims and return the default head_dim."""
         num_layers = args.get("num_hidden_layers") or args.get("n_layers")
         num_attention_heads = args.get("num_attention_heads")
         num_kv_heads = (
@@ -308,62 +294,59 @@ class ModelLifecycle:
             or num_attention_heads
         )
         hidden_size = args.get("hidden_size")
-        base_head_dim = args.get("head_dim") or (
+        default_head_dim = args.get("head_dim") or (
             hidden_size // num_attention_heads
             if hidden_size and num_attention_heads
             else None
         )
-        head_dim = self._model_adapter.resolve_max_head_dim(args, base_head_dim)
+        head_dim = self._model_adapter.resolve_max_head_dim(args, default_head_dim)
 
-        missing = []
-        if not num_layers:
-            missing.append("num_layers (num_hidden_layers / n_layers)")
-        if not num_kv_heads:
-            missing.append("num_kv_heads (num_key_value_heads / n_kv_heads)")
-        if not head_dim:
-            missing.append("head_dim")
-        if missing:
+        if not num_layers or not num_kv_heads or not head_dim:
             raise ValueError(
-                f"Cannot resolve model dimensions: {', '.join(missing)}. "
+                "Cannot resolve model dimensions from model_args: "
+                f"num_layers={num_layers!r}, num_kv_heads={num_kv_heads!r}, "
+                f"head_dim={head_dim!r}. "
                 f"Available keys: {sorted(args.keys())}"
             )
 
-        self._runner.num_layers = int(num_layers)
-        self._runner.num_attention_heads = (
+        runner = self._runner
+        runner.num_layers = int(num_layers)
+        runner.num_attention_heads = (
             int(num_attention_heads) if num_attention_heads is not None else None
         )
-        self._runner.num_kv_heads = int(num_kv_heads)
-        self._runner.hidden_size = int(hidden_size) if hidden_size is not None else None
-        self._runner.head_dim = int(head_dim)
+        runner.num_kv_heads = int(num_kv_heads)
+        runner.hidden_size = int(hidden_size) if hidden_size is not None else None
+        runner.head_dim = int(head_dim)
 
-        if self._runner.is_mla:
-            self._runner.num_kv_heads = 1
-            self._runner.head_dim = int(args["kv_lora_rank"]) + int(
+        if runner.is_mla:
+            runner.num_kv_heads = 1
+            runner.head_dim = int(args["kv_lora_rank"]) + int(
                 args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
             )
+        return int(default_head_dim) if default_head_dim is not None else None
 
+    def _install_yoco_cache_mapping(self, args: dict[str, Any]) -> None:
+        """Install YOCO layer-to-cache mapping when the model uses shared KV."""
         yoco = self._model_adapter.build_yoco_cache_mapping(args)
         self._runner._yoco_cache_mapping = yoco
         self._runner.num_kv_cache_layers = (
             yoco[0] if yoco is not None else self._runner.num_layers
         )
 
-        # Per-layer KV shapes for heterogeneous models (Gemma4 26B/31B).
-        # Uses the unresolved ``base_head_dim`` so sliding-attention layers
-        # get their true head_dim (256) rather than the max-with-global used
-        # for cache allocation (512).  Returns None for uniform models,
-        # leaving the scalar paths on the runner unchanged.
-        #
-        # ``base_head_dim`` is None only when neither ``head_dim`` nor
-        # ``hidden_size / num_attention_heads`` could be resolved — the
-        # missing-check above already raises in that case, but we guard
-        # here too so ``int()`` never receives None.
-        if base_head_dim is not None:
+    def _install_per_layer_attention_metadata(
+        self,
+        args: dict[str, Any],
+        default_head_dim: int | None,
+    ) -> None:
+        """Install per-layer KV and sliding-window metadata."""
+        # Use the default head_dim before any global-attention widening so
+        # sliding-attention layers keep their true cache shape.
+        if default_head_dim is not None:
             per_layer = self._model_adapter.build_per_layer_kv_shapes(
                 args,
                 num_layers=self._runner.num_layers,
                 num_kv_heads=self._runner.num_kv_heads,
-                head_dim=int(base_head_dim),
+                head_dim=default_head_dim,
             )
         else:
             per_layer = None
@@ -379,13 +362,9 @@ class ModelLifecycle:
             )
         )
 
-        # Pipeline parallelism slices layers by index but leaves these per-layer
-        # KV lists at full length, so a non-first stage would index them by LOCAL
-        # layer and read the wrong global layer. They are non-None only for non-
-        # uniform models (e.g. Gemma4 interleaved sliding/full attention); reject
-        # PP for them until the split slices the lists too. ``pp`` is the runner's
-        # canonical PP signal (set by the worker before load, mirroring the
-        # forward path's ``self.pp`` checks).
+    def _reject_pipeline_parallel_with_per_layer_metadata(self) -> None:
+        """Reject PP until per-layer metadata is stage-sliced."""
+        # PP layer indices are stage-local; these metadata lists are still global.
         if (
             self._runner.pp is not None
             and self._runner.pp.size > 1
@@ -401,6 +380,8 @@ class ModelLifecycle:
                 "head dims, e.g. Gemma4)."
             )
 
+    def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
+        """Install hybrid linear-attention dimensions for GDN-style models."""
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
@@ -421,6 +402,25 @@ class ModelLifecycle:
                 self._runner.linear_num_k_heads * self._runner.linear_key_head_dim * 2
                 + self._runner.linear_num_v_heads * self._runner.linear_value_head_dim
             )
+
+    def _install_runtime_extensions(
+        self,
+        model_args: Mapping[str, Any],
+        request: GenerationLoadRequest,
+    ) -> None:
+        """Install optional runtime extensions after model dimensions resolve."""
+
+        runner = self._runner
+
+        # Clear stale extension state before loading replacement extensions.
+        runner._gemma4_mtp_assistant = None
+        gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
+            speculative_config=runner.vllm_config.speculative_config,
+            target_hf_config=request.hf_config,
+            target_model_args=model_args,
+        )
+        runner.kv_cache_dtype = request.target_dtype
+        runner._gemma4_mtp_assistant = gemma4_mtp_assistant
 
     def _extract_model_args(self, model: Any, is_vlm: bool) -> dict[str, Any]:
         # Both the .args (mlx-lm) and .config (HF) paths may expose a nested
