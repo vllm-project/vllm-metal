@@ -80,6 +80,7 @@ def _context(
         request_states=request_states,
         cu_seqlens=[],
         num_decode_segments=len(decode_reqs),
+        num_speculative_tokens=3,
         logitsprocs=None,
     )
 

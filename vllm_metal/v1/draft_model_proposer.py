@@ -16,7 +16,8 @@ A :class:`DraftModelProposer` drafts with a *separate* full model (vLLM
   position-for-position across the two caches; only the block table is owned
   separately.
 
-Each scheduler step ``propose()`` runs, batched over the dynamic mixed batch:
+Each scheduler step ``propose()`` runs, batched over the dynamic mixed batch
+with the scheduler-selected speculative token count:
 
 1. **Ingest** — for every drafting request, run the draft model over the
    committed-token suffix it has not yet written into the draft cache
@@ -175,8 +176,12 @@ class DraftModelProposer:
         return False
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        num_speculative_tokens = ctx.num_speculative_tokens
+        if num_speculative_tokens <= 0:
+            return None
+
         self._prune_finished(ctx.request_states)
-        plans = self._collect_draft_plans(ctx)
+        plans = self._collect_draft_plans(ctx, num_speculative_tokens)
         if not plans:
             return None
 
@@ -185,7 +190,7 @@ class DraftModelProposer:
             self._ingest_and_draft_first(plans, self._offset_caches)
         ]
         # Steps 2..K: single-token decode per request.
-        for draft_index in range(1, self._num_speculative_tokens):
+        for draft_index in range(1, num_speculative_tokens):
             draft_cols.append(
                 self._draft_step(
                     plans, draft_cols[-1], draft_index, self._offset_caches
@@ -215,7 +220,9 @@ class DraftModelProposer:
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
 
-    def _collect_draft_plans(self, ctx: ProposeContext) -> list[_DraftPlan]:
+    def _collect_draft_plans(
+        self, ctx: ProposeContext, num_speculative_tokens: int
+    ) -> list[_DraftPlan]:
         # Eligibility filter (greedy + non-intermediate prefill + greedy-only
         # sampling) is shared with every greedy drafter; this step then builds
         # per-request ingest plans and drops any row with no newly-committed
@@ -230,12 +237,14 @@ class DraftModelProposer:
         )
         plans: list[_DraftPlan] = []
         for req_id, state in eligible:
-            plan = self._make_plan(req_id, state)
+            plan = self._make_plan(req_id, state, num_speculative_tokens)
             if plan is not None:
                 plans.append(plan)
         return plans
 
-    def _make_plan(self, req_id: str, state: RequestState) -> _DraftPlan | None:
+    def _make_plan(
+        self, req_id: str, state: RequestState, num_speculative_tokens: int
+    ) -> _DraftPlan | None:
         committed_len = len(state.token_ids)
         draft_seq_len = self._draft_seq_lens.get(req_id, 0)
         if draft_seq_len >= committed_len:
@@ -246,7 +255,7 @@ class DraftModelProposer:
         # Draft positions reach committed_len + K - 1; size the draft block
         # table to cover them from the draft's own pool.
         block_ids = self._ensure_draft_blocks(
-            req_id, committed_len + self._num_speculative_tokens
+            req_id, committed_len + num_speculative_tokens
         )
         return _DraftPlan(
             req_id=req_id,

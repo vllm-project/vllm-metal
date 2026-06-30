@@ -52,6 +52,7 @@ class ProposeContext:
     request_states: Mapping[str, RequestState]
     cu_seqlens: Sequence[int]
     num_decode_segments: int
+    num_speculative_tokens: int
     logitsprocs: LogitsProcessors | None
 
 
