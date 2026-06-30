@@ -31,6 +31,49 @@ def apply_compat_patches() -> None:
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
+    _patch_transformers_exaone4_config()
+
+
+def _patch_transformers_exaone4_config() -> None:
+    """Guard ``Exaone4Config`` against a div-by-zero on no-sliding-window configs.
+
+    transformers' ``Exaone4Config.__post_init__`` sets
+    ``sliding_window_pattern = 0`` when ``sliding_window is None`` (EXAONE 4.0
+    checkpoints without a sliding window, e.g. ``EXAONE-4.0-1.2B``), then derives
+    ``layer_types`` via ``(i + 1) % sliding_window_pattern`` — a
+    ``ZeroDivisionError``. The config, and therefore the whole model, fails to
+    load through ``AutoConfig`` / ``mlx_lm`` / vLLM before any forward runs.
+
+    Pre-populate ``layer_types`` as all ``"full_attention"`` (the real layout of
+    a no-sliding-window model) so the original ``__post_init__`` skips the
+    crashing derivation. The wrapper only fires on the exact crash condition
+    (``layer_types is None and sliding_window is None``), so sliding-window
+    variants (e.g. the 32B) keep transformers' own derivation untouched.
+
+    TODO: remove once the supported transformers release no longer divides by a
+    zero ``sliding_window_pattern`` (tracked upstream in transformers).
+    """
+    try:
+        from transformers.models.exaone4 import configuration_exaone4
+    except ImportError as exc:
+        logger.debug("Skipping Exaone4 config compatibility patch: %s", exc)
+        return
+
+    config_cls = getattr(configuration_exaone4, "Exaone4Config", None)
+    if config_cls is None or getattr(config_cls, "_vllm_metal_exaone4_patched", False):
+        return
+
+    original_post_init = config_cls.__post_init__
+
+    def _patched_post_init(self: Any, **kwargs: Any) -> Any:
+        if self.layer_types is None and self.sliding_window is None:
+            num_layers = getattr(self, "num_hidden_layers", 0) or 0
+            self.layer_types = ["full_attention"] * num_layers
+        return original_post_init(self, **kwargs)
+
+    config_cls.__post_init__ = _patched_post_init
+    config_cls._vllm_metal_exaone4_patched = True
+    logger.debug("Installed Exaone4 no-sliding-window config compatibility patch")
 
 
 def _metal_ray_local_gpu_ids(

@@ -88,6 +88,17 @@ class SDPAPagedAttentionWrapper(nn.Module):
         """Expose the wrapped attention's RoPE module."""
         return self._inner.rope
 
+    @property
+    def is_local(self) -> Any:
+        """Expose the wrapped attention's local/global attention flag.
+
+        EXAONE 4.0's host model forward reads ``self_attn.is_local`` to select
+        the sliding-window vs global mask per layer. Attention modules without
+        the attribute (the common case) default to ``False`` — global
+        attention — so wrapping them is a no-op for this flag.
+        """
+        return getattr(self._inner, "is_local", False)
+
     def rebind_cache(
         self,
         kv_cache: MetalPagedKVCache,
