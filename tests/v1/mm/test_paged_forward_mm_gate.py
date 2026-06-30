@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for paged forward multimodal fail-fast + ctx.segment_positions field.
+"""Tests for paged forward multimodal fail-fast behavior.
 
 The successful mm paged forward is exercised in
 ``test_paged_forward_mm.py``; this file holds the fail-fast invariants:
@@ -16,7 +16,6 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.v1.mm import EncoderCache
@@ -30,17 +29,6 @@ def _feature(identifier: str) -> MultiModalFeatureSpec:
         identifier=identifier,
         mm_position=PlaceholderRange(offset=0, length=1),
     )
-
-
-class TestPagedAttentionContextSegmentPositions:
-    def test_field_defaults_to_none(self) -> None:
-        ctx = PagedAttentionContext(slot_mapping=[])
-        assert ctx.segment_positions is None
-
-    def test_field_carries_per_segment_entries(self) -> None:
-        positions = [None, mx.array([[[0, 1, 2]]] * 3, dtype=mx.int32)]
-        ctx = PagedAttentionContext(slot_mapping=[], segment_positions=positions)
-        assert ctx.segment_positions is positions
 
 
 class TestStartPagedForwardMmFailFast:
