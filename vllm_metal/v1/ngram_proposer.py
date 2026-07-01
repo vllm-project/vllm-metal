@@ -103,6 +103,9 @@ class NgramProposer:
         return False
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        if ctx.num_speculative_tokens <= 0:
+            return None
+
         drafting = list(
             self._controller.draft_eligible_requests(
                 ctx.decode_reqs,
