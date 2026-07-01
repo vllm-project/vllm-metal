@@ -1365,12 +1365,7 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
-        spec = self.vllm_config.speculative_config
-        num_speculative_tokens = getattr(
-            scheduler_output,
-            "num_spec_tokens_to_schedule",
-            spec.num_speculative_tokens if spec is not None else 0,
-        )
+        num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
             decode_reqs=decode_reqs,
