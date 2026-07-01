@@ -782,6 +782,46 @@ def test_manager_rejects_zero_wrapped_modules() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("registered_ids", "active_id", "requested_id", "slot_match"),
+    [
+        ((1, 2), 2, 1, r"\[2\]"),
+        ((), None, 99, r"\[None\]"),
+    ],
+)
+def test_manager_set_adapter_mapping_rejects_missing_active_lora_id(
+    registered_ids: tuple[int, ...],
+    active_id: int | None,
+    requested_id: int,
+    slot_match: str,
+) -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    for lora_id in registered_ids:
+        manager.add_adapter(
+            _make_adapter(
+                lora_id,
+                fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+                fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
+            )
+        )
+    if active_id is not None:
+        manager.activate_adapter(active_id)
+
+    with pytest.raises(
+        ValueError, match=rf"not active.*\[{requested_id}\].*{slot_match}"
+    ):
+        manager.set_adapter_mapping(
+            LoRAMapping(index_mapping=(requested_id,), prompt_mapping=(requested_id,))
+        )
+
+
 # Runner routing: paged forward processes decode tokens before prefill tokens,
 
 

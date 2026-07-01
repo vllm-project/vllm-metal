@@ -161,6 +161,19 @@ class MLXLoRAModelManager:
     def set_adapter_mapping(self, mapping: LoRAMapping) -> None:
         if mapping == self._last_mapping:
             return
+        requested = {
+            lora_id
+            for lora_id in (*mapping.index_mapping, *mapping.prompt_mapping)
+            if lora_id != 0
+        }
+        active = {lora_id for lora_id in self.lora_index_to_id if lora_id is not None}
+        missing = sorted(requested - active)
+        if missing:
+            raise ValueError(
+                "LoRA mapping references adapters that are not active in "
+                f"LoRA slots: {missing}; slot table: {self.lora_index_to_id}. "
+                "Use 0 for no-LoRA tokens."
+            )
         self.punica_wrapper.update_metadata(mapping, self.lora_index_to_id)
         self._last_mapping = mapping
 
