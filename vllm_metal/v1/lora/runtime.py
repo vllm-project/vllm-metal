@@ -8,8 +8,8 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from vllm.lora.layers import LoRAMapping
 
-from .mapping import LoRAMappingBuilder
 from .worker_manager import MetalWorkerLoRAManager
 
 if TYPE_CHECKING:
@@ -18,6 +18,23 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
+
+
+class _LoRAMappingBuilder:
+    def __init__(self) -> None:
+        self._idx: list[int] = []
+        self._prompt: list[int] = []
+
+    def add_request(self, lora_id: int | None, num_tokens: int) -> None:
+        token_id = 0 if lora_id is None else int(lora_id)
+        self._idx += [token_id] * num_tokens
+        self._prompt.append(token_id)
+
+    def build(self) -> LoRAMapping:
+        return LoRAMapping(tuple(self._idx), tuple(self._prompt))
+
+    def is_empty(self) -> bool:
+        return not self._idx
 
 
 class MetalLoRARuntime:
@@ -109,7 +126,7 @@ class MetalLoRARuntime:
         # Push the per-step active set and token routing to the manager.
         if self._manager is None:
             return
-        builder = LoRAMappingBuilder()
+        builder = _LoRAMappingBuilder()
         active_requests: set[LoRARequest] = set()
         for lora_id, num_tokens in routing_entries:
             builder.add_request(lora_id, num_tokens)

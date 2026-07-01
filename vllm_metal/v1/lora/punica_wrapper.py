@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 
 if TYPE_CHECKING:
-    from .mapping import LoRAMapping
+    from vllm.lora.layers import LoRAMapping
 
 
 class PunicaWrapperMLX:

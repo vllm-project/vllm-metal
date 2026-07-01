@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING, NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
+from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import is_in_target_modules
 
 from .layers import MLXLinearWithLoRA, can_wrap
-from .mapping import LoRAMapping
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
 from .punica_wrapper import PunicaWrapperMLX
 
