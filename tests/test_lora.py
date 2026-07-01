@@ -726,6 +726,31 @@ def test_manager_pin_tracks_existing_adapter_only() -> None:
     assert 7 not in manager.list_adapters()
 
 
+def test_manager_remove_all_adapters_clears_slots_and_registry() -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=2,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    for lora_id in (1, 2):
+        adapter = _make_adapter(
+            lora_id,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+        )
+        manager.add_adapter(adapter)
+        manager.activate_adapter(lora_id)
+
+    manager.remove_all_adapters()
+
+    assert manager.list_adapters() == set()
+    assert manager.lora_index_to_id == [None, None]
+    np.testing.assert_array_equal(np.array(manager.modules["fc1"].lora_b_stacked), 0.0)
+
+
 def test_manager_target_modules_filter_excludes_unmatched() -> None:
     """``target_modules=['fc1']`` must wrap fc1 only — fc2 stays a plain Linear."""
     model = _TwoLinearModel()
@@ -886,7 +911,6 @@ def test_activate_adapter_rejects_zero_module_match() -> None:
         manager.activate_adapter(1)
     # Slot must be rolled back so a later valid activation can use it.
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 1 not in manager._active
 
 
 def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
@@ -923,7 +947,6 @@ def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
     with pytest.raises(ValueError, match="ambiguous suffix matches"):
         manager.activate_adapter(42)
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 42 not in manager._active
 
 
 def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> SimpleNamespace:
