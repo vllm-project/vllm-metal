@@ -21,9 +21,7 @@ class PunicaWrapperMLX:
         self.max_batches = max_batches
         self.max_loras = max_loras
         self._token_slot_indices: mx.array | None = None
-        self._sampler_slot_indices: mx.array | None = None
         self._no_lora = True
-        self.is_prefill = False
 
     @property
     def no_lora(self) -> bool:
@@ -33,25 +31,14 @@ class PunicaWrapperMLX:
     def token_slot_indices(self) -> mx.array | None:
         return self._token_slot_indices
 
-    @property
-    def sampler_slot_indices(self) -> mx.array | None:
-        return self._sampler_slot_indices
-
     def update_metadata(
         self, mapping: LoRAMapping, lora_index_to_id: list[int | None]
     ) -> None:
         null = self.max_loras
         slot_of = {aid: i for i, aid in enumerate(lora_index_to_id) if aid is not None}
         tok = [slot_of.get(t, null) for t in mapping.index_mapping]
-        prm = [slot_of.get(t, null) for t in mapping.prompt_mapping]
         self._token_slot_indices = mx.array(tok, dtype=mx.int32)
-        self._sampler_slot_indices = mx.array(prm, dtype=mx.int32)
         self._no_lora = all(s == null for s in tok)
-        self.is_prefill = mapping.is_prefill
-
-    def reset(self) -> None:
-        self._token_slot_indices = self._sampler_slot_indices = None
-        self._no_lora, self.is_prefill = True, False
 
     def add_lora_linear(
         self,
