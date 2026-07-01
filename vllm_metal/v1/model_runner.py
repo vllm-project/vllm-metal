@@ -1365,6 +1365,7 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
+        num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
             decode_reqs=decode_reqs,
@@ -1378,6 +1379,7 @@ class MetalModelRunner:
             request_states=self._request_states,
             cu_seqlens=cu_seqlens,
             num_decode_segments=num_decode_segments,
+            num_speculative_tokens=num_speculative_tokens,
             logitsprocs=self._logitsprocs,
         )
         self._draft_token_ids = (

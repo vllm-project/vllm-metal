@@ -218,12 +218,14 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         num_scheduled_tokens: dict[str, int],
         scheduled_spec_decode_tokens: dict[str, list[int]],
         num_invalid_spec_tokens: dict[str, int] | None = None,
+        num_spec_tokens_to_schedule: int = 1,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_invalid_spec_tokens=num_invalid_spec_tokens,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             finished_req_ids=set(),
         )
 
@@ -706,6 +708,61 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             block_ids=(0,),
         )
         assert draft_token_ids == DraftTokenIds(["r0"], [[42]])
+
+    def test_gemma4_mtp_honors_scheduler_selected_zero_drafts(self) -> None:
+        class Assistant:
+            forward_ready = True
+
+            def propose_draft_token_ids(
+                self,
+                *,
+                seeds,
+                target_hidden_states,
+                target_input_embeddings,
+            ):
+                del seeds, target_hidden_states, target_input_embeddings
+                raise AssertionError("assistant should not draft when K=0")
+
+        class Adapter:
+            def target_input_embeddings(self, model, input_ids):
+                del model, input_ids
+                raise AssertionError("draft embeddings should not be requested")
+
+        runner = self._make_runner()
+        runner._gemma4_mtp_assistant = Assistant()
+        runner._model_adapter = Adapter()
+        runner._drafter = Gemma4MTPProposer(runner)
+        req_state = self._make_state([1, 6])
+        decode_reqs = [("r0", req_state)]
+        segment = mr.PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=1,
+            block_ids=(0,),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 1},
+            {},
+            num_spec_tokens_to_schedule=0,
+        )
+        self._install_paged_state(
+            runner,
+            decode_reqs,
+            (segment,),
+            self._make_logits([9]),
+            scheduler_output,
+            target_hidden_states=mx.array([[1.0, 0.0, 0.0, 0.0]]),
+        )
+
+        output = runner.sample_tokens(grammar_output=None)
+
+        assert output is not None
+        assert output.sampled_token_ids == [[9]]
+        assert req_state.token_ids == [1, 6, 9]
+        assert runner.take_draft_token_ids() is None
 
     def test_sample_paged_batch_stashes_gemma4_prefill_drafts(self) -> None:
         captured: dict[str, object] = {}

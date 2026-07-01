@@ -52,6 +52,7 @@ class ProposeContext:
     request_states: Mapping[str, RequestState]
     cu_seqlens: Sequence[int]
     num_decode_segments: int
+    num_speculative_tokens: int
     logitsprocs: LogitsProcessors | None
 
 
@@ -104,6 +105,9 @@ class Gemma4MTPProposer:
         )
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        if ctx.num_speculative_tokens <= 0:
+            return None
+
         runner = self._runner
         assistant = runner._gemma4_mtp_assistant
         if (

@@ -60,6 +60,7 @@ def _context(
     prefill_reqs: list[SimpleNamespace] | None = None,
     prefill_result_modes: list[str] | None = None,
     request_states: dict[str, SimpleNamespace] | None = None,
+    num_speculative_tokens: int = 3,
 ) -> ProposeContext:
     decode_reqs = decode_reqs or []
     prefill_reqs = prefill_reqs or []
@@ -80,6 +81,7 @@ def _context(
         request_states=request_states,
         cu_seqlens=[],
         num_decode_segments=len(decode_reqs),
+        num_speculative_tokens=num_speculative_tokens,
         logitsprocs=None,
     )
 
@@ -103,6 +105,30 @@ class TestNgramProposePropose:
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
         assert drafts.draft_token_ids == [[3, 1, 2]]
+
+    def test_uses_scheduler_selected_num_speculative_tokens(self) -> None:
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        ctx = _context(
+            decode_reqs=[("r0", state)],
+            num_speculative_tokens=1,
+        )
+
+        drafts = proposer.propose(ctx)
+
+        assert drafts is not None
+        assert drafts.req_ids == ["r0"]
+        assert drafts.draft_token_ids == [[3]]
+
+    def test_scheduler_selected_zero_tokens_returns_none(self) -> None:
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2, 3, 1, 2])
+        ctx = _context(
+            decode_reqs=[("r0", state)],
+            num_speculative_tokens=0,
+        )
+
+        assert proposer.propose(ctx) is None
 
     def test_no_match_returns_none(self) -> None:
         # Non-repeating context shorter than the n-gram window: no draft.

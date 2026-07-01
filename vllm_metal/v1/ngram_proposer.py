@@ -9,9 +9,10 @@ and keeps no KV cache: the matching is the pure-Python + Numba KMP kernel that
 vLLM ships in :mod:`vllm.v1.spec_decode.ngram_proposer`, which this class wraps.
 
 The wrapper's only job is to translate the per-step :class:`ProposeContext` into
-the three array arguments that upstream's stateless ``propose`` expects
-(``sampled_token_ids``, ``num_tokens_no_spec``, ``token_ids_cpu``) and hand the
-result back as :class:`DraftTokenIds`. The committed history lives in
+the runtime draft count and array arguments that upstream's stateless
+``propose`` expects (``num_speculative_tokens``, ``sampled_token_ids``,
+``num_tokens_no_spec``, ``token_ids_cpu``) and hand the result back as
+:class:`DraftTokenIds`. The committed history lives in
 ``state.token_ids`` (already updated with this step's accepted/sampled tokens by
 the time the runner builds the context), so no per-request bookkeeping is needed.
 
@@ -102,6 +103,9 @@ class NgramProposer:
         return False
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        if ctx.num_speculative_tokens <= 0:
+            return None
+
         drafting = list(
             self._controller.draft_eligible_requests(
                 ctx.decode_reqs,
@@ -130,6 +134,7 @@ class NgramProposer:
         sampled_token_ids: list[list[int]] = [[0]] * num_requests
 
         drafts = self._ngram.propose(
+            ctx.num_speculative_tokens,
             sampled_token_ids,
             num_tokens_no_spec,
             token_ids_cpu,

@@ -61,6 +61,7 @@ def _make_scheduler_output(
         num_invalid_spec_tokens=None,
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
         total_num_scheduled_tokens=len(req_ids),
+        num_spec_tokens_to_schedule=0,
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[],
