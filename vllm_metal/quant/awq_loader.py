@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """AWQ load owner for vllm-metal.
 
-Encapsulates the entry-point preflight, the ``mlx_lm.load`` invocation
-with a normalized ``model_config={"quantization_config": ...}`` kwarg,
-the dtype-scoped cache key, and the post-load alignment of non-quantized
-floating params. ``ModelLifecycle`` delegates the entire AWQ branch to
-instances of this class so quantization policy stays cohesive in one
-place rather than leaking into the generic loader flow.
+Encapsulates the entry-point preflight, the ``mlx_lm.load`` invocation with a
+normalized ``model_config={"quantization_config": ...}`` kwarg, and the
+post-load alignment of non-quantized floating params. ``ModelLifecycle``
+delegates the entire AWQ branch to instances of this class so quantization
+policy stays cohesive in one place rather than leaking into the generic loader
+flow.
 
 GPTQ checkpoints are explicitly rejected at the entry point. mlx-lm's
 ``_transform_awq_weights`` accepts ``quant_method="gptq"`` at the
@@ -49,9 +49,8 @@ class AWQQuantLoader:
 
     Construct via :meth:`for_model`, which inspects the checkpoint's
     ``config.json`` and returns ``None`` when the checkpoint is not AWQ.
-    Lifecycle dispatches the quantized branch to this owner so the
-    dtype-scoped cache key and the post-load alignment policy do not
-    bleed into generic loader code paths.
+    Lifecycle dispatches the quantized branch to this owner so post-load
+    alignment policy does not bleed into generic loader code paths.
     """
 
     def __init__(self, normalized_quant_config: Mapping[str, Any]) -> None:
@@ -92,25 +91,6 @@ class AWQQuantLoader:
         if quant_method != "awq":
             return None
         return cls(normalize_quant_config(raw_qc))
-
-    @staticmethod
-    def cache_key(model_name: str, *, target_dtype: Any) -> tuple[str, str]:
-        """Cache key for an AWQ load.
-
-        ``target_dtype`` is encoded into the loader segment because the
-        post-load alignment mutates the model in place: a model first
-        loaded with bf16 and later requested as fp16 must NOT be served
-        from cache, since the cached object would carry the wrong dtype
-        on its non-quantized floating params. Encoding the dtype inside
-        the loader segment keeps the cache key shape identical to the
-        generic ``_generation_cache_key`` (a 2-tuple), so dtype scoping
-        is a property of this owner rather than of the generic cache.
-
-        Static so lifecycle can compute the speculative AWQ cache key
-        before deciding whether to invoke detection (which involves an
-        HF Hub config fetch on cache miss).
-        """
-        return (model_name, f"mlx_lm-awq:{target_dtype}")
 
     def load(
         self,

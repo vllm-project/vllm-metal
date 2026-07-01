@@ -132,7 +132,7 @@ def _qwen35_vlm_model(
     )
 
 
-def _cache_generation_model(
+def _stub_generation_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
     config: object,
@@ -142,11 +142,21 @@ def _cache_generation_model(
 ) -> tuple[object, object]:
     fake_model = model or SimpleNamespace(config=config)
     fake_tokenizer = object() if tokenizer is None else tokenizer
-    cache_key = model_lifecycle._generation_cache_key("stub-model", is_vlm=is_vlm)
+
+    def _load_generation_model(
+        self: ModelLifecycle,
+        model_name: str,
+        actual_is_vlm: bool,
+        **_: object,
+    ) -> tuple[object, object]:
+        assert model_name == "stub-model"
+        assert actual_is_vlm is is_vlm
+        return fake_model, fake_tokenizer
+
     monkeypatch.setattr(
-        model_lifecycle,
-        "_MODEL_CACHE",
-        {cache_key: (fake_model, fake_tokenizer)},
+        ModelLifecycle,
+        "_load_generation_model",
+        _load_generation_model,
     )
     return fake_model, fake_tokenizer
 
@@ -219,7 +229,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _stub_generation_model(monkeypatch, config=_text_config())
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(model_type="gemma4"),
@@ -262,7 +272,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _stub_generation_model(monkeypatch, config=_text_config())
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
@@ -283,7 +293,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _stub_generation_model(monkeypatch, config=_text_config())
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
@@ -306,7 +316,7 @@ class TestModelLifecycle:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
         fake_model = _qwen35_vlm_model()
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=fake_model.config,
             is_vlm=True,
@@ -339,7 +349,7 @@ class TestModelLifecycle:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=fake_model.config,
             is_vlm=True,
@@ -367,7 +377,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=SimpleNamespace(text_config=_text_config()),
             is_vlm=True,
@@ -385,7 +395,7 @@ class TestModelLifecycle:
         assert runner._multimodal_adapter is None
         assert runner.encoder_cache is None
 
-    def test_generation_cache_separates_text_and_vlm_variants(
+    def test_load_separates_text_and_vlm_loader_paths(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -393,19 +403,22 @@ class TestModelLifecycle:
         text_tokenizer = object()
         vlm_model = _qwen35_vlm_model()
         vlm_tokenizer = object()
+
+        class _StubAWQLoader:
+            @classmethod
+            def for_model(cls, _model_name: str) -> None:
+                return None
+
+        monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
         monkeypatch.setattr(
             model_lifecycle,
-            "_MODEL_CACHE",
-            {
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
-                    text_model,
-                    text_tokenizer,
-                ),
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=True): (
-                    vlm_model,
-                    vlm_tokenizer,
-                ),
-            },
+            "mlx_lm_load",
+            lambda *_args, **_kwargs: (text_model, text_tokenizer),
+        )
+        monkeypatch.setattr(
+            model_lifecycle,
+            "mlx_vlm_load",
+            lambda _model_name: (vlm_model, vlm_tokenizer),
         )
 
         lifecycle, runner = _make_lifecycle(
@@ -444,7 +457,7 @@ class TestModelLifecycle:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
         reset_config()
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=SimpleNamespace(text_config=_text_config()),
             is_vlm=True,
@@ -477,7 +490,7 @@ class TestModelLifecycle:
 
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
         reset_config()
-        model_lifecycle.reset_model_cache()
+        Gemma4MTPAssistantLoader.clear_cache()
         _patch_mlx_lm_qwen35_fp8_sanitize()
 
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
@@ -495,14 +508,14 @@ class TestModelLifecycle:
             assert runner.model is not None
             assert int(runner.model_args["vocab_size"]) > 0
         finally:
-            model_lifecycle.reset_model_cache()
+            Gemma4MTPAssistantLoader.clear_cache()
 
-    def test_load_extracts_text_model_config_from_cached_model(
+    def test_load_extracts_text_model_config_from_loaded_model(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_tokenizer = object()
-        fake_model, _ = _cache_generation_model(
+        fake_model, _ = _stub_generation_model(
             monkeypatch,
             config=_text_config(),
             tokenizer=fake_tokenizer,
@@ -531,7 +544,7 @@ class TestModelLifecycle:
                 calls.append(kwargs)
                 return runtime
 
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _stub_generation_model(monkeypatch, config=_text_config())
         monkeypatch.setattr(
             model_lifecycle,
             "Gemma4MTPAssistantLoader",
@@ -567,7 +580,7 @@ class TestModelLifecycle:
             def load_if_needed(self, **kwargs: object) -> object:
                 raise RuntimeError("assistant load failed")
 
-        _cache_generation_model(monkeypatch, config=_text_config())
+        _stub_generation_model(monkeypatch, config=_text_config())
         monkeypatch.setattr(
             model_lifecycle,
             "Gemma4MTPAssistantLoader",
@@ -591,7 +604,9 @@ class TestModelLifecycle:
 
         assert runner._gemma4_mtp_assistant is None
 
-    def test_reset_model_cache_clears_gemma4_mtp_assistant_cache(self) -> None:
+    def test_gemma4_mtp_assistant_loader_clear_cache_resets_cached_load(
+        self,
+    ) -> None:
         load_model_calls = 0
 
         def _load_model(
@@ -645,7 +660,7 @@ class TestModelLifecycle:
         assert first is second
         assert load_model_calls == 1
 
-        model_lifecycle.reset_model_cache()
+        Gemma4MTPAssistantLoader.clear_cache()
 
         third = loader.load_if_needed(
             speculative_config=spec_config,
@@ -659,7 +674,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=SimpleNamespace(
                 vocab_size=_TEXT_MODEL_ARGS["vocab_size"],
@@ -692,16 +707,7 @@ class TestModelLifecycle:
             text_config=dict(_TEXT_MODEL_ARGS),
         )
         fake_model = SimpleNamespace(args=args)
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {
-                model_lifecycle._generation_cache_key("stub-model", is_vlm=False): (
-                    fake_model,
-                    object(),
-                )
-            },
-        )
+        _stub_generation_model(monkeypatch, config=args, model=fake_model)
         lifecycle, runner = _make_lifecycle()
 
         lifecycle.load()
@@ -720,7 +726,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _cache_generation_model(
+        _stub_generation_model(
             monkeypatch,
             config=SimpleNamespace(
                 text_config=_SlotTextConfig(
@@ -743,20 +749,24 @@ class TestModelLifecycle:
         assert runner.num_layers == 32
         assert runner.head_dim == 128
 
-    def test_load_stt_model_reuses_cached_model(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_load_stt_model_loads_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = SimpleNamespace(
             create_runtime_adapter=lambda model_name: (object(), model_name)
         )
-        monkeypatch.setattr(
-            model_lifecycle,
-            "_MODEL_CACHE",
-            {model_lifecycle._stt_cache_key("stub-model"): (fake_model, None)},
+        calls: list[str] = []
+
+        def _load_model(model_name: str) -> object:
+            calls.append(model_name)
+            return fake_model
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_metal.stt.loader",
+            SimpleNamespace(load_model=_load_model),
         )
 
         assert model_lifecycle.load_stt_model("stub-model") is fake_model
+        assert calls == ["stub-model"]
 
     @pytest.mark.parametrize(
         "is_awq", [True, False], ids=["awq-checkpoint", "non-awq-checkpoint"]
@@ -789,10 +799,6 @@ class TestModelLifecycle:
             def for_model(cls, _model_name: str) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
-            @staticmethod
-            def cache_key(model_name: str, *, target_dtype: object) -> tuple[str, str]:
-                return (model_name, f"mlx_lm-awq:{target_dtype}")
-
             def load(
                 self,
                 model_path: str,
@@ -816,7 +822,6 @@ class TestModelLifecycle:
             return fake_model, fake_tokenizer
 
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
-        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
 
         lifecycle, runner = _make_lifecycle()
@@ -887,12 +892,6 @@ class TestModelLifecycle:
                 )
                 return cls()
 
-            @staticmethod
-            def cache_key(
-                model_name: str, config_dir: str, *, target_dtype: object
-            ) -> tuple[str, str]:
-                return (model_name, f"gguf:{config_dir}:{target_dtype}")
-
             def load(self) -> tuple[object, object]:
                 return fake_model, fake_tokenizer
 
@@ -907,7 +906,6 @@ class TestModelLifecycle:
             "vllm_metal.gguf.loader",
             SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
         )
-        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
 
         lifecycle, runner = _make_lifecycle(
@@ -941,30 +939,41 @@ class TestModelLifecycle:
         GGUF owner, and the optional ``gguf`` package is never imported.
 
         Tripwire: block the ``gguf`` package itself (``sys.modules[...] = None``
-        raises on import). A clean load through the generic cached path proves a
-        default install with no gguf extra is unaffected — the detection guard
-        short-circuits before the lazy owner import that would pull in ``gguf``.
+        raises on import). A clean generic load proves a default install with no
+        gguf extra is unaffected by the lazy owner import.
         """
+        fake_model = SimpleNamespace(config=_text_config())
+        fake_tokenizer = object()
+
+        class _StubAWQLoader:
+            @classmethod
+            def for_model(cls, _model_name: str) -> None:
+                return None
+
         monkeypatch.setitem(sys.modules, "gguf", None)
-        _cache_generation_model(monkeypatch, config=_text_config())
+        monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
+        monkeypatch.setattr(
+            model_lifecycle,
+            "mlx_lm_load",
+            lambda *_args, **_kwargs: (fake_model, fake_tokenizer),
+        )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config()  # no quantization -> not gguf
         )
 
         lifecycle.load()  # must not raise: the gguf owner import is never reached
 
+        assert runner.model is fake_model
         assert runner._is_vlm is False
         assert runner.model_args["vocab_size"] == 32000
 
-    def test_gguf_cache_key_separates_tokenizer_dirs(
+    def test_gguf_load_uses_each_tokenizer_dir(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Two loads of the same .gguf with different ``--tokenizer`` dirs must
-        not collide in the process cache. A .gguf carries weights only, so the
-        model and tokenizer are built from the config dir; returning the first's
-        result for the second (and bypassing the config-dir fail-fast once the
-        cache is warm) would be a silent wrong load.
+        both reach the GGUF owner with their own config dirs. A .gguf carries
+        weights only, so the model and tokenizer are built from the config dir.
         """
         for_model_dirs: list[str] = []
 
@@ -984,12 +993,6 @@ class TestModelLifecycle:
                 for_model_dirs.append(config_dir)
                 return cls(config_dir)
 
-            @staticmethod
-            def cache_key(
-                model_name: str, config_dir: str, *, target_dtype: object
-            ) -> tuple[str, str]:
-                return (model_name, f"gguf:{config_dir}:{target_dtype}")
-
             def load(self) -> tuple[object, object]:
                 return (
                     SimpleNamespace(config=_text_config()),
@@ -1001,7 +1004,6 @@ class TestModelLifecycle:
             "vllm_metal.gguf.loader",
             SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
         )
-        monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
 
         def _load_tokenizer_for(tokenizer_dir: str) -> object:
             lifecycle, runner = _make_lifecycle(
@@ -1016,8 +1018,7 @@ class TestModelLifecycle:
         second = _load_tokenizer_for("/dir-b")
 
         assert for_model_dirs == ["/dir-a", "/dir-b"], (
-            "for_model must run for each distinct --tokenizer dir, not be skipped "
-            "by a colliding cache key"
+            "for_model must run for each distinct --tokenizer dir"
         )
         assert first == "tokenizer::/dir-a"
         assert second == "tokenizer::/dir-b"

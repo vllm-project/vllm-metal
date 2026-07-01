@@ -38,7 +38,6 @@ import torch
 from mlx.utils import tree_flatten
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 # (awq_repo, has_regular_quant_bias)
@@ -79,11 +78,7 @@ def _runner_model_config(repo: str, *, dtype):
 
 
 def _release_metal_state() -> None:
-    """Drop the process-level model cache and hand Metal allocations back
-    to the pool. Required between parametrized rows so the next 7-8B AWQ
-    load gets the full budget on a single pytest process.
-    """
-    model_lifecycle.reset_model_cache()
+    """Hand Metal allocations back to the pool between parametrized rows."""
     gc.collect()
     mx.clear_cache()
 
@@ -133,7 +128,6 @@ def _collect_awq_dtype_pins(model, *, expected_non_quant_dtype):
 @pytest.mark.slow
 @pytest.mark.parametrize("awq_repo,has_regular_quant_bias", _DENSE_AWQ_MATRIX)
 def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
-    monkeypatch,
     awq_repo,
     has_regular_quant_bias,
 ):
@@ -142,7 +136,6 @@ def test_awq_load_aligns_non_quant_dtypes_to_runner_target(
     have been touched by the alignment step (their dtype is owned by the
     AWQ transform).
     """
-    monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
     # Pre-bind references so the ``finally`` ``del`` works even if the
     # load throws before they would otherwise be assigned.
     runner = None

@@ -34,7 +34,6 @@ import torch
 from mlx.utils import tree_flatten
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 _AWQ_REPO = "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
@@ -51,14 +50,11 @@ def _runner_model_config(*, dtype):
 
 
 @pytest.mark.slow
-def test_awq_load_aligns_non_quant_dtypes_to_runner_target(monkeypatch):
+def test_awq_load_aligns_non_quant_dtypes_to_runner_target():
     """After AWQ load, non-quantized floating params must match the runner's
     target dtype, and quantized layers' scales/biases must NOT have been
     touched by the alignment step (their dtype is owned by the transform).
     """
-    # Ensure no other test left a cached entry around for this model.
-    monkeypatch.setattr(model_lifecycle, "_MODEL_CACHE", {})
-
     runner = make_stub_runner(model_config=_runner_model_config(dtype=torch.bfloat16))
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
 
@@ -151,14 +147,7 @@ def test_awq_e2e_paged_runner_smoke():
                 f"expected 'Paris' in AWQ greedy continuation, got: {text!r}"
             )
     finally:
-        # Order matters: ``ModelLifecycle`` stores the AWQ model in the
-        # process-level ``_MODEL_CACHE``, so ``del llm`` alone cannot
-        # release the weights — the cache holds an independent strong
-        # reference. Drop the cache entry first so the subsequent
-        # ``del`` + ``gc.collect`` actually reclaim the model; otherwise
-        # later slow tests in the same pytest process can OOM on 16 GB
-        # Metal machines.
-        model_lifecycle.reset_model_cache()
+        # Drop Python references before returning Metal allocations to the pool.
         del llm
         gc.collect()
         mx.clear_cache()

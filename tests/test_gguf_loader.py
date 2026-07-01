@@ -467,19 +467,3 @@ def test_for_model_rejects_missing_tokenizer_dir(tmp_path):
         GGUFModelLoader.for_model(
             gguf_path, config_dir=gguf_path, target_dtype=mx.float32
         )
-
-
-def test_cache_key_is_dtype_and_config_dir_scoped(tmp_path):
-    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    key = GGUFModelLoader.cache_key(gguf_path, cfg_dir, target_dtype=mx.float16)
-    # dtype-scoped: a different dtype must not be cross-served from cache.
-    assert key != GGUFModelLoader.cache_key(
-        gguf_path, cfg_dir, target_dtype=mx.bfloat16
-    )
-    # config_dir-scoped: the same .gguf with a different --tokenizer dir is a
-    # different model (a .gguf carries weights only) and must not collide.
-    assert key != GGUFModelLoader.cache_key(
-        gguf_path, cfg_dir + "_other", target_dtype=mx.float16
-    )
-    # Full contract: model path + config-dir + dtype-scoped loader segment.
-    assert key == (gguf_path, f"gguf:{cfg_dir}:{mx.float16}")

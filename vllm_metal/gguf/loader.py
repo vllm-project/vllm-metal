@@ -145,25 +145,6 @@ class GGUFModelLoader:
             tokenizer_config=tokenizer_config,
         )
 
-    @staticmethod
-    def cache_key(
-        model_name: str, config_dir: str, *, target_dtype: mx.Dtype
-    ) -> tuple[str, str]:
-        """Process-cache key for a GGUF load.
-
-        A ``.gguf`` carries weights only; the model skeleton and tokenizer are
-        built from ``config_dir`` (the ``--tokenizer`` dir), so the key MUST
-        include it — two LLMs for the same ``.gguf`` with different config dirs
-        are different models and must not collide (else the second is served the
-        first's tokenizer/skeleton, and the config-dir fail-fast is bypassed once
-        the cache is warm). ``target_dtype`` is encoded too, dtype-scoped like the
-        AWQ owner's: a model first served as bf16 must not be returned when fp16
-        is later requested. Static so the lifecycle can compute the key and probe
-        the shared cache before building a loader; the 2-tuple shape matches
-        ``_generation_cache_key``.
-        """
-        return (model_name, f"gguf:{config_dir}:{target_dtype}")
-
     def load(self) -> tuple[nn.Module, Any]:
         """Run the full load workflow and return ``(model, tokenizer)``.
 
