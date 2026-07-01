@@ -749,6 +749,49 @@ class TestGemma4KvSharedCompatPatch:
         assert getattr(twice, "_vllm_metal_gemma4_kv_shared_patch", False) is True
 
 
+class TestExaone4ConfigCompatPatch:
+    def test_no_sliding_window_config_loads_all_full_attention(self) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+        config = Exaone4Config(num_hidden_layers=4, sliding_window=None)
+
+        assert config.layer_types == ["full_attention"] * 4
+
+    def test_sliding_window_config_keeps_transformers_derivation(self) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+        config = Exaone4Config(
+            num_hidden_layers=4, sliding_window=4096, sliding_window_pattern=4
+        )
+
+        # Shim stays inert: transformers derives its own sliding/full mix.
+        assert "sliding_attention" in config.layer_types
+
+    def test_explicit_layer_types_are_preserved(self) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+        explicit = ["full_attention", "sliding_attention"]
+        config = Exaone4Config(
+            num_hidden_layers=2, sliding_window=None, layer_types=list(explicit)
+        )
+
+        assert config.layer_types == explicit
+
+    def test_patch_is_idempotent(self) -> None:
+        from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
+
+        compat._patch_transformers_exaone4_config()
+        once = Exaone4Config.__post_init__
+        compat._patch_transformers_exaone4_config()
+        twice = Exaone4Config.__post_init__
+
+        assert once is twice
+        assert Exaone4Config._vllm_metal_exaone4_patched is True
+
+
 class TestWrapModelSanitize:
     def test_returns_false_when_class_has_no_sanitize(self) -> None:
         class ModelWithoutSanitize:

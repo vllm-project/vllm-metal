@@ -67,8 +67,7 @@ def _patch_transformers_exaone4_config() -> None:
 
     def _patched_post_init(self: Any, **kwargs: Any) -> Any:
         if self.layer_types is None and self.sliding_window is None:
-            num_layers = getattr(self, "num_hidden_layers", 0) or 0
-            self.layer_types = ["full_attention"] * num_layers
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         return original_post_init(self, **kwargs)
 
     config_cls.__post_init__ = _patched_post_init

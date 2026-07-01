@@ -1,111 +1,80 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Generate EXAONE 4.0 golden token IDs.
+"""EXAONE 4.0 parity smoke tool: mlx_lm vs vllm-metal paged.
 
-Two modes:
-
-- ``mlx_lm`` (default): greedy decoding via ``mlx_lm.stream_generate``.
-  Produces the independent reference (``GOLDEN_MLX_LM``).
-- ``--paged``: greedy decoding via vllm-metal's paged attention path.
-  Produces the in-tree baseline (``GOLDEN_PAGED``) so small floating-point
-  tie-break drifts between the two paths don't cause spurious failures.
-
-The prompts and ``MAX_TOKENS`` here MUST stay in sync with
-``tests/test_exaone4_golden.py`` (the dicts are keyed by prompt string).
+Runs greedy decoding (temperature=0) on the same prompts through both paths,
+prints both token sequences, and exits non-zero on any divergence.
 
 Usage:
-    python tools/gen_exaone4_golden.py <model-path>
-    python tools/gen_exaone4_golden.py --paged <model-path>
+    python tools/gen_exaone4_golden.py [--model REPO] [--max-tokens N]
 """
 
 from __future__ import annotations
 
+import argparse
 import os
-import sys
 
-_PROMPTS = [
+PROMPTS = [
     "One plus one equals",
     "Two plus two equals",
     "Monday, Tuesday, Wednesday,",
     "서울은 대한민국의",
     "인공지능은",
 ]
-_MAX_TOKENS = 10
 
 
-def _mlx_lm_golden(model_path: str) -> dict[str, list[int]]:
-    # The paged path applies vllm-metal's compat patches via platform
-    # registration; the direct mlx_lm reference path does not, so apply them
-    # explicitly. EXAONE 4.0 needs the Exaone4Config no-sliding-window shim to
-    # load at all (see vllm_metal.compat).
-    from vllm_metal.compat import apply_compat_patches
-
-    apply_compat_patches()
-
+def _mlx_tokens(model: str, max_tokens: int) -> dict[str, list[int]]:
     from mlx_lm import load, stream_generate
     from mlx_lm.sample_utils import make_sampler
 
-    print(f"Loading {model_path} via mlx_lm...")
-    model, tokenizer = load(model_path)
-    print("Loaded.")
+    from vllm_metal.compat import apply_compat_patches
 
-    # Disable EOS so every sequence is exactly MAX_TOKENS long.
-    tokenizer._eos_token_ids = set()
+    apply_compat_patches()  # EXAONE needs the Exaone4Config shim to load.
+    m, tokenizer = load(model)
+    tokenizer._eos_token_ids = set()  # decode a fixed length, ignore EOS
     sampler = make_sampler(temp=0.0)
-
-    results: dict[str, list[int]] = {}
-    for prompt in _PROMPTS:
-        results[prompt] = [
+    return {
+        prompt: [
             r.token
             for r in stream_generate(
-                model, tokenizer, prompt, max_tokens=_MAX_TOKENS, sampler=sampler
+                m, tokenizer, prompt, max_tokens=max_tokens, sampler=sampler
             )
         ]
-    return results
+        for prompt in PROMPTS
+    }
 
 
-def _paged_golden(model_path: str) -> dict[str, list[int]]:
+def _paged_tokens(model: str, max_tokens: int) -> dict[str, list[int]]:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
     os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
+    from vllm import LLM, SamplingParams
 
-    from vllm import LLM, SamplingParams  # noqa: E402 — deferred import
-
-    print(f"Loading {model_path} via vllm-metal paged path...")
-    llm = LLM(
-        model=model_path,
-        max_model_len=512,
-        max_num_seqs=1,
-        disable_log_stats=True,
-    )
-    sp = SamplingParams(temperature=0, max_tokens=_MAX_TOKENS, ignore_eos=True)
-    return {o.prompt: list(o.outputs[0].token_ids) for o in llm.generate(_PROMPTS, sp)}
-
-
-def _print_dict(name: str, outputs: dict[str, list[int]]) -> None:
-    print()
-    print(f"{name} = {{")
-    for prompt in _PROMPTS:
-        pad = 45 - len(prompt)
-        print(f"    {prompt!r}:{' ' * max(pad, 1)}{outputs[prompt]},")
-    print("}")
+    llm = LLM(model=model, max_model_len=512, max_num_seqs=1, disable_log_stats=True)
+    sp = SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True)
+    return {o.prompt: list(o.outputs[0].token_ids) for o in llm.generate(PROMPTS, sp)}
 
 
 def main() -> None:
-    args = sys.argv[1:]
-    paged = False
-    if args and args[0] == "--paged":
-        paged = True
-        args = args[1:]
-    if len(args) != 1:
-        print("Usage: python tools/gen_exaone4_golden.py [--paged] <model-path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--model", default="mlx-community/exaone-4.0-1.2b-4bit")
+    parser.add_argument("--max-tokens", type=int, default=10)
+    args = parser.parse_args()
 
-    model_path = args[0]
-    if paged:
-        _print_dict("GOLDEN_PAGED", _paged_golden(model_path))
-    else:
-        _print_dict("GOLDEN_MLX_LM", _mlx_lm_golden(model_path))
+    mlx = _mlx_tokens(args.model, args.max_tokens)
+    paged = _paged_tokens(args.model, args.max_tokens)
+
+    parity = True
+    for prompt in PROMPTS:
+        match = mlx[prompt] == paged[prompt]
+        parity &= match
+        print(f"[{'MATCH' if match else 'DIFF '}] {prompt!r}")
+        print(f"    mlx_lm: {mlx[prompt]}")
+        print(f"    paged:  {paged[prompt]}")
+    print("\nPARITY OK" if parity else "\nPARITY FAILED")
+    raise SystemExit(0 if parity else 1)
 
 
 if __name__ == "__main__":

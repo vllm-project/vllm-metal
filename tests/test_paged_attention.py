@@ -54,6 +54,23 @@ class TestSDPAPagedAttentionWrapper:
         assert wrapper.rotary_emb is inner.rotary_emb
         assert wrapper.rope is inner.rope
 
+    def test_exposes_inner_is_local(self):
+        class _Inner:
+            is_local = True
+
+        wrapper = SDPAPagedAttentionWrapper(
+            _Inner(), layer_idx=0, kv_cache=object(), block_size=16
+        )
+
+        assert wrapper.is_local is True
+
+    def test_defaults_is_local_false_when_inner_lacks_it(self):
+        wrapper = SDPAPagedAttentionWrapper(
+            object(), layer_idx=0, kv_cache=object(), block_size=16
+        )
+
+        assert wrapper.is_local is False
+
     def test_forwards_precomputed_rope_embeddings_without_context(self):
         class _Inner:
             def __init__(self):
