@@ -105,6 +105,9 @@ class Gemma4MTPProposer:
         )
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        if ctx.num_speculative_tokens <= 0:
+            return None
+
         runner = self._runner
         assistant = runner._gemma4_mtp_assistant
         if (
