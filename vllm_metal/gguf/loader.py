@@ -1,21 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-native local GGUF loader (dense decoder-only, Q8_0/Q4_0).
-
-Joins PR 1's ``GGUFMLXQuantizedTensor`` (MLX-native repack) and PR 2's
-``GGUFLinear``/``GGUFEmbedding`` wrappers into a working mlx-lm model. The model
-skeleton is built through the public ``mlx_lm.utils.load_model(..., strict=False)``
-path; this loader layers the GGUF-specific orchestration on top: preflight, read,
-partition, install the quantized wrappers, load the plain tensors, and verify
-every parameter ended up populated.
-
-``GGUFModelLoader`` is the owner. Model-family name/scope policy lives in
-:class:`vllm_metal.gguf.adapter.GGUFModelAdapter`. Design rationale is in
-``codex/GGUF_PR3_DESIGN.md`` §5.
-
-Scope: dense decoder-only, Q8_0/Q4_0 per tensor. Linear-attention/SSM hybrids,
-fused-QKV, MoE, K-quants, Q4_1, vision and remote ``repo:quant`` references are
-out of scope and fail fast at the arch allowlist or in preflight.
-"""
+"""MLX-native local GGUF loader for dense Q8_0/Q4_0 decoder checkpoints."""
 
 from __future__ import annotations
 
@@ -37,11 +21,11 @@ from mlx_lm.utils import load_config, load_model, load_tokenizer
 
 from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
 from vllm_metal.gguf.mlx_native import MLX_NATIVE_GGUF_TYPES, GGUFMLXQuantizedTensor
+from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
 __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
-_GGUF_SUFFIX = ".gguf"
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
@@ -72,84 +56,26 @@ class GGUFModelLoader:
 
     Args:
         gguf_path: Path to a local ``.gguf`` file (dense decoder, Q8_0/Q4_0).
-        config_dir: Directory with the companion HF ``config.json`` + tokenizer
-            that define the mlx-lm skeleton (GGUF files carry weights only).
+        config_dir: Companion HF config source that defines the mlx-lm skeleton.
+        tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.
         tokenizer_config: Extra kwargs forwarded to mlx_lm tokenizer loading.
     """
 
     def __init__(
         self,
-        gguf_path: str,
+        gguf_path: str | Path,
         *,
-        config_dir: str,
+        config_dir: str | Path,
+        tokenizer_dir: str | Path | None = None,
         target_dtype: mx.Dtype,
         tokenizer_config: dict[str, Any] | None = None,
     ) -> None:
         self._gguf_path = Path(gguf_path)
         self._config_dir = Path(config_dir)
+        self._tokenizer_dir = Path(tokenizer_dir or config_dir)
         self._target_dtype = target_dtype
         self._tokenizer_config = dict(tokenizer_config or {})
-
-    @classmethod
-    def for_model(
-        cls,
-        model_name: str,
-        *,
-        config_dir: str,
-        target_dtype: mx.Dtype,
-        tokenizer_config: dict[str, Any] | None = None,
-    ) -> GGUFModelLoader:
-        """Build a loader for a GGUF model the lifecycle has already routed here.
-
-        Called only after the lifecycle confirmed ``model_config.quantization ==
-        "gguf"`` and lazily imported this module (which imports the optional
-        ``gguf`` package) — mirroring how the AWQ branch routes on detected
-        config. This factory does the GGUF-specific input validation before
-        constructing the loader.
-
-        It raises rather than returning ``None`` so a confirmed-GGUF checkpoint
-        can never silently fall through to the generic loader and bypass this
-        owner — the same contract :meth:`AWQQuantLoader.for_model` uses for GPTQ.
-
-        Args:
-            model_name: Path to the local ``.gguf`` file
-                (``model_config.model_weights``, carried there by the GGUF
-                engine integration).
-            config_dir: Companion config/tokenizer directory the user passes via
-                ``--tokenizer`` (``model_config.tokenizer``). A ``.gguf`` carries
-                weights only, so mlx-lm builds the model from this directory.
-            target_dtype: Compute dtype for dequantized embedding rows /
-                activations, threaded to the constructed loader.
-            tokenizer_config: Extra kwargs forwarded to mlx-lm tokenizer loading
-                (e.g. ``trust_remote_code``).
-
-        Raises:
-            GGUFLoadError: ``model_name`` is not a local ``.gguf`` file (remote
-                ``repo:quant`` / Hub references are not supported yet), or
-                ``config_dir`` has no ``config.json`` (``--tokenizer`` omitted or
-                pointing at a directory without the companion config).
-        """
-        gguf_path = Path(model_name)
-        if gguf_path.suffix != _GGUF_SUFFIX or not gguf_path.is_file():
-            raise GGUFLoadError(
-                f"{model_name!r} is a GGUF model, but it is not a local .gguf "
-                "file. Remote GGUF (repo:quant / Hub download) is not supported "
-                "yet; pass a path to a local .gguf file."
-            )
-        if not (Path(config_dir) / "config.json").is_file():
-            raise GGUFLoadError(
-                "Serving a GGUF model needs --tokenizer pointing at a directory "
-                f"with config.json and the tokenizer files; got {config_dir!r}. A "
-                ".gguf carries weights only, so mlx-lm builds the model from that "
-                "directory."
-            )
-        return cls(
-            model_name,
-            config_dir=config_dir,
-            target_dtype=target_dtype,
-            tokenizer_config=tokenizer_config,
-        )
 
     def load(self) -> tuple[nn.Module, Any]:
         """Run the full load workflow and return ``(model, tokenizer)``.
@@ -187,14 +113,17 @@ class GGUFModelLoader:
 
         # Build the tokenizer from the companion config directory and return both.
         tokenizer = load_tokenizer(
-            self._config_dir,
+            self._tokenizer_dir,
             tokenizer_config_extra=self._tokenizer_config,
             eos_token_ids=config.get("eos_token_id"),
         )
         return model, tokenizer
 
     def _open_inputs(self) -> tuple[Any, dict[str, Any]]:
-        if self._gguf_path.suffix != _GGUF_SUFFIX or not self._gguf_path.is_file():
+        if (
+            not GGUFLoadSource.is_weights_path(str(self._gguf_path))
+            or not self._gguf_path.is_file()
+        ):
             raise GGUFLoadError(f"Not a local .gguf file: {str(self._gguf_path)!r}")
         if not (self._config_dir / "config.json").is_file():
             raise GGUFLoadError(

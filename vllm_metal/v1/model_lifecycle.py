@@ -78,9 +78,7 @@ class GenerationLoadRequest:
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
-        gguf_source = (
-            None if is_vlm else GGUFLoadSource.from_model_config(model_config)
-        )
+        gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
 
         return cls(
             model_name=(
@@ -214,7 +212,9 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        loaded_from = gguf_source.weights_path if gguf_source is not None else model_name
+        loaded_from = (
+            gguf_source.weights_path if gguf_source is not None else model_name
+        )
         logger.info(
             "%s loaded in %.2fs: %s",
             load_label,
@@ -232,9 +232,10 @@ class ModelLifecycle:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
-        loader = GGUFModelLoader.for_model(
+        loader = GGUFModelLoader(
             source.weights_path,
             config_dir=source.config_dir,
+            tokenizer_dir=source.tokenizer_dir,
             target_dtype=target_dtype,
             tokenizer_config=dict(tokenizer_config),
         )
