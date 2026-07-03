@@ -541,14 +541,17 @@ def sdpa_forward(
         kv_cache.value_scale_caches[layer_idx] = new_value_scale_cache
         kv_cache.key_zero_caches[layer_idx] = new_key_zero_cache
     else:
-        flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
-        flat_k[slot_mapping] = k_3d
-        new_k_cache = flat_k.reshape(kv_cache.key_caches[layer_idx].shape)
-
-        flat_v = kv_cache.value_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
-        flat_v[slot_mapping] = v_3d
-        new_v_cache = flat_v.reshape(kv_cache.value_caches[layer_idx].shape)
-
+        # Fused K/V paged scatter: one Metal dispatch (reshape_and_cache) writes
+        # both K and V into the paged cache by slot_mapping, replacing the two
+        # per-layer MLX scatters. The outputs alias the input cache buffers in
+        # place and carry graph provenance for the paged_attention read below.
+        new_k_cache, new_v_cache = get_ops().reshape_and_cache(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
         # Rebind so next layer / decode step uses the updated cache
         kv_cache.key_caches[layer_idx] = new_k_cache
         kv_cache.value_caches[layer_idx] = new_v_cache

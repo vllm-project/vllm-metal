@@ -26,7 +26,10 @@ template <> inline bfloat16_t to_cache<bfloat16_t, bfloat16_t>(bfloat16_t v) {
 
 template <> inline half to_cache<half, half>(half v) { return v; }
 
-constant bool use_fp8_scales [[function_constant(10)]];
+// Renamed from use_fp8_scales at function_constant(10): once this kernel is
+// concatenated into the v2 library, both the name and the index collide with an
+// existing constant, so it uses a unique name at a free index (100).
+constant bool rac_use_fp8_scales [[function_constant(100)]];
 
 // Cache layout: [num_blocks, block_size, num_heads, head_size]
 // Both key and value caches use the same token-contiguous layout.
@@ -43,9 +46,9 @@ template <typename KV_T, typename CACHE_T>
     const device int64_t *__restrict__ slot_mapping
     [[buffer(4)]], // [num_tokens]
     const device float *__restrict__ k_scale
-    [[buffer(5), function_constant(use_fp8_scales)]], // [1]
+    [[buffer(5), function_constant(rac_use_fp8_scales)]], // [1]
     const device float *__restrict__ v_scale
-    [[buffer(6), function_constant(use_fp8_scales)]], // [1]
+    [[buffer(6), function_constant(rac_use_fp8_scales)]], // [1]
     device const int &key_stride [[buffer(7)]],
     device const int &value_stride [[buffer(8)]],
     device const int &num_heads [[buffer(9)]],
@@ -79,7 +82,7 @@ template <typename KV_T, typename CACHE_T>
         head_idx * head_size +
         head_offset;
 
-    if (use_fp8_scales) {
+    if (rac_use_fp8_scales) {
       key_cache[tgt_idx] =
           to_cache<KV_T, CACHE_T>(KV_T((float)key[src_key_idx] / *k_scale));
       value_cache[tgt_idx] =
@@ -102,9 +105,9 @@ template <typename KV_T, typename CACHE_T>
       device cache_type *__restrict__ value_cache [[buffer(3)]],               \
       const device int64_t *__restrict__ slot_mapping [[buffer(4)]],           \
       const device float *__restrict__ k_scale                                 \
-      [[buffer(5), function_constant(use_fp8_scales)]],                        \
+      [[buffer(5), function_constant(rac_use_fp8_scales)]],                        \
       const device float *__restrict__ v_scale                                 \
-      [[buffer(6), function_constant(use_fp8_scales)]],                        \
+      [[buffer(6), function_constant(rac_use_fp8_scales)]],                        \
       device const int &key_stride [[buffer(7)]],                              \
       device const int &value_stride [[buffer(8)]],                            \
       device const int &num_heads [[buffer(9)]],                               \
