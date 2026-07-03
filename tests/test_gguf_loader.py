@@ -436,13 +436,9 @@ def test_rejects_missing_config(tmp_path):
         ).load()
 
 
-def test_for_model_builds_loader_that_stays_quantized(tmp_path):
-    # The lifecycle-facing factory yields a loader whose model keeps the GGUF
-    # quantized wrappers (Q8_0 in memory), not a dense dequantized fallback.
+def test_direct_loader_keeps_quantized_wrappers(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    loader = GGUFModelLoader.for_model(
-        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
-    )
+    loader = GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
     assert isinstance(loader, GGUFModelLoader)
     model, _ = loader.load()
     hist = _gguf_module_histogram(model)
@@ -450,20 +446,15 @@ def test_for_model_builds_loader_that_stays_quantized(tmp_path):
     assert hist.get("GGUFLinear") == 2 * 7
 
 
-def test_for_model_rejects_remote_reference(tmp_path):
-    # A non-local model id (remote repo:quant) is out of scope; for_model must
-    # fail fast rather than fall through to the generic loader.
+def test_direct_loader_rejects_remote_reference(tmp_path):
     _, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    with pytest.raises(GGUFLoadError, match="not a local .gguf file"):
-        GGUFModelLoader.for_model(
+    with pytest.raises(GGUFLoadError, match="Not a local .gguf file"):
+        GGUFModelLoader(
             "org/qwen3-gguf:Q8_0", config_dir=cfg_dir, target_dtype=mx.float32
-        )
+        ).load()
 
 
-def test_for_model_rejects_missing_tokenizer_dir(tmp_path):
-    # --tokenizer omitted: config_dir resolves to the .gguf itself (no config.json).
+def test_direct_loader_rejects_missing_config_dir(tmp_path):
     gguf_path, _ = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
-    with pytest.raises(GGUFLoadError, match="needs --tokenizer"):
-        GGUFModelLoader.for_model(
-            gguf_path, config_dir=gguf_path, target_dtype=mx.float32
-        )
+    with pytest.raises(GGUFLoadError, match="No config.json"):
+        GGUFModelLoader(gguf_path, config_dir=gguf_path, target_dtype=mx.float32).load()

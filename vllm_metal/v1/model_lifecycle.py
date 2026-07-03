@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
+from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
@@ -63,6 +64,7 @@ class GenerationLoadRequest:
     is_vlm: bool
     target_dtype: Any
     tokenizer_config: Mapping[str, Any]
+    gguf_source: GGUFLoadSource | None
 
     @classmethod
     def from_runner(
@@ -76,14 +78,20 @@ class GenerationLoadRequest:
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
+        gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
 
         return cls(
-            model_name=get_model_download_path(model_config.model),
+            model_name=(
+                gguf_source.weights_path
+                if gguf_source is not None
+                else get_model_download_path(model_config.model)
+            ),
             model_config=model_config,
             hf_config=hf_config,
             is_vlm=is_vlm,
             target_dtype=torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype,
             tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
+            gguf_source=gguf_source,
         )
 
 
@@ -139,6 +147,7 @@ class ModelLifecycle:
             model_config=request.model_config,
             target_dtype=request.target_dtype,
             tokenizer_config=request.tokenizer_config,
+            gguf_source=request.gguf_source,
         )
         return LoadedGenerationModel(
             model=model,
@@ -154,6 +163,7 @@ class ModelLifecycle:
         model_config: Any | None = None,
         target_dtype: Any | None = None,
         tokenizer_config: Mapping[str, Any] | None = None,
+        gguf_source: GGUFLoadSource | None = None,
     ) -> tuple[Any, Any]:
         """Load a text or VLM generation model."""
 
@@ -169,13 +179,15 @@ class ModelLifecycle:
             target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
 
         start_time = time.time()
-        is_gguf = not is_vlm and model_config.quantization == "gguf"
+        if gguf_source is None and not is_vlm:
+            gguf_source = GGUFLoadSource.from_model_config(model_config)
+        is_gguf = gguf_source is not None
         awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
 
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
-                model_config,
+                gguf_source,
                 target_dtype,
                 tokenizer_config,
             )
@@ -200,9 +212,9 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        # For GGUF the engine integration rewrites model_config.model to the
-        # config source; the weights the user served live in model_weights.
-        loaded_from = model_config.model_weights if is_gguf else model_name
+        loaded_from = (
+            gguf_source.weights_path if gguf_source is not None else model_name
+        )
         logger.info(
             "%s loaded in %.2fs: %s",
             load_label,
@@ -213,18 +225,17 @@ class ModelLifecycle:
 
     def _load_gguf_text_model(
         self,
-        model_config: Any,
+        source: GGUFLoadSource,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],
     ) -> tuple[Any, Any]:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
-        # The GGUF engine integration rewrites model_config.model to the config
-        # source and carries the .gguf path in model_config.model_weights.
-        loader = GGUFModelLoader.for_model(
-            model_config.model_weights,
-            config_dir=model_config.model,
+        loader = GGUFModelLoader(
+            source.weights_path,
+            config_dir=source.config_dir,
+            tokenizer_dir=source.tokenizer_dir,
             target_dtype=target_dtype,
             tokenizer_config=dict(tokenizer_config),
         )

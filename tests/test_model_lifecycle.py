@@ -869,30 +869,30 @@ class TestModelLifecycle:
         """
         fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()
-        for_model_calls: list[dict[str, object]] = []
+        loader_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
 
         class _StubGGUFLoader:
-            @classmethod
-            def for_model(
-                cls,
-                model_name: str,
+            def __init__(
+                self,
+                gguf_path: str,
                 *,
                 config_dir: str,
+                tokenizer_dir: str,
                 target_dtype: object,
                 tokenizer_config: dict[str, object] | None = None,
-            ) -> _StubGGUFLoader:
-                for_model_calls.append(
+            ) -> None:
+                loader_calls.append(
                     {
-                        "model_name": model_name,
+                        "gguf_path": gguf_path,
                         "config_dir": config_dir,
+                        "tokenizer_dir": tokenizer_dir,
                         "target_dtype": target_dtype,
                         "tokenizer_config": (
                             dict(tokenizer_config) if tokenizer_config else None
                         ),
                     }
                 )
-                return cls()
 
             def load(self) -> tuple[object, object]:
                 return fake_model, fake_tokenizer
@@ -926,10 +926,11 @@ class TestModelLifecycle:
             "generic mlx_lm.load must NOT be called when the GGUF owner owns "
             "the load path"
         )
-        assert len(for_model_calls) == 1
-        call = for_model_calls[0]
-        assert call["model_name"] == "stub-model.gguf"
+        assert len(loader_calls) == 1
+        call = loader_calls[0]
+        assert call["gguf_path"] == "stub-model.gguf"
         assert call["config_dir"] == "config-dir"
+        assert call["tokenizer_dir"] == "tokenizer-dir"
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
             "and thread it to the owner"
@@ -972,36 +973,30 @@ class TestModelLifecycle:
         assert runner._is_vlm is False
         assert runner.model_args["vocab_size"] == 32000
 
-    def test_gguf_load_uses_each_tokenizer_dir(
+    def test_gguf_load_threads_config_and_tokenizer_sources(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Two loads of the same .gguf with different ``--tokenizer`` dirs must
-        both reach the GGUF owner with their own config dirs. A .gguf carries
-        weights only, so the model and tokenizer are built from the config dir.
-        """
-        for_model_dirs: list[str] = []
+        """GGUF loads keep the config source separate from the tokenizer source."""
+        loader_sources: list[tuple[str, str]] = []
 
         class _StubGGUFLoader:
-            def __init__(self, config_dir: str) -> None:
-                self._config_dir = config_dir
-
-            @classmethod
-            def for_model(
-                cls,
-                model_name: str,
+            def __init__(
+                self,
+                gguf_path: str,
                 *,
                 config_dir: str,
+                tokenizer_dir: str,
                 target_dtype: object,
                 tokenizer_config: dict[str, object] | None = None,
-            ) -> _StubGGUFLoader:
-                for_model_dirs.append(config_dir)
-                return cls(config_dir)
+            ) -> None:
+                loader_sources.append((config_dir, tokenizer_dir))
+                self._tokenizer_dir = tokenizer_dir
 
             def load(self) -> tuple[object, object]:
                 return (
                     SimpleNamespace(config=_text_config()),
-                    f"tokenizer::{self._config_dir}",
+                    f"tokenizer::{self._tokenizer_dir}",
                 )
 
         monkeypatch.setitem(
@@ -1013,7 +1008,7 @@ class TestModelLifecycle:
         def _load_tokenizer_for(tokenizer_dir: str) -> object:
             lifecycle, runner = _make_lifecycle(
                 model_config=_runner_model_config(
-                    model=tokenizer_dir,
+                    model="/config-dir",
                     quantization="gguf",
                     tokenizer=tokenizer_dir,
                     model_weights="stub-model.gguf",
@@ -1025,9 +1020,7 @@ class TestModelLifecycle:
         first = _load_tokenizer_for("/dir-a")
         second = _load_tokenizer_for("/dir-b")
 
-        assert for_model_dirs == ["/dir-a", "/dir-b"], (
-            "for_model must run for each distinct --tokenizer dir"
-        )
+        assert loader_sources == [("/config-dir", "/dir-a"), ("/config-dir", "/dir-b")]
         assert first == "tokenizer::/dir-a"
         assert second == "tokenizer::/dir-b"
 
