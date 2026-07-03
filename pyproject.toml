@@ -87,6 +87,13 @@ Issues = "https://github.com/vllm-project/vllm-metal/issues"
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 
+# GGUF engine integration (vLLM 0.24 moved in-tree GGUF support to the
+# CUDA/ROCm-only vllm-gguf-plugin; this restores the Metal-consumable layer).
+# Loaded by vLLM in EngineArgs.__post_init__ and in the EngineCore/worker
+# subprocesses; the target module stays importable without the `gguf` extra.
+[project.entry-points."vllm.general_plugins"]
+gguf_metal = "vllm_metal.gguf.vllm_integration:register"
+
 # Maturin configuration for mixed Rust/Python project
 [tool.maturin]
 # Build both the Rust extension and include Python source

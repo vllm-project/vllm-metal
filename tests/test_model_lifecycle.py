@@ -84,6 +84,7 @@ def _runner_model_config(**overrides: object) -> object:
         "trust_remote_code": False,
         "dtype": torch.float16,
         "quantization": None,
+        "model_weights": "",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -859,11 +860,12 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """``quantization == "gguf"`` (set by vLLM core for a .gguf) delegates the
-        whole load to ``GGUFModelLoader`` (lazily imported) and never calls generic
-        ``mlx_lm.load`` — detection-routed like the AWQ branch, no env flag. The
-        lifecycle threads the resolved model path, ``--tokenizer`` dir, derived
-        dtype, and tokenizer config to the owner.
+        """``quantization == "gguf"`` (set by the GGUF engine integration for a
+        .gguf) delegates the whole load to ``GGUFModelLoader`` (lazily imported)
+        and never calls generic ``mlx_lm.load`` — detection-routed like the AWQ
+        branch, no env flag. The lifecycle threads the ``.gguf`` path from
+        ``model_config.model_weights``, the ``--tokenizer`` dir, derived dtype,
+        and tokenizer config to the owner.
         """
         fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()
@@ -910,7 +912,9 @@ class TestModelLifecycle:
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
-                quantization="gguf", tokenizer="tokenizer-dir"
+                quantization="gguf",
+                tokenizer="tokenizer-dir",
+                model_weights="stub-model.gguf",
             )
         )
         lifecycle.load()
@@ -923,7 +927,7 @@ class TestModelLifecycle:
         )
         assert len(for_model_calls) == 1
         call = for_model_calls[0]
-        assert call["model_name"] == "stub-model"
+        assert call["model_name"] == "stub-model.gguf"
         assert call["config_dir"] == "tokenizer-dir"
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
@@ -1008,7 +1012,9 @@ class TestModelLifecycle:
         def _load_tokenizer_for(tokenizer_dir: str) -> object:
             lifecycle, runner = _make_lifecycle(
                 model_config=_runner_model_config(
-                    quantization="gguf", tokenizer=tokenizer_dir
+                    quantization="gguf",
+                    tokenizer=tokenizer_dir,
+                    model_weights="stub-model.gguf",
                 )
             )
             lifecycle.load()

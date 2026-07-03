@@ -23,7 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-import gguf
+try:
+    import gguf
+except ImportError as exc:
+    raise ImportError(
+        "GGUF support requires the optional 'gguf' dependency. "
+        "Install it with: pip install 'vllm-metal[gguf]'"
+    ) from exc
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
@@ -107,9 +113,9 @@ class GGUFModelLoader:
         owner — the same contract :meth:`AWQQuantLoader.for_model` uses for GPTQ.
 
         Args:
-            model_name: Already-resolved model path
-                (``get_model_download_path(model_config.model)``); for a local
-                GGUF this is the ``.gguf`` file.
+            model_name: Path to the local ``.gguf`` file
+                (``model_config.model_weights``, carried there by the GGUF
+                engine integration).
             config_dir: Companion config/tokenizer directory the user passes via
                 ``--tokenizer`` (``model_config.tokenizer``). A ``.gguf`` carries
                 weights only, so mlx-lm builds the model from this directory.

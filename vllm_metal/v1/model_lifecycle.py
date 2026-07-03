@@ -175,7 +175,6 @@ class ModelLifecycle:
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
-                model_name,
                 model_config,
                 target_dtype,
                 tokenizer_config,
@@ -201,17 +200,19 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
+        # For GGUF the engine integration rewrites model_config.model to the
+        # config source; the weights the user served live in model_weights.
+        loaded_from = model_config.model_weights if is_gguf else model_name
         logger.info(
             "%s loaded in %.2fs: %s",
             load_label,
             time.time() - start_time,
-            model_name,
+            loaded_from,
         )
         return model, tokenizer
 
     def _load_gguf_text_model(
         self,
-        model_name: str,
         model_config: Any,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],
@@ -219,8 +220,10 @@ class ModelLifecycle:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
+        # The GGUF engine integration rewrites model_config.model to the config
+        # source and carries the .gguf path in model_config.model_weights.
         loader = GGUFModelLoader.for_model(
-            model_name,
+            model_config.model_weights,
             config_dir=model_config.tokenizer,
             target_dtype=target_dtype,
             tokenizer_config=dict(tokenizer_config),
