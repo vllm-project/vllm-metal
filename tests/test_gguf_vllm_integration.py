@@ -177,15 +177,11 @@ def test_magic_bytes_without_suffix_fails_fast(tmp_path, config_dir) -> None:
     )
 
 
-def test_explicit_quantization_is_respected(gguf_file, config_dir) -> None:
-    # A user-chosen quantization must survive the wrap (it only sets when
-    # unset); the rest of the GGUF rewrite still applies.
-    model_config = _engine_args(
-        model=gguf_file, tokenizer=config_dir, quantization="awq"
-    ).create_model_config()
-
-    assert model_config.quantization == "awq"
-    assert model_config.model_weights == gguf_file
+def test_explicit_non_gguf_quantization_fails_fast(gguf_file, config_dir) -> None:
+    with pytest.raises(ValueError, match="Cannot serve GGUF model"):
+        _engine_args(
+            model=gguf_file, tokenizer=config_dir, quantization="awq"
+        ).create_model_config()
 
 
 def test_non_gguf_model_is_untouched(config_dir) -> None:

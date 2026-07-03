@@ -234,8 +234,12 @@ class GGUFEngineIntegration:
                     self.tokenizer if isinstance(self.tokenizer, str) else None,
                     self.hf_config_path,
                 )
-                if self.quantization is None:
-                    self.quantization = "gguf"
+                if self.quantization not in (None, "gguf"):
+                    raise ValueError(
+                        f"Cannot serve GGUF model with quantization={self.quantization!r}; "
+                        "leave quantization unset or use 'gguf'."
+                    )
+                self.quantization = "gguf"
                 if not self.model_weights:
                     self.model_weights = gguf_model
                 if self.served_model_name is None:
