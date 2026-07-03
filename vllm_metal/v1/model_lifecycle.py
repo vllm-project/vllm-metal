@@ -224,7 +224,7 @@ class ModelLifecycle:
         # source and carries the .gguf path in model_config.model_weights.
         loader = GGUFModelLoader.for_model(
             model_config.model_weights,
-            config_dir=model_config.tokenizer,
+            config_dir=model_config.model,
             target_dtype=target_dtype,
             tokenizer_config=dict(tokenizer_config),
         )

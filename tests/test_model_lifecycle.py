@@ -912,6 +912,7 @@ class TestModelLifecycle:
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
+                model="config-dir",
                 quantization="gguf",
                 tokenizer="tokenizer-dir",
                 model_weights="stub-model.gguf",
@@ -928,7 +929,7 @@ class TestModelLifecycle:
         assert len(for_model_calls) == 1
         call = for_model_calls[0]
         assert call["model_name"] == "stub-model.gguf"
-        assert call["config_dir"] == "tokenizer-dir"
+        assert call["config_dir"] == "config-dir"
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
             "and thread it to the owner"
@@ -1012,6 +1013,7 @@ class TestModelLifecycle:
         def _load_tokenizer_for(tokenizer_dir: str) -> object:
             lifecycle, runner = _make_lifecycle(
                 model_config=_runner_model_config(
+                    model=tokenizer_dir,
                     quantization="gguf",
                     tokenizer=tokenizer_dir,
                     model_weights="stub-model.gguf",
