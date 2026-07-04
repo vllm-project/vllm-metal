@@ -789,8 +789,24 @@ class MetalPlatform(Platform):
         metal_config = get_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
+
+        # Gate on additional_config rather than only the process-local
+        # singleton: executors invoke this hook in worker processes too,
+        # where the singleton may not have been populated yet, while
+        # ``additional_config`` travels with the pickled ``vllm_config``.
+        # Defaults mirror ``check_and_update_config``.
+        add = getattr(vllm_config, "additional_config", None) or {}
+        if add.get("turboquant"):
+            turboquant = True
+            k_quant = add.get("k_quant", "q8_0")
+            v_quant = add.get("v_quant", "q3_0")
+        else:
+            turboquant = metal_config.turboquant
+            k_quant = metal_config.k_quant
+            v_quant = metal_config.v_quant
+
         if (
-            not metal_config.turboquant
+            not turboquant
             or not metal_config.use_paged_attention
             or not model_config
             or not model_config.is_hybrid
@@ -816,8 +832,8 @@ class MetalPlatform(Platform):
             block_size=1,
             num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
             head_dim=model_config.get_head_size(),
-            k_quant=metal_config.k_quant,
-            v_quant=metal_config.v_quant,
+            k_quant=k_quant,
+            v_quant=v_quant,
         )
 
         # Kernel alignment straight from the backend (MultipleOf(16)). The

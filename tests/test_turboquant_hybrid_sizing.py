@@ -98,6 +98,48 @@ class TestHybridTurboQuantCachePolicy:
 
         assert per_block == len(SDPA_LAYERS) * TQ_PAGE
 
+    def test_upstream_uniformity_probe_handles_mixed_hybrid_specs(self) -> None:
+        """vLLM probes spec uniformity by merging and catching AssertionError.
+
+        The probe calls ``values()[0].merge(all_values)``, so the class of
+        the model's FIRST layer answers it. Regression: for hybrids whose
+        first layer is SDPA, ``TurboQuantAttentionSpec.merge`` raised
+        ``TypeError`` for the legitimately mixed dict (TurboQuant SDPA +
+        Mamba linear), which escaped the probe's ``except AssertionError``
+        and aborted engine init.
+        """
+        from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
+
+        # Linear layer first (Mamba answers the probe) and SDPA layer
+        # first (TurboQuant answers the probe) — both must survive.
+        for sdpa_layers in ([3, 7], [0, 4]):
+            runner = make_stub_runner(
+                model_args={"full_attention_interval": 4},
+                num_layers=NUM_LAYERS,
+                full_attention_interval=4,
+                sdpa_layer_indices=set(sdpa_layers),
+                num_sdpa_layers=len(sdpa_layers),
+                num_linear_layers=NUM_LAYERS - len(sdpa_layers),
+                num_kv_heads=KV_HEADS,
+                head_dim=HEAD_DIM,
+                kv_cache_dtype=mx.float16,
+                cache_config=SimpleNamespace(
+                    block_size=BLOCK_SIZE, mamba_page_size_padded=None
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=4),
+                linear_conv_kernel_dim=4,
+                linear_conv_dim=1024,
+                linear_num_v_heads=16,
+                linear_value_head_dim=64,
+                linear_key_head_dim=64,
+            )
+            with patch(
+                "vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()
+            ):
+                specs = runner._cache_policy.get_kv_cache_spec()
+
+            assert is_kv_cache_spec_uniform(specs) is False
+
     def test_one_sequence_estimate_includes_linear_state(self) -> None:
         runner = _hybrid_runner()
         max_model_len = 2048
@@ -180,6 +222,39 @@ class TestTurboQuantHybridAlignment:
         expected_page = expected_block * self._TQ_PAGE_1_TOKEN
         assert expected_page >= self._MAMBA_PAGE
         assert vllm_config.cache_config.mamba_page_size_padded == expected_page
+
+    def test_realign_gates_on_additional_config(self, monkeypatch) -> None:
+        """Workers may run this hook before the metal singleton is populated.
+
+        ``additional_config`` travels with the pickled ``vllm_config``, so
+        gating on it keeps driver and worker processes consistent even when
+        the process-local singleton still has TurboQuant disabled.
+        """
+        vllm_config = self._vllm_config(block_size=544)
+        vllm_config.additional_config = {
+            "turboquant": True,
+            "k_quant": K_QUANT,
+            "v_quant": V_QUANT,
+        }
+        fresh_singleton = MetalConfig(
+            memory_fraction=-1.0,
+            use_mlx=False,
+            mlx_device="gpu",
+            debug=False,
+            use_paged_attention=True,
+        )
+        assert fresh_singleton.turboquant is False
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: fresh_singleton)
+        monkeypatch.setattr(
+            ModelRegistry,
+            "resolve_model_cls",
+            lambda architecture, model_config: (self._stub_model_cls(), None),
+        )
+
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config)
+
+        expected_block = 16 * -(-self._MAMBA_PAGE // (16 * self._TQ_PAGE_1_TOKEN))
+        assert vllm_config.cache_config.block_size == expected_block
 
     def test_realign_noop_without_turboquant(self, monkeypatch) -> None:
         vllm_config = self._vllm_config(block_size=544)

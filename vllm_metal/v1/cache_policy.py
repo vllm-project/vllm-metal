@@ -77,21 +77,27 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @classmethod
     def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
+        # vLLM's ``is_kv_cache_spec_uniform`` probes uniformity by calling
+        # ``merge`` on the full spec list and treats AssertionError as "not
+        # uniform" (its except clause catches nothing else). Hybrid models
+        # legitimately reach this probe with a mixed TurboQuant+Mamba dict,
+        # so type/config mismatches here must surface as AssertionError,
+        # matching ``KVCacheSpec.merge``'s assert-based contract.
         turbo_specs: list[TurboQuantAttentionSpec] = []
         for spec in specs:
             if not isinstance(spec, TurboQuantAttentionSpec):
-                raise TypeError(
+                raise AssertionError(
                     "All attention layers in the same KV cache group must be "
                     "TurboQuantAttentionSpec."
                 )
             turbo_specs.append(spec)
         if not turbo_specs:
-            raise ValueError("TurboQuantAttentionSpec.merge() requires specs")
+            raise AssertionError("TurboQuantAttentionSpec.merge() requires specs")
 
         k_set = {s.k_quant for s in turbo_specs}
         v_set = {s.v_quant for s in turbo_specs}
         if len(k_set) != 1 or len(v_set) != 1:
-            raise ValueError(
+            raise AssertionError(
                 "All TurboQuant layers in the same cache group must share the "
                 "same (k_quant, v_quant); mixed-quant groups are not supported."
             )
