@@ -198,18 +198,21 @@ class TestPrepare:
         assert ctx.offsets == [7]
         assert ctx.cu_seqlens == [0, 1]
 
-    def test_prepare_unified_spec_decode_splits_query_tokens(self):
+    def test_prepare_unified_spec_decode_keeps_window_whole(self):
         # Speculative verification appends draft rows after the last token.
-        # Each row is a separate attention segment with its own position.
+        # The window stays ONE multi-token segment (cu_seqlens aligned with
+        # decode requests); per-row causality is the kernel's varlen job.
         prepare_unified([([5, 6, 7], 7, 3)], [], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
         assert ctx.slot_mapping == [27, 28, 29]
-        assert ctx.block_tables == [[5, 6, 7], [5, 6, 7], [5, 6, 7]]
-        assert ctx.context_lens == [8, 9, 10]
-        assert ctx.offsets == [7, 8, 9]
-        assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.block_tables == [[5, 6, 7]]
+        assert ctx.context_lens == [10]
+        assert ctx.offsets == [7]
+        assert ctx.cu_seqlens == [0, 3]
+        assert ctx.verify_window_q == 3
+        assert ctx.num_decode_requests == 1
 
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill

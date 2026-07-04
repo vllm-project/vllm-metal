@@ -64,6 +64,12 @@ class PagedAttentionContext:
     # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
     # per-segment handling entirely.
     segment_positions: list[Any] | None = None
+    # Longest spec-decode verification window in this batch, or 1.  Set
+    # above 1 only when every multi-token segment is a decode window (no
+    # prefill segments), so the kernel dispatcher may route the batch to
+    # the per-token kernel's window mode; prefill batches keep the tiled
+    # kernel and stay numerically identical to the non-speculative path.
+    verify_window_q: int = 1
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -140,8 +146,8 @@ def prepare_unified(
         decode_requests: list of ``(block_ids, seq_len)`` or
             ``(block_ids, seq_len, num_tokens)`` for decode requests.
             ``seq_len`` = tokens already cached before this step. ``num_tokens``
-            defaults to 1 and expands the decode row span for speculative
-            verification.
+            defaults to 1; a larger value is a speculative-verification
+            window, kept as one multi-token segment.
         prefill_requests: list of ``(block_ids, num_tokens, start_pos)`` for
             prefill.  ``start_pos`` is the position of the first token in this
             chunk (0 for a fresh prefill, >0 for continuation chunks).
@@ -153,7 +159,12 @@ def prepare_unified(
     context_lens: list[int] = []
     offsets: list[int] = []
 
-    # Decode requests first.
+    max_decode_window = 1
+
+    # Decode requests first.  A multi-token decode request (spec-decode
+    # verification window) stays ONE segment, so cu_seqlens aligns with
+    # decode requests and the kernel sees the window whole; per-row causal
+    # frontiers come from the kernels' varlen handling.
     for decode_request in decode_requests:
         if len(decode_request) == 2:
             block_ids, seq_len = decode_request
@@ -165,10 +176,11 @@ def prepare_unified(
             block_idx = block_ids[pos // block_size]
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
-            cu_seqlens.append(cu_seqlens[-1] + 1)
-            block_tables.append(block_ids)
-            context_lens.append(pos + 1)  # including this decode token
-            offsets.append(pos)  # RoPE position
+        cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        block_tables.append(block_ids)
+        context_lens.append(seq_len + num_tokens)  # including window tokens
+        offsets.append(seq_len)  # RoPE position of the first window token
+        max_decode_window = max(max_decode_window, num_tokens)
 
     # Prefill requests (variable tokens each, starting at start_pos)
     for block_ids, num_tokens, start_pos in prefill_requests:
@@ -189,5 +201,9 @@ def prepare_unified(
             cu_seqlens=cu_seqlens,
             offsets=offsets,
             num_decode_requests=len(decode_requests),
+            # Window routing applies only to pure-verification batches;
+            # any prefill segment keeps the whole batch on the tiled
+            # kernel, numerically identical to the non-speculative path.
+            verify_window_q=1 if prefill_requests else max_decode_window,
         )
     )
