@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from types import ModuleType
 
-from vllm_metal.metal.constants import PARTITION_SIZE
+from vllm_metal.metal.constants import PA_WINDOW_ROWS, PARTITION_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ def _build_v2_paged_attention_source() -> str:
     """Concatenate float8 + utils + turboquant + v2 paged_attention (online softmax)."""
     parts = [
         f"#define VLLM_METAL_PARTITION_SIZE {PARTITION_SIZE}",
+        f"#define VLLM_METAL_PA_WINDOW_ROWS {PA_WINDOW_ROWS}",
         _read_metal_source(_KERNELS_V2_DIR / "float8.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),

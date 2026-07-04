@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from vllm_metal.metal.constants import PARTITION_SIZE
+from vllm_metal.metal.constants import PA_WINDOW_ROWS, PARTITION_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,7 @@ def _build_spec() -> _BuildSpec:
         "-D_METAL_",
         "-DACCELERATE_NEW_LAPACK",
         f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
+        f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
         "-undefined",
         "dynamic_lookup",
         str(nb_src),

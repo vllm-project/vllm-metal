@@ -37,6 +37,17 @@ using namespace mlx::core;
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 
+// Window mode for spec-decode verification (per-token kernel): query rows
+// per threadgroup (2 = the measured register/occupancy sweet spot on Apple
+// GPUs; larger windows become several sub-window threadgroups).
+// Single-sourced from vllm_metal/metal/constants.py via
+// -DVLLM_METAL_PA_WINDOW_ROWS; the shader consumes the same define as
+// PA_WINDOW_ROWS, so host and kernel cannot drift.
+#ifndef VLLM_METAL_PA_WINDOW_ROWS
+#define VLLM_METAL_PA_WINDOW_ROWS 2
+#endif
+constexpr int kWindowRows = VLLM_METAL_PA_WINDOW_ROWS;
+
 // ---------------------------------------------------------------------------
 // Split-KV (flash-decoding) decode gate
 // ---------------------------------------------------------------------------
@@ -318,7 +329,8 @@ static void dispatch_paged_attention_v2_online(
     int num_kv_heads, float scale, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int block_size, int max_seq_len, int sliding_window, Stream s,
+    int block_size, int max_seq_len, int sliding_window,
+    int window_seqlen_q, Stream s,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -329,15 +341,28 @@ static void dispatch_paged_attention_v2_online(
     int v_bits = 3) {
   int head_size = static_cast<int>(query.shape(2));
 
-  // Tiled kernel for prefill batches (max_seqlen_q > 1), matching vLLM
-  // Triton's 2D/3D dispatch split.  Pure-decode batches (every sequence has
-  // exactly 1 query token) use the original per-token kernel.
+  // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
+  // split.  Pure-decode batches (every sequence has exactly 1 query token)
+  // use the original per-token kernel.
   int total_q_tokens = static_cast<int>(query.shape(0));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
   bool has_prefill = total_q_tokens > num_seqs;
   bool dtype_ok = query.dtype() != float32
                && query.dtype() == key_cache.dtype();
-  if (has_prefill && !use_turboquant && dtype_ok) {
+
+  // Spec-decode verification windows: a multi-token batch whose segments
+  // are all verification windows runs the per-token kernel in window mode
+  // (kWindowRows-row sub-window threadgroups share every KV read), keeping
+  // split-KV eligibility.  The tiled kernel is wrong for this shape: its
+  // BQ-row MMA tiles waste ~80% of their compute on a K+1 window and it has
+  // no KV-length parallelism.  head_size <= 256 is a host-only routing
+  // bound: the kernel's per-row register state is
+  // kWindowRows * ceil(head_size/32) accumulator floats per thread, and 512
+  // would collapse occupancy (the kernel itself has no head-size cap).
+  const bool window_batch =
+      has_prefill && window_seqlen_q > 1 && head_size <= 256;
+
+  if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
     if (auto cfg = select_tile_config(head_size)) {
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
@@ -356,9 +381,19 @@ static void dispatch_paged_attention_v2_online(
   auto dt        = dtype_to_metal(query.dtype());
   auto k_cache_dt = dtype_to_metal(key_cache.dtype());
   auto v_cache_dt = dtype_to_metal(value_cache.dtype());
+  // Window mode: one threadgroup per (segment, kWindowRows-row sub-window)
+  // instead of per token.  The function constant carries the sub-window
+  // count so the kernel's grid.y decomposition folds to constants.
+  int window_q_fc = 0;
+  if (window_batch) {
+    window_q_fc = (window_seqlen_q + kWindowRows - 1) / kWindowRows;
+  }
+  const int grid_y =
+      window_batch ? num_seqs * window_q_fc : total_q_tokens;
+
   // ----- Split-KV (flash-decoding) occupancy gate ------------------------
   const bool pure_decode = !has_prefill;  // every seq has exactly 1 query token
-  const int base_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
+  const int base_grid = num_heads * grid_y;  // grid.z = 1 occupancy
   const int max_num_partitions =
       (max_seq_len + kPartitionSize - 1) / kPartitionSize;
   // TurboQuant and sliding-window batches take the split too.  TQ partials
@@ -366,7 +401,9 @@ static void dispatch_paged_attention_v2_online(
   // -23% TPOT at conc=1/8K); windowed batches mask per partition, and a
   // fully-masked partition contributes exact zeros — epsilon-normalized
   // partial, zero merge weight (Gemma-4 E2B measured -35% TPOT at conc=1).
-  const bool partition = pure_decode
+  // Window batches keep split-KV eligibility: their per-row partition
+  // stats/tmp_out land at the same per-token rows the reduce kernel reads.
+  const bool partition = (pure_decode || window_batch)
       && base_grid < min_decode_grid() && max_num_partitions >= 2;
 
   std::string kname =
@@ -389,7 +426,8 @@ static void dispatch_paged_attention_v2_online(
   std::string hash_name = kname + "_v2"
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_kb" + std::to_string(k_bits_i)
-      + "_vb" + std::to_string(v_bits_i);
+      + "_vb" + std::to_string(v_bits_i)
+      + "_wq" + std::to_string(window_q_fc);
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(
@@ -400,16 +438,26 @@ static void dispatch_paged_attention_v2_online(
        {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
        {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
        {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)},
-       {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)}});
+       {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)},
+       {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
 
   constexpr int NUM_THREADS    = 256;
   constexpr int NUM_SIMD_LANES = 32;
   constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
-  int warp_scores_bytes = NUM_WARPS * block_size
+  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
+  // per row and stages the sub-window's query rows after them; the layout
+  // must mirror the kernel's shared_mem carve exactly.
+  const int rows_per_tg = window_batch ? kWindowRows : 1;
+  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
                           * static_cast<int>(sizeof(float));
+  int q_window_bytes = window_batch
+      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
+      : 0;
   int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
                     * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
+  size_t shmem = static_cast<size_t>(
+      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
+  shmem = (shmem + 15) & ~size_t(15);
 
   auto& enc = metal::get_command_encoder(s);
 
@@ -436,7 +484,7 @@ static void dispatch_paged_attention_v2_online(
     enc.set_bytes(scale, 9);
     bind_turboquant();
     enc.dispatch_threadgroups(
-        MTL::Size::Make(num_heads, total_q_tokens, 1),
+        MTL::Size::Make(num_heads, grid_y, 1),
         MTL::Size::Make(NUM_THREADS, 1, 1));
     return;
   }
@@ -472,7 +520,7 @@ static void dispatch_paged_attention_v2_online(
   enc.set_output_array(max_logits, 1);
   bind_turboquant();
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_tokens, max_num_partitions),
+      MTL::Size::Make(num_heads, grid_y, max_num_partitions),
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
@@ -529,12 +577,14 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   PagedAttentionPrimitive(
       Stream stream, int num_kv_heads, float scale, float softcap,
       int block_size, int max_seq_len, int sliding_window,
-      bool use_turboquant = false, int k_bits = 8, int v_bits = 3)
+      bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
+      int window_seqlen_q = 1)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
-        use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits) {}
+        use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
+        window_seqlen_q_(window_seqlen_q) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -556,7 +606,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[1], inputs[2],    // key_cache, value_cache
         num_kv_heads_, scale_, softcap_,
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
-        block_size_, max_seq_len_, sliding_window_,
+        block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_);
   }
@@ -572,7 +622,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->sliding_window_ == sliding_window_
         && rhs->use_turboquant_ == use_turboquant_
         && rhs->k_bits_ == k_bits_
-        && rhs->v_bits_ == v_bits_;
+        && rhs->v_bits_ == v_bits_
+        && rhs->window_seqlen_q_ == window_seqlen_q_;
   }
 
  private:
@@ -585,6 +636,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   bool use_turboquant_;
   int k_bits_;
   int v_bits_;
+  int window_seqlen_q_;
 };
 
 static array paged_attention_primitive_fn(
@@ -599,13 +651,57 @@ static array paged_attention_primitive_fn(
     const array* value_scale_cache = nullptr,
     const array* key_zero_cache = nullptr,
     const array* v_centroids = nullptr,
-    int v_bits = 3) {
+    int v_bits = 3, int window_seqlen_q = 1) {
+  // window_seqlen_q must equal the longest cu_seqlens_q segment: window-mode
+  // threadgroups only exist for ceil(window_seqlen_q / kWindowRows)
+  // sub-windows per segment, so an understated value leaves the tail rows of
+  // a longer segment unwritten (garbage logits, no error), and an overstated
+  // one dispatches empty threadgroups.  Only the spec-verify path passes a
+  // window hint and its cu_seqlens_q is a small host-built array, so
+  // materializing it to check the real segment lengths is cheap, and the
+  // plain-decode path (window_seqlen_q == 1) skips the block entirely.
+  if (window_seqlen_q > 1) {
+    array cu = cu_seqlens_q;
+    cu.eval();
+    if (cu.dtype() != int32) {
+      throw std::invalid_argument(
+          "cu_seqlens_q must be int32 for window-mode validation");
+    }
+    const int32_t* cu_data = cu.data<int32_t>();
+    const int num_segments = static_cast<int>(cu.shape(0)) - 1;
+    const int total_q = static_cast<int>(query.shape(0));
+    if (num_segments < 1 || cu_data[0] != 0 ||
+        cu_data[num_segments] != total_q) {
+      throw std::invalid_argument(
+          "cu_seqlens_q must start at 0 and end at the query row count (" +
+          std::to_string(total_q) + "), got " +
+          std::to_string(num_segments) + " segment(s)");
+    }
+    int max_segment = 0;
+    for (int i = 0; i < num_segments; ++i) {
+      const int seg = cu_data[i + 1] - cu_data[i];
+      if (seg < 1) {
+        throw std::invalid_argument(
+            "cu_seqlens_q segment " + std::to_string(i) + " is empty (" +
+            std::to_string(cu_data[i]) + " -> " + std::to_string(cu_data[i + 1]) +
+            "); every window-mode segment needs at least one query row");
+      }
+      max_segment = std::max(max_segment, seg);
+    }
+    if (max_segment != window_seqlen_q) {
+      throw std::invalid_argument(
+          "window_seqlen_q=" + std::to_string(window_seqlen_q) +
+          " does not match the longest cu_seqlens_q segment (" +
+          std::to_string(max_segment) +
+          "); an understated value leaves window rows unwritten");
+    }
+  }
   int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
-      use_turboquant, k_bits, v_bits);
+      use_turboquant, k_bits, v_bits, window_seqlen_q);
   if (use_turboquant) {
     return array(
         query.shape(), query.dtype(), std::move(prim),
@@ -1328,7 +1424,8 @@ NB_MODULE(_paged_ops, m) {
            nb::object v_centroids_h,
            bool use_turboquant,
            const std::string& quant_type,
-           int v_bits) {
+           int v_bits,
+           int window_seqlen_q) {
           const array* ks = use_turboquant
               ? nb::inst_ptr<array>(key_scale_cache_h) : nullptr;
           const array* vs = use_turboquant
@@ -1346,7 +1443,8 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(seq_lens_h),
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
-              use_turboquant, quant_type, ks, vs, kz, vc, v_bits);
+              use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
+              window_seqlen_q);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1364,8 +1462,12 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("use_turboquant") = false,
         nb::arg("quant_type") = "",
         nb::arg("v_bits") = 3,
+        nb::arg("window_seqlen_q") = 1,
         "Paged attention primitive (read-only). Cache writes are handled "
-        "by MLX-native scatter upstream.");
+        "by MLX-native scatter upstream.  window_seqlen_q must equal the "
+        "longest cu_seqlens_q segment (validated when > 1); small "
+        "multi-token batches (spec-decode verification windows) route to "
+        "the per-token kernel's window mode.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),
