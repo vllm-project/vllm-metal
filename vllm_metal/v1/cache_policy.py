@@ -410,13 +410,16 @@ class ModelCachePolicy:
         if self._use_turboquant(config):
             # _turboquant_page_size_bytes is parameterised by tokens (block_size);
             # pass aligned_tokens to get the per-sequence byte total directly.
-            return num_kv_layers * _turboquant_page_size_bytes(
+            tq_bytes = num_kv_layers * _turboquant_page_size_bytes(
                 block_size=aligned_tokens,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,
                 k_quant=config.k_quant,
                 v_quant=config.v_quant,
             )
+            if self._runner.is_hybrid:
+                return tq_bytes + self.linear_cache_bytes_per_slot()
+            return tq_bytes
 
         sdpa_kv_bytes = (
             self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
@@ -542,9 +545,11 @@ class ModelCachePolicy:
         return self._runner.num_kv_cache_layers
 
     def _use_turboquant(self, config: MetalConfig) -> bool:
-        return bool(
-            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
-        )
+        # Hybrid models compress their SDPA layers too (see
+        # ``_build_hybrid_backend``), so they must not be excluded here:
+        # every scheduler-visible sizing path (specs, per-block bytes,
+        # one-sequence estimates) has to agree with the runtime layout.
+        return bool(config.turboquant and not self._runner.is_mla)
 
     def _kv_factor(self) -> int:
         return 1 if self._runner.is_mla else 2

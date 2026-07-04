@@ -759,6 +759,123 @@ class MetalPlatform(Platform):
         # ``block_size`` at request time.
         super().update_block_size_for_backend(vllm_config)
 
+        cls._realign_hybrid_block_size_for_turboquant(vllm_config)
+
+    @classmethod
+    def _realign_hybrid_block_size_for_turboquant(
+        cls, vllm_config: "VllmConfig"
+    ) -> None:
+        """Redo hybrid block-size alignment with TurboQuant page sizes.
+
+        Upstream ``Platform._align_hybrid_block_size`` sizes the attention
+        block with the standard dtype page formula, but TurboQuant packs
+        SDPA pages ~3-4x smaller (vllm-metal#468). Keeping the fp16-based
+        block would make every scheduler-visible page disagree with the
+        runtime layout: ``check_enough_kv_cache_memory`` rejects contexts
+        that fit, and the paged-attention planner budgets ~3-4x fewer
+        blocks than the TurboQuant cache actually needs.
+
+        Mirrors the upstream alignment (same mamba-state math, same
+        kernel-alignment source) with ``attn_page_size_1_token`` computed
+        from the packed TurboQuant layout.
+        """
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
+
+        metal_config = get_config()
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        if (
+            not metal_config.turboquant
+            or not metal_config.use_paged_attention
+            or not model_config
+            or not model_config.is_hybrid
+        ):
+            return
+
+        # Same mamba-state computation as upstream _align_hybrid_block_size.
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            model_config.architecture,
+            model_config=model_config,
+        )
+        mamba_page_size = MambaSpec(
+            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+            block_size=-1,
+        ).page_size_bytes
+        if mamba_page_size == 0:
+            return
+
+        # _turboquant_page_size_bytes is linear in block_size, so the
+        # one-token value scales exactly to any block size.
+        tq_page_size_1_token = _turboquant_page_size_bytes(
+            block_size=1,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_dim=model_config.get_head_size(),
+            k_quant=metal_config.k_quant,
+            v_quant=metal_config.v_quant,
+        )
+
+        # Kernel alignment straight from the backend (MultipleOf(16)). The
+        # upstream max() against cache_config.block_size is skipped here:
+        # at this point block_size already holds the fp16-aligned result of
+        # super(), not the user's value.
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        assert backend_cls is not None
+        kernel_block_alignment_size = min(
+            s.base if isinstance(s, MultipleOf) else s
+            for s in backend_cls.get_supported_kernel_block_sizes()
+        )
+
+        if cache_config.mamba_cache_mode == "all":
+            # Mirror upstream: with prefix caching, align to the mamba chunk
+            # size for kernel performance.
+            from math import lcm
+
+            mamba_block_size = (
+                cache_config.mamba_block_size
+                if cache_config.user_specified_mamba_block_size
+                else None
+            )
+            base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
+            assert base_chunk_size is not None
+            attn_tokens_per_mamba_state = cdiv(mamba_page_size, tq_page_size_1_token)
+            chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
+            attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
+            cache_config.mamba_block_size = attn_block_size
+        else:
+            attn_block_size = kernel_block_alignment_size * cdiv(
+                mamba_page_size,
+                kernel_block_alignment_size * tq_page_size_1_token,
+            )
+
+        if cache_config.block_size < attn_block_size:
+            logger.info(
+                "TurboQuant hybrid alignment: attention block size %s -> %d "
+                "tokens so the packed attention page (%d B/token) still "
+                "covers the mamba page (%d B).",
+                cache_config.block_size,
+                attn_block_size,
+                tq_page_size_1_token,
+                mamba_page_size,
+            )
+            cache_config.block_size = attn_block_size
+
+        if cache_config.mamba_cache_mode == "align":
+            cache_config.mamba_block_size = cache_config.block_size
+
+        # Pad mamba page size to exactly match the packed attention page.
+        attn_page_size = cache_config.block_size * tq_page_size_1_token
+        assert attn_page_size >= mamba_page_size
+        if attn_page_size == mamba_page_size:
+            cache_config.mamba_page_size_padded = None
+            return
+        cache_config.mamba_page_size_padded = attn_page_size
+
     @classmethod
     def get_attn_backend_cls(
         cls,
