@@ -16,6 +16,7 @@ pytest.importorskip("vllm", reason="vllm not installed")
 from vllm.pooling_params import LateInteractionParams, PoolingParams  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
@@ -169,7 +170,17 @@ def _make_runner(
         model=model or _PoolingModel(),
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
-        _paged_attention_runtime=object() if paged else None,
+        _paged_attention_runtime=(
+            MHAPagedAttentionRuntime(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=4,
+                block_size=4,
+                dtype=mx.float32,
+            )
+            if paged
+            else None
+        ),
         _paged_block_size=4,
         num_layers=1,
     )

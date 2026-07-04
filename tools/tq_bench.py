@@ -561,10 +561,7 @@ def bench_paged_attention(
         gc.collect()
         # Force MLX to return cached device buffers so the next (larger) ctx
         # iteration actually has headroom on 8 GB machines.
-        try:
-            mx.metal.clear_cache()
-        except (AttributeError, RuntimeError):
-            pass
+        mx.clear_cache()
 
     print("  " + "─" * 78)
 

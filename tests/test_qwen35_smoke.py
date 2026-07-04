@@ -3,7 +3,7 @@
 
 Qwen3.5 uses the `qwen3_5` architecture which requires transformers>=5.0.0.
 This test verifies that the upgraded dependency stack (mlx-lm>=0.31.3,
-mlx-vlm>=0.6.2, llguidance>=1.7.0, transformers>=5.5.1) works correctly
+mlx-vlm>=0.6.2, llguidance>=1.7.0, transformers>=5.5.3) works correctly
 with vLLM on Metal.
 
 Golden token IDs were generated with greedy decoding (temperature=0) on

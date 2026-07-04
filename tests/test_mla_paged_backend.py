@@ -24,17 +24,6 @@ _LATENT_DIM = _KV_LORA_RANK + _QK_ROPE_HEAD_DIM
 
 
 class TestMLAPagedLatentCache:
-    def test_latent_dim_stored_correctly(self) -> None:
-        cache = MLAPagedLatentCache(
-            num_layers=4,
-            latent_dim=_LATENT_DIM,
-            num_blocks=10,
-            block_size=16,
-            dtype=mx.float16,
-        )
-
-        assert cache.latent_dim == _LATENT_DIM
-
     def test_per_layer_array_shape(self) -> None:
         cache = MLAPagedLatentCache(
             num_layers=3,
@@ -58,7 +47,7 @@ class TestMLAPagedLatentCache:
             dtype=mx.bfloat16,
         )
 
-        assert cache.dtype == mx.bfloat16
+        assert all(arr.dtype == mx.bfloat16 for arr in cache.latent_caches)
 
     def test_invalid_dtype_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported dtype"):

@@ -155,11 +155,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        slot_ids = (
-            ctx.gdn_slot_mapping
-            if ctx.gdn_slot_mapping is not None
-            else list(range(num_requests))
-        )
+        if ctx.gdn_slot_mapping is None:
+            raise RuntimeError("GDN wrapper requires gdn_slot_mapping in context")
+        slot_ids = ctx.gdn_slot_mapping
         if len(slot_ids) != num_requests:
             raise RuntimeError("GDN wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):

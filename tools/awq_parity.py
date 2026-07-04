@@ -43,10 +43,7 @@ def _free_metal_cache() -> None:
     """Hand released allocations back to the Metal pool so the next
     model load has the full budget."""
     gc.collect()
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-    elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-        mx.metal.clear_cache()
+    mx.clear_cache()
 
 
 def _greedy_tokens(model, tokenizer, prompt: str, steps: int) -> list[int]:

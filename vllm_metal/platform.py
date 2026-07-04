@@ -9,6 +9,7 @@ import psutil
 import torch
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 
+import vllm_metal.envs as envs
 from vllm_metal.config import get_config
 
 if TYPE_CHECKING:
@@ -42,6 +43,15 @@ class MetalPlatform(Platform):
     # one Apple GPU per node this is effectively a no-op, but it must be a unique
     # name that does not collide with CUDA_VISIBLE_DEVICES.
     device_control_env_var: str = "VLLM_METAL_VISIBLE_DEVICES"
+
+    # Dotted path of the worker setup hook that patches RayWorkerProc to read the
+    # custom "mlx" resource (see compat._patch_ray_distributed). Installed both via
+    # the executor ray_runtime_env (single-stage) and, for data parallelism, at the
+    # Ray job level (_register_dp_ray_worker_setup_hook).
+    _RAY_WORKER_SETUP_HOOK: str = "vllm_metal.compat._patch_ray_distributed"
+    # Set once this process has initialized Ray with the job-level worker hook, so
+    # the DP registration is idempotent across repeated check_and_update_config calls.
+    _dp_ray_hook_registered: bool = False
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -191,12 +201,7 @@ class MetalPlatform(Platform):
         """
         import mlx.core as mx
 
-        # Prefer an explicit MLX barrier when available; otherwise force evaluation.
-        # `mx.eval([])` is a no-op, so we evaluate a tiny scalar as a safe fallback.
-        try:
-            mx.synchronize()
-        except (AttributeError, TypeError):
-            mx.eval(mx.array(0, dtype=mx.int32))
+        mx.synchronize()
 
         if torch.backends.mps.is_available():
             torch.mps.synchronize()
@@ -228,6 +233,96 @@ class MetalPlatform(Platform):
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+
+    @classmethod
+    def _ray_runtime_env_with_metal_hook(
+        cls, ray_runtime_env: object = None
+    ) -> dict[str, object]:
+        """Return a runtime_env dict that installs the Apple-GPU worker setup hook.
+
+        The single source of the hook-install rule, shared by the single-stage Ray
+        executor and the DP job-level ``ray.init`` so the two cannot drift: it
+        preserves the caller's ``ray_runtime_env`` keys (``working_dir`` /
+        ``py_modules`` / ``env_vars``) and rejects a conflicting foreign
+        ``worker_process_setup_hook`` (chaining is unsupported) rather than silently
+        replacing it.
+        """
+        runtime_env: dict[str, object] = (
+            dict(ray_runtime_env) if isinstance(ray_runtime_env, dict) else {}
+        )
+        existing = runtime_env.get("worker_process_setup_hook")
+        if existing not in (None, cls._RAY_WORKER_SETUP_HOOK):
+            raise ValueError(
+                "Metal must install a Ray worker_process_setup_hook, but one is "
+                f"already set ({existing!r}); chaining is not supported. Unset "
+                "ray_runtime_env's worker_process_setup_hook."
+            )
+        runtime_env["worker_process_setup_hook"] = cls._RAY_WORKER_SETUP_HOOK
+        return runtime_env
+
+    @classmethod
+    def _register_dp_ray_worker_setup_hook(cls, ray_runtime_env: object = None) -> None:
+        """Register the Apple-GPU worker patch at the Ray JOB level for DP.
+
+        ``ray_runtime_env`` is the user's ``parallel_config.ray_runtime_env`` (or
+        ``None``): its keys are preserved and merged with the worker hook so a DP
+        serve that ships a ``working_dir`` / ``py_modules`` / ``env_vars`` still
+        reaches the remote Macs.
+
+        Ray only runs a ``worker_process_setup_hook`` from the JOB runtime_env
+        (``ray.init``), not from a per-actor runtime_env. The data-parallel engine
+        manager connects to Ray without forwarding ``parallel_config.ray_runtime_env``
+        to ``ray.init`` (see ``vllm/v1/engine/utils.py``), so the hook wired into
+        ``ray_runtime_env`` for the single-stage Ray executor never reaches the
+        per-replica ``RayWorkerProc`` workers, and ``get_node_and_gpu_ids`` would
+        ``KeyError`` on the custom "mlx" resource. We initialize Ray ourselves with
+        the hook in the job runtime_env before the engine connects; the engine's
+        later ``ray.init`` reuses this session.
+
+        Ordering contract: this must run before anything else initializes Ray in
+        this process. ``address="auto"`` connects to the cluster the documented
+        launch points at via ``RAY_ADDRESS=auto`` and fails loud (ConnectionError)
+        if no cluster is reachable — DP requires a running Ray cluster.
+
+        Fails loud if Ray was already initialized by something other than this hook
+        (its job runtime_env is then fixed without our setup hook, which would
+        silently re-break the DP workers). Idempotent while our Ray session is live;
+        if that session was shut down, the now-stale flag is cleared and the hook is
+        re-registered so a second in-process DP engine still gets the patch.
+        """
+        # SCAFFOLDING: remove when upstream CoreEngineActorManager forwards
+        # parallel_config.ray_runtime_env into its ray.init (vllm/v1/engine/utils.py),
+        # mirroring the single-stage initialize_ray_cluster path; the executor-level
+        # hook set in check_and_update_config would then reach the DP RayWorkerProc
+        # workers and this job-level registration could be dropped.
+        import ray
+
+        if ray.is_initialized():
+            if cls._dp_ray_hook_registered:
+                # Our hook is already in the live Ray session — idempotent no-op.
+                return
+            raise RuntimeError(
+                "Ray is already initialized before vllm-metal could register the "
+                "Apple-GPU worker setup hook at the Ray job level, which data "
+                "parallelism requires (Ray honors worker_process_setup_hook only "
+                "from the job runtime_env). Do not initialize Ray before serving — "
+                "let vllm-metal own ray.init (remove any manual ray.init)."
+            )
+        # Ray is not initialized: a fresh start, or our previous session was shut
+        # down in this process (a now-stale registered flag). Clear the flag so a
+        # second in-process DP engine re-registers instead of skipping the hook.
+        cls._dp_ray_hook_registered = False
+        # Install the worker hook by the same rule as the single-stage Ray path
+        # (_ray_runtime_env_with_metal_hook): preserve the user's ray_runtime_env
+        # (working_dir / py_modules / env_vars the remote Macs may need) and reject a
+        # conflicting foreign hook rather than silently replacing it. The DP manager
+        # reuses this job session without re-applying ray_runtime_env, so this is the
+        # one place the user's env reaches the remote actors.
+        ray.init(
+            address="auto",
+            runtime_env=cls._ray_runtime_env_with_metal_hook(ray_runtime_env),
+        )
+        cls._dp_ray_hook_registered = True
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -295,22 +390,9 @@ class MetalPlatform(Platform):
             # loud rather than warn-and-continue: the user asked for Ray.
             from ray.runtime_env import RuntimeEnv
 
-            hook = "vllm_metal.compat._patch_ray_distributed"
-            runtime_env = parallel_config.ray_runtime_env
-            if runtime_env is None:
-                parallel_config.ray_runtime_env = RuntimeEnv(
-                    worker_process_setup_hook=hook
-                )
-            else:
-                existing_hook = runtime_env.get("worker_process_setup_hook")
-                if existing_hook not in (None, hook):
-                    raise ValueError(
-                        "Metal must install a Ray worker_process_setup_hook for "
-                        "the 'ray' executor, but one is already set "
-                        f"({existing_hook!r}); chaining is not supported. Unset "
-                        "ray_runtime_env's worker_process_setup_hook."
-                    )
-                runtime_env["worker_process_setup_hook"] = hook
+            parallel_config.ray_runtime_env = RuntimeEnv(
+                **cls._ray_runtime_env_with_metal_hook(parallel_config.ray_runtime_env)
+            )
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
@@ -320,6 +402,17 @@ class MetalPlatform(Platform):
         # mx.distributed data plane (point-to-point send/recv), wired in the
         # model runner (see MetalModelRunner._start_paged_forward). The control
         # plane stays on vLLM's gloo group; the two transports coexist.
+        if parallel_config.pipeline_parallel_size > 1:
+            base_port = envs.VLLM_METAL_RING_BASE_PORT
+            max_port = base_port + parallel_config.pipeline_parallel_size - 1
+            if max_port > 65535:
+                raise ValueError(
+                    "VLLM_METAL_RING_BASE_PORT is too high for "
+                    "pipeline_parallel_size: "
+                    f"base {base_port} with pipeline_parallel_size="
+                    f"{parallel_config.pipeline_parallel_size} would use port "
+                    f"{max_port}"
+                )
 
         # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
         # GPU per node cannot shard a TP>1 model, and there is no cross-device
@@ -336,6 +429,87 @@ class MetalPlatform(Platform):
                 "(tensor_parallel_size > 1), alone or combined with pipeline "
                 "parallelism; only TP=1 is validated."
             )
+
+        # Data parallelism (dense models, one full replica per Mac via the Ray DP
+        # backend). DP replicas are independent engines, not part of a single
+        # engine's world_size, so the tensor-parallel guard above does not cover
+        # them. Dense DP needs NO cross-device collective: upstream runs each
+        # replica as an independent
+        # EngineCoreActor (data_parallel_size reset to 1, no dp_group — see
+        # vllm/v1/engine/core.py), placed on the "mlx" resource, and each replica
+        # spawns the same RayExecutorV2/RayWorkerProc, so the Ray worker hook
+        # installed above covers it unchanged. We only relax admission: allow that
+        # validated dense-DP-over-Ray shape and fail fast on every other DP
+        # combination this reachability newly admits (guard-widening audit).
+        if getattr(parallel_config, "data_parallel_size", 1) > 1:
+            # MoE DP routes to DPMoEEngineCoreActor + an expert-parallel all-to-all
+            # that mx.distributed has no equivalent for; only dense DP is validated.
+            if model_config is not None and model_config.is_moe:
+                raise NotImplementedError(
+                    "Metal supports data parallelism for dense models only; MoE "
+                    "data parallelism (expert-parallel all-to-all) is not supported."
+                )
+            # The 'mp' DP backend spawns local subprocesses only and cannot place a
+            # replica on a second Mac — it would silently overcommit one node.
+            # Cross-Mac DP requires the Ray DP backend.
+            if parallel_config.data_parallel_backend != "ray":
+                raise NotImplementedError(
+                    "Metal data parallelism across Macs requires the Ray DP "
+                    "backend; re-run with --data-parallel-backend ray (the default "
+                    "'mp' backend spawns local subprocesses and cannot place "
+                    "replicas on other nodes)."
+                )
+            # One Apple GPU per node: exactly one full-model replica per node.
+            # Reject != 1, not just > 1: upstream treats data_parallel_size_local==0
+            # as a sentinel for externally-specified (headless / front-end-only) DP
+            # (see ParallelConfig.data_parallel_size_local), a topology Metal never
+            # validated and which the > 1 check alone would silently admit.
+            if parallel_config.data_parallel_size_local != 1:
+                raise NotImplementedError(
+                    "Metal allows exactly one data-parallel replica per node (one "
+                    "Apple GPU per Mac); set --data-parallel-size-local 1 "
+                    "(the external-DP sentinel 0 and values > 1 are not supported)."
+                )
+            # External/hybrid LB change the front-end topology (a per-rank API
+            # server) and are documented for MoE / wide-EP serving; only the
+            # default internal load balancer is validated.
+            if (
+                parallel_config.data_parallel_external_lb
+                or parallel_config.data_parallel_hybrid_lb
+            ):
+                raise NotImplementedError(
+                    "Metal data parallelism supports only the default internal load "
+                    "balancer; --data-parallel-external-lb / --data-parallel-hybrid-lb "
+                    "are not supported."
+                )
+            # DP+PP (each replica its own PP group) needs the mx.distributed ring
+            # bootstrap scoped per-replica and per-replica ring ports; never
+            # validated. (DP+TP is already rejected by the tensor-parallel guard.)
+            if parallel_config.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "Metal does not support combining data parallelism with "
+                    "pipeline parallelism yet; use --data-parallel-size or "
+                    "--pipeline-parallel-size > 1, not both."
+                )
+            # DP + speculative decoding / LoRA were never validated under data
+            # parallelism (each replica is an independent dense engine); mirror the
+            # pipeline-parallel rejections below rather than run an untested path.
+            # (DP + multimodal and DP + STT are rejected later, after the model
+            # config is normalized / the STT model is detected.)
+            if vllm_config.speculative_config is not None:
+                raise NotImplementedError(
+                    "Metal does not support data parallelism with speculative "
+                    "decoding; remove --speculative-config or use "
+                    "--data-parallel-size 1."
+                )
+            if vllm_config.lora_config is not None:
+                raise NotImplementedError(
+                    "Metal does not support data parallelism with LoRA; remove "
+                    "--enable-lora or use --data-parallel-size 1."
+                )
+            # NB: the Ray job-level hook is registered only AFTER the remaining DP
+            # rejections (multimodal, STT) further below, so an unsupported DP
+            # config fails fast before any ray.init side effect.
 
         scheduler_config = vllm_config.scheduler_config
 
@@ -434,6 +608,19 @@ class MetalPlatform(Platform):
 
             DefaultModelAdapter().normalize_model_config(model_config)
 
+            # DP + multimodal: the multimodal tensor-IPC queue only supports DP=1
+            # (vllm/v1/engine/utils.py). Checked AFTER normalize_model_config so a
+            # model served on the text-only backbone (multimodal_config cleared by
+            # the adapter) is not wrongly rejected — only a genuine multimodal model.
+            if (
+                getattr(parallel_config, "data_parallel_size", 1) > 1
+                and model_config.multimodal_config is not None
+            ):
+                raise NotImplementedError(
+                    "Metal does not support data parallelism for multimodal models "
+                    "(the multimodal tensor-IPC path is DP=1 only)."
+                )
+
         # STT model detection — set tokenizer fallback if not already configured.
         # Lazy imports to avoid circular import: platform.py is loaded during
         # vllm.config init, and stt.detection imports from vllm.config.
@@ -455,11 +642,24 @@ class MetalPlatform(Platform):
                     "Pipeline parallelism (pipeline_parallel_size > 1) is not "
                     "supported for speech-to-text models."
                 )
+            if getattr(parallel_config, "data_parallel_size", 1) > 1:
+                raise NotImplementedError(
+                    "Data parallelism (data_parallel_size > 1) is not "
+                    "supported for speech-to-text models."
+                )
             was_async_scheduling = bool(scheduler_config.async_scheduling)
             apply_stt_scheduler_policy(model_config, scheduler_config)
             if was_async_scheduling and not scheduler_config.async_scheduling:
                 logger.info("STT: disabled async_scheduling")
             logger.info("STT model detected")
+
+        # Data parallelism passed every admission guard above (including the
+        # multimodal and STT rejections). Only now — after all fail-fasts, before
+        # the engine connects — register the Apple-GPU worker patch at the Ray job
+        # level so it reaches the per-replica RayWorkerProc workers (the
+        # executor-level ray_runtime_env hook does not propagate on the DP path).
+        if getattr(parallel_config, "data_parallel_size", 1) > 1:
+            cls._register_dp_ray_worker_setup_hook(parallel_config.ray_runtime_env)
 
         # Log memory configuration
         total_mem = cls.get_device_total_memory()

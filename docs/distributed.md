@@ -163,3 +163,40 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
 - **Model support.** YOCO / hybrid / MLA / pooling / VLM / non-paged / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
+
+## Data parallelism
+
+Data parallelism (DP) runs **N independent full-model replicas**, one per Mac, behind a single endpoint, and load-balances requests across them. Unlike pipeline parallelism it is a pure **throughput** scale-out: each replica holds the whole model, so DP does **not** serve a model larger than one Mac — use it only for a model that already fits one Mac. On a fixed cluster the two are mutually exclusive uses of the same nodes: **DP = more requests/sec for a model that fits; PP = one model split across nodes for longer context / a compute split.**
+
+Dense DP needs no cross-device collective — vLLM runs each replica as a fully independent engine placed on the `mlx` resource, and the request load balancer is upstream and platform-agnostic. Only the validated **dense + Ray DP backend + one replica per node + internal load balancer** shape is supported; everything else fails fast at config time (see the limitations below).
+
+**Serving (two Macs).** Bring up the Ray cluster exactly as for [pipeline parallelism](#pipeline-parallelism) — `ray start` on both Macs with `--resources='{"mlx":1}'`, the macOS cluster env vars, and a per-node `VLLM_HOST_IP` — then serve with DP instead of PP:
+
+```bash
+# Mac A (head): one full replica per Mac, Ray DP backend, internal LB.
+RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_MEMORY_FRACTION=0.5 \
+  vllm serve mlx-community/Qwen3-8B-4bit \
+    --max-model-len 8192 \
+    --data-parallel-size 2 \
+    --data-parallel-backend ray \
+    --data-parallel-size-local 1 \
+    --data-parallel-address 10.0.0.1
+```
+
+- `--data-parallel-backend ray` is **required**: the default `mp` backend only spawns local subprocesses and cannot place a replica on a second Mac (it would silently overcommit one Mac).
+- `--data-parallel-size-local 1`: one Apple GPU per Mac means one replica per node.
+- `--data-parallel-address <head-ip>`: pin the DP master to the Ray head's IP so placement finds it. The Ray DP backend otherwise follows `get_ip()` / `VLLM_HOST_IP`, so set it explicitly to avoid a mismatch.
+
+On a healthy boot each Mac logs `patched Ray V2 worker get_node_and_gpu_ids ...` and an `EngineCore` actor is placed on each node IP.
+
+**Design.** vLLM owns the whole DP control plane (replica placement, the DP coordinator, the request load balancer); `MetalPlatform` only relaxes admission to the supported shape. One Metal-specific detail: Ray honours a `worker_process_setup_hook` only from the **job** runtime_env (`ray.init`), and the DP engine manager connects to Ray without forwarding it — so vllm-metal registers the Apple-GPU worker patch at the job level itself before the engine connects (`MetalPlatform._register_dp_ray_worker_setup_hook`); otherwise the per-replica `RayWorkerProc` would `KeyError` on the custom `mlx` resource.
+
+DP helps **under concurrency**, not single-stream latency, and stays below the 2× ideal because the head Mac also runs the API server, the DP coordinator, and the load balancer alongside its own replica; adding more replica nodes amortizes that head overhead. Measure your own throughput with `vllm bench serve`.
+
+**Limitations.**
+
+- **Capacity is unchanged.** Each replica loads the full model; DP does not serve a model larger than one Mac (that needs a sharded load, which is not yet available).
+- **Dense models only.** MoE DP (expert-parallel all-to-all) is rejected — MLX has no `all_to_all` collective.
+- **Requires a running Ray cluster.** DP registers the worker hook by initializing Ray itself; it fails loud if no cluster is reachable, or if Ray was already initialized by something else (do not pre-`ray.init` before serving).
+- **Validated at 2 Macs.** More nodes (one replica each) should work but are untested.
+- **Rejected combinations** (fail fast at config time): DP+PP, DP+TP, DP+MoE, DP+multimodal (the multimodal tensor-IPC path is DP=1 only), DP+speculative-decoding, DP+LoRA, DP+STT, `--data-parallel-external-lb` / `--data-parallel-hybrid-lb`, and any `--data-parallel-size-local` other than 1 (including the external-DP sentinel 0).

@@ -159,6 +159,18 @@ class TestRingHosts:
             ["10.0.0.7:40002"],
         ]
 
+    def test_rejects_privileged_base_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "80")
+        with pytest.raises(ValueError, match="user-port range"):
+            _ring_hosts(["10.0.0.5"])
+
+    def test_rejects_port_range_overflow(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
+        with pytest.raises(ValueError, match="too high for the pipeline size"):
+            _ring_hosts(["10.0.0.5", "10.0.0.6"])
+
 
 class TestPipelinedModel:
     def test_singleton_runs_full_model_without_recv(self) -> None:

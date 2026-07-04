@@ -9,9 +9,14 @@ one copy instead of three.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import mlx.core as mx
 
 from vllm_metal.metal import warm_up_kernels
+
+if TYPE_CHECKING:
+    from vllm_metal.attention.context import PagedAttentionContext
 
 
 class PagedAttentionRuntimeBase:
@@ -39,3 +44,24 @@ class PagedAttentionRuntimeBase:
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
+
+    def needs_step_context(self) -> bool:
+        """Return whether this runtime attaches request-ordered step metadata."""
+        return False
+
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx: PagedAttentionContext
+    ) -> None:
+        """Attach runtime-specific metadata to one forward-pass context."""
+        del req_ids, ctx
+
+    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        """Append runtime-owned side-effect arrays that must be eval'd."""
+        del outputs
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        """Release any runtime-owned state for finished requests."""
+        del req_ids
+
+    def materialize_pending_state(self) -> None:
+        """Detach deferred runtime state from the lazy graph."""

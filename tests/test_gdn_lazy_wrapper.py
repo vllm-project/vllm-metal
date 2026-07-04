@@ -995,6 +995,33 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         finally:
             clear_context()
 
+    def test_requires_gdn_slot_mapping_in_paged_context(self) -> None:
+        # Arrange
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        set_context(
+            PagedAttentionContext(
+                slot_mapping=[0, 1],
+                cu_seqlens=[0, 1, 2],
+            )
+        )
+
+        # Act / Assert
+        try:
+            with pytest.raises(RuntimeError, match="gdn_slot_mapping"):
+                wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
+        finally:
+            clear_context()
+
     def test_rejects_out_of_range_gdn_slots(self) -> None:
         # Arrange
         inner = _TinyGDNInner()

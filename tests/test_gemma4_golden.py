@@ -315,14 +315,14 @@ def _run_variant(variant: Gemma4Variant) -> dict[str, list[int]]:
     if not os.path.isdir(model_path):
         pytest.skip(f"{variant.model_env}={model_path} is not a directory")
 
-    # MetalConfig and the model cache are process-level singletons; reset
-    # both and drop any previously-loaded model so the variant starts clean.
+    # MetalConfig and assistant state are process-level; reset both so the
+    # variant starts from deterministic lifecycle state.
     from vllm_metal.config import reset_config
-    from vllm_metal.v1.model_lifecycle import reset_model_cache
+    from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 
     previous = os.environ.get("VLLM_METAL_MEMORY_FRACTION")
     os.environ["VLLM_METAL_MEMORY_FRACTION"] = variant.memory_fraction
-    reset_model_cache()
+    Gemma4MTPAssistantLoader.clear_cache()
     reset_config()
     gc.collect()
     try:
@@ -338,7 +338,7 @@ def _run_variant(variant: Gemma4Variant) -> dict[str, list[int]]:
             os.environ.pop("VLLM_METAL_MEMORY_FRACTION", None)
         else:
             os.environ["VLLM_METAL_MEMORY_FRACTION"] = previous
-        reset_model_cache()
+        Gemma4MTPAssistantLoader.clear_cache()
         reset_config()
         gc.collect()
 

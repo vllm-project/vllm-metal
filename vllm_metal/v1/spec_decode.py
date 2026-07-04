@@ -21,6 +21,8 @@ from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
+    from vllm_metal.v1.model_runner import RequestState
+
 
 class _PagedDecodeStateLike(Protocol):
     token_ids: Sequence[int]
@@ -91,13 +93,14 @@ class SpeculativeDecodeController:
         speculative_config: SpeculativeConfig | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
-        if use_async_scheduling and Gemma4MTPAssistantSource.is_gemma4_mtp(
-            speculative_config
-        ):
+        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
+        # back to the scheduler synchronously via take_draft_token_ids(), so
+        # async scheduling is unsupported whenever SD is enabled.
+        if use_async_scheduling and speculative_config is not None:
             raise NotImplementedError(
-                "Gemma4 MTP speculative decoding on Metal requires synchronous "
-                "scheduling so take_draft_token_ids() can hand drafts back to "
-                "the scheduler. Use --no-async-scheduling."
+                "Speculative decoding on Metal requires synchronous scheduling "
+                "so take_draft_token_ids() can hand drafts back to the "
+                "scheduler. Use --no-async-scheduling."
             )
 
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -302,7 +305,7 @@ class SpeculativeDecodeController:
             decode_token_ids,
             strict=True,
         ):
-            if not sampled_ids or not self._can_draft_greedy(
+            if not sampled_ids or not self.can_draft_greedy(
                 req_id,
                 state,
                 logitsprocs=logitsprocs,
@@ -325,7 +328,7 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate":
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self._can_draft_greedy(
+            if state is None or not self.can_draft_greedy(
                 prefill.req_id,
                 state,
                 logitsprocs=logitsprocs,
@@ -344,13 +347,14 @@ class SpeculativeDecodeController:
 
         return tuple(seeds)
 
-    def _can_draft_greedy(
+    def can_draft_greedy(
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
         *,
         logitsprocs: LogitsProcessors | None,
     ) -> bool:
+        """Whether a request may be drafted under greedy-only spec decode."""
         try:
             self._validate_greedy_sampling(
                 [(req_id, request_state)],
@@ -359,6 +363,56 @@ class SpeculativeDecodeController:
         except NotImplementedError:
             return False
         return True
+
+    def draft_eligible_requests(
+        self,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        decode_token_ids: Sequence[Sequence[int]],
+        prefill_reqs: Sequence[_SpecDecodePrefillLike],
+        prefill_result_modes: Sequence[str],
+        request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        *,
+        logitsprocs: LogitsProcessors | None,
+    ) -> Sequence[tuple[str, RequestState]]:
+        """Filter ``ctx`` to requests eligible for drafting this step.
+
+        Shared eligibility filter used by the draft-model and n-gram proposers
+        that draft greedily: skip decode rows that did not sample this step,
+        skip non-greedy requests via :meth:`can_draft_greedy`, skip
+        intermediate prefill chunks, and de-duplicate prefill rows whose
+        ``req_id`` was already admitted through decode.
+
+        Callers post-process the returned pairs (e.g. the draft-model
+        proposer maps each to its per-step ingest plan and drops rows with
+        no newly-committed tokens), but the eligibility decisions live here
+        so the two proposers cannot drift out of sync.
+        """
+        eligible: list[tuple[str, RequestState]] = []
+        seen: set[str] = set()
+
+        for (req_id, state), sampled_ids in zip(
+            decode_reqs, decode_token_ids, strict=True
+        ):
+            if not sampled_ids:
+                continue
+            if not self.can_draft_greedy(req_id, state, logitsprocs=logitsprocs):
+                continue
+            eligible.append((req_id, state))  # type: ignore[arg-type]
+            seen.add(req_id)
+
+        for prefill, result_mode in zip(
+            prefill_reqs, prefill_result_modes, strict=True
+        ):
+            if result_mode == "intermediate" or prefill.req_id in seen:
+                continue
+            state = request_states.get(prefill.req_id)
+            if state is None or not self.can_draft_greedy(
+                prefill.req_id, state, logitsprocs=logitsprocs
+            ):
+                continue
+            eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
+
+        return eligible
 
     def _validate_greedy_sampling(
         self,

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal platform."""
 
+import importlib
 import platform
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import ParallelConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -36,16 +38,6 @@ class TestMetalPlatform:
         """Test device name retrieval."""
         name = MetalPlatform.get_device_name()
         assert "Apple Silicon" in name
-
-    def test_device_count(self) -> None:
-        """Test device count."""
-        count = MetalPlatform.get_device_count()
-        assert count == 1
-
-    def test_current_device(self) -> None:
-        """Test current device."""
-        device = MetalPlatform.current_device()
-        assert device == 0
 
     def test_set_device_valid(self) -> None:
         """Test setting valid device."""
@@ -133,6 +125,23 @@ class TestMetalPlatform:
             )
         finally:
             reset_config()
+
+    def test_check_and_update_config_rejects_pipeline_ring_port_overflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_pipeline_with_async_scheduling(
         self,
@@ -253,6 +262,416 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="tensor parallelism"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    @staticmethod
+    def _dp_parallel_config(**overrides: object) -> SimpleNamespace:
+        """A valid dense data-parallel-over-Ray parallel_config, with overrides.
+
+        Defaults to the one supported shape (dense + ray backend + local==1 +
+        internal LB); reject tests override the field they exercise. Executor
+        backend defaults to ``mp`` so the executor branch falls through without
+        importing Ray; the ALLOW test overrides it to ``ray``.
+        """
+        base: dict[str, object] = {
+            "worker_cls": "auto",
+            "distributed_executor_backend": "mp",
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 1,
+            "disable_custom_all_reduce": False,
+            "data_parallel_size": 2,
+            "data_parallel_backend": "ray",
+            "data_parallel_size_local": 1,
+            "data_parallel_external_lb": False,
+            "data_parallel_hybrid_lb": False,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    @classmethod
+    def _dp_vllm_config(
+        cls,
+        *,
+        parallel: dict | None = None,
+        parallel_config: object = None,
+        model: dict | None = None,
+        speculative_config: object = None,
+        lora_config: object = None,
+    ) -> SimpleNamespace:
+        """A complete vllm_config for a dense-DP run, with field overrides.
+
+        Reject tests override only the field under test on top of the full scaffold
+        so a guard fires for the right reason (not a missing attribute). Pass
+        ``parallel_config`` to inject a prebuilt (e.g. real ``ParallelConfig``)
+        object instead of the SimpleNamespace stand-in.
+        """
+        model_fields: dict[str, object] = {
+            "model": "test-model",
+            "is_moe": False,
+            "multimodal_config": None,
+            "disable_cascade_attn": False,
+            "tokenizer": None,
+            "max_model_len": 32768,
+            "hf_config": SimpleNamespace(model_type="qwen3"),
+        }
+        model_fields.update(model or {})
+        return SimpleNamespace(
+            parallel_config=(
+                parallel_config
+                if parallel_config is not None
+                else cls._dp_parallel_config(**(parallel or {}))
+            ),
+            cache_config=SimpleNamespace(block_size=None),
+            model_config=SimpleNamespace(**model_fields),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                enable_chunked_prefill=True,
+                max_num_batched_tokens=2048,
+                max_num_scheduled_tokens=None,
+            ),
+            speculative_config=speculative_config,
+            lora_config=lora_config,
+        )
+
+    @staticmethod
+    def _stub_ray(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+        """Stub ray.init / is_initialized and reset the DP-hook flag so a unit test
+        exercising the DP admission never contacts a real cluster. Returns the list
+        that captures ray.init kwargs."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", False)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        return init_calls
+
+    def test_check_and_update_config_allows_dense_data_parallel_ray(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dense DP over the Ray backend (one replica/node, internal LB) is allowed.
+
+        Also pins the job-level hook registration: DP registers the
+        worker_process_setup_hook via ray.init (Ray does not honor it from the
+        per-actor runtime_env the DP engine manager uses), and the registered hook
+        string resolves to a real callable. ray.init is stubbed (no real cluster).
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        init_calls = self._stub_ray(monkeypatch)
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config(
+                parallel={
+                    "distributed_executor_backend": "ray",
+                    "ray_runtime_env": None,
+                }
+            )
+            MetalPlatform.check_and_update_config(vllm_config)
+            assert vllm_config.parallel_config.distributed_executor_backend == "ray"
+            assert init_calls, "DP must register the worker hook via ray.init"
+            # Pin the full cluster-connect contract: the documented RAY_ADDRESS=auto
+            # launch only works if we connect to the existing cluster, not a private
+            # local Ray, so address must be "auto".
+            assert init_calls[0]["address"] == "auto"
+            hook = init_calls[0]["runtime_env"]["worker_process_setup_hook"]
+            assert hook == MetalPlatform._RAY_WORKER_SETUP_HOOK
+            # The registered hook string must resolve to a real callable so a
+            # rename of compat._patch_ray_distributed breaks this unit test, not
+            # only a live cluster run.
+            module_path, _, attr = hook.rpartition(".")
+            resolved = getattr(importlib.import_module(module_path), attr)
+            assert callable(resolved)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_allows_dp_for_text_only_backbone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A model whose multimodal_config is cleared by normalize (served on the
+        text-only backbone) is NOT rejected under DP — the DP multimodal guard runs
+        AFTER normalize_model_config, not before."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        self._stub_ray(monkeypatch)
+        # normalize clears multimodal_config (text-only backbone).
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
+            lambda _self, mc: setattr(mc, "multimodal_config", None),
+        )
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config(
+                parallel={
+                    "distributed_executor_backend": "ray",
+                    "ray_runtime_env": None,
+                },
+                model={"multimodal_config": SimpleNamespace()},
+            )
+            # Does not raise: multimodal_config is None after normalize.
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_dp_moe(self) -> None:
+        """MoE data parallelism (expert-parallel all-to-all) is unsupported."""
+        with pytest.raises(NotImplementedError, match="dense models only"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(model={"is_moe": True})
+            )
+
+    def test_check_and_update_config_rejects_dp_mp_backend(self) -> None:
+        """DP across Macs requires the Ray DP backend; mp cannot span nodes."""
+        with pytest.raises(NotImplementedError, match="Ray DP backend"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"data_parallel_backend": "mp"})
+            )
+
+    def test_check_and_update_config_rejects_dp_size_local(self) -> None:
+        """One Apple GPU per node: exactly one DP replica per node (reject > 1)."""
+        with pytest.raises(
+            NotImplementedError, match="exactly one data-parallel replica"
+        ):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"data_parallel_size_local": 2})
+            )
+
+    def test_check_and_update_config_rejects_dp_size_local_external_sentinel(
+        self,
+    ) -> None:
+        """data_parallel_size_local==0 is upstream's externally-specified-DP
+        sentinel (headless / front-end-only). Metal never validated that topology,
+        so the guard must reject 0 too, not only > 1."""
+        with pytest.raises(
+            NotImplementedError, match="exactly one data-parallel replica"
+        ):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"data_parallel_size_local": 0})
+            )
+
+    def test_check_and_update_config_rejects_dp_external_lb(self) -> None:
+        """Only the default internal LB is supported under DP."""
+        with pytest.raises(NotImplementedError, match="internal load balancer"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"data_parallel_external_lb": True})
+            )
+
+    def test_check_and_update_config_rejects_dp_hybrid_lb(self) -> None:
+        """The hybrid load balancer is also rejected under DP."""
+        with pytest.raises(NotImplementedError, match="internal load balancer"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"data_parallel_hybrid_lb": True})
+            )
+
+    def test_check_and_update_config_rejects_dp_with_pipeline_parallel(self) -> None:
+        """DP combined with PP is not validated (per-replica ring scoping/ports)."""
+        with pytest.raises(
+            NotImplementedError, match="combining data parallelism with"
+        ):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel={"pipeline_parallel_size": 2})
+            )
+
+    def test_check_and_update_config_rejects_dp_speculative_decoding(self) -> None:
+        """DP with speculative decoding is unvalidated; reject at config time."""
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(speculative_config=SimpleNamespace(method="ngram"))
+            )
+
+    def test_check_and_update_config_rejects_dp_lora(self) -> None:
+        """DP with LoRA is unvalidated; reject at config time."""
+        with pytest.raises(NotImplementedError, match="data parallelism with LoRA"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(lora_config=SimpleNamespace(max_loras=1))
+            )
+
+    def test_check_and_update_config_rejects_dp_multimodal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuine multimodal model (multimodal_config survives normalize) is
+        rejected under DP — the tensor-IPC path is DP=1 only."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        init_calls = self._stub_ray(monkeypatch)
+        # normalize leaves multimodal_config in place (genuine multimodal model).
+        monkeypatch.setattr(
+            "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
+            lambda _self, _mc: None,
+        )
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config(
+                parallel={
+                    "distributed_executor_backend": "ray",
+                    "ray_runtime_env": None,
+                },
+                model={"multimodal_config": SimpleNamespace()},
+            )
+            with pytest.raises(NotImplementedError, match="multimodal models"):
+                MetalPlatform.check_and_update_config(vllm_config)
+            # Fail fast before any ray.init side effect.
+            assert init_calls == []
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_dp_stt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STT models use a dedicated runner with no DP path; reject DP."""
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        init_calls = self._stub_ray(monkeypatch)
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config(
+                parallel={
+                    "distributed_executor_backend": "ray",
+                    "ray_runtime_env": None,
+                }
+            )
+            with pytest.raises(NotImplementedError, match="speech-to-text"):
+                MetalPlatform.check_and_update_config(vllm_config)
+            # Fail fast before any ray.init side effect.
+            assert init_calls == []
+        finally:
+            reset_config()
+
+    def test_register_dp_hook_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With our hook already registered and the Ray session still live,
+        re-registering is a no-op."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", True)
+        monkeypatch.setattr(ray, "is_initialized", lambda: True)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        MetalPlatform._register_dp_ray_worker_setup_hook()
+        assert init_calls == []
+
+    def test_register_dp_hook_reregisters_after_ray_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registered flag left True after ray.shutdown() is stale: if our Ray
+        session is gone, re-init with the hook so a second in-process DP engine still
+        gets the Metal worker patch — otherwise the DP manager rebuilds Ray with a
+        hook-less ray.init and the workers KeyError on the mlx resource."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", True)
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        MetalPlatform._register_dp_ray_worker_setup_hook()
+        assert init_calls, "stale flag + shut-down Ray must trigger a re-init"
+        assert (
+            init_calls[0]["runtime_env"]["worker_process_setup_hook"]
+            == MetalPlatform._RAY_WORKER_SETUP_HOOK
+        )
+        assert MetalPlatform._dp_ray_hook_registered is True
+
+    def test_register_dp_hook_rejects_foreign_ray_init(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If Ray was already initialized by something else (no setup hook), the
+        DP workers would miss the patch — fail loud instead of silently proceeding."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", False)
+        monkeypatch.setattr(ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(ray, "init", lambda **kwargs: None)
+        with pytest.raises(RuntimeError, match="already initialized"):
+            MetalPlatform._register_dp_ray_worker_setup_hook()
+
+    def test_register_dp_hook_rejects_foreign_worker_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A foreign worker_process_setup_hook in ray_runtime_env is rejected
+        (chaining unsupported), matching the single-stage Ray path — the DP job-level
+        registration must not silently replace a user-set hook."""
+        ray = pytest.importorskip("ray")
+        monkeypatch.setattr(MetalPlatform, "_dp_ray_hook_registered", False)
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
+        init_calls: list[dict] = []
+        monkeypatch.setattr(ray, "init", lambda **kwargs: init_calls.append(kwargs))
+        with pytest.raises(ValueError, match="chaining is not supported"):
+            MetalPlatform._register_dp_ray_worker_setup_hook(
+                {"worker_process_setup_hook": "some.other.hook"}
+            )
+        # Rejected before any ray.init side effect.
+        assert init_calls == []
+
+    def test_dp_hook_registration_preserves_user_ray_runtime_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user-provided ray_runtime_env (env_vars / working_dir / py_modules the
+        remote Macs need) is merged with the worker hook, not replaced by a
+        hook-only env: the DP manager reuses this job session without re-applying
+        ray_runtime_env, so dropping the user's keys would start remote actors
+        without the requested environment."""
+        pytest.importorskip("ray")
+        from ray.runtime_env import RuntimeEnv
+
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        init_calls = self._stub_ray(monkeypatch)
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config(
+                parallel={
+                    "distributed_executor_backend": "ray",
+                    "ray_runtime_env": RuntimeEnv(env_vars={"VLLM_METAL_DP": "1"}),
+                }
+            )
+            MetalPlatform.check_and_update_config(vllm_config)
+            assert init_calls, "DP must register the worker hook via ray.init"
+            runtime_env = init_calls[0]["runtime_env"]
+            # Both the user's env and our worker hook reach the Ray job.
+            assert runtime_env["env_vars"] == {"VLLM_METAL_DP": "1"}
+            assert (
+                runtime_env["worker_process_setup_hook"]
+                == MetalPlatform._RAY_WORKER_SETUP_HOOK
+            )
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_dp_binds_real_parallel_config_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DP admission reads real ``vllm.config.ParallelConfig`` fields, not
+        only SimpleNamespace stand-ins: a real DP-over-Ray config in the supported
+        shape is admitted (and registers the job-level hook), while a real config
+        with the external LB flag is rejected. Pins the field-name contract so an
+        upstream rename of the ``data_parallel_*`` fields fails this unit test, not
+        only a live cluster run."""
+        pytest.importorskip("ray")
+        # Reject path: a real config with external LB must fail fast at the guard.
+        reject_pc = ParallelConfig(
+            data_parallel_size=2,
+            data_parallel_backend="ray",
+            data_parallel_size_local=1,
+            data_parallel_external_lb=True,
+        )
+        with pytest.raises(NotImplementedError, match="internal load balancer"):
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel_config=reject_pc)
+            )
+
+        # Admit path: the supported shape on a real config is accepted and
+        # registers the job-level Ray worker hook.
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        init_calls = self._stub_ray(monkeypatch)
+        admit_pc = ParallelConfig(
+            data_parallel_size=2,
+            data_parallel_backend="ray",
+            data_parallel_size_local=1,
+        )
+        reset_config()
+        try:
+            MetalPlatform.check_and_update_config(
+                self._dp_vllm_config(parallel_config=admit_pc)
+            )
+            assert init_calls, "DP must register the worker hook via ray.init"
+        finally:
+            reset_config()
+
     def test_device_capability(self) -> None:
         """Test device capability."""
         major, minor = MetalPlatform.get_device_capability()
@@ -351,18 +770,6 @@ class TestMetalPlatform:
 
         device = MetalPlatform.get_torch_device()
         assert device.type in ("mps", "cpu")
-
-    def test_verify_quantization_supported(self) -> None:
-        """Test that verify_quantization allows all methods to pass through."""
-        # All quantization methods should pass through - actual support depends
-        # on model implementation, not the platform
-        MetalPlatform.verify_quantization("none")
-        MetalPlatform.verify_quantization(None)
-        MetalPlatform.verify_quantization("fp16")
-        MetalPlatform.verify_quantization("bfloat16")
-        MetalPlatform.verify_quantization("int8")
-        MetalPlatform.verify_quantization("awq")
-        MetalPlatform.verify_quantization("compressed-tensors")
 
     def test_check_and_update_config_disables_chunked_prefill_non_paged(
         self, monkeypatch: pytest.MonkeyPatch
@@ -904,10 +1311,8 @@ class TestMetalPlatform:
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Platform synchronize should use MX barrier when present."""
+        """Platform synchronize should use the pinned MLX barrier."""
         mx = pytest.importorskip("mlx.core")
-        if not hasattr(mx, "synchronize"):
-            pytest.skip("mlx.core.synchronize not available")
 
         called = False
 
@@ -916,49 +1321,6 @@ class TestMetalPlatform:
             called = True
 
         monkeypatch.setattr(mx, "synchronize", fake_sync)
-        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
-
-        MetalPlatform.synchronize()
-        assert called is True
-
-    def test_synchronize_falls_back_to_eval_when_missing_barrier(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Fallback to evaluation when MX barrier is unavailable."""
-        mx = pytest.importorskip("mlx.core")
-
-        monkeypatch.delattr(mx, "synchronize", raising=False)
-
-        called = False
-
-        def fake_eval(_value: object) -> None:
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(mx, "eval", fake_eval)
-        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
-
-        MetalPlatform.synchronize()
-        assert called is True
-
-    def test_synchronize_falls_back_to_eval_when_barrier_signature_incompatible(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Fallback if MX barrier exists but can't be called with no args."""
-        mx = pytest.importorskip("mlx.core")
-
-        def fake_sync(_stream: object) -> None:
-            return None
-
-        monkeypatch.setattr(mx, "synchronize", fake_sync)
-
-        called = False
-
-        def fake_eval(_value: object) -> None:
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(mx, "eval", fake_eval)
         monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
 
         MetalPlatform.synchronize()

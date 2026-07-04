@@ -3,7 +3,7 @@
 
 Tests cover:
 1. _find_non_ssm_backend returns MetalBackend with correct kernel block alignment
-2. update_block_size_for_backend delegates to vLLM base implementation
+2. update_block_size_for_backend preserves vLLM base block-size behavior
 3. Metal-specific adjustments (block_size multiple of 16 for paged attention)
 """
 
@@ -113,8 +113,8 @@ class TestUpdateBlockSizeForBackend:
     def stub_super_update(self):
         """Stub vLLM's ``Platform.update_block_size_for_backend`` (the base
         method ``super()`` resolves to). Tests in this suite assert *Metal's*
-        wrapping behavior — the warning, the post-super multiple-of-32
-        adjustment, and the delegation itself — not vLLM's internal
+        wrapping behavior — the warning and the post-super multiple-of-32
+        adjustment — not vLLM's internal
         ``_align_hybrid_block_size`` math, which has its own coverage upstream
         and reads ``ModelConfig`` attributes our mocks deliberately don't carry.
         """
@@ -127,11 +127,22 @@ class TestUpdateBlockSizeForBackend:
     # Core Functionality Tests
     # ========================================================================
 
-    def test_calls_super_implementation(self, vllm_config, stub_super_update):
-        """Test: update_block_size_for_backend delegates to vLLM's base."""
-        MetalPlatform.update_block_size_for_backend(vllm_config)
+    def test_preserves_base_block_size_update(self, vllm_config, stub_super_update):
+        """Test: wrapper keeps vLLM base implementation as the owner of block size."""
 
-        stub_super_update.assert_called_once_with(vllm_config)
+        def _base_update(config):
+            config.cache_config.block_size = 64
+
+        stub_super_update.side_effect = _base_update
+
+        with patch("vllm_metal.config.get_config") as mock_get_config:
+            mock_metal_config = MagicMock()
+            mock_metal_config.use_paged_attention = True
+            mock_get_config.return_value = mock_metal_config
+
+            MetalPlatform.update_block_size_for_backend(vllm_config)
+
+        assert vllm_config.cache_config.block_size == 64
 
     def test_non_hybrid_model_skipped(self, vllm_config):
         """Test: Non-hybrid model skips Metal-specific adjustments.

@@ -224,8 +224,9 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
         error_type: type[Exception],
         match: str,
     ) -> None:
-        with pytest.raises(error_type, match=match):
+        with pytest.raises(error_type, match=match) as exc_info:
             _adapter().get_mrope_input_positions([1, 2, 3], [feature])
+        assert feature.identifier in str(exc_info.value)
 
     def test_multiple_images_per_request_delegated_in_offset_order(self) -> None:
         language_model = _RecordingLanguageModel()
@@ -356,8 +357,11 @@ class TestPaddleOCRVLMultimodalAdapterEncodeMultimodal:
     def test_rejects_patch_count_mismatch(self) -> None:
         adapter = _adapter(visual=_RecordingVisual())
 
-        with pytest.raises(ValueError, match="patch count does not match"):
-            adapter.encode_multimodal([_feature(raw_patches=15)])
+        feature = _feature(raw_patches=15)
+
+        with pytest.raises(ValueError, match="patch count does not match") as exc_info:
+            adapter.encode_multimodal([feature])
+        assert feature.identifier in str(exc_info.value)
 
     def test_requires_visual_for_encode(self) -> None:
         with pytest.raises(RuntimeError, match="visual tower not loaded"):

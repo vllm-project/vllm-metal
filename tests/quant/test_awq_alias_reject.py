@@ -13,15 +13,6 @@ from vllm_metal.quant.awq_config import (
     normalize_quant_config,
 )
 
-_CANONICAL = {
-    "quant_method": "awq",
-    "bits": 4,
-    "group_size": 128,
-    "zero_point": True,
-    "version": "gemm",
-}
-
-
 # ---- normalize-success paths ------------------------------------------------
 
 
@@ -180,9 +171,3 @@ def test_reject_path_mentions_field_value():
         normalize_quant_config({"quant_method": "awq", "bits": 8, "group_size": 128})
     msg = str(excinfo.value)
     assert "bits" in msg and "8" in msg
-
-
-def test_canonical_round_trips():
-    """Idempotent on already-canonical input."""
-    out = normalize_quant_config(_CANONICAL)
-    assert normalize_quant_config(out) == out

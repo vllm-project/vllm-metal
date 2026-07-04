@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for ``AWQQuantLoader``.
 
-Three test groups covering the public surface of the loader:
+Two test groups covering the public surface of the loader:
 
-* ``TestCacheKey`` — dtype scoping, disjointness from the generic key,
-  and stability of ``cache_key``.
 * ``TestConfigDetection`` — ``for_model``: AWQ accept, non-AWQ silent
   decline, GPTQ explicit reject, ``text_config`` fallback, alias
   normalization, Hub-fetch-error propagation.
@@ -26,24 +24,10 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-import torch
 from huggingface_hub.utils import HFValidationError
 
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_config import UnsupportedQuantizationConfigError
 from vllm_metal.quant.awq_loader import AWQQuantLoader
-from vllm_metal.v1.model_lifecycle import _generation_cache_key
-
-
-def _mlx_dtype(torch_dtype):
-    """Mirror what production does to derive the cache-key dtype: convert a
-    torch dtype through ``torch_to_mlx``. Tests use this instead of literal
-    strings so we pin the *actual* MLX dtype the production path passes
-    (e.g. ``mlx.core.bfloat16``), not just "different strings produce
-    different keys".
-    """
-    return torch_to_mlx(torch.empty(0, dtype=torch_dtype)).dtype
-
 
 _AWQ_INNER = {
     "quant_method": "awq",
@@ -58,49 +42,6 @@ def _write_config(tmp_path: Path, config: dict) -> Path:
     """Drop a config.json into ``tmp_path`` and return the directory."""
     (tmp_path / "config.json").write_text(json.dumps(config))
     return tmp_path
-
-
-class TestCacheKey:
-    """``AWQQuantLoader.cache_key``: shape, dtype scoping, disjointness."""
-
-    def test_isolates_by_dtype(self):
-        """Two engines requesting the same model with different dtypes
-        must NOT share a cache entry, since AWQ post-load alignment
-        mutates the model in place.
-        """
-        bf16_key = AWQQuantLoader.cache_key(
-            "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
-            target_dtype=_mlx_dtype(torch.bfloat16),
-        )
-        fp16_key = AWQQuantLoader.cache_key(
-            "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
-            target_dtype=_mlx_dtype(torch.float16),
-        )
-        assert bf16_key != fp16_key
-
-    def test_pins_loader_segment_with_dtype(self):
-        """Pin the wire format: the second key segment is
-        ``mlx_lm-awq:<dtype>`` (encoding the dtype inside the loader
-        segment, not as a third tuple element). A future refactor that
-        strips the dtype or swaps to torch repr would fail loudly here.
-        """
-        key = AWQQuantLoader.cache_key("foo", target_dtype=_mlx_dtype(torch.bfloat16))
-        assert key == ("foo", f"mlx_lm-awq:{mx.bfloat16}")
-
-    def test_distinct_from_generic_lifecycle_key(self):
-        """AWQ cache key must not collide with the generic mlx_lm key
-        for the same model: an AWQ-mutated cached model must not be
-        served to a non-AWQ caller, nor vice versa.
-        """
-        awq_key = AWQQuantLoader.cache_key("x", target_dtype=_mlx_dtype(torch.bfloat16))
-        generic_key = _generation_cache_key("x", is_vlm=False)
-        assert awq_key != generic_key
-
-    def test_stable_for_same_inputs(self):
-        bf16 = _mlx_dtype(torch.bfloat16)
-        assert AWQQuantLoader.cache_key(
-            "foo", target_dtype=bf16
-        ) == AWQQuantLoader.cache_key("foo", target_dtype=bf16)
 
 
 class TestConfigDetection:
@@ -198,11 +139,7 @@ class TestConfigDetection:
         assert "GPTQ" in str(excinfo.value)
 
     def test_returns_loader_for_awq(self, tmp_path):
-        """AWQ checkpoint: ``for_model`` returns a configured loader.
-
-        Cache-key shape is covered by ``TestCacheKey``; this test only
-        pins detection.
-        """
+        """AWQ checkpoint: ``for_model`` returns a configured loader."""
         model_dir = _write_config(
             tmp_path,
             {"model_type": "qwen2", "quantization_config": _AWQ_INNER},

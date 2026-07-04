@@ -50,7 +50,6 @@ from vllm_metal.attention.context import (
     prepare_unified,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
 from vllm_metal.distributed import (
@@ -69,7 +68,10 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
-from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantRuntime
+from vllm_metal.v1.gemma4_mtp import (
+    Gemma4MTPAssistantRuntime,
+    Gemma4MTPAssistantSource,
+)
 from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
@@ -86,6 +88,11 @@ from vllm_metal.v1.pooling import (
     pooling_dummy_forward_outputs,
     supported_pooling_tasks,
     validate_pooling_request,
+)
+from vllm_metal.v1.proposer import (
+    Gemma4MTPProposer,
+    MetalProposer,
+    ProposeContext,
 )
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
@@ -293,16 +300,11 @@ class MetalModelRunner:
         )
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
+        self._drafter: MetalProposer | None = None
         self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
-
-        # GDN slot allocator: stable request_id → slot mapping for hybrid
-        # models so recurrent state survives request reordering/preemption.
-        self._gdn_req_to_slot: dict[str, int] = {}
-        self._gdn_free_slots: list[int] = []
-        self._gdn_needs_materialize = False
 
         # vLLM Sampler for token sampling with temperature, top_k, top_p support
         self._sampler = Sampler()
@@ -524,134 +526,16 @@ class MetalModelRunner:
         # the runner owns the downstream send (see the PP branch in the forward).
         self._pp_model = PipelinedModel(self._forward_model, pp)
 
-    def _gdn_alloc_slot(self, req_id: str) -> int:
-        """Allocate a stable GDN state pool slot for a request."""
-        return self._gdn_assign_slots_for_step([req_id])[0]
-
-    def _gdn_assign_slots_for_step(self, req_ids: list[str]) -> list[int]:
-        """Assign all GDN state slots needed by one scheduler step.
-
-        Capacity growth happens once for the whole step before request mappings
-        are mutated, so a later allocation failure cannot leave a partial
-        request-to-slot assignment behind.
-        """
-        backend = self._paged_attention_runtime
-        if not isinstance(backend, HybridPagedAttentionRuntime):
-            raise RuntimeError("GDN slot allocation requires hybrid paged backend")
-        sc = backend._state_cache
-        if sc is None:
-            raise RuntimeError("GDN state cache is not initialized")
-
-        assigned_slots: list[int] = []
-        planned_by_req: dict[str, int] = {}
-        planned_new: list[tuple[str, int, bool]] = []
-        free_slots = list(self._gdn_free_slots)
-        next_new_slot = sc.allocated_seqs
-
-        for req_id in req_ids:
-            existing = self._gdn_req_to_slot.get(req_id)
-            if existing is not None:
-                assigned_slots.append(existing)
-                continue
-            planned = planned_by_req.get(req_id)
-            if planned is not None:
-                assigned_slots.append(planned)
-                continue
-
-            if free_slots:
-                slot = free_slots.pop()
-                reused = True
-            else:
-                slot = next_new_slot
-                next_new_slot += 1
-                reused = False
-            planned_by_req[req_id] = slot
-            planned_new.append((req_id, slot, reused))
-            assigned_slots.append(slot)
-
-        if not planned_new:
-            return assigned_slots
-
-        target_capacity = max(slot for _, slot, _ in planned_new) + 1
-        sc.ensure_capacity(target_capacity)
-
-        # Zero state for reused slots so the new request starts clean.
-        # Done at alloc time (inside the forward-pass graph) rather than
-        # at free time to avoid mx.eval synchronisation issues.
-        for _, slot, reused in planned_new:
-            if reused:
-                sc.reset_slot(slot)
-
-        for req_id, slot, _ in planned_new:
-            self._gdn_req_to_slot[req_id] = slot
-        self._gdn_free_slots = free_slots
-        return assigned_slots
-
-    def _gdn_materialize_state_cache(self) -> None:
-        """Detach GDN state arrays from the lazy graph to prevent growth."""
-        backend = self._paged_attention_runtime
-        if isinstance(backend, HybridPagedAttentionRuntime) and backend._state_cache:
-            backend._state_cache.apply_pending_states()
-        mx.eval(*self._gdn_updated_state_arrays())
-
-    def _gdn_updated_state_arrays(self) -> list[mx.array]:
-        """Return GDN state arrays updated by a hybrid forward pass.
-
-        Each GDN layer updates conv and recurrent state either in the stable
-        pool or in a compact pending handoff that the next lazy decode can
-        consume directly.  MLX evaluation is array-granular, so submit the
-        currently authoritative state arrays for each layer: compact pending
-        updates when present, otherwise the stable pools.
-        """
-
-        backend = self._paged_attention_runtime
-        if not isinstance(backend, HybridPagedAttentionRuntime):
-            raise RuntimeError("GDN state cache requires hybrid paged backend")
-        sc = backend._state_cache
-        if sc is None:
-            raise RuntimeError("GDN state cache is not initialized")
-        return sc.updated_state_arrays()
-
     def _submit_paged_forward_outputs(
         self,
-        logits: mx.array,
-        *,
-        has_prefill: bool,
-        target_hidden_states: mx.array | None = None,
+        *outputs: mx.array,
     ) -> None:
-        """Submit logits, hidden states, and GDN state side effects."""
-        outputs = [logits]
-        if target_hidden_states is not None:
-            outputs.append(target_hidden_states)
-        if has_prefill and isinstance(
-            self._paged_attention_runtime, HybridPagedAttentionRuntime
-        ):
-            outputs.extend(self._gdn_updated_state_arrays())
-        mx.async_eval(*outputs)
-
-    def _gdn_release_slots(self, req_ids: set[str]) -> None:
-        """Release finished GDN slots and defer state materialization."""
-        freed_slots: list[int] = []
-        for req_id in req_ids:
-            slot = self._gdn_req_to_slot.pop(req_id, None)
-            if slot is not None:
-                freed_slots.append(slot)
-
-        if not freed_slots:
-            return
-
-        backend = self._paged_attention_runtime
-        if isinstance(backend, HybridPagedAttentionRuntime) and backend._state_cache:
-            backend._state_cache.apply_pending_states()
-        self._gdn_needs_materialize = True
-        self._gdn_free_slots.extend(freed_slots)
-
-    def _gdn_materialize_pending_state_cache(self) -> None:
-        """Materialize GDN state after slot recycling if the step needs it."""
-        if not self._gdn_needs_materialize:
-            return
-        self._gdn_materialize_state_cache()
-        self._gdn_needs_materialize = False
+        """Submit caller outputs first, then runtime-owned side effects."""
+        eval_outputs = list(outputs)
+        runtime = self._paged_attention_runtime
+        if runtime is not None:
+            runtime.extend_forward_eval_outputs(eval_outputs)
+        mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -791,6 +675,58 @@ class MetalModelRunner:
             backend,
             block_size=block_size,
         )
+
+    def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
+        """Construct the polymorphic drafter once the paged cache is ready.
+
+        One factory for both speculative methods, keyed on the speculative
+        method. Gemma4 MTP uses the in-model assistant loaded in
+        ``ModelLifecycle`` (read lazily by the proposer); draft-model SD loads
+        its own model + a paged cache sized to the target's ``num_blocks`` —
+        which is why this runs after the paged backend exists. A configured but
+        unsupported method fails loud rather than silently degrading to plain
+        decode (which would look like a drafter that never accepts anything).
+        """
+        spec = self.vllm_config.speculative_config
+        if spec is None:
+            return
+        if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
+            self._drafter = Gemma4MTPProposer(self)
+        elif spec.uses_draft_model():
+            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
+            self._drafter = DraftModelProposer.build(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                extract_logits=self._model_adapter.extract_logits,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                dtype=self.kv_cache_dtype,
+            )
+            max_num_seqs = self.scheduler_config.max_num_seqs
+            extra_per_req = (spec.num_speculative_tokens + block_size - 1) // block_size
+            if num_blocks < max_num_seqs * extra_per_req:
+                raise ValueError(
+                    f"Draft KV cache too small: {num_blocks} blocks cannot "
+                    f"support {max_num_seqs} concurrent requests each needing "
+                    f"{extra_per_req} extra block(s) for "
+                    f"{spec.num_speculative_tokens} speculative tokens. "
+                    "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
+                )
+        elif spec.method == "ngram":
+            from vllm_metal.v1.ngram_proposer import NgramProposer
+
+            # N-gram drafts from token history alone — no model, no KV cache, so
+            # num_blocks/block_size are unused here.
+            self._drafter = NgramProposer.build(
+                vllm_config=self.vllm_config,
+                controller=self._spec_decode_controller,
+            )
+        else:
+            raise NotImplementedError(
+                f"Speculative method {spec.method!r} is not supported on Metal "
+                "(supported: Gemma4 MTP, draft_model, ngram)."
+            )
 
     def estimate_one_sequence_kv_bytes(
         self, *, max_model_len: int, block_size: int
@@ -1034,10 +970,10 @@ class MetalModelRunner:
         # states here.
         collect_target_hidden_states = (
             not has_pooling_work
-            and self._spec_decode_controller.needs_target_hidden_states(
+            and self._drafter is not None
+            and self._drafter.needs_target_hidden_states(
                 decode_segments,
                 has_final_prefill=any(pr.prompt_len is not None for pr in prefill_reqs),
-                speculative_config=self.vllm_config.speculative_config,
             )
         )
 
@@ -1105,14 +1041,12 @@ class MetalModelRunner:
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
         try:
-            # ---- GDN slot mapping (hybrid models) ----
-            if self.is_hybrid:
-                ctx = get_context()
-                if ctx is not None:
-                    # Decode requests come first, then prefill.
-                    gdn_req_ids = [req_id for req_id, _ in decode_reqs]
-                    gdn_req_ids.extend(pr.req_id for pr in prefill_reqs)
-                    ctx.gdn_slot_mapping = self._gdn_assign_slots_for_step(gdn_req_ids)
+            ctx = get_context()
+            runtime = self._paged_attention_runtime
+            if ctx is not None and runtime is not None and runtime.needs_step_context():
+                step_req_ids = [req_id for req_id, _ in decode_reqs]
+                step_req_ids.extend(pr.req_id for pr in prefill_reqs)
+                runtime.populate_step_context(req_ids=step_req_ids, ctx=ctx)
 
             # ---- forward (lazy graph + async submit) ----
             offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
@@ -1164,23 +1098,19 @@ class MetalModelRunner:
         # Submit to GPU — returns immediately, GPU runs in background.
         if has_pooling_work:
             assert pooling_hidden_states is not None
-            mx.async_eval(pooling_hidden_states)
+            self._submit_paged_forward_outputs(pooling_hidden_states)
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
-            # the next stage. async_eval on the send forces both the transfer
-            # and (transitively, via the sent activations) this stage's paged
-            # KV-cache writes.
-            mx.async_eval(pp_send_handle)
+            # the next stage, plus any runtime-owned forward side effects.
+            self._submit_paged_forward_outputs(pp_send_handle)
         else:
             assert logits is not None
-            # For GDN prefill, state-cache updates are side effects that the
-            # logits graph does not necessarily force. Submit them with logits
-            # and any target hidden states retained for assistant decoding.
-            self._submit_paged_forward_outputs(
-                logits,
-                target_hidden_states=target_hidden_states,
-                has_prefill=bool(prefill_reqs),
-            )
+            # Runtime-owned forward side effects may not be forced by
+            # evaluating logits alone, so submit the complete output set.
+            forward_outputs = [logits]
+            if target_hidden_states is not None:
+                forward_outputs.append(target_hidden_states)
+            self._submit_paged_forward_outputs(*forward_outputs)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -1435,72 +1365,28 @@ class MetalModelRunner:
             )
             batch.add_output(req_id, decode_token_ids[i], logprobs)
 
-        self._prepare_gemma4_mtp_draft_tokens(
+        num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
+        draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,
             prefill_reqs=prefill_reqs,
             prefill_token_ids=prefill_result.token_ids,
-            batch=batch,
-            cu_seqlens=cu_seqlens,
-            num_decode_segments=num_decode_segments,
-        )
-
-        return batch, scheduler_output
-
-    def _prepare_gemma4_mtp_draft_tokens(
-        self,
-        *,
-        target_hidden_states: mx.array | None,
-        decode_reqs: list[tuple[str, RequestState]],
-        decode_segments: tuple[PagedDecodeSegment, ...],
-        decode_token_ids: list[list[int]],
-        prefill_reqs: list[PrefillRequest],
-        prefill_token_ids: list[int],
-        batch: _ExecutionBatch,
-        cu_seqlens: list[int],
-        num_decode_segments: int,
-    ) -> None:
-        """Ask the Gemma4 MTP assistant for drafts after target sampling."""
-        assistant = self._gemma4_mtp_assistant
-        if (
-            assistant is None
-            or not assistant.forward_ready
-            or target_hidden_states is None
-        ):
-            return
-
-        seeds = self._spec_decode_controller.build_gemma4_mtp_draft_seeds(
-            decode_reqs=decode_reqs,
-            decode_segments=decode_segments,
-            decode_token_ids=decode_token_ids,
-            prefill_reqs=prefill_reqs,
-            prefill_token_ids=prefill_token_ids,
             prefill_result_modes=[
                 entry.result_mode for entry in batch.paged_prefill_entries
             ],
             request_states=self._request_states,
             cu_seqlens=cu_seqlens,
             num_decode_segments=num_decode_segments,
+            num_speculative_tokens=num_speculative_tokens,
             logitsprocs=self._logitsprocs,
         )
-        if not seeds:
-            return
+        self._draft_token_ids = (
+            self._drafter.propose(draft_ctx) if self._drafter is not None else None
+        )
 
-        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
-        target_input_embeddings = self._target_input_embeddings(input_ids)
-        draft_token_ids = assistant.propose_draft_token_ids(
-            seeds=seeds,
-            target_hidden_states=target_hidden_states,
-            target_input_embeddings=target_input_embeddings,
-        )
-        if not draft_token_ids:
-            return
-        self._draft_token_ids = DraftTokenIds(
-            req_ids=[seed.req_id for seed in seeds],
-            draft_token_ids=draft_token_ids,
-        )
+        return batch, scheduler_output
 
     def _register_new_request_mm_features(
         self, req_id: str, new_req: NewRequestData
@@ -1616,27 +1502,21 @@ class MetalModelRunner:
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> None:
-        """Run the vision encoder for each scheduled feature, stash by identifier.
+        """Run the vision encoder for scheduled features, stash by identifier.
 
         Skips features whose ``identifier`` already lives in
         ``encoder_cache.encoder_outputs`` (cache hit; the scheduler may
-        re-list a feature across chunks).  Calls
-        ``adapter.encode_multimodal`` one feature at a time so a single bad
-        feature is reported with a precise req_id+idx rather than poisoning
-        a whole request batch.
-
-        TODO(multimodal-batching): batch scheduled features into a single
-        ``adapter.encode_multimodal`` call.  Upstream vLLM stacks pixel_values
-        and image_grid_thw across requests so the vision tower runs once per
-        step; we serialize, which inflates TTFT under concurrency (e.g.,
-        conc=8 + 384x384 measured ~3.5s p50 TTFT).  Requires per-feature
-        slicing of returned hidden_states + deepstack residuals by
-        ``grid_thw.prod()``.
+        re-list a feature across chunks).  Uncached features are batched into
+        one ``adapter.encode_multimodal`` call so adapters can handle the
+        scheduled encoder work for the whole step.
         """
         adapter = self._multimodal_adapter
         cache = self.encoder_cache
         if adapter is None or cache is None:
             return
+
+        features_to_encode: list[MultiModalFeatureSpec] = []
+        identifiers_to_encode: set[str] = set()
         for req_id, feature_indices in scheduled_encoder_inputs.items():
             mm_features = cache.mm_features.get(req_id)
             if mm_features is None:
@@ -1651,16 +1531,26 @@ class MetalModelRunner:
                         f"request {req_id!r} with {len(mm_features)} features."
                     )
                 feature = mm_features[idx]
-                if feature.identifier in cache.encoder_outputs:
+                if (
+                    feature.identifier in cache.encoder_outputs
+                    or feature.identifier in identifiers_to_encode
+                ):
                     continue
-                outputs = adapter.encode_multimodal([feature])
-                if len(outputs) != 1:
-                    raise RuntimeError(
-                        f"encode_multimodal returned {len(outputs)} outputs "
-                        "for 1 feature; adapter must return one result per "
-                        "feature."
-                    )
-                cache.encoder_outputs[feature.identifier] = outputs[0]
+                features_to_encode.append(feature)
+                identifiers_to_encode.add(feature.identifier)
+
+        if not features_to_encode:
+            return
+
+        outputs = adapter.encode_multimodal(features_to_encode)
+        if len(outputs) != len(features_to_encode):
+            raise RuntimeError(
+                f"encode_multimodal returned {len(outputs)} outputs for "
+                f"{len(features_to_encode)} features; adapter must return one "
+                "result per feature."
+            )
+        for feature, output in zip(features_to_encode, outputs, strict=True):
+            cache.encoder_outputs[feature.identifier] = output
 
     def _run_mm_paged_forward(
         self,
@@ -2280,12 +2170,13 @@ class MetalModelRunner:
         self,
         evicted_req_ids: set[str],
         *,
-        materialize_gdn_state: bool = True,
+        materialize_runtime_state: bool = True,
     ) -> None:
         """Evict runner-owned state for finished requests."""
+        runtime = self._paged_attention_runtime
         if not evicted_req_ids:
-            if materialize_gdn_state:
-                self._gdn_materialize_pending_state_cache()
+            if materialize_runtime_state and runtime is not None:
+                runtime.materialize_pending_state()
             return
 
         for req_id in evicted_req_ids:
@@ -2300,9 +2191,10 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
-        self._gdn_release_slots(evicted_req_ids)
-        if materialize_gdn_state:
-            self._gdn_materialize_pending_state_cache()
+        if runtime is not None:
+            runtime.release_requests(evicted_req_ids)
+            if materialize_runtime_state:
+                runtime.materialize_pending_state()
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
@@ -2339,7 +2231,7 @@ class MetalModelRunner:
         # evicted and any pending GDN release must be materialized now.
         self._cleanup_finished_requests(
             evicted_req_ids,
-            materialize_gdn_state=will_fail_fast_before_model_work,
+            materialize_runtime_state=will_fail_fast_before_model_work,
         )
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder
@@ -2390,7 +2282,9 @@ class MetalModelRunner:
             )
             if self._is_pooling:
                 batch, scheduler_output = self._sample_paged_batch(None)
-                self._gdn_materialize_pending_state_cache()
+                runtime = self._paged_attention_runtime
+                if runtime is not None:
+                    runtime.materialize_pending_state()
                 self._validate_scheduled_outputs(batch, scheduler_output)
                 return self._build_output(batch)
             return None
@@ -2414,7 +2308,9 @@ class MetalModelRunner:
             self._run_non_paged_decode_batch(batch)
 
         # Non-paged path: complete synchronously
-        self._gdn_materialize_pending_state_cache()
+        runtime = self._paged_attention_runtime
+        if runtime is not None:
+            runtime.materialize_pending_state()
         self._validate_scheduled_outputs(batch, scheduler_output)
         if not batch.req_ids:
             return self._build_output(batch)
@@ -2442,9 +2338,14 @@ class MetalModelRunner:
             # engine collects results from the last stage only.
             if is_non_last_stage(self.pp):
                 self._execute_model_state = None
+                runtime = self._paged_attention_runtime
+                if runtime is not None:
+                    runtime.materialize_pending_state()
                 return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
-            self._gdn_materialize_pending_state_cache()
+            runtime = self._paged_attention_runtime
+            if runtime is not None:
+                runtime.materialize_pending_state()
             self._validate_scheduled_outputs(batch, scheduler_output)
             return self._build_output(batch)
 

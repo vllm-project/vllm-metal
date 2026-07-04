@@ -6,9 +6,9 @@ import logging
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_adapter_absolute_path
 
-from .mapping import LoRAMapping
 from .model_manager import MLXLoRAModelManager
 from .peft_loader import LoadedLoRA, load_peft_adapter
 

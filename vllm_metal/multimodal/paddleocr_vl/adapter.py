@@ -107,11 +107,15 @@ class PaddleOCRVLMultimodalAdapter:
         for feature in features:
             if feature.modality != "image":
                 raise ValueError(
-                    "encode_multimodal only supports image features; got "
-                    f"modality={feature.modality!r}"
+                    f"Feature {feature.identifier!r}: encode_multimodal only "
+                    "supports image features; got "
+                    f"modality={feature.modality!r}."
                 )
             if feature.data is None:
-                raise ValueError("feature.data is required for vision encoding")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: feature.data is required "
+                    "for vision encoding."
+                )
 
             pixel_values = self._as_mlx(
                 self._feature_value(feature.data, "pixel_values")
@@ -120,16 +124,21 @@ class PaddleOCRVLMultimodalAdapter:
                 pixel_values = mx.expand_dims(pixel_values, axis=0)
             if len(pixel_values.shape) != 5:
                 raise ValueError(
-                    "pixel_values must have shape (patches, 3, patch, patch) "
+                    f"Feature {feature.identifier!r}: pixel_values must have "
+                    "shape (patches, 3, patch, patch) "
                     "or (1, patches, 3, patch, patch); got "
                     f"{pixel_values.shape}"
                 )
 
-            grid_thw = self._grid_thw(feature.data, "image_grid_thw")
+            try:
+                grid_thw = self._grid_thw(feature.data, "image_grid_thw")
+            except ValueError as exc:
+                raise ValueError(f"Feature {feature.identifier!r}: {exc}") from exc
             raw_patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
             if int(pixel_values.shape[1]) != raw_patches:
                 raise ValueError(
-                    "pixel_values patch count does not match image_grid_thw: "
+                    f"Feature {feature.identifier!r}: pixel_values patch "
+                    "count does not match image_grid_thw: "
                     f"got {pixel_values.shape[1]}, expected {raw_patches}"
                 )
             image_grid_thw = mx.array([grid_thw], dtype=mx.int32)
@@ -212,25 +221,35 @@ class PaddleOCRVLMultimodalAdapter:
             modality = feature.modality
             if modality == "video":
                 raise NotImplementedError(
-                    "Video multimodal features are not yet supported."
+                    f"Feature {feature.identifier!r}: Video multimodal "
+                    "features are not yet supported."
                 )
             if modality != "image":
-                raise ValueError(f"Unsupported modality: {modality}")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: Unsupported modality: {modality}"
+                )
             if feature.data is None:
                 raise ValueError(
-                    "Image feature data is required to read image_grid_thw."
+                    f"Feature {feature.identifier!r}: Image feature data is "
+                    "required to read image_grid_thw."
                 )
 
-            t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+            try:
+                t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+            except ValueError as exc:
+                raise ValueError(f"Feature {feature.identifier!r}: {exc}") from exc
             if t != 1:
-                raise ValueError(f"Multi-frame images are not yet supported, got t={t}")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: Multi-frame images are "
+                    f"not yet supported, got t={t}"
+                )
             num_grid_tokens = (
                 t * (h // self._spatial_merge_size) * (w // self._spatial_merge_size)
             )
             num_embeds = feature.mm_position.get_num_embeds()
             if num_embeds != num_grid_tokens:
                 raise ValueError(
-                    "image_grid_thw implies "
+                    f"Feature {feature.identifier!r}: image_grid_thw implies "
                     f"{num_grid_tokens} multimodal embeddings, got "
                     f"mm_position.get_num_embeds()={num_embeds}"
                 )

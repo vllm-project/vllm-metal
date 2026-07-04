@@ -9,12 +9,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
 import vllm_metal.v1.model_runner as model_runner_mod
 from tests.stub_runner import make_stub_runner
 from vllm_metal.v1.lora import layers as layers_mod
-from vllm_metal.v1.lora import mapping as mapping_mod
 from vllm_metal.v1.lora import model_manager as model_manager_mod
 from vllm_metal.v1.lora import peft_loader as peft_loader_mod
 from vllm_metal.v1.lora import punica_wrapper as punica_mod
@@ -28,25 +28,12 @@ pytest.importorskip("vllm.lora.utils")
 pytest.importorskip("safetensors")
 
 
-def test_mapping_builder_routes_tokens_and_marks_prefill() -> None:
-    builder = mapping_mod.LoRAMappingBuilder()
-    assert builder.is_empty()
-    builder.add_request(lora_id=7, num_tokens=4)  # prefill (>1 token)
-    builder.add_request(lora_id=None, num_tokens=1)
-    builder.add_request(lora_id=7, num_tokens=1)
-
-    mapping = builder.build()
-    assert mapping.index_mapping == (7, 7, 7, 7, 0, 7)
-    assert mapping.prompt_mapping == (7, 0, 7)
-    assert mapping.is_prefill is True
-
-
 # PunicaWrapperMLX.add_lora_linear
 def test_punica_add_lora_linear_no_lora_is_a_passthrough() -> None:
     wrapper = punica_mod.PunicaWrapperMLX(
         max_num_batched_tokens=4, max_batches=2, max_loras=1
     )
-    mapping = mapping_mod.LoRAMapping(index_mapping=(0, 0), prompt_mapping=(0,))
+    mapping = LoRAMapping(index_mapping=(0, 0), prompt_mapping=(0,))
     wrapper.update_metadata(mapping, lora_index_to_id=[None])
 
     x = mx.array(np.ones((2, 3), dtype=np.float32))
@@ -122,7 +109,7 @@ def test_linear_wrapper_call_with_active_lora_changes_output() -> None:
         lora_b=mx.array(np.array([[1.0], [0.0]], dtype=np.float32)),
     )
 
-    mapping = mapping_mod.LoRAMapping(index_mapping=(42,), prompt_mapping=(42,))
+    mapping = LoRAMapping(index_mapping=(42,), prompt_mapping=(42,))
     punica.update_metadata(mapping, lora_index_to_id=[42])
 
     x = mx.array(np.array([[1.0, 0.0]], dtype=np.float32))
@@ -289,9 +276,7 @@ def test_punica_routes_two_adapters_in_one_batch() -> None:
         max_num_batched_tokens=4, max_batches=2, max_loras=2
     )
     # Tokens: [adapter 11, adapter 22, adapter 11, adapter 22].
-    mapping = mapping_mod.LoRAMapping(
-        index_mapping=(11, 22, 11, 22), prompt_mapping=(11, 22)
-    )
+    mapping = LoRAMapping(index_mapping=(11, 22, 11, 22), prompt_mapping=(11, 22))
     wrapper.update_metadata(mapping, lora_index_to_id=[11, 22])
 
     a0 = np.array([[1.0, 0.0]], dtype=np.float32)  # adapter 11 picks dim 0
@@ -322,9 +307,7 @@ def test_punica_three_adapters_with_no_lora_token() -> None:
     wrapper = punica_mod.PunicaWrapperMLX(
         max_num_batched_tokens=4, max_batches=4, max_loras=3
     )
-    mapping = mapping_mod.LoRAMapping(
-        index_mapping=(7, 8, 0, 9), prompt_mapping=(7, 8, 0, 9)
-    )
+    mapping = LoRAMapping(index_mapping=(7, 8, 0, 9), prompt_mapping=(7, 8, 0, 9))
     wrapper.update_metadata(mapping, lora_index_to_id=[7, 8, 9])
 
     # Three rank-1 adapters that each return a scalar = adapter index + 1.
@@ -386,7 +369,7 @@ def test_punica_batched_matches_per_token_single_adapter_runs() -> None:
         max_num_batched_tokens=4, max_batches=4, max_loras=2
     )
     wrapper.update_metadata(
-        mapping_mod.LoRAMapping(index_mapping=tuple(assigned), prompt_mapping=(33, 44)),
+        LoRAMapping(index_mapping=tuple(assigned), prompt_mapping=(33, 44)),
         lora_index_to_id=[33, 44],
     )
     out = np.array(
@@ -420,7 +403,7 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
 
     # Step 1: adapter 11 is in slot 0.
     wrapper.update_metadata(
-        mapping_mod.LoRAMapping(index_mapping=(11, 11), prompt_mapping=(11,)),
+        LoRAMapping(index_mapping=(11, 11), prompt_mapping=(11,)),
         lora_index_to_id=[11, None],
     )
     assert wrapper.token_slot_indices.tolist() == [0, 0]
@@ -441,7 +424,7 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
         )
     )
     wrapper.update_metadata(
-        mapping_mod.LoRAMapping(index_mapping=(11, 22), prompt_mapping=(11, 22)),
+        LoRAMapping(index_mapping=(11, 22), prompt_mapping=(11, 22)),
         lora_index_to_id=[22, 11],
     )
     assert wrapper.token_slot_indices.tolist() == [1, 0]
@@ -532,7 +515,7 @@ def test_manager_wraps_linears_then_activate_applies_delta() -> None:
     assert manager.lora_index_to_id[0] == 1
 
     # Push the per-step mapping so the punica wrapper knows which slot to use.
-    mapping = mapping_mod.LoRAMapping(index_mapping=(1,), prompt_mapping=(1,))
+    mapping = LoRAMapping(index_mapping=(1,), prompt_mapping=(1,))
     manager.set_adapter_mapping(mapping)
 
     # fc1 base = 0, so output is 0 + LoRA delta.  fc2 base = 0 too.
@@ -575,7 +558,7 @@ def test_manager_two_adapters_mixed_batch_through_full_forward() -> None:
     assert sorted(manager.list_adapters()) == [1, 2]
 
     # Mixed batch: token 0 -> adapter 1 with [1,0]; token 1 -> adapter 2 with [0,1].
-    mapping = mapping_mod.LoRAMapping(index_mapping=(1, 2), prompt_mapping=(1, 2))
+    mapping = LoRAMapping(index_mapping=(1, 2), prompt_mapping=(1, 2))
     manager.set_adapter_mapping(mapping)
 
     x = mx.array(np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
@@ -637,7 +620,7 @@ def test_manager_set_adapter_mapping_caches_identical_mapping(monkeypatch) -> No
 
     monkeypatch.setattr(manager.punica_wrapper, "update_metadata", counting_update)
 
-    mapping = mapping_mod.LoRAMapping(index_mapping=(0,), prompt_mapping=(0,))
+    mapping = LoRAMapping(index_mapping=(0,), prompt_mapping=(0,))
     manager.set_adapter_mapping(mapping)
     manager.set_adapter_mapping(mapping)
     manager.set_adapter_mapping(mapping)
@@ -662,7 +645,7 @@ def test_manager_activate_invalidates_mapping_cache(monkeypatch) -> None:
     manager.add_adapter(adapter)
     manager.activate_adapter(5)
 
-    mapping = mapping_mod.LoRAMapping(index_mapping=(5,), prompt_mapping=(5,))
+    mapping = LoRAMapping(index_mapping=(5,), prompt_mapping=(5,))
     manager.set_adapter_mapping(mapping)
     assert manager._last_mapping == mapping
 
@@ -743,6 +726,31 @@ def test_manager_pin_tracks_existing_adapter_only() -> None:
     assert 7 not in manager.list_adapters()
 
 
+def test_manager_remove_all_adapters_clears_slots_and_registry() -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=2,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    for lora_id in (1, 2):
+        adapter = _make_adapter(
+            lora_id,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+        )
+        manager.add_adapter(adapter)
+        manager.activate_adapter(lora_id)
+
+    manager.remove_all_adapters()
+
+    assert manager.list_adapters() == set()
+    assert manager.lora_index_to_id == [None, None]
+    np.testing.assert_array_equal(np.array(manager.modules["fc1"].lora_b_stacked), 0.0)
+
+
 def test_manager_target_modules_filter_excludes_unmatched() -> None:
     """``target_modules=['fc1']`` must wrap fc1 only — fc2 stays a plain Linear."""
     model = _TwoLinearModel()
@@ -760,6 +768,60 @@ def test_manager_target_modules_filter_excludes_unmatched() -> None:
     assert not isinstance(model.fc2, layers_mod.MLXLinearWithLoRA)
 
 
+def test_manager_rejects_zero_wrapped_modules() -> None:
+    model = _TwoLinearModel()
+    with pytest.raises(RuntimeError, match="no LoRA target modules"):
+        model_manager_mod.MLXLoRAModelManager(
+            model=model,
+            lora_config=_lora_config_stub(
+                max_loras=1, max_lora_rank=1, target_modules=["missing"]
+            ),
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            dtype=mx.float32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("registered_ids", "active_id", "requested_id", "slot_match"),
+    [
+        ((1, 2), 2, 1, r"\[2\]"),
+        ((), None, 99, r"\[None\]"),
+    ],
+)
+def test_manager_set_adapter_mapping_rejects_missing_active_lora_id(
+    registered_ids: tuple[int, ...],
+    active_id: int | None,
+    requested_id: int,
+    slot_match: str,
+) -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    for lora_id in registered_ids:
+        manager.add_adapter(
+            _make_adapter(
+                lora_id,
+                fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+                fc1_b=np.array([[1.0], [0.0]], dtype=np.float32),
+            )
+        )
+    if active_id is not None:
+        manager.activate_adapter(active_id)
+
+    with pytest.raises(
+        ValueError, match=rf"not active.*\[{requested_id}\].*{slot_match}"
+    ):
+        manager.set_adapter_mapping(
+            LoRAMapping(index_mapping=(requested_id,), prompt_mapping=(requested_id,))
+        )
+
+
 # Runner routing: paged forward processes decode tokens before prefill tokens,
 
 
@@ -775,18 +837,6 @@ def test_paged_lora_routing_orders_decode_before_prefill() -> None:
     entries = runner._paged_lora_routing(decode_reqs, prefill_pack)
 
     assert entries == [(11, 1), (22, 4)]
-
-    builder = mapping_mod.LoRAMappingBuilder()
-    for lora_id, num_tokens in entries:
-        builder.add_request(lora_id, num_tokens)
-    mapping = builder.build()
-
-    # Token 0 is the decode token (adapter 11); tokens 1..4 are the prefill
-    # tokens (adapter 22). Scheduler-order routing would have produced
-    # (22, 22, 22, 22, 11) here — that is the bug this test prevents.
-    assert mapping.index_mapping == (11, 22, 22, 22, 22)
-    assert mapping.prompt_mapping == (11, 22)
-    assert mapping.is_prefill is True
 
 
 def test_handle_new_request_registers_lora_before_paged_prefill() -> None:
@@ -874,6 +924,29 @@ def test_prepare_step_raises_for_unloaded_lora_id() -> None:
         rt.prepare_step([(7, 1)])
 
 
+def test_prepare_step_marks_prefill_mapping() -> None:
+    class CapturingManager:
+        def __init__(self) -> None:
+            self.mapping = None
+
+        def set_active_adapters(self, lora_requests, mapping) -> None:
+            self.mapping = mapping
+
+    class Request:
+        pass
+
+    manager = CapturingManager()
+    rt = runtime_mod.MetalLoRARuntime()
+    rt._manager = manager
+    rt._loaded[7] = Request()
+
+    rt.prepare_step([(7, 3)])
+
+    assert manager.mapping.index_mapping == (7, 7, 7)
+    assert manager.mapping.prompt_mapping == (7,)
+    assert manager.mapping.is_prefill is True
+
+
 def test_worker_manager_rejects_cpu_loras_gt_max_loras() -> None:
     with pytest.raises(NotImplementedError, match="max_cpu_loras > max_loras"):
         worker_manager_mod.MetalWorkerLoRAManager(
@@ -915,7 +988,6 @@ def test_activate_adapter_rejects_zero_module_match() -> None:
         manager.activate_adapter(1)
     # Slot must be rolled back so a later valid activation can use it.
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 1 not in manager._active
 
 
 def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
@@ -952,7 +1024,6 @@ def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
     with pytest.raises(ValueError, match="ambiguous suffix matches"):
         manager.activate_adapter(42)
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 42 not in manager._active
 
 
 def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> SimpleNamespace:

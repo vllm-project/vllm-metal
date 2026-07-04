@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for paged forward multimodal fail-fast + ctx.segment_positions field.
+"""Tests for paged forward multimodal fail-fast behavior.
 
 The successful mm paged forward is exercised in
 ``test_paged_forward_mm.py``; this file holds the fail-fast invariants:
@@ -16,7 +16,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import RequestState
@@ -31,23 +31,18 @@ def _feature(identifier: str) -> MultiModalFeatureSpec:
     )
 
 
-class TestPagedAttentionContextSegmentPositions:
-    def test_field_defaults_to_none(self) -> None:
-        ctx = PagedAttentionContext(slot_mapping=[])
-        assert ctx.segment_positions is None
-
-    def test_field_carries_per_segment_entries(self) -> None:
-        positions = [None, mx.array([[[0, 1, 2]]] * 3, dtype=mx.int32)]
-        ctx = PagedAttentionContext(slot_mapping=[], segment_positions=positions)
-        assert ctx.segment_positions is positions
-
-
 class TestStartPagedForwardMmFailFast:
     def _runner(self, *, adapter):
         runner = make_stub_runner(
             encoder_cache=EncoderCache(),
             _is_vlm=True,
-            _paged_attention_runtime=MagicMock(),
+            _paged_attention_runtime=MHAPagedAttentionRuntime(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=4,
+                block_size=16,
+                dtype=mx.float32,
+            ),
             _paged_block_size=16,
         )
         runner._multimodal_adapter = adapter

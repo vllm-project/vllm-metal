@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.linear import (
     GDNPagedAttentionWrapper,
     is_linear_attention,
@@ -31,6 +32,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 )
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
+from vllm_metal.attention.state import HybridGDNStateManager
 
 logger = init_logger(__name__)
 
@@ -127,6 +129,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
+        self._gdn_state_manager: HybridGDNStateManager | None = None
 
     def initialize(self, num_blocks: int) -> None:
         self._cache = MetalPagedKVCache(
@@ -152,6 +155,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             initial_seqs=0,
             dtype=self._dtype,
         )
+        self._gdn_state_manager = HybridGDNStateManager(self._state_cache)
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
@@ -215,3 +219,26 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         if self._state_cache is None:
             raise RuntimeError("state_cache accessed before initialize()")
         return self._state_cache
+
+    @property
+    def gdn_state_manager(self) -> HybridGDNStateManager:
+        if self._gdn_state_manager is None:
+            raise RuntimeError("gdn_state_manager accessed before initialize()")
+        return self._gdn_state_manager
+
+    def needs_step_context(self) -> bool:
+        return True
+
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx: PagedAttentionContext
+    ) -> None:
+        self.gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+
+    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        self.gdn_state_manager.extend_forward_eval_outputs(outputs)
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        self.gdn_state_manager.release_requests(req_ids)
+
+    def materialize_pending_state(self) -> None:
+        self.gdn_state_manager.materialize_pending_state()

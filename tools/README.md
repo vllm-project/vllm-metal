@@ -129,3 +129,26 @@ python -m tools.benchmark.gemma4_mtp_benchmark \
 
 The output JSON includes package versions, relevant environment variables,
 prompts, generated token IDs, elapsed time, and output tokens per second.
+
+## Spec-decode eval dataset
+
+Speculative decoding must be evaluated on *natural* prompts — acceptance rate (and
+therefore speedup) is much lower on synthetic sets like `sonnet`/`random`.
+`build_spec_bench_dataset.py` downloads `RedHatAI/speculator_benchmarks` (the dataset
+the vLLM `speculators` repo benchmarks with) and writes a single `spec_bench`-format
+file (`turns` column) that vLLM's `--dataset-name spec_bench` loader reads directly,
+length-filtering prompts to fit the target context and sampling a fixed number per
+category. To change the sample (dataset, per-category count, length budget, seed), edit
+the constants at the top of the script.
+
+```bash
+# Build the eval set -> spec_bench_sample.jsonl
+python tools/build_spec_bench_dataset.py
+
+# Benchmark speculative decoding (greedy is required for drafting to engage)
+vllm bench serve --backend vllm --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --endpoint /v1/completions \
+  --dataset-name spec_bench --dataset-path spec_bench_sample.jsonl --spec-bench-output-len 128 \
+  --num-prompts 100 --request-rate 10 --max-concurrency 32 \
+  --temperature 0 --top-p 1.0 --top-k -1 --ignore-eos --seed 0
+```

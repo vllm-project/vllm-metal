@@ -250,3 +250,7 @@ class GGUFMLXQuantizedTensor:
             mode=_QUANT_MODE,
         )
         return rows.astype(output_dtype)
+
+    def eval_arrays(self) -> None:
+        """Materialize the packed arrays backing this quantized tensor."""
+        mx.eval(self.qweight, self.scales, self.biases)

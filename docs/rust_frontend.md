@@ -2,7 +2,7 @@
 
 vllm-metal supports the optional `vllm-rs` Rust frontend as a drop-in replacement for vLLM's Python serving layer. The Rust frontend is hardware-agnostic; vllm-metal continues to run the engine on Metal/MLX inside the spawned Python subprocess.
 
-As of vLLM 0.23.0, the Rust frontend source is vendored in the main vLLM repository under `rust/`. The former `Inferact/vllm-frontend-rs` repository is kept only as a historical archive.
+As of vLLM 0.24.0, the Rust frontend source is vendored in the main vLLM repository under `rust/`. The former `Inferact/vllm-frontend-rs` repository is kept only as a historical archive.
 
 For architecture, flag reference, and usage, see the [upstream README](https://github.com/vllm-project/vllm/tree/main/rust#readme).
 

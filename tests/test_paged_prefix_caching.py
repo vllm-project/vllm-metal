@@ -25,6 +25,7 @@ from vllm.v1.core.sched.output import (
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention import context as pac
+from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.v1.sampling_batch import _SamplingResult
 
 
@@ -33,10 +34,14 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
     return make_stub_runner(
         model_args={"vocab_size": 32000},
         model=MagicMock(),
-        _paged_attention_runtime=MagicMock(),
+        _paged_attention_runtime=MHAPagedAttentionRuntime(
+            num_layers=num_layers,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        ),
         _paged_block_size=4,
-        _gdn_req_to_slot={},
-        _gdn_free_slots=[],
         _rust_state_manager=None,
         num_layers=num_layers,
     )

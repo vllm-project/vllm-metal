@@ -79,7 +79,7 @@ class MultimodalRuntimeAdapter(Protocol):
         self,
         features: list[MultiModalFeatureSpec],
     ) -> Sequence[MultimodalEncodeResult]:
-        """Run the model's vision tower; return one result per feature.
+        """Run the model's vision tower; return one result per feature in order.
 
         Results may carry optional deepstack visual embeds for models whose
         language model injects vision residuals in intermediate layers.

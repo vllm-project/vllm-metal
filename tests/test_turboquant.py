@@ -1420,7 +1420,7 @@ def section_latency() -> int:
 #     - Per CTA dispatch, freed on completion — never shows in get_active_memory()
 #
 # Protocol:
-#   1. gc.collect() + mx.metal.clear_cache() for clean baseline
+#   1. gc.collect() + mx.clear_cache() for clean baseline
 #   2. Create + eval cache → measure static heap delta
 #   3. Create attention inputs → record pre-attn active
 #   4. mx.metal.reset_peak_memory()

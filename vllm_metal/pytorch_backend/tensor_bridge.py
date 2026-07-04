@@ -167,12 +167,7 @@ def sync_mlx() -> None:
 
     Call this before converting MLX arrays to ensure all operations complete.
     """
-    # Prefer an explicit MLX barrier when available; otherwise force evaluation.
-    # `mx.eval([])` is a no-op, so we evaluate a tiny scalar as a safe fallback.
-    try:
-        mx.synchronize()
-    except (AttributeError, TypeError):
-        mx.eval(mx.array(0, dtype=mx.int32))
+    mx.synchronize()
 
 
 def sync_torch() -> None:

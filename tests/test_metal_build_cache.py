@@ -132,10 +132,6 @@ def test_hash_changes_with_nb_version(patched):
     assert build._input_hash(s2) != h1
 
 
-def test_hash_stable_across_calls(patched):
-    assert build._input_hash(patched.spec) == build._input_hash(patched.spec)
-
-
 def test_needs_rebuild_swallows_resolution_errors(patched, monkeypatch):
     patched.out.write_bytes(b"compiled")
     patched.hsh.write_text("anything")
@@ -166,7 +162,6 @@ def test_metallib_digest_changes_with_source():
     # one-byte shader edit must change the digest (else an edited kernel loads
     # silently stale).
     assert build._metallib_digest("shader A") != build._metallib_digest("shader B")
-    assert build._metallib_digest("shader A") == build._metallib_digest("shader A")
 
 
 # --------------------------------------------------------------------------

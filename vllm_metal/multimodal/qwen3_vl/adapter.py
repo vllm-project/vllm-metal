@@ -202,11 +202,15 @@ class Qwen3VLMultimodalAdapter:
         for feature in features:
             if feature.modality != "image":
                 raise ValueError(
-                    "encode_multimodal only supports image features; got "
-                    f"modality={feature.modality!r}"
+                    f"Feature {feature.identifier!r}: encode_multimodal only "
+                    "supports image features; got "
+                    f"modality={feature.modality!r}."
                 )
             if feature.data is None:
-                raise ValueError("feature.data is required for vision encoding")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: feature.data is required "
+                    "for vision encoding."
+                )
 
             pixel_values = self._as_mlx(
                 self._feature_value(feature.data, "pixel_values")
@@ -327,18 +331,28 @@ class Qwen3VLMultimodalAdapter:
             modality = feature.modality
             if modality == "video":
                 raise NotImplementedError(
-                    "Video multimodal features are not yet supported."
+                    f"Feature {feature.identifier!r}: Video multimodal "
+                    "features are not yet supported."
                 )
             if modality != "image":
-                raise ValueError(f"Unsupported modality: {modality}")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: Unsupported modality: {modality}"
+                )
             if feature.data is None:
                 raise ValueError(
-                    "Image feature data is required to read image_grid_thw."
+                    f"Feature {feature.identifier!r}: Image feature data is "
+                    "required to read image_grid_thw."
                 )
 
-            t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+            try:
+                t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+            except ValueError as exc:
+                raise ValueError(f"Feature {feature.identifier!r}: {exc}") from exc
             if t != 1:
-                raise ValueError(f"Multi-frame images are not yet supported, got t={t}")
+                raise ValueError(
+                    f"Feature {feature.identifier!r}: Multi-frame images are "
+                    f"not yet supported, got t={t}"
+                )
 
             llm_grid_h = h // self._spatial_merge_size
             llm_grid_w = w // self._spatial_merge_size
@@ -346,7 +360,7 @@ class Qwen3VLMultimodalAdapter:
             num_embeds = feature.mm_position.get_num_embeds()
             if num_embeds != num_grid_tokens:
                 raise ValueError(
-                    "image_grid_thw implies "
+                    f"Feature {feature.identifier!r}: image_grid_thw implies "
                     f"{num_grid_tokens} multimodal embeddings, got "
                     f"mm_position.get_num_embeds()={num_embeds}"
                 )

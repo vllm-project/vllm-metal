@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
+from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import is_in_target_modules
 
 from .layers import (
@@ -17,7 +18,6 @@ from .layers import (
     can_wrap,
     can_wrap_qlora,
 )
-from .mapping import LoRAMapping
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
 from .punica_wrapper import PunicaWrapperMLX
 
@@ -53,7 +53,6 @@ class MLXLoRAModelManager:
         self.dtype = dtype
 
         self._registered: dict[int, LoadedLoRA] = {}
-        self._active: set[int] = set()
         self.lora_index_to_id: list[int | None] = [None] * self.lora_slots
 
         self.modules: dict[str, _WrappedModule] = {}
@@ -105,13 +104,12 @@ class MLXLoRAModelManager:
                     )
                 )
         if not repls:
-            logger.warning(
-                "MLXLoRAModelManager wrapped 0 modules — model has no plain "
-                "nn.Linear or MLX-quantize-protocol layer, or target_modules "
-                "excludes everything. For AWQ models make sure to pass "
-                "--enable-lora after the AWQ checkpoint is loaded."
+            raise RuntimeError(
+                "MLXLoRAModelManager found no LoRA target modules to wrap. "
+                "The model may expose only quantized layers, which v1 LoRA "
+                "does not support yet, or LoRAConfig.target_modules may "
+                "exclude every wrappable nn.Linear."
             )
-            return
         for name, w in repls:
             w.set_mapping(self.punica_wrapper)
             self.modules[name] = w
@@ -151,7 +149,7 @@ class MLXLoRAModelManager:
         return self._registered.pop(lora_id, None) is not None
 
     def remove_all_adapters(self) -> None:
-        for lid in list(self._active):
+        for lid in [lid for lid in self.lora_index_to_id if lid is not None]:
             self.deactivate_adapter(lid)
         self._registered.clear()
 
@@ -163,7 +161,7 @@ class MLXLoRAModelManager:
         return set(self._registered)
 
     def activate_adapter(self, lora_id: int) -> bool:
-        if lora_id in self._active:
+        if self._slot_for_adapter(lora_id) is not None:
             return False
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
@@ -180,15 +178,10 @@ class MLXLoRAModelManager:
         return True
 
     def deactivate_adapter(self, lora_id: int) -> bool:
-        if lora_id not in self._active:
-            return False
-        try:
-            slot = self.lora_index_to_id.index(lora_id)
-        except ValueError:
-            self._active.discard(lora_id)
+        slot = self._slot_for_adapter(lora_id)
+        if slot is None:
             return False
         self.lora_index_to_id[slot] = None
-        self._active.discard(lora_id)
         for w in self.modules.values():
             w.reset_lora(slot)
         self._last_mapping = None
@@ -197,6 +190,19 @@ class MLXLoRAModelManager:
     def set_adapter_mapping(self, mapping: LoRAMapping) -> None:
         if mapping == self._last_mapping:
             return
+        requested = {
+            lora_id
+            for lora_id in (*mapping.index_mapping, *mapping.prompt_mapping)
+            if lora_id != 0
+        }
+        active = {lora_id for lora_id in self.lora_index_to_id if lora_id is not None}
+        missing = sorted(requested - active)
+        if missing:
+            raise ValueError(
+                "LoRA mapping references adapters that are not active in "
+                f"LoRA slots: {missing}; slot table: {self.lora_index_to_id}. "
+                "Use 0 for no-LoRA tokens."
+            )
         self.punica_wrapper.update_metadata(mapping, self.lora_index_to_id)
         self._last_mapping = mapping
 
@@ -257,7 +263,6 @@ class MLXLoRAModelManager:
             lora_a, lora_b = weights
             module.set_prepared_lora(slot, lora_a, lora_b)
         self.lora_index_to_id[slot] = lora_id
-        self._active.add(lora_id)
         self._last_mapping = None
 
 
