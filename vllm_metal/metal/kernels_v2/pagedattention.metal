@@ -1079,7 +1079,14 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       const int physical_block_offset =
           (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD];
+      // Lean-register QK: each K vector is loaded once and immediately
+      // folded into every row's vector accumulator, so a single K_vec is
+      // live instead of the whole token's NUM_VECS_PER_THREAD registers.
+      // Per row this is the same mul-then-fma chain in the same j order as
+      // Qk_dot, so scores stay bitwise identical; the register relief keeps
+      // window threadgroups (and plain decode) off the occupancy cliff.
+      using A_vec = typename FloatVec<K_vec>::Type;
+      A_vec qk_accs[PA_WINDOW_ROWS];
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
@@ -1088,6 +1095,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             physical_block_offset * kv_token_stride +
             kv_head_idx * kv_head_stride;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+        K_vec k_vec_j;
 
         if constexpr (is_uchar<K_CACHE_T>()) {
           // uchar K: FP8 (non-TQ) or TurboQuant uint8 / sub-8-bit K path.
@@ -1099,13 +1107,13 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
                 physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
                 kv_head_idx * SCALE_GROUPS;
             tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
-                k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
+                k_vec_j, k_ptr, key_scale_cache, key_zero_cache,
                 k_scale_base_offset, vec_idx, k_bits);
           } else {
             // FP8 path
             Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
                 k_ptr + vec_idx * VEC_SIZE);
-            k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+            k_vec_j = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
           }
         } else if constexpr (is_char<K_CACHE_T>()) {
           // char K: TQ int8 K — always asymmetric dequant (no FP8 for char)
@@ -1116,27 +1124,38 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
               physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
               kv_head_idx * SCALE_GROUPS;
           tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
-              k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
+              k_vec_j, k_ptr, key_scale_cache, key_zero_cache,
               k_scale_base_offset, vec_idx, k_bits);
         } else {
-          k_vecs[j] = *reinterpret_cast<const device K_vec *>(
+          k_vec_j = *reinterpret_cast<const device K_vec *>(
               k_ptr + vec_idx * VEC_SIZE);
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_tg; r++) {
+          if (r >= num_rows) break;
+          const threadgroup Q_vec *q_row =
+              (WINDOW_MODE ? q_rows_window + r * Q_VECS_PER_ROW
+                           : &q_vecs[0][0]) +
+              thread_group_offset * NUM_VECS_PER_THREAD;
+          if (j == 0) {
+            qk_accs[r] = mul<A_vec, Q_vec, K_vec>(q_row[0], k_vec_j);
+          } else {
+            qk_accs[r] = fma(q_row[j], k_vec_j, qk_accs[r]);
+          }
         }
       }
 
-      // One K load feeds every row's dot product — this sharing is the whole
-      // point of window mode.  Per-token mode runs exactly one iteration.
 #pragma unroll
       for (int r = 0; r < rows_per_tg; r++) {
         if (r >= num_rows) break;
-        const threadgroup Q_vec *q_row_base =
-            WINDOW_MODE ? q_rows_window + r * Q_VECS_PER_ROW : &q_vecs[0][0];
-        float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
-                               *reinterpret_cast<
-                                   const threadgroup Q_vec(*)[NUM_VECS_PER_THREAD]>(
-                                   q_row_base +
-                                   thread_group_offset * NUM_VECS_PER_THREAD),
-                               k_vecs);
+        // Finalize the reduction across lanes (same tree as Qk_dot).
+        float qk = sum(qk_accs[r]);
+#pragma unroll
+        for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
+          qk += simd_shuffle_xor(qk, mask);
+        }
+        qk *= scale;
 
         if (softcapping > 0.0f) {
           qk = tanh(qk / softcapping) * softcapping;
