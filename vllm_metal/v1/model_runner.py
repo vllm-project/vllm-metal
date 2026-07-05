@@ -750,7 +750,7 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference (standard MLX path)
+        # Run a small dummy inference.
         try:
             dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
             mx.eval(*self._dummy_forward_outputs(dummy_tokens))

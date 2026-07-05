@@ -9,19 +9,7 @@ from vllm_metal.v1 import contiguous_cache
 
 
 class TestHybridCacheMergeExtract:
-    """Regression tests for hybrid (KV + ArraysCache) batching.
-
-    Background:
-    - `mlx-lm==0.30.6` removed `MambaCache` and hybrid models now use `ArraysCache`.
-    - vllm-metal keeps a small `ArraysCache` merge/extract path so partially
-      populated state entries still round-trip.
-    - Rotating KV merge is delegated to the current `mlx-lm`
-      `BatchRotatingKVCache.merge` implementation.
-
-    These tests validate that vllm-metal can merge per-request caches into a batched
-    cache, run a batched forward pass, and then extract per-request caches back,
-    without depending on `MambaCache`.
-    """
+    """Non-paged cache merge/extract round-trip tests."""
 
     _ARRAYS_CACHE_ENTRIES = 2
     _ARRAYS_CACHE_FEATURES = 4
@@ -173,13 +161,7 @@ class TestHybridCacheMergeExtract:
         assert extracted_req1.offset == cache_req1.offset
 
     def test_rotating_kvcache_merge_handles_offset_exceeding_max_size(self) -> None:
-        """Merging works when offset > max_size (cache has rotated).
-
-        This protects vllm-metal's reliance on ``BatchRotatingKVCache.merge``:
-        the merge must size by effective sliding-window length, not cumulative
-        offset, after the cache rotates past its maximum size.
-        """
-        # offset=300 >> max_size=8 — the cache has rotated many times
+        """Merging works after the cache has rotated."""
         cache_req0 = self._make_rotating_kv_cache(
             max_size=8, total_tokens=300, value=1.0
         )
@@ -201,12 +183,7 @@ class TestHybridCacheMergeExtract:
         assert extracted_req1.offset == cache_req1.offset
 
     def test_rotating_kvcache_merge_handles_prefill_exceeding_max_size(self) -> None:
-        """Merging works when prefill length exceeds max_size.
-
-        After a large prefill the internal buffer may temporarily be larger than
-        ``max_size``.  The merge must trim to the effective sliding-window length.
-        """
-        # Prefill 128 tokens into a cache with max_size=70
+        """Merging works when prefill length exceeds max_size."""
         cache_req0 = contiguous_cache.RotatingKVCache(max_size=70)
         big_k = mx.full(
             (1, self._KV_NUM_HEADS, 128, self._KV_HEAD_DIM), 1.0, dtype=mx.float32
@@ -231,12 +208,7 @@ class TestHybridCacheMergeExtract:
         assert extracted_req1.offset == cache_req1.offset
 
     def test_rotating_kvcache_merge_decode_extract_roundtrip(self) -> None:
-        """Merged cache can be used for a batched decode step and extracted back.
-
-        This verifies that the internal state (_idx, _offset) returned by
-        ``BatchRotatingKVCache.merge`` is compatible with
-        ``BatchRotatingKVCache.update_and_fetch`` and ``extract``.
-        """
+        """Merged rotating cache can decode once and extract back."""
         cache_req0 = self._make_rotating_kv_cache(
             max_size=8, total_tokens=20, value=1.0
         )
@@ -246,12 +218,10 @@ class TestHybridCacheMergeExtract:
         batch_cache = merged[0]
         assert isinstance(batch_cache, contiguous_cache.BatchRotatingKVCache)
 
-        # Simulate one batched decode step (S=1)
         decode_k = mx.ones((2, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM))
         decode_v = mx.ones((2, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM))
         batch_cache.update_and_fetch(decode_k, decode_v)
 
-        # Extract back to per-request caches
         extracted_req0 = batch_cache.extract(0)
         extracted_req1 = batch_cache.extract(1)
 
@@ -261,14 +231,7 @@ class TestHybridCacheMergeExtract:
         assert extracted_req1.offset == cache_req1.offset + 1
 
     def test_extracted_rotating_cache_can_decode_after_rotation(self) -> None:
-        """Extracted RotatingKVCache can continue decoding after offset > max_size.
-
-        After merge -> extract, the extracted cache may have offset > max_size
-        but keys.shape[2] < max_size (buffer sliced by extract).  Without the
-        buffer padding fix in ``_extract_kv_cache``, the next
-        ``_update_in_place`` call would compute a negative ``new_size`` and
-        crash with ``ValueError: [full] Negative dimensions not allowed``.
-        """
+        """Extracted rotating cache can keep decoding after rotation."""
         cache_req0 = self._make_rotating_kv_cache(
             max_size=8, total_tokens=300, value=1.0
         )
@@ -283,7 +246,6 @@ class TestHybridCacheMergeExtract:
         assert extracted_req0.offset > extracted_req0.max_size
         assert extracted_req0.keys.shape[2] == extracted_req0.max_size
 
-        # This would crash without the buffer padding fix
         decode_k = mx.ones(
             (1, self._KV_NUM_HEADS, 1, self._KV_HEAD_DIM), dtype=mx.float32
         )

@@ -220,7 +220,7 @@ class MetalWorker(WorkerBase):
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path (default): reports one max-length sequence of KV cache
+        MLX path: reports one max-length sequence of KV cache
         so the scheduler budgets for one concurrent sequence.
 
         Returns:
