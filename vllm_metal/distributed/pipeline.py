@@ -26,6 +26,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.core.distributed import Group
+from mlx.utils import tree_flatten
 from vllm.distributed.utils import get_pp_indices
 
 import vllm_metal.envs as envs
@@ -171,6 +172,13 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
         )
 
     start, end = get_pp_indices(len(layers), pp.rank, pp.size)
+    if start >= end:
+        raise NotImplementedError(
+            f"Pipeline parallelism with {pp.size} stages over a model with "
+            f"{len(layers)} layers leaves stage {pp.rank} with no layers "
+            f"(get_pp_indices returned [{start}, {end})); use at most "
+            f"{len(layers)} pipeline stages."
+        )
     backbone.layers = layers[start:end]
 
     if not pp.is_last:
@@ -233,17 +241,52 @@ class PipelinedModel:
     forward evals.
     """
 
+    # Floating-point dtypes a stage's activation ("wire") may cross the ring with;
+    # a packed quantized weight is uint32 and never the wire dtype.
+    _FLOATING_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
+
     def __init__(self, model: Any, pp: PipelineGroup) -> None:
         self._model = model
         self._pp = pp
-        # Wire descriptor: (hidden, dtype) of the activation that crosses
-        # stages, taken from the embedding *output*. The embedding weight is
-        # the wrong source: quantized checkpoints pack it (uint32, hidden
-        # folded by the bit width). Shape/dtype inference is lazy — nothing is
-        # evaluated here.
-        probe = model.model.embed_tokens(mx.array([0]))
-        self._wire_hidden: int = probe.shape[-1]
-        self._wire_dtype: mx.Dtype = probe.dtype
+        # Wire descriptor: (hidden, dtype) of the activation that crosses stages.
+        # Derived from the model config + a stage-owned compute parameter, NOT by
+        # probing ``embed_tokens``: a streaming non-first stage does not own the
+        # embedding. ``hidden`` is the model hidden size; ``dtype`` is the stage
+        # compute dtype (the first floating-point parameter of the first owned
+        # layer — norm weights and quant scales are floating; a quantized weight is
+        # packed uint32 and is skipped).
+        self._wire_hidden: int = self._wire_hidden_size(model)
+        self._wire_dtype: mx.Dtype = self._stage_compute_dtype(model)
+
+    @staticmethod
+    def _wire_hidden_size(model: Any) -> int:
+        """The activation width, from ``model.args.hidden_size``. Fail loud with a
+        source-aware message rather than a bare ``AttributeError`` if a model lacks
+        a positive integer hidden size."""
+        hidden = getattr(getattr(model, "args", None), "hidden_size", None)
+        if not isinstance(hidden, int) or hidden <= 0:
+            raise TypeError(
+                "PP wire descriptor needs model.args.hidden_size as a positive "
+                f"integer, got {hidden!r}."
+            )
+        return hidden
+
+    @classmethod
+    def _stage_compute_dtype(cls, model: Any) -> mx.Dtype:
+        """The stage's activation dtype, from the first floating-point parameter of
+        its first owned layer. Packed quantized weights (uint32) are skipped; norm
+        weights and quant scales carry the real compute dtype."""
+        first_layer = model.model.layers[0]
+        # Annotate the tree_flatten result: it is typed list|dict, and iterating the
+        # dict branch would yield str keys — pin the (path, array) list for mypy.
+        flat: list[tuple[str, Any]] = tree_flatten(first_layer.parameters())
+        for _path, param in flat:
+            if param.dtype in cls._FLOATING_DTYPES:
+                return param.dtype
+        raise TypeError(
+            "PP stage's first layer exposes no floating-point parameter to derive "
+            "the wire dtype from."
+        )
 
     def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
         pp = self._pp
@@ -262,7 +305,7 @@ class PipelinedModel:
         if h_out.dtype != self._wire_dtype:
             raise TypeError(
                 f"PP stage produced hidden {h_out.dtype}, but the wire dtype "
-                f"(embedding output dtype) is {self._wire_dtype}; mismatch "
+                f"(stage compute dtype) is {self._wire_dtype}; mismatch "
                 f"deadlocks the ring."
             )
         return h_out
