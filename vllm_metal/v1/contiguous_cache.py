@@ -37,9 +37,10 @@ AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
     """Merge per-request ArraysCache objects into a single batched ArraysCache.
 
-    This mirrors the behavior of `mlx_lm.models.cache.ArraysCache.merge` but is
-    implemented here for compatibility with older mlx-lm versions that do not
-    provide `merge()` / `extract()`.
+    Keep this local instead of delegating to
+    ``mlx_lm.models.cache.ArraysCache.merge`` so entries that are ``None`` for
+    every request round-trip as ``None`` instead of depending on upstream's
+    non-empty-entry assumption.
     """
     if not caches:
         raise ValueError("caches must be non-empty")
@@ -68,7 +69,7 @@ def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
 
 
 def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
-    """Extract a single request's ArraysCache from a batched ArraysCache."""
+    """Extract one request's ArraysCache, preserving all-``None`` entries."""
     state = batch_cache.state
     extracted = ArraysCache(len(state))
     extracted.state = [

@@ -13,11 +13,14 @@ class TestHybridCacheMergeExtract:
 
     Background:
     - `mlx-lm==0.30.6` removed `MambaCache` and hybrid models now use `ArraysCache`.
-    - Older mlx-lm versions don't provide `ArraysCache.merge()` / `extract()`.
+    - vllm-metal keeps a small `ArraysCache` merge/extract path so partially
+      populated state entries still round-trip.
+    - Rotating KV merge is delegated to the current `mlx-lm`
+      `BatchRotatingKVCache.merge` implementation.
 
     These tests validate that vllm-metal can merge per-request caches into a batched
     cache, run a batched forward pass, and then extract per-request caches back,
-    without depending on `MambaCache` or new mlx-lm APIs.
+    without depending on `MambaCache`.
     """
 
     _ARRAYS_CACHE_ENTRIES = 2
@@ -172,9 +175,9 @@ class TestHybridCacheMergeExtract:
     def test_rotating_kvcache_merge_handles_offset_exceeding_max_size(self) -> None:
         """Merging works when offset > max_size (cache has rotated).
 
-        This is a regression test for a bug in ``BatchRotatingKVCache.merge``
-        (mlx-lm <= 0.29.1) where using ``c.offset`` instead of ``len(c)`` caused
-        a broadcast shape error after the cache rotated past its maximum size.
+        This protects vllm-metal's reliance on ``BatchRotatingKVCache.merge``:
+        the merge must size by effective sliding-window length, not cumulative
+        offset, after the cache rotates past its maximum size.
         """
         # offset=300 >> max_size=8 — the cache has rotated many times
         cache_req0 = self._make_rotating_kv_cache(
@@ -230,8 +233,8 @@ class TestHybridCacheMergeExtract:
     def test_rotating_kvcache_merge_decode_extract_roundtrip(self) -> None:
         """Merged cache can be used for a batched decode step and extracted back.
 
-        This verifies that the internal state (_idx, _offset) set by
-        ``_merge_rotating_kv_caches`` is compatible with
+        This verifies that the internal state (_idx, _offset) returned by
+        ``BatchRotatingKVCache.merge`` is compatible with
         ``BatchRotatingKVCache.update_and_fetch`` and ``extract``.
         """
         cache_req0 = self._make_rotating_kv_cache(
