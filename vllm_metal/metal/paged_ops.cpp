@@ -403,8 +403,18 @@ static void dispatch_paged_attention_v2_online(
   // partial, zero merge weight (Gemma-4 E2B measured -35% TPOT at conc=1).
   // Window batches keep split-KV eligibility: their per-row partition
   // stats/tmp_out land at the same per-token rows the reduce kernel reads.
+  // Gate on the split-equivalent grid (one row per token), not the
+  // window-compacted one: window mode halves grid.y, so gating on
+  // base_grid flips the partition decision relative to the split path in
+  // a band of shapes whose location depends on the core count
+  // (min_decode_grid).  Inside that band the two paths run different
+  // kernel families (_ps512 vs _ps0) and the bitwise contract breaks --
+  // observed on an M4 Pro 16-core for 32q/8kv single-sequence windows,
+  // invisible on 10-core M4 / M2 Ultra whose thresholds land elsewhere.
+  const int gate_grid =
+      window_batch ? num_heads * total_q_tokens : base_grid;
   const bool partition = (pure_decode || window_batch)
-      && base_grid < min_decode_grid() && max_num_partitions >= 2;
+      && gate_grid < min_decode_grid() && max_num_partitions >= 2;
 
   std::string kname =
       "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
