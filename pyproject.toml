@@ -40,7 +40,12 @@ dependencies = [
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
     # Keep aligned with vLLM 0.24.0's Transformers lower bound.
-    "transformers>=5.5.3",
+    # Temporary cap: transformers 5.13.0 (released 2026-07-03) breaks MLX Metal
+    # availability inside the vLLM process on GitHub's macOS runner VMs, so
+    # platform resolution falls back to CPU. Verified A/B on the same runner:
+    # 5.13.0 -> CpuPlatform, 5.12.1 -> MetalPlatform.
+    # TODO: remove once the interaction is understood/fixed upstream.
+    "transformers>=5.5.3,<5.13",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
     # Native Metal extension JIT build

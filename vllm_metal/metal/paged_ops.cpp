@@ -839,6 +839,106 @@ static std::vector<array> tq_encode_primitive_fn(
 }
 
 // ---------------------------------------------------------------------------
+// reshape_and_cache — fused K/V paged scatter (non-quantized fp16/bf16/fp32)
+//
+// Replaces the two per-layer MLX scatters on the standard decode path
+// (flat_k[slot_mapping] = k_3d; flat_v[slot_mapping] = v_3d) with one fused
+// Metal dispatch that writes both K and V into the paged cache by slot_mapping,
+// wiring up the pre-existing reshape_and_cache.metal kernel. Same in-place
+// aliasing pattern as TQEncodePrimitive so the writes carry graph provenance
+// for the downstream paged_attention read.
+// ---------------------------------------------------------------------------
+
+class ReshapeAndCachePrimitive : public Primitive {
+ public:
+  explicit ReshapeAndCachePrimitive(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("ReshapeAndCachePrimitive only supports GPU");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // inputs:  0=key, 1=value, 2=key_cache_in, 3=value_cache_in, 4=slot_mapping
+    // outputs: 0=new_key_cache, 1=new_value_cache (alias inputs 2,3 in place)
+    outputs[0].copy_shared_buffer(inputs[2]);
+    outputs[1].copy_shared_buffer(inputs[3]);
+
+    const array& key          = inputs[0];
+    const array& value        = inputs[1];
+    const array& slot_mapping = inputs[4];
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+
+    // key shape: [num_tokens, num_kv_heads, head_size]
+    int num_tokens   = static_cast<int>(key.shape(0));
+    int num_kv_heads = static_cast<int>(key.shape(1));
+    int head_size    = static_cast<int>(key.shape(2));
+    // cache shape: [num_blocks, block_size, num_kv_heads, head_size]
+    int block_size   = static_cast<int>(inputs[2].shape(1));
+
+    auto kv_dt    = dtype_to_metal(key.dtype());
+    auto cache_dt = dtype_to_metal(inputs[2].dtype());
+    std::string kname = "reshape_and_cache_kv_" + kv_dt + "_cache_" + cache_dt;
+
+    // rac_use_fp8_scales (fc 100) = false: non-quantized cache, so the
+    // k_scale/v_scale buffers (5,6) are absent from the signature.
+    bool use_fp8 = false;
+    std::string hash_name = kname + "_fp8_0";
+
+    auto* lib = d.get_library("paged_attention_v2_kern");
+    auto* kernel = d.get_kernel(
+        kname, lib, hash_name,
+        {{&use_fp8, MTL::DataType::DataTypeBool, NS::UInteger(100)}});
+
+    int32_t key_stride_i   = static_cast<int32_t>(num_kv_heads * head_size);
+    int32_t value_stride_i = key_stride_i;
+    int32_t num_heads_i    = static_cast<int32_t>(num_kv_heads);
+    int32_t head_size_i    = static_cast<int32_t>(head_size);
+    int32_t block_size_i   = static_cast<int32_t>(block_size);
+
+    auto& enc = get_command_encoder_compat(d, s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(key,          0);
+    enc.set_input_array(value,        1);
+    enc.set_output_array(outputs[0],  2);
+    enc.set_output_array(outputs[1],  3);
+    enc.set_input_array(slot_mapping, 4);
+    enc.set_bytes(key_stride_i,   7);
+    enc.set_bytes(value_stride_i, 8);
+    enc.set_bytes(num_heads_i,    9);
+    enc.set_bytes(head_size_i,    10);
+    enc.set_bytes(block_size_i,   11);
+
+    int tg = std::min(num_kv_heads * head_size, 256);
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_tokens, 1, 1),
+        MTL::Size::Make(tg, 1, 1));
+  }
+
+  const char* name() const override { return "ReshapeAndCache"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    return dynamic_cast<const ReshapeAndCachePrimitive*>(&other) != nullptr;
+  }
+};
+
+static std::vector<array> reshape_and_cache_primitive_fn(
+    const array& key, const array& value,
+    const array& key_cache, const array& value_cache,
+    const array& slot_mapping) {
+  auto prim = std::make_shared<ReshapeAndCachePrimitive>(
+      default_stream(Device::gpu));
+  return array::make_arrays(
+      {key_cache.shape(), value_cache.shape()},
+      {key_cache.dtype(), value_cache.dtype()},
+      prim,
+      {key, value, key_cache, value_cache, slot_mapping});
+}
+
+// ---------------------------------------------------------------------------
 // GDN linear attention — in-place paged state
 // ---------------------------------------------------------------------------
 
@@ -1215,6 +1315,39 @@ NB_MODULE(_paged_ops, m) {
         "QUANT_PARAMS (signed q8_0/int8 at k_bits=8; unsigned uint8/q5_0/"
         "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
         "any v_bits in [1, 8] via the v_centroids buffer.");
+
+  m.def("reshape_and_cache",
+        [](nb::handle key_h, nb::handle value_h,
+           nb::handle key_cache_h, nb::handle value_cache_h,
+           nb::handle slot_mapping_h) {
+          auto results = reshape_and_cache_primitive_fn(
+              *nb::inst_ptr<array>(key_h),
+              *nb::inst_ptr<array>(value_h),
+              *nb::inst_ptr<array>(key_cache_h),
+              *nb::inst_ptr<array>(value_cache_h),
+              *nb::inst_ptr<array>(slot_mapping_h));
+
+          // Same placeholder dance as tq_encode: mint mx.core.array objects and
+          // overwrite_descriptor to bypass cross-module nanobind RTTI.
+          nb::object mx_core  = nb::module_::import_("mlx.core");
+          nb::object arr_cls  = mx_core.attr("array");
+          nb::object zero_arg = nb::int_(0);
+          nb::object out_k    = arr_cls(zero_arg);
+          nb::object out_v    = arr_cls(zero_arg);
+          nb::inst_ptr<array>(out_k)->overwrite_descriptor(results[0]);
+          nb::inst_ptr<array>(out_v)->overwrite_descriptor(results[1]);
+          return nb::make_tuple(out_k, out_v);
+        },
+        nb::arg("key"), nb::arg("value"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("slot_mapping"),
+        "Fused K/V paged scatter for non-quantized (fp16/bf16/fp32) caches. "
+        "Wraps an MLX Primitive whose two cache writes carry graph provenance "
+        "for the downstream paged_attention read; each output aliases its input "
+        "cache buffer in place, so the caller MUST rebind "
+        "kv_cache.<cache>[layer_idx] to the returned value. key/value are "
+        "[num_tokens, num_kv_heads, head_size]; caches are "
+        "[num_blocks, block_size, num_kv_heads, head_size].");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.

@@ -63,6 +63,7 @@ def _build_v2_paged_attention_source() -> str:
         _read_metal_source(_KERNELS_V2_DIR / "float8.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "reshape_and_cache.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention_tiled.metal"),
     ]

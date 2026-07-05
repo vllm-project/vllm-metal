@@ -174,6 +174,14 @@ main() {
     section "Verifying package import"
     python -c "import vllm_metal; print('vllm_metal imported successfully')"
 
+    # Preflight: assert vLLM resolves the Metal platform before spending
+    # minutes on smokes. When this fails, MLX cannot see Metal inside the
+    # full vLLM process and every smoke dies confusingly on vLLM's CPU
+    # fallback; an unpinned dependency regression can cause this (see
+    # transformers 5.13.0, #471).
+    section "Checking Metal platform resolution"
+    python -c "import sys; from vllm.platforms import current_platform; name = type(current_platform).__name__; print('Resolved platform:', name); sys.exit(0 if name == 'MetalPlatform' else 1)"
+
     smoke_tests
     section "Running tests"
     # Exclude perf/long-running tests by default; run them explicitly via:

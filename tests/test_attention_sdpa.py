@@ -607,6 +607,16 @@ class TestSDPAForward:
         captured: dict[str, int] = {}
 
         class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _key,
+                _value,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
             def paged_attention_primitive(
                 self,
                 _query,
