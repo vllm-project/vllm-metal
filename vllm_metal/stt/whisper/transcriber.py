@@ -335,7 +335,7 @@ class WhisperTranscriber:
                         segments.append(
                             TranscriptionSegment(
                                 id=seg_id,
-                                seek=int(seg_start * SEEK_MULTIPLIER),
+                                seek=int((seg_start + time_offset) * SEEK_MULTIPLIER),
                                 start=round(seg_start + time_offset, 2),
                                 end=round(ts + time_offset, 2),
                                 text=seg_text,
@@ -354,7 +354,7 @@ class WhisperTranscriber:
                 segments.append(
                     TranscriptionSegment(
                         id=seg_id,
-                        seek=int(seg_start * SEEK_MULTIPLIER),
+                        seek=int((seg_start + time_offset) * SEEK_MULTIPLIER),
                         start=round(seg_start + time_offset, 2),
                         end=round(
                             seg_start + time_offset + DEFAULT_SEGMENT_DURATION, 2

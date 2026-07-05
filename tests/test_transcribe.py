@@ -101,8 +101,22 @@ class TestExtractSegments:
         segments = transcriber._extract_segments(tokens, time_offset=10.0)
 
         assert len(segments) == 1
+        assert segments[0].seek == 1000
         assert segments[0].start == pytest.approx(10.0)
         assert segments[0].end == pytest.approx(13.0)
+
+    def test_time_offset_applies_to_unfinished_segment_seek(
+        self, transcriber: WhisperTranscriber
+    ) -> None:
+        start_tok = transcriber._get_token_id("<|0.00|>")
+
+        segments = transcriber._extract_segments(
+            [start_tok, 2425],
+            time_offset=10.0,
+        )
+
+        assert len(segments) == 1
+        assert segments[0].seek == 1000
 
     def test_empty_tokens(self, transcriber: WhisperTranscriber) -> None:
         assert transcriber._extract_segments([]) == []
