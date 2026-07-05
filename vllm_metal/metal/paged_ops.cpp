@@ -393,7 +393,6 @@ static void dispatch_paged_attention_v2_online(
 
   // ----- Split-KV (flash-decoding) occupancy gate ------------------------
   const bool pure_decode = !has_prefill;  // every seq has exactly 1 query token
-  const int base_grid = num_heads * grid_y;  // grid.z = 1 occupancy
   const int max_num_partitions =
       (max_seq_len + kPartitionSize - 1) / kPartitionSize;
   // TurboQuant and sliding-window batches take the split too.  TQ partials
@@ -404,15 +403,16 @@ static void dispatch_paged_attention_v2_online(
   // Window batches keep split-KV eligibility: their per-row partition
   // stats/tmp_out land at the same per-token rows the reduce kernel reads.
   // Gate on the split-equivalent grid (one row per token), not the
-  // window-compacted one: window mode halves grid.y, so gating on
-  // base_grid flips the partition decision relative to the split path in
-  // a band of shapes whose location depends on the core count
+  // window-compacted one: window mode halves grid.y, so gating on the
+  // dispatch grid flips the partition decision relative to the split
+  // path in a band of shapes whose location depends on the core count
   // (min_decode_grid).  Inside that band the two paths run different
   // kernel families (_ps512 vs _ps0) and the bitwise contract breaks --
   // observed on an M4 Pro 16-core for 32q/8kv single-sequence windows,
   // invisible on 10-core M4 / M2 Ultra whose thresholds land elsewhere.
-  const int gate_grid =
-      window_batch ? num_heads * total_q_tokens : base_grid;
+  // (For non-window batches grid_y == total_q_tokens, so this is the
+  // same value the gate always used.)
+  const int gate_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
   const bool partition = (pure_decode || window_batch)
       && gate_grid < min_decode_grid() && max_num_partitions >= 2;
 
