@@ -633,7 +633,7 @@ def test_qlora_manager_activate_rejects_zero_module_match() -> None:
     with pytest.raises(ValueError, match="matched 0 wrapped modules"):
         manager.activate_adapter(1)
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 1 not in manager._active
+    assert 1 not in manager.lora_index_to_id
 
 
 def test_qlora_manager_activate_rejects_ambiguous_suffix_match() -> None:
@@ -668,7 +668,7 @@ def test_qlora_manager_activate_rejects_ambiguous_suffix_match() -> None:
     with pytest.raises(ValueError, match="ambiguous suffix matches"):
         manager.activate_adapter(42)
     assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 42 not in manager._active
+    assert 42 not in manager.lora_index_to_id
 
 
 # Worker-manager constraints carry over to QLoRA
