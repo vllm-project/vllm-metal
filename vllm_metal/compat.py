@@ -27,11 +27,55 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_transformers_autotokenizer_register_str_key()
     _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
     _patch_transformers_exaone4_config()
+
+
+def _patch_transformers_autotokenizer_register_str_key() -> None:
+    """Tolerate ``AutoTokenizer.register("Name", ...)`` string keys.
+
+    ``mlx_lm.tokenizer_utils`` registers its ``NewlineTokenizer`` via
+    ``AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=...)`` —
+    passing a *string* config key. transformers >= 5.x expects a config
+    *class* and unconditionally reads ``key.__module__`` in
+    ``_LazyAutoMapping.register``, so importing ``mlx_lm`` raises
+    ``AttributeError: 'str' object has no attribute '__module__'`` and takes
+    the whole Metal path down (the CPU fallback path never imports mlx_lm, so
+    it silently dodges the crash — which is how this stayed hidden).
+
+    This patch makes ``register`` store string keys in ``_extra_content`` and
+    skip the class-provenance check, which is a no-op for real config classes.
+    Must run before ``mlx_lm`` is first imported; ``apply_compat_patches`` runs
+    inside the platform plugin's ``_register`` hook, before the MLX runtime
+    loads, so the ordering holds.
+    """
+    try:
+        from transformers.models.auto.auto_factory import _LazyAutoMapping
+    except Exception:
+        return
+
+    if getattr(_LazyAutoMapping.register, "_vllm_metal_str_key_patch", False):
+        return
+
+    _orig_register = _LazyAutoMapping.register
+
+    def register(self, key, value, exist_ok=False):  # type: ignore[no-untyped-def]
+        if isinstance(key, str):
+            # Legacy string-keyed registration (e.g. mlx_lm's NewlineTokenizer).
+            # Store by name and skip the class-only provenance check.
+            try:
+                self._extra_content[key] = value
+            except Exception:
+                pass
+            return
+        return _orig_register(self, key, value, exist_ok=exist_ok)
+
+    register._vllm_metal_str_key_patch = True  # type: ignore[attr-defined]
+    _LazyAutoMapping.register = register
 
 
 def _patch_transformers_exaone4_config() -> None:

@@ -290,6 +290,9 @@ class MetalModelRunner:
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
         self._lora = MetalLoRARuntime()
         self._spec_decode_controller = SpeculativeDecodeController()
+        # Optional LMCache KV offload connector (VLLM_METAL_ENABLE_LMCACHE=1).
+        # Lazily constructed on first use once the paged cache exists.
+        self._lmcache_connector = None
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -575,6 +578,99 @@ class MetalModelRunner:
         draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
         return draft_token_ids
+
+    def _maybe_lmcache_connector(self):
+        """Return the MLX LMCache bridge when enabled, else None.
+
+        Lazily constructed once the paged attention runtime (and thus the MLX
+        KV cache) exists. Gated by ``VLLM_METAL_ENABLE_LMCACHE=1``. Any
+        construction failure disables the feature for the process rather than
+        breaking serving.
+        """
+        from vllm_metal.lmcache_integration import lmcache_enabled
+
+        if not lmcache_enabled():
+            return None
+        if self._lmcache_connector is not None:
+            return self._lmcache_connector
+        runtime = self._paged_attention_runtime
+        if runtime is None:
+            return None
+        try:
+            from vllm_metal.lmcache_integration import MetalLMCacheConnector
+
+            self._lmcache_connector = MetalLMCacheConnector(instance_id="vllm-metal")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("LMCache disabled: connector init failed: %s", exc)
+            self._lmcache_connector = None
+        return self._lmcache_connector
+
+    def _lmcache_bind_kv_connector(self) -> "Any":
+        """Bind the live MLX cache to the vLLM KVConnector (worker role).
+
+        Returns the bound ``MetalLMCacheKVConnector`` if a KV transfer group is
+        active and it is our Metal connector, else None. Binding is idempotent.
+        """
+        try:
+            from vllm.distributed.kv_transfer.kv_transfer_state import (
+                get_kv_transfer_group,
+                has_kv_transfer_group,
+            )
+        except Exception:
+            return None
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        # Only our Metal connector knows how to talk to the MLX cache.
+        if not hasattr(connector, "bind_metal_cache"):
+            return None
+        runtime = self._paged_attention_runtime
+        mlx = self._maybe_lmcache_connector()
+        if runtime is None or mlx is None:
+            return None
+        connector.bind_metal_cache(mlx, runtime.kv_cache)
+        return connector
+
+    def _lmcache_start_load(self, scheduler_output: "SchedulerOutput") -> None:
+        """Worker-side KVConnector load: pull matched-prefix KV from LMCache
+        into the assigned blocks before the forward. No-op unless the Metal
+        KVConnector is active and has metadata for this step."""
+        connector = self._lmcache_bind_kv_connector()
+        if connector is None:
+            return
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if meta is None:
+            return
+        try:
+            connector.bind_connector_metadata(meta)
+            connector.start_load_kv(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("LMCache start_load_kv skipped: %s", exc)
+
+    def _lmcache_finish_save(self) -> None:
+        """Worker-side KVConnector save: store freshly computed prompt KV to
+        LMCache after the forward, then clear the bound metadata."""
+        try:
+            from vllm.distributed.kv_transfer.kv_transfer_state import (
+                get_kv_transfer_group,
+                has_kv_transfer_group,
+            )
+        except Exception:
+            return
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        if not hasattr(connector, "bind_metal_cache"):
+            return
+        try:
+            connector.wait_for_save()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("LMCache wait_for_save skipped: %s", exc)
+        finally:
+            try:
+                connector.clear_connector_metadata()
+            except Exception:
+                pass
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -1811,6 +1907,14 @@ class MetalModelRunner:
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
+                # NOTE: LMCache-cached prefixes are accounted for by the vLLM
+                # scheduler via the KVConnector protocol (see
+                # vllm_metal.lmcache_kv_connector): the scheduler folds
+                # externally-cached tokens into ``num_computed_tokens`` before
+                # this point, so the suffix-only ``token_ids[computed:cur]`` +
+                # ``start_pos=computed`` logic below is already correct. The
+                # worker-side load happens in execute_model's
+                # ``_lmcache_start_load`` before the forward.
                 cur_len = computed_tokens + scheduled_tokens
                 is_intermediate = cur_len < prompt_len
 
@@ -2274,6 +2378,11 @@ class MetalModelRunner:
             self._lora.prepare_step(
                 self._paged_lora_routing(batch.paged_decode_reqs, prefill_pack)
             )
+            # LMCache (worker role): load any matched-prefix KV the scheduler
+            # committed for this step into the assigned blocks BEFORE the
+            # forward, so the model attends to the loaded prefix instead of
+            # recomputing it. No-op unless the Metal KVConnector is active.
+            self._lmcache_start_load(scheduler_output)
             self._start_paged_forward(
                 batch,
                 prefill_pack,
@@ -2285,6 +2394,7 @@ class MetalModelRunner:
                 runtime = self._paged_attention_runtime
                 if runtime is not None:
                     runtime.materialize_pending_state()
+                self._lmcache_finish_save()
                 self._validate_scheduled_outputs(batch, scheduler_output)
                 return self._build_output(batch)
             return None
@@ -2346,6 +2456,10 @@ class MetalModelRunner:
             runtime = self._paged_attention_runtime
             if runtime is not None:
                 runtime.materialize_pending_state()
+            # LMCache (worker role): the forward is complete and KV is written,
+            # so persist freshly computed prompt KV to LMCache now. No-op unless
+            # the Metal KVConnector is active.
+            self._lmcache_finish_save()
             self._validate_scheduled_outputs(batch, scheduler_output)
             return self._build_output(batch)
 

@@ -1,0 +1,68 @@
+{
+  "prompts": [
+    {
+      "target": 256,
+      "ntok": 316,
+      "cold_ms": 146.4,
+      "apc_ms": 21.5,
+      "lmcache_store_ms": 6.32,
+      "lmcache_restore_ms": 8.4,
+      "lmcache_hits": 316,
+      "bit_exact": true,
+      "kv_MB": 36.2
+    },
+    {
+      "target": 512,
+      "ntok": 631,
+      "cold_ms": 4975.2,
+      "apc_ms": 89.3,
+      "lmcache_store_ms": 8.33,
+      "lmcache_restore_ms": 15.24,
+      "lmcache_hits": 631,
+      "bit_exact": true,
+      "kv_MB": 72.4
+    },
+    {
+      "target": 1024,
+      "ntok": 1276,
+      "cold_ms": 2648.3,
+      "apc_ms": 57.5,
+      "lmcache_store_ms": 16.05,
+      "lmcache_restore_ms": 27.62,
+      "lmcache_hits": 1276,
+      "bit_exact": true,
+      "kv_MB": 146.3
+    },
+    {
+      "target": 2048,
+      "ntok": 2551,
+      "cold_ms": 4023.4,
+      "apc_ms": 44.1,
+      "lmcache_store_ms": 27.75,
+      "lmcache_restore_ms": 48.24,
+      "lmcache_hits": 2551,
+      "bit_exact": true,
+      "kv_MB": 292.6
+    },
+    {
+      "target": 4096,
+      "ntok": 5116,
+      "cold_ms": 5628.7,
+      "apc_ms": 108.0,
+      "lmcache_store_ms": 54.52,
+      "lmcache_restore_ms": 97.05,
+      "lmcache_hits": 5116,
+      "bit_exact": true,
+      "kv_MB": 586.7
+    }
+  ],
+  "correctness": {
+    "identical_output": true,
+    "sample": " In a distant galaxy far beyond the reach of known science, "
+  },
+  "meta": {
+    "model": "Qwen/Qwen3-0.6B",
+    "backend": "Metal/MLX",
+    "dtype": "bfloat16"
+  }
+}

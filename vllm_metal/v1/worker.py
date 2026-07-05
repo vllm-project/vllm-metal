@@ -253,6 +253,40 @@ class MetalWorker(WorkerBase):
             kv_cache_config: KV cache configuration for this worker
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        # Initialize the worker-side KV transfer group (e.g. the LMCache Metal
+        # connector) if a kv_transfer_config is set. Mirrors vLLM's GPU worker.
+        if self.vllm_config.kv_transfer_config is not None:
+            try:
+                from vllm.distributed.kv_transfer import (
+                    ensure_kv_transfer_initialized,
+                )
+
+                ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("KV transfer init skipped: %s", exc)
+
+    def get_kv_connector_handshake_metadata(self):
+        """Return per-worker KV connector handshake metadata, or None.
+
+        The Metal LMCache connector runs in-process (uniproc) and needs no
+        cross-worker handshake, so this returns None — but the method must
+        exist because the engine core invokes it via collective_rpc when a
+        kv_transfer_config is present.
+        """
+        try:
+            from vllm.distributed.kv_transfer.kv_transfer_state import (
+                get_kv_transfer_group,
+                has_kv_transfer_group,
+            )
+        except Exception:
+            return None
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        get_hs = getattr(connector, "get_handshake_metadata", None)
+        if get_hs is None or get_hs() is None:
+            return None
+        return None
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
