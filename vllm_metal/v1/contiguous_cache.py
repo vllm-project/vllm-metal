@@ -77,79 +77,6 @@ def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
     return extracted
 
 
-def _merge_rotating_kv_caches(
-    caches: list[RotatingKVCache],
-) -> BatchRotatingKVCache:
-    """Merge per-request RotatingKVCache objects into a single BatchRotatingKVCache.
-
-    This mirrors ``BatchRotatingKVCache.merge`` but pre-computes the temporal-ordered
-    keys/values, trims them to ``len(cache)`` (the effective sliding-window length),
-    and uses that length for the copy width.  The upstream implementation in
-    mlx-lm <= 0.29.1 uses ``c.offset`` which can exceed the underlying array size
-    after the cache has rotated, causing a broadcast shape error.
-
-    This workaround can be removed once vllm-metal can depend on an mlx-lm version
-    that includes the upstream fix (ml-explore/mlx-lm#738) and has been verified
-    to work with gpt-oss models end-to-end.
-    """
-    if not caches:
-        raise ValueError("caches must be non-empty")
-
-    if any(c.keys is None or c.values is None for c in caches):
-        raise ValueError(
-            "Cannot merge unpopulated RotatingKVCache (keys/values is None)"
-        )
-
-    if not all(c.max_size == caches[0].max_size for c in caches):
-        raise ValueError(
-            "BatchRotatingKVCache can only merge caches with the same maximum size"
-        )
-
-    # Pre-compute temporal-ordered keys/values and trim to the effective
-    # sliding-window length.  ``_temporal_order`` may return an array larger
-    # than ``len(cache)`` when the internal buffer has not been trimmed yet
-    # (e.g. after a large prefill), so we trim via ``_trim`` to preserve
-    # the ``keep`` prefix semantics used by RotatingKVCache internally.
-    ordered: list[tuple[mx.array, mx.array]] = []
-    for c in caches:
-        effective_len = c.size() if hasattr(c, "size") else len(c)
-        ordered_keys = c._temporal_order(c.keys)
-        ordered_values = c._temporal_order(c.values)
-        if ordered_keys.shape[2] > effective_len:
-            trim_size = ordered_keys.shape[2] - effective_len
-            ordered_keys = c._trim(trim_size, ordered_keys)
-            ordered_values = c._trim(trim_size, ordered_values)
-        else:
-            ordered_keys = ordered_keys[..., :effective_len, :]
-            ordered_values = ordered_values[..., :effective_len, :]
-        ordered.append((ordered_keys, ordered_values))
-
-    lengths = [k.shape[2] for k, _ in ordered]
-    max_length = max(lengths)
-    padding = [max_length - length for length in lengths]
-    batch_size = len(caches)
-    n_heads = max(k.shape[1] for k, _ in ordered)
-    k_dim = max(k.shape[3] for k, _ in ordered)
-    v_dim = max(v.shape[3] for _, v in ordered)
-    dtype = next(iter(k.dtype for k, _ in ordered))
-
-    keys = mx.zeros((batch_size, n_heads, max_length, k_dim), dtype=dtype)
-    values = mx.zeros((batch_size, n_heads, max_length, v_dim), dtype=dtype)
-    for i, (pad, (k, v)) in enumerate(zip(padding, ordered, strict=True)):
-        n = k.shape[2]
-        keys[i : i + 1, :, pad : pad + n] = k
-        values[i : i + 1, :, pad : pad + n] = v
-
-    cache = BatchRotatingKVCache(caches[0].max_size, padding)
-    cache.keys = keys
-    cache.values = values
-    cache.offset = mx.array([c.offset for c in caches])
-    cache._idx = keys.shape[2]
-    cache._offset = keys.shape[2]
-
-    return cache
-
-
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
 ) -> list[BatchKVCache | BatchRotatingKVCache | ArraysCache]:
@@ -186,7 +113,7 @@ def _merge_kv_caches(
                         "Mixed cache types in a single layer: expected RotatingKVCache"
                     )
                 rotating_caches.append(cache)
-            batch_cache = _merge_rotating_kv_caches(rotating_caches)
+            batch_cache = BatchRotatingKVCache.merge(rotating_caches)
         elif isinstance(layer_caches[0], KVCache):
             kv_caches: list[KVCache] = []
             for cache in layer_caches:
