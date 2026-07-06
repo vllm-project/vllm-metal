@@ -770,7 +770,7 @@ def test_manager_target_modules_filter_excludes_unmatched() -> None:
 
 def test_manager_rejects_zero_wrapped_modules() -> None:
     model = _TwoLinearModel()
-    with pytest.raises(RuntimeError, match="no LoRA target modules"):
+    with pytest.raises(RuntimeError, match="no LoRA target modules") as exc_info:
         model_manager_mod.MLXLoRAModelManager(
             model=model,
             lora_config=_lora_config_stub(
@@ -780,6 +780,8 @@ def test_manager_rejects_zero_wrapped_modules() -> None:
             max_num_batched_tokens=2,
             dtype=mx.float32,
         )
+    assert "quantized layers" not in str(exc_info.value)
+    assert "target_modules" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

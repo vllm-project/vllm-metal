@@ -106,9 +106,9 @@ class MLXLoRAModelManager:
         if not repls:
             raise RuntimeError(
                 "MLXLoRAModelManager found no LoRA target modules to wrap. "
-                "The model may expose only quantized layers, which v1 LoRA "
-                "does not support yet, or LoRAConfig.target_modules may "
-                "exclude every wrappable nn.Linear."
+                "LoRAConfig.target_modules may exclude every wrappable module, "
+                "or the selected leaves may not expose a supported linear "
+                "contract for LoRA/QLoRA wrapping."
             )
         for name, w in repls:
             w.set_mapping(self.punica_wrapper)
