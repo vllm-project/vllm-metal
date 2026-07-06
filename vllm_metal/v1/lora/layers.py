@@ -20,7 +20,9 @@ def can_wrap(module: Any) -> bool:
 
 def can_wrap_qlora(module: Any) -> bool:
     quantized_embedding_cls = getattr(nn, "QuantizedEmbedding", None)
-    if quantized_embedding_cls is not None and isinstance(module, quantized_embedding_cls):
+    if quantized_embedding_cls is not None and isinstance(
+        module, quantized_embedding_cls
+    ):
         return False
 
     return (
