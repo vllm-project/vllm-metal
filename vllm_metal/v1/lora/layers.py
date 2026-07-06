@@ -25,10 +25,12 @@ def can_wrap_qlora(module: Any) -> bool:
     ):
         return False
 
+    weight = getattr(module, "weight", None)
+    scales = getattr(module, "scales", None)
     return (
         not isinstance(module, nn.Linear)
-        and hasattr(module, "weight")
-        and hasattr(module, "scales")
+        and getattr(weight, "ndim", None) == 2
+        and getattr(scales, "ndim", None) == 2
         and hasattr(module, "bits")
         and hasattr(module, "group_size")
         and callable(module)
@@ -165,17 +167,9 @@ class MLXQuantizedLinearWithLoRA(nn.Module):
     def weight(self) -> mx.array:
         return self.base_layer.weight
 
-    @weight.setter
-    def weight(self, value: mx.array) -> None:
-        self.base_layer.weight = value
-
     @property
     def bias(self) -> mx.array:
         return self.base_layer.bias
-
-    @bias.setter
-    def bias(self, value: mx.array) -> None:
-        self.base_layer.bias = value
 
     @property
     def in_features(self) -> int:

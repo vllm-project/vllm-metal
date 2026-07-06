@@ -135,6 +135,38 @@ def test_can_wrap_qlora_requires_scales_on_duck_type() -> None:
     assert not can_wrap_qlora(_FakeQuantLinear())
 
 
+def test_can_wrap_qlora_accepts_duck_typed_quantized_linear_contract() -> None:
+    class _FakeQuantLinear(nn.Module):
+        bits = 4
+        group_size = 64
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = mx.zeros((64, 8), dtype=mx.uint32)
+            self.scales = mx.zeros((64, 4), dtype=mx.float16)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return x
+
+    assert can_wrap_qlora(_FakeQuantLinear())
+
+
+def test_can_wrap_qlora_rejects_non_unary_quantized_projection() -> None:
+    class _FakeQuantSwitchLinear(nn.Module):
+        bits = 4
+        group_size = 64
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = mx.zeros((2, 64, 8), dtype=mx.uint32)
+            self.scales = mx.zeros((2, 64, 4), dtype=mx.float16)
+
+        def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+            return x + indices
+
+    assert not can_wrap_qlora(_FakeQuantSwitchLinear())
+
+
 # MLXQuantizedLinearWithLoRA wrapper
 
 
@@ -155,9 +187,14 @@ def test_qlora_wrapper_preserves_quantized_projection_surface() -> None:
     assert w.in_features == 128
     assert w.out_features == 64
 
+    assert type(w).weight.fset is None
+    assert type(w).bias.fset is None
+
     base_param_names = {name for name, _ in mlx_utils.tree_flatten(ql.parameters())}
     wrapped_param_names = {name for name, _ in mlx_utils.tree_flatten(w.parameters())}
     assert {f"base_layer.{name}" for name in base_param_names} <= wrapped_param_names
+    assert "weight" not in wrapped_param_names
+    assert "bias" not in wrapped_param_names
 
 
 @pytest.mark.parametrize(
