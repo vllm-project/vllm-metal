@@ -19,8 +19,14 @@ def can_wrap(module: Any) -> bool:
 
 
 def can_wrap_qlora(module: Any) -> bool:
+    quantized_embedding_cls = getattr(nn, "QuantizedEmbedding", None)
+    if quantized_embedding_cls is not None and isinstance(module, quantized_embedding_cls):
+        return False
+
     return (
         not isinstance(module, nn.Linear)
+        and hasattr(module, "weight")
+        and hasattr(module, "scales")
         and hasattr(module, "bits")
         and hasattr(module, "group_size")
         and callable(module)
@@ -144,7 +150,7 @@ class MLXQuantizedLinearWithLoRA(nn.Module):
         dtype: mx.Dtype,
     ):
         super().__init__()
-        self._base = base_layer
+        self.base_layer = base_layer
         self.max_loras, self.max_lora_rank = max_loras, max_lora_rank
         self.input_size, self.output_size = _infer_qlora_dims(base_layer)
         # +1 trailing slot is the null slot (see punica_wrapper).
@@ -153,23 +159,49 @@ class MLXQuantizedLinearWithLoRA(nn.Module):
         self.lora_b_stacked = mx.zeros((slots, self.output_size, max_lora_rank), dtype)
         self.punica_wrapper: PunicaWrapperMLX | None = None
 
+    @property
+    def weight(self) -> mx.array:
+        return self.base_layer.weight
+
+    @weight.setter
+    def weight(self, value: mx.array) -> None:
+        self.base_layer.weight = value
+
+    @property
+    def bias(self) -> mx.array:
+        return self.base_layer.bias
+
+    @bias.setter
+    def bias(self, value: mx.array) -> None:
+        self.base_layer.bias = value
+
+    @property
+    def in_features(self) -> int:
+        return self.input_size
+
+    @property
+    def out_features(self) -> int:
+        return self.output_size
+
     def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
         self.punica_wrapper = punica_wrapper
 
     def prepare_lora_weights(
         self, slot: int, lora_a: mx.array, lora_b: mx.array
     ) -> tuple[mx.array, mx.array]:
-        if lora_a.ndim != 2:
+        if lora_a.ndim != 2 or lora_b.ndim != 2:
             raise ValueError(
-                f"lora_a must be 2-D (rank, in_features); got shape {lora_a.shape}"
+                f"QLoRA weight shape mismatch for slot {slot}: A and B must be "
+                f"2-D, got A.ndim={lora_a.ndim}, B.ndim={lora_b.ndim} "
+                "(expected A=(rank, in), B=(out, rank))"
             )
         rank, in_ = int(lora_a.shape[0]), int(lora_a.shape[1])
-        out = int(lora_b.shape[0])
-        b_rank = int(lora_b.shape[1]) if lora_b.ndim == 2 else None
-        if b_rank is not None and b_rank != rank:
+        out, b_rank = int(lora_b.shape[0]), int(lora_b.shape[1])
+        if b_rank != rank:
             raise ValueError(
-                f"lora_a rank ({rank}) does not match B rank ({b_rank}); "
-                "A shape is (rank, in_features), B shape is (out_features, rank)."
+                f"QLoRA weight shape mismatch for slot {slot}: A rank {rank} "
+                f"(A=({rank},{in_})) does not match B rank {b_rank} "
+                f"(B=({out},{b_rank})); A=(rank, in), B=(out, rank)"
             )
         if (in_, out) != (self.input_size, self.output_size):
             raise ValueError(
@@ -199,7 +231,7 @@ class MLXQuantizedLinearWithLoRA(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         # Quantized base forward — runs at the layer's native precision.
-        y = self._base(x)
+        y = self.base_layer(x)
         if self.punica_wrapper is None or self.punica_wrapper.no_lora:
             return y
 
