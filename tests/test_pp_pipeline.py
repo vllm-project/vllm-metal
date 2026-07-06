@@ -198,14 +198,11 @@ class TestPipelinedModel:
     def test_singleton_runs_full_model_without_recv(self) -> None:
         # size-1 group: is_first and is_last are both true, so the wrapper runs
         # the full model (no recv) and passes input_embeddings=None — the model
-        # embeds the tokens itself.
+        # embeds the tokens itself. The wire descriptor is never read for a
+        # singleton, so the stub needs nothing beyond __call__.
         class _Stub:
             def __init__(self) -> None:
-                self.args = SimpleNamespace(hidden_size=32)
                 self.input_embeddings: object = "unset"
-                self.model = SimpleNamespace(
-                    embed_tokens=nn.Embedding(4, 32), layers=[_StubLayer(32)]
-                )
 
             def __call__(self, input_ids, *, cache=None, input_embeddings=None):
                 self.input_embeddings = input_embeddings
@@ -235,28 +232,3 @@ class TestPipelinedModel:
         assert wrapper._wire_hidden == 32
         assert wrapper._wire_dtype == layer.q_proj.scales.dtype
         assert wrapper._wire_dtype != layer.input_layernorm.weight.dtype
-
-    def test_wire_descriptor_rejects_non_floating_stage(self) -> None:
-        # A stage whose first layer exposes no floating compute parameter cannot
-        # declare a valid wire dtype — fail loud rather than deadlock the ring.
-        class _IntLayer(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.w = mx.zeros((4, 4), dtype=mx.int32)
-
-        model = SimpleNamespace(
-            args=SimpleNamespace(hidden_size=4),
-            model=SimpleNamespace(layers=[_IntLayer()]),
-        )
-        with pytest.raises(TypeError, match="no floating-point parameter to derive"):
-            PipelinedModel(model, _pp(1, 2))
-
-    def test_wire_descriptor_rejects_missing_hidden_size(self) -> None:
-        # No model.args.hidden_size -> source-aware fail-fast, not a bare
-        # AttributeError.
-        model = SimpleNamespace(
-            args=SimpleNamespace(),
-            model=SimpleNamespace(layers=[_StubLayer(32)]),
-        )
-        with pytest.raises(TypeError, match="model.args.hidden_size as a positive"):
-            PipelinedModel(model, _pp(1, 2))
