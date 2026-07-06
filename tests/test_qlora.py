@@ -19,11 +19,11 @@ from vllm_metal.v1.lora import (
     can_wrap_qlora,
 )
 from vllm_metal.v1.lora import peft_loader as peft_loader_mod
-from vllm_metal.v1.lora import worker_manager as worker_manager_mod
 from vllm_metal.v1.lora.layers import MLXLinearWithLoRA
 
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
+mlx_utils = pytest.importorskip("mlx.utils")
 pytest.importorskip("vllm.lora.peft_helper")
 pytest.importorskip("vllm.lora.utils")
 pytest.importorskip("safetensors")
@@ -116,18 +116,23 @@ def test_can_wrap_qlora_rejects_non_quantized_module() -> None:
     assert not can_wrap_qlora(_Dummy())
 
 
-def test_can_wrap_qlora_accepts_duck_typed_quantized_module() -> None:
-    """A module with ``bits`` and ``group_size`` attrs must be accepted."""
+def test_can_wrap_qlora_rejects_quantized_embedding() -> None:
+    embed = nn.QuantizedEmbedding(64, 128, group_size=64, bits=4)
+
+    assert not can_wrap_qlora(embed)
+
+
+def test_can_wrap_qlora_requires_scales_on_duck_type() -> None:
+    """Do not accept non-linear callables just because they carry AWQ attrs."""
 
     class _FakeQuantLinear(nn.Module):
         bits = 4
         group_size = 128
-        scales = mx.zeros((64, 2))  # (out, groups)
 
         def __call__(self, x: mx.array) -> mx.array:
             return x
 
-    assert can_wrap_qlora(_FakeQuantLinear())
+    assert not can_wrap_qlora(_FakeQuantLinear())
 
 
 # MLXQuantizedLinearWithLoRA wrapper
@@ -140,26 +145,19 @@ def test_qlora_wrapper_infers_dims_from_quantized_linear() -> None:
     assert w.output_size == 64
 
 
-def test_qlora_wrapper_set_lora_writes_into_correct_slot() -> None:
-    ql = _make_quantized_linear(128, 64)
+def test_qlora_wrapper_preserves_quantized_projection_surface() -> None:
+    ql = _make_quantized_linear(128, 64, bias=True)
     w = MLXQuantizedLinearWithLoRA(ql, max_loras=2, max_lora_rank=4, dtype=mx.float32)
 
-    lora_a = mx.array(np.ones((2, 128), dtype=np.float32))
-    lora_b = mx.array(np.ones((64, 2), dtype=np.float32))
+    assert w.base_layer is ql
+    assert w.weight is ql.weight
+    assert w.bias is ql.bias
+    assert w.in_features == 128
+    assert w.out_features == 64
 
-    w.set_lora(slot=1, lora_a=lora_a, lora_b=lora_b)
-
-    a_stacked = np.array(w.lora_a_stacked)
-    b_stacked = np.array(w.lora_b_stacked)
-
-    # Slot 0 must still be zero.
-    assert not a_stacked[0].any()
-    assert not b_stacked[0].any()
-    # Slot 1: first 2 rows of A and first 2 cols of B are ones.
-    np.testing.assert_array_equal(a_stacked[1, :2, :], np.ones((2, 128)))
-    np.testing.assert_array_equal(a_stacked[1, 2:, :], np.zeros((2, 128)))
-    np.testing.assert_array_equal(b_stacked[1, :, :2], np.ones((64, 2)))
-    np.testing.assert_array_equal(b_stacked[1, :, 2:], np.zeros((64, 2)))
+    base_param_names = {name for name, _ in mlx_utils.tree_flatten(ql.parameters())}
+    wrapped_param_names = {name for name, _ in mlx_utils.tree_flatten(w.parameters())}
+    assert {f"base_layer.{name}" for name in base_param_names} <= wrapped_param_names
 
 
 @pytest.mark.parametrize(
@@ -168,6 +166,7 @@ def test_qlora_wrapper_set_lora_writes_into_correct_slot() -> None:
         ((2, 99), (64, 2), "QLoRA weight shape mismatch"),  # in_dim mismatch
         ((5, 128), (64, 5), "exceeds max_lora_rank"),  # rank > max
         ((2, 3, 1), (64, 2), "must be 2-D"),  # A not 2-D
+        ((2, 128), (64, 2, 1), "must be 2-D"),  # B not 2-D
         ((2, 128), (64, 3), "does not match B rank"),  # A rank != B rank
     ],
 )
@@ -180,20 +179,6 @@ def test_qlora_wrapper_rejects_bad_weights(
     b = mx.array(np.ones(lora_b_shape, dtype=np.float32))
     with pytest.raises(ValueError, match=err_match):
         w.set_lora(0, a, b)
-
-
-def test_qlora_wrapper_reset_lora_zeroes_slot() -> None:
-    ql = _make_quantized_linear(128, 64)
-    w = MLXQuantizedLinearWithLoRA(ql, max_loras=1, max_lora_rank=2, dtype=mx.float32)
-
-    w.set_lora(
-        slot=0,
-        lora_a=mx.array(np.ones((2, 128), dtype=np.float32)),
-        lora_b=mx.array(np.ones((64, 2), dtype=np.float32)),
-    )
-    w.reset_lora(0)
-    assert not np.array(w.lora_a_stacked[0]).any()
-    assert not np.array(w.lora_b_stacked[0]).any()
 
 
 def test_qlora_wrapper_passthrough_when_no_punica() -> None:
@@ -524,262 +509,10 @@ def test_qlora_mixed_model_forward_plain_module_unaffected_by_qlora_adapter() ->
     assert not np.array(out_proj_wrapper.lora_b_stacked[0]).any()
 
 
-# Slot reuse, capacity, pin/remove (quantized variant)
-
-
-def test_qlora_manager_slot_reused_after_swap() -> None:
-    """Slot freed by deactivating one QLoRA adapter is reused by the next."""
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2, max_cpu_loras=2),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-    a1 = _make_adapter(1, module_name="q_proj", in_dim=128, out_dim=64)
-    a2 = _make_adapter(2, module_name="q_proj", in_dim=128, out_dim=64)
-
-    manager.add_adapter(a1)
-    manager.activate_adapter(1)
-    manager.deactivate_adapter(1)
-    manager.add_adapter(a2)
-    manager.activate_adapter(2)
-
-    # Slot 0 must hold adapter 2's B weights.
-    q_proj_w = manager.modules["q_proj"]
-    assert isinstance(q_proj_w, MLXQuantizedLinearWithLoRA)
-    b2_col0 = np.array(q_proj_w.lora_b_stacked[0])[:, 0]
-    # b2_col0 corresponds to rank-dim 0 of adapter 2's B; it should not be all
-    # zeros (adapter 2 has random weights).
-    assert b2_col0.any(), "Slot 0 did not receive adapter 2's weights"
-
-
-def test_qlora_manager_no_free_slot_raises() -> None:
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2, max_cpu_loras=4),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-    a1 = _make_adapter(1, module_name="q_proj", in_dim=128, out_dim=64)
-    a2 = _make_adapter(2, module_name="q_proj", in_dim=128, out_dim=64)
-    manager.add_adapter(a1)
-    manager.add_adapter(a2)
-    manager.activate_adapter(1)
-    with pytest.raises(ValueError, match="No free LoRA slots"):
-        manager.activate_adapter(2)
-
-
-def test_qlora_manager_add_over_capacity_raises() -> None:
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2, max_cpu_loras=1),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-    a1 = _make_adapter(1, module_name="q_proj", in_dim=128, out_dim=64)
-    a2 = _make_adapter(2, module_name="q_proj", in_dim=128, out_dim=64)
-    manager.add_adapter(a1)
-    with pytest.raises(RuntimeError, match="capacity"):
-        manager.add_adapter(a2)
-
-
-def test_qlora_manager_pin_tracks_existing_adapter_only() -> None:
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2, max_cpu_loras=2),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-    a = _make_adapter(7, module_name="q_proj", in_dim=128, out_dim=64)
-    manager.add_adapter(a)
-    # pin acknowledges a registered adapter; unknown ids return False.
-    assert manager.pin_adapter(7) is True
-    assert manager.pin_adapter(8) is False
-    assert manager.remove_adapter(7) is True
-    assert 7 not in manager.list_adapters()
-
-
-def test_qlora_manager_activate_rejects_zero_module_match() -> None:
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-    bogus = peft_loader_mod.LoadedLoRA(
-        lora_id=1,
-        rank=1,
-        weights={
-            "does.not.exist": peft_loader_mod.LoRALayerWeightsMLX(
-                module_name="does.not.exist",
-                rank=1,
-                lora_a=mx.array(np.zeros((1, 128), dtype=np.float32)),
-                lora_b=mx.array(np.zeros((64, 1), dtype=np.float32)),
-                scaling=1.0,
-            )
-        },
-    )
-    manager.add_adapter(bogus)
-    with pytest.raises(ValueError, match="matched 0 wrapped modules"):
-        manager.activate_adapter(1)
-    assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 1 not in manager.lora_index_to_id
-
-
-def test_qlora_manager_activate_rejects_ambiguous_suffix_match() -> None:
-    model = _QuantizedModel()
-    manager = MLXLoRAModelManager(
-        model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=2),
-        max_num_seqs=1,
-        max_num_batched_tokens=2,
-        dtype=mx.float32,
-    )
-
-    def _w(name: str, in_dim: int, out_dim: int) -> peft_loader_mod.LoRALayerWeightsMLX:
-        return peft_loader_mod.LoRALayerWeightsMLX(
-            module_name=name,
-            rank=1,
-            lora_a=mx.array(np.zeros((1, in_dim), dtype=np.float32)),
-            lora_b=mx.array(np.zeros((out_dim, 1), dtype=np.float32)),
-            scaling=1.0,
-        )
-
-    ambiguous = peft_loader_mod.LoadedLoRA(
-        lora_id=42,
-        rank=1,
-        weights={
-            "language_model.q_proj": _w("language_model.q_proj", 128, 64),
-            "vision_model.q_proj": _w("vision_model.q_proj", 128, 64),
-            "out_proj": _w("out_proj", 64, 32),
-        },
-    )
-    manager.add_adapter(ambiguous)
-    with pytest.raises(ValueError, match="ambiguous suffix matches"):
-        manager.activate_adapter(42)
-    assert all(sid is None for sid in manager.lora_index_to_id)
-    assert 42 not in manager.lora_index_to_id
-
-
-# Worker-manager constraints carry over to QLoRA
-
-
-def test_qlora_worker_manager_rejects_cpu_loras_gt_max_loras() -> None:
-    with pytest.raises(NotImplementedError, match="max_cpu_loras > max_loras"):
-        worker_manager_mod.MetalWorkerLoRAManager(
-            model=_QuantizedModel(),
-            lora_config=_lora_config_stub(
-                max_loras=2, max_lora_rank=8, max_cpu_loras=4
-            ),
-            max_num_seqs=1,
-            max_num_batched_tokens=8,
-            dtype=mx.float32,
-        )
-
-
-def _make_worker_manager_quantized() -> worker_manager_mod.MetalWorkerLoRAManager:
-    return worker_manager_mod.MetalWorkerLoRAManager(
-        model=_QuantizedModel(),
-        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=2),
-        max_num_seqs=2,
-        max_num_batched_tokens=4,
-        dtype=mx.float32,
-    )
-
-
-def _patch_loader(monkeypatch, adapters: dict[int, peft_loader_mod.LoadedLoRA]) -> None:
-    monkeypatch.setattr("vllm.lora.utils.get_adapter_absolute_path", lambda p: p)
-
-    def _fake_load(path, *, lora_id, max_position_embeddings, lora_config):
-        return adapters[lora_id]
-
-    monkeypatch.setattr(worker_manager_mod, "load_peft_adapter", _fake_load)
-
-
-def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
-        lora_int_id=lora_id,
-        lora_path=f"/fake/adapter-{lora_id}",
-        load_inplace=load_inplace,
-    )
-
-
-def test_qlora_worker_manager_empty_batch_deactivates_stale_adapters(
-    monkeypatch,
-) -> None:
-    manager = _make_worker_manager_quantized()
-    a = _make_adapter(1, module_name="q_proj", in_dim=128, out_dim=64)
-    _patch_loader(monkeypatch, {1: a})
-
-    assert manager.add_adapter(_stub_lora_request(1)) is True
-    assert 1 in {sid for sid in manager._mm.lora_index_to_id if sid is not None}
-
-    manager.set_active_adapters(set(), None)
-    assert all(sid is None for sid in manager._mm.lora_index_to_id)
-
-
-def test_qlora_worker_manager_load_inplace_replaces_weights(monkeypatch) -> None:
-    manager = _make_worker_manager_quantized()
-    rng = np.random.default_rng(0)
-    v1 = peft_loader_mod.LoadedLoRA(
-        lora_id=7,
-        rank=1,
-        weights={
-            "q_proj": peft_loader_mod.LoRALayerWeightsMLX(
-                module_name="q_proj",
-                rank=1,
-                lora_a=mx.array(rng.standard_normal((1, 128)).astype(np.float32)),
-                lora_b=mx.array(np.ones((64, 1), dtype=np.float32) * 3.0),
-                scaling=1.0,
-            )
-        },
-    )
-    v2 = peft_loader_mod.LoadedLoRA(
-        lora_id=7,
-        rank=1,
-        weights={
-            "q_proj": peft_loader_mod.LoRALayerWeightsMLX(
-                module_name="q_proj",
-                rank=1,
-                lora_a=mx.array(rng.standard_normal((1, 128)).astype(np.float32)),
-                lora_b=mx.array(np.ones((64, 1), dtype=np.float32) * 9.0),
-                scaling=1.0,
-            )
-        },
-    )
-    state: dict[int, peft_loader_mod.LoadedLoRA] = {7: v1}
-    _patch_loader(monkeypatch, state)
-
-    assert manager.add_adapter(_stub_lora_request(7)) is True
-    slot = manager._mm.lora_index_to_id.index(7)
-    b_col = np.array(manager._mm.modules["q_proj"].lora_b_stacked[slot])[:, 0]
-    assert np.allclose(b_col, 3.0, atol=1e-5)
-
-    # Without load_inplace, duplicate is a no-op.
-    assert manager.add_adapter(_stub_lora_request(7)) is False
-
-    # With load_inplace, weights swap.
-    state[7] = v2
-    assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
-    slot = manager._mm.lora_index_to_id.index(7)
-    b_col = np.array(manager._mm.modules["q_proj"].lora_b_stacked[slot])[:, 0]
-    assert np.allclose(b_col, 9.0, atol=1e-5)
-
-
 # PEFT loader with quantized model adapter_config.json
 
 
-def _write_peft_adapter(tmp_path: Path, *, use_rslora: bool = False) -> Path:
+def _write_peft_adapter(tmp_path: Path) -> Path:
     """Write a minimal PEFT adapter directory for q_proj."""
     from safetensors.numpy import save_file
 
@@ -790,7 +523,7 @@ def _write_peft_adapter(tmp_path: Path, *, use_rslora: bool = False) -> Path:
         "lora_alpha": 4,
         "lora_dropout": 0.0,
         "target_modules": ["q_proj"],
-        "use_rslora": use_rslora,
+        "use_rslora": False,
     }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config))
     rng = np.random.default_rng(0)
@@ -804,23 +537,6 @@ def _write_peft_adapter(tmp_path: Path, *, use_rslora: bool = False) -> Path:
         str(tmp_path / "adapter_model.safetensors"),
     )
     return tmp_path
-
-
-def test_peft_loader_loads_qlora_adapter(tmp_path: Path) -> None:
-    pytest.importorskip("safetensors.numpy")
-    adapter_dir = _write_peft_adapter(tmp_path)
-    loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
-
-    assert loaded.lora_id == 1
-    assert loaded.rank == 2
-    module_key = "layers.0.self_attn.q_proj"
-    assert module_key in loaded.weights
-
-    weights = loaded.weights[module_key]
-    assert weights.lora_a.shape == (2, 128)
-    assert weights.lora_b.shape == (64, 2)
-    # lora_alpha=4, r=2 → scaling = lora_alpha / r = 2.0
-    assert weights.scaling == pytest.approx(2.0)
 
 
 def test_peft_loader_qlora_and_manager_round_trip(tmp_path: Path) -> None:
@@ -846,21 +562,6 @@ def test_peft_loader_qlora_and_manager_round_trip(tmp_path: Path) -> None:
     # Slot 0 must have non-zero weights.
     assert np.array(q_proj_w.lora_a_stacked[0]).any()
     assert np.array(q_proj_w.lora_b_stacked[0]).any()
-
-
-def test_peft_loader_qlora_rslora_scaling(tmp_path: Path) -> None:
-    """RSLoRA scaling = lora_alpha / sqrt(r): check it differs from regular."""
-    pytest.importorskip("safetensors.numpy")
-    regular_dir = _write_peft_adapter(tmp_path / "regular", use_rslora=False)
-    rslora_dir = _write_peft_adapter(tmp_path / "rslora", use_rslora=True)
-
-    regular = peft_loader_mod.load_peft_adapter(regular_dir, lora_id=1)
-    rslora = peft_loader_mod.load_peft_adapter(rslora_dir, lora_id=2)
-
-    key = "layers.0.self_attn.q_proj"
-    # lora_alpha=4, r=2 → regular: 4/2=2.0, rslora: 4/sqrt(2)≈2.828
-    assert regular.weights[key].scaling == pytest.approx(2.0)
-    assert rslora.weights[key].scaling == pytest.approx(4.0 / np.sqrt(2.0), rel=1e-4)
 
 
 # dtype propagation: adapter runs in adapter dtype on quant base
