@@ -251,6 +251,35 @@ class GGUFMLXQuantizedTensor:
         )
         return rows.astype(output_dtype)
 
+    def permute_rows(self, index: mx.array) -> GGUFMLXQuantizedTensor:
+        """Return a copy with output rows reordered by ``index`` (load-time).
+
+        ``index`` must be a permutation of ``range(out_features)``. The packed
+        ``qweight`` and its affine ``scales``/``biases`` all carry output rows
+        on axis 0 and quantize along the (untouched) input axis, so gathering
+        the three together stays bit-exact to a dequantize-permute-requantize
+        and keeps the tensor MLX-native quantized. Used to undo llama.cpp's
+        RoPE weight layout on q/k projections at load time.
+        """
+        out_features = self.out_features
+        if index.ndim != 1 or index.shape[0] != out_features:
+            raise ValueError(
+                f"permute_rows index must be 1-D of length {out_features} "
+                f"(out_features), got shape {tuple(index.shape)}"
+            )
+        ordered = mx.sort(index)
+        if not bool(mx.all(ordered == mx.arange(out_features)).item()):
+            raise ValueError(
+                "permute_rows index must be a permutation of "
+                f"range({out_features}); got duplicate or out-of-range values"
+            )
+        return GGUFMLXQuantizedTensor(
+            qweight=self.qweight[index],
+            scales=self.scales[index],
+            biases=self.biases[index],
+            qweight_type=self.qweight_type,
+        )
+
     def eval_arrays(self) -> None:
         """Materialize the packed arrays backing this quantized tensor."""
         mx.eval(self.qweight, self.scales, self.biases)
