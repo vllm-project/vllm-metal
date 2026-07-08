@@ -19,6 +19,7 @@ import pytest
 gguf = pytest.importorskip("gguf")
 
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
+from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
 
 QT = gguf.GGMLQuantizationType
@@ -308,6 +309,37 @@ def test_loads_dense_llama_installs_wrappers(tmp_path, quant_type):
     out = model(mx.array([[1, 2, 3]]))
     mx.eval(out)
     assert out.shape == (1, 3, 256)
+
+
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
+    # The main quantized-path behavior: installed q/k GGUFLinear tensors carry the
+    # RoPE-un-permuted quantized weight, not the raw (llama.cpp-permuted) one.
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, "llama", has_qk_norm=False, quant_type=quant_type
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    arrays = mx.load(gguf_path)
+    cfg, d = _tiny_config("llama"), _dims(_tiny_config("llama"))
+    raw_q = GGUFMLXQuantizedTensor.from_mx_load(
+        arrays, "blk.0.attn_q.weight", quant_type
+    )
+    raw_k = GGUFMLXQuantizedTensor.from_mx_load(
+        arrays, "blk.0.attn_k.weight", quant_type
+    )
+    exp_q = raw_q.permute_rows(_rope_inv_index(d["qd"], cfg["num_attention_heads"]))
+    exp_k = raw_k.permute_rows(_rope_inv_index(d["kvd"], cfg["num_key_value_heads"]))
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    got_q = model.model.layers[0].self_attn.q_proj.tensor
+    got_k = model.model.layers[0].self_attn.k_proj.tensor
+    assert bool(mx.array_equal(got_q.qweight, exp_q.qweight).item())
+    assert bool(mx.array_equal(got_k.qweight, exp_k.qweight).item())
+    assert not bool(mx.array_equal(got_q.qweight, raw_q.qweight).item())
+    assert not bool(mx.array_equal(got_k.qweight, raw_k.qweight).item())
 
 
 def test_untied_llama_installs_lm_head(tmp_path):
