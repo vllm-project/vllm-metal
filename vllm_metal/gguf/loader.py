@@ -201,25 +201,27 @@ class GGUFModelLoader:
 
             # llama.cpp permutes q/k rows for its RoPE layout regardless of qtype;
             # the adapter returns the row index to undo it (None for every other
-            # tensor / arch), applied identically to the quantized or plain weight.
+            # tensor / arch). GGUF is a file boundary: validate the source tensor
+            # shape BEFORE permuting, so a malformed row count fails fast instead
+            # of being masked into an expected shape by the gather.
             permute = adapter.rope_permute_index(name)
 
             if suffix == _BIAS_SUFFIX:
-                bias = arrays[name][permute] if permute is not None else arrays[name]
+                bias = arrays[name]
                 self._validate_plain_shape(model, translated, bias, name)
-                biases[module_path] = bias
+                biases[module_path] = bias[permute] if permute is not None else bias
             elif tensor.tensor_type in MLX_NATIVE_GGUF_TYPES:
                 qt = GGUFMLXQuantizedTensor.from_mx_load(
                     arrays, name, tensor.tensor_type
                 )
-                if permute is not None:
-                    qt = qt.permute_rows(permute)
                 self._validate_quant_shape(module_path, current, qt, name)
-                quant[module_path] = qt
+                quant[module_path] = (
+                    qt.permute_rows(permute) if permute is not None else qt
+                )
             else:  # plain F32/F16/BF16
-                weight = arrays[name][permute] if permute is not None else arrays[name]
+                weight = arrays[name]
                 self._validate_plain_shape(model, translated, weight, name)
-                plain[translated] = weight
+                plain[translated] = weight[permute] if permute is not None else weight
 
         # A bias whose weight is plain (not quantized) loads through the normal
         # path; only biases paired with a quant weight go to GGUFLinear.
