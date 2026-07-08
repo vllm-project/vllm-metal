@@ -19,6 +19,7 @@ import pytest
 gguf = pytest.importorskip("gguf")
 
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
+from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
 
 QT = gguf.GGMLQuantizationType
@@ -249,6 +250,288 @@ def test_untied_qwen2_attaches_bias_and_installs_lm_head(tmp_path):
     out = model(mx.array([[1, 2, 3]]))
     mx.eval(out)
     assert out.shape[-1] == 256
+
+
+def _write_minimal_tokenizer(config_dir: str, vocab_size: int) -> None:
+    """Write a tiny WordLevel fast tokenizer into a synthetic config dir.
+
+    transformers builds a llama tokenizer through ``LlamaTokenizer``, which
+    needs real tokenizer files (unlike qwen, which constructs from config
+    alone), so the llama fixtures must ship a tokenizer to reach ``load()``.
+    """
+
+    def _special(i: int, content: str) -> dict:
+        return {
+            "id": i,
+            "content": content,
+            "special": True,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+        }
+
+    vocab = {"<unk>": 0, "<s>": 1, "</s>": 2}
+    vocab.update({f"t{i}": i for i in range(3, vocab_size)})
+    tokenizer = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [_special(0, "<unk>"), _special(1, "<s>"), _special(2, "</s>")],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    }
+    dir_path = Path(config_dir)
+    (dir_path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (dir_path / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "PreTrainedTokenizerFast"})
+    )
+
+
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+def test_loads_dense_llama_installs_wrappers(tmp_path, quant_type):
+    # llama: separate q/k/v, no q/k norm, no attention bias, tied embeddings.
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, "llama", has_qk_norm=False, quant_type=quant_type
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
+    hist = _gguf_module_histogram(model)
+    assert hist.get("GGUFEmbedding") == 1
+    assert hist.get("GGUFLinear") == 2 * 7
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert out.shape == (1, 3, 256)
+
+
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
+    # The main quantized-path behavior: installed q/k GGUFLinear tensors carry the
+    # RoPE-un-permuted quantized weight, not the raw (llama.cpp-permuted) one.
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, "llama", has_qk_norm=False, quant_type=quant_type
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    arrays = mx.load(gguf_path)
+    cfg, d = _tiny_config("llama"), _dims(_tiny_config("llama"))
+    raw_q = GGUFMLXQuantizedTensor.from_mx_load(
+        arrays, "blk.0.attn_q.weight", quant_type
+    )
+    raw_k = GGUFMLXQuantizedTensor.from_mx_load(
+        arrays, "blk.0.attn_k.weight", quant_type
+    )
+    exp_q = raw_q.permute_rows(_rope_inv_index(d["qd"], cfg["num_attention_heads"]))
+    exp_k = raw_k.permute_rows(_rope_inv_index(d["kvd"], cfg["num_key_value_heads"]))
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    got_q = model.model.layers[0].self_attn.q_proj.tensor
+    got_k = model.model.layers[0].self_attn.k_proj.tensor
+    assert bool(mx.array_equal(got_q.qweight, exp_q.qweight).item())
+    assert bool(mx.array_equal(got_k.qweight, exp_k.qweight).item())
+    assert not bool(mx.array_equal(got_q.qweight, raw_q.qweight).item())
+    assert not bool(mx.array_equal(got_k.qweight, raw_k.qweight).item())
+
+
+def test_untied_llama_installs_lm_head(tmp_path):
+    # The 8B-shaped path: untied output, no biases (llama attention_bias=False).
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "llama",
+        config_overrides={"tie_word_embeddings": False},
+        has_qk_norm=False,
+        with_bias=False,
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
+    q_proj = model.model.layers[0].self_attn.q_proj
+    assert isinstance(q_proj, GGUFLinear)
+    assert "bias" not in q_proj  # llama q/k/v are bias-free
+    assert isinstance(model.lm_head, GGUFLinear)  # untied output -> real lm_head
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert out.shape[-1] == 256
+
+
+def test_llama_skips_tie_redundant_output_when_config_omits_tie_flag(tmp_path):
+    # Omitted-tie branch for the new arch: the loader must read the resolved
+    # model.args tie flag (llama default True), not a config.get default.
+    d = _dims(_tiny_config("llama"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "llama",
+        has_qk_norm=False,
+        inject={"output.weight": ("q", (d["vocab"], d["h"]))},
+    )
+    config_path = Path(cfg_dir) / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("tie_word_embeddings")
+    config_path.write_text(json.dumps(config))
+    _write_minimal_tokenizer(cfg_dir, 256)
+
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=mx.float32,
+    ).load()
+
+    assert not hasattr(model, "lm_head")
+    assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
+
+
+@pytest.mark.parametrize(
+    "moe_tensor",
+    ["blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_exps.weight"],
+)
+def test_rejects_out_of_scope_moe_tensor_under_llama_arch(tmp_path, moe_tensor):
+    # Guard-widening regression: admitting "llama" makes llama-family MoE files
+    # (Mixtral et al., general.architecture="llama") reachable. The router
+    # (ffn_gate_inp) and experts (ffn_gate_exps) must both fail fast at preflight,
+    # not slip through to an "unmapped tensor" error deep in the load.
+    d = _dims(_tiny_config("llama"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "llama",
+        has_qk_norm=False,
+        inject={moe_tensor: ("f", (2, d["h"]))},
+    )
+    with pytest.raises(GGUFLoadError, match="Out-of-scope GGUF tensor"):
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
+
+
+def _rope_inv_index(out_features, n_head):
+    # Independent reference for llama.cpp's inverse q/k RoPE row permutation.
+    return (
+        mx.arange(out_features)
+        .reshape(n_head, out_features // n_head // 2, 2)
+        .swapaxes(1, 2)
+        .reshape(out_features)
+    )
+
+
+def _plain_qk_fixture(tmp_path, model_type, *, has_qk_norm=False):
+    # A dense fixture whose attn_q/attn_k are written PLAIN (F32), to exercise
+    # the plain-weight branch of _partition (llama.cpp permutes q/k regardless
+    # of qtype, so the plain path must un-permute too).
+    d = _dims(_tiny_config(model_type))
+    drop = {f"blk.{i}.attn_{p}.weight" for i in range(d["layers"]) for p in ("q", "k")}
+    inject = {}
+    for i in range(d["layers"]):
+        inject[f"blk.{i}.attn_q.weight"] = ("f", (d["qd"], d["h"]))
+        inject[f"blk.{i}.attn_k.weight"] = ("f", (d["kvd"], d["h"]))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, model_type, has_qk_norm=has_qk_norm, drop=drop, inject=inject
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    return gguf_path, cfg_dir, d
+
+
+def test_plain_llama_qk_are_row_unpermuted(tmp_path):
+    gguf_path, cfg_dir, d = _plain_qk_fixture(tmp_path, "llama")
+    raw_q = mx.load(gguf_path)["blk.0.attn_q.weight"]
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    cfg = _tiny_config("llama")
+    n_head, n_kv = cfg["num_attention_heads"], cfg["num_key_value_heads"]
+    raw_k = mx.load(gguf_path)["blk.0.attn_k.weight"]
+    got_q = model.model.layers[0].self_attn.q_proj.weight
+    got_k = model.model.layers[0].self_attn.k_proj.weight
+    assert bool(mx.array_equal(got_q, raw_q[_rope_inv_index(d["qd"], n_head)]).item())
+    assert bool(mx.array_equal(got_k, raw_k[_rope_inv_index(d["kvd"], n_kv)]).item())
+    # A non-trivial reorder actually happened (not identity), for q and k (GQA).
+    assert not bool(mx.array_equal(got_q, raw_q).item())
+    assert not bool(mx.array_equal(got_k, raw_k).item())
+
+
+def test_plain_qwen_qk_are_not_permuted(tmp_path):
+    # qwen uses the HF RoPE layout: q/k must load byte-identical (no permute).
+    gguf_path, cfg_dir, _ = _plain_qk_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    raw_q = mx.load(gguf_path)["blk.0.attn_q.weight"]
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    got = model.model.layers[0].self_attn.q_proj.weight
+    assert bool(mx.array_equal(got, raw_q).item())
+
+
+def test_llama_loads_when_config_omits_head_dim(tmp_path):
+    # head_dim is resolved onto the built q/k projections, not model.args, so the
+    # permute index must read out_features off the built object (#449 omitted-
+    # default). Every other fixture sets head_dim; this pops it.
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "llama", has_qk_norm=False)
+    _write_minimal_tokenizer(cfg_dir, 256)
+    config_path = Path(cfg_dir) / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("head_dim")  # derived head_dim == hidden_size // heads == 16
+    config_path.write_text(json.dumps(config))
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    assert _gguf_module_histogram(model).get("GGUFLinear") == 2 * 7
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert out.shape == (1, 3, 256)
+
+
+def test_llama_qk_bias_is_row_unpermuted(tmp_path):
+    # llama.cpp permutes q/k bias with the same RoPE index as the weight; a
+    # llama with attention_bias must un-permute the bias too, or attention is
+    # silently wrong (permuted weight + un-permuted bias). v bias is untouched.
+    d = _dims(_tiny_config("llama"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "llama",
+        config_overrides={"attention_bias": True},
+        has_qk_norm=False,
+        with_bias=True,
+        # llama attention_bias also biases o_proj; _dense_tensor_specs only writes
+        # q/k/v biases, so supply the output bias the built model expects.
+        inject={
+            f"blk.{i}.attn_output.bias": ("f", (d["h"],)) for i in range(d["layers"])
+        },
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    arrays = mx.load(gguf_path)
+    raw_q_bias, raw_v_bias = arrays["blk.0.attn_q.bias"], arrays["blk.0.attn_v.bias"]
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    attn = model.model.layers[0].self_attn
+    n_head = _tiny_config("llama")["num_attention_heads"]
+    assert bool(
+        mx.array_equal(
+            attn.q_proj.bias, raw_q_bias[_rope_inv_index(d["qd"], n_head)]
+        ).item()
+    )
+    assert not bool(mx.array_equal(attn.q_proj.bias, raw_q_bias).item())
+    # v bias is not RoPE'd: byte-identical.
+    assert bool(mx.array_equal(attn.v_proj.bias, raw_v_bias).item())
 
 
 def test_completeness_fails_on_dropped_norm(tmp_path):

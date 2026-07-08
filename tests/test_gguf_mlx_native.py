@@ -500,3 +500,51 @@ def test_real_generate_matches_dense():
     assert candidate == reference
     assert calls["linear"] > 0
     assert calls["embedding"] > 0
+
+
+# === permute_rows (llama RoPE q/k un-permutation mechanism) ===
+
+
+@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
+def test_permute_rows_matches_dequant_then_gather(tmp_path, qtype):
+    # Reordering the packed qweight + scales + biases together must be bit-exact
+    # to dequantizing then gathering the same rows.
+    qt, oracle = _make_tensor(tmp_path, qtype, shape=(64, 128))
+    index = mx.array(np.random.default_rng(1).permutation(64))
+
+    permuted = qt.permute_rows(index)
+
+    assert permuted.qweight_type == qt.qweight_type
+    assert permuted.logical_shape == qt.logical_shape
+    x = mx.array(np.random.default_rng(2).standard_normal((3, 128)), dtype=mx.float32)
+    got = permuted.matmul(x)
+    want = x @ mx.array(oracle)[index].T
+    assert bool(mx.allclose(got, want, atol=1e-3).item())
+
+
+@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
+def test_permute_rows_round_trips_via_inverse(tmp_path, qtype):
+    # The index is not an involution for head_dim > 4, so the inverse is
+    # argsort(index), not the index itself.
+    qt, oracle = _make_tensor(tmp_path, qtype, shape=(64, 128))
+    index = mx.array(np.random.default_rng(3).permutation(64))
+
+    restored = qt.permute_rows(index).permute_rows(mx.argsort(index))
+
+    x = mx.array(np.random.default_rng(4).standard_normal((2, 128)), dtype=mx.float32)
+    assert bool(mx.allclose(restored.matmul(x), qt.matmul(x), atol=1e-4).item())
+
+
+def test_permute_rows_rejects_non_permutation(tmp_path):
+    qt, _ = _make_tensor(tmp_path, GGMLQuantizationType.Q8_0, shape=(64, 128))
+    with pytest.raises(ValueError) as short:
+        qt.permute_rows(mx.arange(32))
+    assert str(short.value) == (
+        "permute_rows index must be 1-D of length 64 (out_features), got shape (32,)"
+    )
+    with pytest.raises(ValueError) as dup:
+        qt.permute_rows(mx.zeros(64, dtype=mx.int32))  # all-zero: duplicates
+    assert str(dup.value) == (
+        "permute_rows index must be a permutation of range(64); "
+        "got duplicate or out-of-range values"
+    )
