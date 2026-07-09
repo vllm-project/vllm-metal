@@ -94,6 +94,32 @@ def _write_gemma4_assistant_config(path) -> None:
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
 
+def _write_glm4_moe_lite_mtp_config(path) -> None:
+    config = {
+        "architectures": ["Glm4MoeLiteMTPModel"],
+        "model_type": "glm4_moe_lite_mtp",
+        "num_hidden_layers": 0,
+        "num_nextn_predict_layers": 1,
+        "n_predict": 1,
+        "hidden_size": 256,
+        "vocab_size": 1024,
+        "kv_lora_rank": 64,
+        "qk_rope_head_dim": 16,
+        "qk_nope_head_dim": 32,
+        "v_head_dim": 32,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 128,
+        "intermediate_size": 512,
+        "first_k_dense_replace": 1,
+        "rope_theta": 1000000.0,
+        "rms_norm_eps": 1e-5,
+    }
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
 class _ByteLevelBackend:
     decoder = "ByteLevel(add_prefix_space=False, trim_offsets=False, use_regex=False)"
 
@@ -282,10 +308,111 @@ class TestGemma4MTPConfigCompatPatch:
             "_patch_mlx_lm_gemma4_kv_shared_sanitize",
             lambda: calls.append("gemma4_kv"),
         )
+        # Stub the GLM MTP config patch too, so this unrelated test does not run
+        # the real one (which would register glm4_moe_lite_mtp with AutoConfig).
+        monkeypatch.setattr(
+            compat,
+            "_patch_vllm_glm4_moe_lite_mtp_config_loading",
+            lambda: calls.append("glm4_mtp"),
+        )
 
         compat.apply_compat_patches()
 
-        assert calls == ["bytelevel", "qwen35_fp8", "gemma4_kv"]
+        assert calls == ["glm4_mtp", "bytelevel", "qwen35_fp8", "gemma4_kv"]
+
+
+class TestGlm4MoeLiteMTPConfigCompatPatch:
+    def test_transformers_autoconfig_loads_raw_glm4_moe_lite_mtp_config(
+        self,
+        tmp_path,
+    ) -> None:
+        from transformers import AutoConfig
+
+        _write_glm4_moe_lite_mtp_config(tmp_path)
+        compat._patch_vllm_glm4_moe_lite_mtp_config_loading()
+
+        config = AutoConfig.from_pretrained(tmp_path)
+
+        assert config.model_type == "glm4_moe_lite_mtp"
+        assert config.architectures == ["Glm4MoeLiteMTPModel"]
+        assert config.num_hidden_layers == 0
+        assert config.n_predict == 1
+        assert config.num_nextn_predict_layers == 1
+
+    def test_vllm_get_config_applies_existing_glm4_moe_lite_mtp_override(
+        self,
+        tmp_path,
+    ) -> None:
+        from vllm.config.speculative import SpeculativeConfig
+        from vllm.transformers_utils.config import get_config
+
+        _write_glm4_moe_lite_mtp_config(tmp_path)
+        compat._patch_vllm_glm4_moe_lite_mtp_config_loading()
+
+        config = get_config(
+            tmp_path,
+            trust_remote_code=False,
+            hf_overrides_fn=SpeculativeConfig.hf_config_override,
+        )
+
+        # The extracted head config is already the MTP wrapper form; vLLM's
+        # override passes it through (num_hidden_layers=0, n_predict=1).
+        assert config.model_type == "glm4_moe_lite_mtp"
+        assert config.architectures == ["Glm4MoeLiteMTPModel"]
+        assert config.num_hidden_layers == 0
+        assert config.n_predict == 1
+
+    def test_missing_glm4_config_module_does_not_stop_other_patches(
+        self,
+        monkeypatch,
+    ) -> None:
+        calls: list[str] = []
+
+        monkeypatch.setattr(compat, "_APPLIED", False)
+        monkeypatch.setattr(
+            compat,
+            "_transformers_knows_glm4_moe_lite_mtp",
+            lambda _auto_config: False,
+        )
+
+        def _raise_missing_glm4_config():
+            raise ModuleNotFoundError(
+                "No module named 'transformers.models.glm4_moe_lite'"
+            )
+
+        monkeypatch.setattr(
+            compat,
+            "_glm4_moe_lite_mtp_config_class",
+            _raise_missing_glm4_config,
+        )
+        # Stub the surrounding patches so only real-vs-caught behavior of the
+        # GLM config patch is exercised.
+        monkeypatch.setattr(
+            compat,
+            "_patch_vllm_gemma4_mtp_config_loading",
+            lambda: calls.append("gemma4_mtp"),
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_vllm_bytelevel_tokenizer_loading",
+            lambda: calls.append("bytelevel"),
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_lm_qwen35_fp8_sanitize",
+            lambda: calls.append("qwen35_fp8"),
+        )
+        monkeypatch.setattr(
+            compat,
+            "_patch_mlx_lm_gemma4_kv_shared_sanitize",
+            lambda: calls.append("gemma4_kv"),
+        )
+
+        # The GLM patch swallows the missing-module import error and returns, so
+        # every other patch still runs.
+        compat.apply_compat_patches()
+
+        assert calls == ["gemma4_mtp", "bytelevel", "qwen35_fp8", "gemma4_kv"]
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):

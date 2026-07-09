@@ -28,6 +28,7 @@ def apply_compat_patches() -> None:
         return
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
+    _patch_vllm_glm4_moe_lite_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
@@ -219,6 +220,65 @@ def _patch_vllm_gemma4_mtp_config_loading() -> None:
     # override runs.
     AutoConfig.register("gemma4_assistant", config_cls, exist_ok=True)
     logger.debug("Registered Gemma4 assistant config compatibility")
+
+
+def _glm4_moe_lite_mtp_config_class() -> type[Any]:
+    """Return a minimal Transformers config for the GLM-4.7-Flash nextn head."""
+    from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import (
+        Glm4MoeLiteConfig,
+    )
+
+    class Glm4MoeLiteMTPCompatConfig(Glm4MoeLiteConfig):
+        model_type = "glm4_moe_lite_mtp"
+
+    return Glm4MoeLiteMTPCompatConfig
+
+
+def _transformers_knows_glm4_moe_lite_mtp(auto_config: Any) -> bool:
+    try:
+        auto_config.for_model("glm4_moe_lite_mtp")
+    except ValueError:
+        return False
+    return True
+
+
+def _patch_vllm_glm4_moe_lite_mtp_config_loading() -> None:
+    """Register the GLM-4.7-Flash ``glm4_moe_lite_mtp`` draft config for the pin.
+
+    vLLM 0.24 normalizes a ``Glm4MoeLiteForCausalLM`` draft config into the
+    ``glm4_moe_lite_mtp`` MTP wrapper (``num_hidden_layers=0``,
+    ``n_predict=num_nextn_predict_layers``), but the pinned Transformers release
+    has no ``glm4_moe_lite_mtp`` AutoConfig entry, so parsing the extracted head
+    checkpoint's ``model_type`` fails before that override runs. Keep the shim to
+    config loading only; model construction stays owned by vllm-metal's native
+    MTP head modules. Mirrors ``_patch_vllm_gemma4_mtp_config_loading``.
+    """
+    try:
+        from transformers import AutoConfig
+    except ImportError as exc:
+        logger.warning(
+            "Could not install GLM4 MoE-lite MTP config compatibility patch: %s",
+            exc,
+        )
+        return
+
+    if _transformers_knows_glm4_moe_lite_mtp(AutoConfig):
+        return
+
+    try:
+        config_cls = _glm4_moe_lite_mtp_config_class()
+    except ImportError as exc:
+        logger.warning(
+            "Could not install GLM4 MoE-lite MTP config compatibility patch "
+            "because Glm4MoeLite config classes are unavailable: %s",
+            exc,
+        )
+        return
+
+    # TODO: remove once the supported dependency stack parses raw
+    # ``model_type=glm4_moe_lite_mtp`` configs before vLLM's MTP override runs.
+    AutoConfig.register("glm4_moe_lite_mtp", config_cls, exist_ok=True)
+    logger.debug("Registered GLM4 MoE-lite MTP config compatibility")
 
 
 def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:
