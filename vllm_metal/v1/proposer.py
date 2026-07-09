@@ -95,14 +95,10 @@ class Gemma4MTPProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # Delegate to the controller (single source of truth, method-keyed):
-        # the assistant consumes the previous target step's hidden states.
-        runner = self._runner
-        return runner._spec_decode_controller.needs_target_hidden_states(
-            decode_segments,
-            has_final_prefill=has_final_prefill,
-            speculative_config=runner.vllm_config.speculative_config,
-        )
+        # The assistant consumes the previous target step's hidden states for
+        # decode and final-prefill rows; intermediate prefill chunks never
+        # sample, so they cannot seed a draft.
+        return bool(decode_segments) or has_final_prefill
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         if ctx.num_speculative_tokens <= 0:

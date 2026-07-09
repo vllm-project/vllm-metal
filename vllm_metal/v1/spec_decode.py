@@ -12,10 +12,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
-from vllm_metal.v1.gemma4_mtp import (
-    Gemma4MTPAssistantSource,
-    Gemma4MTPDraftSeed,
-)
+from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 
 if TYPE_CHECKING:
@@ -210,23 +207,6 @@ class SpeculativeDecodeController:
             start_row += segment.num_query_tokens
 
         return tuple(segments)
-
-    def needs_target_hidden_states(
-        self,
-        decode_segments: Sequence[PagedDecodeSegment],
-        *,
-        has_final_prefill: bool = False,
-        speculative_config: SpeculativeConfig | None = None,
-    ) -> bool:
-        """Return whether target hidden states are needed for draft follow-up.
-
-        Gemma4 MTP needs the previous target step's hidden states even for
-        plain decode or final prefill rows, because the assistant consumes
-        those rows to draft the next tokens.
-        """
-        if not decode_segments and not has_final_prefill:
-            return False
-        return Gemma4MTPAssistantSource.is_gemma4_mtp(speculative_config)
 
     def verify_greedy(
         self,
