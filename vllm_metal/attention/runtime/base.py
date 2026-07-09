@@ -59,6 +59,15 @@ class PagedAttentionRuntimeBase:
         """Append runtime-owned side-effect arrays that must be eval'd."""
         del outputs
 
+    def reset_requests(self, req_ids: set[str]) -> None:
+        """Reset runtime-owned per-request state for still-live requests.
+
+        Called when a preempted request resumes and re-prefills from position
+        0. Pure paged-KV runtimes keep no per-request recurrent state (the
+        re-prefill overwrites their KV rows), so the default is a no-op.
+        """
+        del req_ids
+
     def release_requests(self, req_ids: set[str]) -> None:
         """Release any runtime-owned state for finished requests."""
         del req_ids

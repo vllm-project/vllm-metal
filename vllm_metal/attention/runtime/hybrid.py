@@ -237,6 +237,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.gdn_state_manager.extend_forward_eval_outputs(outputs)
 
+    def reset_requests(self, req_ids: set[str]) -> None:
+        self.gdn_state_manager.reset_requests(req_ids)
+
     def release_requests(self, req_ids: set[str]) -> None:
         self.gdn_state_manager.release_requests(req_ids)
 

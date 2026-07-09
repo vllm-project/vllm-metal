@@ -1928,9 +1928,11 @@ class MetalModelRunner:
         cached_reqs: CachedRequestData,
     ) -> None:
         """Apply scheduler-provided block updates for paged cached requests."""
-        if self._paged_attention_runtime is None:
+        runtime = self._paged_attention_runtime
+        if runtime is None:
             return
 
+        resumed_req_ids: set[str] = set()
         for i, req_id in enumerate(cached_reqs.req_ids):
             state = self._request_states.get(req_id)
             if state is None:
@@ -1947,6 +1949,14 @@ class MetalModelRunner:
             state.block_ids = list(new_block_ids[0])
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
+            resumed_req_ids.add(req_id)
+
+        # A resumed request re-prefills from position 0 but keeps any
+        # per-request recurrent state the runtime holds for it (it never
+        # finished, so release_requests never ran); reset that state before
+        # this step's forward is built.
+        if resumed_req_ids:
+            runtime.reset_requests(resumed_req_ids)
 
     def _collect_cached_requests(
         self,

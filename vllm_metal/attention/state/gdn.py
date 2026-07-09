@@ -107,6 +107,19 @@ class HybridGDNStateManager:
         """Append authoritative GDN state arrays that the forward mutates."""
         outputs.extend(self._state_cache.updated_state_arrays())
 
+    def reset_requests(self, req_ids: set[str]) -> None:
+        """Zero the slots of still-live requests, keeping their slot mapping.
+
+        A preempted-then-resumed request is never a ``finished_req_id``, so it
+        keeps its stable slot — which still holds mid-sequence recurrent state
+        when the resume re-prefills from position 0. That state must be zeroed
+        or the prefill kernel seeds itself from it.
+        """
+        for req_id in req_ids:
+            slot = self._req_to_slot.get(req_id)
+            if slot is not None:
+                self._state_cache.reset_slot(slot)
+
     def release_requests(self, req_ids: set[str]) -> None:
         """Release slots for finished requests and mark state for eval."""
         freed_slots: list[int] = []
