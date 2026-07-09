@@ -439,6 +439,10 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
+        # Prune non-owned layers adjacent to the (lazy) load, before LoRA setup or
+        # cache profiling materialize weights. No-op on the single-stage path.
+        if self.pp is not None:
+            self.apply_pipeline_split(self.pp)
         text_config = getattr(self.model_config.hf_config, "get_text_config", None)
         max_position_embeddings = None
         if callable(text_config):
@@ -483,7 +487,9 @@ class MetalModelRunner:
     def apply_pipeline_split(self, pp: PipelineGroup) -> None:
         """Slice the loaded model to this pipeline stage and fix layer counts.
 
-        Called by the worker after ``load_model`` (Phase 0 load-then-slice).
+        Runs inside ``load_model`` right after the (lazy) weight load, before LoRA
+        setup and cache profiling, so the stage's non-owned layers are pruned
+        before anything materializes them.
         Delegates the in-place backbone slice to the adapter, then resets the
         runner's layer accounting to the LOCAL slice so per-layer offset caches
         (``_start_paged_forward``) and the KV-cache spec size only this stage's

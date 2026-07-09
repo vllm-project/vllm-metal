@@ -16,6 +16,7 @@ from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
+from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
@@ -1632,3 +1633,34 @@ class TestRunnerMlaProperties:
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
         assert runner.is_mla is False
+
+
+class TestLoadModelPipelineSplitOrdering:
+    def test_split_runs_before_lora_setup_on_pp_stage(self) -> None:
+        # The pipeline split must run adjacent to the (lazy) load and before LoRA
+        # setup, so the stage's non-owned layers are pruned before anything
+        # materializes them. Pin the order so a future edit cannot move the split
+        # back after LoRA and silently reintroduce the full-model peak.
+        events: list[str] = []
+
+        class _FakeGroup:
+            def rank(self) -> int:
+                return 0
+
+            def size(self) -> int:
+                return 2
+
+        runner = make_stub_runner(
+            pp=PipelineGroup(_FakeGroup()),
+            model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+            metal_config=SimpleNamespace(use_paged_attention=True),
+            scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
+            kv_cache_dtype=None,
+        )
+        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
+        runner.apply_pipeline_split = lambda pp: events.append("split")
+        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
+
+        runner.load_model()
+
+        assert events == ["load", "split", "lora"]

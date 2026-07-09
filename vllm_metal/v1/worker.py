@@ -196,11 +196,6 @@ class MetalWorker(WorkerBase):
     def load_model(self) -> None:
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
-        # Phase 0 = load-then-slice: every stage loaded full weights above; now
-        # drop the layers (and, off the last stage, the final norm) this stage
-        # does not own. No-op when self.pp is None (single-stage path).
-        if self.pp is not None:
-            self.model_runner.apply_pipeline_split(self.pp)
 
     def _one_sequence_kv_bytes(self) -> int:
         """Bytes for one max-length sequence of cache state.

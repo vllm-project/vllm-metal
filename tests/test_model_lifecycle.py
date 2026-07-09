@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -16,6 +17,7 @@ import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
+from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
@@ -268,6 +270,62 @@ class TestModelLifecycle:
         assert request.target_dtype is not None
         assert request.tokenizer_config == {"trust_remote_code": True}
         assert calls == [hf_config]
+
+    def test_generation_load_request_marks_pipeline_stage_lazy(self) -> None:
+        # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
+        # prune its non-owned layers before the first eval; a single-stage load
+        # stays eager. lazy_weights is the typed contract the mlx_lm loader reads.
+        class _Adapter:
+            def should_force_text_backbone(self, config: object) -> bool:
+                return False
+
+        class _FakeGroup:
+            def __init__(self, size: int) -> None:
+                self._size = size
+
+            def rank(self) -> int:
+                return 0
+
+            def size(self) -> int:
+                return self._size
+
+        def _lazy_for(pp: PipelineGroup | None) -> bool:
+            runner = make_stub_runner(
+                metal_config=SimpleNamespace(debug=False),
+                model_config=_runner_model_config(),
+                pp=pp,
+            )
+            return GenerationLoadRequest.from_runner(runner, _Adapter()).lazy_weights
+
+        assert _lazy_for(None) is False
+        assert _lazy_for(PipelineGroup(_FakeGroup(1))) is False
+        assert _lazy_for(PipelineGroup(_FakeGroup(2))) is True
+
+    def test_load_mlx_lm_text_model_forwards_lazy_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The pp lazy_weights flag must reach mlx_lm's loader so a stage can prune
+        # its non-owned layers before the first eval; a single-stage load is eager.
+        captured: dict[str, object] = {}
+
+        def _fake_load(
+            path: str, *, tokenizer_config: object, lazy: bool
+        ) -> tuple[object, object]:
+            captured["lazy"] = lazy
+            return object(), object()
+
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_load)
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_mlx_lm_compatible_model_path",
+            lambda name: contextlib.nullcontext(name),
+        )
+        lifecycle, _ = _make_lifecycle()
+
+        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=True)
+        assert captured["lazy"] is True
+        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
+        assert captured["lazy"] is False
 
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,

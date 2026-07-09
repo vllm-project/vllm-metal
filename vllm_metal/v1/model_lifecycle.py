@@ -65,6 +65,7 @@ class GenerationLoadRequest:
     target_dtype: Any
     tokenizer_config: Mapping[str, Any]
     gguf_source: GGUFLoadSource | None
+    lazy_weights: bool
 
     @classmethod
     def from_runner(
@@ -80,6 +81,12 @@ class GenerationLoadRequest:
             is_vlm = False
         gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
 
+        # A pipeline-parallel stage prunes its non-owned layers right after load, so
+        # the generic mlx_lm weights load lazily and per-stage peak stays owned-only.
+        # Only the mlx_lm path honors this; GGUF/AWQ/VLM ignore it and load eager.
+        pp = runner.pp
+        lazy_weights = pp is not None and pp.size > 1
+
         return cls(
             model_name=(
                 gguf_source.weights_path
@@ -92,6 +99,7 @@ class GenerationLoadRequest:
             target_dtype=torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype,
             tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
             gguf_source=gguf_source,
+            lazy_weights=lazy_weights,
         )
 
 
@@ -148,6 +156,7 @@ class ModelLifecycle:
             target_dtype=request.target_dtype,
             tokenizer_config=request.tokenizer_config,
             gguf_source=request.gguf_source,
+            lazy_weights=request.lazy_weights,
         )
         return LoadedGenerationModel(
             model=model,
@@ -164,6 +173,7 @@ class ModelLifecycle:
         target_dtype: Any | None = None,
         tokenizer_config: Mapping[str, Any] | None = None,
         gguf_source: GGUFLoadSource | None = None,
+        lazy_weights: bool = False,
     ) -> tuple[Any, Any]:
         """Load a text or VLM generation model."""
 
@@ -210,6 +220,7 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
+                lazy=lazy_weights,
             )
 
         loaded_from = (
@@ -259,11 +270,14 @@ class ModelLifecycle:
         self,
         model_name: str,
         tokenizer_config: Mapping[str, Any],
+        *,
+        lazy: bool = False,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model, tokenizer = mlx_lm_load(
                 str(compatible_model_name),
                 tokenizer_config=tokenizer_config,
+                lazy=lazy,
             )
         return model, tokenizer
 
