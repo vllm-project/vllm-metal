@@ -1632,3 +1632,93 @@ class TestRunnerMlaProperties:
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
         assert runner.is_mla is False
+
+
+class _RecordingMTPHead:
+    """Records its ``build_proposer`` context and returns a canned proposer."""
+
+    model_type = "recording_mtp"
+
+    def __init__(self) -> None:
+        self.contexts: list[object] = []
+        self.proposer = SimpleNamespace(
+            needs_target_hidden_states=lambda *a, **k: False,
+            propose=lambda ctx: None,
+        )
+
+    def build_proposer(self, context: object) -> object:
+        self.contexts.append(context)
+        return self.proposer
+
+
+class TestInstallDrafterMtpDispatch:
+    """``install_drafter`` dispatch for mtp drafts: delegate or fail loud."""
+
+    def _make_mtp_spec(self, *, model_type: str) -> SimpleNamespace:
+        # A non-Gemma4, non-draft-model mtp config: falls through the dispatch
+        # to the native-head branch.
+        return SimpleNamespace(
+            method="mtp",
+            uses_draft_model=lambda: False,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type=model_type),
+            ),
+        )
+
+    def test_registered_head_builds_and_installs_its_proposer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from vllm_metal.v1.mtp_heads.registry import NativeMTPBuildContext
+
+        head = _RecordingMTPHead()
+        monkeypatch.setattr(
+            "vllm_metal.v1.mtp_heads.registry.MTP_HEAD_REGISTRY",
+            {head.model_type: head},
+        )
+        runner = make_stub_runner(
+            tokenizer=object(),
+            kv_cache_dtype="DTYPE",
+            model_args={"target": "cfg"},
+        )
+        spec = self._make_mtp_spec(model_type=head.model_type)
+        runner.vllm_config = SimpleNamespace(speculative_config=spec)
+
+        runner.install_drafter(num_blocks=1, block_size=16)
+
+        assert runner._drafter is head.proposer
+        (context,) = head.contexts
+        assert isinstance(context, NativeMTPBuildContext)
+        assert context.speculative_config is spec
+        assert context.controller is runner._spec_decode_controller
+        assert context.vllm_config is runner.vllm_config
+        assert context.target_config is runner.model_args
+        assert context.dtype == "DTYPE"
+
+    def test_gemma4_mtp_config_installs_gemma4_proposer(self) -> None:
+        # Assistant configs resolve on the dedicated path, not the registry.
+        runner = make_stub_runner(tokenizer=object())
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="gemma4_mtp"),
+                ),
+            ),
+        )
+
+        runner.install_drafter(num_blocks=1, block_size=16)
+
+        assert isinstance(runner._drafter, Gemma4MTPProposer)
+
+    def test_unregistered_mtp_draft_raises_naming_model_type(self) -> None:
+        runner = make_stub_runner(tokenizer=object())
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=self._make_mtp_spec(model_type="eagle"),
+        )
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            runner.install_drafter(num_blocks=1, block_size=16)
+
+        message = str(excinfo.value)
+        assert "'eagle'" in message
+        assert "Gemma4 MTP" in message

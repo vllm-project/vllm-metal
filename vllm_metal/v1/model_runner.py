@@ -81,6 +81,11 @@ from vllm_metal.v1.model_adapter import (
     TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.mtp_heads.registry import (
+    NativeMTPBuildContext,
+    find_native_mtp_head,
+    unsupported_mtp_message,
+)
 from vllm_metal.v1.pooling import (
     finish_paged_pooling_batch,
     forward_sequence_hidden_states,
@@ -722,6 +727,20 @@ class MetalModelRunner:
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
             )
+        elif spec.method == "mtp":
+            # A registered native head owns its config validation and proposer
+            # construction; unregistered mtp drafts fail loud.
+            head = find_native_mtp_head(spec)
+            if head is None:
+                raise NotImplementedError(unsupported_mtp_message(spec))
+            context = NativeMTPBuildContext(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                vllm_config=self.vllm_config,
+                target_config=self.model_args,
+                dtype=self.kv_cache_dtype,
+            )
+            self._drafter = head.build_proposer(context)
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
