@@ -11,6 +11,7 @@ Key contracts:
 - Outputs align with scheduler expectations for paged and non-paged paths.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
@@ -258,6 +259,8 @@ class _PagedForwardState(NamedTuple):
     # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
     pooling_hidden_states: mx.array | None = None
+    # DFlash-style concatenated intermediate-layer states ``[T, n * hidden]``.
+    target_aux_hidden_states: mx.array | None = None
 
 
 class MetalModelRunner:
@@ -563,12 +566,14 @@ class MetalModelRunner:
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        aux_layer_ids: Sequence[int] | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
             cache=cache,
             collect_hidden_states=collect_hidden_states,
+            aux_layer_ids=aux_layer_ids,
         )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
@@ -698,6 +703,28 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.use_dflash():
+            from vllm_metal.v1.dflash_proposer import DFlashProposer
+
+            if self.vllm_config.cache_config.enable_prefix_caching:
+                # Prefix-cache hits skip the target forward for cached tokens,
+                # so their hidden states — DFlash's context K/V source — are
+                # never observed. Reject up front instead of silently leaving
+                # affected requests undrafted.
+                raise NotImplementedError(
+                    "DFlash speculative decoding on Metal requires prefix "
+                    "caching to be disabled (--no-enable-prefix-caching): "
+                    "cached prefix tokens never produce the target hidden "
+                    "states the drafter's context is built from."
+                )
+            # DFlash draft KV lives in proposer-owned contiguous slabs
+            # (~num_layers * kv_heads * head_dim * 4 bytes per token), so no
+            # draft paged-cache blocks are needed.
+            self._drafter = DFlashProposer.build(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                dtype=self.kv_cache_dtype,
+            )
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
@@ -731,7 +758,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, dflash, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(
@@ -1040,6 +1067,7 @@ class MetalModelRunner:
 
         logits: mx.array | None = None
         target_hidden_states: mx.array | None = None
+        target_aux_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
         # Lazy send op for the non-last pipeline stage (None otherwise).
@@ -1094,9 +1122,15 @@ class MetalModelRunner:
                     input_ids,
                     cache=offset_caches,
                     collect_hidden_states=collect_target_hidden_states,
+                    aux_layer_ids=(
+                        getattr(self._drafter, "aux_hidden_state_layer_ids", None)
+                        if collect_target_hidden_states
+                        else None
+                    ),
                 )
                 logits = target_output.logits
                 target_hidden_states = target_output.hidden_states
+                target_aux_hidden_states = target_output.aux_hidden_states
                 del target_output
         finally:
             clear_context()
@@ -1116,6 +1150,8 @@ class MetalModelRunner:
             forward_outputs = [logits]
             if target_hidden_states is not None:
                 forward_outputs.append(target_hidden_states)
+            if target_aux_hidden_states is not None:
+                forward_outputs.append(target_aux_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
         # ---- build cu_seqlens for logit extraction ----
@@ -1132,6 +1168,7 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
             decode_segments=decode_segments,
@@ -1157,6 +1194,7 @@ class MetalModelRunner:
         scheduler_output = paged_state.scheduler_output
         logits = paged_state.logits
         target_hidden_states = paged_state.target_hidden_states
+        target_aux_hidden_states = paged_state.target_aux_hidden_states
         pooling_hidden_states = paged_state.pooling_hidden_states
         cu_seqlens = paged_state.cu_seqlens
         decode_segments = paged_state.decode_segments
@@ -1184,9 +1222,12 @@ class MetalModelRunner:
 
         # ---- wait for MLX forward to complete ----
         if target_hidden_states is not None:
-            # The Gemma4 MTP assistant drafter will consume these rows after
-            # sampling; evaluate them with logits so the retained state is ready.
-            mx.eval(logits, target_hidden_states)
+            # The drafter will consume these rows after sampling; evaluate
+            # them with logits so the retained state is ready.
+            if target_aux_hidden_states is not None:
+                mx.eval(logits, target_hidden_states, target_aux_hidden_states)
+            else:
+                mx.eval(logits, target_hidden_states)
         else:
             mx.eval(logits)
 
@@ -1374,6 +1415,7 @@ class MetalModelRunner:
         num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,

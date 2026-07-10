@@ -43,6 +43,9 @@ class ProposeContext:
     """
 
     target_hidden_states: mx.array | None
+    # DFlash-style concatenated intermediate-layer states ``[T, n * hidden]``,
+    # collected only for drafters exposing ``aux_hidden_state_layer_ids``.
+    target_aux_hidden_states: mx.array | None
     decode_reqs: Sequence[tuple[str, RequestState]]
     decode_segments: Sequence[PagedDecodeSegment]
     decode_token_ids: Sequence[Sequence[int]]

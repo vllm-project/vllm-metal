@@ -414,6 +414,25 @@ class SpeculativeDecodeController:
 
         return eligible
 
+    @staticmethod
+    def greedy_sampling_params(sampling_params: Any) -> bool:
+        """Request-lifetime greedy check (excludes transient min_tokens state).
+
+        Single source of truth shared by verify-side validation and drafters'
+        ingest eligibility, so the two cannot drift.
+        """
+        return not (
+            sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
+            or sampling_params.top_k > 0
+            or sampling_params.top_p != 1.0
+            or sampling_params.frequency_penalty != 0.0
+            or sampling_params.presence_penalty != 0.0
+            or sampling_params.repetition_penalty != 1.0
+            or sampling_params.logprobs is not None
+            or bool(sampling_params.allowed_token_ids)
+            or bool(sampling_params.bad_words_token_ids)
+        )
+
     def _validate_greedy_sampling(
         self,
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
@@ -422,18 +441,7 @@ class SpeculativeDecodeController:
     ) -> None:
         for _, request_state in decode_reqs:
             sampling_params = request_state.sampling_params
-            unsupported = (
-                sampling_params.temperature >= GREEDY_TEMPERATURE_EPS
-                or sampling_params.top_k > 0
-                or sampling_params.top_p != 1.0
-                or sampling_params.frequency_penalty != 0.0
-                or sampling_params.presence_penalty != 0.0
-                or sampling_params.repetition_penalty != 1.0
-                or sampling_params.logprobs is not None
-                or bool(sampling_params.allowed_token_ids)
-                or bool(sampling_params.bad_words_token_ids)
-            )
-            if unsupported:
+            if not self.greedy_sampling_params(sampling_params):
                 raise NotImplementedError(
                     "Speculative decode verification on Metal currently "
                     "supports greedy sampling only (temperature=0, no "

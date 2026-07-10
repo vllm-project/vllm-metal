@@ -25,6 +25,9 @@ class TargetModelForwardOutput:
 
     logits: mx.array
     hidden_states: mx.array | None = None
+    # Concatenated intermediate-layer residual states ``[num_tokens, n * hidden]``
+    # for drafters that consume EAGLE3/DFlash-style aux hidden states.
+    aux_hidden_states: mx.array | None = None
 
 
 class MultimodalEncodeResult(Protocol):
@@ -137,8 +140,15 @@ class ModelAdapter(Protocol):
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        aux_layer_ids: Sequence[int] | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target text model and optionally retain target hidden states."""
+        """Run the target text model and optionally retain target hidden states.
+
+        ``aux_layer_ids`` (0-indexed decoder layers; the residual stream is
+        captured *after* each listed layer) additionally returns the
+        concatenated aux hidden states for DFlash-style drafters. Only
+        honored when ``collect_hidden_states`` is set.
+        """
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -336,6 +346,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        aux_layer_ids: Sequence[int] | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target model and return logits plus optional hidden states."""
         if not collect_hidden_states:
@@ -345,16 +356,92 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 hidden_states=None,
             )
 
-        hidden_states = self._forward_target_hidden_states(
-            model,
-            input_ids,
-            cache=cache,
-        )
+        if aux_layer_ids:
+            hidden_states, aux_hidden_states = self._forward_with_aux_capture(
+                model,
+                input_ids,
+                cache=cache,
+                aux_layer_ids=aux_layer_ids,
+            )
+        else:
+            hidden_states = self._forward_target_hidden_states(
+                model,
+                input_ids,
+                cache=cache,
+            )
+            aux_hidden_states = None
         logits = self._compute_target_logits(model, hidden_states)
         return TargetModelForwardOutput(
             logits=logits,
             hidden_states=self._flatten_target_hidden_states(hidden_states),
+            aux_hidden_states=(
+                self._flatten_target_hidden_states(aux_hidden_states)
+                if aux_hidden_states is not None
+                else None
+            ),
         )
+
+    def _forward_with_aux_capture(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None,
+        aux_layer_ids: Sequence[int],
+    ) -> tuple[mx.array, mx.array]:
+        """Run the backbone loop explicitly, teeing residual states.
+
+        Mirrors mlx_lm's llama/qwen-family ``Model.__call__`` op for op
+        (embed -> shared mask -> per-layer -> final norm) so the final hidden
+        state is identical to the stock forward, while capturing the residual
+        stream *after* each layer listed in ``aux_layer_ids``. The captured
+        tensors are concatenated along the feature dim in list order —
+        DFlash's ``fc`` input layout.
+        """
+        from mlx_lm.models.base import create_attention_mask
+
+        backbone = self._target_backbone(model)
+        if backbone is None:
+            raise NotImplementedError(
+                "Aux hidden-state capture requires a text model with a "
+                "`model` backbone."
+            )
+        layers = getattr(backbone, "layers", None)
+        embed_tokens = getattr(backbone, "embed_tokens", None)
+        final_norm = getattr(backbone, "norm", None)
+        if layers is None or embed_tokens is None or final_norm is None:
+            raise NotImplementedError(
+                "Aux hidden-state capture supports mlx_lm llama/qwen-family "
+                "backbones (embed_tokens / layers / norm); got "
+                f"{type(backbone).__name__}."
+            )
+        if getattr(backbone, "embed_scale", None) not in (None, 1, 1.0):
+            raise NotImplementedError(
+                "Aux hidden-state capture does not support scaled-embedding "
+                "backbones yet."
+            )
+        capture = set(aux_layer_ids)
+        invalid = [i for i in capture if not 0 <= i < len(layers)]
+        if invalid:
+            raise ValueError(
+                f"aux_layer_ids {sorted(invalid)} out of range for "
+                f"{len(layers)}-layer target model"
+            )
+
+        h = embed_tokens(input_ids)
+        layer_caches = cache if cache is not None else [None] * len(layers)
+        mask = create_attention_mask(h, layer_caches[0])
+
+        collected: dict[int, mx.array] = {}
+        for i, (layer, layer_cache) in enumerate(
+            zip(layers, layer_caches, strict=True)
+        ):
+            h = layer(h, mask, layer_cache)
+            if i in capture:
+                collected[i] = h
+
+        aux = mx.concatenate([collected[i] for i in aux_layer_ids], axis=-1)
+        return final_norm(h), aux
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for Gemma4 MTP feedback."""

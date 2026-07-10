@@ -72,6 +72,7 @@ def _context(
         request_states = dict(decode_reqs)
     return ProposeContext(
         target_hidden_states=None,
+        target_aux_hidden_states=None,
         decode_reqs=decode_reqs,
         decode_segments=[],
         decode_token_ids=decode_token_ids,
