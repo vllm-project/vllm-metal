@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the native MTP head registry lookup and unsupported-head message."""
+"""Tests for native MTP head registry behavior."""
 
 from __future__ import annotations
 
@@ -8,14 +8,9 @@ from typing import Any
 
 import pytest
 
-# Imported via the package re-exports on purpose: doubles as the back-compat
-# check for existing import sites.
-from vllm_metal.v1.mtp_heads import (
+from vllm_metal.v1.mtp_heads.registry import (
     NativeMTPBuildContext,
-    find_native_mtp_head,
-    registered_mtp_head_types,
-    registry,
-    unsupported_mtp_message,
+    NativeMTPHeadRegistry,
 )
 
 
@@ -29,8 +24,6 @@ def _mtp_config(*, model_type: str) -> SimpleNamespace:
 
 
 class _FakeProposer:
-    """Minimal ``MetalProposer`` double."""
-
     def needs_target_hidden_states(
         self, decode_segments: Any, *, has_final_prefill: bool
     ) -> bool:
@@ -41,9 +34,8 @@ class _FakeProposer:
 
 
 class _FakeHead:
-    """Minimal :class:`NativeMTPHead` for registry-lookup tests."""
-
-    model_type = "dummy_mtp"
+    def __init__(self, model_type: str = "dummy_mtp") -> None:
+        self.model_type = model_type
 
     def build_proposer(self, context: NativeMTPBuildContext) -> _FakeProposer:
         return _FakeProposer()
@@ -80,43 +72,36 @@ class _FakeHead:
         ),
     ],
 )
-def test_find_native_mtp_head_returns_none(config: Any) -> None:
-    assert find_native_mtp_head(config) is None
+def test_find_returns_none_for_unregistered_or_non_mtp_config(config: Any) -> None:
+    assert NativeMTPHeadRegistry.find(config) is None
 
 
 def test_returns_registered_head_for_matching_model_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     head = _FakeHead()
-    monkeypatch.setattr(registry, "MTP_HEAD_REGISTRY", {"dummy_mtp": head})
+    monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
 
-    assert find_native_mtp_head(_mtp_config(model_type="dummy_mtp")) is head
+    NativeMTPHeadRegistry.register(head)
 
-
-def test_registered_mtp_head_types_reads_registry_at_call_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A from-import of the dict would freeze a stale reference; the helper must
-    # re-read the module attribute so a rebound registry is reflected.
-    monkeypatch.setattr(registry, "MTP_HEAD_REGISTRY", {"dummy_mtp": _FakeHead()})
-
-    assert registered_mtp_head_types() == ["dummy_mtp"]
+    assert NativeMTPHeadRegistry.find(_mtp_config(model_type="dummy_mtp")) is head
+    assert NativeMTPHeadRegistry.registered_types() == ["dummy_mtp"]
 
 
-def test_unsupported_mtp_message_names_model_type_and_supported_path() -> None:
-    message = unsupported_mtp_message(_mtp_config(model_type="eagle"))
+def test_unsupported_message_names_model_type_and_supported_path() -> None:
+    message = NativeMTPHeadRegistry.unsupported_message(_mtp_config(model_type="eagle"))
 
     assert "'eagle'" in message
     assert "Gemma4 MTP" in message
 
 
-def test_unsupported_mtp_message_names_registered_heads(
+def test_unsupported_message_names_registered_heads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        registry, "MTP_HEAD_REGISTRY", {"glm4_moe_lite_mtp": _FakeHead()}
-    )
+    monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
+    head = _FakeHead("glm4_moe_lite_mtp")
+    NativeMTPHeadRegistry.register(head)
 
-    message = unsupported_mtp_message(_mtp_config(model_type="eagle"))
+    message = NativeMTPHeadRegistry.unsupported_message(_mtp_config(model_type="eagle"))
 
     assert "glm4_moe_lite_mtp" in message

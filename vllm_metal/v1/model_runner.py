@@ -83,8 +83,7 @@ from vllm_metal.v1.model_adapter import (
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 from vllm_metal.v1.mtp_heads.registry import (
     NativeMTPBuildContext,
-    find_native_mtp_head,
-    unsupported_mtp_message,
+    NativeMTPHeadRegistry,
 )
 from vllm_metal.v1.pooling import (
     finish_paged_pooling_batch,
@@ -728,11 +727,11 @@ class MetalModelRunner:
                 controller=self._spec_decode_controller,
             )
         elif spec.method == "mtp":
-            # A registered native head owns its config validation and proposer
-            # construction; unregistered mtp drafts fail loud.
-            head = find_native_mtp_head(spec)
+            head = NativeMTPHeadRegistry.find(spec)
             if head is None:
-                raise NotImplementedError(unsupported_mtp_message(spec))
+                raise NotImplementedError(
+                    NativeMTPHeadRegistry.unsupported_message(spec)
+                )
             context = NativeMTPBuildContext(
                 speculative_config=spec,
                 controller=self._spec_decode_controller,

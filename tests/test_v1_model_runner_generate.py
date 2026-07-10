@@ -18,6 +18,10 @@ from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
+from vllm_metal.v1.mtp_heads.registry import (
+    NativeMTPBuildContext,
+    NativeMTPHeadRegistry,
+)
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 
 
@@ -1634,29 +1638,28 @@ class TestRunnerMlaProperties:
         assert runner.is_mla is False
 
 
-class _RecordingMTPHead:
-    """Records its ``build_proposer`` context and returns a canned proposer."""
+class _FakeMTPProposer:
+    def needs_target_hidden_states(self, *args, **kwargs) -> bool:
+        return False
 
+    def propose(self, ctx) -> None:
+        return None
+
+
+class _RecordingMTPHead:
     model_type = "recording_mtp"
 
     def __init__(self) -> None:
         self.contexts: list[object] = []
-        self.proposer = SimpleNamespace(
-            needs_target_hidden_states=lambda *a, **k: False,
-            propose=lambda ctx: None,
-        )
+        self.proposer = _FakeMTPProposer()
 
-    def build_proposer(self, context: object) -> object:
+    def build_proposer(self, context: NativeMTPBuildContext) -> _FakeMTPProposer:
         self.contexts.append(context)
         return self.proposer
 
 
 class TestInstallDrafterMtpDispatch:
-    """``install_drafter`` dispatch for mtp drafts: delegate or fail loud."""
-
     def _make_mtp_spec(self, *, model_type: str) -> SimpleNamespace:
-        # A non-Gemma4, non-draft-model mtp config: falls through the dispatch
-        # to the native-head branch.
         return SimpleNamespace(
             method="mtp",
             uses_draft_model=lambda: False,
@@ -1668,13 +1671,9 @@ class TestInstallDrafterMtpDispatch:
     def test_registered_head_builds_and_installs_its_proposer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from vllm_metal.v1.mtp_heads.registry import NativeMTPBuildContext
-
         head = _RecordingMTPHead()
-        monkeypatch.setattr(
-            "vllm_metal.v1.mtp_heads.registry.MTP_HEAD_REGISTRY",
-            {head.model_type: head},
-        )
+        monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
+        NativeMTPHeadRegistry.register(head)
         runner = make_stub_runner(
             tokenizer=object(),
             kv_cache_dtype="DTYPE",
@@ -1695,7 +1694,6 @@ class TestInstallDrafterMtpDispatch:
         assert context.dtype == "DTYPE"
 
     def test_gemma4_mtp_config_installs_gemma4_proposer(self) -> None:
-        # Assistant configs resolve on the dedicated path, not the registry.
         runner = make_stub_runner(tokenizer=object())
         runner.vllm_config = SimpleNamespace(
             speculative_config=SimpleNamespace(
