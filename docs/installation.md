@@ -14,7 +14,7 @@
 > source. Building the Metal kernels yourself is only for contributors editing
 > them; see [Contributing](CONTRIBUTING.md).
 
-`uv` is bootstrapped automatically; the Rust toolchain is only needed for the optional [Rust frontend](rust_frontend.md).
+`uv` is bootstrapped automatically.
 
 Verify the Python architecture before installing:
 
@@ -39,16 +39,6 @@ For how to use the `vllm` CLI, please refer to the [official vLLM guide](https:/
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
-
-### Optional: Rust frontend
-
-Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain on `PATH` (install from <https://rustup.rs>):
-
-```bash
-./install.sh --with-vllm-rs
-```
-
-The `vllm-rs` binary is installed to `~/.cargo/bin/`. See [Rust Frontend](rust_frontend.md) for usage.
 
 ## Reinstallation and Update
 

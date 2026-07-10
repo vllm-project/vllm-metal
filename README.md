@@ -38,13 +38,3 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the official vLLM guide.
 https://docs.vllm.ai/en/latest/cli/
-
-### Optional: Rust frontend (experimental)
-
-Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain (https://rustup.rs):
-
-```bash
-./install.sh --with-vllm-rs
-```
-
-See [docs/rust_frontend.md](docs/rust_frontend.md) for usage and architecture.

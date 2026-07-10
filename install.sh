@@ -92,32 +92,6 @@ download_and_install_wheel() {
   success "Installed ${package_name}"
 }
 
-install_vllm_rs() {
-  local vllm_src_dir="$1"
-
-  section "Installing vllm-rs (experimental Rust frontend)"
-
-  if ! command -v cargo &> /dev/null || ! command -v rustup &> /dev/null; then
-    error "cargo/rustup not found on PATH; install Rust from https://rustup.rs first."
-    exit 1
-  fi
-
-  if [[ ! -d "$vllm_src_dir/rust/src/cmd" ]]; then
-    error "Rust frontend source not found under $vllm_src_dir/rust."
-    exit 1
-  fi
-
-  echo "Installing vllm-rs from vLLM source: $vllm_src_dir/rust"
-
-  # Run cargo from the vLLM repository root so rustup honors rust-toolchain.toml.
-  if ! ( cd "$vllm_src_dir" && cargo install --locked --path rust/src/cmd --bin vllm-rs ); then
-    error "Failed to install vllm-rs."
-    exit 1
-  fi
-
-  success "Installed vllm-rs to ~/.cargo/bin"
-}
-
 main() {
   set -eu -o pipefail
   trap cleanup_tmp_dirs EXIT
@@ -125,21 +99,14 @@ main() {
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"
   local package_name="vllm-metal"
-  local with_vllm_rs=0
 
   for arg in "$@"; do
     case "$arg" in
-      --with-vllm-rs)
-        with_vllm_rs=1
-        ;;
       -h|--help)
         cat <<'EOF'
-Usage: install.sh [--with-vllm-rs]
+Usage: install.sh
 
 Options:
-  --with-vllm-rs    Also install vllm-rs (experimental Rust frontend) from
-                    the bundled vLLM release source.
-                    Requires the Rust toolchain on PATH (https://rustup.rs).
   -h, --help        Show this help.
 EOF
         exit 0
@@ -243,10 +210,6 @@ EOF
     download_and_install_wheel "$wheel_url" "$package_name"
   fi
 
-  if [[ "$with_vllm_rs" == "1" ]]; then
-    install_vllm_rs "$vllm_src_dir"
-  fi
-
   echo ""
   success "Installation complete!"
   echo ""
@@ -255,13 +218,6 @@ EOF
   echo ""
   echo "Or add the venv to your PATH:"
   echo "  export PATH=\"$venv/bin:\$PATH\""
-
-  if [[ "$with_vllm_rs" == "1" ]]; then
-    echo ""
-    echo "vllm-rs is installed to ~/.cargo/bin. Make sure that directory is on your PATH."
-    echo "Activate the venv, then run:"
-    echo "  VLLM_USE_RUST_FRONTEND=1 VLLM_RUST_FRONTEND_PATH=\"$HOME/.cargo/bin/vllm-rs\" vllm serve <MODEL>"
-  fi
 }
 
 main "$@"
