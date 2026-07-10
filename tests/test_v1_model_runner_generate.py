@@ -66,6 +66,23 @@ class ForwardOutputRuntimeStub:
         return None
 
 
+def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
+    runner = make_stub_runner(tokenizer=object())
+    runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            uses_draft_model=lambda: False,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="gemma4_mtp"),
+            ),
+        ),
+    )
+
+    runner.install_drafter(num_blocks=1, block_size=16)
+
+    assert isinstance(runner._drafter, Gemma4MTPProposer)
+
+
 class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())
