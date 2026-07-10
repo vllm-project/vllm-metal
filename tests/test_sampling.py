@@ -13,7 +13,12 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor import (
+    BatchUpdate,
+    LogitsProcessor,
+    LogitsProcessors,
+    build_logitsprocs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -401,9 +406,18 @@ class TestV1SamplingBatch:
         assert not batch.can_use_native_greedy()
 
     def test_native_greedy_rejects_unknown_non_argmax_processor(self) -> None:
-        class _UnknownNonArgmax:
+        class _UnknownNonArgmax(LogitsProcessor):
+            def __init__(self, *_args: object) -> None:
+                return None
+
+            def apply(self, logits: torch.Tensor) -> torch.Tensor:
+                return logits
+
             def is_argmax_invariant(self) -> bool:
                 return False
+
+            def update_state(self, batch_update: BatchUpdate | None) -> None:
+                return None
 
         logitsprocs = LogitsProcessors([_UnknownNonArgmax()])
         batch = self._batch([SamplingParams(temperature=0.0)], logitsprocs)
