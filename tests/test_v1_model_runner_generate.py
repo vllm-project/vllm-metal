@@ -1676,7 +1676,7 @@ class TestInstallDrafterMtpDispatch:
         NativeMTPHeadRegistry.register(head)
         runner = make_stub_runner(
             tokenizer=object(),
-            kv_cache_dtype="DTYPE",
+            kv_cache_dtype=mx.float16,
             model_args={"target": "cfg"},
         )
         spec = self._make_mtp_spec(model_type=head.model_type)
@@ -1691,13 +1691,14 @@ class TestInstallDrafterMtpDispatch:
         assert context.controller is runner._spec_decode_controller
         assert context.vllm_config is runner.vllm_config
         assert context.target_config is runner.model_args
-        assert context.dtype == "DTYPE"
+        assert context.dtype == mx.float16
 
     def test_gemma4_mtp_config_installs_gemma4_proposer(self) -> None:
         runner = make_stub_runner(tokenizer=object())
         runner.vllm_config = SimpleNamespace(
             speculative_config=SimpleNamespace(
                 method="mtp",
+                uses_draft_model=lambda: False,
                 draft_model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(model_type="gemma4_mtp"),
                 ),

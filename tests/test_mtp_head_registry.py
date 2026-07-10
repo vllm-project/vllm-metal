@@ -41,67 +41,45 @@ class _FakeHead:
         return _FakeProposer()
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        pytest.param(None, id="no_config"),
-        pytest.param(
-            SimpleNamespace(method="ngram", draft_model_config=None),
-            id="non_mtp_method",
-        ),
-        pytest.param(
-            SimpleNamespace(
-                method="draft_model",
-                draft_model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(model_type="llama"),
-                ),
-            ),
-            id="draft_model_method",
-        ),
-        pytest.param(_mtp_config(model_type="eagle"), id="unregistered_model_type"),
-        pytest.param(
-            SimpleNamespace(method="mtp", draft_model_config=None),
-            id="missing_draft_model_config",
-        ),
-        pytest.param(
-            SimpleNamespace(
-                method="mtp",
-                draft_model_config=SimpleNamespace(hf_config=None),
-            ),
-            id="missing_hf_config",
-        ),
-    ],
-)
-def test_find_returns_none_for_unregistered_or_non_mtp_config(config: Any) -> None:
-    assert NativeMTPHeadRegistry.find(config) is None
-
-
-def test_returns_registered_head_for_matching_model_type(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    head = _FakeHead()
+@pytest.fixture(autouse=True)
+def _empty_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
 
-    NativeMTPHeadRegistry.register(head)
 
-    assert NativeMTPHeadRegistry.find(_mtp_config(model_type="dummy_mtp")) is head
+def test_find_returns_none_for_unregistered_model_type() -> None:
+    config = _mtp_config(model_type="eagle")
+
+    head = NativeMTPHeadRegistry.find(config)
+
+    assert head is None
+
+
+def test_returns_registered_head_for_matching_model_type() -> None:
+    head = _FakeHead()
+    config = _mtp_config(model_type="dummy_mtp")
+
+    NativeMTPHeadRegistry.register(head)
+    found = NativeMTPHeadRegistry.find(config)
+
+    assert found is head
     assert NativeMTPHeadRegistry.registered_types() == ["dummy_mtp"]
 
 
 def test_unsupported_message_names_model_type_and_supported_path() -> None:
-    message = NativeMTPHeadRegistry.unsupported_message(_mtp_config(model_type="eagle"))
+    config = _mtp_config(model_type="eagle")
+
+    message = NativeMTPHeadRegistry.unsupported_message(config)
 
     assert "'eagle'" in message
     assert "Gemma4 MTP" in message
 
 
-def test_unsupported_message_names_registered_heads(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
+def test_unsupported_message_names_registered_heads() -> None:
     head = _FakeHead("glm4_moe_lite_mtp")
+    config = _mtp_config(model_type="eagle")
+
     NativeMTPHeadRegistry.register(head)
+    message = NativeMTPHeadRegistry.unsupported_message(config)
 
-    message = NativeMTPHeadRegistry.unsupported_message(_mtp_config(model_type="eagle"))
-
+    assert "'eagle'" in message
     assert "glm4_moe_lite_mtp" in message

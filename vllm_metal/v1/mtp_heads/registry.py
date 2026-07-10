@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 if TYPE_CHECKING:
+    import mlx.core as mx
+    from vllm.config import VllmConfig
+
     from vllm_metal.v1.proposer import MetalProposer
+    from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,10 +19,10 @@ class NativeMTPBuildContext:
     """Inputs a native MTP head uses to build its proposer."""
 
     speculative_config: Any
-    controller: Any
-    vllm_config: Any
+    controller: SpeculativeDecodeController
+    vllm_config: VllmConfig
     target_config: Any
-    dtype: Any
+    dtype: mx.Dtype | None
 
 
 class NativeMTPHead(Protocol):
@@ -39,10 +43,8 @@ class NativeMTPHeadRegistry:
         cls._heads[head.model_type] = head
 
     @classmethod
-    def find(cls, speculative_config: Any | None) -> NativeMTPHead | None:
+    def find(cls, speculative_config: Any) -> NativeMTPHead | None:
         model_type = cls._draft_model_type(speculative_config)
-        if model_type is None:
-            return None
         return cls._heads.get(model_type)
 
     @classmethod
@@ -50,7 +52,7 @@ class NativeMTPHeadRegistry:
         return sorted(cls._heads)
 
     @classmethod
-    def unsupported_message(cls, speculative_config: Any | None) -> str:
+    def unsupported_message(cls, speculative_config: Any) -> str:
         model_type = cls._draft_model_type(speculative_config)
         return (
             f"No MTP head on Metal for draft model_type {model_type!r} "
@@ -59,16 +61,8 @@ class NativeMTPHeadRegistry:
         )
 
     @staticmethod
-    def _draft_model_type(speculative_config: Any | None) -> str | None:
-        if (
-            speculative_config is None
-            or getattr(speculative_config, "method", None) != "mtp"
-        ):
-            return None
-        draft_model_config = getattr(speculative_config, "draft_model_config", None)
-        hf_config = getattr(draft_model_config, "hf_config", None)
-        model_type = getattr(hf_config, "model_type", None)
-        return model_type if isinstance(model_type, str) else None
+    def _draft_model_type(speculative_config: Any) -> str:
+        return speculative_config.draft_model_config.hf_config.model_type
 
 
 __all__ = [
