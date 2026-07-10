@@ -1928,11 +1928,9 @@ class MetalModelRunner:
         cached_reqs: CachedRequestData,
     ) -> None:
         """Apply scheduler-provided block updates for paged cached requests."""
-        runtime = self._paged_attention_runtime
-        if runtime is None:
+        if self._paged_attention_runtime is None:
             return
 
-        resumed_req_ids: set[str] = set()
         for i, req_id in enumerate(cached_reqs.req_ids):
             state = self._request_states.get(req_id)
             if state is None:
@@ -1949,14 +1947,6 @@ class MetalModelRunner:
             state.block_ids = list(new_block_ids[0])
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
-            resumed_req_ids.add(req_id)
-
-        # A resumed request re-prefills from position 0 but keeps any
-        # per-request recurrent state the runtime holds for it (it never
-        # finished, so release_requests never ran); reset that state before
-        # this step's forward is built.
-        if resumed_req_ids:
-            runtime.reset_requests(resumed_req_ids)
 
     def _collect_cached_requests(
         self,
@@ -2182,18 +2172,16 @@ class MetalModelRunner:
                     unexpected_empty_req_ids[:16],
                 )
 
-    def _cleanup_finished_requests(
+    def _reconcile_request_lifecycle(
         self,
         evicted_req_ids: set[str],
         *,
+        preempted_req_ids: set[str] | None = None,
+        resumed_req_ids: set[str] | None = None,
         materialize_runtime_state: bool = True,
     ) -> None:
-        """Evict runner-owned state for finished requests."""
+        """Reconcile runner metadata and runtime-owned recurrent state."""
         runtime = self._paged_attention_runtime
-        if not evicted_req_ids:
-            if materialize_runtime_state and runtime is not None:
-                runtime.materialize_pending_state()
-            return
 
         for req_id in evicted_req_ids:
             state = self._request_states.pop(req_id, None)
@@ -2208,7 +2196,13 @@ class MetalModelRunner:
             self._paged_request_seq_lens.pop(req_id, None)
 
         if runtime is not None:
-            runtime.release_requests(evicted_req_ids)
+            runtime_invalidated = set(evicted_req_ids)
+            if preempted_req_ids:
+                runtime_invalidated.update(preempted_req_ids)
+            if resumed_req_ids:
+                runtime_invalidated.update(resumed_req_ids)
+            if runtime_invalidated:
+                runtime.release_requests(runtime_invalidated)
             if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
@@ -2245,8 +2239,10 @@ class MetalModelRunner:
         # Scheduler cleanup is independent of whether this step's work is
         # supported. If the next check raises, old request state must still be
         # evicted and any pending GDN release must be materialized now.
-        self._cleanup_finished_requests(
+        self._reconcile_request_lifecycle(
             evicted_req_ids,
+            preempted_req_ids=scheduler_output.preempted_req_ids,
+            resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
         # Pre-register mm_features so a new request whose first encoder input

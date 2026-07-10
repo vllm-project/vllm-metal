@@ -1449,7 +1449,7 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._paged_request_seq_lens["done"] = 1
 
         released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
-        runner._cleanup_finished_requests({"done"}, materialize_runtime_state=False)
+        runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
         reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
         assert reused_slot == released_slot
 
@@ -1478,6 +1478,107 @@ class TestV1MetalModelRunnerGDNSubmit:
 
 
 class TestV1MetalModelRunnerGDNLifecycle:
+    def _make_runner(
+        self,
+    ) -> tuple[mr.MetalModelRunner, HybridRuntimeStub, GDNPagedStateCache]:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        return runner, runtime, cache
+
+    def _make_scheduler_output(
+        self,
+        *,
+        resumed_req_ids: set[str] | None = None,
+        preempted_req_ids: set[str] | None = None,
+        scheduled_encoder_inputs: dict[str, list[int]] | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=list(resumed_req_ids or ()),
+                resumed_req_ids=resumed_req_ids or set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[None] * len(resumed_req_ids or ()),
+                num_computed_tokens=[0] * len(resumed_req_ids or ()),
+                num_output_tokens=[0] * len(resumed_req_ids or ()),
+            ),
+            num_scheduled_tokens=dict.fromkeys(resumed_req_ids or (), 1),
+            total_num_scheduled_tokens=len(resumed_req_ids or ()),
+            scheduled_spec_decode_tokens={},
+            num_invalid_spec_tokens=None,
+            scheduled_encoder_inputs=scheduled_encoder_inputs or {},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=preempted_req_ids or set(),
+            has_structured_output_requests=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("event_kwargs", "req_id"),
+        [
+            ({"preempted_req_ids": {"req-0"}}, "req-0"),
+            ({"resumed_req_ids": {"req-0"}}, "req-0"),
+        ],
+        ids=["preempted", "resumed"],
+    )
+    def test_preempt_or_resume_releases_runtime_state_not_runner_metadata(
+        self,
+        event_kwargs: dict[str, set[str]],
+        req_id: str,
+    ) -> None:
+        runner, runtime, cache = self._make_runner()
+        state = mr.RequestState(
+            token_ids=[1, 2],
+            prompt_len=2,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        runner._request_states[req_id] = state
+        runner._paged_request_seq_lens[req_id] = 2
+        slot = runtime.gdn_state_manager.assign_step_slots([req_id])[0]
+
+        cache.set_pending_conv_state(
+            0,
+            [slot],
+            mx.full((1, 1, 4), 7, dtype=mx.float32),
+        )
+        cache.set_pending_recurrent_state(
+            0,
+            [slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+        scheduler_output = self._make_scheduler_output(
+            scheduled_encoder_inputs={req_id: [0]},
+            **event_kwargs,
+        )
+
+        with pytest.raises(RuntimeError, match="Multimodal encoder dispatch"):
+            runner.execute_model(scheduler_output)
+
+        assert runner._request_states[req_id] is state
+        assert runner._paged_request_seq_lens[req_id] == 2
+        assert runtime.gdn_state_manager.request_slots == {}
+        assert runtime.gdn_state_manager.free_slots == (slot,)
+        assert runtime.gdn_state_manager.needs_materialize is False
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][slot]), 7)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
+
     def test_start_paged_forward_assigns_hybrid_slots_in_batch_order(
         self, monkeypatch
     ) -> None:
@@ -1571,7 +1672,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         runner._paged_request_seq_lens["done"] = 1
 
         released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
-        runner._cleanup_finished_requests({"done"}, materialize_runtime_state=False)
+        runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
         reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
         assert reused_slot == released_slot
 
