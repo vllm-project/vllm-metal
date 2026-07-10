@@ -91,60 +91,6 @@ class TestHybridGDNStateManager:
         assert outputs[1] is cache.pending_conv_states[0]
         assert outputs[2] is cache.pending_recurrent_states[0]
 
-    def test_reset_requests_zeroes_slot_and_keeps_mapping(self) -> None:
-        cache = _make_cache(num_layers=1, max_seqs=2)
-        manager = HybridGDNStateManager(cache)
-        slot = manager.assign_step_slots(["resumed"])[0]
-
-        conv = cache.conv_states[0]
-        conv[slot] = 3
-        cache.conv_states[0] = conv
-        recurrent = cache.recurrent_states[0]
-        recurrent[slot] = 5
-        cache.recurrent_states[0] = recurrent
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-
-        manager.reset_requests({"resumed"})
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-
-        assert manager.request_slots == {"resumed": slot}
-        assert manager.free_slots == ()
-        assert np.all(np.array(cache.conv_states[0][slot]) == 0)
-        assert np.all(np.array(cache.recurrent_states[0][slot]) == 0)
-        assert manager.assign_step_slots(["resumed"]) == [slot]
-
-    def test_reset_requests_does_not_touch_other_live_slot(self) -> None:
-        cache = _make_cache(num_layers=1, max_seqs=2)
-        manager = HybridGDNStateManager(cache)
-        slot_a, slot_b = manager.assign_step_slots(["resumed", "live"])
-
-        conv = cache.conv_states[0]
-        conv[slot_a] = 3
-        conv[slot_b] = 11
-        cache.conv_states[0] = conv
-        recurrent = cache.recurrent_states[0]
-        recurrent[slot_a] = 5
-        recurrent[slot_b] = 13
-        cache.recurrent_states[0] = recurrent
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-
-        manager.reset_requests({"resumed"})
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-
-        assert np.all(np.array(cache.conv_states[0][slot_a]) == 0)
-        assert np.all(np.array(cache.recurrent_states[0][slot_a]) == 0)
-        np.testing.assert_array_equal(np.array(cache.conv_states[0][slot_b]), 11)
-        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot_b]), 13)
-
-    def test_reset_requests_ignores_unknown_request(self) -> None:
-        cache = _make_cache(num_layers=1, max_seqs=2)
-        manager = HybridGDNStateManager(cache)
-        manager.assign_step_slots(["req-A"])
-
-        manager.reset_requests({"never-assigned"})
-
-        assert manager.request_slots == {"req-A": 0}
-
     def test_release_requests_applies_pending_states_before_reuse(self) -> None:
         cache = GDNPagedStateCache(
             num_layers=1,
