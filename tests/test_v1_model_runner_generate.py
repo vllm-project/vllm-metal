@@ -1659,13 +1659,24 @@ class _RecordingMTPHead:
 
 
 class TestInstallDrafterMtpDispatch:
-    def _make_mtp_spec(self, *, model_type: str) -> SimpleNamespace:
+    def _make_mtp_spec(
+        self, *, model_type: str, num_speculative_tokens: int = 1
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             method="mtp",
             uses_draft_model=lambda: False,
+            num_speculative_tokens=num_speculative_tokens,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type=model_type),
             ),
+        )
+
+    def _make_vllm_config(
+        self, spec: SimpleNamespace, *, enable_prefix_caching: bool = False
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
         )
 
     def test_registered_head_builds_and_installs_its_proposer(
@@ -1721,3 +1732,24 @@ class TestInstallDrafterMtpDispatch:
         message = str(excinfo.value)
         assert "'eagle'" in message
         assert "Gemma4 MTP" in message
+
+    def test_glm_head_rejects_prefix_caching_through_install_drafter(self) -> None:
+        runner = make_stub_runner(tokenizer=object(), kv_cache_dtype=None)
+        runner.vllm_config = self._make_vllm_config(
+            self._make_mtp_spec(model_type="glm4_moe_lite_mtp"),
+            enable_prefix_caching=True,
+        )
+
+        with pytest.raises(NotImplementedError, match="no-enable-prefix-caching"):
+            runner.install_drafter(num_blocks=1, block_size=16)
+
+    def test_glm_head_rejects_multi_token_through_install_drafter(self) -> None:
+        runner = make_stub_runner(tokenizer=object(), kv_cache_dtype=None)
+        runner.vllm_config = self._make_vllm_config(
+            self._make_mtp_spec(
+                model_type="glm4_moe_lite_mtp", num_speculative_tokens=2
+            ),
+        )
+
+        with pytest.raises(NotImplementedError, match="at most 1 speculative"):
+            runner.install_drafter(num_blocks=1, block_size=16)
