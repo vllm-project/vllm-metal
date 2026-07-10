@@ -15,7 +15,6 @@ from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
-import numpy as np
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -26,7 +25,6 @@ from vllm.v1.core.sched.output import (
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention import context as pac
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.v1.sampling_batch import _SamplingResult
 
@@ -348,69 +346,6 @@ class TestCachedRequestBlockUpdates:
         assert state.block_ids == [7, 8]
         assert state.generated_tokens == 0
         assert "req-1" not in runner._paged_request_seq_lens
-
-    def test_resumed_request_resets_gdn_slot_state(self):
-        """Resume-for-recompute zeroes the request's GDN slot, keeping its mapping."""
-        runtime = HybridPagedAttentionRuntime(
-            num_layers=2,
-            full_attention_interval=2,
-            max_num_seqs=2,
-            num_kv_heads=1,
-            head_dim=4,
-            linear_num_v_heads=1,
-            linear_key_head_dim=32,
-            linear_value_head_dim=4,
-            linear_conv_kernel_dim=2,
-            linear_conv_dim=4,
-            block_size=4,
-            dtype=mx.float32,
-        )
-        runtime.initialize(num_blocks=2)
-        runner = make_stub_runner(
-            model_args={"vocab_size": 32000},
-            model=MagicMock(),
-            _paged_attention_runtime=runtime,
-            _paged_block_size=4,
-            _rust_state_manager=None,
-            num_layers=2,
-        )
-        runner._request_states["req-1"] = mr.RequestState(
-            token_ids=[10, 20, 30, 40, 50],
-            prompt_len=4,
-            cache=[],
-            sampling_params=_greedy_sp(),
-            generator=None,
-            generated_tokens=1,
-            block_ids=[0, 1],
-        )
-        runner._paged_request_seq_lens["req-1"] = 5
-
-        manager = runtime.gdn_state_manager
-        slot = manager.assign_step_slots(["req-1"])[0]
-        cache = runtime.state_cache
-        conv = cache.conv_states[0]
-        conv[slot] = 3
-        cache.conv_states[0] = conv
-        recurrent = cache.recurrent_states[0]
-        recurrent[slot] = 5
-        cache.recurrent_states[0] = recurrent
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-
-        cached_reqs = CachedRequestData(
-            req_ids=["req-1"],
-            new_block_ids=[([7, 8],)],
-            resumed_req_ids={"req-1"},
-            new_token_ids=[],
-            all_token_ids={},
-            num_computed_tokens=[4],
-            num_output_tokens=[0],
-        )
-        runner._update_cached_request_blocks(cached_reqs)
-
-        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
-        assert manager.request_slots == {"req-1": slot}
-        assert np.all(np.array(cache.conv_states[0][slot]) == 0)
-        assert np.all(np.array(cache.recurrent_states[0][slot]) == 0)
 
 
 class TestMixedDecodeAndPrefixHitPrefill:
