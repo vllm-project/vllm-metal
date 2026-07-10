@@ -57,11 +57,7 @@ class ProposeContext:
 
 
 class MetalProposer(Protocol):
-    """Uniform drafting seam.
-
-    Implementations: :class:`Gemma4MTPProposer`, and (draft-model SD) a
-    ``DraftModelProposer``.
-    """
+    """Uniform drafting seam."""
 
     def needs_target_hidden_states(
         self,
@@ -95,9 +91,6 @@ class Gemma4MTPProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # The assistant consumes the previous target step's hidden states for
-        # decode and final-prefill rows; intermediate prefill chunks never
-        # sample, so they cannot seed a draft.
         return bool(decode_segments) or has_final_prefill
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
