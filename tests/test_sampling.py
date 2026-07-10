@@ -347,6 +347,63 @@ class TestV1SamplingBatch:
         bad_sp._bad_words_token_ids = [[99]]
         assert not self._batch([bad_sp]).can_use_native_greedy()
 
+    def test_native_greedy_gates_on_builtin_logitsproc_activity(self) -> None:
+        """Always-registered MinTokens/LogitBias builtins are non-argmax-invariant,
+        but standard greedy must still take the native MLX path (they are no-ops
+        unless their params are set). Active params, or any unrecognized
+        non-argmax-invariant processor, must fall back to the vLLM sampler."""
+        from types import SimpleNamespace
+
+        from vllm.v1.sample.logits_processor import (
+            LogitsProcessors,
+            build_logitsprocs,
+        )
+
+        def _builtins() -> LogitsProcessors:
+            config = SimpleNamespace(
+                speculative_config=None,
+                scheduler_config=SimpleNamespace(max_num_seqs=4),
+            )
+            return build_logitsprocs(
+                config,
+                torch.device("cpu"),
+                is_pin_memory=False,
+                is_pooling_model=False,
+            )
+
+        def _batch(sp: SamplingParams, procs: LogitsProcessors) -> SamplingBatch:
+            return SamplingBatch(
+                [sp],
+                [[1, 2, 3]],
+                [[]],
+                vocab_size=VOCAB_SIZE,
+                device=torch.device("cpu"),
+                logitsprocs=procs,
+            )
+
+        # Dormant builtins: native greedy still allowed despite their presence.
+        assert _batch(
+            SamplingParams(temperature=0.0), _builtins()
+        ).can_use_native_greedy()
+        # Active logit_bias must fall back so the bias is actually applied.
+        assert not _batch(
+            SamplingParams(temperature=0.0, logit_bias={1: 5.0}), _builtins()
+        ).can_use_native_greedy()
+        # Active min_tokens must fall back so EOS masking is applied.
+        assert not _batch(
+            SamplingParams(temperature=0.0, min_tokens=5), _builtins()
+        ).can_use_native_greedy()
+
+        # An unrecognized non-argmax-invariant processor forces the safe path.
+        class _UnknownNonArgmax:
+            def is_argmax_invariant(self) -> bool:
+                return False
+
+        assert not _batch(
+            SamplingParams(temperature=0.0),
+            LogitsProcessors([_UnknownNonArgmax()]),
+        ).can_use_native_greedy()
+
     def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
         """Greedy with allowed_token_ids must fall back and the constraint works."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)

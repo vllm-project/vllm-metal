@@ -14,6 +14,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -166,7 +170,15 @@ class SamplingBatch:
 
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
-        if any(self.logitsprocs.non_argmax_invariant):
+        # MinTokens and LogitBias are the only non-argmax-invariant builtins, and
+        # both are no-ops unless their request params are set. Gate on those params
+        # below so standard greedy decode uses native MLX argmax instead of bridging
+        # the full-vocab logits to the torch sampler every step. Any other
+        # non-argmax-invariant processor forces the safe torch path.
+        if any(
+            type(proc) not in (MinTokensLogitsProcessor, LogitBiasLogitsProcessor)
+            for proc in self.logitsprocs.non_argmax_invariant
+        ):
             return False
         return all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
@@ -178,6 +190,8 @@ class SamplingBatch:
             and sampling_params.logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
+            and not sampling_params.logit_bias
+            and (sampling_params.min_tokens or 0) == 0
             for sampling_params in self.sampling_params_list
         )
 
