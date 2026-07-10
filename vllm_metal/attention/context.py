@@ -121,6 +121,69 @@ class OffsetCache:
 
 
 # ---------------------------------------------------------------------------
+# Slot mapping helpers
+# ---------------------------------------------------------------------------
+
+
+def _slot_for_pos(block_ids: list[int], pos: int, block_size: int) -> int:
+    block_index, block_offset = divmod(pos, block_size)
+    return block_ids[block_index] * block_size + block_offset
+
+
+def _has_contiguous_physical_blocks(
+    block_ids: list[int],
+    start_block: int,
+    end_block: int,
+) -> bool:
+    expected = block_ids[start_block]
+    for table_idx in range(start_block + 1, end_block + 1):
+        expected += 1
+        if block_ids[table_idx] != expected:
+            return False
+    return True
+
+
+def _append_slot_range(
+    slot_mapping: list[int],
+    block_ids: list[int],
+    start_pos: int,
+    num_tokens: int,
+    block_size: int,
+) -> None:
+    """Append slots for a contiguous logical token span.
+
+    Most prefill chunks in practice are backed by physically contiguous KV
+    blocks.  In that case, every token slot is one arithmetic range even when
+    the logical span crosses block boundaries, so avoid the per-token loop from
+    the original implementation.
+    """
+    if num_tokens <= 0:
+        return
+
+    start_block, block_offset = divmod(start_pos, block_size)
+    start_slot = block_ids[start_block] * block_size + block_offset
+
+    if num_tokens == 1:
+        slot_mapping.append(start_slot)
+        return
+
+    end_block = (start_pos + num_tokens - 1) // block_size
+    if _has_contiguous_physical_blocks(block_ids, start_block, end_block):
+        slot_mapping.extend(range(start_slot, start_slot + num_tokens))
+        return
+
+    pos = start_pos
+    remaining = num_tokens
+    while remaining:
+        block_index, block_offset = divmod(pos, block_size)
+        chunk = min(block_size - block_offset, remaining)
+        start_slot = block_ids[block_index] * block_size + block_offset
+        slot_mapping.extend(range(start_slot, start_slot + chunk))
+        pos += chunk
+        remaining -= chunk
+
+
+# ---------------------------------------------------------------------------
 # Prepare functions — called before each forward pass
 # ---------------------------------------------------------------------------
 
@@ -147,13 +210,55 @@ def prepare_unified(
             chunk (0 for a fresh prefill, >0 for continuation chunks).
         block_size: tokens per KV cache block.
     """
+    single_token_decode_only = not prefill_requests
+    for decode_request in decode_requests:
+        if len(decode_request) == 3:
+            num_tokens = decode_request[2]
+            if num_tokens != 1:
+                single_token_decode_only = False
+
+    num_decode_requests = len(decode_requests)
+
+    # Very common serving hot path: pure batched decode with one token per
+    # request.  A 3-tuple with num_tokens == 1 is metadata-equivalent to the
+    # 2-tuple form, so keep it on this fast path.
+    if single_token_decode_only:
+        n = num_decode_requests
+        slot_mapping = [0] * n
+        cu_seqlens = list(range(n + 1))
+        block_tables: list[list[int]] = []
+        context_lens = [0] * n
+        offsets = [0] * n
+
+        for i, decode_request in enumerate(decode_requests):
+            block_ids = decode_request[0]
+            seq_len = decode_request[1]
+            slot_mapping[i] = _slot_for_pos(block_ids, seq_len, block_size)
+            block_tables.append(block_ids)
+            context_lens[i] = seq_len + 1
+            offsets[i] = seq_len
+
+        set_context(
+            PagedAttentionContext(
+                slot_mapping=slot_mapping,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                cu_seqlens=cu_seqlens,
+                offsets=offsets,
+                num_decode_requests=num_decode_requests,
+            )
+        )
+        return
+
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
     block_tables: list[list[int]] = []
     context_lens: list[int] = []
     offsets: list[int] = []
+    cu_len = 0
 
-    # Decode requests first.
+    # Decode requests first.  Multi-token decode is represented as one token
+    # per varlen segment for speculative verification.
     for decode_request in decode_requests:
         if len(decode_request) == 2:
             block_ids, seq_len = decode_request
@@ -161,22 +266,20 @@ def prepare_unified(
         else:
             block_ids, seq_len, num_tokens = decode_request
 
-        for pos in range(seq_len, seq_len + num_tokens):
-            block_idx = block_ids[pos // block_size]
-            slot = block_idx * block_size + (pos % block_size)
-            slot_mapping.append(slot)
-            cu_seqlens.append(cu_seqlens[-1] + 1)
-            block_tables.append(block_ids)
-            context_lens.append(pos + 1)  # including this decode token
-            offsets.append(pos)  # RoPE position
+        _append_slot_range(slot_mapping, block_ids, seq_len, num_tokens, block_size)
 
-    # Prefill requests (variable tokens each, starting at start_pos)
+        for pos in range(seq_len, seq_len + num_tokens):
+            cu_len += 1
+            cu_seqlens.append(cu_len)
+            block_tables.append(block_ids)
+            context_lens.append(pos + 1)
+            offsets.append(pos)
+
+    # Prefill requests (variable tokens each, starting at start_pos).
     for block_ids, num_tokens, start_pos in prefill_requests:
-        for pos in range(start_pos, start_pos + num_tokens):
-            block_idx = block_ids[pos // block_size]
-            slot = block_idx * block_size + (pos % block_size)
-            slot_mapping.append(slot)
-        cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        _append_slot_range(slot_mapping, block_ids, start_pos, num_tokens, block_size)
+        cu_len += num_tokens
+        cu_seqlens.append(cu_len)
         block_tables.append(block_ids)
         context_lens.append(start_pos + num_tokens)
         offsets.append(start_pos)
@@ -188,6 +291,6 @@ def prepare_unified(
             context_lens=context_lens,
             cu_seqlens=cu_seqlens,
             offsets=offsets,
-            num_decode_requests=len(decode_requests),
+            num_decode_requests=num_decode_requests,
         )
     )

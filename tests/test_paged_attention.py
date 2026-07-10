@@ -18,6 +18,81 @@ from vllm_metal.attention.context import (
 )
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 
+DecodeRequest = tuple[list[int], int] | tuple[list[int], int, int]
+PrefillRequest = tuple[list[int], int, int]
+PrepareMetadata = tuple[
+    list[int],
+    list[int],
+    list[list[int]],
+    list[int],
+    list[int],
+    int,
+]
+
+
+def _reference_prepare_unified(
+    decode_requests: list[DecodeRequest],
+    prefill_requests: list[PrefillRequest],
+    block_size: int,
+) -> PrepareMetadata:
+    slot_mapping: list[int] = []
+    cu_seqlens: list[int] = [0]
+    block_tables: list[list[int]] = []
+    context_lens: list[int] = []
+    offsets: list[int] = []
+
+    for decode_request in decode_requests:
+        if len(decode_request) == 2:
+            block_ids, seq_len = decode_request
+            num_tokens = 1
+        else:
+            block_ids, seq_len, num_tokens = decode_request
+
+        for pos in range(seq_len, seq_len + num_tokens):
+            block_idx = block_ids[pos // block_size]
+            slot_mapping.append(block_idx * block_size + (pos % block_size))
+            cu_seqlens.append(cu_seqlens[-1] + 1)
+            block_tables.append(block_ids)
+            context_lens.append(pos + 1)
+            offsets.append(pos)
+
+    for block_ids, num_tokens, start_pos in prefill_requests:
+        for pos in range(start_pos, start_pos + num_tokens):
+            block_idx = block_ids[pos // block_size]
+            slot_mapping.append(block_idx * block_size + (pos % block_size))
+        cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        block_tables.append(block_ids)
+        context_lens.append(start_pos + num_tokens)
+        offsets.append(start_pos)
+
+    return (
+        slot_mapping,
+        cu_seqlens,
+        block_tables,
+        context_lens,
+        offsets,
+        len(decode_requests),
+    )
+
+
+def _current_prepare_unified_metadata(
+    decode_requests: list[DecodeRequest],
+    prefill_requests: list[PrefillRequest],
+    block_size: int,
+) -> PrepareMetadata:
+    prepare_unified(decode_requests, prefill_requests, block_size)
+    ctx = get_context()
+    assert ctx is not None
+    assert ctx.cu_seqlens is not None
+    return (
+        ctx.slot_mapping,
+        ctx.cu_seqlens,
+        ctx.block_tables,
+        ctx.context_lens,
+        ctx.offsets,
+        ctx.num_decode_requests,
+    )
+
 
 class TestOffsetCache:
     def test_offset_property(self):
@@ -218,6 +293,39 @@ class TestPrepare:
         assert ctx.offsets == [7, 0]
         assert ctx.context_lens == [8, 5]
         assert ctx.block_tables == [[5, 6], [10, 11]]
+
+    @pytest.mark.parametrize(
+        ("decode_requests", "prefill_requests", "block_size"),
+        [
+            # Crosses physically non-contiguous blocks.
+            ([], [([10, 40, 11], 8, 2)], 4),
+            # Non-power-of-two block size.
+            ([], [([1, 3, 2], 5, 5)], 7),
+            # Mixed speculative decode and prefix-hit prefill, both non-contiguous.
+            ([([5, 9, 4], 5, 3)], [([7, 20, 8], 6, 3)], 4),
+            # Non-power-of-two speculative decode.
+            ([([2, 4, 8], 8, 3)], [], 7),
+            # 3-tuple single-token decode stays equivalent to the 2-tuple form.
+            ([([5, 6], 7, 1)], [], 4),
+            # Zero-length prefill keeps segment metadata without adding slots.
+            ([([2, 4, 8], 8)], [([1, 3, 5], 8, 6), ([10, 11], 0, 0)], 7),
+        ],
+    )
+    def test_prepare_unified_matches_reference_edge_cases(
+        self,
+        decode_requests,
+        prefill_requests,
+        block_size,
+    ):
+        assert _current_prepare_unified_metadata(
+            decode_requests,
+            prefill_requests,
+            block_size,
+        ) == _reference_prepare_unified(
+            decode_requests,
+            prefill_requests,
+            block_size,
+        )
 
 
 class TestPackedRoPE:
