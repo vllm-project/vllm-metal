@@ -100,6 +100,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 # PP requires synchronous scheduling: the first stage has no
                 # sampler and rebuilds tokens from the scheduler, so a valid PP
@@ -214,6 +215,7 @@ class TestMetalPlatform:
                 tokenizer=None,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
+                is_hybrid=False,
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=False,
@@ -311,6 +313,7 @@ class TestMetalPlatform:
             "tokenizer": None,
             "max_model_len": 32768,
             "hf_config": SimpleNamespace(model_type="qwen3"),
+            "is_hybrid": False,
         }
         model_fields.update(model or {})
         return SimpleNamespace(
@@ -800,6 +803,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -852,6 +856,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -866,6 +871,47 @@ class TestMetalPlatform:
             assert vllm_config.scheduler_config.enable_chunked_prefill is True
             # max_num_batched_tokens should NOT be bumped (chunked prefill handles it)
             assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_hybrid_prefix_caching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None,
+                    enable_prefix_caching=True,
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=True,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            with pytest.raises(NotImplementedError, match="Prefix caching"):
+                MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
 
@@ -898,6 +944,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -943,6 +990,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -992,6 +1040,7 @@ class TestMetalPlatform:
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
                 ),
                 scheduler_config=SimpleNamespace(
                     async_scheduling=True,
@@ -1032,6 +1081,7 @@ class TestMetalPlatform:
                 tokenizer=None,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
+                is_hybrid=False,
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=True,
@@ -1064,6 +1114,7 @@ class TestMetalPlatform:
                 tokenizer="custom-tokenizer",
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
+                is_hybrid=False,
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=True,
@@ -1098,6 +1149,7 @@ class TestMetalPlatform:
                 max_model_len=128,
                 multimodal_config=SimpleNamespace(language_model_only=False),
                 hf_config=SimpleNamespace(model_type="gemma4"),
+                is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -1144,6 +1196,7 @@ class TestMetalPlatform:
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
+                is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -1188,6 +1241,7 @@ class TestMetalPlatform:
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(model_type="qwen3_vl"),
+                is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -1236,6 +1290,7 @@ class TestMetalPlatform:
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
+                is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -1280,6 +1335,7 @@ class TestMetalPlatform:
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(model_type="phi3_v"),
+                is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
