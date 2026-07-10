@@ -1177,11 +1177,13 @@ class MetalModelRunner:
         assert logits is not None
 
         # ---- wait for MLX forward to complete ----
+        # Only force logits here when something before sampling consumes them
+        # eagerly: the Gemma4 MTP drafter (target_hidden_states) or the
+        # structured-output bitmask. Otherwise the sampler's own eval pulls the
+        # forward through, so a separate wait here is a redundant per-step sync.
         if target_hidden_states is not None:
-            # The Gemma4 MTP assistant drafter will consume these rows after
-            # sampling; evaluate them with logits so the retained state is ready.
             mx.eval(logits, target_hidden_states)
-        else:
+        elif grammar_output is not None:
             mx.eval(logits)
 
         # ---- apply structured output bitmask if present ----
