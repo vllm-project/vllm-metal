@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 
 import mlx.core as mx
+import mlx.nn as nn
 
 
 def _apply_mrope_segment(
@@ -50,6 +52,74 @@ def _apply_mrope_segment_with_positions(
 
     cos, sin = rotary_emb(q_seg, position_ids)  # type: ignore[operator]
     return apply_multimodal_rotary_pos_emb(q_seg, k_seg, cos, sin)
+
+
+def _supports_batched_offsets(rope_fn: object) -> bool:
+    """Return whether a RoPE callable supports vectorized MLX offsets."""
+    return isinstance(rope_fn, nn.RoPE) or (
+        isinstance(rope_fn, partial) and rope_fn.func is mx.fast.rope
+    )
+
+
+def _apply_equal_length_batched_rope(
+    rope_fn: Callable[..., mx.array],
+    x: mx.array,
+    segment_count: int,
+    segment_len: int,
+    batch_offsets: int | mx.array,
+) -> mx.array:
+    """Apply native RoPE to equal-length packed segments as one batch."""
+    batch, heads, _, head_dim = x.shape
+
+    if segment_len == 1:
+        batched = mx.reshape(
+            mx.transpose(x, (0, 2, 1, 3)),
+            (batch * segment_count, heads, 1, head_dim),
+        )
+    else:
+        batched = mx.reshape(
+            mx.transpose(
+                mx.reshape(
+                    x,
+                    (batch, heads, segment_count, segment_len, head_dim),
+                ),
+                (0, 2, 1, 3, 4),
+            ),
+            (batch * segment_count, heads, segment_len, head_dim),
+        )
+
+    if batch == 1 or isinstance(batch_offsets, int):
+        effective_offsets = batch_offsets
+    else:
+        effective_offsets = mx.reshape(
+            mx.broadcast_to(
+                batch_offsets[None, :],
+                (batch, segment_count),
+            ),
+            (-1,),
+        )
+
+    rotated = rope_fn(batched, offset=effective_offsets)
+
+    if segment_len == 1:
+        return mx.transpose(
+            mx.reshape(
+                rotated,
+                (batch, segment_count, heads, head_dim),
+            ),
+            (0, 2, 1, 3),
+        )
+
+    return mx.reshape(
+        mx.transpose(
+            mx.reshape(
+                rotated,
+                (batch, segment_count, heads, segment_len, head_dim),
+            ),
+            (0, 2, 1, 3, 4),
+        ),
+        x.shape,
+    )
 
 
 def apply_precomputed_mrope(
@@ -170,9 +240,40 @@ def apply_packed_rope(
     rope_fn = getattr(attn_module, "rope", None)
     rotary_emb = getattr(attn_module, "rotary_emb", None) if rope_fn is None else None
 
+    segment_count = len(cu_seqlens) - 1
+    if (
+        rope_fn is not None
+        and positions is None
+        and segment_count > 1
+        and cu_seqlens[0] == 0
+        and cu_seqlens[-1] == queries.shape[2]
+        and (not apply_keys or cu_seqlens[-1] == keys.shape[2])
+        and _supports_batched_offsets(rope_fn)
+    ):
+        segment_len = cu_seqlens[1]
+        if segment_len > 0 and all(
+            cu_seqlens[i + 1] == (i + 1) * segment_len for i in range(1, segment_count)
+        ):
+            if offsets is None:
+                batch_offsets: int | mx.array = 0
+            elif all(offsets[i] == offsets[0] for i in range(1, segment_count)):
+                batch_offsets = offsets[0]
+            else:
+                batch_offsets = mx.array(offsets[:segment_count])
+
+            rotated_q = _apply_equal_length_batched_rope(
+                rope_fn, queries, segment_count, segment_len, batch_offsets
+            )
+            if not apply_keys:
+                return rotated_q, keys
+            rotated_k = _apply_equal_length_batched_rope(
+                rope_fn, keys, segment_count, segment_len, batch_offsets
+            )
+            return rotated_q, rotated_k
+
     q_parts = []
     k_parts = []
-    for i in range(len(cu_seqlens) - 1):
+    for i in range(segment_count):
         start = cu_seqlens[i]
         end = cu_seqlens[i + 1]
         off = offsets[i] if offsets is not None else 0

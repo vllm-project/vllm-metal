@@ -7,7 +7,11 @@ Run with:
 
 from __future__ import annotations
 
+from functools import partial
+from types import SimpleNamespace
+
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from vllm_metal.attention.context import (
@@ -222,6 +226,123 @@ class TestPrepare:
 
 class TestPackedRoPE:
     """Tests for per-request RoPE position reset in packed prefill."""
+
+    @staticmethod
+    def _reference_rope(rope, x, cu_seqlens, offsets):
+        parts = []
+        for i, (start, end) in enumerate(
+            zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)
+        ):
+            offset = offsets[i] if offsets is not None else 0
+            parts.append(rope(x[:, :, start:end, :], offset=offset))
+        return mx.concatenate(parts, axis=2)
+
+    @pytest.mark.parametrize(
+        ("batch", "segment_len", "offsets"),
+        [
+            (1, 1, [3, 11, 29, 47]),
+            (1, 3, [2, 17, 31, 64]),
+            (2, 1, [5, 23, 41, 59]),
+            (2, 2, [13, 13, 13, 13]),
+            (1, 1, None),
+        ],
+    )
+    def test_native_rope_batches_equal_length_segments(
+        self, batch, segment_len, offsets
+    ):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        segment_count = 4
+        total_len = segment_count * segment_len
+        cu_seqlens = [i * segment_len for i in range(segment_count + 1)]
+        module = SimpleNamespace(rope=nn.RoPE(dims=8, traditional=False, base=10_000.0))
+        q = mx.random.normal((batch, 3, total_len, 8))
+        k = mx.random.normal((batch, 2, total_len, 8))
+
+        expected_q = self._reference_rope(module.rope, q, cu_seqlens, offsets)
+        expected_k = self._reference_rope(module.rope, k, cu_seqlens, offsets)
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    def test_fast_rope_partial_batches_equal_length_segments(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = partial(
+            mx.fast.rope,
+            dims=8,
+            traditional=False,
+            base=10_000.0,
+            scale=1.0,
+        )
+        module = SimpleNamespace(rope=rope)
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [7, 19, 43, 71]
+        q = mx.random.normal((1, 3, 4, 8))
+        k = mx.random.normal((1, 2, 4, 8))
+
+        expected_q = self._reference_rope(rope, q, cu_seqlens, offsets)
+        expected_k = self._reference_rope(rope, k, cu_seqlens, offsets)
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    def test_batched_rope_preserves_keys_when_not_applied(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        module = SimpleNamespace(rope=nn.RoPE(dims=8, traditional=False, base=10_000.0))
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 17, 41, 83]
+        q = mx.random.normal((1, 3, 4, 8))
+        k = mx.random.normal((1, 2, 4, 8))
+        expected_q = self._reference_rope(module.rope, q, cu_seqlens, offsets)
+
+        q_out, k_out = apply_packed_rope(
+            module,
+            q,
+            k,
+            cu_seqlens,
+            offsets=offsets,
+            apply_keys=False,
+        )
+        mx.eval(expected_q, q_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert k_out is k
+
+    def test_custom_rope_keeps_per_segment_call_contract(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        class RecordingRoPE:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, x, offset=0):
+                self.calls.append((x.shape, offset))
+                return x + offset
+
+        rope = RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        q = mx.zeros((1, 2, 3, 8))
+        k = mx.zeros((1, 1, 3, 8))
+
+        q_out, k_out = apply_packed_rope(module, q, k, [0, 1, 2, 3], offsets=[3, 5, 8])
+
+        assert [offset for _, offset in rope.calls] == [3, 3, 5, 5, 8, 8]
+        assert q_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
+        assert k_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
 
     def test_positions_reset_per_request(self):
         """Each packed request's RoPE should start from position 0."""
