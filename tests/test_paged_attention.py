@@ -269,6 +269,56 @@ class TestPackedRoPE:
         assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
         assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
 
+    @pytest.mark.parametrize("rope_kind", ["nn", "fast"])
+    @pytest.mark.parametrize(
+        "offsets",
+        [None, [5, 5, 5, 5]],
+        ids=["implicit-zero", "equal-nonzero"],
+    )
+    def test_single_token_equal_offsets_avoid_scalar_offset_kernel(
+        self, rope_kind, offsets
+    ):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        dims = 128
+        if rope_kind == "nn":
+            rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
+        else:
+            rope = partial(
+                mx.fast.rope,
+                dims=dims,
+                traditional=False,
+                base=10_000.0,
+                scale=1.0,
+            )
+
+        # Independently allocated rows trigger MLX #3494. Repeated/aliased
+        # rows can mask the scalar-offset single-token kernel bug.
+        def make_packed_tokens(heads):
+            rows = mx.array(
+                [
+                    mx.random.normal((heads, 1, dims)).astype(mx.float16).tolist()
+                    for _ in range(4)
+                ],
+                dtype=mx.float16,
+            )
+            return mx.transpose(rows, (2, 1, 0, 3))
+
+        module = SimpleNamespace(rope=rope)
+        q = make_packed_tokens(3)
+        k = make_packed_tokens(2)
+        cu_seqlens = [0, 1, 2, 3, 4]
+
+        expected_q = self._reference_rope(rope, q, cu_seqlens, offsets)
+        expected_k = self._reference_rope(rope, k, cu_seqlens, offsets)
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
     def test_fast_rope_partial_batches_equal_length_segments(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,

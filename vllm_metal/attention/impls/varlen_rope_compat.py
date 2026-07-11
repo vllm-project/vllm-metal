@@ -254,8 +254,18 @@ def apply_packed_rope(
         if segment_len > 0 and all(
             cu_seqlens[i + 1] == (i + 1) * segment_len for i in range(1, segment_count)
         ):
-            if offsets is None:
-                batch_offsets: int | mx.array = 0
+            batch_offsets: int | mx.array
+            # MLX 0.31.2 corrupts rows after the first for [B, H, 1, D]
+            # RoPE with a scalar offset (MLX #3494). Vector offsets select the
+            # correct kernel, including when every request has the same offset.
+            if segment_len == 1:
+                batch_offsets = (
+                    mx.zeros((segment_count,), dtype=mx.int32)
+                    if offsets is None
+                    else mx.array(offsets[:segment_count])
+                )
+            elif offsets is None:
+                batch_offsets = 0
             elif all(offsets[i] == offsets[0] for i in range(1, segment_count)):
                 batch_offsets = offsets[0]
             else:
