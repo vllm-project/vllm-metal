@@ -36,12 +36,16 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsLists,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
 
 from vllm_metal.attention.context import (
     OffsetCache,
@@ -260,7 +264,7 @@ class _PagedForwardState(NamedTuple):
     pooling_hidden_states: mx.array | None = None
 
 
-class MetalModelRunner:
+class MetalModelRunner(KVConnectorModelRunnerMixin):
     """Model runner for MLX-based inference on Metal.
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
@@ -597,6 +601,180 @@ class MetalModelRunner:
         This method exists to satisfy the engine's initialization protocol.
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+        self._kv_cache_config = kv_cache_config
+        # vLLM host contract: expose the paged KV cache to whatever KV-transfer
+        # connector is configured (no-op without one). The generic registration
+        # lives in KVConnectorModelRunnerMixin; Metal only supplies the tensors
+        # as torch views over its MLX buffers via the vLLM-defined hook below.
+        views = self._kv_caches_as_torch()
+        if views is not None:
+            self._kv_connector_views = views
+            self.register_kv_caches_with_connector(views)
+
+    # ------------------------------------------------------------------
+    # vLLM KV-connector host-contract hooks (see KVConnectorModelRunnerMixin).
+    # Metal's paged KV cache is MLX arrays, which vLLM cannot consume directly,
+    # so Metal exposes them as CPU torch views. Because the connector-facing
+    # per-layer buffer is ``torch.stack([K, V])`` -- and torch.stack ALLOCATES
+    # (the stacked buffer is a copy, not an MLX alias) -- Metal overrides the
+    # two generic sync hooks to refresh the copy before a save and write loaded
+    # KV back after a load. None of this is connector- or KV-format-aware; it is
+    # purely "present my buffers to vLLM's generic host contract as torch".
+    # ------------------------------------------------------------------
+    def _kv_connector_layer_names(self) -> list[str]:
+        cfg = getattr(self, "_kv_cache_config", None)
+        if cfg is None:
+            return []
+        names: list[str] = []
+        for group in cfg.kv_cache_groups:
+            names.extend(group.layer_names)
+        return names
+
+    def _kv_caches_as_torch(self) -> "dict[str, torch.Tensor] | None":
+        """Return ``{layer_name: stacked_kv_view}`` torch views over MLX buffers.
+
+        ``None`` when there is no paged runtime / per-layer K/V caches yet.
+        """
+        backend = self._paged_attention_runtime
+        if backend is None:
+            return None
+        from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+
+        kv_cache = getattr(backend, "kv_cache", None)
+        key_caches = getattr(kv_cache, "key_caches", None)
+        value_caches = getattr(kv_cache, "value_caches", None)
+        if not key_caches or not value_caches:
+            return None
+        names = self._kv_connector_layer_names()
+        if len(names) != len(key_caches):
+            names = [f"layer_{i}" for i in range(len(key_caches))]
+        views: dict[str, torch.Tensor] = {}
+        for i, name in enumerate(names):
+            k = mlx_to_torch(key_caches[i], device="cpu")
+            v = mlx_to_torch(value_caches[i], device="cpu")
+            views[name] = torch.stack([k, v], dim=0)
+        return views
+
+    @staticmethod
+    def _kv_connector_touched_blocks(scheduler_output) -> "list[int]":
+        """Physical KV-cache block ids touched this step, from generic vLLM
+        scheduler data only (per-request block tables) -- no connector metadata.
+        Used to narrow the MLX<->view sync to changed blocks."""
+        blocks: set[int] = set()
+        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or []
+        for req in new_reqs:
+            bids = getattr(req, "block_ids", None)
+            if bids:
+                blocks.update(bids[0])
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        new_block_ids = getattr(cached, "new_block_ids", None) or []
+        for entry in new_block_ids:
+            if entry:
+                blocks.update(entry[0])
+        return sorted(blocks)
+
+    def sync_kv_caches_before_save(self, scheduler_output) -> None:
+        """vLLM hook override: refresh the stacked views from live MLX before a
+        store (the stack is a copy). Narrowed to blocks touched this step."""
+        views = getattr(self, "_kv_connector_views", None)
+        backend = self._paged_attention_runtime
+        if not views or backend is None:
+            return
+        blocks = self._kv_connector_touched_blocks(scheduler_output)
+        if not blocks:
+            return
+        from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+
+        kv_cache = getattr(backend, "kv_cache", None)
+        key_caches = getattr(kv_cache, "key_caches", None)
+        value_caches = getattr(kv_cache, "value_caches", None)
+        if not key_caches or not value_caches:
+            return
+        idx = torch.tensor(blocks, dtype=torch.long)
+        for i, name in enumerate(list(views.keys())):
+            k = mlx_to_torch(key_caches[i], device="cpu")
+            v = mlx_to_torch(value_caches[i], device="cpu")
+            view = views[name]
+            view[0].index_copy_(0, idx, k.index_select(0, idx))
+            view[1].index_copy_(0, idx, v.index_select(0, idx))
+
+    def writeback_kv_caches_after_load(self, scheduler_output) -> None:
+        """vLLM hook override: write loaded KV from the stacked views back into
+        the live MLX cache after a retrieve. Narrowed to touched blocks."""
+        views = getattr(self, "_kv_connector_views", None)
+        backend = self._paged_attention_runtime
+        if not views or backend is None:
+            return
+        blocks = self._kv_connector_touched_blocks(scheduler_output)
+        if not blocks:
+            return
+        import mlx.core as _mx
+
+        from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+
+        kv_cache = getattr(backend, "kv_cache", None)
+        key_caches = getattr(kv_cache, "key_caches", None)
+        value_caches = getattr(kv_cache, "value_caches", None)
+        if not key_caches or not value_caches:
+            return
+        idx = torch.tensor(blocks, dtype=torch.long)
+        for i, name in enumerate(list(views.keys())):
+            stacked = views[name]
+            k_live = mlx_to_torch(key_caches[i], device="cpu")
+            v_live = mlx_to_torch(value_caches[i], device="cpu")
+            k_live.index_copy_(0, idx, stacked[0].index_select(0, idx))
+            v_live.index_copy_(0, idx, stacked[1].index_select(0, idx))
+        _mx.eval(*key_caches, *value_caches)
+
+    @staticmethod
+    def _has_kv_connector() -> bool:
+        from vllm.distributed.kv_transfer import has_kv_transfer_group
+
+        return has_kv_transfer_group()
+
+    def _kv_connector_begin_step(self, scheduler_output) -> None:
+        """Start-of-step connector driving for the async Metal forward path.
+
+        Mirrors the head of the generic mixin lifecycle
+        (bind_connector_metadata -> start_load_kv) then writes any loaded KV
+        back into the live MLX cache via the vLLM-defined writeback hook, so the
+        upcoming forward attends to the retrieved prefix. All connector calls go
+        through the generic get_kv_transfer_group() API; no connector-specific
+        knowledge lives here.
+        """
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        from vllm.forward_context import get_forward_context
+
+        connector = get_kv_transfer_group()
+        meta = scheduler_output.kv_connector_metadata
+        if meta is not None:
+            connector.bind_connector_metadata(meta)
+        try:
+            connector.start_load_kv(get_forward_context())
+        except Exception:  # noqa: BLE001 - no forward ctx on some steps
+            connector.start_load_kv(None)
+        self.writeback_kv_caches_after_load(scheduler_output)
+
+    def _kv_connector_end_step(self, scheduler_output) -> "KVConnectorOutput | None":
+        """End-of-step connector driving: refresh views from MLX (generic hook),
+        wait_for_save, drain finished async transfers, propagate invalid blocks,
+        and clear metadata -- mirroring the tail of the generic mixin lifecycle.
+        Returns the KVConnectorOutput to attach to the ModelRunnerOutput."""
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        connector = get_kv_transfer_group()
+        self.sync_kv_caches_before_save(scheduler_output)
+        connector.wait_for_save()
+        finished_sending, finished_recving = connector.get_finished(
+            scheduler_output.finished_req_ids
+        )
+        invalid_blocks = connector.get_block_ids_with_load_errors()
+        connector.clear_connector_metadata()
+        return KVConnectorOutput(
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+            invalid_block_ids=invalid_blocks,
+        )
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -2220,6 +2398,17 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
+        # vLLM KV-connector host contract (no-op without a kv_transfer_config).
+        # On a scheduler step with no tokens to run, drive the connector's
+        # async load/save so requests parked in WAITING_FOR_REMOTE_KVS complete
+        # (the generic kv_connector_no_forward from KVConnectorModelRunnerMixin).
+        # Otherwise begin this step's connector load and write retrieved KV back
+        # into the live MLX cache before the forward runs.
+        if self._has_kv_connector():
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            self._kv_connector_begin_step(scheduler_output)
+
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
@@ -2361,7 +2550,16 @@ class MetalModelRunner:
             if runtime is not None:
                 runtime.materialize_pending_state()
             self._validate_scheduled_outputs(batch, scheduler_output)
-            return self._build_output(batch)
+            output = self._build_output(batch)
+            # vLLM KV-connector host contract (no-op without a connector): the
+            # forward is now complete, so finalize this step's connector work
+            # (refresh views from live MLX, wait_for_save, drain finished async
+            # transfers) and attach the result for the scheduler.
+            if self._has_kv_connector():
+                kv_out = self._kv_connector_end_step(scheduler_output)
+                if kv_out is not None:
+                    output.kv_connector_output = kv_out
+            return output
 
         # Non-paged path: return output built by execute_model
         if self._pending_output is not None:

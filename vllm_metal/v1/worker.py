@@ -20,6 +20,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.worker.kv_connector_worker_mixin import KVConnectorWorkerMixin
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_metal.config import get_config
@@ -58,7 +59,7 @@ def init_worker_distributed_environment(
     )
 
 
-class MetalWorker(WorkerBase):
+class MetalWorker(KVConnectorWorkerMixin, WorkerBase):
     """Worker implementation for Apple Silicon Metal/MLX.
 
     This worker handles model loading and inference on Apple Silicon
@@ -247,6 +248,12 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # vLLM host contract: initialize the configured KV-transfer connector
+        # (if any) before the KV cache, so the worker-side connector exists when
+        # the runner registers its caches. Provided by KVConnectorWorkerMixin;
+        # no-op without a kv_transfer_config. Metal has no connector-specific
+        # knowledge here -- it only invokes the generic vLLM entry point.
+        self.maybe_initialize_kv_transfer(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
