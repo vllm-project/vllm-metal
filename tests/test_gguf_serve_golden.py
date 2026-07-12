@@ -199,3 +199,73 @@ def test_llama_gguf_greedy_matches_dense_reference_prefix() -> None:
         f"(gguf={gguf_ids}, dense={dense_ids})"
     )
     assert gguf_ids == _LLAMA_GOLDEN_IDS[:_LLAMA_DENSE_AGREE_PREFIX]
+
+
+# === mistral arch (Mistral-7B-Instruct-v0.3-Q8_0.gguf, target_dtype=bf16) ===
+# Greedy decode of _PROMPT. The GGUF declares general.architecture="llama"
+# (mistral converts under the llama arch, so the q/k RoPE un-permutation
+# applies through the adapter's mistral->llama alias); the config dir says
+# model_type="mistral" and omits head_dim. All 16 ids match the dense mlx_lm
+# reference (no quantized-vs-dense divergence inside the window).
+_MISTRAL_GOLDEN_IDS = [
+    6233,
+    29493,
+    1330,
+    1040,
+    6333,
+    1070,
+    1040,
+    5717,
+    4610,
+    1117,
+    28566,
+    4573,
+    29491,
+    781,
+    781,
+    1782,
+]
+_MISTRAL_DENSE_AGREE_PREFIX = 16
+
+_MISTRAL_GGUF_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_SERVE_PATH"
+_MISTRAL_TOK_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_TOKENIZER_PATH"
+_MISTRAL_DENSE_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_DENSE_PATH"
+
+
+@pytest.mark.slow
+def test_mistral_gguf_greedy_matches_committed_golden() -> None:
+    gguf_path = _require_path(_MISTRAL_GGUF_ENV)
+    tokenizer_dir = _require_path(_MISTRAL_TOK_ENV)
+
+    model, tokenizer = GGUFModelLoader(
+        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
+    ).load()
+
+    assert _greedy_token_ids(model, tokenizer, _PROMPT, _N) == _MISTRAL_GOLDEN_IDS
+
+
+@pytest.mark.slow
+def test_mistral_gguf_greedy_matches_dense_reference_prefix() -> None:
+    gguf_path = _require_path(_MISTRAL_GGUF_ENV)
+    tokenizer_dir = _require_path(_MISTRAL_TOK_ENV)
+    dense_dir = _require_path(_MISTRAL_DENSE_ENV)
+
+    dense_model, dense_tokenizer = mlx_lm_load(dense_dir)
+    dense_ids = _greedy_token_ids(
+        dense_model, dense_tokenizer, _PROMPT, _MISTRAL_DENSE_AGREE_PREFIX
+    )
+    del dense_model
+    mx.clear_cache()
+
+    gguf_model, gguf_tokenizer = GGUFModelLoader(
+        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
+    ).load()
+    gguf_ids = _greedy_token_ids(
+        gguf_model, gguf_tokenizer, _PROMPT, _MISTRAL_DENSE_AGREE_PREFIX
+    )
+
+    assert gguf_ids == dense_ids, (
+        "mistral Q8_0 GGUF greedy prefix must match the dense mlx_lm reference "
+        f"(gguf={gguf_ids}, dense={dense_ids})"
+    )
+    assert gguf_ids == _MISTRAL_GOLDEN_IDS[:_MISTRAL_DENSE_AGREE_PREFIX]

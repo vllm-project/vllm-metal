@@ -69,11 +69,12 @@ vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). A
 `.gguf` carries weights only, so it pairs with a companion config dir
 (`--tokenizer`) and needs the `gguf` extra; the weights stay MLX-native
-quantized (Q8_0/Q4_0, not a dense fallback). Scope is dense `qwen2`/`qwen3`
+quantized (Q8_0/Q4_0, not a dense fallback). Scope is dense
+`qwen2`/`qwen3`/`llama`/`mistral` (mistral converts under the llama GGUF arch)
 with per-tensor `Q8_0`/`Q4_0`; K-quants, `Q4_1`, fused-QKV, MoE, SSM/hybrid,
 vision, and remote `repo:quant` are rejected with a clear error. Verified
-end-to-end on Qwen3-0.6B Q8_0
-([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
+end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3
+Q8_0 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |

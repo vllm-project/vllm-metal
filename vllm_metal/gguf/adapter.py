@@ -72,6 +72,14 @@ class GGUFModelAdapter:
     # and are absent here. mistral (a llama-arch family) normalizes to "llama".
     _ROPE_PERMUTE_ARCHS = frozenset({"llama"})
 
+    # config model_type -> canonical arch for families llama.cpp folds into an
+    # existing GGUF arch (MistralForCausalLM converts under MODEL_ARCH.LLAMA,
+    # and mlx-lm builds "mistral" configs through its llama module). Exact-key
+    # lookup: a key must never collide with a real gguf MODEL_ARCH_NAMES entry
+    # (gguf-py has no plain "mistral" arch; the multimodal "mistral3"/"mistral4"
+    # archs do not match this key and stay allowlist-rejected).
+    _ARCH_ALIASES = {"mistral": "llama"}
+
     def __init__(
         self,
         *,
@@ -111,11 +119,12 @@ class GGUFModelAdapter:
                 f"Architecture {arch!r} is not a supported dense decoder; the GGUF "
                 f"loader supports {sorted(cls.SUPPORTED_DENSE_ARCHS)}."
             )
-        if arch != cls._normalize_arch(config_model_type):
+        config_arch = cls._normalize_arch(config_model_type)
+        if arch != config_arch:
             raise GGUFLoadError(
                 f"GGUF architecture {arch!r} does not match config model_type "
-                f"{cls._normalize_arch(config_model_type)!r}; the .gguf and "
-                "config_dir describe different models."
+                f"{config_model_type!r} (canonical {config_arch!r}); the .gguf "
+                "and config_dir describe different models."
             )
         return arch
 
@@ -207,9 +216,10 @@ class GGUFModelAdapter:
             .reshape(out_features)
         )
 
-    @staticmethod
-    def _normalize_arch(name: str) -> str:
-        return name.strip().lower().replace("-", "_")
+    @classmethod
+    def _normalize_arch(cls, name: str) -> str:
+        arch = name.strip().lower().replace("-", "_")
+        return cls._ARCH_ALIASES.get(arch, arch)
 
     @classmethod
     def _resolve_arch_enum(cls, gguf: Any, arch: str) -> Any | None:
