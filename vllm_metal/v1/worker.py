@@ -247,7 +247,40 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # vLLM host contract: initialize the configured KV-transfer connector
+        # (if any) before the runner allocates its KV cache, so the worker-side
+        # connector agent exists when the runner registers its caches. No-op
+        # without a kv_transfer_config. Uses vLLM's public API; connector- and
+        # KV-format-agnostic.
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self):
+        """Return this worker's KV-connector handshake metadata, if any.
+
+        Generic vLLM host-contract method: the engine core collects handshake
+        metadata from every worker via ``collective_rpc`` (duck-typed by name)
+        after KV setup. Keyed by ``(pp_rank, tp_rank)``. Returns ``None`` when no
+        connector is configured or the connector needs no handshake. Uses only
+        vLLM's public KV-transfer API; connector-agnostic.
+        """
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        metadata = connector.get_handshake_metadata()
+        if metadata is None:
+            return None
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""

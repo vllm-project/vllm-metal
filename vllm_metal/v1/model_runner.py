@@ -290,6 +290,11 @@ class MetalModelRunner:
         self._model_lifecycle = ModelLifecycle(self, self._model_adapter)
         self._lora = MetalLoRARuntime()
         self._spec_decode_controller = SpeculativeDecodeController()
+        # Bridges Metal's live MLX KV cache to vLLM's generic KVConnector
+        # contract. Connector-agnostic; no-op without a kv_transfer_config.
+        from vllm_metal.v1.kv_connector import MetalKVConnectorBridge
+
+        self._kv_connector_bridge = MetalKVConnectorBridge(self)
 
         self.model: Any = None
         self.tokenizer: Any = None
@@ -597,6 +602,10 @@ class MetalModelRunner:
         This method exists to satisfy the engine's initialization protocol.
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+        # Present Metal's live MLX KV cache to whatever generic vLLM KV-transfer
+        # connector is configured (no-op without one). Metal-specific only in
+        # that it aliases MLX buffers as torch; connector-agnostic otherwise.
+        self._kv_connector_bridge.on_initialize_kv_cache(kv_cache_config)
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -2216,9 +2225,34 @@ class MetalModelRunner:
         For the paged attention path, the forward pass is submitted
         asynchronously — sampling and postprocessing are deferred to
         ``sample_tokens`` so the scheduler can run while the GPU computes.
+
+        Thin wrapper: if the body raises after a KV-connector step was begun,
+        abort that step (clear connector metadata exactly once so the next
+        scheduler step does not inherit stale metadata) and re-raise the
+        original exception. No-op without a connector.
         """
+        try:
+            return self._execute_model_impl(scheduler_output)
+        except BaseException:
+            self._kv_connector_bridge.abort_step()
+            raise
+
+    def _execute_model_impl(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
         if self.model is None:
             raise RuntimeError("Model not loaded")
+
+        # vLLM KV-connector host contract (no-op without a kv_transfer_config).
+        # On a zero-token step, drive the connector's async load/save so
+        # requests parked in WAITING_FOR_REMOTE_KVS can complete. Otherwise
+        # begin this step's connector work (bind metadata + start loads); the
+        # loads write directly into the live MLX KV cache via the registered
+        # aliases, so there is no staging writeback.
+        if self._kv_connector_bridge.has_connector():
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                return self._kv_connector_bridge.no_forward(scheduler_output)
+            self._kv_connector_bridge.begin_step(scheduler_output)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
@@ -2343,7 +2377,20 @@ class MetalModelRunner:
         For the paged path, this is where the actual GPU synchronization,
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
+
+        Thin wrapper: if the body raises before the KV-connector step is
+        finished, abort that step (clear metadata once) and re-raise. No-op
+        without a connector or an in-flight step.
         """
+        try:
+            return self._sample_tokens_impl(grammar_output)
+        except BaseException:
+            self._kv_connector_bridge.abort_step()
+            raise
+
+    def _sample_tokens_impl(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | None:
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
             # Pipeline parallelism: only the last stage holds logits and samples.
@@ -2361,7 +2408,17 @@ class MetalModelRunner:
             if runtime is not None:
                 runtime.materialize_pending_state()
             self._validate_scheduled_outputs(batch, scheduler_output)
-            return self._build_output(batch)
+            output = self._build_output(batch)
+            # vLLM KV-connector host contract: the forward is complete and the
+            # live MLX KV writes are materialized, so finish this step's
+            # connector work (wait_for_save, drain finished transfers, propagate
+            # invalid blocks) and attach the result. The connector read/wrote
+            # the live aliases directly; no staging sync is performed.
+            if self._kv_connector_bridge.has_connector():
+                kv_out = self._kv_connector_bridge.finish_step()
+                if kv_out is not None:
+                    output.kv_connector_output = kv_out
+            return output
 
         # Non-paged path: return output built by execute_model
         if self._pending_output is not None:
