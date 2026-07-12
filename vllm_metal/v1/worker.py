@@ -247,7 +247,38 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # Initialize the KV-transfer connector (if one is configured) before the
+        # KV cache, mirroring vLLM's GPUWorker. This is the generic KVConnector
+        # host contract; it is connector-agnostic (no knowledge of any specific
+        # connector) and a no-op when no kv_transfer_config is set.
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """Return this worker's KV-connector handshake metadata, if any.
+
+        Generic KVConnector host contract mirroring vLLM's GPUWorker: the
+        engine core collects handshake metadata from every worker after KV
+        setup. Connector-agnostic and returns ``None`` when no connector is
+        configured or the connector needs no handshake exchange.
+        """
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        metadata = connector.get_handshake_metadata()
+        if metadata is None:
+            return None
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
