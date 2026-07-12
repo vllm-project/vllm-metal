@@ -140,25 +140,6 @@ class TestHybridTurboQuantCachePolicy:
 
             assert is_kv_cache_spec_uniform(specs) is False
 
-    def test_one_sequence_estimate_includes_linear_state(self) -> None:
-        runner = _hybrid_runner()
-        max_model_len = 2048
-        with patch("vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()):
-            estimate = runner._cache_policy.estimate_one_sequence_kv_bytes(
-                max_model_len=max_model_len, block_size=BLOCK_SIZE
-            )
-        linear_bytes = runner._cache_policy.linear_cache_bytes_per_slot()
-
-        aligned_tokens = -(-max_model_len // BLOCK_SIZE) * BLOCK_SIZE
-        sdpa_bytes = len(SDPA_LAYERS) * _turboquant_page_size_bytes(
-            block_size=aligned_tokens,
-            num_kv_heads=KV_HEADS,
-            head_dim=HEAD_DIM,
-            k_quant=K_QUANT,
-            v_quant=V_QUANT,
-        )
-        assert estimate == sdpa_bytes + linear_bytes
-
 
 class TestTurboQuantHybridAlignment:
     """MetalPlatform re-aligns hybrid block size with packed page math."""
@@ -215,46 +196,13 @@ class TestTurboQuantHybridAlignment:
             lambda architecture, model_config: (self._stub_model_cls(), None),
         )
 
-        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config)
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config, None)
 
         expected_block = 16 * -(-self._MAMBA_PAGE // (16 * self._TQ_PAGE_1_TOKEN))
         assert vllm_config.cache_config.block_size == expected_block
         expected_page = expected_block * self._TQ_PAGE_1_TOKEN
         assert expected_page >= self._MAMBA_PAGE
         assert vllm_config.cache_config.mamba_page_size_padded == expected_page
-
-    def test_realign_gates_on_additional_config(self, monkeypatch) -> None:
-        """Workers may run this hook before the metal singleton is populated.
-
-        ``additional_config`` travels with the pickled ``vllm_config``, so
-        gating on it keeps driver and worker processes consistent even when
-        the process-local singleton still has TurboQuant disabled.
-        """
-        vllm_config = self._vllm_config(block_size=544)
-        vllm_config.additional_config = {
-            "turboquant": True,
-            "k_quant": K_QUANT,
-            "v_quant": V_QUANT,
-        }
-        fresh_singleton = MetalConfig(
-            memory_fraction=-1.0,
-            use_mlx=False,
-            mlx_device="gpu",
-            debug=False,
-            use_paged_attention=True,
-        )
-        assert fresh_singleton.turboquant is False
-        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: fresh_singleton)
-        monkeypatch.setattr(
-            ModelRegistry,
-            "resolve_model_cls",
-            lambda architecture, model_config: (self._stub_model_cls(), None),
-        )
-
-        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config)
-
-        expected_block = 16 * -(-self._MAMBA_PAGE // (16 * self._TQ_PAGE_1_TOKEN))
-        assert vllm_config.cache_config.block_size == expected_block
 
     def test_realign_noop_without_turboquant(self, monkeypatch) -> None:
         vllm_config = self._vllm_config(block_size=544)
@@ -263,7 +211,7 @@ class TestTurboQuantHybridAlignment:
         config.turboquant = False
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: config)
 
-        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config)
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config, None)
 
         assert vllm_config.cache_config.block_size == 544
         assert vllm_config.cache_config.mamba_page_size_padded == before_padded
@@ -273,6 +221,57 @@ class TestTurboQuantHybridAlignment:
         vllm_config.model_config.is_hybrid = False
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
 
-        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config)
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(vllm_config, None)
 
         assert vllm_config.cache_config.block_size == 16
+
+    def test_update_block_size_snapshots_user_mamba_before_super(
+        self, monkeypatch
+    ) -> None:
+        """Ordering regression on a real ``CacheConfig``.
+
+        Upstream ``super()._align_hybrid_block_size`` overwrites
+        ``cache_config.mamba_block_size`` with its computed value while leaving
+        ``user_specified_mamba_block_size`` True, so the TurboQuant realign must
+        consume a snapshot taken *before* super(), not the post-super() value.
+        Uses ``--block-size 64`` + ``mamba_cache_mode="all"`` + a user mamba
+        block of 128, the exact case an isolated stub config cannot exercise.
+        """
+        from vllm.config import CacheConfig
+
+        cache_config = CacheConfig(block_size=64, mamba_block_size=128)
+        assert cache_config.user_specified_mamba_block_size is True
+        cache_config.mamba_cache_mode = "all"
+
+        vllm_config = SimpleNamespace(
+            cache_config=cache_config,
+            model_config=SimpleNamespace(is_hybrid=True),
+            parallel_config=SimpleNamespace(),
+        )
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
+
+        # Upstream super() overwrites mamba_block_size with its own result.
+        def fake_super(cls, vc) -> None:
+            vc.cache_config.mamba_block_size = 999  # != the user's 128
+
+        monkeypatch.setattr(
+            MetalPlatform.__mro__[1],
+            "update_block_size_for_backend",
+            classmethod(fake_super),
+        )
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            MetalPlatform,
+            "_realign_hybrid_block_size_for_turboquant",
+            classmethod(
+                lambda cls, vc, user_mamba_block_size: captured.update(
+                    umbs=user_mamba_block_size
+                )
+            ),
+        )
+
+        MetalPlatform.update_block_size_for_backend(vllm_config)
+
+        # The realign must receive the user's 128, snapshotted before super()
+        # clobbered cache_config.mamba_block_size with 999.
+        assert captured["umbs"] == 128

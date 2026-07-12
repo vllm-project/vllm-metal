@@ -80,9 +80,11 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         # vLLM's ``is_kv_cache_spec_uniform`` probes uniformity by calling
         # ``merge`` on the full spec list and treats AssertionError as "not
         # uniform" (its except clause catches nothing else). Hybrid models
-        # legitimately reach this probe with a mixed TurboQuant+Mamba dict,
-        # so type/config mismatches here must surface as AssertionError,
-        # matching ``KVCacheSpec.merge``'s assert-based contract.
+        # legitimately reach this probe with a mixed TurboQuant+Mamba dict, and
+        # a non-TurboQuant spec in the list is exactly that signal — so it must
+        # surface as AssertionError for the probe to answer "not uniform".
+        # Genuinely broken groups (empty input, mixed k/v quant) are not the
+        # probe's concern and stay ValueError so they fail loudly.
         turbo_specs: list[TurboQuantAttentionSpec] = []
         for spec in specs:
             if not isinstance(spec, TurboQuantAttentionSpec):
@@ -92,12 +94,12 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
                 )
             turbo_specs.append(spec)
         if not turbo_specs:
-            raise AssertionError("TurboQuantAttentionSpec.merge() requires specs")
+            raise ValueError("TurboQuantAttentionSpec.merge() requires specs")
 
         k_set = {s.k_quant for s in turbo_specs}
         v_set = {s.v_quant for s in turbo_specs}
         if len(k_set) != 1 or len(v_set) != 1:
-            raise AssertionError(
+            raise ValueError(
                 "All TurboQuant layers in the same cache group must share the "
                 "same (k_quant, v_quant); mixed-quant groups are not supported."
             )
@@ -416,16 +418,16 @@ class ModelCachePolicy:
         if self._use_turboquant(config):
             # _turboquant_page_size_bytes is parameterised by tokens (block_size);
             # pass aligned_tokens to get the per-sequence byte total directly.
-            tq_bytes = num_kv_layers * _turboquant_page_size_bytes(
+            # TurboQuant requires paged attention, whose capacity is reported via
+            # the paged planner (num_blocks x per-block bytes), not this
+            # single-sequence estimator — so hybrid+TQ never reaches here.
+            return num_kv_layers * _turboquant_page_size_bytes(
                 block_size=aligned_tokens,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,
                 k_quant=config.k_quant,
                 v_quant=config.v_quant,
             )
-            if self._runner.is_hybrid:
-                return tq_bytes + self.linear_cache_bytes_per_slot()
-            return tq_bytes
 
         sdpa_kv_bytes = (
             self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()

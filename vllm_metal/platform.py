@@ -757,13 +757,26 @@ class MetalPlatform(Platform):
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
+        #
+        # Snapshot the user's mamba block size before super() runs: upstream
+        # ``_align_hybrid_block_size`` overwrites ``cache_config.mamba_block_size``
+        # with its computed ``attn_block_size`` while leaving
+        # ``user_specified_mamba_block_size`` True, so the TurboQuant realign below
+        # would otherwise consume super()'s result as if it were the user's value.
+        user_mamba_block_size = (
+            vllm_config.cache_config.mamba_block_size
+            if vllm_config.cache_config.user_specified_mamba_block_size
+            else None
+        )
         super().update_block_size_for_backend(vllm_config)
 
-        cls._realign_hybrid_block_size_for_turboquant(vllm_config)
+        cls._realign_hybrid_block_size_for_turboquant(
+            vllm_config, user_mamba_block_size
+        )
 
     @classmethod
     def _realign_hybrid_block_size_for_turboquant(
-        cls, vllm_config: "VllmConfig"
+        cls, vllm_config: "VllmConfig", user_mamba_block_size: int | None
     ) -> None:
         """Redo hybrid block-size alignment with TurboQuant page sizes.
 
@@ -790,20 +803,13 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
-        # Gate on additional_config rather than only the process-local
-        # singleton: executors invoke this hook in worker processes too,
-        # where the singleton may not have been populated yet, while
-        # ``additional_config`` travels with the pickled ``vllm_config``.
-        # Defaults mirror ``check_and_update_config``.
-        add = getattr(vllm_config, "additional_config", None) or {}
-        if add.get("turboquant"):
-            turboquant = True
-            k_quant = add.get("k_quant", "q8_0")
-            v_quant = add.get("v_quant", "q3_0")
-        else:
-            turboquant = metal_config.turboquant
-            k_quant = metal_config.k_quant
-            v_quant = metal_config.v_quant
+        # The resolved Metal config is authoritative here: ``check_and_update_config``
+        # populates the singleton on the driver, and ``MetalWorker.__init__`` re-applies
+        # TurboQuant from ``additional_config`` in each worker process before this hook
+        # runs, so the singleton already reflects TurboQuant in both cases.
+        turboquant = metal_config.turboquant
+        k_quant = metal_config.k_quant
+        v_quant = metal_config.v_quant
 
         if (
             not turboquant
@@ -836,10 +842,11 @@ class MetalPlatform(Platform):
             v_quant=v_quant,
         )
 
-        # Kernel alignment straight from the backend (MultipleOf(16)). The
-        # upstream max() against cache_config.block_size is skipped here:
-        # at this point block_size already holds the fp16-aligned result of
-        # super(), not the user's value.
+        # Kernel alignment straight from the backend (MultipleOf(16)). Upstream's
+        # max() against cache_config.block_size is skipped: the realign only grows
+        # block_size (below), and the post-super() value already encodes both the
+        # user's --block-size floor and the fp16 alignment, so the user floor is
+        # never violated.
         backend_cls = cls._find_non_ssm_backend(vllm_config)
         assert backend_cls is not None
         kernel_block_alignment_size = min(
@@ -852,12 +859,9 @@ class MetalPlatform(Platform):
             # size for kernel performance.
             from math import lcm
 
-            mamba_block_size = (
-                cache_config.mamba_block_size
-                if cache_config.user_specified_mamba_block_size
-                else None
+            base_chunk_size = (
+                user_mamba_block_size or model_config.get_mamba_chunk_size()
             )
-            base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
             assert base_chunk_size is not None
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, tq_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
