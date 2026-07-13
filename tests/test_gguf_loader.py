@@ -18,6 +18,7 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
+from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
@@ -340,6 +341,85 @@ def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
     assert bool(mx.array_equal(got_k.qweight, exp_k.qweight).item())
     assert not bool(mx.array_equal(got_q.qweight, raw_q.qweight).item())
     assert not bool(mx.array_equal(got_k.qweight, raw_k.qweight).item())
+
+
+def test_loads_untied_mistral_via_llama_arch_mapping(tmp_path):
+    # Real Mistral GGUFs declare general.architecture="llama" while the config
+    # says model_type="mistral"; the adapter mapping admits the pair and the
+    # llama RoPE q/k un-permutation applies through it. Mirrors the real v0.3
+    # shape: untied (lm_head present) and head_dim OMITTED (hidden // heads).
+    # Arrange
+    d = _dims(_tiny_config("mistral"))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "mistral",
+        config_overrides={"tie_word_embeddings": False},
+        has_qk_norm=False,
+        gguf_arch="llama",
+    )
+    _write_minimal_tokenizer(cfg_dir, 256)
+    config_path = Path(cfg_dir) / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("head_dim")  # derived head_dim == hidden_size // heads == 16
+    config_path.write_text(json.dumps(config))
+    arrays = mx.load(gguf_path)
+    cfg = _tiny_config("mistral")
+    raw_q = GGUFMLXQuantizedTensor.from_mx_load(arrays, "blk.0.attn_q.weight", QT.Q8_0)
+    raw_k = GGUFMLXQuantizedTensor.from_mx_load(arrays, "blk.0.attn_k.weight", QT.Q8_0)
+    exp_q = raw_q.permute_rows(_rope_inv_index(d["qd"], cfg["num_attention_heads"]))
+    exp_k = raw_k.permute_rows(_rope_inv_index(d["kvd"], cfg["num_key_value_heads"]))
+
+    # Act
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+
+    # Assert
+    assert isinstance(model.lm_head, GGUFLinear)  # untied head installed
+    got_q = model.model.layers[0].self_attn.q_proj.tensor
+    got_k = model.model.layers[0].self_attn.k_proj.tensor
+    for got, exp, raw in ((got_q, exp_q, raw_q), (got_k, exp_k, raw_k)):
+        assert bool(mx.array_equal(got.qweight, exp.qweight).item())
+        assert bool(mx.array_equal(got.scales, exp.scales).item())
+        assert bool(mx.array_equal(got.biases, exp.biases).item())
+        assert not bool(mx.array_equal(got.qweight, raw.qweight).item())
+    assert out.shape == (1, 3, 256)
+
+
+def test_resolve_arch_accepts_llama_gguf_with_mistral_config():
+    # The one admitted pairing: a llama-arch .gguf with a mistral config.
+    arch = GGUFModelAdapter.resolve_arch(gguf_arch="llama", config_model_type="mistral")
+
+    assert arch == "llama"
+
+
+@pytest.mark.parametrize("gguf_arch", ["mistral", "mistral3", "mistral4"])
+def test_resolve_arch_rejects_unsupported_mistral_gguf_archs(gguf_arch):
+    # The config-side mapping never widens the .gguf side: a file declaring a
+    # raw "mistral" arch is not a llama.cpp product, and the multimodal
+    # mistral3/mistral4 archs are out of scope; all stay allowlist-rejected.
+    with pytest.raises(GGUFLoadError) as not_dense:
+        GGUFModelAdapter.resolve_arch(gguf_arch=gguf_arch, config_model_type="mistral")
+
+    assert str(not_dense.value) == (
+        f"Architecture {gguf_arch!r} is not a supported dense decoder; the GGUF "
+        "loader supports ['llama', 'qwen2', 'qwen3']."
+    )
+
+
+def test_resolve_arch_mismatch_names_raw_and_mapped_config_type():
+    # The mismatch error shows the GGUF arch, the raw config model_type, and
+    # the GGUF arch that model_type maps to.
+    with pytest.raises(GGUFLoadError) as mismatch:
+        GGUFModelAdapter.resolve_arch(gguf_arch="qwen2", config_model_type="mistral")
+
+    assert str(mismatch.value) == (
+        "GGUF architecture 'qwen2' does not match config model_type 'mistral' "
+        "(maps to GGUF arch 'llama'); the .gguf and config_dir describe "
+        "different models."
+    )
 
 
 def test_untied_llama_installs_lm_head(tmp_path):
