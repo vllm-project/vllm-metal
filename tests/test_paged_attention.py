@@ -12,6 +12,12 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 
 from vllm_metal.attention.context import (
     OffsetCache,
@@ -321,6 +327,48 @@ class TestPackedRoPE:
 
         assert mx.allclose(q_out, expected_q, rtol=1e-3, atol=1e-3).item()
         assert mx.allclose(k_out, expected_k, rtol=1e-3, atol=1e-3).item()
+
+    @pytest.mark.parametrize(
+        "rope",
+        [
+            Llama3RoPE(
+                8,
+                scaling_config={
+                    "factor": 8.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 8192,
+                },
+            ),
+            ProportionalRoPE(8, 8),
+            SuScaledRoPE(8),
+            YarnRoPE(8),
+        ],
+    )
+    def test_mlx_lm_rope_wrappers_match_segment_reference(self, rope):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        module = SimpleNamespace(rope=rope)
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.arange(1 * 2 * 4 * 8, dtype=mx.float32).reshape(1, 2, 4, 8) / 100
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 11, 29, 47]
+
+        expected_q = mx.concatenate(
+            [rope(q[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [rope(k[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
 
     def test_native_rope_uses_vector_zero_offsets_for_implicit_offsets(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (

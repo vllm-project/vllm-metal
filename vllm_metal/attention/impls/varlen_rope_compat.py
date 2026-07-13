@@ -7,6 +7,20 @@ from collections.abc import Callable
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
+
+_VECTOR_OFFSET_ROPE_TYPES = (
+    nn.RoPE,
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 
 
 def _apply_mrope_segment(
@@ -195,7 +209,7 @@ def apply_packed_rope(
         and queries.shape[2] == segment_count
         and (not apply_keys or keys.shape[2] == segment_count)
         and all(cu_seqlens[i] == i for i in range(segment_count + 1))
-        and isinstance(rope_fn, nn.RoPE)
+        and isinstance(rope_fn, _VECTOR_OFFSET_ROPE_TYPES)
     ):
         # MLX 0.31.2 corrupts rows after the first for [B, H, 1, D] RoPE
         # with a scalar offset (MLX #3494). Vector offsets select the correct
