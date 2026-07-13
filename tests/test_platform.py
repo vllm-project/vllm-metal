@@ -874,8 +874,33 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_check_and_update_config_rejects_hybrid_prefix_caching(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        "cache_config,err_match",
+        [
+            (
+                SimpleNamespace(
+                    block_size=None,
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="none",
+                ),
+                "Prefix caching",
+            ),
+            (
+                SimpleNamespace(
+                    block_size=None,
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="all",
+                ),
+                "Mamba cache modes",
+            ),
+        ],
+        ids=["prefix_caching", "mamba_cache_mode"],
+    )
+    def test_check_and_update_config_rejects_hybrid_state_cache_modes(
+        self,
+        cache_config: SimpleNamespace,
+        err_match: str,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
@@ -889,10 +914,7 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(
-                    block_size=None,
-                    enable_prefix_caching=True,
-                ),
+                cache_config=cache_config,
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -910,7 +932,7 @@ class TestMetalPlatform:
                 ),
             )
 
-            with pytest.raises(NotImplementedError, match="Prefix caching"):
+            with pytest.raises(NotImplementedError, match=err_match):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()

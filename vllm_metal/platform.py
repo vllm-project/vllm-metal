@@ -397,15 +397,17 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
-        if (
-            model_config is not None
-            and model_config.is_hybrid
-            and vllm_config.cache_config.enable_prefix_caching
-        ):
-            raise NotImplementedError(
-                "Prefix caching is not supported for hybrid GDN models on Metal "
-                "because GDN recurrent state cannot be restored from KV blocks."
-            )
+        if model_config is not None and model_config.is_hybrid:
+            cache_config = vllm_config.cache_config
+            if (
+                cache_config.enable_prefix_caching
+                or cache_config.mamba_cache_mode != "none"
+            ):
+                raise NotImplementedError(
+                    "Prefix caching and Mamba cache modes are not supported for "
+                    "hybrid GDN models on Metal because GDN recurrent state cannot "
+                    "be restored from KV blocks."
+                )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
