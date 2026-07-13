@@ -93,19 +93,8 @@ class TestHybridTurboQuantCachePolicy:
         assert per_block == len(SDPA_LAYERS) * TQ_PAGE
 
     def test_upstream_uniformity_probe_handles_mixed_hybrid_specs(self) -> None:
-        """vLLM probes spec uniformity by merging and catching AssertionError.
-
-        The probe calls ``values()[0].merge(all_values)``, so the class of
-        the model's FIRST layer answers it. Regression: for hybrids whose
-        first layer is SDPA, ``TurboQuantAttentionSpec.merge`` raised
-        ``TypeError`` for the legitimately mixed dict (TurboQuant SDPA +
-        Mamba linear), which escaped the probe's ``except AssertionError``
-        and aborted engine init.
-        """
         from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
 
-        # Linear layer first (Mamba answers the probe) and SDPA layer
-        # first (TurboQuant answers the probe) — both must survive.
         for sdpa_layers in ([3, 7], [0, 4]):
             runner = make_stub_runner(
                 model_args={"full_attention_interval": 4},
@@ -136,10 +125,6 @@ class TestHybridTurboQuantCachePolicy:
 
 
 class TestTurboQuantHybridAlignment:
-    """MetalPlatform re-aligns hybrid block size with packed page math."""
-
-    # Large GDN state so the fp16-aligned block is too small for the
-    # packed page: (3*8192 + 32*128*128) * 2 bytes = 1,097,728 per request.
     _MAMBA_SHAPES = ((3, 8192), (32, 128, 128))
     _MAMBA_PAGE = (3 * 8192 + 32 * 128 * 128) * 2
     _TQ_PAGE_1_TOKEN = _turboquant_page_size_bytes(
@@ -199,8 +184,6 @@ class TestTurboQuantHybridAlignment:
     def test_realign_grows_block_and_pads_mamba_to_packed_page(
         self, monkeypatch
     ) -> None:
-        # Simulate the post-super() state: fp16 alignment picked
-        # 16 * cdiv(mamba_page, 16 * fp16_page_1_token) = 544 tokens.
         vllm_config = self._vllm_config(block_size=544)
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
         self._patch_model_cls(monkeypatch)

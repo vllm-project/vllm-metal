@@ -757,7 +757,6 @@ class MetalPlatform(Platform):
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
-        #
         cache_config = vllm_config.cache_config
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None
@@ -783,20 +782,7 @@ class MetalPlatform(Platform):
         user_block_size: int | None,
         user_mamba_block_size: int | None,
     ) -> None:
-        """Redo hybrid block-size alignment with TurboQuant page sizes.
-
-        Upstream ``Platform._align_hybrid_block_size`` sizes the attention
-        block with the standard dtype page formula, but TurboQuant packs
-        SDPA pages ~3-4x smaller (vllm-metal#468). Keeping the fp16-based
-        block would make every scheduler-visible page disagree with the
-        runtime layout: ``check_enough_kv_cache_memory`` rejects contexts
-        that fit, and the paged-attention planner budgets ~3-4x fewer
-        blocks than the TurboQuant cache actually needs.
-
-        Mirrors the upstream alignment (same mamba-state math, same
-        kernel-alignment source) with ``attn_page_size_1_token`` computed
-        from the packed TurboQuant layout.
-        """
+        """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
         from vllm.v1.attention.backend import MultipleOf
@@ -808,10 +794,6 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
-        # The resolved Metal config is authoritative here: ``check_and_update_config``
-        # populates the singleton on the driver, and ``MetalWorker.__init__`` re-applies
-        # TurboQuant from ``additional_config`` in each worker process before this hook
-        # runs, so the singleton already reflects TurboQuant in both cases.
         turboquant = metal_config.turboquant
         k_quant = metal_config.k_quant
         v_quant = metal_config.v_quant
@@ -824,7 +806,6 @@ class MetalPlatform(Platform):
         ):
             return
 
-        # Same mamba-state computation as upstream _align_hybrid_block_size.
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
             model_config=model_config,
@@ -837,8 +818,6 @@ class MetalPlatform(Platform):
         if mamba_page_size == 0:
             return
 
-        # _turboquant_page_size_bytes is linear in block_size, so the
-        # one-token value scales exactly to any block size.
         tq_page_size_1_token = _turboquant_page_size_bytes(
             block_size=1,
             num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
@@ -859,8 +838,6 @@ class MetalPlatform(Platform):
         )
 
         if cache_config.mamba_cache_mode == "all":
-            # Mirror upstream: with prefix caching, align to the mamba chunk
-            # size for kernel performance.
             from math import lcm
 
             base_chunk_size = (

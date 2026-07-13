@@ -77,14 +77,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @classmethod
     def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
-        # vLLM's ``is_kv_cache_spec_uniform`` probes uniformity by calling
-        # ``merge`` on the full spec list and treats AssertionError as "not
-        # uniform" (its except clause catches nothing else). Hybrid models
-        # legitimately reach this probe with a mixed TurboQuant+Mamba dict, and
-        # a non-TurboQuant spec in the list is exactly that signal — so it must
-        # surface as AssertionError for the probe to answer "not uniform".
-        # Genuinely broken groups (empty input, mixed k/v quant) are not the
-        # probe's concern and stay ValueError so they fail loudly.
+        # vLLM's uniformity probe treats AssertionError as "mixed spec type".
         turbo_specs: list[TurboQuantAttentionSpec] = []
         for spec in specs:
             if not isinstance(spec, TurboQuantAttentionSpec):
@@ -416,11 +409,6 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            # _turboquant_page_size_bytes is parameterised by tokens (block_size);
-            # pass aligned_tokens to get the per-sequence byte total directly.
-            # TurboQuant requires paged attention, whose capacity is reported via
-            # the paged planner (num_blocks x per-block bytes), not this
-            # single-sequence estimator — so hybrid+TQ never reaches here.
             return num_kv_layers * _turboquant_page_size_bytes(
                 block_size=aligned_tokens,
                 num_kv_heads=self._runner.num_kv_heads,
