@@ -200,6 +200,7 @@ def apply_packed_rope(
         # MLX 0.31.2 corrupts rows after the first for [B, H, 1, D] RoPE
         # with a scalar offset (MLX #3494). Vector offsets select the correct
         # kernel, including when every request has the same offset.
+        # Remove this workaround after an MLX bump that fixes the pinned wheel.
         batch_offsets = (
             mx.zeros((segment_count,), dtype=mx.int32)
             if offsets is None
