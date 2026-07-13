@@ -16,7 +16,7 @@ from vllm_metal.config import MetalConfig
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import (
     TurboQuantAttentionSpec,
-    _turboquant_page_size_bytes,
+    turboquant_page_size_bytes,
 )
 
 BLOCK_SIZE = 1056
@@ -27,7 +27,7 @@ HEAD_DIM = 128
 K_QUANT = "q4_0"
 V_QUANT = "q4_0"
 
-TQ_PAGE = _turboquant_page_size_bytes(
+TQ_PAGE = turboquant_page_size_bytes(
     block_size=BLOCK_SIZE,
     num_kv_heads=KV_HEADS,
     head_dim=HEAD_DIM,
@@ -127,7 +127,7 @@ class TestHybridTurboQuantCachePolicy:
 class TestTurboQuantHybridAlignment:
     _MAMBA_SHAPES = ((3, 8192), (32, 128, 128))
     _MAMBA_PAGE = (3 * 8192 + 32 * 128 * 128) * 2
-    _TQ_PAGE_1_TOKEN = _turboquant_page_size_bytes(
+    _TQ_PAGE_1_TOKEN = turboquant_page_size_bytes(
         block_size=1,
         num_kv_heads=KV_HEADS,
         head_dim=HEAD_DIM,

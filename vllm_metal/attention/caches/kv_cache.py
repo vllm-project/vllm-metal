@@ -209,10 +209,9 @@ class MetalPagedKVCache:
             )
 
             # Log TurboQuant KV cache memory usage with comparison.
-            # Single source of truth: _turboquant_page_size_bytes in cache_policy.
-            from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
+            from vllm_metal.v1.cache_policy import turboquant_page_size_bytes
 
-            per_block_bytes = _turboquant_page_size_bytes(
+            per_block_bytes = turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,

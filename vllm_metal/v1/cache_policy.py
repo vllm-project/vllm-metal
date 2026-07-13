@@ -67,7 +67,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return _turboquant_page_size_bytes(
+        return turboquant_page_size_bytes(
             block_size=self.block_size,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_size,
@@ -119,7 +119,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
 
-def _turboquant_page_size_bytes(
+def turboquant_page_size_bytes(
     block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
 ) -> int:
     """Calculate TurboQuant-compressed page size for one layer."""
@@ -332,7 +332,7 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            return num_kv_layers * _turboquant_page_size_bytes(
+            return num_kv_layers * turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,
@@ -409,7 +409,7 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            return num_kv_layers * _turboquant_page_size_bytes(
+            return num_kv_layers * turboquant_page_size_bytes(
                 block_size=aligned_tokens,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,

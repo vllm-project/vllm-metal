@@ -61,7 +61,7 @@ from vllm_metal.metal import get_ops
 from vllm_metal.v1.cache_policy import (
     TurboQuantAttentionSpec,
     _build_turboquant_attention_spec,
-    _turboquant_page_size_bytes,
+    turboquant_page_size_bytes,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2637,7 +2637,7 @@ def test_tq_spec_real_page_size_bytes_matches_helper(
         k_quant=k_quant,
         v_quant=v_quant,
     )
-    expected = _turboquant_page_size_bytes(
+    expected = turboquant_page_size_bytes(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,

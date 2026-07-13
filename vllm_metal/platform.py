@@ -804,7 +804,7 @@ class MetalPlatform(Platform):
         from vllm.v1.attention.backend import MultipleOf
         from vllm.v1.kv_cache_interface import MambaSpec
 
-        from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
+        from vllm_metal.v1.cache_policy import turboquant_page_size_bytes
 
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
@@ -818,7 +818,7 @@ class MetalPlatform(Platform):
         if mamba_page_size == 0:
             return
 
-        tq_page_size_1_token = _turboquant_page_size_bytes(
+        tq_page_size_1_token = turboquant_page_size_bytes(
             block_size=1,
             num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
             head_dim=model_config.get_head_size(),
