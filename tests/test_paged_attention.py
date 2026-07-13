@@ -226,21 +226,21 @@ class TestPrepare:
 class TestPackedRoPE:
     """Tests for per-request RoPE position reset in packed prefill."""
 
+    class RecordingRoPE(nn.RoPE):
+        def __init__(self) -> None:
+            super().__init__(dims=8, traditional=False, base=10_000.0)
+            self.calls = []
+
+        def __call__(self, x, offset=0):
+            self.calls.append((x.shape, offset))
+            return super().__call__(x, offset=offset)
+
     def test_native_rope_batches_single_token_segments(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 
-        class RecordingRoPE(nn.RoPE):
-            def __init__(self) -> None:
-                super().__init__(dims=8, traditional=False, base=10_000.0)
-                self.calls = []
-
-            def __call__(self, x, offset=0):
-                self.calls.append((x.shape, offset))
-                return super().__call__(x, offset=offset)
-
-        rope = RecordingRoPE()
+        rope = self.RecordingRoPE()
         reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
         module = SimpleNamespace(rope=rope)
         q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
@@ -280,16 +280,7 @@ class TestPackedRoPE:
             apply_packed_rope,
         )
 
-        class RecordingRoPE(nn.RoPE):
-            def __init__(self) -> None:
-                super().__init__(dims=8, traditional=False, base=10_000.0)
-                self.offsets = []
-
-            def __call__(self, x, offset=0):
-                self.offsets.append(offset)
-                return super().__call__(x, offset=offset)
-
-        rope = RecordingRoPE()
+        rope = self.RecordingRoPE()
         module = SimpleNamespace(rope=rope)
         cu_seqlens = [0, 1, 2, 3, 4]
         q = mx.zeros((1, 3, 4, 8), dtype=mx.float32)
@@ -297,27 +288,18 @@ class TestPackedRoPE:
 
         apply_packed_rope(module, q, k, cu_seqlens)
 
-        assert len(rope.offsets) == 2
-        assert rope.offsets[0].shape == (4,)
-        assert rope.offsets[0].tolist() == [0, 0, 0, 0]
-        assert rope.offsets[1].shape == (4,)
-        assert rope.offsets[1].tolist() == [0, 0, 0, 0]
+        assert len(rope.calls) == 2
+        assert rope.calls[0][1].shape == (4,)
+        assert rope.calls[0][1].tolist() == [0, 0, 0, 0]
+        assert rope.calls[1][1].shape == (4,)
+        assert rope.calls[1][1].tolist() == [0, 0, 0, 0]
 
     def test_batched_rope_preserves_keys_when_not_applied(self):
         from vllm_metal.attention.impls.varlen_rope_compat import (
             apply_packed_rope,
         )
 
-        class RecordingRoPE(nn.RoPE):
-            def __init__(self) -> None:
-                super().__init__(dims=8, traditional=False, base=10_000.0)
-                self.calls = 0
-
-            def __call__(self, x, offset=0):
-                self.calls += 1
-                return super().__call__(x, offset=offset)
-
-        rope = RecordingRoPE()
+        rope = self.RecordingRoPE()
         reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
         module = SimpleNamespace(rope=rope)
         cu_seqlens = [0, 1, 2, 3, 4]
@@ -342,7 +324,7 @@ class TestPackedRoPE:
         )
         mx.eval(expected_q, q_out)
 
-        assert rope.calls == 1
+        assert len(rope.calls) == 1
         assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
         assert k_out is k
 
@@ -351,16 +333,7 @@ class TestPackedRoPE:
             apply_packed_rope,
         )
 
-        class RecordingRoPE(nn.RoPE):
-            def __init__(self) -> None:
-                super().__init__(dims=8, traditional=False, base=10_000.0)
-                self.calls = []
-
-            def __call__(self, x, offset=0):
-                self.calls.append((x.shape, offset))
-                return super().__call__(x, offset=offset)
-
-        rope = RecordingRoPE()
+        rope = self.RecordingRoPE()
         module = SimpleNamespace(rope=rope)
         q = mx.zeros((1, 2, 6, 8))
         k = mx.zeros((1, 1, 6, 8))

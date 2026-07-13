@@ -53,10 +53,6 @@ def _apply_mrope_segment_with_positions(
     return apply_multimodal_rotary_pos_emb(q_seg, k_seg, cos, sin)
 
 
-def _supports_batched_offsets(rope_fn: object) -> bool:
-    return isinstance(rope_fn, nn.RoPE)
-
-
 def _apply_single_token_batched_rope(
     rope_fn: Callable[..., mx.array],
     x: mx.array,
@@ -194,7 +190,7 @@ def apply_packed_rope(
         and queries.shape[2] == segment_count
         and (not apply_keys or keys.shape[2] == segment_count)
         and all(cu_seqlens[i] == i for i in range(segment_count + 1))
-        and _supports_batched_offsets(rope_fn)
+        and isinstance(rope_fn, nn.RoPE)
     ):
         # MLX 0.31.2 corrupts rows after the first for [B, H, 1, D] RoPE
         # with a scalar offset (MLX #3494). Vector offsets select the correct
