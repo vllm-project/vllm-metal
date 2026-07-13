@@ -58,6 +58,11 @@ def _apply_single_token_batched_rope(
     x: mx.array,
     offsets: mx.array,
 ) -> mx.array:
+    """Apply RoPE to packed decode rows as one native batch.
+
+    ``x`` is ``(1, heads, segment_count, head_dim)`` and each segment is one
+    token, so ``offsets`` must be the vector ``(segment_count,)``.
+    """
     batched = mx.transpose(x, (2, 1, 0, 3))
     rotated = rope_fn(batched, offset=offsets)
     return mx.transpose(rotated, (2, 1, 0, 3))
