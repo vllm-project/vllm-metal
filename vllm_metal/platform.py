@@ -783,13 +783,6 @@ class MetalPlatform(Platform):
         user_mamba_block_size: int | None,
     ) -> None:
         """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
-        from vllm.model_executor.models import ModelRegistry
-        from vllm.utils.math_utils import cdiv
-        from vllm.v1.attention.backend import MultipleOf
-        from vllm.v1.kv_cache_interface import MambaSpec
-
-        from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
-
         metal_config = get_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -805,6 +798,13 @@ class MetalPlatform(Platform):
             or not model_config.is_hybrid
         ):
             return
+
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
 
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
