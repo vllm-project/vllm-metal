@@ -211,10 +211,7 @@ def apply_packed_rope(
         and all(cu_seqlens[i] == i for i in range(segment_count + 1))
         and isinstance(rope_fn, _VECTOR_OFFSET_ROPE_TYPES)
     ):
-        # MLX 0.31.2 corrupts rows after the first for [B, H, 1, D] RoPE
-        # with a scalar offset (MLX #3494). Vector offsets select the correct
-        # kernel, including when every request has the same offset.
-        # Remove this workaround after an MLX bump that fixes the pinned wheel.
+        # Batch packed decode rows while preserving each row's absolute offset.
         batch_offsets = (
             mx.zeros((segment_count,), dtype=mx.int32)
             if offsets is None

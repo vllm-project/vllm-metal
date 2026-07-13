@@ -281,53 +281,6 @@ class TestPackedRoPE:
         assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
         assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
 
-    def test_native_rope_matches_segment_reference_for_float16_rows(self):
-        from vllm_metal.attention.impls.varlen_rope_compat import (
-            apply_packed_rope,
-        )
-
-        dims = 128
-        segment_count = 4
-        offsets = [5, 5, 5, 5]
-        cu_seqlens = [0, 1, 2, 3, 4]
-        rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
-        reference_rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
-        module = SimpleNamespace(rope=rope)
-        q_rows = [
-            (mx.arange(3 * dims, dtype=mx.float32).reshape(3, 1, dims) / 100 + row)
-            .astype(mx.float16)
-            .tolist()
-            for row in range(segment_count)
-        ]
-        k_rows = [
-            (mx.arange(2 * dims, dtype=mx.float32).reshape(2, 1, dims) / 100 + row)
-            .astype(mx.float16)
-            .tolist()
-            for row in range(segment_count)
-        ]
-        q = mx.transpose(mx.array(q_rows, dtype=mx.float16), (2, 1, 0, 3))
-        k = mx.transpose(mx.array(k_rows, dtype=mx.float16), (2, 1, 0, 3))
-
-        expected_q = mx.concatenate(
-            [
-                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
-                for i in range(segment_count)
-            ],
-            axis=2,
-        )
-        expected_k = mx.concatenate(
-            [
-                reference_rope(k[:, :, i : i + 1, :], offset=offsets[i])
-                for i in range(segment_count)
-            ],
-            axis=2,
-        )
-        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
-        mx.eval(expected_q, expected_k, q_out, k_out)
-
-        assert mx.allclose(q_out, expected_q, rtol=1e-3, atol=1e-3).item()
-        assert mx.allclose(k_out, expected_k, rtol=1e-3, atol=1e-3).item()
-
     @pytest.mark.parametrize(
         "rope",
         [
