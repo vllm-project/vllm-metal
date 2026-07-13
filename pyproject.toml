@@ -33,7 +33,7 @@ dependencies = [
     # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
     # a wheel built against one MLX is only ABI-safe against that exact MLX.
     # Rebuild and re-release the wheel on every MLX bump.
-    "mlx==0.31.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
