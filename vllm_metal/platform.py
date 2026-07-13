@@ -758,25 +758,30 @@ class MetalPlatform(Platform):
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
         #
-        # Snapshot the user's mamba block size before super() runs: upstream
-        # ``_align_hybrid_block_size`` overwrites ``cache_config.mamba_block_size``
-        # with its computed ``attn_block_size`` while leaving
-        # ``user_specified_mamba_block_size`` True, so the TurboQuant realign below
-        # would otherwise consume super()'s result as if it were the user's value.
+        cache_config = vllm_config.cache_config
+        user_block_size = (
+            cache_config.block_size if cache_config.user_specified_block_size else None
+        )
         user_mamba_block_size = (
-            vllm_config.cache_config.mamba_block_size
-            if vllm_config.cache_config.user_specified_mamba_block_size
+            cache_config.mamba_block_size
+            if cache_config.user_specified_mamba_block_size
             else None
         )
         super().update_block_size_for_backend(vllm_config)
 
         cls._realign_hybrid_block_size_for_turboquant(
-            vllm_config, user_mamba_block_size
+            vllm_config,
+            user_block_size=user_block_size,
+            user_mamba_block_size=user_mamba_block_size,
         )
 
     @classmethod
     def _realign_hybrid_block_size_for_turboquant(
-        cls, vllm_config: "VllmConfig", user_mamba_block_size: int | None
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        user_block_size: int | None,
+        user_mamba_block_size: int | None,
     ) -> None:
         """Redo hybrid block-size alignment with TurboQuant page sizes.
 
@@ -842,16 +847,15 @@ class MetalPlatform(Platform):
             v_quant=v_quant,
         )
 
-        # Kernel alignment straight from the backend (MultipleOf(16)). Upstream's
-        # max() against cache_config.block_size is skipped: the realign only grows
-        # block_size (below), and the post-super() value already encodes both the
-        # user's --block-size floor and the fp16 alignment, so the user floor is
-        # never violated.
         backend_cls = cls._find_non_ssm_backend(vllm_config)
         assert backend_cls is not None
-        kernel_block_alignment_size = min(
+        backend_block_alignment_size = min(
             s.base if isinstance(s, MultipleOf) else s
             for s in backend_cls.get_supported_kernel_block_sizes()
+        )
+        kernel_block_alignment_size = max(
+            backend_block_alignment_size,
+            user_block_size or backend_block_alignment_size,
         )
 
         if cache_config.mamba_cache_mode == "all":
