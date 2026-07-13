@@ -2,33 +2,38 @@
 """Opt-in greedy golden-token parity for the local GGUF serve path.
 
 Loads a real local ``.gguf`` and greedy-decodes a fixed prompt across two slow
-checks:
+checks, parameterized over the supported GGUF model families:
 
-- ``test_gguf_greedy_matches_committed_golden`` pins the first ``N`` token ids to
-  a committed golden sequence — a deterministic regression guard for the served
-  Q8_0 model.
-- ``test_gguf_greedy_matches_dense_reference_prefix`` asserts the leading tokens
-  match an ``mlx_lm`` dense reference of the same checkpoint (loaded at its
-  native dtype), proving the quantized model decodes the same high-confidence
-  prefix as the float reference. The quantized and dense decodes diverge after
-  that prefix (expected from quantization — for Qwen3-0.6B they agree through
-  index 11 and diverge at index 12), so only the agreeing prefix is asserted.
+- ``test_gguf_greedy_matches_committed_golden`` pins the first ``N`` token ids
+  to a committed golden sequence — a deterministic regression guard for the
+  served Q8_0 model.
+- ``test_gguf_greedy_matches_dense_reference_prefix`` asserts the leading
+  tokens match an ``mlx_lm`` dense reference of the same checkpoint (loaded at
+  its native dtype), proving the quantized model decodes the same
+  high-confidence prefix as the float reference. The quantized and dense
+  decodes may diverge after that prefix (expected from quantization), so only
+  each family's agreeing prefix is asserted.
 
-These load the GGUF directly through ``GGUFModelLoader``; the full ``vllm serve``
-HTTP smoke through the Metal paged runner lives in ``tools/gguf_serve_smoke.py``.
-Slow and env-gated (skipped unless the model paths are set); kept OUT of the
-deterministic unit files (real checkpoints, not synthetic fixtures). Run with::
+These load the GGUF directly through ``GGUFModelLoader``; the full
+``vllm serve`` HTTP smoke through the Metal paged runner lives in
+``tools/gguf_serve_smoke.py``. Slow and env-gated (each family skips unless its
+model paths are set); kept OUT of the deterministic unit files (real
+checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
 
     VLLM_METAL_MEMORY_FRACTION=0.5 \\
     VLLM_METAL_TEST_GGUF_SERVE_PATH=<...Qwen3-0.6B-Q8_0.gguf> \\
     VLLM_METAL_TEST_GGUF_TOKENIZER_PATH=<...Qwen3-0.6B dir> \\
     VLLM_METAL_TEST_GGUF_DENSE_PATH=<...Qwen3-0.6B dir> \\
     pytest tests/test_gguf_serve_golden.py -m slow
+
+(llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*`` and mistral
+``VLLM_METAL_TEST_GGUF_MISTRAL_*`` for the same trio.)
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,34 +48,114 @@ from vllm_metal.gguf.loader import GGUFModelLoader  # noqa: E402
 
 _PROMPT = "The capital of France is"
 _N = 16
-# Greedy decode of _PROMPT through Qwen3-0.6B-Q8_0.gguf (target_dtype=bf16).
-# The leading 12 ids match the dense mlx_lm reference; they diverge at index 12
-# (quantized vs dense), so the full sequence is pinned here as a GGUF-path
-# regression while the prefix is cross-checked against dense below.
-_GOLDEN_IDS = [
-    12095,
-    13,
-    576,
-    6722,
-    315,
-    9625,
-    374,
-    1083,
-    279,
-    6722,
-    315,
-    279,
-    5429,
-    315,
-    9625,
-    13,
-]
-# Compared against the dense reference; safely inside the 12-token agreement.
-_DENSE_AGREE_PREFIX = 8
 
-_GGUF_ENV = "VLLM_METAL_TEST_GGUF_SERVE_PATH"
-_TOK_ENV = "VLLM_METAL_TEST_GGUF_TOKENIZER_PATH"
-_DENSE_ENV = "VLLM_METAL_TEST_GGUF_DENSE_PATH"
+
+@dataclass(frozen=True)
+class _GoldenCase:
+    """One GGUF family's committed golden material and env-gated local paths."""
+
+    label: str
+    gguf_env: str
+    tokenizer_env: str
+    dense_env: str
+    golden_ids: tuple[int, ...]
+    dense_agree_prefix: int
+    target_dtype: mx.Dtype
+
+
+_CASES = [
+    # Qwen3-0.6B-Q8_0.gguf: the leading 12 ids match the dense reference and
+    # diverge at index 12 (quantized vs dense); the asserted prefix stays
+    # safely inside that agreement.
+    _GoldenCase(
+        label="qwen3",
+        gguf_env="VLLM_METAL_TEST_GGUF_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_DENSE_PATH",
+        golden_ids=(
+            12095,
+            13,
+            576,
+            6722,
+            315,
+            9625,
+            374,
+            1083,
+            279,
+            6722,
+            315,
+            279,
+            5429,
+            315,
+            9625,
+            13,
+        ),
+        dense_agree_prefix=8,
+        target_dtype=mx.bfloat16,
+    ),
+    # Llama-3.2-1B-Instruct-Q8_0.gguf: agreement through index 12, divergence
+    # at 13. Without the llama.cpp q/k RoPE row-un-permutation this prefix
+    # agreement is only 1 token (attention is broken), so this pins the fix
+    # end-to-end.
+    _GoldenCase(
+        label="llama",
+        gguf_env="VLLM_METAL_TEST_GGUF_LLAMA_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_LLAMA_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_LLAMA_DENSE_PATH",
+        golden_ids=(
+            12366,
+            13,
+            578,
+            469,
+            3168,
+            301,
+            22703,
+            374,
+            7559,
+            304,
+            12366,
+            13,
+            578,
+            9928,
+            49606,
+            16730,
+        ),
+        dense_agree_prefix=13,
+        target_dtype=mx.bfloat16,
+    ),
+    # Mistral-7B-Instruct-v0.3-Q8_0.gguf: the file declares
+    # general.architecture="llama" (mistral converts under the llama arch, so
+    # the q/k RoPE un-permutation applies through the adapter's config-side
+    # mapping); the config dir says model_type="mistral" and omits head_dim.
+    # All 16 ids match the dense reference inside the window.
+    _GoldenCase(
+        label="mistral",
+        gguf_env="VLLM_METAL_TEST_GGUF_MISTRAL_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_MISTRAL_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_MISTRAL_DENSE_PATH",
+        golden_ids=(
+            6233,
+            29493,
+            1330,
+            1040,
+            6333,
+            1070,
+            1040,
+            5717,
+            4610,
+            1117,
+            28566,
+            4573,
+            29491,
+            781,
+            781,
+            1782,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
+]
+_CASE_IDS = [case.label for case in _CASES]
 
 
 def _require_path(env: str) -> str:
@@ -94,178 +179,42 @@ def _greedy_token_ids(model: Any, tokenizer: Any, prompt: str, n: int) -> list[i
 
 
 @pytest.mark.slow
-def test_gguf_greedy_matches_committed_golden() -> None:
-    gguf_path = _require_path(_GGUF_ENV)
-    tokenizer_dir = _require_path(_TOK_ENV)
+@pytest.mark.parametrize("case", _CASES, ids=_CASE_IDS)
+def test_gguf_greedy_matches_committed_golden(case: _GoldenCase) -> None:
+    gguf_path = _require_path(case.gguf_env)
+    tokenizer_dir = _require_path(case.tokenizer_env)
 
     model, tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
+        gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
 
-    assert _greedy_token_ids(model, tokenizer, _PROMPT, _N) == _GOLDEN_IDS
+    ids = _greedy_token_ids(model, tokenizer, _PROMPT, _N)
+    assert ids == list(case.golden_ids)
 
 
 @pytest.mark.slow
-def test_gguf_greedy_matches_dense_reference_prefix() -> None:
-    gguf_path = _require_path(_GGUF_ENV)
-    tokenizer_dir = _require_path(_TOK_ENV)
-    dense_dir = _require_path(_DENSE_ENV)
+@pytest.mark.parametrize("case", _CASES, ids=_CASE_IDS)
+def test_gguf_greedy_matches_dense_reference_prefix(case: _GoldenCase) -> None:
+    gguf_path = _require_path(case.gguf_env)
+    tokenizer_dir = _require_path(case.tokenizer_env)
+    dense_dir = _require_path(case.dense_env)
 
     dense_model, dense_tokenizer = mlx_lm_load(dense_dir)
     dense_ids = _greedy_token_ids(
-        dense_model, dense_tokenizer, _PROMPT, _DENSE_AGREE_PREFIX
+        dense_model, dense_tokenizer, _PROMPT, case.dense_agree_prefix
     )
     del dense_model
     mx.clear_cache()
 
     gguf_model, gguf_tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
+        gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
     gguf_ids = _greedy_token_ids(
-        gguf_model, gguf_tokenizer, _PROMPT, _DENSE_AGREE_PREFIX
+        gguf_model, gguf_tokenizer, _PROMPT, case.dense_agree_prefix
     )
 
     assert gguf_ids == dense_ids, (
-        "Q8_0 GGUF greedy prefix must match the dense mlx_lm reference "
-        f"(gguf={gguf_ids}, dense={dense_ids})"
+        f"{case.label} Q8_0 GGUF greedy prefix must match the dense mlx_lm "
+        f"reference (gguf={gguf_ids}, dense={dense_ids})"
     )
-    assert gguf_ids == _GOLDEN_IDS[:_DENSE_AGREE_PREFIX]
-
-
-# === llama arch (Llama-3.2-1B-Instruct-Q8_0.gguf, target_dtype=bf16) ===
-# Greedy decode of _PROMPT. The leading 13 ids match the dense mlx_lm reference;
-# they diverge at index 13 (quantized vs dense). Without the llama.cpp q/k RoPE
-# row-un-permutation this prefix agreement is only 1 token (attention is broken),
-# so this pins the fix end-to-end.
-_LLAMA_GOLDEN_IDS = [
-    12366,
-    13,
-    578,
-    469,
-    3168,
-    301,
-    22703,
-    374,
-    7559,
-    304,
-    12366,
-    13,
-    578,
-    9928,
-    49606,
-    16730,
-]
-_LLAMA_DENSE_AGREE_PREFIX = 13
-
-_LLAMA_GGUF_ENV = "VLLM_METAL_TEST_GGUF_LLAMA_SERVE_PATH"
-_LLAMA_TOK_ENV = "VLLM_METAL_TEST_GGUF_LLAMA_TOKENIZER_PATH"
-_LLAMA_DENSE_ENV = "VLLM_METAL_TEST_GGUF_LLAMA_DENSE_PATH"
-
-
-@pytest.mark.slow
-def test_llama_gguf_greedy_matches_committed_golden() -> None:
-    gguf_path = _require_path(_LLAMA_GGUF_ENV)
-    tokenizer_dir = _require_path(_LLAMA_TOK_ENV)
-
-    model, tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
-    ).load()
-
-    assert _greedy_token_ids(model, tokenizer, _PROMPT, _N) == _LLAMA_GOLDEN_IDS
-
-
-@pytest.mark.slow
-def test_llama_gguf_greedy_matches_dense_reference_prefix() -> None:
-    gguf_path = _require_path(_LLAMA_GGUF_ENV)
-    tokenizer_dir = _require_path(_LLAMA_TOK_ENV)
-    dense_dir = _require_path(_LLAMA_DENSE_ENV)
-
-    dense_model, dense_tokenizer = mlx_lm_load(dense_dir)
-    dense_ids = _greedy_token_ids(
-        dense_model, dense_tokenizer, _PROMPT, _LLAMA_DENSE_AGREE_PREFIX
-    )
-    del dense_model
-    mx.clear_cache()
-
-    gguf_model, gguf_tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
-    ).load()
-    gguf_ids = _greedy_token_ids(
-        gguf_model, gguf_tokenizer, _PROMPT, _LLAMA_DENSE_AGREE_PREFIX
-    )
-
-    assert gguf_ids == dense_ids, (
-        "llama Q8_0 GGUF greedy prefix must match the dense mlx_lm reference "
-        f"(gguf={gguf_ids}, dense={dense_ids})"
-    )
-    assert gguf_ids == _LLAMA_GOLDEN_IDS[:_LLAMA_DENSE_AGREE_PREFIX]
-
-
-# === mistral arch (Mistral-7B-Instruct-v0.3-Q8_0.gguf, target_dtype=bf16) ===
-# Greedy decode of _PROMPT. The GGUF declares general.architecture="llama"
-# (mistral converts under the llama arch, so the q/k RoPE un-permutation
-# applies through the adapter's mistral->llama alias); the config dir says
-# model_type="mistral" and omits head_dim. All 16 ids match the dense mlx_lm
-# reference (no quantized-vs-dense divergence inside the window).
-_MISTRAL_GOLDEN_IDS = [
-    6233,
-    29493,
-    1330,
-    1040,
-    6333,
-    1070,
-    1040,
-    5717,
-    4610,
-    1117,
-    28566,
-    4573,
-    29491,
-    781,
-    781,
-    1782,
-]
-_MISTRAL_DENSE_AGREE_PREFIX = 16
-
-_MISTRAL_GGUF_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_SERVE_PATH"
-_MISTRAL_TOK_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_TOKENIZER_PATH"
-_MISTRAL_DENSE_ENV = "VLLM_METAL_TEST_GGUF_MISTRAL_DENSE_PATH"
-
-
-@pytest.mark.slow
-def test_mistral_gguf_greedy_matches_committed_golden() -> None:
-    gguf_path = _require_path(_MISTRAL_GGUF_ENV)
-    tokenizer_dir = _require_path(_MISTRAL_TOK_ENV)
-
-    model, tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
-    ).load()
-
-    assert _greedy_token_ids(model, tokenizer, _PROMPT, _N) == _MISTRAL_GOLDEN_IDS
-
-
-@pytest.mark.slow
-def test_mistral_gguf_greedy_matches_dense_reference_prefix() -> None:
-    gguf_path = _require_path(_MISTRAL_GGUF_ENV)
-    tokenizer_dir = _require_path(_MISTRAL_TOK_ENV)
-    dense_dir = _require_path(_MISTRAL_DENSE_ENV)
-
-    dense_model, dense_tokenizer = mlx_lm_load(dense_dir)
-    dense_ids = _greedy_token_ids(
-        dense_model, dense_tokenizer, _PROMPT, _MISTRAL_DENSE_AGREE_PREFIX
-    )
-    del dense_model
-    mx.clear_cache()
-
-    gguf_model, gguf_tokenizer = GGUFModelLoader(
-        gguf_path, config_dir=tokenizer_dir, target_dtype=mx.bfloat16
-    ).load()
-    gguf_ids = _greedy_token_ids(
-        gguf_model, gguf_tokenizer, _PROMPT, _MISTRAL_DENSE_AGREE_PREFIX
-    )
-
-    assert gguf_ids == dense_ids, (
-        "mistral Q8_0 GGUF greedy prefix must match the dense mlx_lm reference "
-        f"(gguf={gguf_ids}, dense={dense_ids})"
-    )
-    assert gguf_ids == _MISTRAL_GOLDEN_IDS[:_MISTRAL_DENSE_AGREE_PREFIX]
+    assert gguf_ids == list(case.golden_ids)[: case.dense_agree_prefix]
