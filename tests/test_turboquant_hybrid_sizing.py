@@ -242,19 +242,22 @@ class TestTurboQuantHybridAlignment:
         assert vllm_config.cache_config.block_size == 16
 
     @pytest.mark.parametrize(
-        "cache_kwargs",
+        "cache_kwargs,hash_consumer",
         [
-            {"block_size": 64, "hash_block_size": 64},
-            {"hash_block_size": 64},
+            ({"block_size": 64}, False),
+            ({"block_size": 64, "hash_block_size": 64}, True),
+            ({"hash_block_size": 64}, True),
         ],
-        ids=["user_block_and_hash", "hash_only"],
+        ids=["user_block", "user_block_and_hash", "hash_only"],
     )
-    def test_update_block_size_survives_vllm_grouping_with_hash_block(
-        self, cache_kwargs, monkeypatch
+    def test_update_block_size_survives_vllm_grouping(
+        self, cache_kwargs, hash_consumer, monkeypatch
     ) -> None:
         cache_config = CacheConfig(enable_prefix_caching=False, **cache_kwargs)
         cache_config.mamba_cache_mode = "none"
         vllm_config = self._vllm_config_with_cache(cache_config)
+        if hash_consumer:
+            vllm_config.kv_transfer_config = SimpleNamespace()
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config", lambda: _tq_config()
@@ -273,9 +276,12 @@ class TestTurboQuantHybridAlignment:
 
         expected_block = 64 * -(-self._MAMBA_PAGE // (64 * self._TQ_PAGE_1_TOKEN))
         assert cache_config.block_size == expected_block
-        assert cache_config.block_size % cache_config.hash_block_size == 0
         assert {group.kv_cache_spec.page_size_bytes for group in groups} == {
             cache_config.block_size * self._TQ_PAGE_1_TOKEN
         }
-        assert scheduler_block_size % cache_config.hash_block_size == 0
-        assert hash_block_size == scheduler_block_size
+        if cache_config.hash_block_size is None:
+            assert hash_block_size == scheduler_block_size
+        else:
+            assert cache_config.block_size % cache_config.hash_block_size == 0
+            assert scheduler_block_size % cache_config.hash_block_size == 0
+            assert hash_block_size == cache_config.hash_block_size
