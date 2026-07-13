@@ -94,44 +94,6 @@ static int min_decode_grid() {
   return v;
 }
 
-// MLX 0.31.2 moved stream-scoped encoder/temporary management from
-// ``metal::Device`` onto ``metal::CommandEncoder`` plus a free
-// ``metal::get_command_encoder(Stream)`` helper.  Keep a tiny shim here so the
-// paged-kernel bridge compiles against both 0.31.1 and 0.31.2.
-#if MLX_VERSION_NUMERIC >= 31002
-static metal::CommandEncoder& get_command_encoder_compat(
-    metal::Device& d,
-    Stream s) {
-  (void)d;
-  return metal::get_command_encoder(s);
-}
-
-static void add_temporary_compat(
-    metal::CommandEncoder& enc,
-    const array& arr,
-    metal::Device& d,
-    Stream s) {
-  (void)d;
-  (void)s;
-  enc.add_temporary(arr);
-}
-#else
-static metal::CommandEncoder& get_command_encoder_compat(
-    metal::Device& d,
-    Stream s) {
-  return d.get_command_encoder(s.index);
-}
-
-static void add_temporary_compat(
-    metal::CommandEncoder& enc,
-    const array& arr,
-    metal::Device& d,
-    Stream s) {
-  (void)enc;
-  d.add_temporary(arr, s.index);
-}
-#endif
-
 void init_v2_library(const std::string& v2_src) {
   v2_paged_attention_source_ = v2_src;
   auto& d = metal::device(Device::gpu);
@@ -336,7 +298,7 @@ static void dispatch_paged_attention_tiled(
       (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
 
   int num_heads = static_cast<int>(query.shape(1));
-  auto& enc = get_command_encoder_compat(d, s);
+  auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
@@ -449,7 +411,7 @@ static void dispatch_paged_attention_v2_online(
                     * static_cast<int>(sizeof(float));
   size_t shmem = static_cast<size_t>(std::max(warp_scores_bytes, merge_bytes));
 
-  auto& enc = get_command_encoder_compat(d, s);
+  auto& enc = metal::get_command_encoder(s);
 
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
@@ -488,7 +450,7 @@ static void dispatch_paged_attention_v2_online(
   auto make_temp = [&](Shape shape, Dtype dtype) {
     array a(std::move(shape), dtype, nullptr, {});
     a.set_data(allocator::malloc(a.nbytes()));
-    add_temporary_compat(enc, a, d, s);
+    enc.add_temporary(a);
     return a;
   };
   array tmp_out = make_temp(
@@ -755,7 +717,7 @@ class TQEncodePrimitive : public Primitive {
     int32_t num_kv_heads_i = static_cast<int32_t>(num_kv_heads);
     int32_t block_size_i   = static_cast<int32_t>(block_size);
 
-    auto& enc = get_command_encoder_compat(d, s);
+    auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(key,                0);
     enc.set_input_array(value,              1);
@@ -899,7 +861,7 @@ class ReshapeAndCachePrimitive : public Primitive {
     int32_t head_size_i    = static_cast<int32_t>(head_size);
     int32_t block_size_i   = static_cast<int32_t>(block_size);
 
-    auto& enc = get_command_encoder_compat(d, s);
+    auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(key,          0);
     enc.set_input_array(value,        1);
@@ -1072,7 +1034,7 @@ static void dispatch_mla_paged_attention(
   size_t shmem =
       static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
 
-  auto& enc = get_command_encoder_compat(d, s);
+  auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
@@ -1196,7 +1158,7 @@ void gdn_linear_attention_impl(
   auto* lib = d.get_library("gdn_kern");
   auto* kernel = d.get_kernel(kname, lib, kname, {});
 
-  auto& enc = get_command_encoder_compat(d, s);
+  auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
 
   enc.set_input_array(q, 0);
@@ -1220,15 +1182,15 @@ void gdn_linear_attention_impl(
       MTL::Size::Make(Dv, 1, num_requests * Hv),
       MTL::Size::Make(32, 1, 1));
 
-  add_temporary_compat(enc, q, d, s);
-  add_temporary_compat(enc, k, d, s);
-  add_temporary_compat(enc, v, d, s);
-  add_temporary_compat(enc, g, d, s);
-  add_temporary_compat(enc, beta, d, s);
-  add_temporary_compat(enc, state_pool, d, s);
-  add_temporary_compat(enc, cu_seqlens, d, s);
-  add_temporary_compat(enc, slot_mapping, d, s);
-  add_temporary_compat(enc, y, d, s);
+  enc.add_temporary(q);
+  enc.add_temporary(k);
+  enc.add_temporary(v);
+  enc.add_temporary(g);
+  enc.add_temporary(beta);
+  enc.add_temporary(state_pool);
+  enc.add_temporary(cu_seqlens);
+  enc.add_temporary(slot_mapping);
+  enc.add_temporary(y);
 }
 // ---------------------------------------------------------------------------
 // nanobind module
