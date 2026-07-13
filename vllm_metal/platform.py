@@ -761,18 +761,12 @@ class MetalPlatform(Platform):
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None
         )
-        user_mamba_block_size = (
-            cache_config.mamba_block_size
-            if cache_config.user_specified_mamba_block_size
-            else None
-        )
         hash_block_size = cache_config.hash_block_size
         super().update_block_size_for_backend(vllm_config)
 
         cls._realign_hybrid_block_size_for_turboquant(
             vllm_config,
             user_block_size=user_block_size,
-            user_mamba_block_size=user_mamba_block_size,
             hash_block_size=hash_block_size,
         )
 
@@ -782,7 +776,6 @@ class MetalPlatform(Platform):
         vllm_config: "VllmConfig",
         *,
         user_block_size: int | None,
-        user_mamba_block_size: int | None,
         hash_block_size: int | None,
     ) -> None:
         """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
@@ -843,20 +836,10 @@ class MetalPlatform(Platform):
             hash_block_size or 1,
         )
 
-        if cache_config.mamba_cache_mode == "all":
-            base_chunk_size = (
-                user_mamba_block_size or model_config.get_mamba_chunk_size()
-            )
-            assert base_chunk_size is not None
-            attn_tokens_per_mamba_state = cdiv(mamba_page_size, tq_page_size_1_token)
-            chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
-            attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
-            cache_config.mamba_block_size = attn_block_size
-        else:
-            attn_block_size = kernel_block_alignment_size * cdiv(
-                mamba_page_size,
-                kernel_block_alignment_size * tq_page_size_1_token,
-            )
+        attn_block_size = kernel_block_alignment_size * cdiv(
+            mamba_page_size,
+            kernel_block_alignment_size * tq_page_size_1_token,
+        )
 
         if cache_config.block_size < attn_block_size:
             logger.info(
@@ -869,9 +852,6 @@ class MetalPlatform(Platform):
                 mamba_page_size,
             )
             cache_config.block_size = attn_block_size
-
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match the packed attention page.
         attn_page_size = cache_config.block_size * tq_page_size_1_token

@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hybrid + TurboQuant sizing must match the runtime's packed KV layout."""
 
-from math import lcm
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
+import pytest
 import torch
 from vllm.config import CacheConfig
 from vllm.model_executor.models import ModelRegistry
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_groups,
+    resolve_kv_cache_block_sizes,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.config import MetalConfig
@@ -158,11 +162,19 @@ class TestTurboQuantHybridAlignment:
             model_config=SimpleNamespace(
                 is_hybrid=True,
                 architecture="StubHybridForCausalLM",
+                dtype=torch.float16,
+                use_mla=False,
                 get_num_kv_heads=lambda parallel_config: KV_HEADS,
                 get_head_size=lambda: HEAD_DIM,
+                get_mamba_chunk_size=lambda: None,
             ),
             cache_config=cache_config,
-            parallel_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            kv_transfer_config=None,
         )
 
     def _stub_model_cls(self) -> SimpleNamespace:
@@ -191,7 +203,6 @@ class TestTurboQuantHybridAlignment:
         MetalPlatform._realign_hybrid_block_size_for_turboquant(
             vllm_config,
             user_block_size=None,
-            user_mamba_block_size=None,
             hash_block_size=None,
         )
 
@@ -211,7 +222,6 @@ class TestTurboQuantHybridAlignment:
         MetalPlatform._realign_hybrid_block_size_for_turboquant(
             vllm_config,
             user_block_size=None,
-            user_mamba_block_size=None,
             hash_block_size=None,
         )
 
@@ -226,84 +236,46 @@ class TestTurboQuantHybridAlignment:
         MetalPlatform._realign_hybrid_block_size_for_turboquant(
             vllm_config,
             user_block_size=None,
-            user_mamba_block_size=None,
             hash_block_size=None,
         )
 
         assert vllm_config.cache_config.block_size == 16
 
-    def test_update_block_size_preserves_user_hash_block_after_super(
-        self, monkeypatch
+    @pytest.mark.parametrize(
+        "cache_kwargs",
+        [
+            {"block_size": 64, "hash_block_size": 64},
+            {"hash_block_size": 64},
+        ],
+        ids=["user_block_and_hash", "hash_only"],
+    )
+    def test_update_block_size_survives_vllm_grouping_with_hash_block(
+        self, cache_kwargs, monkeypatch
     ) -> None:
-        cache_config = CacheConfig(block_size=64, hash_block_size=64)
+        cache_config = CacheConfig(enable_prefix_caching=False, **cache_kwargs)
         cache_config.mamba_cache_mode = "none"
         vllm_config = self._vllm_config_with_cache(cache_config)
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
-        self._patch_model_cls(monkeypatch)
-
-        def fake_super(cls, vc) -> None:
-            vc.cache_config.block_size = 576
-
         monkeypatch.setattr(
-            MetalPlatform.__mro__[1],
-            "update_block_size_for_backend",
-            classmethod(fake_super),
+            "vllm_metal.v1.cache_policy.get_config", lambda: _tq_config()
         )
+        self._patch_model_cls(monkeypatch)
+        runner = _hybrid_runner()
+        runner.cache_config = cache_config
 
         MetalPlatform.update_block_size_for_backend(vllm_config)
+        specs = runner._cache_policy.get_kv_cache_spec()
+        groups = get_kv_cache_groups(vllm_config, specs)
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=groups),
+            vllm_config,
+        )
 
         expected_block = 64 * -(-self._MAMBA_PAGE // (64 * self._TQ_PAGE_1_TOKEN))
         assert cache_config.block_size == expected_block
         assert cache_config.block_size % cache_config.hash_block_size == 0
-
-    def test_update_block_size_preserves_hash_block_without_user_block(
-        self, monkeypatch
-    ) -> None:
-        cache_config = CacheConfig(hash_block_size=64)
-        cache_config.mamba_cache_mode = "none"
-        vllm_config = self._vllm_config_with_cache(cache_config)
-        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
-        self._patch_model_cls(monkeypatch)
-
-        def fake_super(cls, vc) -> None:
-            vc.cache_config.block_size = 576
-
-        monkeypatch.setattr(
-            MetalPlatform.__mro__[1],
-            "update_block_size_for_backend",
-            classmethod(fake_super),
-        )
-
-        MetalPlatform.update_block_size_for_backend(vllm_config)
-
-        expected_block = 64 * -(-self._MAMBA_PAGE // (64 * self._TQ_PAGE_1_TOKEN))
-        assert cache_config.block_size == expected_block
-        assert cache_config.block_size % cache_config.hash_block_size == 0
-
-    def test_update_block_size_snapshots_user_mamba_before_super(
-        self, monkeypatch
-    ) -> None:
-        cache_config = CacheConfig(block_size=64, mamba_block_size=128)
-        assert cache_config.user_specified_mamba_block_size is True
-        cache_config.mamba_cache_mode = "all"
-        vllm_config = self._vllm_config_with_cache(cache_config)
-        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
-        self._patch_model_cls(monkeypatch)
-
-        def fake_super(cls, vc) -> None:
-            vc.cache_config.block_size = 576
-            vc.cache_config.mamba_block_size = 999
-
-        monkeypatch.setattr(
-            MetalPlatform.__mro__[1],
-            "update_block_size_for_backend",
-            classmethod(fake_super),
-        )
-
-        MetalPlatform.update_block_size_for_backend(vllm_config)
-
-        chunk_size = lcm(128, 64)
-        attn_tokens_per_mamba_state = -(-self._MAMBA_PAGE // self._TQ_PAGE_1_TOKEN)
-        expected_block = chunk_size * -(-attn_tokens_per_mamba_state // chunk_size)
-        assert cache_config.block_size == expected_block
-        assert cache_config.mamba_block_size == expected_block
+        assert {group.kv_cache_spec.page_size_bytes for group in groups} == {
+            cache_config.block_size * self._TQ_PAGE_1_TOKEN
+        }
+        assert scheduler_block_size % cache_config.hash_block_size == 0
+        assert hash_block_size == scheduler_block_size
