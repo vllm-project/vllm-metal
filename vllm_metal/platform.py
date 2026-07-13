@@ -766,12 +766,14 @@ class MetalPlatform(Platform):
             if cache_config.user_specified_mamba_block_size
             else None
         )
+        hash_block_size = cache_config.hash_block_size
         super().update_block_size_for_backend(vllm_config)
 
         cls._realign_hybrid_block_size_for_turboquant(
             vllm_config,
             user_block_size=user_block_size,
             user_mamba_block_size=user_mamba_block_size,
+            hash_block_size=hash_block_size,
         )
 
     @classmethod
@@ -781,6 +783,7 @@ class MetalPlatform(Platform):
         *,
         user_block_size: int | None,
         user_mamba_block_size: int | None,
+        hash_block_size: int | None,
     ) -> None:
         """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
         metal_config = get_config()
@@ -798,6 +801,8 @@ class MetalPlatform(Platform):
             or not model_config.is_hybrid
         ):
             return
+
+        from math import lcm
 
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -832,14 +837,13 @@ class MetalPlatform(Platform):
             s.base if isinstance(s, MultipleOf) else s
             for s in backend_cls.get_supported_kernel_block_sizes()
         )
-        kernel_block_alignment_size = max(
+        kernel_block_alignment_size = lcm(
             backend_block_alignment_size,
-            user_block_size or backend_block_alignment_size,
+            user_block_size or 1,
+            hash_block_size or 1,
         )
 
         if cache_config.mamba_cache_mode == "all":
-            from math import lcm
-
             base_chunk_size = (
                 user_mamba_block_size or model_config.get_mamba_chunk_size()
             )

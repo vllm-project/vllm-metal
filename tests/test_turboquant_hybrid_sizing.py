@@ -192,6 +192,7 @@ class TestTurboQuantHybridAlignment:
             vllm_config,
             user_block_size=None,
             user_mamba_block_size=None,
+            hash_block_size=None,
         )
 
         expected_block = 16 * -(-self._MAMBA_PAGE // (16 * self._TQ_PAGE_1_TOKEN))
@@ -211,6 +212,7 @@ class TestTurboQuantHybridAlignment:
             vllm_config,
             user_block_size=None,
             user_mamba_block_size=None,
+            hash_block_size=None,
         )
 
         assert vllm_config.cache_config.block_size == 544
@@ -225,6 +227,7 @@ class TestTurboQuantHybridAlignment:
             vllm_config,
             user_block_size=None,
             user_mamba_block_size=None,
+            hash_block_size=None,
         )
 
         assert vllm_config.cache_config.block_size == 16
@@ -233,6 +236,30 @@ class TestTurboQuantHybridAlignment:
         self, monkeypatch
     ) -> None:
         cache_config = CacheConfig(block_size=64, hash_block_size=64)
+        cache_config.mamba_cache_mode = "none"
+        vllm_config = self._vllm_config_with_cache(cache_config)
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
+        self._patch_model_cls(monkeypatch)
+
+        def fake_super(cls, vc) -> None:
+            vc.cache_config.block_size = 576
+
+        monkeypatch.setattr(
+            MetalPlatform.__mro__[1],
+            "update_block_size_for_backend",
+            classmethod(fake_super),
+        )
+
+        MetalPlatform.update_block_size_for_backend(vllm_config)
+
+        expected_block = 64 * -(-self._MAMBA_PAGE // (64 * self._TQ_PAGE_1_TOKEN))
+        assert cache_config.block_size == expected_block
+        assert cache_config.block_size % cache_config.hash_block_size == 0
+
+    def test_update_block_size_preserves_hash_block_without_user_block(
+        self, monkeypatch
+    ) -> None:
+        cache_config = CacheConfig(hash_block_size=64)
         cache_config.mamba_cache_mode = "none"
         vllm_config = self._vllm_config_with_cache(cache_config)
         monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
