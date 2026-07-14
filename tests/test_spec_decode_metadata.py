@@ -523,43 +523,36 @@ class TestSchedulerPaddedDrafts:
 
         assert active == {}
 
-    def test_real_drafts_are_kept(self) -> None:
+    @pytest.mark.parametrize(
+        ("spec_tokens", "num_scheduled", "invalid_counts"),
+        [
+            ([7, 8], None, None),
+            ([-1, -1], None, {"r0": 2}),
+            ([-2, -2], None, None),
+            ([-1, -1], {"r0": 5}, None),
+        ],
+        ids=[
+            "real_drafts",
+            "grammar_rejected",
+            "foreign_sentinel",
+            "mismatched_accounting",
+        ],
+    )
+    def test_non_padding_handoffs_are_kept(
+        self,
+        spec_tokens: list[int],
+        num_scheduled: dict[str, int] | None,
+        invalid_counts: dict[str, int] | None,
+    ) -> None:
         scheduler_output = _scheduler_output(
-            scheduled_spec_decode_tokens={"r0": [7, 8]},
+            scheduled_spec_decode_tokens={"r0": spec_tokens},
+            num_scheduled_tokens=num_scheduled,
+            num_invalid_spec_tokens=invalid_counts,
         )
 
         active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
 
-        assert active == {"r0": (7, 8)}
-
-    def test_grammar_rejected_drafts_are_kept(self) -> None:
-        scheduler_output = _scheduler_output(
-            scheduled_spec_decode_tokens={"r0": [-1, -1]},
-            num_invalid_spec_tokens={"r0": 2},
-        )
-
-        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
-
-        assert active == {"r0": (-1, -1)}
-
-    def test_non_padding_negative_sentinels_are_kept(self) -> None:
-        scheduler_output = _scheduler_output(
-            scheduled_spec_decode_tokens={"r0": [-2, -2]},
-        )
-
-        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
-
-        assert active == {"r0": (-2, -2)}
-
-    def test_padded_shape_with_mismatched_accounting_is_kept(self) -> None:
-        scheduler_output = _scheduler_output(
-            scheduled_spec_decode_tokens={"r0": [-1, -1]},
-            num_scheduled_tokens={"r0": 5},
-        )
-
-        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
-
-        assert active == {"r0": (-1, -1)}
+        assert active == {"r0": tuple(spec_tokens)}
 
     def test_padded_request_outside_decode_set_is_accepted(self) -> None:
         scheduler_output = _scheduler_output(
