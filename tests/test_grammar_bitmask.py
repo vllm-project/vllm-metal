@@ -283,6 +283,7 @@ class TestApplyGrammarBitmaskPaged:
         )
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"a": 3, "b": 2},
             total_num_scheduled_tokens=5,
             finished_req_ids=set(),
@@ -343,6 +344,7 @@ class TestApplyGrammarBitmaskPaged:
         )
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"a": 3, "b": 2},
             total_num_scheduled_tokens=5,
             finished_req_ids=set(),
@@ -396,6 +398,7 @@ class TestApplyGrammarBitmaskPaged:
         )
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"a": 3},
             total_num_scheduled_tokens=3,
             finished_req_ids=set(),
@@ -430,6 +433,7 @@ class TestApplyGrammarBitmaskPaged:
         )
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"a": 3},
             total_num_scheduled_tokens=3,
             finished_req_ids=set(),
@@ -657,6 +661,7 @@ class TestApplyGrammarBitmaskPaged:
         cu = _build_cu_seqlens(num_decode=1, prefill_lens=[])
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens={"r0": [9]},
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"r0": 2},
             total_num_scheduled_tokens=2,
             finished_req_ids=set(),
@@ -679,6 +684,7 @@ class TestApplyGrammarBitmaskPaged:
         cu = _build_cu_seqlens(num_decode=2, prefill_lens=[])
         sched = SimpleNamespace(
             scheduled_spec_decode_tokens={"r1": [99]},
+            num_invalid_spec_tokens=None,
             num_scheduled_tokens={"r0": 1, "r1": 2},
             total_num_scheduled_tokens=3,
             finished_req_ids=set(),
@@ -810,3 +816,32 @@ class TestSampleTokensGrammarPagedPath:
 
         assert output is not None
         assert output.sampled_token_ids[0][0] == allowed_token
+
+    def test_scheduler_padded_structured_req_does_not_enter_row_span_mode(self) -> None:
+        """A padded structured-output req must not be treated as spec-decode.
+
+        vLLM 0.25 pads a newly admitted decode request with placeholder drafts
+        (``[-1] * num_spec_tokens``, no invalid-token accounting). Those are
+        truthy, so without dropping them this batch would flip into row-span
+        bitmask mode for a request that owns a single logits row.
+        """
+        allowed_token = 5
+        logits = _uniform_logits_3d(1)
+        decode_reqs = [_make_decode_req("r0")]
+        cu = _build_cu_seqlens(num_decode=1, prefill_lens=[])
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+            num_invalid_spec_tokens=None,
+            num_scheduled_tokens={"r0": 3},
+            total_num_scheduled_tokens=3,
+            finished_req_ids=set(),
+        )
+        grammar = _make_grammar_output(
+            ["r0"], _make_single_token_bitmask(allowed_token)
+        )
+
+        result = _applier.apply_paged(sched, grammar, decode_reqs, [], cu, 1, logits)
+
+        result_np = _to_numpy(result)
+        assert np.isfinite(result_np[0, 0, allowed_token])
+        assert result_np[0, 0, (allowed_token + 1) % VOCAB_SIZE] == float("-inf")

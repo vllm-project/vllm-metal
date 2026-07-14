@@ -23,7 +23,7 @@ except ImportError:
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
-from vllm_metal.v1.spec_decode import PagedDecodeSegment
+from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 
 class MetalStructuredOutputApplier:
@@ -85,7 +85,9 @@ class MetalStructuredOutputApplier:
         structured_req_ids = set(grammar_output.structured_output_request_ids)
         spec_req_ids = {
             req_id
-            for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+            for req_id, tokens in SpeculativeDecodeController.active_spec_decode_tokens(
+                scheduler_output
+            ).items()
             if tokens
         }
         structured_spec_req_ids = spec_req_ids & structured_req_ids

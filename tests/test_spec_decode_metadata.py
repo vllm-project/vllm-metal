@@ -240,7 +240,7 @@ class TestSpecDecodePolicy:
     def test_rejects_invalid_draft_token_sentinel(self) -> None:
         with pytest.raises(NotImplementedError, match="invalid draft-token"):
             SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [-1]}),
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
@@ -501,3 +501,58 @@ class TestVerifyGreedySpecDecode:
                 ),
                 logitsprocs=LogitsProcessors([_NonArgmaxProcessor()]),
             )
+
+
+class TestSchedulerPaddedDrafts:
+    """vLLM 0.25 pads a newly admitted decode request with placeholder drafts."""
+
+    def test_padded_drafts_are_dropped(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {}
+
+    def test_real_drafts_are_kept(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [7, 8]},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": (7, 8)}
+
+    def test_grammar_rejected_drafts_are_kept(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+            num_invalid_spec_tokens={"r0": 2},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": (-1, -1)}
+
+    def test_padded_shape_with_mismatched_accounting_is_kept(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+            num_scheduled_tokens={"r0": 5},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": (-1, -1)}
+
+    def test_padded_request_outside_decode_set_is_accepted(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"new": [-1, -1]},
+        )
+
+        SpeculativeDecodeController().validate_supported(
+            scheduler_output,
+            [],
+            paged_attention_enabled=True,
+            is_hybrid=False,
+            logitsprocs=None,
+        )

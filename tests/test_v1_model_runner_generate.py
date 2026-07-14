@@ -1385,7 +1385,11 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            scheduler_output=SimpleNamespace(
+                scheduled_spec_decode_tokens={},
+                num_invalid_spec_tokens=None,
+                num_scheduled_tokens={},
+            ),
         )
 
         assert len(submitted) == 1
@@ -1423,7 +1427,11 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            scheduler_output=SimpleNamespace(
+                scheduled_spec_decode_tokens={},
+                num_invalid_spec_tokens=None,
+                num_scheduled_tokens={},
+            ),
         )
 
         assert len(submitted) == 1
@@ -1647,7 +1655,11 @@ class TestV1MetalModelRunnerGDNLifecycle:
             start_pos=0,
             full_prompt_token_ids=[9],
         )
-        scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={})
+        scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={},
+            num_invalid_spec_tokens=None,
+            num_scheduled_tokens={},
+        )
 
         runner._start_paged_forward(
             mr._ExecutionBatch(),

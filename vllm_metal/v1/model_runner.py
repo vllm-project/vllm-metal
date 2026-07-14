@@ -964,7 +964,7 @@ class MetalModelRunner:
         """
         decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
-            scheduler_output.scheduled_spec_decode_tokens,
+            self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
