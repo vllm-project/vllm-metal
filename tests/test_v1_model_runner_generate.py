@@ -360,6 +360,56 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state.target_hidden_states is not None
         assert runner._execute_model_state.cu_seqlens == [0, 3]
 
+    def test_start_paged_forward_drops_scheduler_padded_drafts(
+        self, monkeypatch
+    ) -> None:
+        """vLLM 0.25 pads a newly admitted decode request with placeholder drafts.
+
+        The runner must hand ``build_decode_segments`` the filtered map, so the
+        request gets a single query row instead of splicing ``-1`` into the
+        embedding lookup.
+        """
+        runner = self._make_runner()
+        runner.vllm_config = self._make_gemma4_mtp_config()
+        runner._drafter = Gemma4MTPProposer(runner)
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_request_seq_lens["r0"] = 1
+
+        captured: dict[str, object] = {}
+
+        def fake_prepare_unified(decode_info, prefill_info, block_size):
+            captured["decode_info"] = decode_info
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            captured["input_ids"] = input_ids.tolist()
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 16)),
+                hidden_states=mx.ones((1, 4)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_unified", fake_prepare_unified)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [0, 1]
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 3},
+            {"r0": [-1, -1]},
+        )
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        assert captured["input_ids"] == [[6]]
+        assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert runner._execute_model_state.cu_seqlens == [0, 1]
+
     def test_start_paged_forward_skips_hidden_states_without_drafts(
         self, monkeypatch
     ) -> None:

@@ -556,3 +556,22 @@ class TestSchedulerPaddedDrafts:
             is_hybrid=False,
             logitsprocs=None,
         )
+
+    def test_padded_drafts_reach_build_decode_segments_as_zero_drafts(self) -> None:
+        controller = SpeculativeDecodeController()
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+        decode_reqs = [("r0", _state([5, 9], [41, 42]))]
+
+        segments = controller.build_decode_segments(
+            decode_reqs,
+            controller.active_spec_decode_tokens(scheduler_output),
+            paged_request_seq_lens={"r0": 7},
+        )
+
+        assert len(segments) == 1
+        assert segments[0].num_query_tokens == 1
+        assert segments[0].input_token_ids == (9,)
+        assert segments[0].draft_token_ids == ()
+        assert segments[0].bonus_row == 0
