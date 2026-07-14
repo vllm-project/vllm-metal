@@ -146,10 +146,11 @@ class TestUpdateBlockSizeForBackend:
 
         assert vllm_config.cache_config.block_size == 64
 
-    def test_non_hybrid_model_skipped(self, vllm_config):
+    def test_non_hybrid_model_skipped(self, vllm_config, stub_super_update):
         """Test: Non-hybrid model skips Metal-specific adjustments.
 
-        Non-hybrid models use base implementation without Metal adjustments.
+        Metal only realigns block size for hybrid models, so a non-hybrid model
+        must delegate to the base implementation and leave block_size untouched.
         """
         # Set model as non-hybrid
         vllm_config.model_config.is_hybrid = False
@@ -158,9 +159,8 @@ class TestUpdateBlockSizeForBackend:
         # Execute (should use base implementation only)
         MetalPlatform.update_block_size_for_backend(vllm_config)
 
-        # For non-hybrid, base implementation may adjust block_size
-        # but Metal-specific paged attention adjustment should not apply
-        assert vllm_config.cache_config.block_size >= original_block_size
+        stub_super_update.assert_called_once()
+        assert vllm_config.cache_config.block_size == original_block_size
 
     def test_model_config_none(self):
         """Test: None model_config returns early without error."""
