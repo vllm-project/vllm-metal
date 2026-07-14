@@ -645,6 +645,15 @@ class MetalModelRunner:
                 model_config=self.model_config,
             )
 
+        if self.pp is not None and self.pp.size > 1:
+            # Profile the PP stage shape: non-first stages never embed and
+            # non-last stages never compute logits, in profiling as in serving.
+            assert self._pp_model is not None
+            output = self._pp_model.dummy_forward(input_ids)
+            if not self.pp.is_last:
+                return [output]
+            return [self._extract_logits(output)]
+
         output = self._forward_model(input_ids)
         logits = self._extract_logits(output)
         return [logits]

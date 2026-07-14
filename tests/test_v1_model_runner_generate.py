@@ -1765,3 +1765,112 @@ class TestLoadModelPipelineSplitOrdering:
         runner.load_model()
 
         assert events == ["load", "split", "lora"]
+
+
+class _StageDummyRecorder:
+    """Stands in for PipelinedModel: records the ids the dummy forward gets."""
+
+    def __init__(self, output: object) -> None:
+        self.output = output
+        self.seen: object = None
+
+    def dummy_forward(self, input_ids: object) -> object:
+        self.seen = input_ids
+        return self.output
+
+
+class _FullPathMustNotRun:
+    def __call__(self, input_ids: object) -> object:
+        raise AssertionError("full-model dummy path must not run on a PP stage")
+
+
+class TestDummyForwardOutputsPPRouting:
+    class _Group:
+        def __init__(self, rank: int, size: int) -> None:
+            self._rank, self._size = rank, size
+
+        def rank(self) -> int:
+            return self._rank
+
+        def size(self) -> int:
+            return self._size
+
+    def _pp_runner(self, rank: int, stage: _StageDummyRecorder) -> mr.MetalModelRunner:
+        return make_stub_runner(
+            pp=PipelineGroup(self._Group(rank, 2)),
+            _pp_model=stage,
+            model=_FullPathMustNotRun(),
+        )
+
+    def test_non_last_stage_returns_hidden_unextracted(self) -> None:
+        # A non-last stage's dummy output is the raw hidden state — exactly what
+        # serving evals — so no logits extraction may touch it.
+        sentinel = SimpleNamespace(logits="would-be-extracted")
+        stage = _StageDummyRecorder(sentinel)
+        runner = self._pp_runner(0, stage)
+        ids = mx.zeros((1, 3), dtype=mx.int32)
+
+        outs = runner._dummy_forward_outputs(ids)
+
+        assert outs == [sentinel]  # passthrough: extraction did NOT run
+        assert stage.seen is ids
+
+    def test_last_stage_extracts_logits(self) -> None:
+        stage = _StageDummyRecorder(SimpleNamespace(logits="stage-logits"))
+        runner = self._pp_runner(1, stage)
+
+        outs = runner._dummy_forward_outputs(mx.zeros((1, 3), dtype=mx.int32))
+
+        assert outs == ["stage-logits"]  # extraction ran on the last stage
+
+    def test_single_stage_keeps_full_model_path(self) -> None:
+        class _RecordingModel:
+            seen: object = None
+
+            def __call__(self, input_ids: object) -> object:
+                self.seen = input_ids
+                return SimpleNamespace(logits="full-logits")
+
+        model = _RecordingModel()
+        runner = make_stub_runner(model=model)  # pp/_pp_model default to None
+        ids = mx.zeros((1, 3), dtype=mx.int32)
+
+        outs = runner._dummy_forward_outputs(ids)
+
+        assert outs == ["full-logits"]
+        assert model.seen is ids
+
+    def test_profile_run_profiles_the_stage_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Caller-level, mirroring TestMetalPoolingProfileWarmup: the mx cache
+        # functions are patched so the test cannot clamp the process-wide
+        # allocator, and what profile_run evals must be exactly the stage's
+        # own hidden output — that is what makes the measured peak stage-shaped.
+        hidden = mx.zeros((1, 4, 8), dtype=mx.float16)
+        stage = _StageDummyRecorder(hidden)
+        runner = make_stub_runner(
+            pp=PipelineGroup(self._Group(0, 2)),
+            _pp_model=stage,
+            model=_FullPathMustNotRun(),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        )
+        evaled: list[object] = []
+        real_eval = mx.eval
+        cache_readings = iter([100, 180])
+        limits: list[int] = []
+        monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
+        monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
+        monkeypatch.setattr(mr.mx, "set_cache_limit", limits.append)
+        monkeypatch.setattr(
+            mr.mx, "eval", lambda *arrays: evaled.extend(arrays) or real_eval(*arrays)
+        )
+
+        overhead = runner.profile_run()
+
+        assert isinstance(stage.seen, mx.array)
+        assert stage.seen.shape == (1, 4)
+        assert stage.seen.dtype == mx.int32
+        assert evaled == [hidden]  # eval saw exactly the stage-shaped output
+        assert overhead == 80
+        assert limits == [80]

@@ -266,13 +266,34 @@ class PipelinedModel:
         )
 
     def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
-        pp = self._pp
         h_in: mx.array | None = None
-        if not pp.is_first:
+        if not self._pp.is_first:
             h_in = pipeline_recv(
-                pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
+                self._pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
             )
-        if pp.is_last:
+        return self._stage_forward(input_ids, h_in, cache=cache)
+
+    def dummy_forward(self, input_ids: mx.array) -> mx.array:
+        """Run this stage's forward locally for profiling/warm-up: no ring I/O.
+
+        Non-first stages take a zeros hidden state at the wire descriptor in
+        place of ``pipeline_recv`` (mirroring upstream vLLM's ``_dummy_run`` +
+        ``make_empty_intermediate_tensors``), so profiling never materializes
+        the embedding a non-first stage does not use; the stage body — and its
+        wire-dtype fail-fast — is shared with ``__call__``.
+        """
+        h_in: mx.array | None = None
+        if not self._pp.is_first:
+            h_in = mx.zeros(
+                (input_ids.shape[0], input_ids.shape[1], self._wire_hidden),
+                dtype=self._wire_dtype,
+            )
+        return self._stage_forward(input_ids, h_in)
+
+    def _stage_forward(
+        self, input_ids: mx.array, h_in: mx.array | None, *, cache: Any = None
+    ) -> mx.array:
+        if self._pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
