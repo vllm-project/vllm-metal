@@ -4,15 +4,13 @@
 
 - macOS on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
-- Xcode Command Line Tools (`xcode-select --install`). The installer compiles vLLM core from source via `clang++`.
 
-> **Metal kernels are prebuilt.** Release wheels ship the native paged-attention
-> extension (`_paged_ops*.so`) and its precompiled Metal shader libraries
-> (`*.metallib`), so `pip install` requires no compiler or Metal toolchain to
-> *run* the kernels — nothing is compiled on first request. The Command Line
-> Tools above are still needed because the installer builds vLLM core from
-> source. Building the Metal kernels yourself is only for contributors editing
-> them; see [Contributing](CONTRIBUTING.md).
+> **Nothing is compiled on your machine.** vLLM core and the vllm-metal plugin
+> both install as prebuilt wheels, and the plugin wheel bundles the native
+> paged-attention extension (`_paged_ops*.so`) and its Metal shader libraries
+> (`*.metallib`) — so no C++ compiler and no Metal toolchain are needed, and
+> nothing is built on the first request. Xcode Command Line Tools are only
+> needed to *edit* the kernels; see [Contributing](CONTRIBUTING.md).
 
 `uv` is bootstrapped automatically.
 

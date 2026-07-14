@@ -17,7 +17,8 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 
 - macOS on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
-- Xcode Command Line Tools (`xcode-select --install`). vLLM core is compiled from source via `clang++`. The Metal kernels ship **prebuilt**, so no Metal compiler or toolchain is needed to run them.
+
+**No compiler required.** vLLM core and the Metal kernels both install as prebuilt wheels — nothing is compiled on your machine. Xcode Command Line Tools are only needed to *edit* the kernels; see [Contributing](docs/CONTRIBUTING.md).
 
 ## Supported Models
 
