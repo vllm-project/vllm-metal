@@ -60,6 +60,7 @@ class TestMetalPlatform:
     ) -> None:
         """PP is allowed, but combining PP>1 with TP>1 is rejected at config time."""
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -136,6 +137,7 @@ class TestMetalPlatform:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -160,6 +162,7 @@ class TestMetalPlatform:
         rather than silently flip the user's scheduler config.
         """
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -194,7 +197,10 @@ class TestMetalPlatform:
             ),
             model_config=None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
-            speculative_config=SimpleNamespace(method="ngram"),
+            speculative_config=SimpleNamespace(
+                use_heterogeneous_vocab=False,
+                method="ngram",
+            ),
         )
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -245,6 +251,7 @@ class TestMetalPlatform:
         spawns. Reject the explicit combination rather than flip it silently.
         """
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -261,6 +268,7 @@ class TestMetalPlatform:
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -489,7 +497,11 @@ class TestMetalPlatform:
         """DP with speculative decoding is unvalidated; reject at config time."""
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(
-                self._dp_vllm_config(speculative_config=SimpleNamespace(method="ngram"))
+                self._dp_vllm_config(
+                    speculative_config=SimpleNamespace(
+                        method="ngram", use_heterogeneous_vocab=False
+                    )
+                )
             )
 
     def test_check_and_update_config_rejects_dp_lora(self) -> None:
@@ -512,6 +524,20 @@ class TestMetalPlatform:
         vllm_config.cache_config.kv_cache_dtype_skip_layers = ["0", "31"]
 
         with pytest.raises(NotImplementedError, match="heterogeneous KV cache dtypes"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_heterogeneous_draft_vocab(self) -> None:
+        """A draft vocabulary that differs from the target is unsupported.
+
+        Upstream stopped verifying equal vocab sizes when the flag is set, so the
+        proposer would otherwise verify draft ids against the target vocabulary
+        with no mapping.
+        """
+        vllm_config = self._dp_vllm_config()
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.speculative_config = SimpleNamespace(use_heterogeneous_vocab=True)
+
+        with pytest.raises(NotImplementedError, match="heterogeneous draft vocabulary"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_dp_multimodal(
@@ -816,6 +842,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -870,6 +897,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -942,6 +970,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -986,6 +1015,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1035,6 +1065,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1088,6 +1119,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1133,6 +1165,7 @@ class TestMetalPlatform:
         """STT models should get tokenizer fallback and async scheduling disabled."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -1169,6 +1202,7 @@ class TestMetalPlatform:
         """STT policy should not overwrite an explicitly configured tokenizer."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -1224,6 +1258,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1273,6 +1308,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1320,6 +1356,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1371,6 +1408,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1418,6 +1456,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",

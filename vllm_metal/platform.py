@@ -410,6 +410,20 @@ class MetalPlatform(Platform):
                 "--additional-config '{\"turboquant\": true}' instead."
             )
 
+        # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
+        # so a draft model with a different vocabulary reaches the proposer, which
+        # verifies draft ids against the target vocabulary with no mapping.
+        speculative_config = vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.use_heterogeneous_vocab
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support speculative decoding with a "
+                "heterogeneous draft vocabulary (use_heterogeneous_vocab). Use a "
+                "draft model that shares the target vocabulary."
+            )
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
             if (

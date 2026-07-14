@@ -331,18 +331,6 @@ def _load_draft_model(
             "draft_model speculative decoding requires a draft_model_config"
         )
 
-    # vLLM 0.25 made verify_equal_vocab_size_if_draft_model() conditional on this
-    # flag, so a draft model with a different vocabulary now reaches us instead of
-    # being rejected at config time. Metal compares draft ids against target-vocab
-    # ids with no vocab mapping, which would silently mis-verify rather than crash.
-    if speculative_config.use_heterogeneous_vocab:
-        raise NotImplementedError(
-            "draft_model speculative decoding with a heterogeneous draft "
-            "vocabulary is not supported on Metal: the draft ids are verified "
-            "against the target vocabulary with no mapping. Use a draft model "
-            "that shares the target vocabulary."
-        )
-
     # Its own instance (patched to its own draft KV cache, so it must not alias
     # the target). AWQ / variable-head-dim drafts aren't handled here yet
     # (canonical loader: ModelLifecycle._load_generation_model).
