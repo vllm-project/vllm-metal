@@ -80,6 +80,11 @@ class TestUpdateBlockSizeForBackend:
         cache_config.mamba_cache_mode = "none"
         cache_config.mamba_block_size = None
         cache_config.mamba_page_size_padded = None
+        # vLLM 0.25's heterogeneous-KV alignment reads these inside
+        # super().update_block_size_for_backend(). Both are default_factory/None
+        # fields, so MagicMock(spec=CacheConfig) does not synthesize them.
+        cache_config.kv_cache_dtype_skip_layers = []
+        cache_config.skip_page_size_padded = None
         return cache_config
 
     @pytest.fixture
@@ -159,6 +164,18 @@ class TestUpdateBlockSizeForBackend:
         # For non-hybrid, base implementation may adjust block_size
         # but Metal-specific paged attention adjustment should not apply
         assert vllm_config.cache_config.block_size >= original_block_size
+
+    def test_rejects_heterogeneous_kv_cache_dtypes(self, vllm_config):
+        """Test: skip-layer KV dtypes are rejected before upstream resizes blocks.
+
+        vLLM 0.25 aligns block sizes across heterogeneous KV dtypes inside the
+        base implementation, which would rewrite the block size behind Metal's
+        own TurboQuant sizing.
+        """
+        vllm_config.cache_config.kv_cache_dtype_skip_layers = ["0", "31"]
+
+        with pytest.raises(NotImplementedError, match="heterogeneous KV cache dtypes"):
+            MetalPlatform.update_block_size_for_backend(vllm_config)
 
     def test_model_config_none(self):
         """Test: None model_config returns early without error."""
