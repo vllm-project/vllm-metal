@@ -12,6 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.sampler import Sampler
 
@@ -53,25 +54,17 @@ def _make_single_token_bitmask(
 def _make_scheduler_output(
     req_ids: list[str],
     *,
+    num_scheduled_tokens: dict[str, int] | None = None,
+    scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
     has_structured_output_requests: bool = False,
-) -> SimpleNamespace:
-    """Minimal SchedulerOutput stub — no spec-decode tokens."""
-    return SimpleNamespace(
-        scheduled_spec_decode_tokens={},
-        num_invalid_spec_tokens=None,
-        num_scheduled_tokens=dict.fromkeys(req_ids, 1),
-        total_num_scheduled_tokens=len(req_ids),
-        num_spec_tokens_to_schedule=0,
+) -> SchedulerOutput:
+    num_scheduled = num_scheduled_tokens or dict.fromkeys(req_ids, 1)
+    return SchedulerOutput(
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[],
-            resumed_req_ids=set(),
-            new_token_ids=[],
-            all_token_ids={},
-            new_block_ids=[],
-            num_computed_tokens=[],
-            num_output_tokens=[],
-        ),
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=num_scheduled,
+        total_num_scheduled_tokens=sum(num_scheduled.values()),
+        scheduled_spec_decode_tokens=scheduled_spec_decode_tokens or {},
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
@@ -281,12 +274,10 @@ class TestApplyGrammarBitmaskPaged:
             [segment.num_query_tokens for segment in segments],
             prefill_lens=[2],
         )
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["a", "b"],
             num_scheduled_tokens={"a": 3, "b": 2},
-            total_num_scheduled_tokens=5,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         )
         grammar = _make_grammar_output(
             ["pf0", "a"],
@@ -342,12 +333,10 @@ class TestApplyGrammarBitmaskPaged:
             [segment.num_query_tokens for segment in segments],
             prefill_lens=[],
         )
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["a", "b"],
             num_scheduled_tokens={"a": 3, "b": 2},
-            total_num_scheduled_tokens=5,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         )
         grammar = _make_grammar_output(
             ["b", "a"],
@@ -396,12 +385,10 @@ class TestApplyGrammarBitmaskPaged:
             [segment.num_query_tokens for segment in segments],
             prefill_lens=[],
         )
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["a"],
             num_scheduled_tokens={"a": 3},
-            total_num_scheduled_tokens=3,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         )
         grammar = _make_grammar_output(["a"], _make_single_token_bitmask(7))
 
@@ -431,12 +418,10 @@ class TestApplyGrammarBitmaskPaged:
             [segment.num_query_tokens for segment in segments],
             prefill_lens=[],
         )
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["a"],
             num_scheduled_tokens={"a": 3},
-            total_num_scheduled_tokens=3,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
         )
         grammar = _make_grammar_output(
             ["a", "missing"],
@@ -659,12 +644,10 @@ class TestApplyGrammarBitmaskPaged:
         logits = _uniform_logits_3d(2)
         decode_reqs = [_make_decode_req("r0")]
         cu = _build_cu_seqlens(num_decode=1, prefill_lens=[])
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens={"r0": [9]},
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["r0"],
             num_scheduled_tokens={"r0": 2},
-            total_num_scheduled_tokens=2,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens={"r0": [9]},
         )
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
@@ -682,12 +665,10 @@ class TestApplyGrammarBitmaskPaged:
         logits = _uniform_logits_3d(3)
         decode_reqs = [_make_decode_req("r0"), _make_decode_req("r1")]
         cu = _build_cu_seqlens(num_decode=2, prefill_lens=[])
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens={"r1": [99]},
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["r0", "r1"],
             num_scheduled_tokens={"r0": 1, "r1": 2},
-            total_num_scheduled_tokens=3,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens={"r1": [99]},
         )
         grammar = _make_grammar_output(
             ["r0"], _make_single_token_bitmask(allowed_token)
@@ -829,12 +810,10 @@ class TestSampleTokensGrammarPagedPath:
         logits = _uniform_logits_3d(1)
         decode_reqs = [_make_decode_req("r0")]
         cu = _build_cu_seqlens(num_decode=1, prefill_lens=[])
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens={"r0": [-1, -1]},
-            num_invalid_spec_tokens=None,
+        sched = _make_scheduler_output(
+            ["r0"],
             num_scheduled_tokens={"r0": 3},
-            total_num_scheduled_tokens=3,
-            finished_req_ids=set(),
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
         )
         grammar = _make_grammar_output(
             ["r0"], _make_single_token_bitmask(allowed_token)

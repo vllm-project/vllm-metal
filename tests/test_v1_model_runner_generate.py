@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -237,14 +238,19 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         scheduled_spec_decode_tokens: dict[str, list[int]],
         num_invalid_spec_tokens: dict[str, int] | None = None,
         num_spec_tokens_to_schedule: int = 1,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
             num_invalid_spec_tokens=num_invalid_spec_tokens,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            finished_req_ids=set(),
         )
 
     def _make_gemma4_mtp_config(self) -> SimpleNamespace:
@@ -1206,11 +1212,11 @@ class TestV1MetalModelRunnerExecuteModel:
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         num_invalid_spec_tokens: dict[str, int] | None = None,
         scheduled_new_reqs: list[SimpleNamespace] | None = None,
-    ) -> SimpleNamespace:
+    ) -> SchedulerOutput:
         req_ids = cached_req_ids or []
-        return SimpleNamespace(
+        return SchedulerOutput(
             scheduled_new_reqs=scheduled_new_reqs or [],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=req_ids,
                 resumed_req_ids=set(),
                 new_token_ids=[],
@@ -1435,11 +1441,7 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(
-                scheduled_spec_decode_tokens={},
-                num_invalid_spec_tokens=None,
-                num_scheduled_tokens={},
-            ),
+            scheduler_output=SchedulerOutput.make_empty(),
         )
 
         assert len(submitted) == 1
@@ -1477,11 +1479,7 @@ class TestV1MetalModelRunnerGDNSubmit:
                 )
             ],
             decode_reqs=[],
-            scheduler_output=SimpleNamespace(
-                scheduled_spec_decode_tokens={},
-                num_invalid_spec_tokens=None,
-                num_scheduled_tokens={},
-            ),
+            scheduler_output=SchedulerOutput.make_empty(),
         )
 
         assert len(submitted) == 1
@@ -1577,10 +1575,10 @@ class TestV1MetalModelRunnerGDNLifecycle:
         resumed_req_ids: set[str] | None = None,
         preempted_req_ids: set[str] | None = None,
         scheduled_encoder_inputs: dict[str, list[int]] | None = None,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
+            scheduled_cached_reqs=CachedRequestData(
                 req_ids=list(resumed_req_ids or ()),
                 resumed_req_ids=resumed_req_ids or set(),
                 new_token_ids=[],
@@ -1705,11 +1703,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
             start_pos=0,
             full_prompt_token_ids=[9],
         )
-        scheduler_output = SimpleNamespace(
-            scheduled_spec_decode_tokens={},
-            num_invalid_spec_tokens=None,
-            num_scheduled_tokens={},
-        )
+        scheduler_output = SchedulerOutput.make_empty()
 
         runner._start_paged_forward(
             mr._ExecutionBatch(),
