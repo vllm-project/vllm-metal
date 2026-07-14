@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
@@ -45,14 +46,21 @@ def _scheduler_output(
     scheduled_spec_decode_tokens: dict[str, list[int]],
     num_scheduled_tokens: dict[str, int] | None = None,
     num_invalid_spec_tokens: dict[str, int] | None = None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> SchedulerOutput:
+    num_scheduled = num_scheduled_tokens or {
+        req_id: len(tokens) + 1
+        for req_id, tokens in scheduled_spec_decode_tokens.items()
+    }
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=num_scheduled,
+        total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-        num_scheduled_tokens=num_scheduled_tokens
-        or {
-            req_id: len(tokens) + 1
-            for req_id, tokens in scheduled_spec_decode_tokens.items()
-        },
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
 
@@ -533,6 +541,15 @@ class TestSchedulerPaddedDrafts:
         active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
 
         assert active == {"r0": (-1, -1)}
+
+    def test_non_padding_negative_sentinels_are_kept(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-2, -2]},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": (-2, -2)}
 
     def test_padded_shape_with_mismatched_accounting_is_kept(self) -> None:
         scheduler_output = _scheduler_output(

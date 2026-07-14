@@ -91,10 +91,14 @@ class SpeculativeDecodeController:
         that were never proposed, so Metal treats such a request as carrying no
         drafts at all.
 
-        Only that exact signature is dropped: an all-negative list that DOES
-        carry an invalid-token count is the grammar-rejection handoff, and a
-        list mixing real and negative ids is a genuine violation. Both still
-        reach the sentinel guards and raise.
+        Only that exact signature is dropped: ``-1`` placeholders, no
+        invalid-token count, and token accounting matching the padded width.
+        An all-``-1`` list that DOES carry an invalid-token count is the
+        grammar-rejection handoff, any other negative id is a genuine
+        violation, and both still reach the sentinel guards and raise. The one
+        upstream path that breaks the accounting condition (a padded request
+        clipped by ``long_prefill_token_threshold``) is rejected at config
+        time by :meth:`MetalPlatform.check_and_update_config`.
         """
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
@@ -104,7 +108,7 @@ class SpeculativeDecodeController:
             for req_id, tokens in spec_tokens.items()
             if not (
                 tokens
-                and all(token_id < 0 for token_id in tokens)
+                and all(token_id == -1 for token_id in tokens)
                 and not invalid_counts.get(req_id)
                 and num_scheduled.get(req_id) == 1 + len(tokens)
             )
