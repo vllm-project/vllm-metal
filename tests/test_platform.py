@@ -196,9 +196,13 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
-            scheduler_config=SimpleNamespace(async_scheduling=False),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                long_prefill_token_threshold=0,
+            ),
             speculative_config=SimpleNamespace(
                 use_heterogeneous_vocab=False,
+                num_speculative_tokens=3,
                 method="ngram",
             ),
         )
@@ -346,6 +350,7 @@ class TestMetalPlatform:
             ),
             model_config=SimpleNamespace(**model_fields),
             scheduler_config=SimpleNamespace(
+                long_prefill_token_threshold=0,
                 async_scheduling=False,
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=2048,
@@ -499,7 +504,9 @@ class TestMetalPlatform:
             MetalPlatform.check_and_update_config(
                 self._dp_vllm_config(
                     speculative_config=SimpleNamespace(
-                        method="ngram", use_heterogeneous_vocab=False
+                        method="ngram",
+                        use_heterogeneous_vocab=False,
+                        num_speculative_tokens=3,
                     )
                 )
             )
@@ -538,6 +545,28 @@ class TestMetalPlatform:
         vllm_config.speculative_config = SimpleNamespace(use_heterogeneous_vocab=True)
 
         with pytest.raises(NotImplementedError, match="heterogeneous draft vocabulary"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_clipped_spec_decode_padding(
+        self,
+    ) -> None:
+        """A long-prefill threshold below the speculative width is unsupported.
+
+        The scheduler clips a padded decode request to the threshold while still
+        attaching the full placeholder draft list, so the handoff's token
+        accounting no longer balances.
+        """
+        vllm_config = self._dp_vllm_config(
+            speculative_config=SimpleNamespace(
+                method="ngram",
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=5,
+            )
+        )
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.scheduler_config.long_prefill_token_threshold = 3
+
+        with pytest.raises(NotImplementedError, match="long-prefill-token-threshold"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_dp_multimodal(

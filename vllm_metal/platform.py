@@ -424,6 +424,24 @@ class MetalPlatform(Platform):
                 "draft model that shares the target vocabulary."
             )
 
+        # Upstream's scheduler pads a newly admitted decode request to the uniform
+        # speculative width, then still clips it to long_prefill_token_threshold,
+        # leaving num_speculative_tokens placeholder drafts against fewer scheduled
+        # tokens; its own num_computed_tokens accounting drifts on that handoff.
+        if (
+            speculative_config is not None
+            and 0
+            < vllm_config.scheduler_config.long_prefill_token_threshold
+            < 1 + speculative_config.num_speculative_tokens
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support speculative decoding with "
+                "--long-prefill-token-threshold below the speculative width: the "
+                "scheduler clips a padded decode request below its placeholder "
+                "draft count. Raise the threshold to at least "
+                "1 + num_speculative_tokens, or leave it unset."
+            )
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
             if (
