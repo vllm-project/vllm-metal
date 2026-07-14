@@ -397,6 +397,19 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
+        # Upstream aligns block sizes across heterogeneous KV dtypes inside
+        # update_block_size_for_backend, which would rewrite the block size behind
+        # Metal's own TurboQuant sizing. Reject at config time rather than fail
+        # inside a spawned worker. Metal's TurboQuant runs off --additional-config,
+        # which leaves this empty.
+        if vllm_config.cache_config.kv_cache_dtype_skip_layers:
+            raise NotImplementedError(
+                "vllm-metal does not support heterogeneous KV cache dtypes "
+                "(--kv-cache-dtype-skip-layers, or --kv-cache-dtype turboquant_*, "
+                "which populates skip layers upstream). Enable TurboQuant with "
+                "--additional-config '{\"turboquant\": true}' instead."
+            )
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
             if (
@@ -760,23 +773,6 @@ class MetalPlatform(Platform):
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
         cache_config = vllm_config.cache_config
-
-        # vLLM 0.25 added a third phase to the base implementation,
-        # ``_align_heterogeneous_kv_block_size``, which raises ``block_size`` and
-        # sets ``skip_page_size_padded`` when several KV dtypes share the block
-        # pool. It would rewrite both behind Metal's own TurboQuant sizing below,
-        # leaving two owners fighting over the same field. Its gate is
-        # ``kv_cache_dtype_skip_layers``, which upstream auto-populates for any
-        # ``--kv-cache-dtype turboquant_*`` on a dense model, so it is reachable
-        # here. Metal's TurboQuant is enabled through ``--additional-config``,
-        # which leaves the list empty, so reject the upstream flags instead.
-        if cache_config.kv_cache_dtype_skip_layers:
-            raise NotImplementedError(
-                "vllm-metal does not support heterogeneous KV cache dtypes "
-                "(--kv-cache-dtype-skip-layers, or --kv-cache-dtype turboquant_*, "
-                "which populates skip layers upstream). Enable TurboQuant with "
-                "--additional-config '{\"turboquant\": true}' instead."
-            )
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None
         )
