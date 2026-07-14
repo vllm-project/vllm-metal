@@ -5,12 +5,9 @@
 - macOS on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
-> **Nothing is compiled on your machine.** vLLM core and the vllm-metal plugin
-> both install as prebuilt wheels, and the plugin wheel bundles the native
-> paged-attention extension (`_paged_ops*.so`) and its Metal shader libraries
-> (`*.metallib`) — so no C++ compiler and no Metal toolchain are needed, and
-> nothing is built on the first request. Xcode Command Line Tools are only
-> needed to *edit* the kernels; see [Contributing](CONTRIBUTING.md).
+> **No compiler required.** vLLM core and the vllm-metal plugin both install as
+> prebuilt wheels, so nothing is compiled on your machine. Contributors editing
+> the Metal kernels need a toolchain; see [Contributing](CONTRIBUTING.md).
 
 `uv` is bootstrapped automatically.
 
