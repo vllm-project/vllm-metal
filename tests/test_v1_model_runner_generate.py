@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
 import numpy as np
@@ -87,6 +88,15 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
 class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())
+
+    def test_warm_up_propagates_dummy_forward_failure(self) -> None:
+        runner = self._make_runner()
+        runner._dummy_forward_outputs = Mock(
+            side_effect=RuntimeError("dummy forward failed")
+        )
+
+        with pytest.raises(RuntimeError, match="dummy forward failed"):
+            runner.warm_up()
 
     def test_accumulates_streamed_segments(self, monkeypatch) -> None:
         captured: dict[str, object] = {}
