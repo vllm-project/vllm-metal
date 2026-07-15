@@ -110,6 +110,11 @@ class MetalWorker(WorkerBase):
         # default single-stage path (no group object, no behavior change).
         self.pp: PipelineGroup | None = None
 
+        # Captured before engine KV sizing: the uni executor shares vllm_config
+        # with the engine, so by the time update_max_model_len is called the
+        # in-place auto-fit mutation is already visible on self.model_config.
+        self._derived_max_model_len = self.model_config.max_model_len
+
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
         # Set up MLX device
@@ -299,6 +304,13 @@ class MetalWorker(WorkerBase):
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len
+        if max_model_len < self._derived_max_model_len:
+            logger.warning(
+                "Auto-fit reduced max_model_len from %d to %d to fit Metal "
+                "memory; pass --max-model-len to pin the context length",
+                self._derived_max_model_len,
+                max_model_len,
+            )
 
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a single cache block in bytes.

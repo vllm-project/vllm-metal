@@ -70,6 +70,7 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
+            speculative_config=None,
         )
         with pytest.raises(
             NotImplementedError, match="alone or combined with pipeline"
@@ -97,6 +98,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -140,6 +142,7 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
+            speculative_config=None,
         )
         with pytest.raises(ValueError, match="too high for pipeline_parallel_size"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -164,6 +167,7 @@ class TestMetalPlatform:
             ),
             model_config=None,
             scheduler_config=SimpleNamespace(async_scheduling=True),
+            speculative_config=None,
         )
         with pytest.raises(NotImplementedError, match="synchronous scheduling"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -213,6 +217,7 @@ class TestMetalPlatform:
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
                 is_hybrid=False,
@@ -245,6 +250,7 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
+            speculative_config=None,
         )
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -260,6 +266,7 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
+            speculative_config=None,
         )
         with pytest.raises(NotImplementedError, match="tensor parallelism"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -312,6 +319,7 @@ class TestMetalPlatform:
             "disable_cascade_attn": False,
             "tokenizer": None,
             "max_model_len": 32768,
+            "original_max_model_len": None,
             "hf_config": SimpleNamespace(model_type="qwen3"),
             "is_hybrid": False,
         }
@@ -800,6 +808,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -811,6 +820,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -853,6 +863,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -864,6 +875,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -919,6 +931,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -930,6 +943,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             with pytest.raises(NotImplementedError, match=err_match):
@@ -963,6 +977,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -974,6 +989,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=2048,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1009,6 +1025,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -1020,6 +1037,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=65536,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1059,6 +1077,7 @@ class TestMetalPlatform:
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
+                    original_max_model_len=None,
                     max_model_len=32768,
                     multimodal_config=None,
                     hf_config=SimpleNamespace(model_type="qwen3"),
@@ -1070,6 +1089,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=65536,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1101,6 +1121,7 @@ class TestMetalPlatform:
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
                 is_hybrid=False,
@@ -1109,6 +1130,7 @@ class TestMetalPlatform:
                 async_scheduling=True,
                 enable_chunked_prefill=False,
             ),
+            speculative_config=None,
         )
 
         MetalPlatform.check_and_update_config(vllm_config)
@@ -1134,6 +1156,7 @@ class TestMetalPlatform:
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
                 tokenizer="custom-tokenizer",
+                original_max_model_len=None,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type="whisper"),
                 is_hybrid=False,
@@ -1142,6 +1165,7 @@ class TestMetalPlatform:
                 async_scheduling=True,
                 enable_chunked_prefill=False,
             ),
+            speculative_config=None,
         )
 
         MetalPlatform.check_and_update_config(vllm_config)
@@ -1168,6 +1192,7 @@ class TestMetalPlatform:
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 max_model_len=128,
                 multimodal_config=SimpleNamespace(language_model_only=False),
                 hf_config=SimpleNamespace(model_type="gemma4"),
@@ -1191,6 +1216,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1211,6 +1237,7 @@ class TestMetalPlatform:
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 max_model_len=128,
                 multimodal_config=SimpleNamespace(language_model_only=False),
                 hf_config=SimpleNamespace(
@@ -1238,6 +1265,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1260,6 +1288,7 @@ class TestMetalPlatform:
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(model_type="qwen3_vl"),
@@ -1283,6 +1312,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1305,6 +1335,7 @@ class TestMetalPlatform:
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(
@@ -1332,6 +1363,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1354,6 +1386,7 @@ class TestMetalPlatform:
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
+                original_max_model_len=None,
                 max_model_len=128,
                 multimodal_config=sentinel,
                 hf_config=SimpleNamespace(model_type="phi3_v"),
@@ -1377,6 +1410,7 @@ class TestMetalPlatform:
                     max_num_batched_tokens=2048,
                     max_num_scheduled_tokens=None,
                 ),
+                speculative_config=None,
             )
 
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1473,3 +1507,175 @@ class TestKvBudgetBytes:
         )
 
         assert budget > 1e9
+
+
+class TestAutoFitMaxModelLenDefault:
+    """MetalPlatform defaults an omitted --max-model-len to vLLM's auto-fit.
+
+    On the paged path the platform flips ``model_config.original_max_model_len``
+    from None (flag omitted) to -1 (vLLM's auto-fit sentinel) so the engine
+    boots at the largest context that fits instead of failing the KV admission
+    check (#505). Explicit values, speculative-decode runs, and the non-paged
+    path keep today's behavior.
+    """
+
+    @staticmethod
+    def _patch_stt_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "vllm_metal.utils.get_model_download_path",
+            lambda model: model,
+        )
+        monkeypatch.setattr(
+            "vllm_metal.stt.detection.is_stt_model", lambda _model: False
+        )
+
+    @staticmethod
+    def _vllm_config(
+        *,
+        original_max_model_len: int | None = None,
+        speculative_config: object = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(block_size=None, enable_prefix_caching=False),
+            model_config=SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                original_max_model_len=original_max_model_len,
+                max_model_len=262144,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="qwen3"),
+                is_hybrid=False,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                enable_chunked_prefill=True,
+                max_num_batched_tokens=2048,
+                max_num_scheduled_tokens=None,
+            ),
+            speculative_config=speculative_config,
+        )
+
+    def test_omitted_max_model_len_defaults_to_auto_fit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An omitted --max-model-len becomes the -1 auto-fit sentinel."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(original_max_model_len=None)
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.model_config.original_max_model_len == -1
+            # The derived length is resolved later by the engine's auto-fit,
+            # not by the platform hook.
+            assert vllm_config.model_config.max_model_len == 262144
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        "explicit_value", [16384, -1], ids=["pinned", "explicit_auto_fit"]
+    )
+    def test_explicit_max_model_len_is_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, explicit_value: int
+    ) -> None:
+        """User-provided --max-model-len values pass through unchanged."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(original_max_model_len=explicit_value)
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.model_config.original_max_model_len == explicit_value
+            assert vllm_config.model_config.max_model_len == 262144
+        finally:
+            reset_config()
+
+    def test_speculative_decoding_keeps_derived_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec-decode runs are excluded: MetalWorker.update_max_model_len does
+        not refresh drafter-side lengths, so auto-fit must not engage."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(
+                original_max_model_len=None,
+                speculative_config=SimpleNamespace(method="ngram"),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.model_config.original_max_model_len is None
+            assert vllm_config.model_config.max_model_len == 262144
+        finally:
+            reset_config()
+
+    def test_explicit_auto_fit_with_speculative_decoding_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit --max-model-len -1 with spec decode must fail fast: the
+        Metal worker does not refresh drafter-side lengths after auto-fit."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(
+                original_max_model_len=-1,
+                speculative_config=SimpleNamespace(method="ngram"),
+            )
+
+            with pytest.raises(
+                NotImplementedError, match="not supported with speculative decoding"
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_non_paged_path_keeps_derived_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The MLX path reports exactly one max-length sequence of memory, so
+        auto-fit could never reduce there; the sentinel is not flipped."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(original_max_model_len=None)
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.model_config.original_max_model_len is None
+        finally:
+            reset_config()
+
+    def test_auto_fit_default_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """check_and_update_config may run more than once (DP re-entry); the
+        flip must be stable across repeated calls."""
+        self._patch_stt_resolution(monkeypatch)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._vllm_config(original_max_model_len=None)
+
+            MetalPlatform.check_and_update_config(vllm_config)
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.model_config.original_max_model_len == -1
+            assert vllm_config.model_config.max_model_len == 262144
+        finally:
+            reset_config()

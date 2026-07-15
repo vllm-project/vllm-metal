@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -418,3 +419,53 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget_before_hybrid" not in message
         assert "--max-num-seqs" not in message
         assert "kv_budget=-1.10GB" in message
+
+
+class TestUpdateMaxModelLen:
+    """update_max_model_len applies the engine value and surfaces reductions."""
+
+    @staticmethod
+    def _make_worker(derived_max_model_len: int) -> MetalWorker:
+        worker = MetalWorker.__new__(MetalWorker)
+        worker.model_config = SimpleNamespace(max_model_len=derived_max_model_len)
+        worker._derived_max_model_len = derived_max_model_len
+        return worker
+
+    def test_reduction_warns_with_derived_and_new_value(self, caplog) -> None:
+        worker = self._make_worker(262144)
+        # The uni executor shares vllm_config with the engine, so the in-place
+        # auto-fit mutation is visible on model_config BEFORE the RPC arrives;
+        # the warning must compare against the captured derived length.
+        worker.model_config.max_model_len = 19216
+        metal_logger = logging.getLogger("vllm_metal")
+        original_level = metal_logger.level
+        metal_logger.addHandler(caplog.handler)
+        metal_logger.setLevel(logging.WARNING)
+
+        try:
+            MetalWorker.update_max_model_len(worker, 19216)
+        finally:
+            metal_logger.removeHandler(caplog.handler)
+            metal_logger.setLevel(original_level)
+
+        assert worker.model_config.max_model_len == 19216
+        assert (
+            "Auto-fit reduced max_model_len from 262144 to 19216 to fit Metal "
+            "memory; pass --max-model-len to pin the context length"
+        ) in caplog.text
+
+    def test_unreduced_length_does_not_warn(self, caplog) -> None:
+        worker = self._make_worker(16384)
+        metal_logger = logging.getLogger("vllm_metal")
+        original_level = metal_logger.level
+        metal_logger.addHandler(caplog.handler)
+        metal_logger.setLevel(logging.WARNING)
+
+        try:
+            MetalWorker.update_max_model_len(worker, 16384)
+        finally:
+            metal_logger.removeHandler(caplog.handler)
+            metal_logger.setLevel(original_level)
+
+        assert worker.model_config.max_model_len == 16384
+        assert "Auto-fit reduced max_model_len" not in caplog.text

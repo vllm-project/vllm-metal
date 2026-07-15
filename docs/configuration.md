@@ -42,3 +42,11 @@ model pairing, and memory considerations.
 | `auto` | `1` | Yes | Paged KV path (default); defaults to 0.9 internally |
 | `0.7` | `1` | Yes | Paged KV path with explicit memory budget |
 | `0.7` | `0` | No | Explicit fraction without paged KV is invalid |
+
+On the paged KV path, an unset `--max-model-len` defaults to vLLM's auto-fit:
+if the model's full context does not fit the KV budget, the engine starts at
+the largest length that fits and logs the reduction (upstream CUDA fails
+instead). Pass `--max-model-len` to pin the context length; explicit values
+are never adjusted. Speculative-decoding runs keep the derived default and
+must pin `--max-model-len` themselves. Auto-fit maximizes single-sequence
+context, so pinning a smaller value restores batching headroom.

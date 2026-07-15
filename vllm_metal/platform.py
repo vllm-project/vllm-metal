@@ -610,6 +610,40 @@ class MetalPlatform(Platform):
                     scheduler_config.max_num_batched_tokens,
                 )
 
+        # Auto-fit shrinks the target's max_model_len at engine init, but
+        # MetalWorker.update_max_model_len does not refresh drafter-side
+        # lengths the way upstream's GPU runner does, so the drafter would
+        # keep the stale pre-reduction context. Reject rather than run it.
+        if (
+            model_config is not None
+            and model_config.original_max_model_len == -1
+            and vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Auto-fit --max-model-len (-1/'auto') is not supported with "
+                "speculative decoding on Metal; the worker does not refresh "
+                "drafter-side lengths after the reduction. Pin --max-model-len "
+                "explicitly or remove --speculative-config."
+            )
+
+        # Default an omitted --max-model-len to vLLM's auto-fit (-1 sentinel):
+        # the packed KV layout prices every layer at the full derived context,
+        # so oversized defaults fail engine init outright (gemma-4-31B derives
+        # 262144 and demands 220 GiB, #505). Explicit values are never touched;
+        # speculative decoding keeps the derived default (rejected above when
+        # auto-fit is requested explicitly).
+        if (
+            model_config is not None
+            and config.use_paged_attention
+            and model_config.original_max_model_len is None
+            and vllm_config.speculative_config is None
+        ):
+            model_config.original_max_model_len = -1
+            logger.info(
+                "Metal: --max-model-len not set; defaulting to auto-fit "
+                "(pass --max-model-len to pin the context length)"
+            )
+
         # Disable cascade attention (not supported), then let the adapter
         # apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
