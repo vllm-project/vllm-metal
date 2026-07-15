@@ -763,6 +763,16 @@ class MetalModelRunner:
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
 
+        if self._multimodal_adapter is not None:
+            cache_bytes = mx.get_cache_memory()
+            if cache_bytes == 0:
+                return
+            mx.clear_cache()
+            logger.info(
+                "MLX cache cleared after multimodal model warm-up (%d bytes)",
+                cache_bytes,
+            )
+
     def _make_sampling_metadata(
         self,
         sampling_params_list: list[SamplingParams],

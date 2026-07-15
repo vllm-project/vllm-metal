@@ -89,14 +89,49 @@ class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())
 
-    def test_warm_up_propagates_dummy_forward_failure(self) -> None:
+    def test_warm_up_propagates_dummy_forward_failure(self, monkeypatch) -> None:
+        calls: list[str] = []
         runner = self._make_runner()
+        runner._multimodal_adapter = SimpleNamespace()
         runner._dummy_forward_outputs = Mock(
             side_effect=RuntimeError("dummy forward failed")
         )
+        monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: 128)
+        monkeypatch.setattr(mr.mx, "clear_cache", lambda: calls.append("clear"))
 
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
+
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        ("has_multimodal_adapter", "cache_bytes", "expected_clears"),
+        (
+            (True, 128, 1),
+            (True, 0, 0),
+            (False, 128, 0),
+        ),
+        ids=("multimodal-nonzero-cache", "multimodal-empty-cache", "text-only"),
+    )
+    def test_warm_up_clears_cache_only_for_multimodal_nonzero_cache(
+        self,
+        monkeypatch,
+        has_multimodal_adapter: bool,
+        cache_bytes: int,
+        expected_clears: int,
+    ) -> None:
+        calls: list[str] = []
+        runner = self._make_runner()
+        if has_multimodal_adapter:
+            runner._multimodal_adapter = SimpleNamespace()
+        runner._dummy_forward_outputs = Mock(return_value=[mx.array([1])])
+
+        monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: cache_bytes)
+        monkeypatch.setattr(mr.mx, "clear_cache", lambda: calls.append("clear"))
+
+        runner.warm_up()
+
+        assert calls == ["clear"] * expected_clears
 
     def test_accumulates_streamed_segments(self, monkeypatch) -> None:
         captured: dict[str, object] = {}
