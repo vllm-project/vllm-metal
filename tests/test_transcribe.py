@@ -118,6 +118,22 @@ class TestExtractSegments:
         assert len(segments) == 1
         assert segments[0].seek == 1000
 
+    def test_consecutive_timestamps_advance_segment_start(
+        self, transcriber: WhisperTranscriber
+    ) -> None:
+        tokens = [
+            transcriber._get_token_id("<|0.00|>"),
+            transcriber._get_token_id("<|2.00|>"),
+            2425,
+            transcriber._get_token_id("<|4.00|>"),
+        ]
+
+        segments = transcriber._extract_segments(tokens)
+
+        assert len(segments) == 1
+        assert segments[0].start == 2.0
+        assert segments[0].end == 4.0
+
     def test_empty_tokens(self, transcriber: WhisperTranscriber) -> None:
         assert transcriber._extract_segments([]) == []
 

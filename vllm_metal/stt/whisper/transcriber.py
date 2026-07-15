@@ -343,7 +343,9 @@ class WhisperTranscriber:
                             )
                         )
                         seg_id += 1
-                    seg_start = None
+                        seg_start = None
+                    else:
+                        seg_start = ts
                     seg_tokens = []
             else:
                 seg_tokens.append(tid)
