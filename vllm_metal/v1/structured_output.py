@@ -116,12 +116,19 @@ class MetalStructuredOutputApplier:
             num_decode,
             decode_segments=decode_segments,
         )
-        has_structured_spec_decode = bool(structured_spec_req_ids)
+        # vLLM lays out the grammar bitmask by the raw scheduled spec width, so a
+        # request the scheduler padded keeps its full bitmask span even though
+        # Metal dropped the placeholder drafts and emits one logits row for it.
+        raw_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        grammar_row_counts = {
+            req_id: 1 + len(raw_spec_tokens.get(req_id, ()))
+            for req_id in grammar_output.structured_output_request_ids
+        }
         constrained = self._build_constrained_rows(
             grammar_output.structured_output_request_ids,
             row_targets,
             grammar_bitmask_row_count=grammar_bitmask.shape[0],
-            consume_row_spans=has_structured_spec_decode,
+            grammar_row_counts=grammar_row_counts,
         )
 
         return self._apply_grammar_bitmask_to_rows(logits, grammar_bitmask, constrained)
@@ -185,61 +192,37 @@ class MetalStructuredOutputApplier:
         row_targets: dict[str, tuple[int, ...]],
         *,
         grammar_bitmask_row_count: int,
-        consume_row_spans: bool,
+        grammar_row_counts: dict[str, int],
     ) -> list[tuple[int, int]]:
         """Pair target logits rows with grammar bitmask rows.
 
-        With row-span consumption, vLLM emits contiguous grammar bitmask rows
-        in structured_output_request_ids order: speculative draft rows first,
-        then the bonus/non-speculative row for the same request.
+        vLLM emits contiguous grammar bitmask rows in
+        structured_output_request_ids order, one row per scheduled position:
+        the speculative draft rows first, then the bonus row. Each request
+        advances the bitmask cursor by its scheduled span
+        (``grammar_row_counts[req_id]``), and its existing logits rows pair with
+        that span from the front. A padded request keeps a full span but owns a
+        single logits row, so only that row is paired and the rest of the span
+        is skipped.
         """
-        if not consume_row_spans:
-            constrained: list[tuple[int, int]] = []
-            for bitmask_row, req_id in enumerate(structured_output_request_ids):
-                rows = row_targets.get(req_id)
-                if rows:
-                    constrained.append((rows[0], bitmask_row))
-            return constrained
-
-        constrained = []
-        seen_req_ids: set[str] = set()
+        constrained: list[tuple[int, int]] = []
         bitmask_row = 0
         for req_id in structured_output_request_ids:
-            if req_id in seen_req_ids:
+            grammar_span = grammar_row_counts[req_id]
+            rows = row_targets.get(req_id, ())
+            if len(rows) > grammar_span:
                 raise ValueError(
-                    "row-span grammar bitmask rows must be expanded in "
-                    f"grammar_bitmask, not by repeating request ID {req_id!r}"
-                )
-            seen_req_ids.add(req_id)
-
-            rows = row_targets.get(req_id)
-            if rows is None:
-                raise ValueError(
-                    f"Grammar bitmask references {req_id!r}, but that request "
-                    "has no paged logits rows in the current batch."
-                )
-            row_count = len(rows)
-            end_bitmask_row = bitmask_row + row_count
-            if end_bitmask_row > grammar_bitmask_row_count:
-                if len(rows) > 1:
-                    raise NotImplementedError(
-                        "Row-span structured-output masking requires one grammar "
-                        "bitmask row per logits row for request "
-                        f"{req_id!r}; got {grammar_bitmask_row_count - bitmask_row} "
-                        f"bitmask rows for {len(rows)} logits rows."
-                    )
-                raise ValueError(
-                    "Grammar bitmask row count must match row-span logits targets "
-                    f"for request {req_id!r}: got {grammar_bitmask_row_count} total "
-                    f"bitmask rows, needed at least {end_bitmask_row}."
+                    "Grammar bitmask span is smaller than the logits rows for "
+                    f"request {req_id!r}: {grammar_span} bitmask rows for "
+                    f"{len(rows)} logits rows."
                 )
             for row_offset, row in enumerate(rows):
                 constrained.append((row, bitmask_row + row_offset))
-            bitmask_row = end_bitmask_row
+            bitmask_row += grammar_span
 
         if bitmask_row != grammar_bitmask_row_count:
             raise ValueError(
-                "Grammar bitmask row count must match row-span logits targets: "
+                "Grammar bitmask row count must match the scheduled spans: "
                 f"consumed {bitmask_row}, got {grammar_bitmask_row_count}."
             )
 
