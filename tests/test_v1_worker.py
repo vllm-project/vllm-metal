@@ -26,7 +26,7 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = SimpleNamespace(use_paged_attention=use_paged_attention)
-    worker.cache_config = SimpleNamespace(block_size=16)
+    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -418,3 +418,46 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget_before_hybrid" not in message
         assert "--max-num-seqs" not in message
         assert "kv_budget=-1.10GB" in message
+
+    @pytest.mark.parametrize(
+        "is_auto, memory_fraction, gpu_mem_util, expected_fraction, expects_warning",
+        [
+            pytest.param(True, -1.0, 0.92, 0.92, False, id="auto_default_flag"),
+            pytest.param(True, -1.0, 0.5, 0.5, False, id="auto_flag_lowered"),
+            pytest.param(False, 0.5, 0.92, 0.5, False, id="env_explicit_default_flag"),
+            pytest.param(False, 0.5, 0.7, 0.5, True, id="env_explicit_flag_conflict"),
+            pytest.param(False, 0.5, 0.5, 0.5, False, id="env_explicit_flag_match"),
+        ],
+    )
+    def test_memory_fraction_precedence(
+        self,
+        monkeypatch,
+        is_auto: bool,
+        memory_fraction: float,
+        gpu_mem_util: float,
+        expected_fraction: float,
+        expects_warning: bool,
+    ) -> None:
+        from vllm_metal.v1.cache_policy import logger as policy_logger
+
+        warn_messages: list[str] = []
+        monkeypatch.setattr(
+            policy_logger,
+            "warning",
+            lambda msg, *args: warn_messages.append(msg % args),
+        )
+
+        worker = _make_worker(
+            SimpleNamespace(is_hybrid=False), use_paged_attention=True
+        )
+        worker.metal_config.is_auto_memory = is_auto
+        worker.metal_config.memory_fraction = memory_fraction
+        worker.cache_config.gpu_memory_utilization = gpu_mem_util
+
+        fraction = WorkerCachePlanner(worker)._memory_fraction()
+
+        assert fraction == expected_fraction
+        assert bool(warn_messages) == expects_warning
+        if expects_warning:
+            assert "VLLM_METAL_MEMORY_FRACTION" in warn_messages[0]
+            assert "--gpu-memory-utilization" in warn_messages[0]
