@@ -74,6 +74,7 @@ def _runner_model_config(repo: str, *, dtype):
         is_multimodal_model=False,
         trust_remote_code=False,
         dtype=dtype,
+        quantization=None,
     )
 
 
