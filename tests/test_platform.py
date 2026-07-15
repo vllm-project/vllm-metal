@@ -11,7 +11,10 @@ import torch
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs, max_memory_usage_bytes
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -1601,3 +1604,139 @@ class TestKvBudgetBytes:
         )
 
         assert budget > 1e9
+
+
+class TestAutoFitMaxModelLenChain:
+    """The -1 sentinel drives upstream auto-fit through public entry points.
+
+    Builds the gemma-4-31B KV shape (the all-FullAttentionSpec specs vllm-metal
+    emits today: 50 sliding-shaped 16x256 layers + 10 global-shaped 4x512
+    layers) and runs vLLM's ``get_kv_cache_configs`` against fixed synthetic
+    memory budgets, asserting the resolved ``max_model_len``.
+    """
+
+    _NUM_LAYERS = 60
+    _FULL_EVERY = 6  # gemma-4's 5:1 sliding:full layer pattern
+
+    @pytest.fixture(autouse=True)
+    def _ensure_compat_patches(self) -> None:
+        """The null-block auto-fit patch (compat.py) is part of the contract
+        under test; ensure it directly because plugin activation can skip it
+        while vLLM is partially imported."""
+        ensure_vllm_auto_fit_null_block_patch()
+
+    _BLOCK_SIZE = 16
+    # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
+    # equals the packed per-block bytes the Metal pool reports.
+    _PACKED_BLOCK_BYTES = 14_417_920
+    _DERIVED_MAX_LEN = 262_144
+
+    @classmethod
+    def _specs(cls) -> dict[str, KVCacheSpec]:
+        """Fresh specs per call: upstream grouping mutates specs in place."""
+        specs: dict[str, KVCacheSpec] = {}
+        for i in range(cls._NUM_LAYERS):
+            is_full = (i + 1) % cls._FULL_EVERY == 0
+            specs[f"layers.{i}.self_attn"] = FullAttentionSpec(
+                block_size=cls._BLOCK_SIZE,
+                num_kv_heads=4 if is_full else 16,
+                head_size=512 if is_full else 256,
+                dtype=torch.bfloat16,
+            )
+        return specs
+
+    @classmethod
+    def _vllm_config(cls, *, original_max_model_len: int | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=cls._DERIVED_MAX_LEN,
+                original_max_model_len=original_max_model_len,
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048,
+                disable_hybrid_kv_cache_manager=False,
+            ),
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None,
+                kv_cache_memory_bytes=None,
+            ),
+        )
+
+    @classmethod
+    def _largest_fitting_len(cls, available: int) -> int:
+        """Independent expectation: bisect the largest length whose demand
+        (public ``max_memory_usage_bytes``) fits ``available`` minus one pool
+        block (BlockPool's null-block reservation, restored by the compat
+        patch so requests at the fitted length stay schedulable)."""
+        budget = available - cls._PACKED_BLOCK_BYTES
+        probe = cls._vllm_config(original_max_model_len=-1)
+        lo, hi, best = 1, cls._DERIVED_MAX_LEN, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            probe.model_config.max_model_len = mid
+            if max_memory_usage_bytes(probe, cls._specs().values()) <= budget:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def test_reduces_omitted_default_to_largest_fitting_length(self) -> None:
+        available = 1500 * self._PACKED_BLOCK_BYTES
+        expected = self._largest_fitting_len(available)
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+        assert expected < self._DERIVED_MAX_LEN
+        assert vllm_config.model_config.max_model_len == expected
+
+    def test_reduced_length_reserves_the_null_block(self) -> None:
+        """The fitted length must never need the whole pool: BlockPool keeps
+        block 0 as the null placeholder, so a request at the fitted length
+        would otherwise starve in the scheduler forever."""
+        num_pool_blocks = 1500
+        available = num_pool_blocks * self._PACKED_BLOCK_BYTES
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+        resolved_blocks = -(-vllm_config.model_config.max_model_len // 16)
+        assert resolved_blocks == num_pool_blocks - 1
+
+    def test_full_context_fits_is_a_no_op(self) -> None:
+        # Full 262144 context needs 16384 packed blocks; give a little more.
+        available = 16_500 * self._PACKED_BLOCK_BYTES
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+        assert vllm_config.model_config.max_model_len == self._DERIVED_MAX_LEN
+
+    def test_without_sentinel_constrained_memory_raises_admission_error(self) -> None:
+        """The #505 failure shape: no sentinel, derived 262144, small budget."""
+        available = 1500 * self._PACKED_BLOCK_BYTES
+        vllm_config = self._vllm_config(original_max_model_len=None)
+
+        with pytest.raises(ValueError, match="To serve at least one request"):
+            get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+    def test_insufficient_memory_for_one_block_raises(self) -> None:
+        available = self._PACKED_BLOCK_BYTES - 1
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
+            get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+    def test_chain_is_stable_across_reruns(self) -> None:
+        available = 1500 * self._PACKED_BLOCK_BYTES
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+        first = vllm_config.model_config.max_model_len
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+        assert vllm_config.model_config.max_model_len == first
