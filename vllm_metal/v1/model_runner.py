@@ -756,13 +756,9 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference.
-        try:
-            dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            mx.eval(*self._dummy_forward_outputs(dummy_tokens))
-            logger.info("Model warm-up complete")
-        except Exception as e:
-            logger.warning(f"Model warm-up failed: {e}")
+        dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+        mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        logger.info("Model warm-up complete")
 
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
