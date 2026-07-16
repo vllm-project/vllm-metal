@@ -5,9 +5,10 @@
 - macOS on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
-> **No compiler required.** vLLM core and the vllm-metal plugin both install as
-> prebuilt wheels, so nothing is compiled on your machine. Contributors editing
-> the Metal kernels need a toolchain; see [Contributing](CONTRIBUTING.md).
+> **No compiler required.** The install script below fetches vLLM core and the
+> vllm-metal plugin as prebuilt wheels, so nothing is compiled on your machine.
+> Installing from a source checkout instead builds the native Metal kernels
+> locally and needs a toolchain; see [Contributing](CONTRIBUTING.md).
 
 `uv` is bootstrapped automatically.
 
