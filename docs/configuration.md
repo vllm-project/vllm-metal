@@ -17,6 +17,15 @@
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
 
+### Boolean values
+
+Boolean `VLLM_METAL_*` variables (those with a `0`/`1` default above, plus
+`VLLM_METAL_BUILD_FROM_SOURCE`) accept `1`/`0`, `true`/`false`, `yes`/`no`,
+and `on`/`off`, case-insensitively. Leaving a variable unset or empty keeps
+its default. Any other value is rejected at first read with a `ValueError`
+naming the variable. (`VLLM_USE_MODELSCOPE` is vLLM's own variable and keeps
+vLLM's `True`/`False` convention.)
+
 ## Multimodal Serve Modes
 
 - `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.

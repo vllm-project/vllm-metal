@@ -32,6 +32,34 @@ if TYPE_CHECKING:
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _bool_env(name: str, *, default: bool) -> bool:
+    """Parse a boolean environment variable.
+
+    Accepts ``1``/``0``, ``true``/``false``, ``yes``/``no`` and ``on``/``off``
+    (case-insensitive, surrounding whitespace ignored).  Unset or empty means
+    ``default``.  Any other value raises ``ValueError`` so typos fail loudly
+    instead of being silently read as false.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"Invalid {name}={raw!r}. Must be one of: "
+        "1/0, true/false, yes/no, on/off (case-insensitive)."
+    )
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
     # plugin calculates the minimal amount needed at startup.
@@ -40,14 +68,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_METAL_MEMORY_FRACTION", "auto"
     ),
     # Whether to use MLX as the compute backend (default True).
-    "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
+    "VLLM_METAL_USE_MLX": lambda: _bool_env("VLLM_METAL_USE_MLX", default=True),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Enable verbose debug logging (default False).
-    "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
+    "VLLM_METAL_DEBUG": lambda: _bool_env("VLLM_METAL_DEBUG", default=False),
     # Use native Metal paged attention (default True).
-    "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
-        os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
+    "VLLM_METAL_USE_PAGED_ATTENTION": lambda: _bool_env(
+        "VLLM_METAL_USE_PAGED_ATTENTION", default=True
     ),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
@@ -62,8 +90,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
     # Enable lazy GDN kernels by default.
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
-    "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
-        os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
+    "VLLM_METAL_GDN_LAZY_KERNELS": lambda: _bool_env(
+        "VLLM_METAL_GDN_LAZY_KERNELS", default=True
     ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
@@ -72,13 +100,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the kernel's instantiated specialization (kv_lora_rank=512,
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
-    "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    "VLLM_METAL_MLA_KERNEL": lambda: _bool_env("VLLM_METAL_MLA_KERNEL", default=False),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
     # for kernel developers / source installs; requires Xcode command-line
     # tools (clang++). Default off — release wheels ship the .so prebuilt.
-    "VLLM_METAL_BUILD_FROM_SOURCE": lambda: (
-        os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
+    "VLLM_METAL_BUILD_FROM_SOURCE": lambda: _bool_env(
+        "VLLM_METAL_BUILD_FROM_SOURCE", default=False
     ),
     # Per-worker visible-device list set by vLLM's Ray executor (the
     # CUDA_VISIBLE_DEVICES analog for Metal; see MetalPlatform.device_control_env_var).
