@@ -1294,6 +1294,71 @@ class TestV1MetalModelRunnerExecuteModel:
 
         assert runner._pending_output is None
 
+    def test_missing_cached_request_fails_before_new_prefill(self, monkeypatch) -> None:
+        runner = self._make_runner()
+        monkeypatch.setattr(
+            runner,
+            "_prefill_single",
+            lambda *args, **kwargs: pytest.fail("prefill should not run"),
+        )
+        new_req = self._make_new_request()
+
+        with pytest.raises(RuntimeError, match="missing"):
+            runner.execute_model(
+                self._make_scheduler_output(
+                    ["missing"],
+                    scheduled_new_reqs=[new_req],
+                )
+            )
+
+        assert "new" not in runner._request_states
+        assert runner._pending_output is None
+
+    def test_missing_cached_request_materializes_released_gdn_state(self) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
+        cache.set_pending_recurrent_state(
+            0,
+            [slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        with pytest.raises(RuntimeError, match="missing"):
+            runner.execute_model(
+                self._make_scheduler_output(
+                    ["missing"],
+                    finished_req_ids={"done"},
+                )
+            )
+
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][slot]), 7)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
+        assert runtime.gdn_state_manager.needs_materialize is False
+
     def test_non_paged_spec_decode_fails_after_cleanup_before_new_state(self) -> None:
         runner = self._make_runner()
         runner._request_states["done"] = mr.RequestState(
