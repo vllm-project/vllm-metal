@@ -758,10 +758,32 @@ class MetalModelRunner:
 
         dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
         mx.eval(*self._dummy_forward_outputs(dummy_tokens))
-        logger.info("Model warm-up complete")
 
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
+        self._clear_mlx_cache_after_multimodal_warmup()
+        logger.info("Model warm-up complete")
+
+    def _clear_mlx_cache_after_multimodal_warmup(self) -> None:
+        """Release MLX buffer-cache memory after successful VLM warm-up.
+
+        The first real multimodal prefill is sensitive to cache pressure left by
+        the warm-up path on memory-constrained Apple Silicon systems. Keep the
+        release VLM-only and skip empty-cache cases so text-only warm-up behavior
+        remains unchanged.
+        """
+        if self._multimodal_adapter is None:
+            return
+
+        cache_bytes = mx.get_cache_memory()
+        if cache_bytes == 0:
+            return
+
+        mx.clear_cache()
+        logger.info(
+            "MLX cache cleared after multimodal model warm-up (%d bytes)",
+            cache_bytes,
+        )
 
     def _make_sampling_metadata(
         self,

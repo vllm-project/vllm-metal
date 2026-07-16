@@ -68,6 +68,30 @@ class ForwardOutputRuntimeStub:
         return None
 
 
+class FakeWarmupMX:
+    int32 = object()
+
+    def __init__(self, cache_bytes: int) -> None:
+        self.cache_bytes = cache_bytes
+        self.clear_calls = 0
+        self.eval_calls = 0
+
+    def array(self, values, *, dtype):
+        assert values == [[1, 2, 3]]
+        assert dtype is self.int32
+        return values
+
+    def eval(self, *outputs) -> None:
+        assert outputs
+        self.eval_calls += 1
+
+    def get_cache_memory(self) -> int:
+        return self.cache_bytes
+
+    def clear_cache(self) -> None:
+        self.clear_calls += 1
+
+
 def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     runner = make_stub_runner(tokenizer=object())
     runner.vllm_config = SimpleNamespace(
@@ -97,6 +121,65 @@ class TestV1MetalModelRunnerGenerate:
 
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
+
+    def test_warm_up_clears_nonzero_mlx_cache_for_multimodal_model(
+        self, monkeypatch
+    ) -> None:
+        fake_mx = FakeWarmupMX(cache_bytes=123)
+        monkeypatch.setattr(mr, "mx", fake_mx)
+
+        runner = self._make_runner()
+        runner._multimodal_adapter = object()
+        runner._dummy_forward_outputs = Mock(return_value=[object()])
+
+        runner.warm_up()
+
+        assert fake_mx.eval_calls == 1
+        assert fake_mx.clear_calls == 1
+
+    def test_warm_up_keeps_text_only_mlx_cache(self, monkeypatch) -> None:
+        fake_mx = FakeWarmupMX(cache_bytes=123)
+        monkeypatch.setattr(mr, "mx", fake_mx)
+
+        runner = self._make_runner()
+        runner._dummy_forward_outputs = Mock(return_value=[object()])
+
+        runner.warm_up()
+
+        assert fake_mx.eval_calls == 1
+        assert fake_mx.clear_calls == 0
+
+    def test_warm_up_skips_multimodal_clear_when_mlx_cache_empty(
+        self, monkeypatch
+    ) -> None:
+        fake_mx = FakeWarmupMX(cache_bytes=0)
+        monkeypatch.setattr(mr, "mx", fake_mx)
+
+        runner = self._make_runner()
+        runner._multimodal_adapter = object()
+        runner._dummy_forward_outputs = Mock(return_value=[object()])
+
+        runner.warm_up()
+
+        assert fake_mx.eval_calls == 1
+        assert fake_mx.clear_calls == 0
+
+    def test_warm_up_does_not_clear_cache_after_dummy_forward_failure(
+        self, monkeypatch
+    ) -> None:
+        fake_mx = FakeWarmupMX(cache_bytes=123)
+        monkeypatch.setattr(mr, "mx", fake_mx)
+
+        runner = self._make_runner()
+        runner._multimodal_adapter = object()
+        runner._dummy_forward_outputs = Mock(
+            side_effect=RuntimeError("dummy forward failed")
+        )
+
+        with pytest.raises(RuntimeError, match="dummy forward failed"):
+            runner.warm_up()
+
+        assert fake_mx.clear_calls == 0
 
     def test_accumulates_streamed_segments(self, monkeypatch) -> None:
         captured: dict[str, object] = {}
