@@ -15,6 +15,15 @@ from vllm_metal.config import (
 class TestMetalConfig:
     """Tests for MetalConfig class."""
 
+    BOOL_ENV_DEFAULTS = (
+        ("VLLM_METAL_USE_MLX", True),
+        ("VLLM_METAL_DEBUG", False),
+        ("VLLM_METAL_USE_PAGED_ATTENTION", True),
+        ("VLLM_METAL_GDN_LAZY_KERNELS", True),
+        ("VLLM_METAL_MLA_KERNEL", False),
+        ("VLLM_METAL_BUILD_FROM_SOURCE", False),
+    )
+
     @pytest.fixture(autouse=True)
     def _reset(self, monkeypatch):
         """Reset config singleton before and after each test."""
@@ -59,6 +68,47 @@ class TestMetalConfig:
         config = MetalConfig.from_env()
 
         assert config.use_paged_attention is False
+
+    @pytest.mark.parametrize(
+        "value",
+        ["1", "true", "TRUE", " yes ", "on"],
+    )
+    def test_bool_env_accepts_true_spellings(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("VLLM_METAL_DEBUG", value)
+
+        config = MetalConfig.from_env()
+
+        assert config.debug is True
+
+    @pytest.mark.parametrize(
+        "value",
+        ["0", "false", "FALSE", " no ", "off"],
+    )
+    def test_bool_env_accepts_false_spellings(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("VLLM_METAL_USE_MLX", value)
+
+        config = MetalConfig.from_env()
+
+        assert config.use_mlx is False
+
+    def test_invalid_bool_env_rejected(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "enabled")
+
+        with pytest.raises(
+            ValueError, match="Invalid VLLM_METAL_USE_PAGED_ATTENTION"
+        ):
+            MetalConfig.from_env()
+
+    @pytest.mark.parametrize("name,default", BOOL_ENV_DEFAULTS)
+    def test_bool_env_defaults(self, name, default) -> None:
+        assert getattr(envs, name) is default
+
+    @pytest.mark.parametrize("name,_default", BOOL_ENV_DEFAULTS)
+    def test_bool_env_rejects_invalid_values(self, monkeypatch, name, _default) -> None:
+        monkeypatch.setenv(name, "maybe")
+
+        with pytest.raises(ValueError, match=f"Invalid {name}"):
+            getattr(envs, name)
 
     def test_get_config_singleton(self) -> None:
         """Test that get_config returns a singleton."""

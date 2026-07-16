@@ -5,7 +5,7 @@
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VLLM_METAL_MEMORY_FRACTION` | `auto` | `auto` allocates just enough memory plus a minimal KV cache, or `0.?` for fraction of memory |
-| `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute (1=yes, 0=no) |
+| `VLLM_METAL_USE_MLX` | `1` | Use MLX for compute |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
@@ -16,6 +16,9 @@
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). |
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
+
+Boolean `VLLM_METAL_*` variables accept `1`/`0`, `true`/`false`, `yes`/`no`,
+and `on`/`off` (case-insensitive).
 
 ## Multimodal Serve Modes
 
