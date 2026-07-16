@@ -1,0 +1,112 @@
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "'Red Hat Text', Arial, Helvetica, sans-serif",
+    "fontSize": "14px",
+    "primaryColor": "#d9dee5",
+    "primaryTextColor": "#1f2933",
+    "primaryBorderColor": "#5c6670",
+    "lineColor": "#667384",
+    "textColor": "#1f2933",
+    "clusterBkg": "#edf0f4",
+    "clusterBorder": "#95a0ae",
+    "edgeLabelBackground": "#eef1f4",
+    "titleColor": "#1f2933"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "nodeSpacing": 70,
+    "rankSpacing": 85,
+    "padding": 12
+  }
+}}%%
+flowchart TB
+  %% Edge semantics: -->  control flow (per-step decisions)
+  %%                 ==>  data flow (KV block bytes)
+  %%                 -.-> config / startup wiring
+
+  subgraph CONFIG["<b>Config / plan time</b>"]
+    PLAT["MetalPlatform<br/>check_and_update_config guards"]
+    CLAMP["compute_safe_kv_budget<br/>hard fit + free-RAM floor"]
+  end
+
+  subgraph PROC["<b>Single engine process</b> — uni executor enforced"]
+    subgraph SS["<b>Scheduler half</b> · control plane"]
+      SCHED["OffloadingConnectorScheduler<br/>lookup accounting, job construction"]
+      TIER["TieringOffloadingManager<br/>CPU + secondary tier orchestration"]
+      MGR["CPUOffloadingManager<br/>block pool, LRU/ARC"]
+      FST["MetalFileSystemTierManager<br/>F_NOCACHE, 0600, .noindex, QoS,<br/>CRC32-verified blocks"]
+    end
+
+    subgraph WS["<b>Worker half</b> · data plane"]
+      CONN["MetalOffloadingConnector<br/>overrides register_kv_caches only"]
+      SPEC["Metal(Tiering)OffloadingSpec<br/>worker from live MLX cache"]
+      WKR["MetalKVOffloadWorker<br/>sync gather / eval / scatter"]
+      GPU["Wired MLX paged KV cache<br/>non-pageable, hard-capped"]
+    end
+
+    REG["MetalSharedOffloadRegion<br/>anonymous RAM host pool, pageable<br/>one buffer, both halves"]
+  end
+
+  subgraph PERSIST["<b>Persistent store</b> — outlives the process"]
+    DISK["NVMe block store<br/>hash-named files, PYTHONHASHSEED-keyed"]
+  end
+
+  %% Config-time / startup wiring
+  PLAT -.->|"rewrites connector,<br/>injects spec_name"| CONN
+  PLAT -.->|"enforces uni executor"| PROC
+  PLAT -.->|"plans wired KV budget"| CLAMP
+  CLAMP -.->|"caps wired cache size"| GPU
+  CONN -.->|"register_kv_caches<br/>at startup"| SPEC
+  SPEC -.->|"builds the<br/>worker"| WKR
+  SPEC -.->|"carves host-pool<br/>views"| REG
+
+  %% Control flow: lookup -> hit/miss -> promotion -> retry
+  SCHED -->|"1: block-hash lookup"| TIER
+  TIER -->|"2: CPU pool hit/miss"| MGR
+  TIER -->|"3: miss — probe disk"| FST
+  TIER -->|"4: promoted, retry<br/>next step"| SCHED
+  SCHED -->|"5: submit_store /<br/>submit_load"| WKR
+
+  %% Data flow: worker mediates GPU<->RAM
+  GPU ==>|"store: gather,<br/>deferred<br/>post-sampling"| WKR
+  WKR ==>|"scatter + rebind,<br/>pre-forward"| GPU
+  WKR ==>|"strided write<br/>into rows"| REG
+  REG ==>|"load:<br/>read rows"| WKR
+
+  %% Data flow: fs tier mediates RAM<->disk via memoryview
+  REG ==>|"spill: rows via<br/>memoryview"| FST
+  FST ==>|"write-through<br/>block files"| DISK
+  DISK ==>|"read block file"| FST
+  FST ==>|"promote: rows via<br/>memoryview"| REG
+
+  subgraph LEG["<b>Legend</b>"]
+    direction LR
+    L1["Inherited upstream"]:::upstream
+    L2["Metal — this PR"]:::metalNew
+    L3["vllm-metal pre-existing"]:::metalBase
+    L4["Persistent store"]:::persistent
+    LC1["·"]:::ghost -->|"control"| LC2["·"]:::ghost
+    LD1["·"]:::ghost ==>|"KV block bytes"| LD2["·"]:::ghost
+    LK1["·"]:::ghost -.->|"config / startup"| LK2["·"]:::ghost
+  end
+
+  %% Provenance / semantics — color encodes origin only
+  classDef upstream fill:#d9dee5,stroke:#5c6670,stroke-width:1.5px,color:#1f2933
+  classDef metalNew fill:#bcd8f6,stroke:#1d5fae,stroke-width:1.5px,color:#0f2a4d
+  classDef metalBase fill:#f9e3b0,stroke:#9c6d12,stroke-width:1.5px,color:#3f2d06
+  classDef persistent fill:#e2daf2,stroke:#63519e,stroke-width:1.5px,color:#29204e,stroke-dasharray:6 4
+  classDef ghost fill:#eef1f4,stroke:#95a0ae,stroke-width:1px,color:#667384
+
+  class SCHED,MGR,TIER,L1 upstream
+  class CONN,SPEC,WKR,REG,FST,PLAT,CLAMP,L2 metalNew
+  class GPU,L3 metalBase
+  class DISK,L4 persistent
+
+  %% Boundaries: process boundary reads heavier; halves are cards inside it
+  style PROC fill:#e2e7ee,stroke:#3d4c60,stroke-width:2px
+  style SS fill:#edf0f4,stroke:#95a0ae,stroke-width:1.25px
+  style WS fill:#edf0f4,stroke:#95a0ae,stroke-width:1.25px
+  style CONFIG fill:#edf0f4,stroke:#95a0ae,stroke-width:1.25px
+  style PERSIST fill:#ece5f6,stroke:#63519e,stroke-width:1.5px,stroke-dasharray:6 4
+  style LEG fill:#edf0f4,stroke:#95a0ae,stroke-width:1px
