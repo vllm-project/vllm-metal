@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -424,6 +424,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         assert captured["input_ids"] == [[6]]
         assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert runner._execute_model_state is not None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
 
     def test_start_paged_forward_skips_hidden_states_without_drafts(
@@ -1221,7 +1222,7 @@ class TestV1MetalModelRunnerExecuteModel:
         finished_req_ids: set[str] | None = None,
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         num_invalid_spec_tokens: dict[str, int] | None = None,
-        scheduled_new_reqs: list[SimpleNamespace] | None = None,
+        scheduled_new_reqs: list[NewRequestData] | None = None,
     ) -> SchedulerOutput:
         req_ids = cached_req_ids or []
         return SchedulerOutput(
@@ -1245,6 +1246,18 @@ class TestV1MetalModelRunnerExecuteModel:
             free_encoder_mm_hashes=[],
             preempted_req_ids=set(),
             has_structured_output_requests=False,
+        )
+
+    def _make_new_request(self, req_id: str = "new") -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+            lora_request=None,
         )
 
     def test_returns_empty_output_directly_for_empty_batch(self) -> None:
@@ -1294,7 +1307,7 @@ class TestV1MetalModelRunnerExecuteModel:
         scheduler_output = self._make_scheduler_output(
             finished_req_ids={"done"},
             scheduled_spec_decode_tokens={"req-0": [7]},
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+            scheduled_new_reqs=[self._make_new_request()],
         )
 
         with pytest.raises(NotImplementedError, match="requires paged attention"):
@@ -1326,11 +1339,11 @@ class TestV1MetalModelRunnerExecuteModel:
             ["r0"],
             scheduled_spec_decode_tokens={"r0": [-1]},
             num_invalid_spec_tokens={"r0": 1},
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+            scheduled_new_reqs=[self._make_new_request()],
         )
         scheduler_output.num_scheduled_tokens = {"r0": 2, "new": 1}
         scheduler_output.total_num_scheduled_tokens = 3
-        scheduler_output.scheduled_cached_reqs.new_block_ids = [[[99]]]
+        scheduler_output.scheduled_cached_reqs.new_block_ids = [([99],)]
 
         with pytest.raises(NotImplementedError, match="scheduler-invalid"):
             runner.execute_model(scheduler_output)
@@ -1353,7 +1366,7 @@ class TestV1MetalModelRunnerExecuteModel:
             )
         )
         scheduler_output = self._make_scheduler_output(
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")]
+            scheduled_new_reqs=[self._make_new_request()]
         )
 
         with pytest.raises(NotImplementedError, match="no-async-scheduling"):
@@ -1952,12 +1965,15 @@ class TestDummyForwardOutputsPPRouting:
         real_eval = mx.eval
         cache_readings = iter([100, 180])
         limits: list[int] = []
+
+        def eval_and_record(*arrays: object) -> None:
+            evaled.extend(arrays)
+            real_eval(*arrays)
+
         monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
         monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
         monkeypatch.setattr(mr.mx, "set_cache_limit", limits.append)
-        monkeypatch.setattr(
-            mr.mx, "eval", lambda *arrays: evaled.extend(arrays) or real_eval(*arrays)
-        )
+        monkeypatch.setattr(mr.mx, "eval", eval_and_record)
 
         overhead = runner.profile_run()
 
