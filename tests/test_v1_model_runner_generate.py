@@ -1258,17 +1258,27 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.sampled_token_ids == []
         assert runner._pending_output is None
 
-    def test_non_paged_cached_request_without_state_emits_placeholder(self) -> None:
+    def test_non_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
 
-        out = runner.execute_model(self._make_scheduler_output(["req-0"]))
+        with pytest.raises(RuntimeError, match="req-0"):
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
 
-        assert out is None
-        pending = runner.sample_tokens(grammar_output=None)
-        assert pending is not None
-        assert pending.req_ids == ["req-0"]
-        assert pending.req_id_to_index == {"req-0": 0}
-        assert pending.sampled_token_ids == [[0]]
+        assert runner._pending_output is None
+
+    def test_paged_cached_request_without_state_raises(self) -> None:
+        runner = self._make_runner()
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+
+        with pytest.raises(RuntimeError, match="req-0"):
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
+
         assert runner._pending_output is None
 
     def test_non_paged_spec_decode_fails_after_cleanup_before_new_state(self) -> None:
