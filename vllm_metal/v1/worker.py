@@ -13,6 +13,16 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -247,7 +257,41 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # Create the worker-side KV connector before KV cache initialization,
+        # mirroring vllm.v1.worker.gpu_worker.Worker.initialize_from_config.
+        # No-op unless kv_transfer_config is set (e.g. --kv-offloading-size).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if has_kv_transfer_group():
+            if not hasattr(self.model_runner, "register_kv_connector_caches"):
+                raise NotImplementedError(
+                    "KV offloading is not supported for STT models on Metal."
+                )
+            # The MLX paged cache already exists (allocated during
+            # determine_available_memory -> setup_paged_attention), so the
+            # connector can be handed the live cache immediately.
+            self.model_runner.register_kv_connector_caches()
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Get KV connector handshake metadata, keyed by (pp_rank, tp_rank).
+
+        Called by the engine core via ``collective_rpc`` whenever a KV
+        connector is configured. Copied from
+        ``vllm.v1.worker.gpu_worker.Worker`` (device-agnostic); the offloading
+        connector needs no handshake and yields ``None``.
+        """
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
@@ -392,6 +436,12 @@ class MetalWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        try:
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            # Never let connector teardown block profiler/model cleanup.
+            logger.exception("KV transfer shutdown failed; continuing")
+
         if self._metal_profiler is not None:
             self._metal_profiler.shutdown()
             self._metal_profiler = None
