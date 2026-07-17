@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -424,6 +424,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         assert captured["input_ids"] == [[6]]
         assert captured["decode_info"] == [([0, 1], 1, 1)]
+        assert runner._execute_model_state is not None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
 
     def test_start_paged_forward_skips_hidden_states_without_drafts(
@@ -1221,7 +1222,7 @@ class TestV1MetalModelRunnerExecuteModel:
         finished_req_ids: set[str] | None = None,
         scheduled_spec_decode_tokens: dict[str, list[int]] | None = None,
         num_invalid_spec_tokens: dict[str, int] | None = None,
-        scheduled_new_reqs: list[SimpleNamespace] | None = None,
+        scheduled_new_reqs: list[NewRequestData] | None = None,
     ) -> SchedulerOutput:
         req_ids = cached_req_ids or []
         return SchedulerOutput(
@@ -1247,6 +1248,18 @@ class TestV1MetalModelRunnerExecuteModel:
             has_structured_output_requests=False,
         )
 
+    def _make_new_request(self, req_id: str = "new") -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+            lora_request=None,
+        )
+
     def test_returns_empty_output_directly_for_empty_batch(self) -> None:
         runner = self._make_runner()
 
@@ -1258,18 +1271,93 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.sampled_token_ids == []
         assert runner._pending_output is None
 
-    def test_non_paged_cached_request_without_state_emits_placeholder(self) -> None:
+    def test_non_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
 
-        out = runner.execute_model(self._make_scheduler_output(["req-0"]))
+        with pytest.raises(RuntimeError, match="req-0"):
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
 
-        assert out is None
-        pending = runner.sample_tokens(grammar_output=None)
-        assert pending is not None
-        assert pending.req_ids == ["req-0"]
-        assert pending.req_id_to_index == {"req-0": 0}
-        assert pending.sampled_token_ids == [[0]]
         assert runner._pending_output is None
+
+    def test_paged_cached_request_without_state_raises(self) -> None:
+        runner = self._make_runner()
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+
+        with pytest.raises(RuntimeError, match="req-0"):
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
+
+        assert runner._pending_output is None
+
+    def test_missing_cached_request_fails_before_new_prefill(self, monkeypatch) -> None:
+        runner = self._make_runner()
+        monkeypatch.setattr(
+            runner,
+            "_prefill_single",
+            lambda *args, **kwargs: pytest.fail("prefill should not run"),
+        )
+        new_req = self._make_new_request()
+
+        with pytest.raises(RuntimeError, match="missing"):
+            runner.execute_model(
+                self._make_scheduler_output(
+                    ["missing"],
+                    scheduled_new_reqs=[new_req],
+                )
+            )
+
+        assert "new" not in runner._request_states
+        assert runner._pending_output is None
+
+    def test_missing_cached_request_materializes_released_gdn_state(self) -> None:
+        cache = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=2,
+            conv_dim=4,
+            num_v_heads=1,
+            value_head_dim=4,
+            key_head_dim=32,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        runtime = HybridRuntimeStub(cache)
+        runner = make_stub_runner(_paged_attention_runtime=runtime)
+        runner._request_states["done"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            generated_tokens=0,
+        )
+        slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
+        cache.set_pending_recurrent_state(
+            0,
+            [slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+        )
+
+        with pytest.raises(RuntimeError, match="missing"):
+            runner.execute_model(
+                self._make_scheduler_output(
+                    ["missing"],
+                    finished_req_ids={"done"},
+                )
+            )
+
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][slot]), 7)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
+        assert runtime.gdn_state_manager.needs_materialize is False
 
     def test_non_paged_spec_decode_fails_after_cleanup_before_new_state(self) -> None:
         runner = self._make_runner()
@@ -1284,7 +1372,7 @@ class TestV1MetalModelRunnerExecuteModel:
         scheduler_output = self._make_scheduler_output(
             finished_req_ids={"done"},
             scheduled_spec_decode_tokens={"req-0": [7]},
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+            scheduled_new_reqs=[self._make_new_request()],
         )
 
         with pytest.raises(NotImplementedError, match="requires paged attention"):
@@ -1316,11 +1404,11 @@ class TestV1MetalModelRunnerExecuteModel:
             ["r0"],
             scheduled_spec_decode_tokens={"r0": [-1]},
             num_invalid_spec_tokens={"r0": 1},
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+            scheduled_new_reqs=[self._make_new_request()],
         )
         scheduler_output.num_scheduled_tokens = {"r0": 2, "new": 1}
         scheduler_output.total_num_scheduled_tokens = 3
-        scheduler_output.scheduled_cached_reqs.new_block_ids = [[[99]]]
+        scheduler_output.scheduled_cached_reqs.new_block_ids = [([99],)]
 
         with pytest.raises(NotImplementedError, match="scheduler-invalid"):
             runner.execute_model(scheduler_output)
@@ -1343,7 +1431,7 @@ class TestV1MetalModelRunnerExecuteModel:
             )
         )
         scheduler_output = self._make_scheduler_output(
-            scheduled_new_reqs=[SimpleNamespace(req_id="new")]
+            scheduled_new_reqs=[self._make_new_request()]
         )
 
         with pytest.raises(NotImplementedError, match="no-async-scheduling"):
@@ -1942,12 +2030,15 @@ class TestDummyForwardOutputsPPRouting:
         real_eval = mx.eval
         cache_readings = iter([100, 180])
         limits: list[int] = []
+
+        def eval_and_record(*arrays: object) -> None:
+            evaled.extend(arrays)
+            real_eval(*arrays)
+
         monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
         monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
         monkeypatch.setattr(mr.mx, "set_cache_limit", limits.append)
-        monkeypatch.setattr(
-            mr.mx, "eval", lambda *arrays: evaled.extend(arrays) or real_eval(*arrays)
-        )
+        monkeypatch.setattr(mr.mx, "eval", eval_and_record)
 
         overhead = runner.profile_run()
 

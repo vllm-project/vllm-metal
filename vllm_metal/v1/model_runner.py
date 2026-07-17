@@ -202,7 +202,6 @@ class _ExecutionBatch:
     new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
-    scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
 
     def add_output(
@@ -1885,20 +1884,10 @@ class MetalModelRunner:
     def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
         """Maintain ``_request_states`` on a non-last pipeline stage.
 
-        Only the last stage samples, and that is where the normal request-state
-        lifecycle is built (``_sample_paged_batch`` needs the sampled token). A
-        non-last stage would otherwise have no state and emit a placeholder for
-        every cached step in :meth:`_collect_cached_requests`, skipping the
-        forward + ``pipeline_send`` the downstream stage is blocked on (its ring
-        ``recv`` then trips the Metal command-buffer watchdog and aborts).
-
-        Mirror upstream vLLM's ``_update_states`` (``gpu_model_runner.py``, the
-        ``if not is_last_rank`` branch): seed state from the scheduler's
-        ``NewRequestData`` and advance it with the sampled tokens the scheduler
-        broadcasts in ``CachedRequestData.new_token_ids`` — the first stage never
-        samples, it reconstructs the token stream from the scheduler. Block ids
-        are left to :meth:`_update_cached_request_blocks`, which runs next and
-        already guards a missing state.
+        Non-last stages do not sample, so they mirror the scheduler token stream
+        to keep cached steps able to run forward and send activations downstream.
+        Cached-state presence is checked before model work; block ids are
+        updated later from cached scheduler metadata.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
@@ -1915,9 +1904,7 @@ class MetalModelRunner:
         if not cached.new_token_ids:
             return
         for i, req_id in enumerate(cached.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                continue
+            state = self._request_states[req_id]
             new_token_ids = cached.new_token_ids[i]
             # Append only the tokens not already reflected in token_ids (mirrors
             # upstream's num_new_tokens; tolerates >1 sampled token per step).
@@ -1939,9 +1926,7 @@ class MetalModelRunner:
             return
 
         for i, req_id in enumerate(cached_reqs.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                continue
+            state = self._request_states[req_id]
 
             new_block_ids = cached_reqs.new_block_ids[i]
             resumed = req_id in cached_reqs.resumed_req_ids
@@ -1966,24 +1951,12 @@ class MetalModelRunner:
             return
 
         if self._paged_attention_runtime is None:
-            batch.scheduled_cached_req_ids.extend(cached_reqs.req_ids)
             for req_id in cached_reqs.req_ids:
-                state = self._request_states.get(req_id)
-                if state is not None:
-                    batch.valid_decode_reqs.append((req_id, state))
+                batch.valid_decode_reqs.append((req_id, self._request_states[req_id]))
             return
 
         for idx, req_id in enumerate(cached_reqs.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                logger.warning(
-                    "Paged cached request %s has no RequestState; "
-                    "emitting placeholder token. This indicates scheduler/runner "
-                    "state desync.",
-                    req_id,
-                )
-                batch.add_output(req_id, [0])
-                continue
+            state = self._request_states[req_id]
 
             if state.generated_tokens == 0:
                 computed_tokens = cached_reqs.num_computed_tokens[idx]
@@ -2101,11 +2074,8 @@ class MetalModelRunner:
             pooler_output=batch.pooler_outputs,
         )
 
-    def _run_non_paged_decode_batch(
-        self,
-        batch: _ExecutionBatch,
-    ) -> None:
-        """Run non-paged decode work and append placeholder outputs as needed."""
+    def _run_non_paged_decode_batch(self, batch: _ExecutionBatch) -> None:
+        """Run non-paged decode work."""
         if batch.valid_decode_reqs:
             if len(batch.valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
                 decode_result = self._batched_decode(batch.valid_decode_reqs)
@@ -2119,10 +2089,6 @@ class MetalModelRunner:
                     else None
                 )
                 batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
-
-        for req_id in batch.scheduled_cached_req_ids:
-            if req_id not in batch.req_id_to_index:
-                batch.add_output(req_id, [0])
 
     def _validate_scheduled_outputs(
         self,
@@ -2227,6 +2193,12 @@ class MetalModelRunner:
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        missing_cached_state_req_ids = [
+            req_id
+            for req_id in cached_reqs.req_ids
+            if req_id in evicted_req_ids or req_id not in self._request_states
+        ]
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
         spec_decode_error: Exception | None = None
         try:
@@ -2241,6 +2213,7 @@ class MetalModelRunner:
             has_scheduled_encoder_inputs
             or spec_decode_error is not None
             or has_unsupported_non_paged_structured_output
+            or bool(missing_cached_state_req_ids)
         )
 
         # Scheduler cleanup is independent of whether this step's work is
@@ -2252,6 +2225,12 @@ class MetalModelRunner:
             resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
+        if missing_cached_state_req_ids:
+            raise RuntimeError(
+                "Scheduled cached request(s) have no RequestState: "
+                f"{missing_cached_state_req_ids[:16]}. "
+                "This is a scheduler/runner state desync."
+            )
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder
         # cache when dispatch runs.
@@ -2284,7 +2263,6 @@ class MetalModelRunner:
         if is_non_last_stage(self.pp):
             self._update_pp_stage_states(scheduler_output)
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
