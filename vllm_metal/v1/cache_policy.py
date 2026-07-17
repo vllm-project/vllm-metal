@@ -676,6 +676,75 @@ class WorkerCachePlanner:
         """Return Metal-memory budget before hybrid GDN reservation."""
         return int(metal_limit * fraction) - model_memory - overhead
 
+    # Headroom for wired allocations outside the planned budget (MLX buffer
+    # cache, tokenizer/server processes) observed at ~4-7GB on live serves.
+    MEMORY_GUARD_SLACK_BYTES = 4 << 30
+
+    @staticmethod
+    def compute_safe_kv_budget(
+        kv_budget: int,
+        *,
+        planned_other_bytes: int,
+        available_bytes: int,
+        total_bytes: int,
+        min_free_fraction: float,
+        guard_disabled: bool,
+    ) -> tuple[int, str | None]:
+        """Clamp the KV budget so the plan cannot destabilize the host.
+
+        The KV pool is wired (non-pageable): macOS cannot reclaim it under
+        pressure, and plans sized purely from ``fraction`` have driven
+        machines to hard resets. Two independent limits:
+
+        - HARD (always on): the full plan must fit in currently-available
+          memory with minimal slack — otherwise serving would thrash from
+          the first request. Returns a budget that triggers the standard
+          cannot-fit error upstream if violated.
+        - SOFT floor (default on, ``VLLM_METAL_DISABLE_MEMORY_GUARD=1`` to
+          opt out): after wiring, at least ``min_free_fraction`` of TOTAL
+          RAM (min 4GB) must remain free. The budget is reduced to honor
+          the floor; the caller logs the returned reason prominently.
+
+        Returns (possibly-clamped budget, human-readable clamp reason or
+        None).
+        """
+        slack = WorkerCachePlanner.MEMORY_GUARD_SLACK_BYTES
+        planned_total = kv_budget + planned_other_bytes + slack
+
+        hard_limit = available_bytes - (1 << 30)
+        if planned_total > hard_limit:
+            hard_budget = max(0, hard_limit - planned_other_bytes - slack)
+            reason = (
+                f"plan needs {planned_total / 1e9:.1f}GB but only "
+                f"{available_bytes / 1e9:.1f}GB is available; KV budget cut "
+                f"{kv_budget / 1e9:.1f}GB -> {hard_budget / 1e9:.1f}GB "
+                "(cannot-fit hard limit)"
+            )
+            kv_budget, clamp_reason = hard_budget, reason
+        else:
+            clamp_reason = None
+
+        if guard_disabled:
+            return kv_budget, clamp_reason
+
+        floor = max(4 << 30, int(total_bytes * min_free_fraction))
+        soft_limit = available_bytes - floor
+        planned_total = kv_budget + planned_other_bytes + slack
+        if planned_total > soft_limit:
+            soft_budget = max(0, soft_limit - planned_other_bytes - slack)
+            clamp_reason = (
+                f"wiring {planned_total / 1e9:.1f}GB would leave less than "
+                f"the {floor / 1e9:.1f}GB free-memory floor "
+                f"({min_free_fraction:.0%} of {total_bytes / 1e9:.0f}GB "
+                f"RAM); KV budget clamped {kv_budget / 1e9:.1f}GB -> "
+                f"{soft_budget / 1e9:.1f}GB. Lower "
+                "VLLM_METAL_MEMORY_FRACTION to size the cache "
+                "intentionally, or set VLLM_METAL_DISABLE_MEMORY_GUARD=1 "
+                "to accept the risk"
+            )
+            kv_budget = soft_budget
+        return kv_budget, clamp_reason
+
     def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
         block_size = self._worker.vllm_config.cache_config.block_size
         fraction = self._memory_fraction()
@@ -691,6 +760,27 @@ class WorkerCachePlanner:
         )
         reservation = self._hybrid_gdn_reservation()
         kv_budget = base_kv_budget - reservation.total_bytes
+
+        # Memory-safety clamp: fraction-derived budgets know nothing about
+        # what the host can actually afford (observed live: fraction 0.8 on
+        # a 128GB machine wired ~90GB for a 1.5B model and drove free
+        # memory to 11%). See compute_safe_kv_budget.
+        import psutil
+
+        import vllm_metal.envs as metal_envs
+
+        vmem = psutil.virtual_memory()
+        kv_budget, clamp_reason = self.compute_safe_kv_budget(
+            kv_budget,
+            planned_other_bytes=model_memory + overhead + reservation.total_bytes,
+            available_bytes=vmem.available,
+            total_bytes=vmem.total,
+            min_free_fraction=metal_envs.VLLM_METAL_MIN_FREE_FRACTION,
+            guard_disabled=metal_envs.VLLM_METAL_DISABLE_MEMORY_GUARD,
+        )
+        if clamp_reason:
+            logger.warning("Memory-safety guard: %s", clamp_reason)
+
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,

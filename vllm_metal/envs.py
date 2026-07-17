@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
+    VLLM_METAL_MIN_FREE_FRACTION: float = 0.15
+    VLLM_METAL_DISABLE_MEMORY_GUARD: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -43,6 +45,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
+    # Minimum fraction of TOTAL system RAM the KV cache plan must leave
+    # un-wired (free for the OS, pager, and other processes). The paged
+    # KV budget is clamped (with a warning) to honor this floor. The KV
+    # pool is wired/non-pageable, so macOS cannot reclaim it under
+    # pressure; breaching the floor has hardware-reset machines.
+    "VLLM_METAL_MIN_FREE_FRACTION": lambda: float(
+        os.getenv("VLLM_METAL_MIN_FREE_FRACTION", "0.15")
+    ),
+    # Disable the memory-safety clamp entirely (power users who manage
+    # system memory themselves). The hard cannot-fit error still applies.
+    "VLLM_METAL_DISABLE_MEMORY_GUARD": lambda: (
+        os.getenv("VLLM_METAL_DISABLE_MEMORY_GUARD", "0") == "1"
+    ),
     # Enable verbose debug logging (default False).
     "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
