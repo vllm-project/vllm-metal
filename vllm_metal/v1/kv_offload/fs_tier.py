@@ -31,6 +31,7 @@ Scheduler-side only (no mlx import): ``MetalTieringOffloadingSpec`` routes the
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import functools
 import os
 import stat
@@ -62,11 +63,9 @@ QOS_CLASS_UTILITY = 0x11
 
 NOINDEX_DIRNAME = "blocks.noindex"
 
-_F_NOCACHE: int | None = None
-if sys.platform == "darwin":
-    import fcntl
-
-    _F_NOCACHE = getattr(fcntl, "F_NOCACHE", None)
+# Only the F_NOCACHE constant is Darwin-specific (fcntl itself is POSIX,
+# imported unconditionally above so non-darwin mypy runs resolve the name).
+_F_NOCACHE: int | None = getattr(fcntl, "F_NOCACHE", None)
 
 
 def set_current_thread_qos(qos_class: int) -> bool:
