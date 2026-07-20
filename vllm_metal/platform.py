@@ -641,6 +641,9 @@ class MetalPlatform(Platform):
             kv_transfer_config.kv_role = "kv_both"
             extra = kv_transfer_config.kv_connector_extra_config
             if kv_offloading_size is not None:
+                # A non-None kv_offloading_size implies cache_config exists
+                # (it was read off cache_config above).
+                assert cache_config is not None
                 # Mirrors upstream _post_init_kv_transfer_config (GiB).
                 extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
                 cache_config.kv_offloading_size = None

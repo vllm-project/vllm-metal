@@ -364,7 +364,7 @@ class MetalFileSystemTierManager(FileSystemTierManager):
         # Replace the exists()-based lookup manager with the size-validating
         # one (shut down the upstream instance's thread first).
         self._lookup_manager.shutdown()
-        self._lookup_manager = MetalFsAsyncLookupManager(
+        self._lookup_manager: MetalFsAsyncLookupManager = MetalFsAsyncLookupManager(
             tier=self, tier_type=self.tier_type
         )
         # Negative cache breaking the failed-promotion livelock: keys whose
