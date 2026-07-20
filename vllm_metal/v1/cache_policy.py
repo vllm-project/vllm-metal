@@ -589,7 +589,7 @@ class ModelCachePolicy:
     def _kv_factor(self) -> int:
         return 1 if self._runner.is_mla else 2
 
-    def _mha_cache_layout(self) -> tuple[int, list[int] | None]:
+    def _mha_cache_layout(self) -> tuple[int, dict[int, int] | None]:
         if self._runner._yoco_cache_mapping is None:
             return self._runner.num_kv_cache_layers, None
 
