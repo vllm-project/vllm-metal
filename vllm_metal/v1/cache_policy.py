@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Literal
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MLAAttentionSpec,
+)
 
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
@@ -273,8 +278,17 @@ class ModelCachePolicy:
         use_turboquant = self._use_turboquant(config)
 
         kv_heads, head_dims = self._cache_layer_shapes(self._runner.num_layers)
+        # Under YOCO KV sharing only the leading ``num_cache_layers`` layers own
+        # a cache; the trailing ones reuse it (see ``_mha_cache_layout``, whose
+        # mapping assigns the owners first).  Emit no spec for the sharers, so
+        # the engine sizes against the layers that were actually allocated --
+        # the same way upstream expresses sharing by omission in
+        # ``GPUModelRunner.get_kv_cache_spec``.
+        num_spec_layers = self._runner.num_layers
+        if self._runner._yoco_cache_mapping is not None:
+            num_spec_layers, _ = self._runner._yoco_cache_mapping
         specs: dict[str, KVCacheSpec] = {}
-        for layer_idx in range(self._runner.num_layers):
+        for layer_idx in range(num_spec_layers):
             if (
                 self._runner.is_hybrid
                 and layer_idx not in self._runner.sdpa_layer_indices
@@ -301,7 +315,16 @@ class ModelCachePolicy:
                 )
             else:
                 layer_name = f"layers.{layer_idx}.self_attn"
-                specs[layer_name] = FullAttentionSpec(
+                # MLA caches a single latent tensor per layer, not separate K
+                # and V (see ``MLAPagedLatentCache``), which is why
+                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` hardcodes
+                # the 2x K/V factor in ``real_page_size_bytes``, so describing
+                # MLA with it makes the engine halve the block count it plans
+                # against relative to the pool actually allocated.
+                spec_cls = (
+                    MLAAttentionSpec if self._runner.is_mla else FullAttentionSpec
+                )
+                specs[layer_name] = spec_cls(
                     block_size=block_size,
                     num_kv_heads=kv_heads[layer_idx],
                     head_size=head_dims[layer_idx],
