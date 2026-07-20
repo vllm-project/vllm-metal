@@ -311,7 +311,24 @@ class ModelCachePolicy:
         return specs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        """Accept engine KV cache config for API compatibility."""
+        """Accept engine KV cache config for API compatibility.
+
+        MLX owns the paged pool, which was already allocated from the
+        profiled capacity in ``setup_paged_attention``.  The engine's block
+        count normally round-trips back to that same number, but
+        ``--num-gpu-blocks-override`` replaces it after the fact, so verify
+        the engine is not planning against more blocks than exist.
+        """
+        runtime = self._runner.paged_attention_runtime
+        if runtime is not None and kv_cache_config.num_blocks > runtime.num_blocks():
+            raise ValueError(
+                f"Engine KV cache config requests {kv_cache_config.num_blocks} "
+                f"blocks but the Metal paged pool was allocated with "
+                f"{runtime.num_blocks()}. vllm-metal sizes its pool from "
+                "available Metal memory and cannot grow it afterwards. If "
+                "--num-gpu-blocks-override is set, lower or remove it; "
+                "otherwise this is a capacity-accounting bug, please report it."
+            )
         logger.info(
             "KV cache config received: %d blocks (MLX manages cache internally)",
             kv_cache_config.num_blocks,
