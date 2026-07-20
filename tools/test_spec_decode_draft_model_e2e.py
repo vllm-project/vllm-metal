@@ -83,9 +83,7 @@ def _is_numerical_tie(
     mismatch."""
     winner = float(logits_row[target_token])
     other = float(logits_row[draft_token])
-    gap = winner - other
-    if gap <= 0.0:
-        return True
+    gap = winner - other  # >= 0: target_token is the argmax
     mag = max(abs(winner), abs(other))
     if mag == 0.0:
         return True
@@ -157,7 +155,7 @@ class TestDraftModelSpecDecode:
         runner = sd_engine.llm_engine.model_executor.driver_worker.model_runner
         controller = runner._spec_decode_controller
         original_verify = controller.verify_greedy
-        stats = {"drafted": 0}
+        stats = {"drafted": 0, "accepted": 0}
         # Rejections that are not a numerical tie (a real mismatch).  Recorded
         # here and asserted after generate() so the check runs in test scope,
         # not the engine loop.
@@ -173,6 +171,7 @@ class TestDraftModelSpecDecode:
                 drafts = segment.draft_token_ids
                 stats["drafted"] += len(drafts)
                 accepted = len(output_ids) - 1
+                stats["accepted"] += accepted
                 if accepted >= len(drafts):
                     continue
                 row_logits = logits[0, segment.start_row + accepted, :]
@@ -200,9 +199,16 @@ class TestDraftModelSpecDecode:
             + (f"\n  fallback: {fallback}" if fallback else "")
         )
 
-        # (b) the drafter genuinely ran (an inert drafter proposes nothing, or
-        # garbage caught below as a non-tie rejection).
+        # (b) the drafter genuinely ran AND landed on the target's own tokens:
+        # drafted > 0 only proves the proposer ran; accepted > 0 rules out a
+        # broken draft cache whose every proposal is corrected as a permitted
+        # near-tie.
         assert stats["drafted"] > 0, "no drafts proposed — inert drafter"
+        assert stats["accepted"] > 0, (
+            "no draft accepted outright — every proposal was corrected; a broken "
+            "draft cache can pass the tie check while proposing nothing the "
+            "target keeps"
+        )
 
         # (c) every draft the target rejected is a numerical tie, not a real
         # score gap (a real gap means stale draft KV or a wrong block table).
