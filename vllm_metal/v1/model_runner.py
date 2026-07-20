@@ -358,6 +358,12 @@ class MetalModelRunner:
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
 
+        # YOCO layer->cache mapping, replaced by _install_yoco_cache_mapping
+        # during model load.  Declared here so readers can treat it as always
+        # present: it is consulted on the KV-sizing path, which runs for every
+        # model, not only the YOCO ones that install a real mapping.
+        self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
+
     @property
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).

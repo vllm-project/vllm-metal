@@ -59,6 +59,7 @@ def make_stub_runner(
         "_logitsprocs": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
         "_lora": MetalLoRARuntime(),
+        "_yoco_cache_mapping": None,
         "model_args": _model_args,
     }
 
