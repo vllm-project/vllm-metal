@@ -9,7 +9,11 @@ for a 1.5B model and drove free memory to 11% (observed live, 2026-07-17).
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 GB = 1 << 30
-SLACK = WorkerCachePlanner.MEMORY_GUARD_SLACK_BYTES
+
+
+def eff_slack(total: int) -> int:
+    """Mirror of the guard's machine-scaled slack (capped at RAM/16)."""
+    return min(WorkerCachePlanner.MEMORY_GUARD_SLACK_BYTES, total // 16)
 
 
 def clamp(kv, other, avail, total, frac=0.15, disabled=False):
@@ -38,14 +42,14 @@ def test_studio_incident_is_clamped() -> None:
     assert reason and "clamped" in reason
     # Post-clamp: wired total leaves at least the floor free.
     floor = max(4 * GB, int(137 * GB * 0.15))
-    assert budget + 2 * GB + SLACK <= 114 * GB - floor
+    assert budget + 2 * GB + eff_slack(137 * GB) <= 114 * GB - floor
 
 
 def test_hard_limit_when_plan_exceeds_available() -> None:
     """A plan bigger than available memory is cut regardless of the guard
     (serving would thrash immediately)."""
     budget, reason = clamp(120 * GB, 2 * GB, 100 * GB, 137 * GB, disabled=True)
-    assert budget + 2 * GB + SLACK <= 100 * GB - 1 * GB
+    assert budget + 2 * GB + eff_slack(137 * GB) <= 100 * GB - 1 * GB
     assert reason and "cannot-fit" in reason
 
 
@@ -75,3 +79,26 @@ def test_floor_fraction_scales() -> None:
 def test_never_negative() -> None:
     budget, _ = clamp(50 * GB, 10 * GB, 8 * GB, 16 * GB)
     assert budget == 0
+
+
+def test_tiny_ci_runner_stays_serving_viable() -> None:
+    """Replays the GitHub macos-15 runner numbers that zeroed the budget in
+    upstream CI (PR #530, run 2026-07-20): ~7GB total RAM, ~4.5GB available
+    at plan time, ~1.25GB model+overhead. A flat 4GB absolute floor demands
+    57% of the machine and clamps every budget to zero; the floor's absolute
+    minimum must scale down (min(4GB, 25% of RAM)) so a small runner still
+    serves a small model."""
+    budget, reason = clamp(int(2.76 * GB), int(1.25 * GB), int(4.5 * GB), 7 * GB)
+    assert reason is not None  # the guard still engages on a small host
+    assert budget > 0.75 * GB  # but leaves a serving-viable budget
+    # Floor actually honored post-clamp.
+    floor = max(min(4 * GB, int(7 * GB * 0.25)), int(7 * GB * 0.15))
+    assert budget + int(1.25 * GB) + eff_slack(7 * GB) <= int(4.5 * GB) - floor
+
+
+def test_sixteen_gb_floor_unchanged_by_small_ram_cap() -> None:
+    """The small-RAM cap must not weaken the 16GB-class floor: at 16GB the
+    absolute minimum is still the full 4GB (25% of 16GB == 4GB)."""
+    with_cap, _ = clamp(int(10.6 * GB), 1 * GB, 13 * GB, 16 * GB)
+    floor = 4 * GB  # unchanged from the pre-cap formula
+    assert with_cap + 1 * GB + eff_slack(16 * GB) <= 13 * GB - floor

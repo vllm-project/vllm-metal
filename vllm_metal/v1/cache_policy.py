@@ -702,13 +702,23 @@ class WorkerCachePlanner:
           cannot-fit error upstream if violated.
         - SOFT floor (default on, ``VLLM_METAL_DISABLE_MEMORY_GUARD=1`` to
           opt out): after wiring, at least ``min_free_fraction`` of TOTAL
-          RAM (min 4GB) must remain free. The budget is reduced to honor
-          the floor; the caller logs the returned reason prominently.
+          RAM must remain free, with an absolute minimum of 4GB capped at
+          25% of RAM — on a 16GB+ machine the minimum is the full 4GB, but
+          on small hosts (e.g. 7GB CI runners) demanding 4GB free would
+          consume most of RAM and zero every budget, so the minimum scales
+          down to a quarter of the machine instead. The budget is reduced
+          to honor the floor; the caller logs the returned reason
+          prominently.
 
         Returns (possibly-clamped budget, human-readable clamp reason or
         None).
         """
-        slack = WorkerCachePlanner.MEMORY_GUARD_SLACK_BYTES
+        # Slack (headroom for plan underestimation) and the floor's absolute
+        # minimum are both sized for >=16GB-class machines; on small hosts
+        # (7GB CI runners) flat 4GB constants exceed what the machine can
+        # give and zero every budget. Scale both to the machine: slack is
+        # capped at 1/16th of RAM (4GB at 64GB+, ~0.4GB on a 7GB runner).
+        slack = min(WorkerCachePlanner.MEMORY_GUARD_SLACK_BYTES, total_bytes // 16)
         planned_total = kv_budget + planned_other_bytes + slack
 
         hard_limit = available_bytes - (1 << 30)
@@ -727,7 +737,8 @@ class WorkerCachePlanner:
         if guard_disabled:
             return kv_budget, clamp_reason
 
-        floor = max(4 << 30, int(total_bytes * min_free_fraction))
+        absolute_min = min(4 << 30, int(total_bytes * 0.25))
+        floor = max(absolute_min, int(total_bytes * min_free_fraction))
         soft_limit = available_bytes - floor
         planned_total = kv_budget + planned_other_bytes + slack
         if planned_total > soft_limit:
