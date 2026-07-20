@@ -82,18 +82,19 @@ def test_never_negative() -> None:
 
 
 def test_tiny_ci_runner_stays_serving_viable() -> None:
-    """Replays the GitHub macos-15 runner numbers that zeroed the budget in
-    upstream CI (PR #530, run 2026-07-20): ~7GB total RAM, ~4.5GB available
-    at plan time, ~1.25GB model+overhead. A flat 4GB absolute floor demands
-    57% of the machine and clamps every budget to zero; the floor's absolute
-    minimum must scale down (min(4GB, 25% of RAM)) so a small runner still
-    serves a small model."""
-    budget, reason = clamp(int(2.76 * GB), int(1.25 * GB), int(4.5 * GB), 7 * GB)
+    """Replays the GitHub macos-15 runner that zeroed the budget in upstream
+    CI (PR #530, runs 2026-07-20): 6GB total RAM, 2.6GB available at plan
+    time, 2.77GB fraction-derived budget, ~0.05GB overhead still to come
+    (model weights are already resident and thus already out of available —
+    they must NOT appear in planned_other_bytes). Flat 4GB floor/slack
+    constants exceed the whole machine; scaled constants must leave a
+    serving-viable budget for a 0.6B model."""
+    budget, reason = clamp(int(2.77 * GB), int(0.05 * GB), int(2.6 * GB), 6 * GB)
     assert reason is not None  # the guard still engages on a small host
-    assert budget > 0.75 * GB  # but leaves a serving-viable budget
+    assert budget > 0.5 * GB  # but leaves a serving-viable budget
     # Floor actually honored post-clamp.
-    floor = max(min(4 * GB, int(7 * GB * 0.25)), int(7 * GB * 0.15))
-    assert budget + int(1.25 * GB) + eff_slack(7 * GB) <= int(4.5 * GB) - floor
+    floor = max(min(4 * GB, int(6 * GB * 0.25)), int(6 * GB * 0.15))
+    assert budget + int(0.05 * GB) + eff_slack(6 * GB) <= int(2.6 * GB) - floor
 
 
 def test_sixteen_gb_floor_unchanged_by_small_ram_cap() -> None:

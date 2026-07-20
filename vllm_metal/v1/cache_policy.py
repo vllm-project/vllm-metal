@@ -781,9 +781,14 @@ class WorkerCachePlanner:
         import vllm_metal.envs as metal_envs
 
         vmem = psutil.virtual_memory()
+        # planned_other_bytes = allocations still to come. The model weights
+        # are already resident when available is sampled (the plan runs
+        # after load), so counting model_memory here would double-subtract
+        # it — harmless noise on a 128GB host, fatal on a 6GB CI runner
+        # where it zeroes the budget.
         kv_budget, clamp_reason = self.compute_safe_kv_budget(
             kv_budget,
-            planned_other_bytes=model_memory + overhead + reservation.total_bytes,
+            planned_other_bytes=overhead + reservation.total_bytes,
             available_bytes=vmem.available,
             total_bytes=vmem.total,
             min_free_fraction=metal_envs.VLLM_METAL_MIN_FREE_FRACTION,
