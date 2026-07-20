@@ -2,8 +2,9 @@
 """End-to-end gate for draft-model speculative decoding on Metal.
 
 With draft == target == ``Qwen/Qwen3-0.6B`` under greedy decoding, every draft
-token equals the target's own argmax, so all drafts are accepted and
-speculative decoding must reproduce plain greedy decoding token-for-token. The
+token equals the target's own argmax, so drafts are accepted and speculative
+decoding reproduces plain greedy decoding token-for-token, except where the
+draft and the target winner are a numerical tie the two forwards can split. The
 greedy goldens are the same ones ``test_paged_deterministic`` pins.
 
 Process isolation: build exactly ONE engine per process (target + draft model +
@@ -14,14 +15,18 @@ two paged caches). Run on its own:
 
 Numerical note: the verify forward runs the K+1 verification rows through the
 QKV/MLP/LM-head GEMMs with M=K+1 (vs M=1 for plain decode); per the documented
-MLX batch/M-size FP behavior this can shift one argmax, so two prompts have a
-documented paged fallback.
+MLX batch/M-size FP behavior the two forwards can split a tie and reject a
+draft. That is tolerated only when it is an actual tie (``_is_numerical_tie``);
+a draft rejected with a real score gap still fails. Two prompts also have a
+documented paged output fallback (GOLDEN_PAGED_FALLBACK) for the output check.
 """
 
 from __future__ import annotations
 
+import math
 import os
 
+import mlx.core as mx
 import pytest
 from vllm import LLM, SamplingParams
 
@@ -58,6 +63,32 @@ GOLDEN_PAGED_FALLBACK = {
     "The capital of France is":                   [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576],
 }
 # fmt: on
+
+# A draft the target rejects is a legitimate numerical tie only when the two
+# logits are within a few bfloat16 ULPs — the differently shaped draft (M=1)
+# and verify (M=K+1) forwards can split a tie by summation order.  A genuine
+# tie is bit-identical (measured gap 0.0); the nearest real decision in these
+# runs leads by ~3.5 ULPs (0.44 at logit magnitude 17), so a 2-ULP window still
+# fails on a real score gap (stale draft KV / wrong block table).  ULP-relative,
+# so it holds at any logit magnitude and needs no per-prompt golden.
+BF16_MANTISSA_BITS = 7
+MAX_TIE_ULPS = 2
+
+
+def _is_numerical_tie(
+    logits_row: mx.array, draft_token: int, target_token: int
+) -> bool:
+    """Whether the draft and the target winner are within MAX_TIE_ULPS bfloat16
+    ULPs — a tie the M=1 draft and M=K+1 verify forwards may split, not a real
+    mismatch."""
+    winner = float(logits_row[target_token])
+    other = float(logits_row[draft_token])
+    gap = winner - other  # >= 0: target_token is the argmax
+    mag = max(abs(winner), abs(other))
+    if mag == 0.0:
+        return True
+    ulp = 2.0 ** (math.floor(math.log2(mag)) - BF16_MANTISSA_BITS)
+    return gap <= MAX_TIE_ULPS * ulp
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -115,28 +146,48 @@ class TestDraftModelSpecDecode:
     @pytest.mark.parametrize("prompt", PROMPTS)
     def test_single_stream_lossless_and_fully_accepted(self, sd_engine, prompt):
         """Greedy draft-model SD must (a) reproduce plain greedy token-for-token
-        and (b) accept every draft. Output alone is not enough: verification
-        corrects an inert drafter, so acceptance is the only proof the draft
-        model actually ran and proposed the target's tokens.
+        and (b/c) accept every draft the target does not reject over a real
+        logit gap; a rejection is allowed only when the draft and target winner
+        are a numerical tie. Output alone is not enough: verification corrects
+        an inert drafter, so the acceptance check is the proof the draft model
+        actually ran and proposed the target's tokens.
         """
         runner = sd_engine.llm_engine.model_executor.driver_worker.model_runner
         controller = runner._spec_decode_controller
         original_verify = controller.verify_greedy
-        counts = {"accepted": 0, "drafted": 0}
+        stats = {"drafted": 0, "accepted": 0}
+        # Rejections that are not a numerical tie (a real mismatch).  Recorded
+        # here and asserted after generate() so the check runs in test scope,
+        # not the engine loop.
+        real_mismatches: list[tuple[int, int, int, float]] = []
 
-        def counting_verify(logits, decode_reqs, decode_segments, *, logitsprocs):
-            # Each verified row is (accepted drafts) + 1 trailing token (bonus on
-            # full accept, else the target's correction), so accepted = len - 1.
+        def tie_checking_verify(logits, decode_reqs, decode_segments, *, logitsprocs):
             result = original_verify(
                 logits, decode_reqs, decode_segments, logitsprocs=logitsprocs
             )
+            # verify stops at the first per-segment mismatch, so accepted =
+            # len(output) - 1 locates the one rejected draft (if any).
             for segment, output_ids in zip(decode_segments, result, strict=True):
-                counts["drafted"] += len(segment.draft_token_ids)
-                counts["accepted"] += len(output_ids) - 1
+                drafts = segment.draft_token_ids
+                stats["drafted"] += len(drafts)
+                accepted = len(output_ids) - 1
+                stats["accepted"] += accepted
+                if accepted >= len(drafts):
+                    continue
+                row_logits = logits[0, segment.start_row + accepted, :]
+                target_token = int(mx.argmax(row_logits))
+                draft_token = int(drafts[accepted])
+                if not _is_numerical_tie(row_logits, draft_token, target_token):
+                    gap = float(row_logits[target_token]) - float(
+                        row_logits[draft_token]
+                    )
+                    real_mismatches.append(
+                        (segment.start_row + accepted, draft_token, target_token, gap)
+                    )
             return result
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(controller, "verify_greedy", counting_verify)
+            mp.setattr(controller, "verify_greedy", tie_checking_verify)
             token_ids = _greedy(sd_engine, [prompt])[prompt]
 
         # (a) lossless vs greedy goldens (two prompts sit on a documented ULP tie)
@@ -148,12 +199,23 @@ class TestDraftModelSpecDecode:
             + (f"\n  fallback: {fallback}" if fallback else "")
         )
 
-        # (b) every draft accepted => the drafter genuinely proposed the target's
-        # tokens (a shortfall means stale draft KV or a wrong block table)
-        assert counts["drafted"] > 0, "no drafts proposed — inert drafter"
-        assert counts["accepted"] == counts["drafted"], (
-            f"single-stream must accept every draft, got "
-            f"{counts['accepted']}/{counts['drafted']}"
+        # (b) the drafter genuinely ran AND landed on the target's own tokens:
+        # drafted > 0 only proves the proposer ran; accepted > 0 rules out a
+        # broken draft cache whose every proposal is corrected as a permitted
+        # near-tie.
+        assert stats["drafted"] > 0, "no drafts proposed — inert drafter"
+        assert stats["accepted"] > 0, (
+            "no draft accepted outright — every proposal was corrected; a broken "
+            "draft cache can pass the tie check while proposing nothing the "
+            "target keeps"
+        )
+
+        # (c) every draft the target rejected is a numerical tie, not a real
+        # score gap (a real gap means stale draft KV or a wrong block table).
+        assert not real_mismatches, (
+            f"{prompt!r}: target rejected a draft with a real logit gap, not a "
+            f"{MAX_TIE_ULPS}-ULP tie — stale draft KV / wrong block table.  "
+            f"(row, draft, target, gap): {real_mismatches}"
         )
 
     @pytest.mark.slow
