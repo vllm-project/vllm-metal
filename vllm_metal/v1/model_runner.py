@@ -81,6 +81,10 @@ from vllm_metal.v1.model_adapter import (
     TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.mtp_heads.registry import (
+    NativeMTPBuildContext,
+    NativeMTPHeadRegistry,
+)
 from vllm_metal.v1.pooling import (
     finish_paged_pooling_batch,
     forward_sequence_hidden_states,
@@ -742,10 +746,24 @@ class MetalModelRunner:
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
             )
+        elif spec.method == "mtp":
+            head = NativeMTPHeadRegistry.find(spec)
+            if head is None:
+                raise NotImplementedError(
+                    NativeMTPHeadRegistry.unsupported_message(spec)
+                )
+            context = NativeMTPBuildContext(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                vllm_config=self.vllm_config,
+                target_config=self.model_args,
+            )
+            self._drafter = head.build_proposer(context)
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, native MTP heads "
+                f"{NativeMTPHeadRegistry.registered_types()}, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(
@@ -2174,14 +2192,22 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
+        invalidated = set(evicted_req_ids)
+        if preempted_req_ids:
+            invalidated.update(preempted_req_ids)
+        if resumed_req_ids:
+            invalidated.update(resumed_req_ids)
+
+        # A drafter that pins per-request state (native MTP's KV slab, draft-model
+        # cache blocks) releases it on the same events as the runtime's recurrent
+        # state (#489 release-don't-hold): a waiting request must not hold the
+        # resource, and a resumed request rebuilds it during recompute.
+        if invalidated and self._drafter is not None:
+            self._drafter.release_requests(invalidated)
+
         if runtime is not None:
-            runtime_invalidated = set(evicted_req_ids)
-            if preempted_req_ids:
-                runtime_invalidated.update(preempted_req_ids)
-            if resumed_req_ids:
-                runtime_invalidated.update(resumed_req_ids)
-            if runtime_invalidated:
-                runtime.release_requests(runtime_invalidated)
+            if invalidated:
+                runtime.release_requests(invalidated)
             if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
