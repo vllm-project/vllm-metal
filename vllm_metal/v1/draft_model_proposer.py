@@ -207,6 +207,17 @@ class DraftModelProposer:
             draft_token_ids=[[int(token) for token in row] for row in rows],
         )
 
+    def release_requests(self, req_ids: set[str]) -> None:
+        # Return a preempted/evicted request's draft KV blocks to the free pool
+        # and drop its committed-length bookkeeping, so it does not pin draft
+        # cache while it waits; a resumed request re-ingests from the paged
+        # context. Mirrors _prune_finished for an explicit lifecycle set.
+        for req_id in req_ids:
+            blocks = self._req_blocks.pop(req_id, None)
+            if blocks is not None:
+                self._free_blocks.extend(blocks)
+            self._draft_seq_lens.pop(req_id, None)
+
     # -- internals -----------------------------------------------------------
 
     def _prune_finished(self, request_states: Any) -> None:
