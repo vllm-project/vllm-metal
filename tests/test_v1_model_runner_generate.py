@@ -21,6 +21,10 @@ from vllm_metal.attention.state import HybridGDNStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
+from vllm_metal.v1.mtp_heads.registry import (
+    NativeMTPBuildContext,
+    NativeMTPHeadRegistry,
+)
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 
 
@@ -83,6 +87,134 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     runner.install_drafter(num_blocks=1, block_size=16)
 
     assert isinstance(runner._drafter, Gemma4MTPProposer)
+
+
+class _FakeMTPProposer:
+    def needs_target_hidden_states(self, *args, **kwargs) -> bool:
+        return False
+
+    def propose(self, ctx) -> None:
+        return None
+
+
+class _RecordingMTPHead:
+    model_type = "recording_mtp"
+
+    def __init__(self) -> None:
+        self.contexts: list[object] = []
+        self.proposer = _FakeMTPProposer()
+
+    def build_proposer(self, context: NativeMTPBuildContext) -> _FakeMTPProposer:
+        self.contexts.append(context)
+        return self.proposer
+
+
+class TestInstallDrafterMtpDispatch:
+    def _make_mtp_spec(
+        self, *, model_type: str, num_speculative_tokens: int = 1
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            method="mtp",
+            uses_draft_model=lambda: False,
+            num_speculative_tokens=num_speculative_tokens,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type=model_type),
+            ),
+        )
+
+    def _make_vllm_config(
+        self, spec: SimpleNamespace, *, enable_prefix_caching: bool = False
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
+        )
+
+    def test_registered_head_builds_and_installs_its_proposer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        head = _RecordingMTPHead()
+        monkeypatch.setattr(NativeMTPHeadRegistry, "_heads", {})
+        NativeMTPHeadRegistry.register(head)
+        runner = make_stub_runner(
+            tokenizer=object(),
+            model_args={"target": "cfg"},
+        )
+        spec = self._make_mtp_spec(model_type=head.model_type)
+        runner.vllm_config = SimpleNamespace(speculative_config=spec)
+
+        runner.install_drafter(num_blocks=1, block_size=16)
+
+        assert runner._drafter is head.proposer
+        (context,) = head.contexts
+        assert isinstance(context, NativeMTPBuildContext)
+        assert context.speculative_config is spec
+        assert context.controller is runner._spec_decode_controller
+        assert context.vllm_config is runner.vllm_config
+        assert context.target_config is runner.model_args
+
+    def test_unregistered_mtp_draft_raises_naming_model_type(self) -> None:
+        runner = make_stub_runner(tokenizer=object())
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=self._make_mtp_spec(model_type="eagle"),
+        )
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            runner.install_drafter(num_blocks=1, block_size=16)
+
+        message = str(excinfo.value)
+        assert "'eagle'" in message
+        assert "Gemma4 MTP" in message
+
+    def test_glm_head_rejects_prefix_caching_through_install_drafter(self) -> None:
+        runner = make_stub_runner(tokenizer=object(), kv_cache_dtype=None)
+        runner.vllm_config = self._make_vllm_config(
+            self._make_mtp_spec(model_type="glm4_moe_lite_mtp"),
+            enable_prefix_caching=True,
+        )
+
+        with pytest.raises(NotImplementedError, match="no-enable-prefix-caching"):
+            runner.install_drafter(num_blocks=1, block_size=16)
+
+    def test_glm_head_rejects_multi_token_through_install_drafter(self) -> None:
+        runner = make_stub_runner(tokenizer=object(), kv_cache_dtype=None)
+        runner.vllm_config = self._make_vllm_config(
+            self._make_mtp_spec(
+                model_type="glm4_moe_lite_mtp", num_speculative_tokens=2
+            ),
+        )
+
+        with pytest.raises(NotImplementedError, match="at most 1 speculative"):
+            runner.install_drafter(num_blocks=1, block_size=16)
+
+
+class TestDrafterReleaseOnLifecycle:
+    def test_reconcile_releases_drafter_state_for_invalidated_requests(self) -> None:
+        released: list[set[str]] = []
+
+        class _RecordingDrafter:
+            def needs_target_hidden_states(self, *args, **kwargs) -> bool:
+                return False
+
+            def propose(self, ctx) -> None:
+                return None
+
+            def release_requests(self, req_ids: set[str]) -> None:
+                released.append(set(req_ids))
+
+        runner = make_stub_runner(tokenizer=object())
+        runner._drafter = _RecordingDrafter()
+
+        # Eviction + preemption + resume all invalidate the drafter's per-request
+        # state, mirroring the runtime recurrent-state release path.
+        runner._reconcile_request_lifecycle(
+            {"done"},
+            preempted_req_ids={"paused"},
+            resumed_req_ids={"back"},
+            materialize_runtime_state=False,
+        )
+
+        assert released == [{"done", "paused", "back"}]
 
 
 class TestV1MetalModelRunnerGenerate:
