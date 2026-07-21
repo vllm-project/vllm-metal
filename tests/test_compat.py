@@ -810,8 +810,9 @@ class TestWrapModelSanitize:
 class TestMetalRayLocalGpuIds:
     """Pure-logic coverage for the Ray V2 worker resource resolver.
 
-    Exercises the decision the ``get_node_and_gpu_ids`` override delegates to —
-    no Ray, no cluster — so it runs in CI on the validated single-node path.
+    Exercises the decision the ``get_node_and_physical_gpu_ids`` override
+    delegates to — no Ray, no cluster — so it runs in CI on the validated
+    single-node path.
     """
 
     def test_single_mlx_resource_maps_to_local_index_zero(self) -> None:
@@ -837,3 +838,90 @@ class TestMetalRayLocalGpuIds:
     def test_none_assignment_fails_loud(self) -> None:
         with pytest.raises(RuntimeError, match="was not assigned"):
             compat._metal_ray_local_gpu_ids("node-1", None, "mlx")
+
+
+class _StubWorkerWithMethod:
+    """Stands in for RayWorkerProc: exposes the upstream method name so the
+    override has something to replace."""
+
+    def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
+        return ("stock", [])
+
+
+class _StubWorkerMissingMethod:
+    """A worker actor without the tracked method — the shape a future upstream
+    rename would produce."""
+
+
+class TestInstallMetalOverride:
+    """Coverage for installing the Metal Ray worker override on a worker class.
+
+    Pins that the override lands on the method vLLM actually calls
+    (``get_node_and_physical_gpu_ids``, renamed from ``get_node_and_gpu_ids`` at
+    vLLM 0.24.0); the old code bound the pre-0.24 name and silently left the
+    stock method — which KeyErrors on the "mlx" custom resource — in place.
+    """
+
+    def test_override_replaces_the_upstream_method_and_resolves_mlx(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ray = pytest.importorskip("ray")
+
+        class _FakeRuntimeContext:
+            def get_node_id(self) -> str:
+                return "node-x"
+
+            def get_assigned_resources(self) -> dict[str, float]:
+                return {"mlx": 1.0}
+
+        monkeypatch.setattr(ray, "get_runtime_context", lambda: _FakeRuntimeContext())
+
+        compat._install_metal_override(_StubWorkerWithMethod)
+
+        assert _StubWorkerWithMethod._metal_patched is True
+        # The override lands on the method upstream calls, NOT the pre-0.24 name.
+        assert not hasattr(_StubWorkerWithMethod, "get_node_and_gpu_ids")
+        resolved = _StubWorkerWithMethod().get_node_and_physical_gpu_ids()
+        assert resolved == ("node-x", [0])
+
+    def test_missing_method_fails_loud(self) -> None:
+        with pytest.raises(RuntimeError) as excinfo:
+            compat._install_metal_override(_StubWorkerMissingMethod)
+        assert str(excinfo.value) == (
+            "Ray worker actor _StubWorkerMissingMethod has no "
+            "'get_node_and_physical_gpu_ids' method; vllm-metal's Metal Ray "
+            "override tracks that upstream name and vLLM appears to have renamed "
+            "it. Update vllm_metal.compat for the installed vLLM version."
+        )
+
+    def test_second_install_is_a_noop(self) -> None:
+        class _Stub:
+            def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
+                return ("stock", [])
+
+        compat._install_metal_override(_Stub)
+        first = _Stub.get_node_and_physical_gpu_ids
+        compat._install_metal_override(_Stub)
+        assert _Stub.get_node_and_physical_gpu_ids is first
+
+    def test_patch_ray_distributed_targets_real_worker(self) -> None:
+        pytest.importorskip("ray")
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        original = RayWorkerProc.__dict__.get("get_node_and_physical_gpu_ids")
+        had_sentinel = "_metal_patched" in RayWorkerProc.__dict__
+        try:
+            compat._patch_ray_distributed()
+            assert RayWorkerProc._metal_patched is True
+            assert (
+                RayWorkerProc.__dict__["get_node_and_physical_gpu_ids"] is not original
+            )
+        finally:
+            if original is not None:
+                RayWorkerProc.get_node_and_physical_gpu_ids = original
+            elif "get_node_and_physical_gpu_ids" in RayWorkerProc.__dict__:
+                # Upstream defined it on a base class; drop our install so the
+                # inherited method is visible again.
+                delattr(RayWorkerProc, "get_node_and_physical_gpu_ids")
+            if not had_sentinel and "_metal_patched" in RayWorkerProc.__dict__:
+                delattr(RayWorkerProc, "_metal_patched")
