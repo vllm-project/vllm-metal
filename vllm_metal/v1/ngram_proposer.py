@@ -102,6 +102,11 @@ class NgramProposer:
         # N-gram matches token ids only; it never reads the target's hidden states.
         return False
 
+    def release_requests(self, req_ids: set[str]) -> None:
+        # N-gram drafts from the per-step token history it is handed; it holds no
+        # per-request state to release.
+        del req_ids
+
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         if ctx.num_speculative_tokens <= 0:
             return None

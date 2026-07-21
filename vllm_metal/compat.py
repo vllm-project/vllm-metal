@@ -15,6 +15,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from transformers.configuration_utils import PretrainedConfig
+
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -28,6 +30,7 @@ def apply_compat_patches() -> None:
         return
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
+    _patch_vllm_glm4_moe_lite_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
     ensure_vllm_auto_fit_null_block_patch()
     _patch_mlx_lm_qwen35_fp8_sanitize()
@@ -289,6 +292,117 @@ def _patch_vllm_gemma4_mtp_config_loading() -> None:
     # override runs.
     AutoConfig.register("gemma4_assistant", config_cls, exist_ok=True)
     logger.debug("Registered Gemma4 assistant config compatibility")
+
+
+@lru_cache(maxsize=1)
+def _glm4_moe_lite_config_cls() -> type[Any]:
+    """The base Transformers config the nextn head nests under ``text_config``.
+
+    Imported lazily so a Transformers release without ``glm4_moe_lite`` raises
+    here (caught by the caller) rather than at module import.
+    """
+    from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import (
+        Glm4MoeLiteConfig,
+    )
+
+    return Glm4MoeLiteConfig
+
+
+class Glm4MoeLiteMTPCompatConfig(PretrainedConfig):
+    """Transformers config for the GLM-4.7-Flash nextn head.
+
+    The mlx-vlm drafter split nests the source model config under ``text_config``
+    and leaves the head's own ``architectures`` / ``num_nextn_predict_layers`` out
+    of the top level. vLLM's MTP override keys on the top-level ``architectures[0]``
+    (``Glm4MoeLiteForCausalLM``) and ``num_nextn_predict_layers`` to normalize the
+    draft into ``Glm4MoeLiteMTPModel`` (``num_hidden_layers=0``, ``n_predict=1``),
+    so promote both from the nested config before that override runs.
+
+    Defined at module scope (not a closure) so vLLM's spawn-based EngineCore can
+    pickle a config instance by qualified name into the worker process.
+    """
+
+    model_type = "glm4_moe_lite_mtp"
+
+    def __init__(self, text_config: Any | None = None, **kwargs: Any) -> None:
+        base = _glm4_moe_lite_config_cls()
+        if text_config is None:
+            self.text_config = base()
+        elif isinstance(text_config, base):
+            self.text_config = text_config
+        elif isinstance(text_config, Mapping):
+            self.text_config = base(**text_config)
+        else:
+            self.text_config = text_config
+        kwargs.setdefault(
+            "architectures", getattr(self.text_config, "architectures", None)
+        )
+        if "num_nextn_predict_layers" not in kwargs:
+            nextn = getattr(self.text_config, "num_nextn_predict_layers", None)
+            if nextn is not None:
+                kwargs["num_nextn_predict_layers"] = nextn
+        super().__init__(**kwargs)
+
+    def get_text_config(self, decoder: bool = False) -> Any:
+        return self.text_config
+
+
+def _glm4_moe_lite_mtp_config_class() -> type[Any]:
+    """Return the GLM-4.7-Flash nextn head config, wiring its nested
+    ``text_config`` sub-config. Raises if the pinned Transformers lacks
+    ``glm4_moe_lite`` (caught by the caller).
+    """
+    Glm4MoeLiteMTPCompatConfig.sub_configs = {
+        "text_config": _glm4_moe_lite_config_cls()
+    }
+    return Glm4MoeLiteMTPCompatConfig
+
+
+def _transformers_knows_glm4_moe_lite_mtp(auto_config: Any) -> bool:
+    try:
+        auto_config.for_model("glm4_moe_lite_mtp")
+    except ValueError:
+        return False
+    return True
+
+
+def _patch_vllm_glm4_moe_lite_mtp_config_loading() -> None:
+    """Register the GLM-4.7-Flash ``glm4_moe_lite_mtp`` draft config for the pin.
+
+    vLLM normalizes a ``Glm4MoeLiteForCausalLM`` draft config into the
+    ``glm4_moe_lite_mtp`` MTP wrapper (``num_hidden_layers=0``,
+    ``n_predict=num_nextn_predict_layers``), but the pinned Transformers release
+    has no ``glm4_moe_lite_mtp`` AutoConfig entry, so parsing the head
+    checkpoint's ``model_type`` fails before that override runs. Keep the shim to
+    config loading only; model construction stays owned by vllm-metal's native
+    MTP head modules. Mirrors ``_patch_vllm_gemma4_mtp_config_loading``.
+    """
+    try:
+        from transformers import AutoConfig
+    except ImportError as exc:
+        logger.warning(
+            "Could not install GLM4 MoE-lite MTP config compatibility patch: %s",
+            exc,
+        )
+        return
+
+    if _transformers_knows_glm4_moe_lite_mtp(AutoConfig):
+        return
+
+    try:
+        config_cls = _glm4_moe_lite_mtp_config_class()
+    except ImportError as exc:
+        logger.warning(
+            "Could not install GLM4 MoE-lite MTP config compatibility patch "
+            "because Glm4MoeLite config classes are unavailable: %s",
+            exc,
+        )
+        return
+
+    # TODO: remove once the supported dependency stack parses raw
+    # ``model_type=glm4_moe_lite_mtp`` configs before vLLM's MTP override runs.
+    AutoConfig.register("glm4_moe_lite_mtp", config_cls, exist_ok=True)
+    logger.debug("Registered GLM4 MoE-lite MTP config compatibility")
 
 
 def _decoder_tree_contains_type(value: Any, decoder_type: str) -> bool:
