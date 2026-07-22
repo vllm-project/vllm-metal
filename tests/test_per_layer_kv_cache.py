@@ -7,9 +7,18 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+import torch
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    SlidingWindowSpec,
+)
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.runtime.mha import (
     MHAPagedAttentionRuntime,
 )
@@ -238,3 +247,87 @@ class TestCachePolicyPerLayerBytes:
             match="TurboQuant with per-layer KV shapes is not yet supported",
         ):
             runner.get_kv_cache_spec()
+
+
+class TestMHAKVCacheLayout:
+    """vLLM-managed standard-MHA cache layout contracts."""
+
+    @staticmethod
+    def _mixed_mha_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
+        full = FullAttentionSpec(
+            block_size=32,
+            num_kv_heads=4,
+            head_size=512,
+            dtype=torch.bfloat16,
+        )
+        sliding = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=16,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        )
+        names = tuple(f"layers.{index}.self_attn" for index in range(4))
+        groups = [
+            KVCacheGroupSpec([names[0], names[2]], full),
+            KVCacheGroupSpec([names[1], names[3]], sliding),
+        ]
+        assert full.page_size_bytes == sliding.page_size_bytes
+        size = full.page_size_bytes * 3
+        config = KVCacheConfig(
+            num_blocks=3,
+            kv_cache_tensors=[
+                KVCacheTensor(size=size, shared_by=[names[0], names[1]]),
+                KVCacheTensor(size=size, shared_by=[names[2], names[3]]),
+            ],
+            kv_cache_groups=groups,
+        )
+        return config, names
+
+    def test_translates_upstream_slots_and_groups(self) -> None:
+        config, names = self._mixed_mha_config()
+
+        layout = MHAKVCacheLayout.from_config(config, names)
+
+        assert layout.group_block_sizes == (32, 16)
+        assert layout.slot_layers == ((0, 1), (2, 3))
+        assert [layer.tensor_index for layer in layout.layers] == [0, 0, 1, 1]
+        assert [layer.group_index for layer in layout.layers] == [0, 1, 0, 1]
+        assert [layer.sliding_window for layer in layout.layers] == [-1, 1024, -1, 1024]
+        assert layout.total_bytes == sum(
+            tensor.size for tensor in config.kv_cache_tensors
+        )
+
+    def test_allocates_shared_slots_from_layout(self) -> None:
+        config, names = self._mixed_mha_config()
+        layout = MHAKVCacheLayout.from_config(config, names)
+
+        cache = MetalPagedKVCache.from_layout(layout, mx.bfloat16)
+
+        assert cache.key_caches[0].shape == (3, 32, 4, 512)
+        assert cache.key_caches[1].shape == (3, 16, 16, 256)
+        assert cache.group_index_for_layer(1) == 1
+        assert cache.block_size_for_layer(1) == 16
+
+    def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
+        config, names = self._mixed_mha_config()
+        cache = MetalPagedKVCache.from_layout(
+            MHAKVCacheLayout.from_config(config, names), mx.bfloat16
+        )
+
+        new_key = cache.key_caches[1] + mx.array(1, dtype=mx.bfloat16)
+        new_value = cache.value_caches[1] + mx.array(2, dtype=mx.bfloat16)
+
+        cache.replace_layer_cache(1, new_key, new_value)
+
+        assert mx.all(cache.key_caches[1].reshape(-1) == new_key.reshape(-1)).item()
+        assert mx.all(cache.value_caches[1].reshape(-1) == new_value.reshape(-1)).item()
+        assert mx.all(cache.key_caches[0].reshape(-1) == new_key.reshape(-1)).item()
+        assert mx.all(cache.value_caches[0].reshape(-1) == new_value.reshape(-1)).item()
+
+    def test_rejects_packed_upstream_tensors(self) -> None:
+        config, names = self._mixed_mha_config()
+        config.kv_cache_tensors[0].block_stride = 256
+
+        with pytest.raises(NotImplementedError, match="offset and block_stride"):
+            MHAKVCacheLayout.from_config(config, names)
