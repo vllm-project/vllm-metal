@@ -10,8 +10,8 @@ appropriate Metal attention impl based on the module's structure:
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
-Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
-``clear_context`` from ``context``.
+Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_grouped``,
+``prepare_unified``, and ``clear_context`` from ``context``.
 """
 
 from __future__ import annotations
