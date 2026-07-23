@@ -23,6 +23,7 @@ from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     get_context,
+    prepare_grouped,
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
@@ -287,6 +288,39 @@ class TestPrepare:
         assert ctx.offsets == [7, 0]
         assert ctx.context_lens == [8, 5]
         assert ctx.block_tables == [[5, 6], [10, 11]]
+
+
+class TestPrepareGrouped:
+    def teardown_method(self):
+        clear_context()
+
+    def test_builds_distinct_group_metadata(self):
+        decode = [([[3, 4], [8]], 17, 1)]
+        prefill = [([[5, 6], [9]], 2, 0)]
+
+        prepare_grouped(decode, prefill, (16, 32))
+
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.kv_groups is not None
+        assert ctx.kv_groups[0].slot_mapping == [4 * 16 + 1, 5 * 16, 5 * 16 + 1]
+        assert ctx.kv_groups[1].slot_mapping == [8 * 32 + 17, 9 * 32, 9 * 32 + 1]
+        assert ctx.kv_groups[0].block_tables == [[3, 4], [5, 6]]
+        assert ctx.kv_groups[1].block_tables == [[8], [9]]
+        assert ctx.slot_mapping == ctx.kv_groups[0].slot_mapping
+        assert ctx.block_tables == ctx.kv_groups[0].block_tables
+
+    def test_repeats_decode_table_for_each_verification_token(self):
+        prepare_grouped([([[3], [8, 9]], 17, 2)], [], (32, 16))
+
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.kv_groups is not None
+        assert ctx.context_lens == [18, 19]
+        assert ctx.kv_groups[0].block_tables == [[3], [3]]
+        assert ctx.kv_groups[1].block_tables == [[8, 9], [8, 9]]
 
 
 class TestPackedRoPE:

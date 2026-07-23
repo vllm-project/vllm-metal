@@ -4,11 +4,11 @@
 The thread-local ``PagedAttentionContext`` carries per-request metadata
 (slot_mapping, block_tables, cu_seqlens, …) to the attention wrappers buried
 inside the model; ``OffsetCache`` is the shim that keeps mlx_lm's RoPE and
-masking working with no real K/V; ``prepare_unified`` stages the context before
+masking working with no real K/V; ``prepare_grouped`` stages the context before
 a forward pass.
 
 Usage:
-    1. Before each forward pass call ``prepare_unified()``
+    1. Before each forward pass call ``prepare_grouped()``
     2. Run ``model(input_ids, cache=offset_caches)`` as normal
     3. The attention wrapper reads ``get_context()`` for paged metadata
     4. Call ``clear_context()`` after the forward pass
@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,10 +30,19 @@ from mlx_lm.models.base import create_causal_mask
 # Thread-local storage used to pass per-request metadata (slot_mapping,
 # block_tables, etc.) to attention wrappers buried inside the model.
 # We cannot add extra arguments to the mlx_lm forward signature, so
-# instead: prepare_unified() stashes context here before the
+# instead: prepare_grouped() stashes context here before the
 # forward pass, each attention wrapper reads it via get_context(), and
 # clear_context() cleans up afterwards.
 _thread_local = threading.local()
+
+
+@dataclass
+class PagedKVGroupContext:
+    """Per-cache-group paged metadata for one packed forward pass."""
+
+    slot_mapping: list[int]
+    block_tables: list[list[int]]
+    block_size: int
 
 
 @dataclass
@@ -70,6 +80,10 @@ class PagedAttentionContext:
     # the per-token kernel's window mode; prefill batches keep the tiled
     # kernel and stay numerically identical to the non-speculative path.
     verify_window_q: int = 1
+    # Per scheduler KV-cache-group slot mappings and block tables.
+    # ``slot_mapping`` / ``block_tables`` above mirror group zero for the
+    # legacy single-group path.
+    kv_groups: tuple[PagedKVGroupContext, ...] | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -131,14 +145,16 @@ class OffsetCache:
 # ---------------------------------------------------------------------------
 
 
-def prepare_unified(
-    decode_requests: list[tuple[list[int], int] | tuple[list[int], int, int]],
-    prefill_requests: list[tuple[list[int], int, int]],
-    block_size: int,
+def prepare_grouped(
+    decode_requests: Sequence[
+        tuple[Sequence[Sequence[int]], int] | tuple[Sequence[Sequence[int]], int, int]
+    ],
+    prefill_requests: Sequence[tuple[Sequence[Sequence[int]], int, int]],
+    block_sizes: Sequence[int],
     *,
     merge_verify_windows: bool = False,
 ) -> None:
-    """Compute metadata for a unified prefill + decode forward pass.
+    """Compute metadata for every scheduler KV-cache group in one forward pass.
 
     Packs decode tokens followed by prefill tokens into a single flattened
     sequence. ``cu_seqlens`` marks attention segments so the varlen kernel
@@ -147,13 +163,14 @@ def prepare_unified(
     Args:
         decode_requests: list of ``(block_ids, seq_len)`` or
             ``(block_ids, seq_len, num_tokens)`` for decode requests.
+            ``block_ids`` carries one list per scheduler cache group.
             ``seq_len`` = tokens already cached before this step. ``num_tokens``
             defaults to 1; a larger value is a speculative-verification
             window, kept as one multi-token segment.
         prefill_requests: list of ``(block_ids, num_tokens, start_pos)`` for
             prefill.  ``start_pos`` is the position of the first token in this
             chunk (0 for a fresh prefill, >0 for continuation chunks).
-        block_size: tokens per KV cache block.
+        block_sizes: tokens per KV cache block, ordered by scheduler group.
         merge_verify_windows: keep a multi-token decode request as ONE
             cu_seqlens segment (the window-mode layout).  Defaults to
             False — the expanded per-token layout — because window mode
@@ -165,59 +182,81 @@ def prepare_unified(
             PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for
             the tiled one.
     """
-    slot_mapping: list[int] = []
+    group_slot_mappings: list[list[int]] = [[] for _ in block_sizes]
+    group_block_tables: list[list[list[int]]] = [[] for _ in block_sizes]
     cu_seqlens: list[int] = [0]
-    block_tables: list[list[int]] = []
     context_lens: list[int] = []
     offsets: list[int] = []
 
     max_decode_window = 1
 
-    # Decode requests first.  A multi-token decode request (spec-decode
-    # verification window) stays ONE segment, so cu_seqlens aligns with
-    # decode requests and the kernel sees the window whole; per-row causal
-    # frontiers come from the kernels' varlen handling.
+    # Decode requests first.  Multi-token decode requests are speculative
+    # verification windows.  The default expanded layout keeps one segment
+    # per row; the window-mode layout keeps one segment per request.
     for decode_request in decode_requests:
         if len(decode_request) == 2:
-            block_ids, seq_len = decode_request
+            block_ids_by_group, seq_len = decode_request
             num_tokens = 1
         else:
-            block_ids, seq_len, num_tokens = decode_request
+            block_ids_by_group, seq_len, num_tokens = decode_request
 
-        for pos in range(seq_len, seq_len + num_tokens):
-            block_idx = block_ids[pos // block_size]
-            slot = block_idx * block_size + (pos % block_size)
-            slot_mapping.append(slot)
+        for group_index, block_size in enumerate(block_sizes):
+            block_ids = block_ids_by_group[group_index]
+            block_table = list(block_ids)
+            for pos in range(seq_len, seq_len + num_tokens):
+                block_idx = block_ids[pos // block_size]
+                group_slot_mappings[group_index].append(
+                    block_idx * block_size + (pos % block_size)
+                )
+            if num_tokens > 1 and not merge_verify_windows:
+                group_block_tables[group_index].extend(
+                    block_table for _ in range(num_tokens)
+                )
+            else:
+                group_block_tables[group_index].append(block_table)
+
         if num_tokens > 1 and not merge_verify_windows:
             # Expanded layout: one single-token segment per window row,
             # byte-for-byte the pre-window-mode metadata.
             for pos in range(seq_len, seq_len + num_tokens):
                 cu_seqlens.append(cu_seqlens[-1] + 1)
-                block_tables.append(block_ids)
                 context_lens.append(pos + 1)  # including this decode token
                 offsets.append(pos)  # RoPE position
             continue
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
-        block_tables.append(block_ids)
         context_lens.append(seq_len + num_tokens)  # including window tokens
         offsets.append(seq_len)  # RoPE position of the first window token
         max_decode_window = max(max_decode_window, num_tokens)
 
     # Prefill requests (variable tokens each, starting at start_pos)
-    for block_ids, num_tokens, start_pos in prefill_requests:
-        for pos in range(start_pos, start_pos + num_tokens):
-            block_idx = block_ids[pos // block_size]
-            slot = block_idx * block_size + (pos % block_size)
-            slot_mapping.append(slot)
+    for block_ids_by_group, num_tokens, start_pos in prefill_requests:
+        for group_index, block_size in enumerate(block_sizes):
+            block_ids = block_ids_by_group[group_index]
+            block_table = list(block_ids)
+            for pos in range(start_pos, start_pos + num_tokens):
+                block_idx = block_ids[pos // block_size]
+                group_slot_mappings[group_index].append(
+                    block_idx * block_size + (pos % block_size)
+                )
+            group_block_tables[group_index].append(block_table)
+
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
-        block_tables.append(block_ids)
         context_lens.append(start_pos + num_tokens)
         offsets.append(start_pos)
 
+    kv_groups = tuple(
+        PagedKVGroupContext(
+            slot_mapping=group_slot_mappings[group_index],
+            block_tables=group_block_tables[group_index],
+            block_size=block_size,
+        )
+        for group_index, block_size in enumerate(block_sizes)
+    )
+
     set_context(
         PagedAttentionContext(
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
+            slot_mapping=kv_groups[0].slot_mapping,
+            block_tables=kv_groups[0].block_tables,
             context_lens=context_lens,
             cu_seqlens=cu_seqlens,
             offsets=offsets,
@@ -226,5 +265,37 @@ def prepare_unified(
             # any prefill segment keeps the whole batch on the tiled
             # kernel, numerically identical to the non-speculative path.
             verify_window_q=1 if prefill_requests else max_decode_window,
+            kv_groups=kv_groups,
         )
+    )
+
+
+def prepare_unified(
+    decode_requests: list[tuple[list[int], int] | tuple[list[int], int, int]],
+    prefill_requests: list[tuple[list[int], int, int]],
+    block_size: int,
+    *,
+    merge_verify_windows: bool = False,
+) -> None:
+    """Prepare one legacy KV-cache group through :func:`prepare_grouped`."""
+    grouped_decode: list[
+        tuple[list[list[int]], int] | tuple[list[list[int]], int, int]
+    ] = []
+    for decode_request in decode_requests:
+        if len(decode_request) == 2:
+            block_ids, seq_len = decode_request
+            grouped_decode.append(([block_ids], seq_len))
+        else:
+            block_ids, seq_len, num_tokens = decode_request
+            grouped_decode.append(([block_ids], seq_len, num_tokens))
+
+    grouped_prefill = [
+        ([block_ids], num_tokens, start_pos)
+        for block_ids, num_tokens, start_pos in prefill_requests
+    ]
+    prepare_grouped(
+        grouped_decode,
+        grouped_prefill,
+        (block_size,),
+        merge_verify_windows=merge_verify_windows,
     )

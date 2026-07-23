@@ -115,7 +115,7 @@ def build_yoco_reduced_context_from_full_metadata(
 ) -> YocoReducedContextMetadata:
     """Build reduced YOCO metadata from an existing paged-attention context.
 
-    ``prepare_unified`` already computes the full packed metadata used by the
+    ``prepare_grouped`` already computes the full packed metadata used by the
     self-decoder. The YOCO cross-decoder needs every query row whose logits are
     consumed: the last query of each prefill segment (next-token prediction),
     but EVERY row of a multi-token decode segment — those are spec-decode
@@ -322,6 +322,7 @@ def _gemma4_text_fast_prefill_call(
 
         from vllm_metal.attention.context import (
             PagedAttentionContext,
+            PagedKVGroupContext,
             get_context,
             set_context,
         )
@@ -355,6 +356,26 @@ def _gemma4_text_fast_prefill_call(
             cu_seqlens=ctx.cu_seqlens,
             num_decode_segments=ctx.num_decode_requests,
         )
+        reduced_kv_groups = None
+        if ctx.kv_groups is not None:
+            groups: list[PagedKVGroupContext] = []
+            for group in ctx.kv_groups:
+                group_meta = build_yoco_reduced_context_from_full_metadata(
+                    slot_mapping=group.slot_mapping,
+                    block_tables=group.block_tables,
+                    context_lens=ctx.context_lens,
+                    offsets=ctx.offsets,
+                    cu_seqlens=ctx.cu_seqlens,
+                    num_decode_segments=ctx.num_decode_requests,
+                )
+                groups.append(
+                    PagedKVGroupContext(
+                        slot_mapping=group_meta.slot_mapping,
+                        block_tables=group_meta.block_tables,
+                        block_size=group.block_size,
+                    )
+                )
+            reduced_kv_groups = tuple(groups)
     except ValueError as exc:
         _warn_fast_prefill_fallback_once(model, str(exc))
         return _call_original(
@@ -433,6 +454,7 @@ def _gemma4_text_fast_prefill_call(
         context_lens=meta.context_lens,
         offsets=meta.offsets,
         cu_seqlens=meta.cu_seqlens,
+        kv_groups=reduced_kv_groups,
     )
 
     set_context(reduced_ctx)
