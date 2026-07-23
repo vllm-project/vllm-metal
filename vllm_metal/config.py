@@ -29,6 +29,9 @@ VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
     {"auto", "text-only-compat", "multimodal-native"}
 )
 
+MLXDevice = Literal["gpu", "cpu"]
+VALID_MLX_DEVICES: frozenset[MLXDevice] = frozenset({"gpu", "cpu"})
+
 
 @dataclass
 class MetalConfig:
@@ -36,7 +39,7 @@ class MetalConfig:
 
     memory_fraction: float  # -1.0 selects the active backend's auto policy
     use_mlx: bool
-    mlx_device: Literal["gpu", "cpu"]
+    mlx_device: MLXDevice
     debug: bool
     use_paged_attention: bool = True
     multimodal_mode: MultimodalMode = "auto"
@@ -59,6 +62,13 @@ class MetalConfig:
                     f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
                     "Must be a finite value in (0, 1] when paged attention is enabled."
                 )
+
+        if self.mlx_device not in VALID_MLX_DEVICES:
+            available = ", ".join(sorted(VALID_MLX_DEVICES))
+            raise ValueError(
+                f"Invalid VLLM_MLX_DEVICE={self.mlx_device!r}. "
+                f"Available devices: {available}."
+            )
 
         if self.multimodal_mode not in VALID_MULTIMODAL_MODES:
             available = ", ".join(sorted(VALID_MULTIMODAL_MODES))
@@ -115,7 +125,7 @@ class MetalConfig:
         return cls(
             memory_fraction=memory_fraction,
             use_mlx=envs.VLLM_METAL_USE_MLX,
-            mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
+            mlx_device=envs.VLLM_MLX_DEVICE.strip().lower(),  # type: ignore[arg-type]
             debug=envs.VLLM_METAL_DEBUG,
             use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]

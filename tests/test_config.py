@@ -206,3 +206,32 @@ class TestMetalConfig:
                 k_quant="q8_0",
                 v_quant="fp16",
             )
+
+    def test_invalid_mlx_device_rejected(self) -> None:
+        """An unknown mlx_device must fail fast, not silently fall back to CPU."""
+        for device in ["mps", "cuda", "gpuu", ""]:
+            with pytest.raises(ValueError, match="Invalid VLLM_MLX_DEVICE"):
+                MetalConfig(
+                    memory_fraction=AUTO_MEMORY_FRACTION,
+                    use_mlx=True,
+                    mlx_device=device,  # type: ignore[arg-type]
+                    debug=False,
+                    use_paged_attention=True,
+                )
+
+    def test_mlx_device_from_env_normalizes_case(self, monkeypatch) -> None:
+        """'GPU' / ' gpu ' / 'CPU' from the environment normalize to canonical values."""
+        for value, expected in [("GPU", "gpu"), (" gpu ", "gpu"), ("CPU", "cpu")]:
+            reset_config()
+            monkeypatch.setenv("VLLM_MLX_DEVICE", value)
+
+            config = MetalConfig.from_env()
+
+            assert config.mlx_device == expected
+
+    def test_invalid_mlx_device_from_env_rejected(self, monkeypatch) -> None:
+        """A wrong backend name in the environment is rejected, not silently CPU-routed."""
+        monkeypatch.setenv("VLLM_MLX_DEVICE", "cuda")
+
+        with pytest.raises(ValueError, match="Invalid VLLM_MLX_DEVICE"):
+            MetalConfig.from_env()
