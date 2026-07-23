@@ -9,6 +9,7 @@ from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 
 if TYPE_CHECKING:
     from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 
 
 class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
@@ -34,6 +35,7 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
+        layout: MHAKVCacheLayout | None = None,
     ) -> None:
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -48,9 +50,19 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
+        self._layout = layout
 
     def initialize(self, num_blocks: int) -> None:
         from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+
+        if self._layout is not None:
+            if num_blocks != self._layout.num_blocks:
+                raise ValueError(
+                    "layout-backed MHA runtime must initialize with the vLLM "
+                    f"config num_blocks ({self._layout.num_blocks}), got {num_blocks}"
+                )
+            self._cache = MetalPagedKVCache.from_layout(self._layout, self._dtype)
+            return
 
         self._cache = MetalPagedKVCache(
             num_layers=self._num_layers,
@@ -66,6 +78,13 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             head_dim_per_layer=self._head_dim_per_layer,
             sliding_window_per_layer=self._sliding_window_per_layer,
         )
+
+    def kv_group_block_sizes(self) -> tuple[int, ...]:
+        """Return layout-owned group sizes or the legacy scalar page size."""
+        if self._layout is None:
+            return super().kv_group_block_sizes()
+        self._require_initialized("kv_group_block_sizes")
+        return self._layout.group_block_sizes
 
     def patch_model(self, model: Any) -> int:
         cache = self._require_initialized("patch_model")
