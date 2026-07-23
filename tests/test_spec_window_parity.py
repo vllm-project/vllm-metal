@@ -298,17 +298,56 @@ def test_windowed_forced_split_family() -> None:
 @pytest.mark.parametrize(
     "cu,total_q,hint,match",
     [
-        ([0, 6], 6, 2, "window_seqlen_q"),
-        ([0, 1, 6], 6, 3, "window_seqlen_q"),
-        ([0, 4], 4, 6, "window_seqlen_q"),
-        ([0, 4], 6, 6, "query row count"),
-        ([0, 0, 6], 6, 6, "at least one query row"),
+        (
+            [0, 6],
+            6,
+            2,
+            r"window_seqlen_q=2 does not match the longest cu_seqlens_q segment \(6\)",
+        ),
+        (
+            [0, 1, 6],
+            6,
+            3,
+            r"window_seqlen_q=3 does not match the longest cu_seqlens_q segment \(5\)",
+        ),
+        (
+            [0, 4],
+            4,
+            6,
+            r"window_seqlen_q=6 does not match the longest cu_seqlens_q segment \(4\)",
+        ),
+        (
+            [0, 4],
+            6,
+            6,
+            r"must start at 0 and end at the query row count \(6\), got 1 segment",
+        ),
+        (
+            [1, 7],
+            7,
+            6,
+            r"must start at 0 and end at the query row count \(7\), got 1 segment",
+        ),
+        (
+            [0],
+            6,
+            6,
+            r"must start at 0 and end at the query row count \(6\), got 0 segment",
+        ),
+        (
+            [0, 0, 6],
+            6,
+            6,
+            r"segment 0 is empty \(0 -> 0\); every window-mode segment needs at least one query row",
+        ),
     ],
     ids=[
         "understated",
         "understated-average-blind",
         "overstated",
         "cu-end-mismatch",
+        "cu-start-nonzero",
+        "cu-no-segments",
         "empty-segment",
     ],
 )
@@ -338,6 +377,65 @@ def test_window_hint_contract_rejected(
             56,
             hint,
             -1,
+        )
+
+
+def test_window_hint_rejects_non_int32_cu() -> None:
+    """Window-mode validation reads cu_seqlens_q host-side as int32; any
+    other dtype is rejected before the bytes could be reinterpreted."""
+    mx.random.seed(13)
+    window = 4
+    key_cache = _cache(4, 8, mx.float16)
+    value_cache = _cache(4, 8, mx.float16)
+    query = mx.random.normal(shape=(window, 16, HEAD_SIZE)).astype(mx.float16)
+    mx.eval(key_cache, value_cache, query)
+    out = mx.array(0)
+    with pytest.raises(
+        ValueError, match="cu_seqlens_q must be int32 for window-mode validation"
+    ):
+        get_ops().paged_attention_primitive(
+            query,
+            key_cache,
+            value_cache,
+            8,
+            HEAD_SIZE**-0.5,
+            0.0,
+            mx.array([list(range(4))], dtype=mx.int32),
+            mx.array([50 + window], dtype=mx.int32),
+            mx.array([0, window], dtype=mx.int64),
+            BLOCK_SIZE,
+            50 + window,
+            -1,
+            out,
+            window_seqlen_q=window,
+        )
+
+
+def test_window_hint_rejected_past_head_size_bound() -> None:
+    """Heads past PA_WINDOW_MAX_HEAD_SIZE never take window mode (per-thread
+    register state scales with rows * head_size); the binding rejects the
+    hint outright so a merged wide-head window can never silently fall to
+    the tiled kernel and break the bitwise contract.  prepare_unified keeps
+    those models on the expanded per-token layout."""
+    mx.random.seed(12)
+    window, head_size = 4, 512
+    key_cache = _cache(4, 8, mx.float16, head_size=head_size)
+    value_cache = _cache(4, 8, mx.float16, head_size=head_size)
+    query = mx.random.normal(shape=(window, 16, head_size)).astype(mx.float16)
+    mx.eval(key_cache, value_cache, query)
+    with pytest.raises(ValueError, match=r"requires head_size <= 256, got 512"):
+        _run(
+            query,
+            key_cache,
+            value_cache,
+            8,
+            [list(range(4))],
+            [50 + window],
+            [0, window],
+            50 + window,
+            window,
+            -1,
+            head_size=head_size,
         )
 
 

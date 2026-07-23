@@ -48,6 +48,15 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 #endif
 constexpr int kWindowRows = VLLM_METAL_PA_WINDOW_ROWS;
 
+// Largest head size window mode serves: per-thread register state scales
+// with kWindowRows * ceil(head_size / 32), and 512 collapses occupancy.
+// Single-sourced from constants.py; prepare_unified keeps wider-head models
+// on the expanded per-token layout, and the binding rejects wider hints.
+#ifndef VLLM_METAL_PA_WINDOW_MAX_HEAD
+#define VLLM_METAL_PA_WINDOW_MAX_HEAD 256
+#endif
+constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
+
 // ---------------------------------------------------------------------------
 // Split-KV (flash-decoding) decode gate
 // ---------------------------------------------------------------------------
@@ -355,12 +364,11 @@ static void dispatch_paged_attention_v2_online(
   // (kWindowRows-row sub-window threadgroups share every KV read), keeping
   // split-KV eligibility.  The tiled kernel is wrong for this shape: its
   // BQ-row MMA tiles waste ~80% of their compute on a K+1 window and it has
-  // no KV-length parallelism.  head_size <= 256 is a host-only routing
-  // bound: the kernel's per-row register state is
-  // kWindowRows * ceil(head_size/32) accumulator floats per thread, and 512
-  // would collapse occupancy (the kernel itself has no head-size cap).
+  // no KV-length parallelism.  head_size <= kWindowMaxHeadSize holds for
+  // every constructed primitive (the binding rejects wider hints), so a
+  // verify batch here always takes window mode, never the tiled fallback.
   const bool window_batch =
-      has_prefill && window_seqlen_q > 1 && head_size <= 256;
+      has_prefill && window_seqlen_q > 1 && head_size <= kWindowMaxHeadSize;
 
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
     if (auto cfg = select_tile_config(head_size)) {
@@ -671,6 +679,15 @@ static array paged_attention_primitive_fn(
   // materializing it to check the real segment lengths is cheap, and the
   // plain-decode path (window_seqlen_q == 1) skips the block entirely.
   if (window_seqlen_q > 1) {
+    const int head_size_q = static_cast<int>(query.shape(2));
+    if (head_size_q > kWindowMaxHeadSize) {
+      throw std::invalid_argument(
+          "window_seqlen_q=" + std::to_string(window_seqlen_q) +
+          " requires head_size <= " + std::to_string(kWindowMaxHeadSize) +
+          ", got " + std::to_string(head_size_q) +
+          "; wider heads must keep the expanded per-token verify layout "
+          "(window-mode register state scales with rows * head_size)");
+    }
     array cu = cu_seqlens_q;
     cu.eval();
     if (cu.dtype() != int32) {
