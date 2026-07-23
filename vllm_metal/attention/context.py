@@ -135,6 +135,8 @@ def prepare_unified(
     decode_requests: list[tuple[list[int], int] | tuple[list[int], int, int]],
     prefill_requests: list[tuple[list[int], int, int]],
     block_size: int,
+    *,
+    merge_verify_windows: bool = True,
 ) -> None:
     """Compute metadata for a unified prefill + decode forward pass.
 
@@ -152,6 +154,13 @@ def prepare_unified(
             prefill.  ``start_pos`` is the position of the first token in this
             chunk (0 for a fresh prefill, >0 for continuation chunks).
         block_size: tokens per KV cache block.
+        merge_verify_windows: keep a multi-token decode request as ONE
+            cu_seqlens segment (the window-mode layout).  Pass False for
+            models the window path does not serve — MLA native decode and
+            the GDN layers of hybrids admit only one-row decode segments,
+            and heads past PA_WINDOW_MAX_HEAD_SIZE would leave the decode
+            kernel for the tiled one — restoring the expanded per-token
+            layout those paths were built against.
     """
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
@@ -176,6 +185,15 @@ def prepare_unified(
             block_idx = block_ids[pos // block_size]
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
+        if num_tokens > 1 and not merge_verify_windows:
+            # Expanded layout: one single-token segment per window row,
+            # byte-for-byte the pre-window-mode metadata.
+            for pos in range(seq_len, seq_len + num_tokens):
+                cu_seqlens.append(cu_seqlens[-1] + 1)
+                block_tables.append(block_ids)
+                context_lens.append(pos + 1)  # including this decode token
+                offsets.append(pos)  # RoPE position
+            continue
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
         block_tables.append(block_ids)
         context_lens.append(seq_len + num_tokens)  # including window tokens

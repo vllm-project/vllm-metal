@@ -33,7 +33,9 @@ def make_stub_runner(
 
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(speculative_config=None),
-        "model_config": SimpleNamespace(runner_type="generate"),
+        "model_config": SimpleNamespace(
+            runner_type="generate", get_head_size=lambda: 128
+        ),
         "model": object(),
         "_is_vlm": False,
         "_multimodal_adapter": None,

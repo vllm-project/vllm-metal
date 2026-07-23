@@ -58,6 +58,7 @@ from vllm_metal.distributed import (
     is_non_last_stage,
     pipeline_send,
 )
+from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -383,6 +384,22 @@ class MetalModelRunner:
         """
         fai = self.model_args.get("full_attention_interval", 0)
         return isinstance(fai, int) and fai > 0
+
+    @property
+    def merge_verify_windows(self) -> bool:
+        """Whether spec-verify windows stay one cu_seqlens segment.
+
+        True only for models the decode kernel's window mode serves.  MLA
+        native decode and the GDN pure-decode check admit only one-row
+        segments, and heads past PA_WINDOW_MAX_HEAD_SIZE would leave the
+        decode kernel for the tiled one; those models keep the expanded
+        per-token verify layout their paths were built against.
+        """
+        return (
+            not self.is_mla
+            and not self.is_hybrid
+            and self.model_config.get_head_size() <= PA_WINDOW_MAX_HEAD_SIZE
+        )
 
     @property
     def _forward_model(self) -> Any:
@@ -1055,7 +1072,12 @@ class MetalModelRunner:
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
+        prepare_unified(
+            decode_info,
+            prefill_info,
+            self._paged_block_size,
+            merge_verify_windows=self.merge_verify_windows,
+        )
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
