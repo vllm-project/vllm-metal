@@ -326,7 +326,7 @@ class TestCachedRequestBlockUpdates:
             sampling_params=_greedy_sp(),
             generator=None,
             generated_tokens=1,
-            block_ids=[0, 1],
+            block_ids=[[0, 1]],
         )
         runner._paged_request_seq_lens["req-1"] = 5
 
@@ -343,7 +343,7 @@ class TestCachedRequestBlockUpdates:
         runner._update_cached_request_blocks(cached_reqs)
 
         state = runner._request_states["req-1"]
-        assert state.block_ids == [7, 8]
+        assert state.block_ids == [[7, 8]]
         assert state.generated_tokens == 0
         assert "req-1" not in runner._paged_request_seq_lens
 
@@ -361,7 +361,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
             sampling_params=_greedy_sp(),
             generator=None,
             generated_tokens=1,
-            block_ids=[0, 1],
+            block_ids=[[0, 1]],
         )
         runner._paged_request_seq_lens["req-A"] = len(prompt_a)
 
@@ -405,7 +405,7 @@ class TestMixedDecodeAndPrefixHitPrefill:
                 "vllm_metal.v1.sampling_batch._mlx_greedy_sample",
                 side_effect=greedy_tokens,
             ),
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             result = runner.execute_model(sched_out)
@@ -441,7 +441,7 @@ class TestCachedRequestContinuation:
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=0,
-            block_ids=block_ids,
+            block_ids=[block_ids],
         )
         runner._paged_request_seq_lens["req-1"] = 6
 
@@ -461,7 +461,7 @@ class TestCachedRequestContinuation:
                 "vllm_metal.v1.sampling_batch._mlx_greedy_sample",
                 return_value=mx.array(fake_token),
             ),
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             sched_out = _make_cached_scheduler_output(
@@ -494,7 +494,7 @@ class TestCachedRequestContinuation:
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=0,
-            block_ids=block_ids,
+            block_ids=[block_ids],
         )
         runner._paged_request_seq_lens["req-1"] = 4
 
@@ -514,7 +514,7 @@ class TestCachedRequestContinuation:
                 "vllm_metal.v1.sampling_batch._mlx_greedy_sample",
                 return_value=mx.array(0),
             ),
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             sched_out = _make_cached_scheduler_output(
@@ -544,11 +544,11 @@ def _make_paged_ctx_spy(
     return spy
 
 
-class TestPrepareUnifiedSlotMapping:
-    """Verify prepare_unified is called with correct slot mapping and RoPE offsets.
+class TestPagedContextSlotMapping:
+    """Verify paged context contains correct slot mapping and RoPE offsets.
 
-    All other tests in this file patch prepare_unified out.  These tests let it
-    run for real and spy on set_context to confirm the runner passes the right
+    All other runner tests in this file patch context preparation out. These
+    tests let it run for real and spy on set_context to confirm the runner passes the right
     block_ids, num_tokens, and start_pos arguments so that slot mapping and RoPE
     offsets are exercised end-to-end.
     """

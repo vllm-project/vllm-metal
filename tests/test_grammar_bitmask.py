@@ -791,7 +791,7 @@ class TestSampleTokensGrammarPagedPath:
                     num_query_tokens=1,
                     draft_token_ids=(),
                     cache_start_pos=0,
-                    block_ids=(),
+                    block_ids=((0,),),
                 ),
             ),
             num_decode_tokens=1,

@@ -168,7 +168,7 @@ def _mm_prefill(
         req_id=req_id,
         token_ids=token_ids,
         sampling_params=SamplingParams(temperature=0.0),
-        block_ids=[0],
+        block_ids=[[0]],
         generator=None,
         prompt_len=prompt_len,
         start_pos=start_pos,
@@ -322,7 +322,7 @@ class TestTextOnlyRoutingForExplicitPositionsAdapter:
             num_query_tokens=1,
             draft_token_ids=(),
             cache_start_pos=5,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         runner._spec_decode_controller.build_decode_segments = MagicMock(
             return_value=(segment,)
@@ -393,7 +393,7 @@ class TestMmDecodeSegmentPositions:
             num_query_tokens=1,
             draft_token_ids=(),
             cache_start_pos=5,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         runner._spec_decode_controller.build_decode_segments = MagicMock(
             return_value=(segment,)
@@ -436,7 +436,7 @@ class TestMmDecodeSegmentPositions:
             num_query_tokens=4,
             draft_token_ids=(100, 101, 102),
             cache_start_pos=5,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         runner._spec_decode_controller.build_decode_segments = MagicMock(
             return_value=(segment,)
@@ -480,7 +480,7 @@ class TestMmDecodeSegmentPositions:
             num_query_tokens=3,
             draft_token_ids=(100, 101),
             cache_start_pos=4,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         runner._spec_decode_controller.build_decode_segments = MagicMock(
             return_value=(text_segment,)
@@ -540,7 +540,7 @@ class TestMixedMmAndText:
             req_id="req-text",
             token_ids=[1, 2, 3],
             sampling_params=SamplingParams(temperature=0.0),
-            block_ids=[1],
+            block_ids=[[1]],
             generator=None,
             prompt_len=3,
             start_pos=0,

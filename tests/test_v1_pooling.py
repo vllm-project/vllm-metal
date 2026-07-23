@@ -423,7 +423,7 @@ class TestMetalPoolingRunnerOutput:
         sched = _scheduler_output(new_reqs=[req_b, req_a])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             out = _execute_pooling(runner, sched)
@@ -443,7 +443,7 @@ class TestMetalPoolingRunnerOutput:
         )
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             partial = _execute_pooling(runner, first)
@@ -458,7 +458,7 @@ class TestMetalPoolingRunnerOutput:
             num_scheduled_tokens={"req-0": 2},
         )
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             final = _execute_pooling(runner, second)
@@ -478,7 +478,7 @@ class TestMetalPoolingRunnerOutput:
         sched = _scheduler_output(new_reqs=[req_b, req_a])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             out = _execute_pooling(runner, sched)
@@ -503,7 +503,7 @@ class TestMetalPoolingRunnerOutput:
         sched = _scheduler_output(new_reqs=[req])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             out = _execute_pooling(runner, sched)
@@ -527,7 +527,7 @@ class TestMetalPoolingRunnerOutput:
         sched = _scheduler_output(new_reqs=[req])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             out = _execute_pooling(runner, sched)
@@ -547,7 +547,7 @@ class TestMetalPoolingRunnerOutput:
         sched = _scheduler_output(new_reqs=[req])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
         ):
             out = _execute_pooling(runner, sched)
@@ -648,7 +648,7 @@ class TestMetalPoolingFailFast:
         ]
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified") as prepare,
+            patch("vllm_metal.v1.model_runner.prepare_grouped") as prepare,
             patch(
                 "vllm_metal.v1.model_runner.forward_sequence_hidden_states"
             ) as forward,
@@ -666,7 +666,7 @@ class TestMetalPoolingFailFast:
         req.prompt_embeds = torch.zeros((1, 2, 3), dtype=torch.float32)
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified") as prepare,
+            patch("vllm_metal.v1.model_runner.prepare_grouped") as prepare,
             patch(
                 "vllm_metal.v1.model_runner.forward_sequence_hidden_states"
             ) as forward,
@@ -719,7 +719,7 @@ class TestMetalPoolingFailFast:
         sched = _scheduler_output(new_reqs=[req])
 
         with (
-            patch("vllm_metal.v1.model_runner.prepare_unified"),
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
             patch("vllm_metal.v1.model_runner.clear_context"),
             pytest.raises(ValueError, match="hidden states"),
         ):

@@ -21,7 +21,7 @@ def _decode_segment() -> PagedDecodeSegment:
         num_query_tokens=1,
         draft_token_ids=(),
         cache_start_pos=7,
-        block_ids=(11,),
+        block_ids=((11,),),
     )
 
 
