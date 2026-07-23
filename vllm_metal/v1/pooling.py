@@ -9,6 +9,7 @@ import mlx.core as mx
 import torch
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import SupportedTask
+from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
@@ -258,41 +259,23 @@ def _unsupported_pooling_option(
     pooling_params: PoolingParams,
     model_config: Any,
 ) -> str | None:
-    checks = (
-        (
-            "late-interaction parameters",
-            getattr(pooling_params, "late_interaction_params", None) is not None,
-        ),
-        (
-            "token-level ALL pooling outputs",
-            getattr(pooling_params, "requires_token_ids", False),
-        ),
-        (
-            "STEP pooling parameters",
-            getattr(pooling_params, "step_tag_id", None) is not None,
-        ),
-        (
-            "returned_token_ids",
-            getattr(pooling_params, "returned_token_ids", None) is not None,
-        ),
-        (
-            "extra pooling kwargs",
-            bool(getattr(pooling_params, "extra_kwargs", None)),
-        ),
-        (
-            "use_activation=False",
-            getattr(pooling_params, "task", None) != "classify"
-            and getattr(pooling_params, "use_activation", None) is False,
-        ),
-        (
-            "embedding-dimension truncation",
-            getattr(pooling_params, "dimensions", None) is not None
-            or getattr(_pooler_config(model_config), "dimensions", None) is not None,
-        ),
-    )
-    for reason, unsupported in checks:
-        if unsupported:
-            return reason
+    if pooling_params.late_interaction_params is not None:
+        return "late-interaction parameters"
+    if pooling_params.requires_token_ids:
+        return "token-level ALL pooling outputs"
+    if pooling_params.step_tag_id is not None:
+        return "STEP pooling parameters"
+    if pooling_params.returned_token_ids is not None:
+        return "returned_token_ids"
+    if pooling_params.extra_kwargs:
+        return "extra pooling kwargs"
+    if pooling_params.task != "classify" and pooling_params.use_activation is False:
+        return "use_activation=False"
+    if (
+        pooling_params.dimensions is not None
+        or getattr(_pooler_config(model_config), "dimensions", None) is not None
+    ):
+        return "embedding-dimension truncation"
     return None
 
 
@@ -309,7 +292,7 @@ def validate_pooling_params(
         )
     _reject_unsupported_pooler_config(model_config)
 
-    task = getattr(pooling_params, "task", None)
+    task = pooling_params.task
     if task in (None, "embed"):
         if not _is_decoder_embedding_config(model_config):
             raise NotImplementedError(
@@ -342,7 +325,7 @@ def validate_pooling_params(
 
 
 def validate_pooling_request(
-    new_req: Any,
+    new_req: NewRequestData,
     model_config: Any,
     *,
     paged_attention_enabled: bool,
@@ -357,7 +340,7 @@ def validate_pooling_request(
         raise NotImplementedError(
             "Multimodal pooling inputs are not supported on Metal yet."
         )
-    if getattr(new_req, "prompt_embeds", None) is not None:
+    if new_req.prompt_embeds is not None:
         raise NotImplementedError(
             "Prompt-embedding pooling inputs are not supported on Metal yet."
         )
@@ -442,7 +425,6 @@ def pool_sequence_embedding(
     hidden_states: mx.array,
     *,
     token_index: int,
-    pooling_params: PoolingParams,
     model_config: Any,
 ) -> torch.Tensor:
     """Return a normalized CPU LAST embedding for one finished request."""
@@ -468,13 +450,9 @@ def _classifier_use_activation(
     pooling_params: PoolingParams,
     model_config: Any,
 ) -> bool:
-    request_value = getattr(pooling_params, "use_activation", None)
-    if request_value is not None:
-        return bool(request_value)
-    pooler_value = getattr(_pooler_config(model_config), "use_activation", None)
-    if pooler_value is not None:
-        return bool(pooler_value)
-    return True
+    if pooling_params.use_activation is not None:
+        return pooling_params.use_activation
+    return getattr(_pooler_config(model_config), "use_activation", None) is not False
 
 
 def pool_sequence_classification(
@@ -550,13 +528,12 @@ def pool_sequence_batch(
         if token_index is None:
             outputs.append(None)
             continue
-        task = getattr(params, "task", None)
+        task = params.task
         if task in (None, "embed"):
             outputs.append(
                 pool_sequence_embedding(
                     hidden_states,
                     token_index=token_index,
-                    pooling_params=params,
                     model_config=model_config,
                 )
             )

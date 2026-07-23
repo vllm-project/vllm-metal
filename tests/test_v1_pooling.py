@@ -14,9 +14,11 @@ import torch
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from vllm.pooling_params import LateInteractionParams, PoolingParams  # noqa: E402
+from vllm.v1.core.sched.output import NewRequestData  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
+from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
@@ -188,10 +190,7 @@ def _make_runner(
 
 
 def _pooling_params(task: str | None = None, **overrides) -> PoolingParams:
-    params = PoolingParams(task=task)
-    for key, value in overrides.items():
-        setattr(params, key, value)
-    return params
+    return PoolingParams(task=task, **overrides)
 
 
 def _new_req(
@@ -202,8 +201,8 @@ def _new_req(
     num_computed_tokens: int = 0,
     block_ids: list[int] | None = None,
     pooling_params: PoolingParams | None = None,
-):
-    return SimpleNamespace(
+) -> NewRequestData:
+    return NewRequestData(
         req_id=req_id,
         prompt_token_ids=token_ids,
         mm_features=[],
@@ -230,7 +229,7 @@ def _cached_req_data(req_ids: list[str], num_computed_tokens: list[int]):
 
 def _scheduler_output(
     *,
-    new_reqs: list[object] | None = None,
+    new_reqs: list[NewRequestData] | None = None,
     cached_req_ids: list[str] | None = None,
     cached_num_computed_tokens: list[int] | None = None,
     num_scheduled_tokens: dict[str, int] | None = None,
@@ -636,31 +635,35 @@ class TestMetalPoolingFailFast:
         with pytest.raises(NotImplementedError, match="LAST"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
-    def test_late_interaction_pooling_fails_fast(self) -> None:
-        runner = _make_runner()
-        params = _pooling_params(
-            late_interaction_params=LateInteractionParams(
-                mode="cache_query",
-                query_key="query-0",
-            )
-        )
-        req = _new_req("req-0", [1, 2], pooling_params=params)
-
-        with pytest.raises(NotImplementedError, match="late-interaction"):
-            runner.execute_model(_scheduler_output(new_reqs=[req]))
-
     def test_multimodal_pooling_fails_fast(self) -> None:
         runner = _make_runner()
         req = _new_req("req-0", [1, 2])
-        req.mm_features = [object()]
+        req.mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-0",
+                mm_position=PlaceholderRange(offset=0, length=1),
+            )
+        ]
 
-        with pytest.raises(NotImplementedError, match="Multimodal pooling"):
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_unified") as prepare,
+            patch(
+                "vllm_metal.v1.model_runner.forward_sequence_hidden_states"
+            ) as forward,
+            pytest.raises(NotImplementedError, match="Multimodal pooling"),
+        ):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
+
+        prepare.assert_not_called()
+        forward.assert_not_called()
+        assert "req-0" not in runner._request_states
 
     def test_prompt_embeds_pooling_fails_fast_before_forward(self) -> None:
         runner = _make_runner()
         req = _new_req("req-0", [1, 2])
-        req.prompt_embeds = mx.zeros((1, 2, 3), dtype=mx.float32)
+        req.prompt_embeds = torch.zeros((1, 2, 3), dtype=torch.float32)
 
         with (
             patch("vllm_metal.v1.model_runner.prepare_unified") as prepare,
@@ -676,35 +679,38 @@ class TestMetalPoolingFailFast:
         assert "req-0" not in runner._request_states
 
     @pytest.mark.parametrize(
-        ("attr", "value", "message"),
+        ("pooling_params", "message"),
         [
-            ("requires_token_ids", True, "token-level ALL"),
-            ("use_activation", False, "use_activation=False"),
+            (
+                _pooling_params(
+                    late_interaction_params=LateInteractionParams(
+                        mode="cache_query",
+                        query_key="query-0",
+                    )
+                ),
+                "late-interaction",
+            ),
+            (_pooling_params(requires_token_ids=True), "token-level ALL"),
+            (_pooling_params(step_tag_id=1), "STEP"),
+            (_pooling_params(returned_token_ids=[1]), "returned_token_ids"),
+            (_pooling_params(extra_kwargs={"foo": True}), "extra pooling kwargs"),
+            (_pooling_params(use_activation=False), "use_activation=False"),
+            (_pooling_params(dimensions=2), "dimension"),
+            (
+                _pooling_params(requires_token_ids=True, dimensions=2),
+                "token-level ALL",
+            ),
         ],
     )
     def test_unsupported_pooling_options_fail_fast(
         self,
-        attr: str,
-        value: object,
+        pooling_params: PoolingParams,
         message: str,
     ) -> None:
         runner = _make_runner()
-        params = _pooling_params()
-        setattr(params, attr, value)
-        req = _new_req("req-0", [1, 2], pooling_params=params)
+        req = _new_req("req-0", [1, 2], pooling_params=pooling_params)
 
         with pytest.raises(NotImplementedError, match=message):
-            runner.execute_model(_scheduler_output(new_reqs=[req]))
-
-    def test_embedding_dimensions_are_rejected(self) -> None:
-        runner = _make_runner()
-        req = _new_req(
-            "req-0",
-            [1, 2],
-            pooling_params=_pooling_params(dimensions=2),
-        )
-
-        with pytest.raises(NotImplementedError, match="dimension"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
     def test_unknown_hidden_state_shape_fails_fast(self) -> None:
