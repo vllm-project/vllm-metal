@@ -456,6 +456,16 @@ def sdpa_forward(
     cache_kv_heads = kv_cache.kv_heads_per_layer[layer_idx]
     cache_head_dim = kv_cache.head_dim_per_layer[layer_idx]
     layer_sliding_window = kv_cache.sliding_window_per_layer[layer_idx]
+    group_index = kv_cache.group_index_for_layer(layer_idx)
+    if ctx.kv_groups is None:
+        raw_slot_mapping = ctx.slot_mapping
+        raw_block_tables = ctx.block_tables
+        cache_block_size = kv_cache.block_size_for_layer(layer_idx)
+    else:
+        group = ctx.kv_groups[group_index]
+        raw_slot_mapping = group.slot_mapping
+        raw_block_tables = group.block_tables
+        cache_block_size = group.block_size
     actual_head_dim = head_dim
     queries, keys, values = pad_qkv_to_cache_head_dim(
         queries, keys, values, head_dim, cache_head_dim
@@ -467,7 +477,7 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    slot_mapping = mx.array(ctx.slot_mapping, dtype=mx.int64)
+    slot_mapping = mx.array(raw_slot_mapping, dtype=mx.int64)
     seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
     cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
     max_seq_len = max(ctx.context_lens)
@@ -479,7 +489,7 @@ def sdpa_forward(
     # it expands each vLLM block into multiple kernel blocks and returns the
     # kernel-compatible block_size.  The cache is reshaped to match (zero-copy).
     block_tables, kernel_block_size = _build_block_tables(
-        ctx.block_tables, kv_cache.block_size
+        raw_block_tables, cache_block_size
     )
 
     if shared_kv is not None or read_existing_kv:
@@ -553,8 +563,7 @@ def sdpa_forward(
             slot_mapping,
         )
         # Rebind so next layer / decode step uses the updated cache
-        kv_cache.key_caches[layer_idx] = new_k_cache
-        kv_cache.value_caches[layer_idx] = new_v_cache
+        kv_cache.replace_layer_cache(layer_idx, new_k_cache, new_v_cache)
 
     # --- Attention: paged attention primitive (read-only, fully lazy) ---
     # No per-layer eval or sync.  The primitive participates in MLX's lazy
@@ -568,7 +577,7 @@ def sdpa_forward(
     # zero-copy view over the same physical memory.
     kernel_k_cache = new_k_cache
     kernel_v_cache = new_v_cache
-    if kernel_block_size != kv_cache.block_size:
+    if kernel_block_size != cache_block_size:
         # Use the cache's actual last-axis size rather than the logical
         # ``head_dim``.  Under TurboQuant the K/V caches are stored in
         # packed form (``packed_head_dim = packed_dim(head_dim, bits)``)
@@ -589,16 +598,16 @@ def sdpa_forward(
         kernel_key_scale = new_key_scale_cache
         kernel_value_scale = new_value_scale_cache
         kernel_key_zero = new_key_zero_cache
-        if kernel_block_size != kv_cache.block_size:
+        if kernel_block_size != cache_block_size:
             sg = new_key_scale_cache.shape[-1]
             kernel_key_scale = new_key_scale_cache.reshape(
-                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+                -1, kernel_block_size, cache_kv_heads, sg
             )
             kernel_value_scale = new_value_scale_cache.reshape(
-                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+                -1, kernel_block_size, cache_kv_heads, sg
             )
             kernel_key_zero = new_key_zero_cache.reshape(
-                -1, kernel_block_size, kv_cache.num_kv_heads, sg
+                -1, kernel_block_size, cache_kv_heads, sg
             )
         # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
         from vllm_metal.attention.caches.turboquant import get_v_centroids

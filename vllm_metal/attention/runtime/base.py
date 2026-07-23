@@ -45,6 +45,10 @@ class PagedAttentionRuntimeBase:
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
 
+    def kv_group_block_sizes(self) -> tuple[int, ...]:
+        """Return scheduler page sizes owned by this runtime."""
+        return (self._require_initialized("kv_group_block_sizes").block_size,)
+
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""
         return False
