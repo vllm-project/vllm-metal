@@ -43,6 +43,7 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_metal import envs
 from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
@@ -58,6 +59,7 @@ from vllm_metal.distributed import (
     is_non_last_stage,
     pipeline_send,
 )
+from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -383,6 +385,33 @@ class MetalModelRunner:
         """
         fai = self.model_args.get("full_attention_interval", 0)
         return isinstance(fai, int) and fai > 0
+
+    @property
+    def merge_verify_windows(self) -> bool:
+        """Whether spec-verify windows stay one cu_seqlens segment.
+
+        Window mode is opt-in (VLLM_METAL_SPEC_VERIFY_WINDOW): its win is
+        chip- and shape-dependent, so the default keeps the expanded
+        per-token verify layout, which is the pre-window behavior bit for
+        bit.  Even opted in, it is True only for models the decode
+        kernel's window mode serves: MLA native decode and the GDN
+        pure-decode check admit only one-row segments, and heads past
+        PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for the
+        tiled one.  The head bound uses the resolved per-layer maximum:
+        variable-head models widen their full-attention layers past the
+        config head size (head_dim_per_layer), and every layer of the
+        step shares one verify layout.
+        """
+        head_dims = self.head_dim_per_layer
+        max_head_dim = (
+            max(head_dims) if head_dims else self.model_config.get_head_size()
+        )
+        return (
+            envs.VLLM_METAL_SPEC_VERIFY_WINDOW
+            and not self.is_mla
+            and not self.is_hybrid
+            and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
+        )
 
     @property
     def _forward_model(self) -> Any:
@@ -1055,7 +1084,12 @@ class MetalModelRunner:
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
+        prepare_unified(
+            decode_info,
+            prefill_info,
+            self._paged_block_size,
+            merge_verify_windows=self.merge_verify_windows,
+        )
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
@@ -1592,14 +1626,15 @@ class MetalModelRunner:
         int-offset arange path on text segments.
 
         Any speculative-decode segment in the batch is rejected up
-        front: a decode request with ``num_query_tokens > 1`` makes
-        ``prepare_unified`` append one ``cu_seqlens`` entry per query
-        token, but ``ctx.segment_positions`` carries one entry per
-        ``PagedDecodeSegment``.  The mismatch corrupts M-RoPE positions
-        for every segment packed after the draft — including text-only
-        spec decode that happens to share the batch with an mm prefill,
-        since the whole batch still routes through this method.
-        Lifting the restriction is tracked as a follow-up to RFC #319.
+        front: ``prepare_unified`` now keeps a ``num_query_tokens > 1``
+        window as one ``cu_seqlens`` segment (aligned with
+        ``ctx.segment_positions``), but this method's M-RoPE position
+        handling has only ever been exercised with single-token decode
+        segments — supplying and validating per-row positions for a
+        multi-token verification window is untracked territory, including
+        text-only spec decode that shares the batch with an mm prefill,
+        since the whole batch routes through this method.  Lifting the
+        restriction is tracked as a follow-up to RFC #319.
         """
         adapter = self._multimodal_adapter
         assert adapter is not None and adapter.forward_ready
@@ -1610,14 +1645,12 @@ class MetalModelRunner:
             if segment.num_query_tokens > 1:
                 raise NotImplementedError(
                     "Speculative decode is not supported on the multimodal "
-                    "paged path yet: prepare_unified() expands a decode "
-                    "segment with num_query_tokens > 1 into one cu_seqlens "
-                    "span per query token, but ctx.segment_positions stores "
-                    "one entry per PagedDecodeSegment — cu_seqlens and "
-                    "segment_positions would misalign for every segment "
-                    "packed after the draft, including text-only spec decode "
-                    "that shares the batch with an mm prefill.  Tracked as "
-                    "a follow-up to RFC #319."
+                    "paged path yet: M-RoPE positions for a multi-token "
+                    "verification window have never been supplied or "
+                    "validated on this path, and every segment in the batch "
+                    "routes through it — including text-only spec decode "
+                    "sharing the batch with an mm prefill.  Tracked as a "
+                    "follow-up to RFC #319."
                 )
 
         # Full-prompt M-RoPE positions per mm prefill request.

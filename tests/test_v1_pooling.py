@@ -147,6 +147,7 @@ def _pooling_model_config(**overrides):
         "model": "stub-pooling-model",
         "hf_config": _hf_config(),
         "pooler_config": _pooler_config(),
+        "get_head_size": lambda: 128,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

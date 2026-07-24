@@ -327,6 +327,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
 
     def test_start_paged_forward_includes_scheduled_drafts(self, monkeypatch) -> None:
+        # Opt into window mode so the captured kwarg pins the full
+        # flag -> merge_verify_windows -> prepare_unified chain.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
         runner = self._make_runner()
         runner.vllm_config = self._make_gemma4_mtp_config()
         runner._drafter = Gemma4MTPProposer(runner)
@@ -336,10 +339,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
+            captured["merge_verify_windows"] = merge_verify_windows
 
         def fake_target_forward(input_ids, *, cache, collect_hidden_states):
             del cache
@@ -372,6 +378,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert captured["decode_info"] == [([0, 1], 1, 3)]
         assert captured["prefill_info"] == []
         assert captured["block_size"] == 4
+        assert captured["merge_verify_windows"] is True
         assert runner._execute_model_state is not None
         assert runner._execute_model_state.target_hidden_states is not None
         assert runner._execute_model_state.cu_seqlens == [0, 3]
@@ -394,7 +401,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
 
         def fake_target_forward(input_ids, *, cache, collect_hidden_states):
@@ -437,7 +446,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
@@ -539,7 +550,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
@@ -587,7 +600,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
@@ -644,7 +659,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
         captured: dict[str, object] = {}
 
-        def fake_prepare_unified(decode_info, prefill_info, block_size):
+        def fake_prepare_unified(
+            decode_info, prefill_info, block_size, *, merge_verify_windows
+        ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
@@ -1905,6 +1922,39 @@ class TestRunnerMlaProperties:
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
         assert runner.is_mla is False
+
+
+class TestMergeVerifyWindows:
+    """merge_verify_windows derivation: the runtime decision behind which
+    models keep spec-verify windows merged (window mode) vs expanded.
+    Window mode is opt-in, so the flag gates everything; with it set the
+    model-class exclusions still apply."""
+
+    def test_false_by_default_without_opt_in(self) -> None:
+        assert make_stub_runner().merge_verify_windows is False
+
+    def test_true_for_plain_mha_when_opted_in(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+        assert make_stub_runner().merge_verify_windows is True
+
+    def test_false_for_mla_even_when_opted_in(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+        runner = make_stub_runner(model_args={"kv_lora_rank": 512})
+        assert runner.merge_verify_windows is False
+
+    def test_false_for_hybrid_even_when_opted_in(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+        runner = make_stub_runner(model_args={"full_attention_interval": 4})
+        assert runner.merge_verify_windows is False
+
+    def test_false_past_window_head_bound_even_when_opted_in(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate", get_head_size=lambda: 512
+            )
+        )
+        assert runner.merge_verify_windows is False
 
 
 class TestLoadModelPipelineSplitOrdering:

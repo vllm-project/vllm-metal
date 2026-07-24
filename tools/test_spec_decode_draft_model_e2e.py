@@ -26,6 +26,10 @@ from __future__ import annotations
 import math
 import os
 
+# Run this gate through spec-verify window mode (opt-in); the ngram e2e gate
+# keeps the default expanded route, so both verify routes stay covered.
+os.environ.setdefault("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+
 import mlx.core as mx
 import pytest
 from vllm import LLM, SamplingParams

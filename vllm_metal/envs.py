@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -73,6 +74,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Spec-decode verification window mode (issue #465). Off by default —
+    # verify windows keep the expanded per-token layout (main behavior)
+    # unless this opt-in is set. Set to "1" to merge K+1 verify windows
+    # into one segment and share each KV block load across the window
+    # rows. Profitability is chip- and shape-dependent: measured wins at
+    # conc >= 4 with 8k+ context (M2 Ultra / M3 Ultra / M4 Pro, up to
+    # +40% e2e at conc 16-32), measured losses single-stream on M4 Pro
+    # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
+    "VLLM_METAL_SPEC_VERIFY_WINDOW": lambda: (
+        os.getenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0") == "1"
+    ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
     # for kernel developers / source installs; requires Xcode command-line
