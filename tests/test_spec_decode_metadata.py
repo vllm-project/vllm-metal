@@ -21,7 +21,7 @@ from vllm_metal.v1.spec_decode import (
 
 
 def _state(token_ids: list[int], block_ids: list[int]) -> SimpleNamespace:
-    return SimpleNamespace(token_ids=token_ids, block_ids=block_ids)
+    return SimpleNamespace(token_ids=token_ids, block_ids=[block_ids])
 
 
 def _request_state(
@@ -108,7 +108,7 @@ class TestPagedDecodeSegment:
             num_query_tokens=1,
             draft_token_ids=(),
             cache_start_pos=7,
-            block_ids=(11, 12),
+            block_ids=((11, 12),),
         )
 
         assert segment.req_id == "r0"
@@ -137,7 +137,7 @@ class TestBuildPagedDecodeSegments:
         assert segment.num_query_tokens == 1
         assert segment.draft_token_ids == ()
         assert segment.cache_start_pos == 7
-        assert segment.block_ids == (41, 42)
+        assert segment.block_ids == ((41, 42),)
         assert segment.draft_verification_rows == ()
         assert segment.bonus_row == 0
 
@@ -354,7 +354,7 @@ class TestGemma4MTPDraftSeeds:
                     num_query_tokens=2,
                     draft_token_ids=(6,),
                     cache_start_pos=4,
-                    block_ids=(1,),
+                    block_ids=((1,),),
                 ),
                 PagedDecodeSegment(
                     req_id="r1",
@@ -363,7 +363,7 @@ class TestGemma4MTPDraftSeeds:
                     num_query_tokens=1,
                     draft_token_ids=(),
                     cache_start_pos=9,
-                    block_ids=(2,),
+                    block_ids=((2,),),
                 ),
             ],
             decode_token_ids=[[6, 8], [9]],
@@ -382,7 +382,7 @@ class TestGemma4MTPDraftSeeds:
                 token_id=8,
                 target_hidden_row=1,
                 target_position=5,
-                block_ids=(1,),
+                block_ids=((1,),),
             ),
         )
 
@@ -390,13 +390,13 @@ class TestGemma4MTPDraftSeeds:
         final_prefill = SimpleNamespace(
             req_id="p0",
             token_ids=[1, 2, 3],
-            block_ids=[4],
+            block_ids=[[4]],
             start_pos=10,
         )
         intermediate_prefill = SimpleNamespace(
             req_id="p1",
             token_ids=[4, 5],
-            block_ids=[5],
+            block_ids=[[5]],
             start_pos=20,
         )
 
@@ -422,7 +422,7 @@ class TestGemma4MTPDraftSeeds:
                 token_id=11,
                 target_hidden_row=2,
                 target_position=12,
-                block_ids=(4,),
+                block_ids=((4,),),
             ),
         )
 
@@ -436,7 +436,7 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=3,
             draft_token_ids=(7, 8),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         output = SpeculativeDecodeController().verify_greedy(
@@ -456,7 +456,7 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=3,
             draft_token_ids=(7, 8),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         output = SpeculativeDecodeController().verify_greedy(
@@ -476,7 +476,7 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=2,
             draft_token_ids=(7,),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         with pytest.raises(NotImplementedError, match="greedy sampling"):
@@ -504,7 +504,7 @@ class TestVerifyGreedySpecDecode:
                         num_query_tokens=2,
                         draft_token_ids=(7,),
                         cache_start_pos=1,
-                        block_ids=(0,),
+                        block_ids=((0,),),
                     ),
                 ),
                 logitsprocs=LogitsProcessors([_NonArgmaxProcessor()]),

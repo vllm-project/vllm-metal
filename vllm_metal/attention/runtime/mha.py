@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.impls.sdpa_wrapper import (
+    patch_sdpa_attention,
+)
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-
-if TYPE_CHECKING:
-    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 
 
 class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
@@ -48,10 +50,9 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
+        self._layout: MHAKVCacheLayout | None = None
 
     def initialize(self, num_blocks: int) -> None:
-        from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-
         self._cache = MetalPagedKVCache(
             num_layers=self._num_layers,
             num_kv_heads=self._num_kv_heads,
@@ -67,12 +68,34 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             sliding_window_per_layer=self._sliding_window_per_layer,
         )
 
+    def adopt_layout(self, layout: MHAKVCacheLayout) -> None:
+        """Replace the legacy dense cache with vLLM's grouped MHA layout."""
+        self._require_initialized("adopt_layout")
+        if self._turboquant:
+            raise NotImplementedError(
+                "layout-backed MHA runtime does not support TurboQuant"
+            )
+
+        self._layout = layout
+        self._block_size = layout.group_block_sizes[0]
+        self._cache = MetalPagedKVCache.from_layout(layout, self._dtype)
+
+    def kv_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return scheduler KV groups consumed by this runtime."""
+        if self._layout is None:
+            return super().kv_scheduler_group_indices()
+        self._require_initialized("kv_scheduler_group_indices")
+        return tuple(range(len(self._layout.group_block_sizes)))
+
+    def kv_group_block_sizes(self) -> tuple[int, ...]:
+        """Return layout-owned group sizes or the legacy scalar page size."""
+        if self._layout is None:
+            return super().kv_group_block_sizes()
+        self._require_initialized("kv_group_block_sizes")
+        return self._layout.group_block_sizes
+
     def patch_model(self, model: Any) -> int:
         cache = self._require_initialized("patch_model")
-
-        from vllm_metal.attention.impls.sdpa_wrapper import (
-            patch_sdpa_attention,
-        )
 
         return patch_sdpa_attention(
             model, cache, self._block_size, cache_idx_map=self._cache_idx_map

@@ -328,6 +328,7 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
 
     from vllm_metal.attention.context import (
         PagedAttentionContext,
+        PagedKVGroupContext,
         clear_context,
         get_context,
         set_context,
@@ -359,6 +360,18 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
                     "cu_seqlens": tuple(ctx.cu_seqlens),
                     "offsets": tuple(ctx.offsets),
                     "gdn_slot_mapping": ctx.gdn_slot_mapping,
+                    "kv_groups": (
+                        tuple(
+                            (
+                                tuple(group.slot_mapping),
+                                tuple(tuple(row) for row in group.block_tables),
+                                group.block_size,
+                            )
+                            for group in ctx.kv_groups
+                        )
+                        if ctx.kv_groups is not None
+                        else None
+                    ),
                 }
             )
             return h + (self.layer_idx + 1), (f"k{self.layer_idx}", "v"), offset
@@ -417,6 +430,18 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
         offsets=[0],
         cu_seqlens=[0, 5],
         gdn_slot_mapping=[17],
+        kv_groups=(
+            PagedKVGroupContext(
+                slot_mapping=[0, 1, 2, 3, 4],
+                block_tables=[[0, 1]],
+                block_size=4,
+            ),
+            PagedKVGroupContext(
+                slot_mapping=[10, 11, 12, 13, 14],
+                block_tables=[[8, 9]],
+                block_size=16,
+            ),
+        ),
     )
     set_context(ctx)
     try:
@@ -429,6 +454,10 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
     assert [layer.calls[0]["tokens"] for layer in text_model.layers] == [5, 5, 1, 1]
     assert text_model.layers[2].calls[0]["cu_seqlens"] == (0, 1)
     assert text_model.layers[2].calls[0]["offsets"] == (4,)
+    assert text_model.layers[2].calls[0]["kv_groups"] == (
+        ((4,), ((0, 1),), 4),
+        ((14,), ((8, 9),), 16),
+    )
     assert text_model.layers[0].calls[0]["gdn_slot_mapping"] == [17]
     assert text_model.layers[2].calls[0]["gdn_slot_mapping"] is None
     assert text_model.layers[3].calls[0]["gdn_slot_mapping"] is None

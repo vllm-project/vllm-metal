@@ -12,6 +12,7 @@ Metal kernel dispatch itself is covered by the end-to-end smoke tests,
 not here.
 """
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,7 +21,16 @@ import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.caches.mha_layout import (
+    MHAKVCacheLayout,
+    MHALayerKVLayout,
+)
+from vllm_metal.attention.context import (
+    PagedAttentionContext,
+    clear_context,
+    get_context,
+    prepare_grouped,
+)
 from vllm_metal.attention.impls.sdpa import (
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
@@ -37,6 +47,12 @@ _N_HEADS = 2
 _N_KV_HEADS = 2
 _HEAD_DIM = 4  # small enough for fast unit tests
 _CACHE_HEAD_DIM = 8  # Gemma4-style: cache wider than layer head_dim
+
+
+@pytest.fixture(autouse=True)
+def _clear_attention_context() -> Iterator[None]:
+    yield
+    clear_context()
 
 
 class _FakeLinear:
@@ -568,8 +584,102 @@ class TestPrepareSDPAQKV:
         assert kv_for_sharing == (expected_k, values)
 
 
+class _PagedRoutingOpsSpy:
+    def __init__(self) -> None:
+        self.calls: list[SimpleNamespace] = []
+
+    def reshape_and_cache(
+        self,
+        _key,
+        _value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    ) -> tuple[mx.array, mx.array]:
+        self.calls.append(SimpleNamespace(slot_mapping=slot_mapping.tolist()))
+        return key_cache, value_cache
+
+    def paged_attention_primitive(
+        self,
+        _query: mx.array,
+        _key_cache: mx.array,
+        _value_cache: mx.array,
+        _num_kv_heads: int,
+        _scale: float,
+        _softcap: float,
+        block_tables: mx.array,
+        _seq_lens: mx.array,
+        _cu_seqlens: mx.array,
+        block_size: int,
+        _max_seq_len: int,
+        _sliding_window: int,
+        _out: mx.array,
+        window_seqlen_q: int = 1,
+    ) -> None:
+        del window_seqlen_q
+        self.calls[-1].block_tables = block_tables.tolist()
+        self.calls[-1].block_size = block_size
+
+
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
+        """Full and sliding layers consume their scheduler-group metadata."""
+        layout = MHAKVCacheLayout(
+            num_blocks=11,
+            tensor_sizes=(1, 1),
+            layers=(
+                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
+                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
+            ),
+            group_block_sizes=(32, 16),
+            slot_layers=((0,), (1,)),
+        )
+        cache = MetalPagedKVCache.from_layout(layout, mx.float16)
+        prepare_grouped(
+            [([[3], [8, 9]], 17, 1)],
+            [([[4], [10]], 2, 0)],
+            (32, 16),
+        )
+        ctx = get_context()
+        assert ctx is not None
+
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        x = mx.ones((_BATCH, 3, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, 3, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        ops = _PagedRoutingOpsSpy()
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=ops),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, 3, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+
+        full_call, sliding_call = ops.calls
+        assert full_call.slot_mapping == [3 * 32 + 17, 4 * 32, 4 * 32 + 1]
+        assert full_call.block_tables == [[3], [4]]
+        assert full_call.block_size == 32
+        assert sliding_call.slot_mapping == [9 * 16 + 1, 10 * 16, 10 * 16 + 1]
+        assert sliding_call.block_tables == [[8, 9], [10, 0]]
+        assert sliding_call.block_size == 16
 
     def test_kernel_receives_per_layer_kv_heads(self) -> None:
         """Heterogeneous layers must pass their concrete KV-head count.

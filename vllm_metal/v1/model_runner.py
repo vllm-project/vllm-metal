@@ -11,6 +11,7 @@ Key contracts:
 - Outputs align with scheduler expectations for paged and non-paged paths.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, TypeAlias
 
@@ -48,7 +49,7 @@ from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     get_context,
-    prepare_unified,
+    prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
@@ -159,7 +160,7 @@ class RequestState:
     pooling_params: PoolingParams | None = None
     generator: torch.Generator | None = None
     generated_tokens: int = 0
-    block_ids: list[int] = field(
+    block_ids: list[list[int]] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
     lora_id: int | None = None
@@ -174,7 +175,7 @@ class PrefillRequest(NamedTuple):
     req_id: str
     token_ids: list[int]  # suffix slice forwarded through the model
     sampling_params: SamplingParams
-    block_ids: list[int]
+    block_ids: list[list[int]]
     generator: torch.Generator | None
     prompt_len: int | None  # full prompt length (None for intermediate chunks)
     start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
@@ -330,6 +331,8 @@ class MetalModelRunner:
         # Paged attention state (set by worker when enabled)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
         self._paged_block_size: int = 0
+        self._paged_scheduler_group_indices: tuple[int, ...] = ()
+        self._paged_group_block_sizes: tuple[int, ...] = ()
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
@@ -712,6 +715,24 @@ class MetalModelRunner:
         """Record the initialized paged-attention backend owned by this runner."""
         self._paged_attention_runtime = backend
         self._paged_block_size = block_size
+        self._paged_scheduler_group_indices = backend.kv_scheduler_group_indices()
+        self._paged_group_block_sizes = backend.kv_group_block_sizes()
+
+    def _copy_paged_block_ids(
+        self, block_ids: Sequence[Sequence[int]]
+    ) -> list[list[int]]:
+        """Copy scheduler cache groups owned by the installed paged runtime."""
+        missing_group_indices = [
+            index
+            for index in self._paged_scheduler_group_indices
+            if index >= len(block_ids)
+        ]
+        if missing_group_indices:
+            raise ValueError(
+                "scheduler block_ids does not include required cache groups "
+                f"{missing_group_indices}"
+            )
+        return [list(block_ids[index]) for index in self._paged_scheduler_group_indices]
 
     def install_gemma4_mtp_kv_sharing(
         self,
@@ -1062,18 +1083,18 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             all_token_ids.extend(pr.token_ids)
 
-        # ---- build metadata for prepare_unified ----
-        decode_info: list[tuple[list[int], int, int]] = []
+        # ---- build metadata for every scheduler cache group ----
+        decode_info: list[tuple[list[list[int]], int, int]] = []
         for segment in decode_segments:
             decode_info.append(
                 (
-                    list(segment.block_ids),
+                    [list(group) for group in segment.block_ids],
                     segment.cache_start_pos,
                     segment.num_query_tokens,
                 )
             )
 
-        prefill_info: list[tuple[list[int], int, int]] = []
+        prefill_info: list[tuple[list[list[int]], int, int]] = []
         for pr in prefill_reqs:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
@@ -1084,10 +1105,10 @@ class MetalModelRunner:
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
 
-        prepare_unified(
+        prepare_grouped(
             decode_info,
             prefill_info,
-            self._paged_block_size,
+            self._paged_group_block_sizes,
             merge_verify_windows=self.merge_verify_windows,
         )
         try:
@@ -1626,15 +1647,15 @@ class MetalModelRunner:
         int-offset arange path on text segments.
 
         Any speculative-decode segment in the batch is rejected up
-        front: ``prepare_unified`` now keeps a ``num_query_tokens > 1``
-        window as one ``cu_seqlens`` segment (aligned with
-        ``ctx.segment_positions``), but this method's M-RoPE position
-        handling has only ever been exercised with single-token decode
-        segments — supplying and validating per-row positions for a
-        multi-token verification window is untracked territory, including
-        text-only spec decode that shares the batch with an mm prefill,
-        since the whole batch routes through this method.  Lifting the
-        restriction is tracked as a follow-up to RFC #319.
+        front: ``prepare_grouped`` may keep a ``num_query_tokens > 1``
+        verification window as one ``cu_seqlens`` segment, but this
+        method's M-RoPE position handling has only been exercised with
+        single-token decode segments. Supplying and validating per-row
+        positions for a multi-token verification window is untracked
+        territory, including text-only spec decode that shares the batch
+        with an mm prefill, since the whole batch routes through this
+        method. Lifting the restriction is tracked as a follow-up to RFC
+        #319.
         """
         adapter = self._multimodal_adapter
         assert adapter is not None and adapter.forward_ready
@@ -1648,8 +1669,8 @@ class MetalModelRunner:
                     "paged path yet: M-RoPE positions for a multi-token "
                     "verification window have never been supplied or "
                     "validated on this path, and every segment in the batch "
-                    "routes through it — including text-only spec decode "
-                    "sharing the batch with an mm prefill.  Tracked as a "
+                    "routes through it, including text-only spec decode "
+                    "sharing the batch with an mm prefill. Tracked as a "
                     "follow-up to RFC #319."
                 )
 
@@ -1858,7 +1879,7 @@ class MetalModelRunner:
             generator = _create_request_generator(self.device, sampling_params)
 
             if self._paged_attention_runtime is not None:
-                sched_block_ids = list(new_req.block_ids[0])
+                sched_block_ids = self._copy_paged_block_ids(new_req.block_ids)
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
@@ -1936,7 +1957,11 @@ class MetalModelRunner:
                 cache=[],
                 sampling_params=new_req.sampling_params or SamplingParams(),
                 pooling_params=new_req.pooling_params,
-                block_ids=list(new_req.block_ids[0]) if new_req.block_ids else [],
+                block_ids=(
+                    self._copy_paged_block_ids(new_req.block_ids)
+                    if new_req.block_ids
+                    else []
+                ),
             )
 
         cached = scheduler_output.scheduled_cached_reqs
@@ -1971,11 +1996,14 @@ class MetalModelRunner:
             resumed = req_id in cached_reqs.resumed_req_ids
             if not resumed:
                 if new_block_ids is not None:
-                    state.block_ids.extend(new_block_ids[0])
+                    for group_index, group_block_ids in enumerate(
+                        self._copy_paged_block_ids(new_block_ids)
+                    ):
+                        state.block_ids[group_index].extend(group_block_ids)
                 continue
 
             assert new_block_ids is not None
-            state.block_ids = list(new_block_ids[0])
+            state.block_ids = self._copy_paged_block_ids(new_block_ids)
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
 

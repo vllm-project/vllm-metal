@@ -285,6 +285,9 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
             captured["context_lens"] = ctx.context_lens
             captured["offsets"] = ctx.offsets
             captured["block_tables"] = ctx.block_tables
+            assert ctx.kv_groups is not None
+            captured["group_slots"] = [group.slot_mapping for group in ctx.kv_groups]
+            captured["group_tables"] = [group.block_tables for group in ctx.kv_groups]
             return mx.array([101, 102], dtype=mx.int32)
 
     layer_types = ("full_attention",)
@@ -312,6 +315,7 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
         ),
         target_kv_cache=cache,
         block_size=_BLOCK_SIZE,
+        group_block_sizes=(_BLOCK_SIZE, 4),
     )
 
     drafts = wired.propose_draft_token_ids(
@@ -321,14 +325,14 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
                 token_id=7,
                 target_hidden_row=0,
                 target_position=1,
-                block_ids=(0,),
+                block_ids=((0,), (5,)),
             ),
             Gemma4MTPDraftSeed(
                 req_id="r1",
                 token_id=8,
                 target_hidden_row=2,
                 target_position=3,
-                block_ids=(0,),
+                block_ids=((0,), (5,)),
             ),
         ),
         target_hidden_states=mx.array(
@@ -346,6 +350,8 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
     assert captured["context_lens"] == [2, 4]
     assert captured["offsets"] == [1, 3]
     assert captured["block_tables"] == [[0], [0]]
+    assert captured["group_slots"] == [[1, 3], [21, 23]]
+    assert captured["group_tables"] == [[[0], [0]], [[5], [5]]]
     assert get_context() is None
 
 
@@ -417,7 +423,7 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
                 token_id=1,
                 target_hidden_row=0,
                 target_position=0,
-                block_ids=(0,),
+                block_ids=((0,),),
             ),
         ),
         target_hidden_states=mx.ones((1, hidden_size)),
@@ -473,6 +479,7 @@ def test_cache_policy_installs_gemma4_mtp_kv_sharing() -> None:
             target_metadata: Gemma4MTPTargetMetadata,
             target_kv_cache: MetalPagedKVCache,
             block_size: int,
+            group_block_sizes: tuple[int, ...],
         ) -> object:
             assert target_metadata.non_shared_layer_types == (
                 "sliding_attention",
@@ -481,6 +488,7 @@ def test_cache_policy_installs_gemma4_mtp_kv_sharing() -> None:
             )
             assert target_kv_cache is backend.kv_cache
             assert block_size == _BLOCK_SIZE
+            assert group_block_sizes == (_BLOCK_SIZE,)
             return installed
 
     layer_types = [

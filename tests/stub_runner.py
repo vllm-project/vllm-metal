@@ -43,6 +43,9 @@ def make_stub_runner(
         "_drafter": None,
         "encoder_cache": None,
         "_paged_attention_runtime": None,
+        "_paged_block_size": 0,
+        "_paged_scheduler_group_indices": (),
+        "_paged_group_block_sizes": (),
         "_request_states": {},
         "_paged_request_seq_lens": {},
         "_pending_output": None,
@@ -69,6 +72,9 @@ def make_stub_runner(
         setattr(runner, k, v)
     for k, v in attrs.items():
         setattr(runner, k, v)
+    if "_paged_block_size" in attrs and "_paged_group_block_sizes" not in attrs:
+        runner._paged_scheduler_group_indices = (0,)
+        runner._paged_group_block_sizes = (attrs["_paged_block_size"],)
     if "_is_pooling" not in attrs:
         runner._is_pooling = (
             getattr(runner.model_config, "runner_type", None) == "pooling"

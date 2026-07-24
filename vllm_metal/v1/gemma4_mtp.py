@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import mlx.core as mx
 from vllm.logger import init_logger
 
-from vllm_metal.attention.context import clear_context, prepare_unified
+from vllm_metal.attention.context import clear_context, prepare_grouped
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
 logger = init_logger(__name__)
@@ -67,6 +67,7 @@ class Gemma4MTPAssistantRuntime:
         target_metadata: Gemma4MTPTargetMetadata,
         target_kv_cache: MetalPagedKVCache,
         block_size: int,
+        group_block_sizes: Sequence[int] | None = None,
     ) -> Gemma4MTPAssistantRuntime:
         """Return a runner-local runtime binding for target paged KV.
 
@@ -84,6 +85,7 @@ class Gemma4MTPAssistantRuntime:
                 plan,
                 target_kv_cache=target_kv_cache,
                 block_size=block_size,
+                group_block_sizes=group_block_sizes,
             ),
             forward_ready=hasattr(self.model, "draft_token_ids"),
         )
@@ -121,10 +123,10 @@ class Gemma4MTPAssistantRuntime:
         hidden_rows = mx.take(target_hidden_states, row_indices, axis=0)[None, :, :]
         input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
 
-        prepare_unified(
-            [(list(seed.block_ids), seed.target_position, 1) for seed in seeds],
+        prepare_grouped(
+            [(seed.block_ids, seed.target_position, 1) for seed in seeds],
             [],
-            self.kv_sharing.block_size,
+            self.kv_sharing.group_block_sizes,
         )
         try:
             draft_token_ids = self.model.draft_token_ids(
@@ -157,7 +159,7 @@ class Gemma4MTPDraftSeed:
     token_id: int
     target_hidden_row: int
     target_position: int
-    block_ids: tuple[int, ...]
+    block_ids: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,7 @@ class Gemma4MTPKVSharingBinding:
     plan: Gemma4MTPKVSharingPlan
     target_kv_cache: MetalPagedKVCache
     block_size: int
+    group_block_sizes: tuple[int, ...]
 
     @classmethod
     def from_plan(
@@ -175,16 +178,21 @@ class Gemma4MTPKVSharingBinding:
         *,
         target_kv_cache: MetalPagedKVCache,
         block_size: int,
+        group_block_sizes: Sequence[int] | None = None,
     ) -> Gemma4MTPKVSharingBinding:
         if block_size <= 0:
             raise ValueError(
                 f"Gemma4 MTP KV sharing block_size must be positive, got {block_size}"
             )
+        group_sizes = (
+            tuple(group_block_sizes) if group_block_sizes is not None else (block_size,)
+        )
         plan.validate_target_cache(target_kv_cache)
         return cls(
             plan=plan,
             target_kv_cache=target_kv_cache,
             block_size=block_size,
+            group_block_sizes=group_sizes,
         )
 
 

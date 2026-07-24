@@ -285,3 +285,45 @@ class TestTurboQuantHybridAlignment:
             assert cache_config.block_size % cache_config.hash_block_size == 0
             assert scheduler_block_size % cache_config.hash_block_size == 0
             assert hash_block_size == cache_config.hash_block_size
+
+    def test_initialize_kv_cache_selects_sdpa_scheduler_group(
+        self, monkeypatch
+    ) -> None:
+        cache_config = CacheConfig(enable_prefix_caching=False, block_size=64)
+        cache_config.mamba_cache_mode = "none"
+        vllm_config = self._vllm_config_with_cache(cache_config)
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config", lambda: _tq_config()
+        )
+        self._patch_model_cls(monkeypatch)
+        runner = _hybrid_runner()
+        runner.cache_config = cache_config
+
+        MetalPlatform.update_block_size_for_backend(vllm_config)
+        specs = runner._cache_policy.get_kv_cache_spec()
+        groups = get_kv_cache_groups(vllm_config, specs)
+        expected_group = next(
+            index
+            for index, group in enumerate(groups)
+            if any(name.endswith(".self_attn") for name in group.layer_names)
+        )
+        backend = runner.build_paged_attention_runtime(
+            block_size=cache_config.block_size
+        )
+        backend.initialize(num_blocks=2)
+        runner.install_paged_attention_runtime(
+            backend,
+            block_size=cache_config.block_size,
+        )
+
+        runner.initialize_kv_cache(
+            KVCacheConfig(
+                num_blocks=2,
+                kv_cache_tensors=[],
+                kv_cache_groups=groups,
+            )
+        )
+
+        assert runner._paged_scheduler_group_indices == (expected_group,)
+        assert runner._paged_group_block_sizes == (cache_config.block_size,)

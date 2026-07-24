@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 class _PagedDecodeStateLike(Protocol):
     token_ids: Sequence[int]
-    block_ids: Sequence[int]
+    block_ids: Sequence[Sequence[int]]
 
 
 class _SpecDecodeRequestStateLike(Protocol):
@@ -34,7 +34,7 @@ class _SpecDecodeRequestStateLike(Protocol):
 class _SpecDecodePrefillLike(Protocol):
     req_id: str
     token_ids: Sequence[int]
-    block_ids: Sequence[int]
+    block_ids: Sequence[Sequence[int]]
     start_pos: int
 
 
@@ -54,7 +54,7 @@ class PagedDecodeSegment:
     num_query_tokens: int
     draft_token_ids: tuple[int, ...]
     cache_start_pos: int
-    block_ids: tuple[int, ...]
+    block_ids: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
         if self.start_row < 0:
@@ -219,7 +219,7 @@ class SpeculativeDecodeController:
 
         for req_id, state in decode_reqs:
             token_ids = tuple(state.token_ids)
-            block_ids = tuple(state.block_ids)
+            block_ids = tuple(tuple(group) for group in state.block_ids)
             draft_token_ids = tuple(spec_tokens.get(req_id, ()))
             if any(token_id < 0 for token_id in draft_token_ids):
                 raise NotImplementedError(
@@ -357,7 +357,7 @@ class SpeculativeDecodeController:
                     token_id=token_id,
                     target_hidden_row=prefill_end - 1,
                     target_position=prefill.start_pos + len(prefill.token_ids) - 1,
-                    block_ids=tuple(prefill.block_ids),
+                    block_ids=tuple(tuple(group) for group in prefill.block_ids),
                 )
             )
 
