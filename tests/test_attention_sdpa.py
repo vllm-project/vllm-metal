@@ -614,7 +614,6 @@ class _PagedRoutingOpsSpy:
         _max_seq_len: int,
         _sliding_window: int,
         _out: mx.array,
-        *,
         window_seqlen_q: int = 1,
     ) -> None:
         del window_seqlen_q
