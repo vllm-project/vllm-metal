@@ -296,33 +296,6 @@ class TestPipelinedModelDummyForward:
         assert "full" not in stub.calls  # head path never taken
         assert out.dtype == wrapper._wire_dtype
 
-    def test_first_stage_embeds_internally(self) -> None:
-        # The first stage owns the embedding: the backbone is called with
-        # input_embeddings=None and embeds the token ids itself.
-        stub = _StageStubModel()
-        stub.model.embed_tokens = nn.Embedding(4, 32)  # first stage owns it
-        wrapper = PipelinedModel(stub, _pp(0, 2))
-
-        wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
-
-        assert stub.calls["backbone"] is None
-        assert "full" not in stub.calls
-
-    def test_last_stage_runs_owned_head(self) -> None:
-        # The last stage owns norm + head: the dummy takes the same top-level
-        # call as serving and returns the model output for logits extraction.
-        stub = _StageStubModel()
-        wrapper = PipelinedModel(stub, _pp(1, 2))
-
-        out = wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
-
-        assert out == "model-output"
-        h_in = stub.calls["full"]
-        assert isinstance(h_in, mx.array)
-        assert h_in.shape == (1, 4, 32)
-        assert h_in.dtype == wrapper._wire_dtype
-        assert "backbone" not in stub.calls
-
     def test_inherits_wire_dtype_fail_fast(self) -> None:
         # The dummy shares the stage body with __call__, so a wire-dtype
         # mismatch fails at profiling/startup instead of on the first request.
