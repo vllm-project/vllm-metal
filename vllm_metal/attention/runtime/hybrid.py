@@ -130,6 +130,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
         self._gdn_state_manager: HybridGDNStateManager | None = None
+        self._scheduler_group_indices = (0,)
+        self._group_block_sizes = (block_size,)
 
     def initialize(self, num_blocks: int) -> None:
         self._cache = MetalPagedKVCache(
@@ -166,6 +168,27 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             self._state_cache.allocated_seqs,
             self._max_num_seqs,
         )
+
+    def adopt_scheduler_group(self, group_index: int, block_size: int) -> None:
+        """Select the vLLM scheduler group that owns SDPA KV blocks."""
+        self._require_initialized("adopt_scheduler_group")
+        if block_size != self._block_size:
+            raise NotImplementedError(
+                "hybrid paged attention requires the SDPA scheduler group "
+                f"block size to stay {self._block_size}, got {block_size}"
+            )
+        self._scheduler_group_indices = (group_index,)
+        self._group_block_sizes = (block_size,)
+
+    def kv_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return scheduler KV groups consumed by SDPA layers."""
+        self._require_initialized("kv_scheduler_group_indices")
+        return self._scheduler_group_indices
+
+    def kv_group_block_sizes(self) -> tuple[int, ...]:
+        """Return SDPA scheduler group page sizes."""
+        self._require_initialized("kv_group_block_sizes")
+        return self._group_block_sizes
 
     def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")

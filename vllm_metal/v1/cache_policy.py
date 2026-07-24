@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -340,7 +341,9 @@ class ModelCachePolicy:
         profiled capacity in ``setup_paged_attention``.  The engine's block
         count normally round-trips back to that same number, but
         ``--num-gpu-blocks-override`` replaces it after the fact, so verify
-        the engine is not planning against more blocks than exist.
+        the engine is not planning against more blocks than exist.  The full
+        upstream config is also the source of truth for scheduler KV groups, so
+        adopt its grouping before serving.
         """
         runtime = self._runner.paged_attention_runtime
         if runtime is not None and kv_cache_config.num_blocks > runtime.num_blocks():
@@ -352,10 +355,110 @@ class ModelCachePolicy:
                 "--num-gpu-blocks-override is set, lower or remove it; "
                 "otherwise this is a capacity-accounting bug, please report it."
             )
+        if runtime is not None:
+            self._adopt_scheduler_groups(runtime, kv_cache_config)
         logger.info(
             "KV cache config received: %d blocks (MLX manages cache internally)",
             kv_cache_config.num_blocks,
         )
+
+    def _adopt_scheduler_groups(
+        self,
+        runtime: PagedAttentionRuntime,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        if self._runner.is_mla:
+            return
+        if self._runner.is_hybrid:
+            self._adopt_hybrid_scheduler_group(runtime, kv_cache_config)
+            return
+        self._adopt_mha_layout(runtime, kv_cache_config)
+
+    def _adopt_mha_layout(
+        self,
+        runtime: PagedAttentionRuntime,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        if not isinstance(runtime, MHAPagedAttentionRuntime):
+            raise RuntimeError("MHA cache config requires MHAPagedAttentionRuntime")
+
+        model_layer_names = self._mha_model_layer_names()
+        if get_config().turboquant:
+            group_indices = self._scheduler_group_indices_for_layers(
+                kv_cache_config,
+                model_layer_names,
+            )
+            if group_indices != (0,):
+                raise NotImplementedError(
+                    "TurboQuant MHA currently supports one scheduler KV group"
+                )
+            return
+
+        layout = MHAKVCacheLayout.from_config(kv_cache_config, model_layer_names)
+        runtime.adopt_layout(layout)
+        runtime.patch_model(self._runner.model)
+        self.install_gemma4_mtp_kv_sharing(
+            runtime,
+            block_size=layout.group_block_sizes[0],
+            group_block_sizes=layout.group_block_sizes,
+        )
+        self._runner.install_paged_attention_runtime(
+            runtime,
+            block_size=layout.group_block_sizes[0],
+        )
+
+    def _adopt_hybrid_scheduler_group(
+        self,
+        runtime: PagedAttentionRuntime,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        if not isinstance(runtime, HybridPagedAttentionRuntime):
+            raise RuntimeError(
+                "hybrid cache config requires HybridPagedAttentionRuntime"
+            )
+
+        group_indices = self._scheduler_group_indices_for_layers(
+            kv_cache_config,
+            tuple(
+                f"layers.{layer_idx}.self_attn"
+                for layer_idx in sorted(self._runner.sdpa_layer_indices)
+            ),
+        )
+        if len(group_indices) != 1:
+            raise NotImplementedError(
+                "hybrid paged attention requires all SDPA layers to share one "
+                "scheduler KV group"
+            )
+        group_index = group_indices[0]
+        block_size = kv_cache_config.kv_cache_groups[
+            group_index
+        ].kv_cache_spec.block_size
+        runtime.adopt_scheduler_group(group_index, block_size)
+        self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
+
+    def _scheduler_group_indices_for_layers(
+        self,
+        kv_cache_config: KVCacheConfig,
+        layer_names: tuple[str, ...],
+    ) -> tuple[int, ...]:
+        layer_set = set(layer_names)
+        layer_to_group: dict[str, int] = {}
+        for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                if layer_name in layer_set:
+                    layer_to_group[layer_name] = group_index
+
+        missing = layer_set - set(layer_to_group)
+        if missing:
+            raise ValueError(
+                "KV cache config is missing scheduler groups for layers: "
+                f"{', '.join(sorted(missing))}"
+            )
+        return tuple(dict.fromkeys(layer_to_group[name] for name in layer_names))
+
+    def _mha_model_layer_names(self) -> tuple[str, ...]:
+        num_layers, _ = self._mha_cache_layout()
+        return tuple(f"layers.{layer_idx}.self_attn" for layer_idx in range(num_layers))
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the byte size of one cache block.
@@ -416,6 +519,7 @@ class ModelCachePolicy:
         backend: PagedAttentionRuntime,
         *,
         block_size: int,
+        group_block_sizes: Sequence[int] | None = None,
     ) -> None:
         """Wire Gemma4 MTP assistant layers to the target paged KV cache."""
         assistant = self._runner._gemma4_mtp_assistant
@@ -434,6 +538,11 @@ class ModelCachePolicy:
             target_metadata=target_metadata,
             target_kv_cache=backend.kv_cache,
             block_size=block_size,
+            group_block_sizes=(
+                tuple(group_block_sizes)
+                if group_block_sizes is not None
+                else backend.kv_group_block_sizes()
+            ),
         )
 
     def estimate_one_sequence_kv_bytes(
