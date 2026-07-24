@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import gcd
 from typing import TYPE_CHECKING, Literal
 
 import mlx.core as mx
@@ -14,9 +15,11 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
 )
 
+from vllm_metal import envs
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -303,6 +306,7 @@ class ModelCachePolicy:
                     torch_dtype=torch_dtype,
                     page_size_padded=self._runner.cache_config.mamba_page_size_padded,
                     block_size=block_size,
+                    mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -343,6 +347,30 @@ class ModelCachePolicy:
         the engine is not planning against more blocks than exist.
         """
         runtime = self._runner.paged_attention_runtime
+        if runtime is not None:
+            runtime.configure_cache_groups(kv_cache_config)
+        if self._runner.is_hybrid and envs.VLLM_METAL_EXPERIMENTAL_GDN_APC:
+            mamba_group_sizes = [
+                len(group.layer_names)
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode == "align"
+            ]
+            if not mamba_group_sizes:
+                raise RuntimeError(
+                    "Experimental hybrid GDN APC received no align-mode Mamba groups"
+                )
+            bytes_per_layer = (
+                self.linear_cache_bytes_per_slot() // self._runner.num_linear_layers
+            )
+            actual_max_page = max(mamba_group_sizes) * bytes_per_layer
+            planned_max_page = self.linear_snapshot_bytes_per_scheduler_block()
+            if actual_max_page != planned_max_page:
+                raise RuntimeError(
+                    "Scheduler Mamba group page size does not match Metal's "
+                    "GDN snapshot memory plan "
+                    f"({actual_max_page} != {planned_max_page} bytes)"
+                )
         if runtime is not None and kv_cache_config.num_blocks > runtime.num_blocks():
             raise ValueError(
                 f"Engine KV cache config requests {kv_cache_config.num_blocks} "
@@ -379,7 +407,27 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        return self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
+        page_bytes = (
+            self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
+        )
+        if self._runner.is_hybrid and envs.VLLM_METAL_EXPERIMENTAL_GDN_APC:
+            page_bytes += self.linear_snapshot_bytes_per_scheduler_block()
+        return page_bytes
+
+    def get_scheduler_cache_block_size_bytes(self) -> int:
+        """Return the uniform page bytes used by vLLM's cache planner.
+
+        Experimental GDN APC budgets one SDPA page plus one sparse GDN snapshot
+        page for every physical block ID.  Upstream's hybrid planner, however,
+        divides the worker-reported memory by one uniform cache-group page.  It
+        must therefore see only that page size; reporting the combined internal
+        storage unit would make it request roughly twice the blocks Metal
+        allocated.
+        """
+        internal_bytes = self.get_cache_block_size_bytes()
+        if self._runner.is_hybrid and envs.VLLM_METAL_EXPERIMENTAL_GDN_APC:
+            return internal_bytes - self.linear_snapshot_bytes_per_scheduler_block()
+        return internal_bytes
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""
@@ -399,6 +447,25 @@ class ModelCachePolicy:
             * recurrent_dtype_size
         )
         return self._runner.num_linear_layers * (conv_bytes + recurrent_bytes)
+
+    def linear_snapshot_bytes_per_scheduler_block(self) -> int:
+        """Bytes in the largest scheduler Mamba-group checkpoint page."""
+        if not self._runner.is_hybrid:
+            raise RuntimeError(
+                "linear_snapshot_bytes_per_scheduler_block() requires a hybrid model"
+            )
+        num_sdpa_layers = self._runner.num_sdpa_layers
+        num_linear_layers = self._runner.num_linear_layers
+        if num_sdpa_layers <= 0 or num_linear_layers <= 0:
+            raise RuntimeError("Hybrid model has invalid SDPA/GDN layer counts")
+
+        # vLLM's uniform-page hybrid allocator divides each attention type into
+        # equal-sized cache groups. Qwen3.5/3.6 has 10 SDPA + 30 GDN layers, so
+        # every physical Mamba block owns 10 GDN layers. This is the actual
+        # payload retained under one scheduler block ID, not all 30 layers.
+        layers_per_group = gcd(num_sdpa_layers, num_linear_layers)
+        bytes_per_layer = self.linear_cache_bytes_per_slot() // num_linear_layers
+        return layers_per_group * bytes_per_layer
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -686,7 +753,7 @@ class WorkerCachePlanner:
                 raise RuntimeError(
                     "Paged attention backend not initialized for capacity reporting"
                 )
-            block_size_bytes = self._worker.get_cache_block_size_bytes()
+            block_size_bytes = self._worker.get_scheduler_cache_block_size_bytes()
             available = backend.num_blocks() * block_size_bytes
             logger.info(
                 "Paged attention: reporting MPS cache capacity "

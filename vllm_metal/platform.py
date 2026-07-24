@@ -449,10 +449,66 @@ class MetalPlatform(Platform):
                 cache_config.enable_prefix_caching
                 or cache_config.mamba_cache_mode != "none"
             ):
-                raise NotImplementedError(
-                    "Prefix caching and Mamba cache modes are not supported for "
-                    "hybrid GDN models on Metal because GDN recurrent state cannot "
-                    "be restored from KV blocks."
+                if not envs.VLLM_METAL_EXPERIMENTAL_GDN_APC:
+                    raise NotImplementedError(
+                        "Prefix caching and Mamba cache modes are not supported for "
+                        "hybrid GDN models on Metal because GDN recurrent state cannot "
+                        "be restored from KV blocks. Set the experimental "
+                        "VLLM_METAL_EXPERIMENTAL_GDN_APC=1 only for controlled "
+                        "scheduler-coherent GDN APC validation."
+                    )
+                if (
+                    not cache_config.enable_prefix_caching
+                    or cache_config.mamba_cache_mode != "align"
+                ):
+                    raise NotImplementedError(
+                        "Experimental Metal GDN snapshots require both "
+                        "--enable-prefix-caching and --mamba-cache-mode align."
+                    )
+                if not config.use_paged_attention:
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC requires paged attention."
+                    )
+                if not getattr(
+                    vllm_config.scheduler_config,
+                    "enable_chunked_prefill",
+                    False,
+                ):
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC requires chunked prefill."
+                    )
+                if (
+                    parallel_config.tensor_parallel_size != 1
+                    or parallel_config.pipeline_parallel_size != 1
+                    or getattr(parallel_config, "data_parallel_size", 1) != 1
+                ):
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC requires tensor_parallel_size=1, "
+                        "pipeline_parallel_size=1, and data_parallel_size=1."
+                    )
+                if speculative_config is not None:
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC does not support speculative "
+                        "decoding."
+                    )
+                if getattr(vllm_config, "lora_config", None) is not None:
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC does not support LoRA."
+                    )
+                if getattr(vllm_config, "kv_transfer_config", None) is not None:
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC does not support KV transfer, "
+                        "external KV connectors, or disaggregated prefill because "
+                        "GDN recurrent state is not transferred with attention KV."
+                    )
+                if config.turboquant:
+                    raise NotImplementedError(
+                        "Experimental Metal GDN APC does not support TurboQuant until "
+                        "hybrid alignment accounts for float32 GDN recurrent state."
+                    )
+                logger.warning(
+                    "EXPERIMENTAL: scheduler-coherent hybrid GDN APC enabled; "
+                    "physical Mamba block checkpoints are fail-closed.",
                 )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its

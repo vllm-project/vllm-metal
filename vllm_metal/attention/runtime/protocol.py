@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import mlx.core as mx
 
 if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
     from vllm_metal.attention.context import PagedAttentionContext
 
 
@@ -21,4 +24,16 @@ class PagedAttentionRuntime(Protocol):
     ) -> None: ...
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None: ...
     def release_requests(self, req_ids: set[str]) -> None: ...
+    def configure_cache_groups(self, kv_cache_config: KVCacheConfig) -> None: ...
+    def invalidate_blocks(self, block_ids: Sequence[int]) -> None: ...
+    def restore_prefix(
+        self,
+        req_id: str,
+        block_tables: Sequence[Sequence[int]],
+        num_computed_tokens: int,
+    ) -> bool: ...
+    def checkpoint_blocks(
+        self,
+        checkpoints: Sequence[tuple[str, Sequence[Sequence[int]], int]],
+    ) -> None: ...
     def materialize_pending_state(self) -> None: ...

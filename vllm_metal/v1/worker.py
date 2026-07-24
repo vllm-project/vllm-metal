@@ -308,6 +308,10 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.get_cache_block_size_bytes()
 
+    def get_scheduler_cache_block_size_bytes(self) -> int:
+        """Return the uniform page bytes used for upstream cache planning."""
+        return self.model_runner.get_scheduler_cache_block_size_bytes()
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         """Add a LoRA/QLoRA adapter."""
         return self.model_runner.add_lora(lora_request)

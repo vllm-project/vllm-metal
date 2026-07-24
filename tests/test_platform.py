@@ -1033,6 +1033,170 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    def test_check_and_update_config_allows_explicit_scoped_hybrid_gdn_apc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_EXPERIMENTAL_GDN_APC", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                speculative_config=None,
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                    data_parallel_size=1,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3_5"),
+                    is_hybrid=True,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                    long_prefill_token_threshold=0,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert (
+                vllm_config.parallel_config.worker_cls
+                == "vllm_metal.v1.worker.MetalWorker"
+            )
+            assert vllm_config.scheduler_config.enable_chunked_prefill is True
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        ("unsupported", "err_match"),
+        [
+            ("kv_transfer", "does not support KV transfer"),
+            ("turboquant", "does not support TurboQuant"),
+        ],
+    )
+    def test_experimental_hybrid_gdn_apc_rejects_external_state_paths(
+        self,
+        unsupported: str,
+        err_match: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reject paths that cannot preserve float32 GDN state identity."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_EXPERIMENTAL_GDN_APC", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                speculative_config=None,
+                lora_config=None,
+                kv_transfer_config=(
+                    SimpleNamespace() if unsupported == "kv_transfer" else None
+                ),
+                additional_config=(
+                    {"turboquant": True} if unsupported == "turboquant" else {}
+                ),
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                    data_parallel_size=1,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3_5"),
+                    is_hybrid=True,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                    long_prefill_token_threshold=0,
+                ),
+            )
+
+            with pytest.raises(NotImplementedError, match=err_match):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_experimental_hybrid_gdn_apc_rejects_non_chunked_prefill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setenv("VLLM_METAL_EXPERIMENTAL_GDN_APC", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                speculative_config=None,
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=1,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3_5"),
+                    is_hybrid=True,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True,
+                    enable_chunked_prefill=False,
+                    max_num_batched_tokens=32768,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            with pytest.raises(NotImplementedError, match="chunked prefill"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

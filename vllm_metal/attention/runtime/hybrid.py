@@ -11,13 +11,14 @@ GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import torch
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
@@ -47,6 +48,7 @@ def _build_linear_layer_spec(
     torch_dtype: torch.dtype,
     page_size_padded: int | None = None,
     block_size: int,
+    mamba_cache_mode: str = "none",
 ) -> MambaSpec:
     """Build a MambaSpec for one GDN linear attention layer.
 
@@ -62,9 +64,13 @@ def _build_linear_layer_spec(
             (conv_kernel_dim - 1, conv_dim),
             (num_v_heads, value_head_dim, key_head_dim),
         ),
-        dtypes=(torch_dtype, torch_dtype),
+        # The Metal GDN runtime accumulates recurrent state in float32 even when
+        # convolution state follows the model/KV dtype. Scheduler sizing must
+        # describe the arrays that are actually snapshotted.
+        dtypes=(torch_dtype, torch.float32),
         block_size=block_size,
         page_size_padded=page_size_padded,
+        mamba_cache_mode=mamba_cache_mode,
     )
 
 
@@ -155,7 +161,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             initial_seqs=0,
             dtype=self._dtype,
         )
-        self._gdn_state_manager = HybridGDNStateManager(self._state_cache)
+        self._gdn_state_manager = HybridGDNStateManager(
+            self._state_cache,
+            block_size=self._block_size,
+        )
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
@@ -239,6 +248,59 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def release_requests(self, req_ids: set[str]) -> None:
         self.gdn_state_manager.release_requests(req_ids)
+
+    def configure_cache_groups(self, kv_cache_config: KVCacheConfig) -> None:
+        linear_name_to_cache_idx = {
+            f"layers.{model_layer_idx}.linear_attn": cache_idx
+            for cache_idx, model_layer_idx in enumerate(self._linear_indices)
+        }
+        mamba_group_layers: dict[int, tuple[int, ...]] = {}
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            if group.kv_cache_spec.mamba_cache_mode != "align":
+                continue
+            unknown_layers = set(group.layer_names) - set(linear_name_to_cache_idx)
+            if unknown_layers:
+                raise RuntimeError(
+                    "Scheduler Mamba group contains unknown Metal GDN layers: "
+                    f"{sorted(unknown_layers)}"
+                )
+            layer_indices = tuple(
+                linear_name_to_cache_idx[layer_name] for layer_name in group.layer_names
+            )
+            if not layer_indices:
+                raise RuntimeError("Scheduler Mamba cache group has no GDN layers")
+            mamba_group_layers[group_idx] = layer_indices
+
+        if not mamba_group_layers:
+            return
+        self.gdn_state_manager.configure_cache_groups(
+            num_blocks=kv_cache_config.num_blocks,
+            block_size=self._block_size,
+            mamba_group_layers=mamba_group_layers,
+        )
+
+    def invalidate_blocks(self, block_ids: Sequence[int]) -> None:
+        self.gdn_state_manager.invalidate_blocks(block_ids)
+
+    def restore_prefix(
+        self,
+        req_id: str,
+        block_tables: Sequence[Sequence[int]],
+        num_computed_tokens: int,
+    ) -> bool:
+        return self.gdn_state_manager.restore_prefix(
+            req_id,
+            block_tables,
+            num_computed_tokens,
+        )
+
+    def checkpoint_blocks(
+        self,
+        checkpoints: Sequence[tuple[str, Sequence[Sequence[int]], int]],
+    ) -> None:
+        self.gdn_state_manager.checkpoint_blocks(checkpoints)
 
     def materialize_pending_state(self) -> None:
         self.gdn_state_manager.materialize_pending_state()

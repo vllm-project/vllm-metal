@@ -123,6 +123,10 @@ class STTModelRunner:
         """Minimal block size; STT holds no real KV cache."""
         return STT_SCHED_BLOCK_BYTES
 
+    def get_scheduler_cache_block_size_bytes(self) -> int:
+        """STT has no separate internal versus scheduler cache page size."""
+        return self.get_cache_block_size_bytes()
+
     # ------------------------------------------------------------------
     # Multimodal / draft hooks (STT has neither)
     # ------------------------------------------------------------------

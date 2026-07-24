@@ -26,7 +26,7 @@ from vllm_metal.v1.proposer import Gemma4MTPProposer
 
 class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
-        self._gdn_state_manager = HybridGDNStateManager(state_cache)
+        self._gdn_state_manager = HybridGDNStateManager(state_cache, block_size=4)
 
     def needs_step_context(self) -> bool:
         return True
@@ -43,6 +43,17 @@ class HybridRuntimeStub:
 
     def release_requests(self, req_ids: set[str]) -> None:
         self._gdn_state_manager.release_requests(req_ids)
+
+    def invalidate_blocks(self, block_ids) -> None:
+        self._gdn_state_manager.invalidate_blocks(block_ids)
+
+    def restore_prefix(self, req_id, block_tables, num_computed_tokens) -> bool:
+        return self._gdn_state_manager.restore_prefix(
+            req_id, block_tables, num_computed_tokens
+        )
+
+    def checkpoint_blocks(self, checkpoints) -> None:
+        self._gdn_state_manager.checkpoint_blocks(checkpoints)
 
     def materialize_pending_state(self) -> None:
         self._gdn_state_manager.materialize_pending_state()
@@ -1432,6 +1443,77 @@ class TestV1MetalModelRunnerExecuteModel:
 
         assert req_state.block_ids == [0]
         assert "new" not in runner._request_states
+
+    def test_cached_block_updates_preserve_every_scheduler_group(self) -> None:
+        runner = self._make_runner()
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runner._sdpa_cache_group_index = 1
+        state = mr.RequestState(
+            token_ids=[1, 2],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+            block_ids=[10],
+            block_tables=([1], [10], [20]),
+        )
+        runner._request_states["r0"] = state
+        cached = CachedRequestData(
+            req_ids=["r0"],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[([2], [11], [21])],
+            num_computed_tokens=[2],
+            num_output_tokens=[1],
+        )
+
+        runner._update_cached_request_blocks(cached)
+
+        assert state.block_tables == ([1, 2], [10, 11], [20, 21])
+        assert state.block_ids == [10, 11]
+
+    def test_resumed_block_update_replaces_every_scheduler_group(self) -> None:
+        runner = self._make_runner()
+        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runner._sdpa_cache_group_index = 1
+        state = mr.RequestState(
+            token_ids=[1, 2],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            generated_tokens=1,
+            block_ids=[10],
+            block_tables=([1], [10], [20]),
+        )
+        runner._request_states["r0"] = state
+        cached = CachedRequestData(
+            req_ids=["r0"],
+            resumed_req_ids={"r0"},
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[([3], [12], [22])],
+            num_computed_tokens=[0],
+            num_output_tokens=[0],
+        )
+
+        runner._update_cached_request_blocks(cached)
+
+        assert state.block_tables == ([3], [12], [22])
+        assert state.block_ids == [12]
+        assert state.generated_tokens == 0
 
     def test_gemma4_mtp_async_scheduling_fails_before_request_setup(self) -> None:
         runner = self._make_runner()

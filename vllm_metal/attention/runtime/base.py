@@ -9,6 +9,7 @@ one copy instead of three.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -16,6 +17,8 @@ import mlx.core as mx
 from vllm_metal.metal import warm_up_kernels
 
 if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
     from vllm_metal.attention.context import PagedAttentionContext
 
 
@@ -62,6 +65,31 @@ class PagedAttentionRuntimeBase:
     def release_requests(self, req_ids: set[str]) -> None:
         """Release runtime-owned state for requests whose state is invalid."""
         del req_ids
+
+    def configure_cache_groups(self, kv_cache_config: KVCacheConfig) -> None:
+        """Configure scheduler cache-group ownership after engine planning."""
+        del kv_cache_config
+
+    def invalidate_blocks(self, block_ids: Sequence[int]) -> None:
+        """Invalidate runtime state for scheduler-reused physical blocks."""
+        del block_ids
+
+    def restore_prefix(
+        self,
+        req_id: str,
+        block_tables: Sequence[Sequence[int]],
+        num_computed_tokens: int,
+    ) -> bool:
+        """Restore runtime state from scheduler-owned physical blocks."""
+        del req_id, block_tables, num_computed_tokens
+        return False
+
+    def checkpoint_blocks(
+        self,
+        checkpoints: Sequence[tuple[str, Sequence[Sequence[int]], int]],
+    ) -> None:
+        """Save runtime state into scheduler-owned physical blocks."""
+        del checkpoints
 
     def materialize_pending_state(self) -> None:
         """Detach deferred runtime state from the lazy graph."""

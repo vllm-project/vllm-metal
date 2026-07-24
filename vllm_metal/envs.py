@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
+    VLLM_METAL_EXPERIMENTAL_GDN_APC: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -65,6 +66,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
+    ),
+    # Correctness-first hybrid GDN automatic prefix caching experiment.
+    # Off by default; platform validation restricts it to the scheduler-coherent
+    # text-only, paged, align-mode configuration.
+    "VLLM_METAL_EXPERIMENTAL_GDN_APC": lambda: (
+        os.getenv("VLLM_METAL_EXPERIMENTAL_GDN_APC", "0") == "1"
     ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless

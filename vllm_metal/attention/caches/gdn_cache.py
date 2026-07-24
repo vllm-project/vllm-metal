@@ -40,6 +40,21 @@ class GDNDecodeStateView:
     uses_compact_state: bool
 
 
+@dataclass(frozen=True)
+class GDNStateSnapshot:
+    """Immutable materialized state for one scheduler-owned Mamba block."""
+
+    layer_indices: tuple[int, ...]
+    conv_states: tuple[mx.array, ...]
+    recurrent_states: tuple[mx.array, ...]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(array.nbytes for array in self.conv_states) + sum(
+            array.nbytes for array in self.recurrent_states
+        )
+
+
 class GDNPagedStateCache:
     """Per-layer MLX arrays for GDN linear attention recurrent state."""
 
@@ -173,6 +188,87 @@ class GDNPagedStateCache:
             recurrent = self.recurrent_states[layer_idx]
             recurrent[slot] = mx.zeros_like(recurrent[slot])
             self.recurrent_states[layer_idx] = recurrent
+
+    def snapshot_slot(
+        self,
+        slot: int,
+        layer_indices: tuple[int, ...] | None = None,
+    ) -> GDNStateSnapshot:
+        """Copy selected layer states from one resident request slot."""
+        self.require_allocated_slots([slot])
+        self.apply_pending_states()
+        if layer_indices is None:
+            layer_indices = tuple(range(self.num_layers))
+        if len(set(layer_indices)) != len(layer_indices) or any(
+            layer_idx < 0 or layer_idx >= self.num_layers for layer_idx in layer_indices
+        ):
+            raise RuntimeError("GDN snapshot contains invalid layer indices")
+        conv_states = tuple(
+            mx.array(self.conv_states[layer_idx][slot]) for layer_idx in layer_indices
+        )
+        recurrent_states = tuple(
+            mx.array(self.recurrent_states[layer_idx][slot])
+            for layer_idx in layer_indices
+        )
+        mx.eval(*conv_states, *recurrent_states)
+        return GDNStateSnapshot(
+            layer_indices=layer_indices,
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+        )
+
+    def _validate_snapshot(self, snapshot: GDNStateSnapshot) -> None:
+        if not (
+            len(snapshot.layer_indices)
+            == len(snapshot.conv_states)
+            == len(snapshot.recurrent_states)
+        ):
+            raise RuntimeError("GDN block snapshot layer count is inconsistent")
+        if len(set(snapshot.layer_indices)) != len(snapshot.layer_indices):
+            raise RuntimeError("GDN block snapshot contains duplicate layers")
+        for item_idx, layer_idx in enumerate(snapshot.layer_indices):
+            if layer_idx < 0 or layer_idx >= self.num_layers:
+                raise RuntimeError("GDN block snapshot layer index is out of range")
+            expected_conv = self.conv_states[layer_idx][0].shape
+            expected_recurrent = self.recurrent_states[layer_idx][0].shape
+            conv = snapshot.conv_states[item_idx]
+            recurrent = snapshot.recurrent_states[item_idx]
+            if conv.shape != expected_conv:
+                raise RuntimeError("GDN block snapshot convolution shape mismatch")
+            if recurrent.shape != expected_recurrent:
+                raise RuntimeError("GDN block snapshot recurrent shape mismatch")
+            if conv.dtype != self.dtype:
+                raise RuntimeError("GDN block snapshot convolution dtype mismatch")
+            if recurrent.dtype != mx.float32:
+                raise RuntimeError("GDN block snapshot recurrent dtype mismatch")
+
+    def restore_slot(
+        self,
+        slot: int,
+        snapshots: tuple[GDNStateSnapshot, ...] | GDNStateSnapshot,
+    ) -> None:
+        """Atomically restore scheduler-block checkpoints into a live slot."""
+        self.require_allocated_slots([slot])
+        if isinstance(snapshots, GDNStateSnapshot):
+            snapshots = (snapshots,)
+        restored_layers = tuple(
+            layer_idx for snapshot in snapshots for layer_idx in snapshot.layer_indices
+        )
+        if len(set(restored_layers)) != len(restored_layers):
+            raise RuntimeError("GDN block snapshots overlap in layer coverage")
+        for snapshot in snapshots:
+            self._validate_snapshot(snapshot)
+
+        self.apply_pending_states()
+        for snapshot in snapshots:
+            for item_idx, layer_idx in enumerate(snapshot.layer_indices):
+                conv = self.conv_states[layer_idx]
+                recurrent = self.recurrent_states[layer_idx]
+                conv[slot] = snapshot.conv_states[item_idx]
+                recurrent[slot] = snapshot.recurrent_states[item_idx]
+                self.conv_states[layer_idx] = conv
+                self.recurrent_states[layer_idx] = recurrent
+        mx.eval(*self.updated_state_arrays())
 
     def set_pending_conv_state(
         self, layer_idx: int, slot_ids: list[int], state_updates: mx.array

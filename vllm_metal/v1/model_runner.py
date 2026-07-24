@@ -32,7 +32,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MambaSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
@@ -118,6 +118,14 @@ SchedulerMemoryReportingMode: TypeAlias = Literal[
     "paged_attention_capacity",
     "single_sequence_estimate",
 ]
+CacheBlockTables: TypeAlias = tuple[list[int], ...]
+
+
+def _copy_cache_block_tables(
+    block_tables: tuple[list[int], ...] | list[list[int]],
+) -> CacheBlockTables:
+    """Detach scheduler-owned per-group block tables for runner bookkeeping."""
+    return tuple(list(table) for table in block_tables)
 
 
 def _lora_id_from_request_data(new_req: NewRequestData) -> int | None:
@@ -162,6 +170,9 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
+    block_tables: CacheBlockTables = field(
+        default_factory=tuple
+    )  # All scheduler cache-group block tables
     lora_id: int | None = None
     # Decode reconstructs M-RoPE positions as
     # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
@@ -181,6 +192,7 @@ class PrefillRequest(NamedTuple):
     full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
     lora_id: int | None = None  # None = no LoRA adapter for this request
     pooling_params: PoolingParams | None = None
+    block_tables: CacheBlockTables = ()  # all scheduler cache groups
 
 
 @dataclass
@@ -330,6 +342,8 @@ class MetalModelRunner:
         # Paged attention state (set by worker when enabled)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
         self._paged_block_size: int = 0
+        self._sdpa_cache_group_index: int = 0
+        self._mamba_cache_group_indices: tuple[int, ...] = ()
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
@@ -631,6 +645,45 @@ class MetalModelRunner:
         This method exists to satisfy the engine's initialization protocol.
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+        self._configure_scheduler_cache_groups(kv_cache_config)
+
+    def _configure_scheduler_cache_groups(self, kv_cache_config: KVCacheConfig) -> None:
+        """Resolve the scheduler group used by Metal SDPA and retain Mamba IDs."""
+        mamba_groups = tuple(
+            group_idx
+            for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        )
+        self._mamba_cache_group_indices = mamba_groups
+        if not self.is_hybrid:
+            self._sdpa_cache_group_index = 0
+            return
+
+        sdpa_groups = tuple(
+            group_idx
+            for group_idx in range(len(kv_cache_config.kv_cache_groups))
+            if group_idx not in mamba_groups
+        )
+        if len(sdpa_groups) != 1:
+            raise RuntimeError(
+                "Metal hybrid paging requires exactly one scheduler SDPA cache "
+                f"group, got {sdpa_groups}"
+            )
+        if not mamba_groups:
+            raise RuntimeError("Metal hybrid paging found no scheduler Mamba groups")
+        self._sdpa_cache_group_index = sdpa_groups[0]
+
+    def _sdpa_block_ids(
+        self,
+        block_tables: CacheBlockTables,
+    ) -> list[int]:
+        if not block_tables:
+            return []
+        if self._sdpa_cache_group_index >= len(block_tables):
+            raise RuntimeError(
+                "Scheduler block tables are missing the configured SDPA group"
+            )
+        return list(block_tables[self._sdpa_cache_group_index])
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -649,6 +702,10 @@ class MetalModelRunner:
             Block size in bytes
         """
         return self._cache_policy.get_cache_block_size_bytes()
+
+    def get_scheduler_cache_block_size_bytes(self) -> int:
+        """Bytes per uniform page for upstream scheduler capacity planning."""
+        return self._cache_policy.get_scheduler_cache_block_size_bytes()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Bytes for one request's linear attention state across all GDN layers."""
@@ -1097,6 +1154,14 @@ class MetalModelRunner:
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
                 runtime.populate_step_context(req_ids=step_req_ids, ctx=ctx)
+                for pr in prefill_reqs:
+                    if pr.start_pos <= 0:
+                        continue
+                    runtime.restore_prefix(
+                        pr.req_id,
+                        pr.block_tables,
+                        pr.start_pos,
+                    )
 
             # ---- forward (lazy graph + async submit) ----
             offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
@@ -1211,6 +1276,27 @@ class MetalModelRunner:
             segment.draft_token_ids for segment in decode_segments
         )
         self._draft_token_ids = None
+
+        # Persist every post-forward GDN state (decode and prefill) into the
+        # physical Mamba destination selected by the scheduler. The runtime
+        # materializes compact pending state before making immutable copies.
+        runtime = self._paged_attention_runtime
+        if runtime is not None and runtime.needs_step_context():
+            checkpoints: list[tuple[str, CacheBlockTables, int]] = []
+            for segment, (req_id, state) in zip(
+                decode_segments, decode_reqs, strict=True
+            ):
+                checkpoints.append(
+                    (
+                        req_id,
+                        state.block_tables,
+                        segment.cache_start_pos + segment.num_query_tokens,
+                    )
+                )
+            for pr in prefill_reqs:
+                end_pos = pr.start_pos + len(pr.token_ids)
+                checkpoints.append((pr.req_id, pr.block_tables, end_pos))
+            runtime.checkpoint_blocks(checkpoints)
 
         if pooling_hidden_states is not None:
             finish_paged_pooling_batch(
@@ -1396,6 +1482,7 @@ class MetalModelRunner:
                     generator=prefill.generator,
                     generated_tokens=1,
                     block_ids=prefill.block_ids,
+                    block_tables=prefill.block_tables,
                     lora_id=prefill.lora_id,
                     mrope_position_delta=mm_delta,
                 )
@@ -1858,7 +1945,8 @@ class MetalModelRunner:
             generator = _create_request_generator(self.device, sampling_params)
 
             if self._paged_attention_runtime is not None:
-                sched_block_ids = list(new_req.block_ids[0])
+                sched_block_tables = _copy_cache_block_tables(new_req.block_ids)
+                sched_block_ids = self._sdpa_block_ids(sched_block_tables)
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
@@ -1881,6 +1969,7 @@ class MetalModelRunner:
                             start_pos=computed_tokens,
                             full_prompt_token_ids=None,
                             lora_id=lora_id,
+                            block_tables=sched_block_tables,
                         ),
                         result_mode="intermediate" if is_intermediate else "new_final",
                     )
@@ -1898,6 +1987,7 @@ class MetalModelRunner:
                         generator=generator,
                         generated_tokens=0,
                         block_ids=sched_block_ids,
+                        block_tables=sched_block_tables,
                         lora_id=lora_id,
                     )
                 continue
@@ -1917,6 +2007,7 @@ class MetalModelRunner:
                 generator=generator,
                 generated_tokens=1,
                 block_ids=[],
+                block_tables=(),
                 lora_id=lora_id,
             )
 
@@ -1930,13 +2021,15 @@ class MetalModelRunner:
         """
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
+            block_tables = _copy_cache_block_tables(new_req.block_ids)
             self._request_states[new_req.req_id] = RequestState(
                 token_ids=token_ids,
                 prompt_len=len(token_ids),
                 cache=[],
                 sampling_params=new_req.sampling_params or SamplingParams(),
                 pooling_params=new_req.pooling_params,
-                block_ids=list(new_req.block_ids[0]) if new_req.block_ids else [],
+                block_ids=self._sdpa_block_ids(block_tables),
+                block_tables=block_tables,
             )
 
         cached = scheduler_output.scheduled_cached_reqs
@@ -1971,11 +2064,29 @@ class MetalModelRunner:
             resumed = req_id in cached_reqs.resumed_req_ids
             if not resumed:
                 if new_block_ids is not None:
-                    state.block_ids.extend(new_block_ids[0])
+                    additions = _copy_cache_block_tables(new_block_ids)
+                    if state.block_tables:
+                        if len(additions) != len(state.block_tables):
+                            raise RuntimeError(
+                                "Scheduler changed cache-group count for a "
+                                f"resident request {req_id!r}"
+                            )
+                        state.block_tables = tuple(
+                            [*table, *new_ids]
+                            for table, new_ids in zip(
+                                state.block_tables,
+                                additions,
+                                strict=True,
+                            )
+                        )
+                    else:
+                        state.block_tables = additions
+                    state.block_ids = self._sdpa_block_ids(state.block_tables)
                 continue
 
             assert new_block_ids is not None
-            state.block_ids = list(new_block_ids[0])
+            state.block_tables = _copy_cache_block_tables(new_block_ids)
+            state.block_ids = self._sdpa_block_ids(state.block_tables)
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
 
@@ -2021,6 +2132,7 @@ class MetalModelRunner:
                             start_pos=computed_tokens,
                             full_prompt_token_ids=None,
                             lora_id=state.lora_id,
+                            block_tables=state.block_tables,
                         ),
                         result_mode=(
                             "intermediate" if is_intermediate else "cached_final"
@@ -2096,6 +2208,7 @@ class MetalModelRunner:
                     start_pos=prefill.start_pos,
                     full_prompt_token_ids=full_prompt,
                     lora_id=prefill.lora_id,
+                    block_tables=prefill.block_tables,
                 )
             )
 
@@ -2254,6 +2367,22 @@ class MetalModelRunner:
             or has_unsupported_non_paged_structured_output
             or bool(missing_cached_state_req_ids)
         )
+
+        # ``new_block_ids_to_zero`` is not guaranteed to enumerate Mamba
+        # allocations in every compatible vLLM scheduler.  Treat it only as a
+        # best-effort way to release stale snapshot memory.  In the supported
+        # local-prefill-only scope, correctness does not depend on this metadata:
+        # block snapshots are keyed solely by physical block ID, carry their GDN
+        # layer owner set, fail closed on an owner mismatch, and are overwritten
+        # whenever a GDN destination block is computed before it can become a
+        # cache-hit source. Platform validation rejects KV transfer/disaggregated
+        # prefill because those paths could reuse an ID without locally computing
+        # and replacing its GDN checkpoint.
+        runtime = self._paged_attention_runtime
+        new_block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+        invalidate_blocks = getattr(runtime, "invalidate_blocks", None)
+        if invalidate_blocks is not None and new_block_ids_to_zero is not None:
+            invalidate_blocks(new_block_ids_to_zero)
 
         # Scheduler cleanup is independent of whether this step's work is
         # supported. If the next check raises, old request state must still be

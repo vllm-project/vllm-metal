@@ -61,7 +61,9 @@ class TestWorkerRunnerBoundaryDelegation:
             paged_attention_runtime=None,
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
-        worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
+        worker.get_scheduler_cache_block_size_bytes = MagicMock(
+            return_value=block_size_bytes
+        )
 
         def _fake_setup(*, overhead: int) -> None:
             model_runner.paged_attention_runtime = SimpleNamespace(
@@ -80,7 +82,7 @@ class TestWorkerRunnerBoundaryDelegation:
         assert available == num_blocks * block_size_bytes
         model_runner.profile_run.assert_called_once_with()
         setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
-        worker.get_cache_block_size_bytes.assert_called_once_with()
+        worker.get_scheduler_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
         """Test MLX path returns one max-length sequence estimate (PR #229)."""
@@ -189,6 +191,36 @@ class TestOneSequenceKvBytes:
         expected = runner.num_linear_layers * (conv_bytes + recurrent_bytes)
 
         assert runner.linear_cache_bytes_per_slot() == expected
+
+    def test_experimental_gdn_apc_bills_one_scheduler_mamba_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_EXPERIMENTAL_GDN_APC", "1")
+        runner = make_stub_runner(
+            model_args={"full_attention_interval": 4},
+            num_sdpa_layers=10,
+            num_kv_heads=16,
+            head_dim=128,
+            kv_cache_dtype=mx.float16,
+            linear_conv_kernel_dim=4,
+            linear_conv_dim=8192,
+            linear_num_v_heads=32,
+            linear_value_head_dim=128,
+            linear_key_head_dim=128,
+            num_linear_layers=30,
+            cache_config=SimpleNamespace(block_size=16),
+        )
+
+        sdpa_page = 2 * 16 * 10 * 16 * 128 * mx.float16.size
+        conv_per_layer = 3 * 8192 * mx.float16.size
+        recurrent_per_layer = 32 * 128 * 128 * mx.float32.size
+        # vLLM groups Qwen3.6's 30 GDN layers into three 10-layer groups.
+        mamba_group_page = 10 * (conv_per_layer + recurrent_per_layer)
+
+        assert (
+            runner.get_cache_block_size_bytes()
+            == sdpa_page + mamba_group_page
+        )
 
     def test_block_alignment_rounds_up_token_count(self) -> None:
         """When block_size doesn't divide max_model_len evenly, the token
