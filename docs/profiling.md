@@ -49,9 +49,9 @@ llm = LLM(
     },
 )
 
-llm.start_profile(profile_prefix="my_run")        # → start_capture
+llm.start_profile(profile_prefix="my_run")  # → start_capture
 out = llm.generate(["Hello"], SamplingParams(max_tokens=8))
-llm.stop_profile()                                # → stop_capture
+llm.stop_profile()  # → stop_capture
 
 # Trace lands at /tmp/metal-trace/my_run_dp0_pp0_tp0.gputrace
 ```
@@ -118,6 +118,7 @@ vllm serve Qwen/Qwen3-0.6B \
 ```python
 # Or, equivalent offline-LLM form. Bound capture work with max_tokens.
 from vllm import LLM, SamplingParams
+
 llm = LLM(
     model="Qwen/Qwen3-0.6B",
     profiler_config={"profiler": "torch", "torch_profiler_dir": "/tmp/metal-trace"},
