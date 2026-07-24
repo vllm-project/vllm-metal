@@ -54,6 +54,12 @@ class ProposeContext:
     num_decode_segments: int
     num_speculative_tokens: int
     logitsprocs: LogitsProcessors | None
+    # Request ids the scheduler finished this step. vLLM can hand a finished
+    # id straight back out to a new request in the same step, so a proposer
+    # that keeps its own per-request state must clear against this, not
+    # against absence from request_states (which the new request repopulates
+    # under the same id).
+    finished_req_ids: set[str]
 
 
 class MetalProposer(Protocol):

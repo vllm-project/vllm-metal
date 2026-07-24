@@ -1433,6 +1433,7 @@ class MetalModelRunner:
             num_decode_segments=num_decode_segments,
             num_speculative_tokens=num_speculative_tokens,
             logitsprocs=self._logitsprocs,
+            finished_req_ids=scheduler_output.finished_req_ids,
         )
         self._draft_token_ids = (
             self._drafter.propose(draft_ctx) if self._drafter is not None else None
