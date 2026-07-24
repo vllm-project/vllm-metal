@@ -215,6 +215,22 @@ class TestV1MetalModelRunnerSampleTokens:
         assert out is None
 
 
+class TestPagedBlockIds:
+    def test_copies_only_runtime_scheduler_groups(self) -> None:
+        runner = make_stub_runner(_paged_block_size=4)
+
+        block_ids = runner._copy_paged_block_ids(([1, 2], [9]))
+
+        assert block_ids == [[1, 2]]
+
+    def test_rejects_missing_runtime_scheduler_group(self) -> None:
+        runner = make_stub_runner(_paged_block_size=4)
+        runner._paged_scheduler_group_indices = (1,)
+
+        with pytest.raises(ValueError, match="required cache groups"):
+            runner._copy_paged_block_ids(([1, 2],))
+
+
 class TestV1MetalModelRunnerSpecDecodeVerification:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(
@@ -508,6 +524,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._paged_group_block_sizes = (4,)
+        runner._paged_scheduler_group_indices = (0,)
         scheduler_output = self._make_scheduler_output({"p0": 1, "p1": 1}, {})
         prefill_reqs = [
             mr.PrefillRequest(
@@ -1795,6 +1812,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._paged_group_block_sizes = (4,)
+        runner._paged_scheduler_group_indices = (0,)
         runner._paged_request_seq_lens["decode-0"] = 1
 
         captured: dict[str, object] = {}
