@@ -79,6 +79,20 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             sliding_window_per_layer=self._sliding_window_per_layer,
         )
 
+    def adopt_layout(self, layout: MHAKVCacheLayout) -> None:
+        """Replace the legacy dense cache with vLLM's grouped MHA layout."""
+        self._require_initialized("adopt_layout")
+        if self._turboquant:
+            raise NotImplementedError(
+                "layout-backed MHA runtime does not support TurboQuant"
+            )
+
+        from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+
+        self._layout = layout
+        self._block_size = layout.group_block_sizes[0]
+        self._cache = MetalPagedKVCache.from_layout(layout, self._dtype)
+
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by this runtime."""
         if self._layout is None:

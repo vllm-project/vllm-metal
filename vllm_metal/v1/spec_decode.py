@@ -334,7 +334,7 @@ class SpeculativeDecodeController:
                     token_id=sampled_ids[-1],
                     target_hidden_row=segment.start_row + accepted_offset,
                     target_position=segment.cache_start_pos + accepted_offset,
-                    block_ids=segment.block_ids[0],
+                    block_ids=segment.block_ids,
                 )
             )
 
@@ -357,7 +357,7 @@ class SpeculativeDecodeController:
                     token_id=token_id,
                     target_hidden_row=prefill_end - 1,
                     target_position=prefill.start_pos + len(prefill.token_ids) - 1,
-                    block_ids=tuple(prefill.block_ids[0]),
+                    block_ids=tuple(tuple(group) for group in prefill.block_ids),
                 )
             )
 
