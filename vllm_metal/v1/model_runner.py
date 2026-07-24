@@ -397,13 +397,20 @@ class MetalModelRunner:
         kernel's window mode serves: MLA native decode and the GDN
         pure-decode check admit only one-row segments, and heads past
         PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for the
-        tiled one.
+        tiled one.  The head bound uses the resolved per-layer maximum:
+        variable-head models widen their full-attention layers past the
+        config head size (head_dim_per_layer), and every layer of the
+        step shares one verify layout.
         """
+        head_dims = self.head_dim_per_layer
+        max_head_dim = (
+            max(head_dims) if head_dims else self.model_config.get_head_size()
+        )
         return (
             envs.VLLM_METAL_SPEC_VERIFY_WINDOW
             and not self.is_mla
             and not self.is_hybrid
-            and self.model_config.get_head_size() <= PA_WINDOW_MAX_HEAD_SIZE
+            and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
         )
 
     @property
