@@ -391,30 +391,74 @@ class TestHybridGDNStateManager:
             "misses": 0,
         }
 
-    def test_partial_block_state_is_not_published(self) -> None:
-        cache = _make_cache(num_layers=1, max_seqs=1)
+    def test_partial_block_state_does_not_overwrite_aligned_snapshot(self) -> None:
+        cache = _make_cache(num_layers=1, max_seqs=2)
         manager = HybridGDNStateManager(cache, block_size=4)
         manager.configure_cache_groups(
             num_blocks=16,
             block_size=4,
             mamba_group_layers={0: (0,)},
         )
-        manager.assign_step_slots(["partial"])
+        seed_slot = manager.assign_step_slots(["seed"])[0]
+        conv = cache.conv_states[0]
+        conv[seed_slot] = 7
+        cache.conv_states[0] = conv
+        recurrent = cache.recurrent_states[0]
+        recurrent[seed_slot] = 11
+        cache.recurrent_states[0] = recurrent
+        manager.checkpoint_blocks([("seed", ([5],), 4)])
+        aligned_stats = manager.block_snapshot_stats.copy()
 
-        manager.checkpoint_blocks([("partial", ([5],), 3)])
+        conv = cache.conv_states[0]
+        conv[seed_slot] = 19
+        cache.conv_states[0] = conv
+        recurrent = cache.recurrent_states[0]
+        recurrent[seed_slot] = 23
+        cache.recurrent_states[0] = recurrent
+        manager.checkpoint_blocks([("seed", ([5],), 3)])
 
-        assert manager.block_snapshot_ids == ()
-        assert manager.block_snapshot_stats == {
-            "count": 0,
-            "bytes": 0,
-            "peak_count": 0,
-            "peak_bytes": 0,
-            "stores": 0,
-            "replacements": 0,
-            "invalidations": 0,
-            "hits": 0,
-            "misses": 0,
-        }
+        assert manager.block_snapshot_ids == (5,)
+        assert manager.block_snapshot_stats == aligned_stats
+        manager.release_requests({"seed"})
+        hit_slot = manager.assign_step_slots(["hit"])[0]
+        assert manager.restore_prefix("hit", ([5],), 4)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][hit_slot]), 7)
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][hit_slot]), 11
+        )
+
+    def test_mixed_aligned_unaligned_checkpoint_batch(self) -> None:
+        cache = _make_cache(num_layers=1, max_seqs=2)
+        manager = HybridGDNStateManager(cache, block_size=4)
+        manager.configure_cache_groups(
+            num_blocks=16,
+            block_size=4,
+            mamba_group_layers={0: (0,)},
+        )
+        aligned_slot, partial_slot = manager.assign_step_slots(
+            ["aligned", "partial"]
+        )
+        conv = cache.conv_states[0]
+        conv[aligned_slot] = 5
+        conv[partial_slot] = 17
+        cache.conv_states[0] = conv
+        recurrent = cache.recurrent_states[0]
+        recurrent[aligned_slot] = 7
+        recurrent[partial_slot] = 19
+        cache.recurrent_states[0] = recurrent
+
+        manager.checkpoint_blocks(
+            [
+                ("aligned", ([6],), 4),
+                ("partial", ([7],), 3),
+            ]
+        )
+
+        assert manager.block_snapshot_ids == (6,)
+        stats = manager.block_snapshot_stats
+        assert stats["count"] == 1
+        assert stats["stores"] == 1
+        assert stats["replacements"] == 0
 
     def test_divergent_suffixes_restore_same_authoritative_prefix(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=1)

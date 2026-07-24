@@ -309,8 +309,8 @@ class HybridGDNStateManager:
             # Partial/decode states live in transient rolling blocks and must
             # never replace a reusable checkpoint for the same physical ID.
             if num_computed_tokens % self._block_size != 0:
-                logger.info(
-                    "GDN_BLOCK_SNAPSHOT_SKIP_UNALIGNED req=%s tokens=%d "
+                logger.debug(
+                    "GDN_BLOCK_SNAPSHOT_SKIP_UNALIGNED req_id=%s tokens=%d "
                     "block_size=%d",
                     req_id,
                     num_computed_tokens,
