@@ -88,6 +88,13 @@ class _DraftPlan:
     ingest_tokens: list[int]
 
 
+# Ingests at or below this size are submitted as expanded decode rows instead
+# of a prefill segment (see _ingest_and_draft_first). Covers the steady-state
+# K+1-token ingest for any practical num_speculative_tokens while keeping
+# full-prompt catch-up ingests on the tiled prefill kernel.
+_DECODE_INGEST_MAX_TOKENS = 16
+
+
 class DraftModelProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
@@ -280,10 +287,6 @@ class DraftModelProposer:
     def _ingest_and_draft_first(
         self, plans: list[_DraftPlan], offset_caches: list[OffsetCache]
     ) -> mx.array:
-        prefill_specs = [
-            (plan.block_ids, len(plan.ingest_tokens), plan.draft_seq_len)
-            for plan in plans
-        ]
         packed: list[int] = []
         last_rows: list[int] = []
         for plan in plans:
@@ -291,7 +294,25 @@ class DraftModelProposer:
             last_rows.append(len(packed) - 1)
         input_ids = mx.array([packed], dtype=mx.int32)
 
-        prepare_unified([], prefill_specs, self._block_size)
+        # The steady-state ingest (K+1 committed tokens per accepted round)
+        # rides the decode path as one single-query segment per token — the
+        # same shape the target's verify rows use. Submitting it as a prefill
+        # segment routes the whole forward to the tiled prefill kernel, which
+        # reads the entire context regardless of query size: ~70 ms vs ~11 ms
+        # per pass at an 8k prefix (#482, Problem 2). Large ingests (the
+        # first-propose catch-up) stay on the tiled path, where it wins.
+        if max(len(plan.ingest_tokens) for plan in plans) <= _DECODE_INGEST_MAX_TOKENS:
+            decode_specs = [
+                (plan.block_ids, plan.draft_seq_len, len(plan.ingest_tokens))
+                for plan in plans
+            ]
+            prepare_unified(decode_specs, [], self._block_size)
+        else:
+            prefill_specs = [
+                (plan.block_ids, len(plan.ingest_tokens), plan.draft_seq_len)
+                for plan in plans
+            ]
+            prepare_unified([], prefill_specs, self._block_size)
         try:
             logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
         finally:
