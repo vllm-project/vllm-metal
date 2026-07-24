@@ -47,6 +47,14 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
+from vllm.utils.hashing import sha256_cbor
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    hash_block_tokens,
+    init_none_hash,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.attention.context import (
@@ -69,6 +77,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The draft cache is a single, non-hybrid KV cache group (draft models here
+# are plain transformers), so every block hash uses the same group id.
+_GROUP_ID = 0
+
 
 @dataclass(frozen=True, slots=True)
 class _DraftDims:
@@ -86,6 +98,7 @@ class _DraftPlan:
     committed_len: int
     draft_seq_len: int
     ingest_tokens: list[int]
+    prefix_hashes: list[Any]
 
 
 class DraftModelProposer:
@@ -115,8 +128,27 @@ class DraftModelProposer:
         # what the target has committed, so it cannot reuse the target's
         # block_ids (those exactly fit the committed length and run out at the
         # next block boundary). Each request draws draft blocks from this pool.
-        self._free_blocks: list[int] = list(range(num_blocks))
         self._req_blocks: dict[str, list[int]] = {}
+        # Content-based prefix cache so shared/repeated draft prefixes reuse
+        # draft KV blocks instead of re-prefilling the prompt (#482 direction 1).
+        # BlockPool gives us hash-keyed caching, refcounting, and an
+        # eviction-ordered free queue for free — the same machinery the
+        # target's own KV cache uses — instead of hand-rolling it.
+        self._caching_hash_fn = sha256_cbor
+        init_none_hash(self._caching_hash_fn)
+        # BlockPool reserves block id 0 as a permanent null placeholder (never
+        # issued), so usable capacity here is num_blocks - 1 -- the same
+        # convention vLLM's own target-side pool uses.
+        self._pool = BlockPool(
+            num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=block_size
+        )
+        # Per-request incremental hashing/registration progress: how many
+        # full prefix blocks have already been hashed and registered, so a
+        # step only pays for newly-completed blocks instead of rescanning
+        # from token 0 every propose() call. Committed tokens are append-only
+        # for the lifetime of a request id, so this is safe to cache.
+        self._prefix_hashes: dict[str, list[Any]] = {}
+        self._registered_upto: dict[str, int] = {}
 
     # -- construction --------------------------------------------------------
 
@@ -201,6 +233,7 @@ class DraftModelProposer:
         # The draft cache now holds KV through committed_len for each request.
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
+            self._register_prefix(plan)
 
         return DraftTokenIds(
             req_ids=[plan.req_id for plan in plans],
@@ -212,10 +245,35 @@ class DraftModelProposer:
     def _prune_finished(self, request_states: Any) -> None:
         for req_id in list(self._req_blocks.keys()):
             if req_id not in request_states:
-                self._free_blocks.extend(self._req_blocks.pop(req_id))
+                blocks = self._req_blocks.pop(req_id)
+                # Free tail-first: mirrors vLLM's own free() convention
+                # (single_type_kv_cache_manager.py) so the pool's eviction
+                # queue prioritizes reclaiming a chain's tail before its
+                # root, and a still-shared root isn't left orphaned by a
+                # premature reclaim of the blocks that depend on it.
+                self._pool.free_blocks(
+                    [self._pool.blocks[blk] for blk in reversed(blocks)]
+                )
+                self._prefix_hashes.pop(req_id, None)
+                self._registered_upto.pop(req_id, None)
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
+
+    def _register_prefix(self, plan: _DraftPlan) -> None:
+        """Map each newly-filled prompt block not yet registered for this
+        request to its physical draft block, so a later request sharing this
+        prefix can reuse the KV. Only scans blocks added since the last call
+        for this request id."""
+        start = self._registered_upto.get(plan.req_id, 0)
+        end = min(len(plan.prefix_hashes), len(plan.block_ids))
+        for i in range(start, end):
+            key = make_block_hash_with_group_id(plan.prefix_hashes[i], _GROUP_ID)
+            if self._pool.cached_block_hash_to_block.get_one_block(key) is None:
+                blk = self._pool.blocks[plan.block_ids[i]]
+                blk.set_block_hash(key)
+                self._pool.cached_block_hash_to_block.insert(key, blk)
+        self._registered_upto[plan.req_id] = end
 
     def _collect_draft_plans(
         self, ctx: ProposeContext, num_speculative_tokens: int
@@ -239,11 +297,56 @@ class DraftModelProposer:
                 plans.append(plan)
         return plans
 
+    def _hash_prefix_blocks(self, req_id: str, token_ids: list[int]) -> list[Any]:
+        """Chained content hashes, one per full ``_block_size`` block of
+        ``token_ids`` (the trailing partial block is not hashed). Each hash
+        fingerprints the whole prefix ending at its block boundary, so a hash
+        match implies identical tokens all the way back to the start.
+
+        Extends this request's previously computed hashes rather than
+        rehashing from token 0: ``token_ids`` only ever grows for a given
+        request id (committed tokens are never rewritten), so blocks already
+        hashed can't change."""
+        hashes = self._prefix_hashes.setdefault(req_id, [])
+        n_full = len(token_ids) // self._block_size
+        parent = hashes[-1] if hashes else None
+        for i in range(len(hashes), n_full):
+            block = token_ids[i * self._block_size : (i + 1) * self._block_size]
+            h = hash_block_tokens(self._caching_hash_fn, parent, block, None)
+            hashes.append(h)
+            parent = h
+        return hashes
+
     def _make_plan(
         self, req_id: str, state: RequestState, num_speculative_tokens: int
     ) -> _DraftPlan | None:
         committed_len = len(state.token_ids)
         draft_seq_len = self._draft_seq_lens.get(req_id, 0)
+        prefix_hashes = self._hash_prefix_blocks(
+            req_id, state.token_ids[:committed_len]
+        )
+        # Prefix reuse: for a fresh request, reuse cached draft blocks for the
+        # longest matching leading run of full prompt blocks, so only the
+        # uncached suffix is ingested.
+        if draft_seq_len == 0 and req_id not in self._req_blocks:
+            reused: list[KVCacheBlock] = []
+            for h in prefix_hashes:
+                key = make_block_hash_with_group_id(h, _GROUP_ID)
+                blk = self._pool.cached_block_hash_to_block.get_one_block(key)
+                if blk is None:
+                    break
+                reused.append(blk)
+            # A drafting position must remain: never reuse the whole committed
+            # length, or there is nothing to ingest and no row to draft from.
+            while reused and len(reused) * self._block_size >= committed_len:
+                reused.pop()
+            if reused:
+                self._pool.touch(reused)
+                self._req_blocks[req_id] = [blk.block_id for blk in reused]
+                draft_seq_len = len(reused) * self._block_size
+                # These blocks are already registered (that's how they were
+                # found); skip re-checking them on the next _register_prefix.
+                self._registered_upto[req_id] = len(reused)
         if draft_seq_len >= committed_len:
             # No newly committed tokens to ingest (should not happen for an
             # accepted decode step or a finalized prefill); skip rather than
@@ -260,21 +363,27 @@ class DraftModelProposer:
             committed_len=committed_len,
             draft_seq_len=draft_seq_len,
             ingest_tokens=list(state.token_ids[draft_seq_len:committed_len]),
+            prefix_hashes=prefix_hashes,
         )
 
     def _ensure_draft_blocks(self, req_id: str, num_positions: int) -> list[int]:
-        """Grow this request's draft block table to cover ``num_positions``."""
+        """Grow this request's draft block table to cover ``num_positions``,
+        drawing new blocks from the pool (which evicts idle cached blocks
+        under pressure) if needed."""
         needed = (num_positions + self._block_size - 1) // self._block_size
         blocks = self._req_blocks.setdefault(req_id, [])
-        while len(blocks) < needed:
-            if not self._free_blocks:
+        n_more = needed - len(blocks)
+        if n_more > 0:
+            try:
+                new_blocks = self._pool.get_new_blocks(n_more)
+            except ValueError as e:
                 raise RuntimeError(
                     f"Draft KV cache exhausted: request {req_id!r} needs "
                     f"{needed} blocks but the draft pool is empty "
                     f"({len(self._req_blocks)} active requests). "
                     "Lower --max-num-seqs or raise VLLM_METAL_MEMORY_FRACTION."
-                )
-            blocks.append(self._free_blocks.pop())
+                ) from e
+            blocks.extend(blk.block_id for blk in new_blocks)
         return blocks
 
     def _ingest_and_draft_first(
