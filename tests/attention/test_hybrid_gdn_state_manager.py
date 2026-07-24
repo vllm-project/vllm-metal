@@ -391,6 +391,31 @@ class TestHybridGDNStateManager:
             "misses": 0,
         }
 
+    def test_partial_block_state_is_not_published(self) -> None:
+        cache = _make_cache(num_layers=1, max_seqs=1)
+        manager = HybridGDNStateManager(cache, block_size=4)
+        manager.configure_cache_groups(
+            num_blocks=16,
+            block_size=4,
+            mamba_group_layers={0: (0,)},
+        )
+        manager.assign_step_slots(["partial"])
+
+        manager.checkpoint_blocks([("partial", ([5],), 3)])
+
+        assert manager.block_snapshot_ids == ()
+        assert manager.block_snapshot_stats == {
+            "count": 0,
+            "bytes": 0,
+            "peak_count": 0,
+            "peak_bytes": 0,
+            "stores": 0,
+            "replacements": 0,
+            "invalidations": 0,
+            "hits": 0,
+            "misses": 0,
+        }
+
     def test_divergent_suffixes_restore_same_authoritative_prefix(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=1)
         manager = HybridGDNStateManager(cache, block_size=4)

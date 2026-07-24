@@ -303,12 +303,25 @@ class HybridGDNStateManager:
         for req_id, block_tables, num_computed_tokens in checkpoints:
             if num_computed_tokens <= 0:
                 continue
+            assert self._block_size is not None
+            # ``mamba_cache_mode=align`` publishes a reusable state only when
+            # the scheduler step ends exactly on a Mamba block boundary.
+            # Partial/decode states live in transient rolling blocks and must
+            # never replace a reusable checkpoint for the same physical ID.
+            if num_computed_tokens % self._block_size != 0:
+                logger.info(
+                    "GDN_BLOCK_SNAPSHOT_SKIP_UNALIGNED req=%s tokens=%d "
+                    "block_size=%d",
+                    req_id,
+                    num_computed_tokens,
+                    self._block_size,
+                )
+                continue
             slot = self._req_to_slot.get(req_id)
             if slot is None:
                 raise RuntimeError(f"No GDN state slot exists for request {req_id!r}")
             self._require_block_tables(block_tables)
-            assert self._block_size is not None
-            logical_block_idx = (num_computed_tokens - 1) // self._block_size
+            logical_block_idx = num_computed_tokens // self._block_size - 1
             for group_idx, layer_indices in self._mamba_group_layers.items():
                 block_id = self._physical_block(
                     block_tables,
