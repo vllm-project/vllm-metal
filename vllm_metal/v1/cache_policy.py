@@ -306,7 +306,9 @@ class ModelCachePolicy:
                     torch_dtype=torch_dtype,
                     page_size_padded=self._runner.cache_config.mamba_page_size_padded,
                     block_size=block_size,
-                    mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
+                    mamba_cache_mode=getattr(
+                        self._runner.cache_config, "mamba_cache_mode", "none"
+                    ),
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -348,7 +350,11 @@ class ModelCachePolicy:
         """
         runtime = self._runner.paged_attention_runtime
         if runtime is not None:
-            runtime.configure_cache_groups(kv_cache_config)
+            configure_cache_groups = getattr(
+                runtime, "configure_cache_groups", None
+            )
+            if configure_cache_groups is not None:
+                configure_cache_groups(kv_cache_config)
         if self._runner.is_hybrid and envs.VLLM_METAL_EXPERIMENTAL_GDN_APC:
             mamba_group_sizes = [
                 len(group.layer_names)

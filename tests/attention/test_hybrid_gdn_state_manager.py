@@ -343,12 +343,53 @@ class TestHybridGDNStateManager:
         )
         manager.assign_step_slots(["seed"])
         manager.checkpoint_blocks([("seed", ([5],), 4)])
+        checkpoint_bytes = manager.block_snapshot_stats["bytes"]
+        assert checkpoint_bytes > 0
         manager.invalidate_blocks([5])
         manager.release_requests({"seed"})
         manager.assign_step_slots(["hit"])
 
         with pytest.raises(RuntimeError, match="physical Mamba block 5"):
             manager.restore_prefix("hit", ([5],), 4)
+
+        assert manager.block_snapshot_stats == {
+            "count": 0,
+            "bytes": 0,
+            "peak_count": 1,
+            "peak_bytes": checkpoint_bytes,
+            "stores": 1,
+            "replacements": 0,
+            "invalidations": 1,
+            "hits": 0,
+            "misses": 1,
+        }
+
+    def test_checkpoint_replacement_keeps_snapshot_bytes_bounded(self) -> None:
+        cache = _make_cache(num_layers=1, max_seqs=1)
+        manager = HybridGDNStateManager(cache, block_size=4)
+        manager.configure_cache_groups(
+            num_blocks=16,
+            block_size=4,
+            mamba_group_layers={0: (0,)},
+        )
+        manager.assign_step_slots(["seed"])
+
+        manager.checkpoint_blocks([("seed", ([5],), 4)])
+        first_stats = manager.block_snapshot_stats
+        manager.checkpoint_blocks([("seed", ([5],), 4)])
+
+        assert manager.block_snapshot_ids == (5,)
+        assert manager.block_snapshot_stats == {
+            "count": 1,
+            "bytes": first_stats["bytes"],
+            "peak_count": 1,
+            "peak_bytes": first_stats["bytes"],
+            "stores": 2,
+            "replacements": 1,
+            "invalidations": 0,
+            "hits": 0,
+            "misses": 0,
+        }
 
     def test_divergent_suffixes_restore_same_authoritative_prefix(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=1)

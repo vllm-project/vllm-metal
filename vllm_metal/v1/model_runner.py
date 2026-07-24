@@ -679,11 +679,14 @@ class MetalModelRunner:
     ) -> list[int]:
         if not block_tables:
             return []
-        if self._sdpa_cache_group_index >= len(block_tables):
+        # Minimal test/adapter runners may predate scheduler cache-group
+        # discovery. Group 0 is the historical non-hybrid SDPA default.
+        sdpa_group_index = getattr(self, "_sdpa_cache_group_index", 0)
+        if sdpa_group_index >= len(block_tables):
             raise RuntimeError(
                 "Scheduler block tables are missing the configured SDPA group"
             )
-        return list(block_tables[self._sdpa_cache_group_index])
+        return list(block_tables[sdpa_group_index])
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -2379,7 +2382,9 @@ class MetalModelRunner:
         # prefill because those paths could reuse an ID without locally computing
         # and replacing its GDN checkpoint.
         runtime = self._paged_attention_runtime
-        new_block_ids_to_zero = scheduler_output.new_block_ids_to_zero
+        new_block_ids_to_zero = getattr(
+            scheduler_output, "new_block_ids_to_zero", None
+        )
         invalidate_blocks = getattr(runtime, "invalidate_blocks", None)
         if invalidate_blocks is not None and new_block_ids_to_zero is not None:
             invalidate_blocks(new_block_ids_to_zero)

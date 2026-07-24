@@ -51,6 +51,12 @@ class HybridGDNStateManager:
         self._block_snapshots: dict[int, GDNStateSnapshot] = {}
         self._block_snapshot_hits = 0
         self._block_snapshot_misses = 0
+        self._block_snapshot_stores = 0
+        self._block_snapshot_replacements = 0
+        self._block_snapshot_invalidations = 0
+        self._block_snapshot_bytes = 0
+        self._block_snapshot_peak_count = 0
+        self._block_snapshot_peak_bytes = 0
 
     @property
     def request_slots(self) -> dict[str, int]:
@@ -130,6 +136,21 @@ class HybridGDNStateManager:
         return tuple(sorted(self._block_snapshots))
 
     @property
+    def block_snapshot_stats(self) -> dict[str, int]:
+        """Bounded scheduler-block checkpoint lifecycle counters."""
+        return {
+            "count": len(self._block_snapshots),
+            "bytes": self._block_snapshot_bytes,
+            "peak_count": self._block_snapshot_peak_count,
+            "peak_bytes": self._block_snapshot_peak_bytes,
+            "stores": self._block_snapshot_stores,
+            "replacements": self._block_snapshot_replacements,
+            "invalidations": self._block_snapshot_invalidations,
+            "hits": self._block_snapshot_hits,
+            "misses": self._block_snapshot_misses,
+        }
+
+    @property
     def cache_groups_configured(self) -> bool:
         """Whether scheduler-owned align-mode Mamba groups are installed."""
         return bool(self._mamba_group_layers)
@@ -168,7 +189,10 @@ class HybridGDNStateManager:
     def invalidate_blocks(self, block_ids: Sequence[int]) -> None:
         """Discard checkpoints exactly when scheduler physical blocks are reused."""
         for block_id in block_ids:
-            self._block_snapshots.pop(int(block_id), None)
+            snapshot = self._block_snapshots.pop(int(block_id), None)
+            if snapshot is not None:
+                self._block_snapshot_bytes -= snapshot.nbytes
+                self._block_snapshot_invalidations += 1
 
     def _require_block_tables(self, block_tables: Sequence[Sequence[int]]) -> None:
         if self._block_size is None or not self._mamba_group_layers:
@@ -305,12 +329,33 @@ class HybridGDNStateManager:
                 )
 
         for block_id, snapshot in writes:
+            previous = self._block_snapshots.get(block_id)
+            if previous is not None:
+                self._block_snapshot_bytes -= previous.nbytes
+                self._block_snapshot_replacements += 1
             self._block_snapshots[block_id] = snapshot
+            self._block_snapshot_bytes += snapshot.nbytes
+            self._block_snapshot_stores += 1
+        self._block_snapshot_peak_count = max(
+            self._block_snapshot_peak_count, len(self._block_snapshots)
+        )
+        self._block_snapshot_peak_bytes = max(
+            self._block_snapshot_peak_bytes, self._block_snapshot_bytes
+        )
         logger.info(
-            "GDN_BLOCK_SNAPSHOT_STORE checkpoints=%d blocks=%d bytes=%d",
+            "GDN_BLOCK_SNAPSHOT_STORE checkpoints=%d writes=%d write_bytes=%d "
+            "current_blocks=%d current_bytes=%d peak_blocks=%d peak_bytes=%d "
+            "stores=%d replacements=%d invalidations=%d",
             len(checkpoints),
             len(writes),
             sum(snapshot.nbytes for _, snapshot in writes),
+            len(self._block_snapshots),
+            self._block_snapshot_bytes,
+            self._block_snapshot_peak_count,
+            self._block_snapshot_peak_bytes,
+            self._block_snapshot_stores,
+            self._block_snapshot_replacements,
+            self._block_snapshot_invalidations,
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
