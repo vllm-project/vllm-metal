@@ -340,6 +340,18 @@ def test_windowed_forced_split_family() -> None:
             6,
             r"segment 0 is empty \(0 -> 0\); every window-mode segment needs at least one query row",
         ),
+        (
+            [0, 6],
+            6,
+            0,
+            r"window_seqlen_q must be >= 1 \(1 = per-token decode\), got 0",
+        ),
+        (
+            [0, 6],
+            6,
+            -1,
+            r"window_seqlen_q must be >= 1 \(1 = per-token decode\), got -1",
+        ),
     ],
     ids=[
         "understated",
@@ -349,6 +361,8 @@ def test_windowed_forced_split_family() -> None:
         "cu-start-nonzero",
         "cu-no-segments",
         "empty-segment",
+        "hint-zero",
+        "hint-negative",
     ],
 )
 def test_window_hint_contract_rejected(

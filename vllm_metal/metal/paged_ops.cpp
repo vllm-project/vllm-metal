@@ -678,6 +678,12 @@ static array paged_attention_primitive_fn(
   // window hint and its cu_seqlens_q is a small host-built array, so
   // materializing it to check the real segment lengths is cheap, and the
   // plain-decode path (window_seqlen_q == 1) skips the block entirely.
+  if (window_seqlen_q < 1) {
+    throw std::invalid_argument(
+        "window_seqlen_q must be >= 1 (1 = per-token decode), got " +
+        std::to_string(window_seqlen_q) +
+        "; a non-positive hint would silently select non-window routing");
+  }
   if (window_seqlen_q > 1) {
     const int head_size_q = static_cast<int>(query.shape(2));
     if (head_size_q > kWindowMaxHeadSize) {
