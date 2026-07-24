@@ -43,6 +43,7 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_metal import envs
 from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
@@ -389,14 +390,18 @@ class MetalModelRunner:
     def merge_verify_windows(self) -> bool:
         """Whether spec-verify windows stay one cu_seqlens segment.
 
-        True only for models the decode kernel's window mode serves.  MLA
-        native decode and the GDN pure-decode check admit only one-row
-        segments, and heads past PA_WINDOW_MAX_HEAD_SIZE would leave the
-        decode kernel for the tiled one; those models keep the expanded
-        per-token verify layout their paths were built against.
+        Window mode is opt-in (VLLM_METAL_SPEC_VERIFY_WINDOW): its win is
+        chip- and shape-dependent, so the default keeps the expanded
+        per-token verify layout, which is the pre-window behavior bit for
+        bit.  Even opted in, it is True only for models the decode
+        kernel's window mode serves: MLA native decode and the GDN
+        pure-decode check admit only one-row segments, and heads past
+        PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for the
+        tiled one.
         """
         return (
-            not self.is_mla
+            envs.VLLM_METAL_SPEC_VERIFY_WINDOW
+            and not self.is_mla
             and not self.is_hybrid
             and self.model_config.get_head_size() <= PA_WINDOW_MAX_HEAD_SIZE
         )
