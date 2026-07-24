@@ -136,7 +136,7 @@ def prepare_unified(
     prefill_requests: list[tuple[list[int], int, int]],
     block_size: int,
     *,
-    merge_verify_windows: bool = True,
+    merge_verify_windows: bool = False,
 ) -> None:
     """Compute metadata for a unified prefill + decode forward pass.
 
@@ -155,12 +155,15 @@ def prepare_unified(
             chunk (0 for a fresh prefill, >0 for continuation chunks).
         block_size: tokens per KV cache block.
         merge_verify_windows: keep a multi-token decode request as ONE
-            cu_seqlens segment (the window-mode layout).  Pass False for
-            models the window path does not serve — MLA native decode and
-            the GDN layers of hybrids admit only one-row decode segments,
-            and heads past PA_WINDOW_MAX_HEAD_SIZE would leave the decode
-            kernel for the tiled one — restoring the expanded per-token
-            layout those paths were built against.
+            cu_seqlens segment (the window-mode layout).  Defaults to
+            False — the expanded per-token layout — because window mode
+            is opt-in runtime policy (the runner passes its
+            merge_verify_windows property); a caller must ask for the
+            merged shape explicitly.  Keep False for models the window
+            path does not serve: MLA native decode and the GDN layers of
+            hybrids admit only one-row decode segments, and heads past
+            PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for
+            the tiled one.
     """
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]

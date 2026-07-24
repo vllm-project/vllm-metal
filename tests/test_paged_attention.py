@@ -200,9 +200,12 @@ class TestPrepare:
 
     def test_prepare_unified_spec_decode_keeps_window_whole(self):
         # Speculative verification appends draft rows after the last token.
-        # The window stays ONE multi-token segment (cu_seqlens aligned with
-        # decode requests); per-row causality is the kernel's varlen job.
-        prepare_unified([([5, 6, 7], 7, 3)], [], block_size=4)
+        # With the merged layout requested, the window stays ONE multi-token
+        # segment (cu_seqlens aligned with decode requests); per-row
+        # causality is the kernel's varlen job.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)], [], block_size=4, merge_verify_windows=True
+        )
         ctx = get_context()
 
         assert ctx is not None
@@ -213,6 +216,18 @@ class TestPrepare:
         assert ctx.cu_seqlens == [0, 3]
         assert ctx.verify_window_q == 3
         assert ctx.num_decode_requests == 1
+
+    def test_prepare_unified_defaults_to_expanded_layout(self):
+        # Window mode is opt-in runtime policy: a caller that does not pass
+        # merge_verify_windows gets the expanded per-token layout, never the
+        # experimental merged shape.
+        prepare_unified([([5, 6, 7], 7, 3)], [], block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.context_lens == [8, 9, 10]
+        assert ctx.verify_window_q == 1
 
     def test_prepare_unified_expands_window_when_merge_disabled(self):
         # merge_verify_windows=False restores the expanded per-token layout
@@ -239,7 +254,12 @@ class TestPrepare:
         # merged segment but the batch reports verify_window_q=1, so the
         # dispatch routes it down the tiled path exactly like the
         # non-speculative case (window mode is pure-verification only).
-        prepare_unified([([5, 6, 7], 7, 3)], [([10, 11], 5, 0)], block_size=4)
+        prepare_unified(
+            [([5, 6, 7], 7, 3)],
+            [([10, 11], 5, 0)],
+            block_size=4,
+            merge_verify_windows=True,
+        )
         ctx = get_context()
 
         assert ctx is not None
