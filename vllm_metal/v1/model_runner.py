@@ -331,6 +331,7 @@ class MetalModelRunner:
         # Paged attention state (set by worker when enabled)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
         self._paged_block_size: int = 0
+        self._paged_scheduler_group_indices: tuple[int, ...] = ()
         self._paged_group_block_sizes: tuple[int, ...] = ()
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
@@ -714,19 +715,24 @@ class MetalModelRunner:
         """Record the initialized paged-attention backend owned by this runner."""
         self._paged_attention_runtime = backend
         self._paged_block_size = block_size
+        self._paged_scheduler_group_indices = backend.kv_scheduler_group_indices()
         self._paged_group_block_sizes = backend.kv_group_block_sizes()
 
     def _copy_paged_block_ids(
         self, block_ids: Sequence[Sequence[int]]
     ) -> list[list[int]]:
         """Copy scheduler cache groups owned by the installed paged runtime."""
-        group_count = len(self._paged_group_block_sizes)
-        if len(block_ids) != group_count:
+        missing_group_indices = [
+            index
+            for index in self._paged_scheduler_group_indices
+            if index >= len(block_ids)
+        ]
+        if missing_group_indices:
             raise ValueError(
-                f"scheduler block_ids has {len(block_ids)} cache groups, but "
-                f"the paged runtime requires {group_count}"
+                "scheduler block_ids does not include required cache groups "
+                f"{missing_group_indices}"
             )
-        return [list(block_ids[group_index]) for group_index in range(group_count)]
+        return [list(block_ids[index]) for index in self._paged_scheduler_group_indices]
 
     def install_gemma4_mtp_kv_sharing(
         self,

@@ -79,6 +79,13 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             sliding_window_per_layer=self._sliding_window_per_layer,
         )
 
+    def kv_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return scheduler KV groups consumed by this runtime."""
+        if self._layout is None:
+            return super().kv_scheduler_group_indices()
+        self._require_initialized("kv_scheduler_group_indices")
+        return tuple(range(len(self._layout.group_block_sizes)))
+
     def kv_group_block_sizes(self) -> tuple[int, ...]:
         """Return layout-owned group sizes or the legacy scalar page size."""
         if self._layout is None:
