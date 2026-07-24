@@ -77,7 +77,7 @@ stt = [
 dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.16.0",
     "mypy>=1.19.1",
     "gguf>=0.17.0",
 ]
