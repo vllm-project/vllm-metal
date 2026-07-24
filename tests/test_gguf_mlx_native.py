@@ -24,7 +24,11 @@ from vllm_metal.gguf.mlx_native import (  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
 
-NATIVE_QTYPES = [GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_0]
+NATIVE_QTYPES = [
+    GGMLQuantizationType.Q8_0,
+    GGMLQuantizationType.Q4_0,
+    GGMLQuantizationType.Q4_1,
+]
 
 
 def _write_quantized_gguf(path, weight: np.ndarray, qtype) -> dict[str, mx.array]:
@@ -162,16 +166,8 @@ def test_accepts_int_qweight_type(tmp_path):
     assert rebuilt.qweight_type is GGMLQuantizationType.Q8_0
 
 
-def test_rejects_q4_1_with_mlx_bug_reference(tmp_path):
-    weight = np.random.default_rng(0).standard_normal((32, 64)).astype(np.float32)
-    arrays = _write_quantized_gguf(
-        tmp_path / "q4_1.gguf", weight, GGMLQuantizationType.Q4_1
-    )
-    with pytest.raises(ValueError, match="ml-explore/mlx#3664"):
-        GGUFMLXQuantizedTensor.from_mx_load(
-            arrays, "w.weight", GGMLQuantizationType.Q4_1
-        )
-    assert GGMLQuantizationType.Q4_1 not in MLX_NATIVE_GGUF_TYPES
+def test_q4_1_is_mlx_native():
+    assert GGMLQuantizationType.Q4_1 in MLX_NATIVE_GGUF_TYPES
 
 
 def test_rejects_unsupported_qtype():
@@ -285,11 +281,10 @@ def test_embedding_empty_ids(tmp_path, qtype):
 # --- Real-file parity (opt-in: needs local GGUF files) ------------------------
 #
 # Set VLLM_METAL_TEST_GGUF_PATHS to a comma-separated list of real .gguf files
-# (e.g. a Q8_0 and a Q4_0 model) to run these. They prove the representation and
-# primitives hold on real checkpoints — every MLX-native tensor constructs, with
-# matmul/embedding parity vs the gguf-py dequantize oracle and a quantized-vs-
-# dense memory comparison. Each file is checked for whichever native qtypes it
-# contains, so pointing at a Q4_0 file gives real Q4_0 coverage.
+# to run these. They prove the representation and primitives hold on real
+# checkpoints — every MLX-native tensor constructs, with matmul/embedding parity
+# vs the gguf-py dequantize oracle and a quantized-vs-dense memory comparison.
+# Each file is checked for whichever native qtypes it contains.
 
 _REAL_GGUF_PATHS = [
     p.strip()
@@ -382,8 +377,8 @@ def test_real_file_memory_below_dense(path):
         quantized += qt.qweight.nbytes + qt.scales.nbytes + qt.biases.nbytes
         dense_f16 += qt.out_features * qt.in_features * 2
 
-    # Per weight: Q8_0 ~1.125 bytes, Q4_0 ~0.625 (packed + f16 scale/bias) vs 2
-    # for dense f16, so any native mix stays well under 0.6x dense.
+    # Per weight: Q8_0 ~1.125 bytes, Q4_0/Q4_1 ~0.625 (packed + f16
+    # scale/bias) vs 2 for dense f16, so any native mix stays below 0.6x dense.
     assert quantized < dense_f16 * 0.6
 
 

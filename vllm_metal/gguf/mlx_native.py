@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLX-native quantized GGUF tensors that compute with their packed weights.
 
-MLX's GGUF loader (``mx.load``) repacks Q8_0 and Q4_0 weights into the affine,
-group-32 representation that ``mx.quantized_matmul`` already consumes: a
-``uint32`` packed ``qweight`` alongside ``float16`` ``scales`` and ``biases``.
-``GGUFMLXQuantizedTensor`` wraps that triple in an explicit, validated contract
-and exposes :meth:`~GGUFMLXQuantizedTensor.matmul` /
+MLX's GGUF loader (``mx.load``) repacks Q8_0, Q4_0, and Q4_1 weights into the
+affine, group-32 representation that ``mx.quantized_matmul`` already consumes:
+a ``uint32`` packed ``qweight`` alongside ``float16`` ``scales`` and
+``biases``. ``GGUFMLXQuantizedTensor`` wraps that triple in an explicit,
+validated contract and exposes :meth:`~GGUFMLXQuantizedTensor.matmul` /
 :meth:`~GGUFMLXQuantizedTensor.embedding`, which run on the packed weights so
 supported weights never get expanded into a dense copy.
 
-Q4_1 is deliberately not supported here. MLX's repack mis-decodes Q4_1 blocks
-(it skips a 2-byte block header where Q4_1 uses 4), so ``mx.load`` returns
-corrupted Q4_1 weights. Fix tracked upstream at ml-explore/mlx#3664; Q4_1 can
-join once a fixed MLX release is in our supported range. K-quants and other
-qtypes MLX does not repack natively are out of scope for this path.
+K-quants and other qtypes MLX does not repack natively are out of scope for
+this path.
 """
 
 from __future__ import annotations
@@ -32,11 +29,11 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
 
-# qtypes MLX repacks into its affine representation (see module docstring for
-# why Q4_1 is excluded despite being a 4-bit standard qtype).
+# qtypes MLX repacks into its affine representation.
 _BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q8_0: 8,
     GGMLQuantizationType.Q4_0: 4,
+    GGMLQuantizationType.Q4_1: 4,
 }
 MLX_NATIVE_GGUF_TYPES = frozenset(_BITS)
 
@@ -59,7 +56,7 @@ class GGUFMLXQuantizedTensor:
     * ``qweight_type`` — a ``gguf.GGMLQuantizationType`` in
       :data:`MLX_NATIVE_GGUF_TYPES`.
     * logical weight is ``(out_features, in_features)``; :attr:`group_size` is 32;
-      :attr:`bits` is 8 for Q8_0, 4 for Q4_0.
+      :attr:`bits` is 8 for Q8_0, 4 for Q4_0/Q4_1.
     * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
       returns ``x``'s dtype; :meth:`embedding` returns an explicit ``output_dtype``.
 
@@ -90,15 +87,6 @@ class GGUFMLXQuantizedTensor:
         if qweight_type in MLX_NATIVE_GGUF_TYPES:
             return qweight_type
         supported = ", ".join(t.name for t in _BITS)
-        if qweight_type == GGMLQuantizationType.Q4_1:
-            # Remove this special case once a fixed MLX release (ml-explore/mlx#3664)
-            # is our lower bound and Q4_1 can be added to _BITS.
-            raise ValueError(
-                "GGUF Q4_1 is not supported on the MLX-native path: MLX's GGUF "
-                "repack mis-decodes Q4_1 blocks and returns corrupted weights "
-                "(ml-explore/mlx#3664). "
-                f"Supported MLX-native qtypes: {supported}."
-            )
         raise ValueError(
             f"Unsupported GGUF quantization type for the MLX-native path: "
             f"{qweight_type.name}. Supported MLX-native qtypes: {supported}."
