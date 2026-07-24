@@ -46,6 +46,7 @@ def _runner_model_config(*, dtype):
         is_multimodal_model=False,
         trust_remote_code=False,
         dtype=dtype,
+        quantization=None,
     )
 
 

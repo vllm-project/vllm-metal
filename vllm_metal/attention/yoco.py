@@ -111,14 +111,21 @@ def build_yoco_reduced_context_from_full_metadata(
     context_lens: Sequence[int],
     offsets: Sequence[int],
     cu_seqlens: Sequence[int],
+    num_decode_segments: int = 0,
 ) -> YocoReducedContextMetadata:
     """Build reduced YOCO metadata from an existing paged-attention context.
 
     ``prepare_unified`` already computes the full packed metadata used by the
-    self-decoder. The YOCO cross-decoder needs the last query from each packed
-    segment while preserving that segment's full K/V context. This helper keeps
-    the contract close to the actual ``PagedAttentionContext`` fields without
-    importing MLX or the runtime context class.
+    self-decoder. The YOCO cross-decoder needs every query row whose logits are
+    consumed: the last query of each prefill segment (next-token prediction),
+    but EVERY row of a multi-token decode segment — those are spec-decode
+    verification windows and each row's logits decide one draft's acceptance.
+    The first ``num_decode_segments`` segments are decode segments; each of
+    their rows is selected as its own length-1 reduced segment with the same
+    per-row context/offset the pre-window-mode per-token expansion produced.
+    This helper keeps the contract close to the actual
+    ``PagedAttentionContext`` fields without importing MLX or the runtime
+    context class.
     """
     if not cu_seqlens or int(cu_seqlens[0]) != 0:
         raise ValueError("cu_seqlens must start with 0")
@@ -148,15 +155,27 @@ def build_yoco_reduced_context_from_full_metadata(
             raise ValueError("slot_mapping shorter than cu_seqlens")
 
         segment_len = q_end - q_start
-        selected_query_index = q_end - 1
-        selected_query_indices.append(selected_query_index)
-        reduced_slot_mapping.append(int(slot_mapping[selected_query_index]))
-        reduced_block_tables.append(
-            [int(block_id) for block_id in block_tables[segment_idx]]
-        )
-        reduced_context_lens.append(int(context_lens[segment_idx]))
-        reduced_offsets.append(int(offsets[segment_idx]) + segment_len - 1)
-        reduced_cu_seqlens.append(reduced_cu_seqlens[-1] + 1)
+        segment_offset = int(offsets[segment_idx])
+        segment_table = [int(block_id) for block_id in block_tables[segment_idx]]
+        if segment_idx < num_decode_segments and segment_len > 1:
+            # Spec-decode verification window: every row's logits verify one
+            # draft, so select all rows, each with the causal frontier the
+            # per-token expansion used to give it (context = position + 1).
+            selected_rows = range(q_start, q_end)
+        else:
+            selected_rows = range(q_end - 1, q_end)
+        for row in selected_rows:
+            row_in_segment = row - q_start
+            selected_query_indices.append(row)
+            reduced_slot_mapping.append(int(slot_mapping[row]))
+            reduced_block_tables.append(segment_table)
+            reduced_context_lens.append(
+                segment_offset + row_in_segment + 1
+                if segment_idx < num_decode_segments and segment_len > 1
+                else int(context_lens[segment_idx])
+            )
+            reduced_offsets.append(segment_offset + row_in_segment)
+            reduced_cu_seqlens.append(reduced_cu_seqlens[-1] + 1)
 
     if int(cu_seqlens[-1]) != len(slot_mapping):
         raise ValueError("slot_mapping length must match final cu_seqlens")
@@ -334,6 +353,7 @@ def _gemma4_text_fast_prefill_call(
             context_lens=ctx.context_lens,
             offsets=ctx.offsets,
             cu_seqlens=ctx.cu_seqlens,
+            num_decode_segments=ctx.num_decode_requests,
         )
     except ValueError as exc:
         _warn_fast_prefill_fallback_once(model, str(exc))

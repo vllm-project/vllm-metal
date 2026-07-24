@@ -29,9 +29,56 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
+    ensure_vllm_auto_fit_null_block_patch()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
     _patch_transformers_exaone4_config()
+
+
+def ensure_vllm_auto_fit_null_block_patch() -> None:
+    """Reserve the null block in vLLM's auto-fit max_model_len estimate.
+
+    ``_estimate_max_model_len_from_groups`` accepts the largest length whose KV
+    demand fits the reported memory, but ``BlockPool`` permanently takes one of
+    ``num_blocks`` as the null placeholder block, so a request at the
+    auto-fitted length needs one more block than the pool can ever allocate.
+    The scheduler admits it, allocation falls one block short, and the request
+    preempts and requeues forever (observed live: gemma-4-31B-it at its fitted
+    length sat in Waiting with 0% KV cache usage indefinitely). Shrink the
+    searched budget by one pool block so every admissible length stays
+    schedulable.
+
+    Idempotent and safe to call repeatedly: plugin activation runs while vLLM
+    is still partially initialized (the import below can fail there), so
+    ``MetalPlatform.update_block_size_for_backend`` re-ensures it inside the
+    engine process after vLLM is fully imported, before KV sizing runs.
+
+    SCAFFOLDING: remove when the pinned vLLM includes the fix from
+    vllm-project/vllm#48724.
+    """
+    try:
+        from vllm.v1.core import kv_cache_utils
+    except ImportError as exc:
+        logger.debug("Skipping vLLM auto-fit null-block patch: %s", exc)
+        return
+
+    if getattr(kv_cache_utils, "_vllm_metal_auto_fit_null_block_patched", False):
+        return
+
+    original = kv_cache_utils._estimate_max_model_len_from_groups
+    pool_bytes_per_block = kv_cache_utils._pool_bytes_per_block
+
+    def _patched_estimate(
+        vllm_config: Any, kv_cache_groups: Any, available_memory: int
+    ) -> int:
+        reserved = pool_bytes_per_block(vllm_config, kv_cache_groups)
+        return original(
+            vllm_config, kv_cache_groups, max(0, available_memory - reserved)
+        )
+
+    kv_cache_utils._estimate_max_model_len_from_groups = _patched_estimate
+    kv_cache_utils._vllm_metal_auto_fit_null_block_patched = True
+    logger.debug("Installed vLLM auto-fit null-block reservation patch")
 
 
 def _patch_transformers_exaone4_config() -> None:
@@ -102,8 +149,16 @@ def _metal_ray_local_gpu_ids(
     return node_id, list(range(count))
 
 
-def _patch_ray_distributed() -> None:
-    """Override the Ray V2 worker actor's ``get_node_and_gpu_ids`` for Metal.
+# The Ray worker actor method the Metal override tracks. vLLM renamed it from
+# ``get_node_and_gpu_ids`` (<=0.23) to ``get_node_and_physical_gpu_ids`` (0.24.0,
+# #463). The override is permanent (Apple GPUs never become a Ray accelerator
+# family), so only this NAME is version-coupled; ``_install_metal_override``
+# fails loud when it is absent so the next rename surfaces at startup.
+_RAY_WORKER_GPU_IDS_METHOD = "get_node_and_physical_gpu_ids"
+
+
+def _install_metal_override(cls: Any) -> None:
+    """Replace ``cls``'s physical-GPU-ids Ray actor method with the Metal override.
 
     Apple GPUs are not a Ray-recognized accelerator family, so a custom Ray
     resource ("mlx") never appears in
@@ -113,23 +168,20 @@ def _patch_ray_distributed() -> None:
     the assigned custom resource instead (one Apple GPU per node -> local index
     ``[0]``), failing loud if a worker was not scheduled onto an "mlx" resource.
 
-    vllm-metal supports only the default Ray V2 executor, whose worker actor is
-    ``RayWorkerProc``.
-
-    Installed in each Ray worker via the ``worker_process_setup_hook`` wired in
-    ``MetalPlatform.check_and_update_config`` — it runs at worker startup, before
-    the first actor call.  This is the only mechanism that works for real Ray: the
-    driver never calls ``get_node_and_gpu_ids`` locally, actors re-import the class
-    fresh in their own processes, and the lazy plugin-load path inside a worker
-    runs too late (it would fire *inside* the unpatched method's first call).
+    Kept module-level and taking ``cls`` (like ``_metal_ray_local_gpu_ids``) so
+    the install and its fail-fast are unit-testable without a live Ray cluster.
     """
-    from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
-
-    cls: Any = RayWorkerProc
     if getattr(cls, "_metal_patched", False):
         return
+    if not hasattr(cls, _RAY_WORKER_GPU_IDS_METHOD):
+        raise RuntimeError(
+            f"Ray worker actor {cls.__name__} has no {_RAY_WORKER_GPU_IDS_METHOD!r} "
+            "method; vllm-metal's Metal Ray override tracks that upstream name and "
+            "vLLM appears to have renamed it. Update vllm_metal.compat for the "
+            "installed vLLM version."
+        )
 
-    def get_node_and_gpu_ids(self):  # noqa: ANN001, ANN202
+    def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:  # noqa: ANN001
         import ray as _ray
         from vllm.platforms import current_platform
 
@@ -140,12 +192,30 @@ def _patch_ray_distributed() -> None:
             current_platform.ray_device_key,
         )
 
-    cls.get_node_and_gpu_ids = get_node_and_gpu_ids
+    setattr(cls, _RAY_WORKER_GPU_IDS_METHOD, get_node_and_physical_gpu_ids)
     cls._metal_patched = True
     logger.info(
-        "vllm_metal: patched Ray V2 worker get_node_and_gpu_ids on RayWorkerProc "
-        "(Apple-GPU custom Ray resource)"
+        "vllm_metal: patched Ray V2 worker %s on %s (Apple-GPU custom Ray resource)",
+        _RAY_WORKER_GPU_IDS_METHOD,
+        cls.__name__,
     )
+
+
+def _patch_ray_distributed() -> None:
+    """Install the Metal Ray worker override on the default Ray V2 executor.
+
+    vllm-metal supports only the default Ray V2 executor, whose worker actor is
+    ``RayWorkerProc``. Installed in each Ray worker via the
+    ``worker_process_setup_hook`` wired in ``MetalPlatform.check_and_update_config``
+    — it runs at worker startup, before the first actor call. This is the only
+    mechanism that works for real Ray: the driver never calls the method locally,
+    actors re-import the class fresh in their own processes, and the lazy
+    plugin-load path inside a worker runs too late (it would fire *inside* the
+    unpatched method's first call).
+    """
+    from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+    _install_metal_override(RayWorkerProc)
 
 
 def _gemma4_assistant_config_class() -> type[Any]:

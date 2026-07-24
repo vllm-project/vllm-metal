@@ -78,6 +78,42 @@ class PagedDecodeSegment:
 class SpeculativeDecodeController:
     """Owns Metal's current target-side speculative decode contract."""
 
+    @staticmethod
+    def active_spec_decode_tokens(
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, tuple[int, ...]]:
+        """Scheduler drafts with vLLM 0.25's placeholder padding removed.
+
+        vLLM 0.25 pads a request it admits into an ongoing decode batch up to
+        the uniform speculative width and hands back ``[-1] * num_spec_tokens``
+        with no invalid-token accounting (``pad_spec_decode``, upstream
+        ``v1/core/sched/scheduler.py``). Those placeholders stand for drafts
+        that were never proposed, so Metal treats such a request as carrying no
+        drafts at all.
+
+        Only that exact signature is dropped: ``-1`` placeholders, no
+        invalid-token count, and token accounting matching the padded width.
+        An all-``-1`` list that DOES carry an invalid-token count is the
+        grammar-rejection handoff, any other negative id is a genuine
+        violation, and both still reach the sentinel guards and raise. The one
+        upstream path that breaks the accounting condition (a padded request
+        clipped by ``long_prefill_token_threshold``) is rejected at config
+        time by :meth:`MetalPlatform.check_and_update_config`.
+        """
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        return {
+            req_id: tuple(tokens)
+            for req_id, tokens in spec_tokens.items()
+            if not (
+                tokens
+                and all(token_id == -1 for token_id in tokens)
+                and not invalid_counts.get(req_id)
+                and num_scheduled.get(req_id) == 1 + len(tokens)
+            )
+        }
+
     def validate_supported(
         self,
         scheduler_output: SchedulerOutput,
@@ -100,7 +136,7 @@ class SpeculativeDecodeController:
                 "scheduler. Use --no-async-scheduling."
             )
 
-        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        spec_tokens = self.active_spec_decode_tokens(scheduler_output)
         invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
         if not spec_tokens and not invalid_counts:
             return

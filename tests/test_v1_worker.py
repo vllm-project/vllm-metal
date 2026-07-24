@@ -26,7 +26,7 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = SimpleNamespace(use_paged_attention=use_paged_attention)
-    worker.cache_config = SimpleNamespace(block_size=16)
+    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -418,3 +418,29 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget_before_hybrid" not in message
         assert "--max-num-seqs" not in message
         assert "kv_budget=-1.10GB" in message
+
+    @pytest.mark.parametrize(
+        "is_auto, memory_fraction, gpu_mem_util, expected_fraction",
+        [
+            pytest.param(True, -1.0, 0.92, 0.92, id="auto_uses_vllm_default"),
+            pytest.param(True, -1.0, 0.5, 0.5, id="auto_uses_vllm_flag"),
+            pytest.param(False, 0.5, 0.7, 0.5, id="metal_env_wins"),
+        ],
+    )
+    def test_memory_fraction_precedence(
+        self,
+        is_auto: bool,
+        memory_fraction: float,
+        gpu_mem_util: float,
+        expected_fraction: float,
+    ) -> None:
+        worker = _make_worker(
+            SimpleNamespace(is_hybrid=False), use_paged_attention=True
+        )
+        worker.metal_config.is_auto_memory = is_auto
+        worker.metal_config.memory_fraction = memory_fraction
+        worker.cache_config.gpu_memory_utilization = gpu_mem_util
+
+        fraction = WorkerCachePlanner(worker)._memory_fraction()
+
+        assert fraction == expected_fraction

@@ -625,6 +625,7 @@ def sdpa_forward(
             use_turboquant=True,
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
+            window_seqlen_q=ctx.verify_window_q,
         )
     else:
         ops.paged_attention_primitive(
@@ -641,6 +642,7 @@ def sdpa_forward(
             max_seq_len,
             layer_sliding_window,
             out,
+            window_seqlen_q=ctx.verify_window_q,
         )
 
     # Reshape + strip padding back to actual head_dim before o_proj.

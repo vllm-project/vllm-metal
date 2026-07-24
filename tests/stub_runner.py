@@ -33,7 +33,9 @@ def make_stub_runner(
 
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(speculative_config=None),
-        "model_config": SimpleNamespace(runner_type="generate"),
+        "model_config": SimpleNamespace(
+            runner_type="generate", get_head_size=lambda: 128
+        ),
         "model": object(),
         "_is_vlm": False,
         "_multimodal_adapter": None,
@@ -47,6 +49,7 @@ def make_stub_runner(
         "_draft_token_ids": None,
         "_execute_model_state": None,
         "pp": None,
+        "_pp_model": None,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
         "kv_heads_per_layer": None,
@@ -58,6 +61,7 @@ def make_stub_runner(
         "_logitsprocs": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
         "_lora": MetalLoRARuntime(),
+        "_yoco_cache_mapping": None,
         "model_args": _model_args,
     }
 

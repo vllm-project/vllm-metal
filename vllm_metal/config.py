@@ -6,12 +6,8 @@ from typing import Literal
 
 import vllm_metal.envs as envs
 
-# Sentinel value indicating auto memory calculation
+# Sentinel value selecting the active backend's automatic memory policy.
 AUTO_MEMORY_FRACTION = -1.0
-
-# Default memory fraction when user leaves VLLM_METAL_MEMORY_FRACTION as "auto"
-# but enables paged attention (auto is for the MLX path).
-PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
 
 # Minimum blocks required for paged attention to be usable.
 PAGED_ATTENTION_MIN_BLOCKS = 16
@@ -38,7 +34,7 @@ VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
 class MetalConfig:
     """Configuration for vLLM Metal plugin."""
 
-    memory_fraction: float  # -1.0 means "auto" (calculate minimal needed)
+    memory_fraction: float  # -1.0 selects the active backend's auto policy
     use_mlx: bool
     mlx_device: Literal["gpu", "cpu"]
     debug: bool

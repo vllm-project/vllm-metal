@@ -413,13 +413,12 @@ class TestMmDecodeSegmentPositions:
         assert call["visual_pos_masks"].tolist() == [[False]]
 
     def test_spec_decode_for_mm_request_is_rejected(self) -> None:
-        # ``prepare_unified`` expands a decode segment with
-        # ``num_query_tokens > 1`` into one cu_seqlens span per query
-        # token, but ``_run_mm_paged_forward`` only stores one entry per
-        # ``PagedDecodeSegment`` in ``ctx.segment_positions``.  Until that
-        # mismatch is resolved (RFC #319 follow-up), spec decode on the
-        # mm paged path must fail fast instead of corrupting downstream
-        # M-RoPE positions for segments packed after the draft.
+        # A multi-token verification window is one merged cu_seqlens
+        # segment now, but M-RoPE positions for a verify window have
+        # never been supplied or validated on the mm paged path.  Until
+        # that lands (RFC #319 follow-up), spec decode on the mm paged
+        # path must fail fast instead of running the window with
+        # unvalidated positions.
         adapter = _MmAdapter()
         runner = _runner(adapter)
         state = RequestState(
@@ -455,13 +454,11 @@ class TestMmDecodeSegmentPositions:
     def test_text_spec_decode_alongside_mm_prefill_is_rejected(self) -> None:
         # Mixed batch: an mm prefill forces the runner onto
         # ``_run_mm_paged_forward``, and a text-only request with
-        # ``num_query_tokens > 1`` rides along.  Even though the text
-        # segment carries no ``mrope_position_delta``, prepare_unified
-        # still appends one cu_seqlens span per draft token while
-        # ``ctx.segment_positions`` keeps a single ``None`` for the
-        # whole segment — so the misalignment leaks into the mm prefill
-        # positions packed after it.  The guard must trigger on the
-        # segment regardless of mm-vs-text origin.
+        # ``num_query_tokens > 1`` rides along.  The window is one merged
+        # segment, but the mm path has never supplied or validated M-RoPE
+        # positions for a multi-token verify window (RFC #319 follow-up),
+        # so the guard must trigger on the segment regardless of
+        # mm-vs-text origin.
         adapter = _MmAdapter()
         runner = _runner(adapter)
         features = [_feature("img-0", offset=0, length=2)]

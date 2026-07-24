@@ -80,6 +80,8 @@ class TestUpdateBlockSizeForBackend:
         cache_config.mamba_cache_mode = "none"
         cache_config.mamba_block_size = None
         cache_config.mamba_page_size_padded = None
+        # MagicMock(spec=CacheConfig) does not synthesize default_factory fields.
+        cache_config.kv_cache_dtype_skip_layers = []
         return cache_config
 
     @pytest.fixture

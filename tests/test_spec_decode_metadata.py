@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
@@ -45,14 +46,21 @@ def _scheduler_output(
     scheduled_spec_decode_tokens: dict[str, list[int]],
     num_scheduled_tokens: dict[str, int] | None = None,
     num_invalid_spec_tokens: dict[str, int] | None = None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> SchedulerOutput:
+    num_scheduled = num_scheduled_tokens or {
+        req_id: len(tokens) + 1
+        for req_id, tokens in scheduled_spec_decode_tokens.items()
+    }
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=num_scheduled,
+        total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-        num_scheduled_tokens=num_scheduled_tokens
-        or {
-            req_id: len(tokens) + 1
-            for req_id, tokens in scheduled_spec_decode_tokens.items()
-        },
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
 
@@ -240,7 +248,7 @@ class TestSpecDecodePolicy:
     def test_rejects_invalid_draft_token_sentinel(self) -> None:
         with pytest.raises(NotImplementedError, match="invalid draft-token"):
             SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [-1]}),
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
@@ -501,3 +509,79 @@ class TestVerifyGreedySpecDecode:
                 ),
                 logitsprocs=LogitsProcessors([_NonArgmaxProcessor()]),
             )
+
+
+class TestSchedulerPaddedDrafts:
+    """vLLM 0.25 pads a newly admitted decode request with placeholder drafts."""
+
+    def test_padded_drafts_are_dropped(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {}
+
+    @pytest.mark.parametrize(
+        ("spec_tokens", "num_scheduled", "invalid_counts"),
+        [
+            ([7, 8], None, None),
+            ([-1, -1], None, {"r0": 2}),
+            ([-2, -2], None, None),
+            ([-1, -1], {"r0": 5}, None),
+        ],
+        ids=[
+            "real_drafts",
+            "grammar_rejected",
+            "foreign_sentinel",
+            "mismatched_accounting",
+        ],
+    )
+    def test_non_padding_handoffs_are_kept(
+        self,
+        spec_tokens: list[int],
+        num_scheduled: dict[str, int] | None,
+        invalid_counts: dict[str, int] | None,
+    ) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": spec_tokens},
+            num_scheduled_tokens=num_scheduled,
+            num_invalid_spec_tokens=invalid_counts,
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": tuple(spec_tokens)}
+
+    def test_padded_request_outside_decode_set_is_accepted(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"new": [-1, -1]},
+        )
+
+        SpeculativeDecodeController().validate_supported(
+            scheduler_output,
+            [],
+            paged_attention_enabled=True,
+            is_hybrid=False,
+            logitsprocs=None,
+        )
+
+    def test_padded_drafts_reach_build_decode_segments_as_zero_drafts(self) -> None:
+        controller = SpeculativeDecodeController()
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+        decode_reqs = [("r0", _state([5, 9], [41, 42]))]
+
+        segments = controller.build_decode_segments(
+            decode_reqs,
+            controller.active_spec_decode_tokens(scheduler_output),
+            paged_request_seq_lens={"r0": 7},
+        )
+
+        assert len(segments) == 1
+        assert segments[0].num_query_tokens == 1
+        assert segments[0].input_token_ids == (9,)
+        assert segments[0].draft_token_ids == ()
+        assert segments[0].bonus_row == 0

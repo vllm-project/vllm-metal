@@ -263,6 +263,34 @@ def test_reduced_context_from_full_paged_metadata() -> None:
     assert meta.cu_seqlens == [0, 1, 2, 3, 4]
 
 
+def test_reduced_context_selects_every_row_of_verify_window() -> None:
+    # A merged spec-verify window (one 3-token decode segment) must select ALL
+    # of its rows for the cross-decoder — each row's logits verify one draft —
+    # with the same per-row context/offset the per-token expansion produced,
+    # while a plain decode and a prefill segment keep last-row selection.
+    meta = build_yoco_reduced_context_from_full_metadata(
+        slot_mapping=[27, 28, 29, 40, 44, 45, 46, 47, 48],
+        block_tables=[[5, 6, 7], [9, 10], [11, 12]],
+        context_lens=[10, 5, 5],
+        offsets=[7, 4, 0],
+        cu_seqlens=[0, 3, 4, 9],
+        num_decode_segments=2,
+    )
+
+    assert meta.selected_query_indices == [0, 1, 2, 3, 8]
+    assert meta.slot_mapping == [27, 28, 29, 40, 48]
+    assert meta.block_tables == [
+        [5, 6, 7],
+        [5, 6, 7],
+        [5, 6, 7],
+        [9, 10],
+        [11, 12],
+    ]
+    assert meta.context_lens == [8, 9, 10, 5, 5]
+    assert meta.offsets == [7, 8, 9, 4, 4]
+    assert meta.cu_seqlens == [0, 1, 2, 3, 4, 5]
+
+
 def test_mlx_slice_assignment_writes_in_place() -> None:
     import mlx.core as mx
 

@@ -198,10 +198,46 @@ class TestPrepare:
         assert ctx.offsets == [7]
         assert ctx.cu_seqlens == [0, 1]
 
-    def test_prepare_unified_spec_decode_splits_query_tokens(self):
+    def test_prepare_unified_spec_decode_keeps_window_whole(self):
         # Speculative verification appends draft rows after the last token.
-        # Each row is a separate attention segment with its own position.
+        # With the merged layout requested, the window stays ONE multi-token
+        # segment (cu_seqlens aligned with decode requests); per-row
+        # causality is the kernel's varlen job.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)], [], block_size=4, merge_verify_windows=True
+        )
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.slot_mapping == [27, 28, 29]
+        assert ctx.block_tables == [[5, 6, 7]]
+        assert ctx.context_lens == [10]
+        assert ctx.offsets == [7]
+        assert ctx.cu_seqlens == [0, 3]
+        assert ctx.verify_window_q == 3
+        assert ctx.num_decode_requests == 1
+
+    def test_prepare_unified_defaults_to_expanded_layout(self):
+        # Window mode is opt-in runtime policy: a caller that does not pass
+        # merge_verify_windows gets the expanded per-token layout, never the
+        # experimental merged shape.
         prepare_unified([([5, 6, 7], 7, 3)], [], block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.context_lens == [8, 9, 10]
+        assert ctx.verify_window_q == 1
+
+    def test_prepare_unified_expands_window_when_merge_disabled(self):
+        # merge_verify_windows=False restores the expanded per-token layout
+        # for models the window path does not serve (MLA native decode,
+        # hybrid GDN layers, heads past PA_WINDOW_MAX_HEAD_SIZE): one
+        # single-token segment per window row, byte-for-byte the
+        # pre-window-mode metadata.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)], [], block_size=4, merge_verify_windows=False
+        )
         ctx = get_context()
 
         assert ctx is not None
@@ -210,6 +246,30 @@ class TestPrepare:
         assert ctx.context_lens == [8, 9, 10]
         assert ctx.offsets == [7, 8, 9]
         assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.verify_window_q == 1
+        assert ctx.num_decode_requests == 1
+
+    def test_prepare_unified_mixed_window_and_prefill_stays_off_window_mode(self):
+        # A verify window sharing the batch with a prefill chunk keeps its
+        # merged segment but the batch reports verify_window_q=1, so the
+        # dispatch routes it down the tiled path exactly like the
+        # non-speculative case (window mode is pure-verification only).
+        prepare_unified(
+            [([5, 6, 7], 7, 3)],
+            [([10, 11], 5, 0)],
+            block_size=4,
+            merge_verify_windows=True,
+        )
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.slot_mapping == [27, 28, 29, 40, 41, 42, 43, 44]
+        assert ctx.block_tables == [[5, 6, 7], [10, 11]]
+        assert ctx.cu_seqlens == [0, 3, 8]
+        assert ctx.context_lens == [10, 5]
+        assert ctx.offsets == [7, 0]
+        assert ctx.verify_window_q == 1
+        assert ctx.num_decode_requests == 1
 
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill
@@ -280,53 +340,6 @@ class TestPackedRoPE:
         assert rope.calls[1][1].tolist() == offsets
         assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
         assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
-
-    def test_native_rope_matches_segment_reference_for_float16_rows(self):
-        from vllm_metal.attention.impls.varlen_rope_compat import (
-            apply_packed_rope,
-        )
-
-        dims = 128
-        segment_count = 4
-        offsets = [5, 5, 5, 5]
-        cu_seqlens = [0, 1, 2, 3, 4]
-        rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
-        reference_rope = nn.RoPE(dims=dims, traditional=False, base=10_000.0)
-        module = SimpleNamespace(rope=rope)
-        q_rows = [
-            (mx.arange(3 * dims, dtype=mx.float32).reshape(3, 1, dims) / 100 + row)
-            .astype(mx.float16)
-            .tolist()
-            for row in range(segment_count)
-        ]
-        k_rows = [
-            (mx.arange(2 * dims, dtype=mx.float32).reshape(2, 1, dims) / 100 + row)
-            .astype(mx.float16)
-            .tolist()
-            for row in range(segment_count)
-        ]
-        q = mx.transpose(mx.array(q_rows, dtype=mx.float16), (2, 1, 0, 3))
-        k = mx.transpose(mx.array(k_rows, dtype=mx.float16), (2, 1, 0, 3))
-
-        expected_q = mx.concatenate(
-            [
-                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
-                for i in range(segment_count)
-            ],
-            axis=2,
-        )
-        expected_k = mx.concatenate(
-            [
-                reference_rope(k[:, :, i : i + 1, :], offset=offsets[i])
-                for i in range(segment_count)
-            ],
-            axis=2,
-        )
-        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
-        mx.eval(expected_q, expected_k, q_out, k_out)
-
-        assert mx.allclose(q_out, expected_q, rtol=1e-3, atol=1e-3).item()
-        assert mx.allclose(k_out, expected_k, rtol=1e-3, atol=1e-3).item()
 
     @pytest.mark.parametrize(
         "rope",

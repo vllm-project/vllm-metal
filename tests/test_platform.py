@@ -11,7 +11,10 @@ import torch
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -60,6 +63,8 @@ class TestMetalPlatform:
     ) -> None:
         """PP is allowed, but combining PP>1 with TP>1 is rejected at config time."""
         vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 # "mp", not "uni": uni+PP>1 short-circuits to the uni-executor
@@ -92,7 +97,10 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(block_size=None),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -132,6 +140,8 @@ class TestMetalPlatform:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
         vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -155,6 +165,8 @@ class TestMetalPlatform:
         rather than silently flip the user's scheduler config.
         """
         vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -178,6 +190,7 @@ class TestMetalPlatform:
         implemented under PP. Reject loudly rather than run it unvalidated.
         """
         vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -186,8 +199,15 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
-            scheduler_config=SimpleNamespace(async_scheduling=False),
-            speculative_config=SimpleNamespace(method="ngram"),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                long_prefill_token_threshold=0,
+            ),
+            speculative_config=SimpleNamespace(
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=3,
+                method="ngram",
+            ),
         )
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -202,6 +222,7 @@ class TestMetalPlatform:
         """
         self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -237,6 +258,8 @@ class TestMetalPlatform:
         spawns. Reject the explicit combination rather than flip it silently.
         """
         vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="uni",
@@ -252,6 +275,8 @@ class TestMetalPlatform:
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
         vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="uni",
@@ -322,9 +347,13 @@ class TestMetalPlatform:
                 if parallel_config is not None
                 else cls._dp_parallel_config(**(parallel or {}))
             ),
-            cache_config=SimpleNamespace(block_size=None),
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[],
+                block_size=None,
+            ),
             model_config=SimpleNamespace(**model_fields),
             scheduler_config=SimpleNamespace(
+                long_prefill_token_threshold=0,
                 async_scheduling=False,
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=2048,
@@ -476,7 +505,13 @@ class TestMetalPlatform:
         """DP with speculative decoding is unvalidated; reject at config time."""
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(
-                self._dp_vllm_config(speculative_config=SimpleNamespace(method="ngram"))
+                self._dp_vllm_config(
+                    speculative_config=SimpleNamespace(
+                        method="ngram",
+                        use_heterogeneous_vocab=False,
+                        num_speculative_tokens=3,
+                    )
+                )
             )
 
     def test_check_and_update_config_rejects_dp_lora(self) -> None:
@@ -485,6 +520,57 @@ class TestMetalPlatform:
             MetalPlatform.check_and_update_config(
                 self._dp_vllm_config(lora_config=SimpleNamespace(max_loras=1))
             )
+
+    def test_check_and_update_config_rejects_heterogeneous_kv_cache_dtypes(
+        self,
+    ) -> None:
+        """Skip-layer KV dtypes are unsupported; reject at config time.
+
+        Upstream would otherwise resize the block pool behind Metal's own
+        TurboQuant sizing, from inside a spawned worker.
+        """
+        vllm_config = self._dp_vllm_config()
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.cache_config.kv_cache_dtype_skip_layers = ["0", "31"]
+
+        with pytest.raises(NotImplementedError, match="heterogeneous KV cache dtypes"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_heterogeneous_draft_vocab(self) -> None:
+        """A draft vocabulary that differs from the target is unsupported.
+
+        Upstream stopped verifying equal vocab sizes when the flag is set, so the
+        proposer would otherwise verify draft ids against the target vocabulary
+        with no mapping.
+        """
+        vllm_config = self._dp_vllm_config()
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.speculative_config = SimpleNamespace(use_heterogeneous_vocab=True)
+
+        with pytest.raises(NotImplementedError, match="heterogeneous draft vocabulary"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_clipped_spec_decode_padding(
+        self,
+    ) -> None:
+        """A long-prefill threshold below the speculative width is unsupported.
+
+        The scheduler clips a padded decode request to the threshold while still
+        attaching the full placeholder draft list, so the handoff's token
+        accounting no longer balances.
+        """
+        vllm_config = self._dp_vllm_config(
+            speculative_config=SimpleNamespace(
+                method="ngram",
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=5,
+            )
+        )
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.scheduler_config.long_prefill_token_threshold = 3
+
+        with pytest.raises(NotImplementedError, match="long-prefill-token-threshold"):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_dp_multimodal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -788,6 +874,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -795,7 +882,10 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(block_size=None),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -839,6 +929,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -847,7 +938,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=SimpleNamespace(
                     model="test-model",
@@ -880,6 +973,7 @@ class TestMetalPlatform:
             (
                 SimpleNamespace(
                     block_size=None,
+                    kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
                     mamba_cache_mode="none",
                 ),
@@ -888,6 +982,7 @@ class TestMetalPlatform:
             (
                 SimpleNamespace(
                     block_size=None,
+                    kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=False,
                     mamba_cache_mode="all",
                 ),
@@ -907,6 +1002,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -951,6 +1047,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -958,7 +1055,10 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(block_size=None),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -997,6 +1097,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1004,7 +1105,10 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(block_size=None),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -1047,6 +1151,7 @@ class TestMetalPlatform:
         reset_config()
         try:
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1054,7 +1159,10 @@ class TestMetalPlatform:
                     tensor_parallel_size=1,
                     disable_custom_all_reduce=False,
                 ),
-                cache_config=SimpleNamespace(block_size=None),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
                 model_config=SimpleNamespace(
                     model="test-model",
                     disable_cascade_attn=False,
@@ -1089,6 +1197,7 @@ class TestMetalPlatform:
         """STT models should get tokenizer fallback and async scheduling disabled."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -1096,7 +1205,10 @@ class TestMetalPlatform:
                 tensor_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
-            cache_config=SimpleNamespace(block_size=None),
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[],
+                block_size=None,
+            ),
             model_config=SimpleNamespace(
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
@@ -1122,6 +1234,7 @@ class TestMetalPlatform:
         """STT policy should not overwrite an explicitly configured tokenizer."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
         vllm_config = SimpleNamespace(
+            speculative_config=None,
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="auto",
@@ -1129,7 +1242,10 @@ class TestMetalPlatform:
                 tensor_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
-            cache_config=SimpleNamespace(block_size=None),
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[],
+                block_size=None,
+            ),
             model_config=SimpleNamespace(
                 model="openai/whisper-tiny",
                 disable_cascade_attn=False,
@@ -1174,6 +1290,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1182,7 +1299,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=model_config,
                 scheduler_config=SimpleNamespace(
@@ -1221,6 +1340,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1229,7 +1349,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=model_config,
                 scheduler_config=SimpleNamespace(
@@ -1266,6 +1388,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1274,7 +1397,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=model_config,
                 scheduler_config=SimpleNamespace(
@@ -1315,6 +1440,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1323,7 +1449,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=model_config,
                 scheduler_config=SimpleNamespace(
@@ -1360,6 +1488,7 @@ class TestMetalPlatform:
                 is_hybrid=False,
             )
             vllm_config = SimpleNamespace(
+                speculative_config=None,
                 parallel_config=SimpleNamespace(
                     worker_cls="auto",
                     distributed_executor_backend="auto",
@@ -1368,7 +1497,9 @@ class TestMetalPlatform:
                     disable_custom_all_reduce=False,
                 ),
                 cache_config=SimpleNamespace(
-                    block_size=None, enable_prefix_caching=False
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                    enable_prefix_caching=False,
                 ),
                 model_config=model_config,
                 scheduler_config=SimpleNamespace(
@@ -1473,3 +1604,85 @@ class TestKvBudgetBytes:
         )
 
         assert budget > 1e9
+
+
+class TestAutoFitMaxModelLenChain:
+    """The -1 sentinel drives the Metal null-block auto-fit contract.
+
+    Builds the gemma-4-31B KV shape (the all-FullAttentionSpec specs vllm-metal
+    emits today: 50 sliding-shaped 16x256 layers + 10 global-shaped 4x512
+    layers) and runs vLLM's ``get_kv_cache_configs`` against fixed synthetic
+    memory budgets. These tests do not re-test upstream's fitting algorithm;
+    they only check Metal's null-block reservation and too-small-pool failure.
+    """
+
+    _NUM_LAYERS = 60
+    _FULL_EVERY = 6  # gemma-4's 5:1 sliding:full layer pattern
+
+    @pytest.fixture(autouse=True)
+    def _ensure_compat_patches(self) -> None:
+        """The null-block auto-fit patch (compat.py) is part of the contract
+        under test; ensure it directly because plugin activation can skip it
+        while vLLM is partially imported."""
+        ensure_vllm_auto_fit_null_block_patch()
+
+    _BLOCK_SIZE = 16
+    # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
+    # equals the packed per-block bytes the Metal pool reports.
+    _PACKED_BLOCK_BYTES = 14_417_920
+    _DERIVED_MAX_LEN = 262_144
+
+    @classmethod
+    def _specs(cls) -> dict[str, KVCacheSpec]:
+        """Fresh specs per call: upstream grouping mutates specs in place."""
+        specs: dict[str, KVCacheSpec] = {}
+        for i in range(cls._NUM_LAYERS):
+            is_full = (i + 1) % cls._FULL_EVERY == 0
+            specs[f"layers.{i}.self_attn"] = FullAttentionSpec(
+                block_size=cls._BLOCK_SIZE,
+                num_kv_heads=4 if is_full else 16,
+                head_size=512 if is_full else 256,
+                dtype=torch.bfloat16,
+            )
+        return specs
+
+    @classmethod
+    def _vllm_config(cls, *, original_max_model_len: int | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=cls._DERIVED_MAX_LEN,
+                original_max_model_len=original_max_model_len,
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048,
+                disable_hybrid_kv_cache_manager=False,
+            ),
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None,
+                kv_cache_memory_bytes=None,
+            ),
+        )
+
+    def test_reduced_length_reserves_the_null_block(self) -> None:
+        """The fitted length must never need the whole pool: BlockPool keeps
+        block 0 as the null placeholder, so a request at the fitted length
+        would otherwise starve in the scheduler forever."""
+        num_pool_blocks = 1500
+        available = num_pool_blocks * self._PACKED_BLOCK_BYTES
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+
+        resolved_blocks = -(-vllm_config.model_config.max_model_len // self._BLOCK_SIZE)
+        assert resolved_blocks == num_pool_blocks - 1
+
+    def test_insufficient_memory_for_one_block_raises(self) -> None:
+        available = self._PACKED_BLOCK_BYTES - 1
+        vllm_config = self._vllm_config(original_max_model_len=-1)
+
+        with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
+            get_kv_cache_configs(vllm_config, [self._specs()], [available])

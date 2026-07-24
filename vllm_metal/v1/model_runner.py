@@ -43,6 +43,7 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_metal import envs
 from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
@@ -58,6 +59,7 @@ from vllm_metal.distributed import (
     is_non_last_stage,
     pipeline_send,
 )
+from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -202,7 +204,6 @@ class _ExecutionBatch:
     new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
-    scheduled_cached_req_ids: list[str] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
 
     def add_output(
@@ -359,6 +360,12 @@ class MetalModelRunner:
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
 
+        # YOCO layer->cache mapping, replaced by _install_yoco_cache_mapping
+        # during model load.  Declared here so readers can treat it as always
+        # present: it is consulted on the KV-sizing path, which runs for every
+        # model, not only the YOCO ones that install a real mapping.
+        self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
+
     @property
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).
@@ -378,6 +385,33 @@ class MetalModelRunner:
         """
         fai = self.model_args.get("full_attention_interval", 0)
         return isinstance(fai, int) and fai > 0
+
+    @property
+    def merge_verify_windows(self) -> bool:
+        """Whether spec-verify windows stay one cu_seqlens segment.
+
+        Window mode is opt-in (VLLM_METAL_SPEC_VERIFY_WINDOW): its win is
+        chip- and shape-dependent, so the default keeps the expanded
+        per-token verify layout, which is the pre-window behavior bit for
+        bit.  Even opted in, it is True only for models the decode
+        kernel's window mode serves: MLA native decode and the GDN
+        pure-decode check admit only one-row segments, and heads past
+        PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for the
+        tiled one.  The head bound uses the resolved per-layer maximum:
+        variable-head models widen their full-attention layers past the
+        config head size (head_dim_per_layer), and every layer of the
+        step shares one verify layout.
+        """
+        head_dims = self.head_dim_per_layer
+        max_head_dim = (
+            max(head_dims) if head_dims else self.model_config.get_head_size()
+        )
+        return (
+            envs.VLLM_METAL_SPEC_VERIFY_WINDOW
+            and not self.is_mla
+            and not self.is_hybrid
+            and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
+        )
 
     @property
     def _forward_model(self) -> Any:
@@ -645,6 +679,15 @@ class MetalModelRunner:
                 model_config=self.model_config,
             )
 
+        if self.pp is not None and self.pp.size > 1:
+            # Profile the PP stage shape: non-first stages never embed and
+            # non-last stages never compute logits, in profiling as in serving.
+            assert self._pp_model is not None
+            output = self._pp_model.dummy_forward(input_ids)
+            if not self.pp.is_last:
+                return [output]
+            return [self._extract_logits(output)]
+
         output = self._forward_model(input_ids)
         logits = self._extract_logits(output)
         return [logits]
@@ -756,13 +799,9 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference.
-        try:
-            dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            mx.eval(*self._dummy_forward_outputs(dummy_tokens))
-            logger.info("Model warm-up complete")
-        except Exception as e:
-            logger.warning(f"Model warm-up failed: {e}")
+        dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+        mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        logger.info("Model warm-up complete")
 
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
@@ -964,7 +1003,7 @@ class MetalModelRunner:
         """
         decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
-            scheduler_output.scheduled_spec_decode_tokens,
+            self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
@@ -1045,7 +1084,12 @@ class MetalModelRunner:
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
 
-        prepare_unified(decode_info, prefill_info, self._paged_block_size)
+        prepare_unified(
+            decode_info,
+            prefill_info,
+            self._paged_block_size,
+            merge_verify_windows=self.merge_verify_windows,
+        )
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
@@ -1582,14 +1626,15 @@ class MetalModelRunner:
         int-offset arange path on text segments.
 
         Any speculative-decode segment in the batch is rejected up
-        front: a decode request with ``num_query_tokens > 1`` makes
-        ``prepare_unified`` append one ``cu_seqlens`` entry per query
-        token, but ``ctx.segment_positions`` carries one entry per
-        ``PagedDecodeSegment``.  The mismatch corrupts M-RoPE positions
-        for every segment packed after the draft — including text-only
-        spec decode that happens to share the batch with an mm prefill,
-        since the whole batch still routes through this method.
-        Lifting the restriction is tracked as a follow-up to RFC #319.
+        front: ``prepare_unified`` now keeps a ``num_query_tokens > 1``
+        window as one ``cu_seqlens`` segment (aligned with
+        ``ctx.segment_positions``), but this method's M-RoPE position
+        handling has only ever been exercised with single-token decode
+        segments — supplying and validating per-row positions for a
+        multi-token verification window is untracked territory, including
+        text-only spec decode that shares the batch with an mm prefill,
+        since the whole batch routes through this method.  Lifting the
+        restriction is tracked as a follow-up to RFC #319.
         """
         adapter = self._multimodal_adapter
         assert adapter is not None and adapter.forward_ready
@@ -1600,14 +1645,12 @@ class MetalModelRunner:
             if segment.num_query_tokens > 1:
                 raise NotImplementedError(
                     "Speculative decode is not supported on the multimodal "
-                    "paged path yet: prepare_unified() expands a decode "
-                    "segment with num_query_tokens > 1 into one cu_seqlens "
-                    "span per query token, but ctx.segment_positions stores "
-                    "one entry per PagedDecodeSegment — cu_seqlens and "
-                    "segment_positions would misalign for every segment "
-                    "packed after the draft, including text-only spec decode "
-                    "that shares the batch with an mm prefill.  Tracked as "
-                    "a follow-up to RFC #319."
+                    "paged path yet: M-RoPE positions for a multi-token "
+                    "verification window have never been supplied or "
+                    "validated on this path, and every segment in the batch "
+                    "routes through it — including text-only spec decode "
+                    "sharing the batch with an mm prefill.  Tracked as a "
+                    "follow-up to RFC #319."
                 )
 
         # Full-prompt M-RoPE positions per mm prefill request.
@@ -1880,20 +1923,10 @@ class MetalModelRunner:
     def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
         """Maintain ``_request_states`` on a non-last pipeline stage.
 
-        Only the last stage samples, and that is where the normal request-state
-        lifecycle is built (``_sample_paged_batch`` needs the sampled token). A
-        non-last stage would otherwise have no state and emit a placeholder for
-        every cached step in :meth:`_collect_cached_requests`, skipping the
-        forward + ``pipeline_send`` the downstream stage is blocked on (its ring
-        ``recv`` then trips the Metal command-buffer watchdog and aborts).
-
-        Mirror upstream vLLM's ``_update_states`` (``gpu_model_runner.py``, the
-        ``if not is_last_rank`` branch): seed state from the scheduler's
-        ``NewRequestData`` and advance it with the sampled tokens the scheduler
-        broadcasts in ``CachedRequestData.new_token_ids`` — the first stage never
-        samples, it reconstructs the token stream from the scheduler. Block ids
-        are left to :meth:`_update_cached_request_blocks`, which runs next and
-        already guards a missing state.
+        Non-last stages do not sample, so they mirror the scheduler token stream
+        to keep cached steps able to run forward and send activations downstream.
+        Cached-state presence is checked before model work; block ids are
+        updated later from cached scheduler metadata.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
@@ -1910,9 +1943,7 @@ class MetalModelRunner:
         if not cached.new_token_ids:
             return
         for i, req_id in enumerate(cached.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                continue
+            state = self._request_states[req_id]
             new_token_ids = cached.new_token_ids[i]
             # Append only the tokens not already reflected in token_ids (mirrors
             # upstream's num_new_tokens; tolerates >1 sampled token per step).
@@ -1934,9 +1965,7 @@ class MetalModelRunner:
             return
 
         for i, req_id in enumerate(cached_reqs.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                continue
+            state = self._request_states[req_id]
 
             new_block_ids = cached_reqs.new_block_ids[i]
             resumed = req_id in cached_reqs.resumed_req_ids
@@ -1961,24 +1990,12 @@ class MetalModelRunner:
             return
 
         if self._paged_attention_runtime is None:
-            batch.scheduled_cached_req_ids.extend(cached_reqs.req_ids)
             for req_id in cached_reqs.req_ids:
-                state = self._request_states.get(req_id)
-                if state is not None:
-                    batch.valid_decode_reqs.append((req_id, state))
+                batch.valid_decode_reqs.append((req_id, self._request_states[req_id]))
             return
 
         for idx, req_id in enumerate(cached_reqs.req_ids):
-            state = self._request_states.get(req_id)
-            if state is None:
-                logger.warning(
-                    "Paged cached request %s has no RequestState; "
-                    "emitting placeholder token. This indicates scheduler/runner "
-                    "state desync.",
-                    req_id,
-                )
-                batch.add_output(req_id, [0])
-                continue
+            state = self._request_states[req_id]
 
             if state.generated_tokens == 0:
                 computed_tokens = cached_reqs.num_computed_tokens[idx]
@@ -2096,11 +2113,8 @@ class MetalModelRunner:
             pooler_output=batch.pooler_outputs,
         )
 
-    def _run_non_paged_decode_batch(
-        self,
-        batch: _ExecutionBatch,
-    ) -> None:
-        """Run non-paged decode work and append placeholder outputs as needed."""
+    def _run_non_paged_decode_batch(self, batch: _ExecutionBatch) -> None:
+        """Run non-paged decode work."""
         if batch.valid_decode_reqs:
             if len(batch.valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
                 decode_result = self._batched_decode(batch.valid_decode_reqs)
@@ -2114,10 +2128,6 @@ class MetalModelRunner:
                     else None
                 )
                 batch.add_output(req_id, [decode_result.token_ids[i]], logprobs)
-
-        for req_id in batch.scheduled_cached_req_ids:
-            if req_id not in batch.req_id_to_index:
-                batch.add_output(req_id, [0])
 
     def _validate_scheduled_outputs(
         self,
@@ -2222,6 +2232,12 @@ class MetalModelRunner:
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        missing_cached_state_req_ids = [
+            req_id
+            for req_id in cached_reqs.req_ids
+            if req_id in evicted_req_ids or req_id not in self._request_states
+        ]
         has_scheduled_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
         spec_decode_error: Exception | None = None
         try:
@@ -2236,6 +2252,7 @@ class MetalModelRunner:
             has_scheduled_encoder_inputs
             or spec_decode_error is not None
             or has_unsupported_non_paged_structured_output
+            or bool(missing_cached_state_req_ids)
         )
 
         # Scheduler cleanup is independent of whether this step's work is
@@ -2247,6 +2264,12 @@ class MetalModelRunner:
             resumed_req_ids=scheduler_output.scheduled_cached_reqs.resumed_req_ids,
             materialize_runtime_state=will_fail_fast_before_model_work,
         )
+        if missing_cached_state_req_ids:
+            raise RuntimeError(
+                "Scheduled cached request(s) have no RequestState: "
+                f"{missing_cached_state_req_ids[:16]}. "
+                "This is a scheduler/runner state desync."
+            )
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder
         # cache when dispatch runs.
@@ -2279,7 +2302,6 @@ class MetalModelRunner:
         if is_non_last_stage(self.pp):
             self._update_pp_stage_states(scheduler_output)
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
 
