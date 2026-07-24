@@ -19,7 +19,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_metal.v1 import ngram_proposer as ngram_mod
 from vllm_metal.v1.ngram_proposer import NgramProposer
 from vllm_metal.v1.proposer import ProposeContext
-from vllm_metal.v1.spec_decode import SpeculativeDecodeController
+from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 
 def _proposer(
@@ -59,6 +59,7 @@ def _context(
     *,
     decode_reqs: list[tuple[str, SimpleNamespace]] | None = None,
     decode_token_ids: list[list[int]] | None = None,
+    decode_segments: list[PagedDecodeSegment] | None = None,
     prefill_reqs: list[SimpleNamespace] | None = None,
     prefill_result_modes: list[str] | None = None,
     request_states: dict[str, SimpleNamespace] | None = None,
@@ -76,7 +77,7 @@ def _context(
     return ProposeContext(
         target_hidden_states=None,
         decode_reqs=decode_reqs,
-        decode_segments=[],
+        decode_segments=decode_segments or [],
         decode_token_ids=decode_token_ids,
         prefill_reqs=prefill_reqs,
         prefill_token_ids=[0] * len(prefill_reqs),
@@ -87,6 +88,22 @@ def _context(
         num_speculative_tokens=num_speculative_tokens,
         logitsprocs=None,
         finished_req_ids=finished_req_ids or set(),
+    )
+
+
+def _verified_segment(req_id: str, *, has_draft: bool = True) -> PagedDecodeSegment:
+    """A decode_segment for req_id: a real (if trivial) verify row if
+    has_draft, a plain no-draft row otherwise."""
+    draft_token_ids = (0,) if has_draft else ()
+    num_query_tokens = len(draft_token_ids) + 1
+    return PagedDecodeSegment(
+        req_id=req_id,
+        input_token_ids=tuple(range(num_query_tokens)),
+        start_row=0,
+        num_query_tokens=num_query_tokens,
+        draft_token_ids=draft_token_ids,
+        cache_start_pos=0,
+        block_ids=(0,),
     )
 
 
@@ -280,7 +297,10 @@ class TestNgramMissThrottle:
         kernel proposes it."""
         proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
         state = _request_state([7, 8, 9])
-        ctx = _context(decode_reqs=[("r0", state)])
+        ctx = _context(
+            decode_reqs=[("r0", state)],
+            decode_segments=[_verified_segment("r0")],
+        )
 
         with patch.object(proposer._ngram, "propose") as mock_propose:
             mock_propose.return_value = [[]]
@@ -308,7 +328,10 @@ class TestNgramMissThrottle:
         this must throttle exactly like true misses would."""
         proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
         state = _request_state([1, 2, 3, 1, 2])
-        ctx = _context(decode_reqs=[("r0", state)])
+        ctx = _context(
+            decode_reqs=[("r0", state)],
+            decode_segments=[_verified_segment("r0")],
+        )
 
         # One resolved miss per call from the second call on (the first has
         # nothing pending yet to resolve), so the streak needs one extra
@@ -482,6 +505,37 @@ class TestNgramMissThrottle:
         # The pending draft must survive untouched, not be scored as a miss.
         assert "r0" in proposer._pending
         assert proposer._miss_streak.get("r0", 0) == 0
+
+    def test_pending_not_resolved_when_segment_carries_no_draft(self) -> None:
+        """A request can be in decode_reqs with an empty decode_segment
+        draft_token_ids -- no draft was scheduled for it at all, or the
+        scheduler padded/dropped a proposed draft on batch admission (see
+        SpeculativeDecodeController.active_spec_decode_tokens). Either way,
+        an older pending draft for it must not be scored just because the
+        request itself shows up in decode_reqs again."""
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3])
+        ctx = _context(
+            decode_reqs=[("r0", state)],
+            decode_segments=[_verified_segment("r0")],
+        )
+
+        with patch.object(proposer._ngram, "propose", side_effect=[[[99]], [[]]]):
+            drafts = proposer.propose(ctx)
+            assert drafts is not None
+            assert proposer._pending["r0"] == (3, (99,))
+
+            # Next step: r0 is still in decode_reqs, but this step's
+            # segment carries no draft at all.
+            state.token_ids.append(123)
+            plain_ctx = _context(
+                decode_reqs=[("r0", state)],
+                decode_segments=[_verified_segment("r0", has_draft=False)],
+            )
+            proposer.propose(plain_ctx)
+
+        # The pending draft from the verified step must survive untouched.
+        assert proposer._pending["r0"] == (3, (99,))
 
 
 if __name__ == "__main__":

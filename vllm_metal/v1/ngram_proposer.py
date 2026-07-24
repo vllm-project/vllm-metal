@@ -249,19 +249,28 @@ class NgramProposer:
 
     def _resolve_pending(self, ctx: ProposeContext) -> None:
         """Score the previous step's proposals against what was actually
-        accepted, but only for requests whose draft is actually verified
-        this step (present in ``decode_reqs``). A request can be alive in
-        ``request_states`` without being scheduled this step at all (still
-        mid-prefill, paused, preempted) -- treating "no new tokens visible
-        yet" as a miss for those would blame the request for a step that
-        never verified it."""
+        accepted, but only for requests whose draft was actually verified
+        this step: present in ``decode_reqs`` *and* the decode_segment for
+        that request carried a non-empty draft. Being in ``decode_reqs``
+        alone isn't enough -- a request can sit there with an empty
+        ``draft_token_ids`` either because no draft was scheduled for it at
+        all (a plain decode row) or because the scheduler padded/dropped a
+        proposed draft on batch admission (see
+        ``SpeculativeDecodeController.active_spec_decode_tokens``). Either
+        way, this step's plain-decode token isn't the verification outcome
+        of the older pending draft, so it must not be scored against it."""
         if not self._pending:
             return
+        verified_req_ids = {
+            segment.req_id for segment in ctx.decode_segments if segment.draft_token_ids
+        }
         decode_states = dict(ctx.decode_reqs)
         for req_id in list(self._pending):
+            if req_id not in verified_req_ids:
+                continue  # not verified this step; leave pending for later
             state = decode_states.get(req_id)
             if state is None:
-                continue  # not verified this step; leave pending for later
+                continue
             position, proposed = self._pending.pop(req_id)
             actual = state.token_ids[position : position + len(proposed)]
             accepted = 0
