@@ -120,7 +120,7 @@ include = ["vllm_metal/metal/*.metallib", "vllm_metal/metal/_paged_ops*.so"]
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-exclude = ["extern", ".venv*", "test_vllm.py", "target"]
+exclude = ["extern", ".venv*", "test_vllm.py", "target", "vllm_metal/v1/dspark"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]

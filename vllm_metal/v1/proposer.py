@@ -63,6 +63,8 @@ class MetalProposer(Protocol):
     ``DraftModelProposer``.
     """
 
+    capture_layer_ids: list[int] | None
+
     def needs_target_hidden_states(
         self,
         decode_segments: Sequence[PagedDecodeSegment],
@@ -85,6 +87,11 @@ class Gemma4MTPProposer:
     after model load, so capturing it at construction time would pin the
     pre-sharing object.
     """
+
+    # Default to None: target_forward uses the existing collect_hidden_states
+    # path (single final layer). DSparkProposer overrides this with a non-empty
+    # list to trigger fused intermediate-layer capture.
+    capture_layer_ids: list[int] | None = None
 
     def __init__(self, runner: MetalModelRunner) -> None:
         self._runner = runner

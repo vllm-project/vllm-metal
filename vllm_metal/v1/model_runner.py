@@ -68,6 +68,9 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
+from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+from vllm_metal.v1.dspark.loader import is_dspark_drafter, load_drafter
+from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -81,6 +84,7 @@ from vllm_metal.v1.model_adapter import (
     TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.ngram_proposer import NgramProposer
 from vllm_metal.v1.pooling import (
     finish_paged_pooling_batch,
     forward_sequence_hidden_states,
@@ -568,12 +572,14 @@ class MetalModelRunner:
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
             cache=cache,
             collect_hidden_states=collect_hidden_states,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
@@ -710,11 +716,33 @@ class MetalModelRunner:
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
+
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "dspark" or (
+            spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config)
+        ):
+            # vLLM resolves a Qwen3DSparkModel draft to method="dspark" and puts
+            # the drafter repo on `spec.model`; the draft_model path carries it on
+            # draft_model_config. Cover both.
+            drafter_repo = (
+                spec.model if spec.method == "dspark" else spec.draft_model_config.model
+            )
+            drafter_model, drafter_cfg = load_drafter(drafter_repo)
+            self._drafter = DSparkProposer(
+                drafter=drafter_model,
+                config=drafter_cfg,
+                runner=self,
+                controller=self._spec_decode_controller,
+            )
+            logger.info(
+                "DSpark drafter loaded for speculative decoding: %s "
+                "(block_size=%d, target_layer_ids=%s)",
+                drafter_repo,
+                drafter_cfg.block_size,
+                drafter_cfg.target_layer_ids,
+            )
         elif spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 controller=self._spec_decode_controller,
@@ -734,8 +762,6 @@ class MetalModelRunner:
                     "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
                 )
         elif spec.method == "ngram":
-            from vllm_metal.v1.ngram_proposer import NgramProposer
-
             # N-gram drafts from token history alone — no model, no KV cache, so
             # num_blocks/block_size are unused here.
             self._drafter = NgramProposer.build(
@@ -1100,10 +1126,16 @@ class MetalModelRunner:
                     pp_send_handle = pipeline_send(stage_output, self.pp)
                 target_hidden_states = None
             else:
+                capture_layer_ids = (
+                    getattr(self._drafter, "capture_layer_ids", None)
+                    if collect_target_hidden_states
+                    else None
+                )
                 target_output = self._target_forward(
                     input_ids,
                     cache=offset_caches,
                     collect_hidden_states=collect_target_hidden_states,
+                    capture_layer_ids=capture_layer_ids,
                 )
                 logits = target_output.logits
                 target_hidden_states = target_output.hidden_states

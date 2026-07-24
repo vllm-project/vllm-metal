@@ -341,7 +341,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
@@ -397,7 +397,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         def fake_prepare_unified(decode_info, prefill_info, block_size):
             captured["decode_info"] = decode_info
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache, collect_hidden_states
             captured["input_ids"] = input_ids.tolist()
             return mr.TargetModelForwardOutput(
@@ -442,7 +442,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
@@ -544,7 +544,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
@@ -592,7 +592,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
@@ -649,7 +649,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_size
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
@@ -1772,7 +1772,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
 
         captured: dict[str, object] = {}
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states, **kwargs):
             del cache, collect_hidden_states
             ctx = mr.get_context()
             assert ctx is not None
