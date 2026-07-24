@@ -9,6 +9,7 @@ completeness, and fail-fast rejection of unsupported files.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import mlx.core as mx
@@ -18,6 +19,7 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
+import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
 from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
@@ -63,6 +65,8 @@ def _dense_tensor_specs(config: dict, *, has_qk_norm: bool, with_bias: bool) -> 
     """Return ``{gguf_name: (kind, shape)}`` for a dense decoder GGUF.
 
     ``kind`` is ``"q"`` (quantized weight) or ``"f"`` (F32 plain weight/bias).
+    Tests may inject ``"q6_k"`` zero blocks for unsupported-qtype coverage;
+    gguf-py can dequantize Q6_K but does not implement its quantizer.
     """
     d = _dims(config)
     specs: dict[str, tuple[str, tuple[int, ...]]] = {
@@ -106,7 +110,16 @@ def _write_gguf(
     for name, (kind, shape) in {**specs, **(inject or {})}.items():
         data = rng.standard_normal(shape).astype(np.float32)
         qtype = (quant_overrides or {}).get(name)
-        if kind == "q" or qtype is not None:
+        if kind == "q6_k":
+            block_size, type_size = gguf.GGML_QUANT_SIZES[QT.Q6_K]
+            assert shape[-1] % block_size == 0
+            packed_shape = (
+                *shape[:-1],
+                shape[-1] // block_size * type_size,
+            )
+            raw = np.zeros(packed_shape, dtype=np.uint8)
+            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q6_K)
+        elif kind == "q" or qtype is not None:
             raw_dtype = qtype or quant_type
             quant_input = data.reshape(1, -1) if data.ndim == 1 else data
             raw = gguf.quants.quantize(quant_input, raw_dtype)
@@ -174,7 +187,7 @@ def _assert_forward_vocab_shape(model: nn.Module) -> None:
     assert out.shape == (1, 3, 256)
 
 
-@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1])
 @pytest.mark.parametrize(
     ("model_type", "has_qk_norm", "needs_tokenizer"),
     [("qwen3", True, False), ("llama", False, True)],
@@ -198,24 +211,72 @@ def test_loads_dense_model_installs_wrappers(
     _assert_forward_vocab_shape(model)
 
 
-def test_skips_tie_redundant_output(tmp_path):
-    # Tied config but the GGUF still carries a redundant Q8_0 output.weight.
-    d = _dims(_tiny_config("qwen3"))
+def test_skips_tie_redundant_output(tmp_path, monkeypatch, caplog):
+    # Tied config but the GGUF still carries a redundant output.weight in an
+    # otherwise unsupported qtype. It is unused and must not block the model.
+    config_overrides = {
+        "hidden_size": 256,
+        "intermediate_size": 256,
+        "head_dim": 64,
+    }
+    d = _dims(_tiny_config("qwen3", **config_overrides))
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
+        config_overrides=config_overrides,
         has_qk_norm=True,
-        inject={"output.weight": ("q", (d["vocab"], d["h"]))},
+        inject={"output.weight": ("q6_k", (d["vocab"], d["h"]))},
     )
+    clear_cache_calls = 0
+    original_clear_cache = gguf_loader.mx.clear_cache
+
+    def track_clear_cache():
+        nonlocal clear_cache_calls
+        clear_cache_calls += 1
+        original_clear_cache()
+
+    monkeypatch.setattr(gguf_loader.mx, "clear_cache", track_clear_cache)
     # Must NOT raise (the redundant output is tie-skipped, not unmapped-failed).
-    model, _ = GGUFModelLoader(
-        gguf_path,
-        config_dir=cfg_dir,
-        target_dtype=mx.float32,
-    ).load()
+    with caplog.at_level(logging.INFO, logger=gguf_loader.__name__):
+        model, _ = GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
     assert not hasattr(model, "lm_head")
     # The tied head runs through the GGUFEmbedding's as_linear.
     assert _gguf_module_histogram(model).get("GGUFEmbedding") == 1
+    assert clear_cache_calls == 1
+    assert f"qtype={QT.Q6_K.name}" in caplog.text
+    assert f"fallback_bytes={d['vocab'] * d['h'] * 2}" in caplog.text
+
+
+def test_rejects_tied_output_above_dense_fallback_limit(tmp_path, monkeypatch):
+    config_overrides = {
+        "hidden_size": 256,
+        "intermediate_size": 256,
+        "head_dim": 64,
+    }
+    d = _dims(_tiny_config("qwen3", **config_overrides))
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen3",
+        config_overrides=config_overrides,
+        has_qk_norm=True,
+        inject={"output.weight": ("q6_k", (d["vocab"], d["h"]))},
+    )
+    monkeypatch.setattr(gguf_loader, "_MAX_TIED_OUTPUT_FALLBACK_BYTES", 1)
+
+    def fail_mx_load(*args, **kwargs):
+        raise AssertionError("memory safety preflight must run before mx.load")
+
+    monkeypatch.setattr(gguf_loader.mx, "load", fail_mx_load)
+    with pytest.raises(GGUFLoadError, match="transient FP16 allocation"):
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
 
 
 @pytest.mark.parametrize(
@@ -318,7 +379,7 @@ def _write_minimal_tokenizer(config_dir: str, vocab_size: int) -> None:
     )
 
 
-@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0])
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1])
 def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
     # The main quantized-path behavior: installed q/k GGUFLinear tensors carry the
     # RoPE-un-permuted quantized weight, not the raw (llama.cpp-permuted) one.
@@ -704,16 +765,45 @@ def test_rejects_vision_tensor(tmp_path):
         ).load()
 
 
-def test_rejects_unsupported_qtype(tmp_path):
+def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
         has_qk_norm=True,
-        quant_overrides={"blk.0.ffn_up.weight": QT.Q4_1},
+        quant_overrides={"blk.0.ffn_up.weight": QT.Q5_0},
     )
+
+    def fail_load_model(*args, **kwargs):
+        raise AssertionError("qtype preflight must run before load_model")
+
+    monkeypatch.setattr(gguf_loader, "load_model", fail_load_model)
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype Q4_1 on mapped weight 'blk.0.ffn_up.weight'",
+        match="Unsupported qtype Q5_0 on mapped weight 'blk.0.ffn_up.weight'",
+    ):
+        GGUFModelLoader(
+            gguf_path,
+            config_dir=cfg_dir,
+            target_dtype=mx.float32,
+        ).load()
+
+
+def test_rejects_unsupported_untied_output_before_mx_load(tmp_path, monkeypatch):
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen3",
+        config_overrides={"tie_word_embeddings": False},
+        has_qk_norm=True,
+        quant_overrides={"output.weight": QT.Q5_0},
+    )
+
+    def fail_mx_load(*args, **kwargs):
+        raise AssertionError("deferred output preflight must run before mx.load")
+
+    monkeypatch.setattr(gguf_loader.mx, "load", fail_mx_load)
+    with pytest.raises(
+        GGUFLoadError,
+        match="Unsupported qtype Q5_0 on mapped weight 'output.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
