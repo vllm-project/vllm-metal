@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-native local GGUF loader for dense Q8_0/Q4_0 decoder checkpoints."""
+"""MLX-native local GGUF loader for dense Q8_0/Q4_0/Q4_1 checkpoints."""
 
 from __future__ import annotations
 
@@ -29,6 +29,15 @@ __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
+_MAX_TIED_OUTPUT_FALLBACK_BYTES = 512 * 1024 * 1024
+_PLAIN_GGUF_TYPES = frozenset(
+    {
+        gguf.GGMLQuantizationType.F32,
+        gguf.GGMLQuantizationType.F16,
+        gguf.GGMLQuantizationType.BF16,
+    }
+)
+_ALLOWED_WEIGHT_TYPES = frozenset(MLX_NATIVE_GGUF_TYPES) | _PLAIN_GGUF_TYPES
 
 
 GGUFWrapper = GGUFLinear | GGUFEmbedding
@@ -55,7 +64,7 @@ class GGUFModelLoader:
     """Load a dense GGUF checkpoint into its mlx-lm model.
 
     Args:
-        gguf_path: Path to a local ``.gguf`` file (dense decoder, Q8_0/Q4_0).
+        gguf_path: Path to a local ``.gguf`` file (dense, Q8_0/Q4_0/Q4_1).
         config_dir: Companion HF config source that defines the mlx-lm skeleton.
         tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.
@@ -90,11 +99,12 @@ class GGUFModelLoader:
             gguf_arch=self._gguf_arch(reader),
             config_model_type=str(config.get("model_type", "")),
         )
-        self._preflight(reader)
+        self._preflight(reader, defer_output_weight=True)
 
         # Build the mlx-lm skeleton through the public upstream loader path.
         model, _ = load_model(self._config_dir, strict=False, model_config=config)
         tied = bool(getattr(model.args, "tie_word_embeddings", False))
+        self._preflight_deferred_output(reader, tied=tied)
 
         # Derive the GGUF->MLX name translation from the live model structure.
         adapter = GGUFModelAdapter.from_model(
@@ -137,14 +147,8 @@ class GGUFModelLoader:
             ) from exc
         return reader, load_config(self._config_dir)
 
-    def _preflight(self, reader: Any) -> None:
+    def _preflight(self, reader: Any, *, defer_output_weight: bool = False) -> None:
         """Reject out-of-scope tensors / qtypes from the reader, before ``mx.load``."""
-        plain_types = {
-            gguf.GGMLQuantizationType.F32,
-            gguf.GGMLQuantizationType.F16,
-            gguf.GGMLQuantizationType.BF16,
-        }
-        allowed_weight_types = set(MLX_NATIVE_GGUF_TYPES) | plain_types
         for tensor in reader.tensors:
             name = tensor.name
             if any(
@@ -154,19 +158,53 @@ class GGUFModelLoader:
                     f"Out-of-scope GGUF tensor {name!r} (fused-QKV/SSM/MoE/vision) "
                     "is not supported by the dense GGUF loader."
                 )
+            if defer_output_weight and name == "output.weight":
+                continue
             if (
                 name.endswith(_WEIGHT_SUFFIX)
-                and tensor.tensor_type not in allowed_weight_types
+                and tensor.tensor_type not in _ALLOWED_WEIGHT_TYPES
             ):
                 raise GGUFLoadError(
                     f"Unsupported qtype {tensor.tensor_type.name} on mapped weight "
-                    f"{name!r}; only Q8_0/Q4_0 (and plain F32/F16/BF16) are supported."
+                    f"{name!r}; only Q8_0/Q4_0/Q4_1 (and plain F32/F16/BF16) "
+                    "are supported."
                 )
-            if name.endswith(_BIAS_SUFFIX) and tensor.tensor_type not in plain_types:
+            if (
+                name.endswith(_BIAS_SUFFIX)
+                and tensor.tensor_type not in _PLAIN_GGUF_TYPES
+            ):
                 raise GGUFLoadError(
                     f"Unsupported qtype {tensor.tensor_type.name} on bias {name!r}; "
                     "additive biases must be plain F32/F16/BF16."
                 )
+
+    def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:
+        """Validate ``output.weight`` after the live model resolves weight tying."""
+        output = next(
+            (tensor for tensor in reader.tensors if tensor.name == "output.weight"),
+            None,
+        )
+        if output is None or output.tensor_type in _ALLOWED_WEIGHT_TYPES:
+            return
+        if not tied:
+            raise GGUFLoadError(
+                f"Unsupported qtype {output.tensor_type.name} on mapped weight "
+                "'output.weight'; only Q8_0/Q4_0/Q4_1 (and plain "
+                "F32/F16/BF16) are supported."
+            )
+
+        # MLX currently converts unsupported GGUF qtypes to FP16 before returning
+        # from mx.load. The tied output is redundant and immediately discarded,
+        # but cap that unavoidable transient allocation so a large vocabulary
+        # cannot cause an unbounded memory spike.
+        fallback_bytes = int(output.n_elements) * 2
+        if fallback_bytes > _MAX_TIED_OUTPUT_FALLBACK_BYTES:
+            raise GGUFLoadError(
+                f"Tied redundant output.weight uses {output.tensor_type.name}, "
+                f"which requires a {fallback_bytes}-byte transient FP16 allocation "
+                f"during mx.load; the safety limit is "
+                f"{_MAX_TIED_OUTPUT_FALLBACK_BYTES} bytes."
+            )
 
     def _partition(
         self,
@@ -177,6 +215,11 @@ class GGUFModelLoader:
     ) -> _PartitionedTensors:
         """Route each GGUF tensor to quant-install / plain-load / bias-side-map."""
         arrays = mx.load(str(self._gguf_path))
+        if tied:
+            skipped_output = arrays.pop("output.weight", None)
+            if skipped_output is not None:
+                del skipped_output
+                mx.clear_cache()
         quant: dict[str, GGUFMLXQuantizedTensor] = {}
         plain: dict[str, mx.array] = {}
         biases: dict[str, mx.array] = {}
@@ -185,6 +228,8 @@ class GGUFModelLoader:
             translated = adapter.translate(name)
             if translated is None:
                 continue
+            if tied and translated == "lm_head.weight":
+                continue  # tie-redundant output table; the tied head uses as_linear
 
             suffix = _BIAS_SUFFIX if name.endswith(_BIAS_SUFFIX) else _WEIGHT_SUFFIX
             module_path = translated[: -len(suffix)]
@@ -192,8 +237,6 @@ class GGUFModelLoader:
             try:
                 current = self._resolve_path(model, module_path)
             except (AttributeError, KeyError, IndexError) as exc:
-                if tied and translated == "lm_head.weight":
-                    continue  # tie-redundant output table; the tied head uses as_linear
                 raise GGUFLoadError(
                     f"GGUF tensor {name!r} maps to {translated!r} but module "
                     f"{module_path!r} is absent from the model."

@@ -21,7 +21,11 @@ from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
 
-NATIVE_QTYPES = [GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_0]
+NATIVE_QTYPES = [
+    GGMLQuantizationType.Q8_0,
+    GGMLQuantizationType.Q4_0,
+    GGMLQuantizationType.Q4_1,
+]
 
 
 def _write_quantized_gguf(path, weight: np.ndarray, qtype) -> dict[str, mx.array]:
@@ -184,13 +188,8 @@ def test_embedding_rejects_non_floating_output_dtype(tmp_path):
             GGUFEmbedding(qt, output_dtype=bad)
 
 
-def test_wrapper_never_sees_invalid_tensor(tmp_path):
-    # Q4_1 is rejected when the tensor is built — before any wrapper can exist.
-    weight = np.random.default_rng(0).standard_normal((32, 64)).astype(np.float32)
-    arrays = _write_quantized_gguf(
-        tmp_path / "q4_1.gguf", weight, GGMLQuantizationType.Q4_1
-    )
-    with pytest.raises(ValueError, match="ml-explore/mlx#3664"):
-        GGUFMLXQuantizedTensor.from_mx_load(
-            arrays, "w.weight", GGMLQuantizationType.Q4_1
-        )
+def test_q4_1_tensor_can_be_wrapped(tmp_path):
+    qt, _ = _make_tensor(tmp_path, GGMLQuantizationType.Q4_1)
+
+    assert GGUFLinear(qt).tensor is qt
+    assert GGUFEmbedding(qt, output_dtype=mx.float16).tensor is qt
