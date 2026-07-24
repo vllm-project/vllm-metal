@@ -382,7 +382,7 @@ class TestGemma4MTPDraftSeeds:
                 token_id=8,
                 target_hidden_row=1,
                 target_position=5,
-                block_ids=(1,),
+                block_ids=((1,),),
             ),
         )
 
@@ -422,7 +422,7 @@ class TestGemma4MTPDraftSeeds:
                 token_id=11,
                 target_hidden_row=2,
                 target_position=12,
-                block_ids=(4,),
+                block_ids=((4,),),
             ),
         )
 

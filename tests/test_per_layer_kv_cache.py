@@ -309,6 +309,52 @@ class TestMHAKVCacheLayout:
         assert cache.group_index_for_layer(1) == 1
         assert cache.block_size_for_layer(1) == 16
 
+    def test_cache_policy_adopts_engine_layout(self, monkeypatch) -> None:
+        config, _ = self._mixed_mha_config()
+        runner = make_stub_runner(
+            num_layers=4,
+            num_kv_cache_layers=4,
+            num_kv_heads=4,
+            head_dim=512,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=SimpleNamespace(block_size=32),
+        )
+        backend = MHAPagedAttentionRuntime(
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=512,
+            block_size=32,
+            dtype=mx.bfloat16,
+        )
+        backend.initialize(num_blocks=config.num_blocks)
+        runner.install_paged_attention_runtime(backend, block_size=32)
+
+        patched: dict[str, object] = {}
+
+        def patch_model(model):
+            patched["model"] = model
+            return 4
+
+        monkeypatch.setattr(backend, "patch_model", patch_model)
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=True,
+                mlx_device="gpu",
+                debug=False,
+                turboquant=False,
+            ),
+        )
+
+        runner.initialize_kv_cache(config)
+
+        assert patched["model"] is runner.model
+        assert backend.kv_cache.group_index_for_layer(1) == 1
+        assert backend.kv_cache.block_size_for_layer(1) == 16
+        assert runner._paged_scheduler_group_indices == (0, 1)
+        assert runner._paged_group_block_sizes == (32, 16)
+
     def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
         config, names = self._mixed_mha_config()
         cache = MetalPagedKVCache.from_layout(
