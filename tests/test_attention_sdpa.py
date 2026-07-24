@@ -12,6 +12,7 @@ Metal kernel dispatch itself is covered by the end-to-end smoke tests,
 not here.
 """
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from vllm_metal.attention.caches.mha_layout import (
 )
 from vllm_metal.attention.context import (
     PagedAttentionContext,
+    clear_context,
     get_context,
     prepare_grouped,
 )
@@ -45,6 +47,12 @@ _N_HEADS = 2
 _N_KV_HEADS = 2
 _HEAD_DIM = 4  # small enough for fast unit tests
 _CACHE_HEAD_DIM = 8  # Gemma4-style: cache wider than layer head_dim
+
+
+@pytest.fixture(autouse=True)
+def _clear_attention_context() -> Iterator[None]:
+    yield
+    clear_context()
 
 
 class _FakeLinear:
