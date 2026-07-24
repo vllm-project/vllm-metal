@@ -614,7 +614,10 @@ class _PagedRoutingOpsSpy:
         _max_seq_len: int,
         _sliding_window: int,
         _out: mx.array,
+        *,
+        window_seqlen_q: int = 1,
     ) -> None:
+        del window_seqlen_q
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
 

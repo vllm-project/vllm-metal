@@ -833,7 +833,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             token_id=9,
             target_hidden_row=1,
             target_position=2,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         assert draft_token_ids == DraftTokenIds(["r0"], [[42]])
 
@@ -960,7 +960,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             token_id=7,
             target_hidden_row=1,
             target_position=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
         assert draft_token_ids == DraftTokenIds(["p0"], [[43]])
 
