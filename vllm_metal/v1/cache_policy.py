@@ -400,7 +400,6 @@ class ModelCachePolicy:
         self.install_gemma4_mtp_kv_sharing(
             runtime,
             block_size=layout.group_block_sizes[0],
-            group_block_sizes=layout.group_block_sizes,
         )
         self._runner.install_paged_attention_runtime(
             runtime,
@@ -519,7 +518,6 @@ class ModelCachePolicy:
         backend: PagedAttentionRuntime,
         *,
         block_size: int,
-        group_block_sizes: Sequence[int] | None = None,
     ) -> None:
         """Wire Gemma4 MTP assistant layers to the target paged KV cache."""
         assistant = self._runner._gemma4_mtp_assistant
@@ -538,11 +536,7 @@ class ModelCachePolicy:
             target_metadata=target_metadata,
             target_kv_cache=backend.kv_cache,
             block_size=block_size,
-            group_block_sizes=(
-                tuple(group_block_sizes)
-                if group_block_sizes is not None
-                else backend.kv_group_block_sizes()
-            ),
+            group_block_sizes=backend.kv_group_block_sizes(),
         )
 
     def estimate_one_sequence_kv_bytes(

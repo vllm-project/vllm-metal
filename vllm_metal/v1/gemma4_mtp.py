@@ -187,11 +187,6 @@ class Gemma4MTPKVSharingBinding:
         group_sizes = (
             tuple(group_block_sizes) if group_block_sizes is not None else (block_size,)
         )
-        if not group_sizes or any(size <= 0 for size in group_sizes):
-            raise ValueError(
-                "Gemma4 MTP KV sharing group block sizes must be positive, got "
-                f"{group_sizes}"
-            )
         plan.validate_target_cache(target_kv_cache)
         return cls(
             plan=plan,

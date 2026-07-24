@@ -151,7 +151,6 @@ def prepare_grouped(
     ],
     prefill_requests: Sequence[tuple[Sequence[Sequence[int]], int, int]],
     block_sizes: Sequence[int],
-    *,
     merge_verify_windows: bool = False,
 ) -> None:
     """Compute metadata for every scheduler KV-cache group in one forward pass.

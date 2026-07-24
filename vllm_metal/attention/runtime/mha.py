@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.impls.sdpa_wrapper import (
+    patch_sdpa_attention,
+)
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-
-if TYPE_CHECKING:
-    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-    from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 
 
 class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
@@ -35,7 +36,6 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
-        layout: MHAKVCacheLayout | None = None,
     ) -> None:
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -50,20 +50,9 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
-        self._layout = layout
+        self._layout: MHAKVCacheLayout | None = None
 
     def initialize(self, num_blocks: int) -> None:
-        from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-
-        if self._layout is not None:
-            if num_blocks != self._layout.num_blocks:
-                raise ValueError(
-                    "layout-backed MHA runtime must initialize with the vLLM "
-                    f"config num_blocks ({self._layout.num_blocks}), got {num_blocks}"
-                )
-            self._cache = MetalPagedKVCache.from_layout(self._layout, self._dtype)
-            return
-
         self._cache = MetalPagedKVCache(
             num_layers=self._num_layers,
             num_kv_heads=self._num_kv_heads,
@@ -87,8 +76,6 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 "layout-backed MHA runtime does not support TurboQuant"
             )
 
-        from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-
         self._layout = layout
         self._block_size = layout.group_block_sizes[0]
         self._cache = MetalPagedKVCache.from_layout(layout, self._dtype)
@@ -109,10 +96,6 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def patch_model(self, model: Any) -> int:
         cache = self._require_initialized("patch_model")
-
-        from vllm_metal.attention.impls.sdpa_wrapper import (
-            patch_sdpa_attention,
-        )
 
         return patch_sdpa_attention(
             model, cache, self._block_size, cache_idx_map=self._cache_idx_map
