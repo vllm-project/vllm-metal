@@ -420,6 +420,69 @@ class TestNgramMissThrottle:
         assert drafts.req_ids == ["r0"]
         mock_propose.assert_called_once()
 
+    def test_prune_and_resolve_run_even_when_speculative_tokens_disabled(
+        self,
+    ) -> None:
+        """A step with drafting disabled (num_speculative_tokens <= 0) must
+        still prune finished ids and resolve pending drafts -- that
+        bookkeeping can't be gated behind the same early return that skips
+        drafting, or a request id reused during a disabled step would carry
+        stale throttle state into a later step where drafting resumes."""
+        proposer = _proposer()
+        old_state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", old_state)])
+
+        with patch.object(proposer._ngram, "propose", return_value=[[]]):
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                proposer.propose(ctx)
+        assert "r0" in proposer._cooldown
+
+        # Same id reused by a new request, but this step has speculative
+        # decoding disabled.
+        new_state = _request_state([1, 2, 3])
+        disabled_ctx = _context(
+            decode_reqs=[("r0", new_state)],
+            finished_req_ids={"r0"},
+            num_speculative_tokens=0,
+        )
+        assert proposer.propose(disabled_ctx) is None  # K=0, nothing drafted
+        assert "r0" not in proposer._cooldown  # cleanup must still happen
+        assert "r0" not in proposer._miss_streak
+
+        # A later, enabled step must evaluate the new request fresh.
+        enabled_ctx = _context(decode_reqs=[("r0", new_state)])
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[42]]
+        ) as mock_propose:
+            drafts = proposer.propose(enabled_ctx)
+        assert drafts is not None
+        mock_propose.assert_called_once()
+
+    def test_pending_not_resolved_for_unscheduled_live_request(self) -> None:
+        """A request can be alive in request_states without being scheduled
+        for decode this step (still mid-prefill, paused, preempted). A
+        pending draft for it must not be scored as a miss just because it
+        wasn't verified this particular step."""
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(proposer._ngram, "propose", return_value=[[99]]):
+            drafts = proposer.propose(ctx)
+        assert drafts is not None
+        assert "r0" in proposer._pending
+
+        # Next step: r0 is still alive but not scheduled for decode.
+        unscheduled_ctx = _context(
+            decode_reqs=[],
+            request_states={"r0": state},
+        )
+        proposer.propose(unscheduled_ctx)
+
+        # The pending draft must survive untouched, not be scored as a miss.
+        assert "r0" in proposer._pending
+        assert proposer._miss_streak.get("r0", 0) == 0
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

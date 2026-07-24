@@ -42,11 +42,10 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
     from vllm.config import VllmConfig
 
-    from vllm_metal.v1.model_runner import RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import (
         PagedDecodeSegment,
@@ -149,11 +148,16 @@ class NgramProposer:
         return False
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        # Bookkeeping runs unconditionally, before the num_speculative_tokens
+        # check: a step with drafting disabled still needs finished ids
+        # pruned and pending drafts resolved, or a request id reused in a
+        # disabled step would carry stale throttle state into the next step
+        # where drafting is enabled again.
+        self._prune_finished(ctx.finished_req_ids)
+        self._resolve_pending(ctx)
+
         if ctx.num_speculative_tokens <= 0:
             return None
-
-        self._prune_finished(ctx.finished_req_ids)
-        self._resolve_pending(ctx.request_states)
 
         drafting = list(
             self._controller.draft_eligible_requests(
@@ -243,15 +247,22 @@ class NgramProposer:
         if streak >= _MAX_CONSECUTIVE_MISSES:
             self._cooldown[req_id] = _COOLDOWN_STEPS
 
-    def _resolve_pending(self, request_states: Mapping[str, RequestState]) -> None:
+    def _resolve_pending(self, ctx: ProposeContext) -> None:
         """Score the previous step's proposals against what was actually
-        accepted, now that this step's ``state.token_ids`` reflects it."""
+        accepted, but only for requests whose draft is actually verified
+        this step (present in ``decode_reqs``). A request can be alive in
+        ``request_states`` without being scheduled this step at all (still
+        mid-prefill, paused, preempted) -- treating "no new tokens visible
+        yet" as a miss for those would blame the request for a step that
+        never verified it."""
         if not self._pending:
             return
-        for req_id, (position, proposed) in self._pending.items():
-            state = request_states.get(req_id)
+        decode_states = dict(ctx.decode_reqs)
+        for req_id in list(self._pending):
+            state = decode_states.get(req_id)
             if state is None:
-                continue
+                continue  # not verified this step; leave pending for later
+            position, proposed = self._pending.pop(req_id)
             actual = state.token_ids[position : position + len(proposed)]
             accepted = 0
             # actual may be shorter than proposed if the engine hasn't
@@ -264,7 +275,6 @@ class NgramProposer:
                 self._miss_streak.pop(req_id, None)
             else:
                 self._record_miss(req_id)
-        self._pending.clear()
 
     def _prune_finished(self, finished_req_ids: set[str]) -> None:
         if not finished_req_ids:
