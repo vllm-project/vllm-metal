@@ -9,7 +9,7 @@
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
 | `VLLM_METAL_DEBUG` | `0` | Enable debug logging |
-| `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` / `text-only-compat` use the compatibility allowlist; `multimodal-native` disables overrides |
+| `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist; `multimodal-native` disables overrides |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
@@ -22,7 +22,6 @@
 ## Multimodal Serve Modes
 
 - `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.
-- `text-only-compat`: use the same compatibility allowlist as `auto`.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 
 ## Speculative Decoding

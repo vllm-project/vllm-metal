@@ -145,18 +145,8 @@ class TestMetalConfig:
         assert config.k_quant == "q8_0"
         assert config.v_quant == "q3_0"
 
-    def test_text_only_compat_mode_is_accepted(self) -> None:
-        config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=True,
-            mlx_device="gpu",
-            debug=False,
-            use_paged_attention=True,
-            multimodal_mode="text-only-compat",
-        )
-        assert config.multimodal_mode == "text-only-compat"
-
-    def test_invalid_multimodal_mode_rejected(self) -> None:
+    @pytest.mark.parametrize("mode", ["text-only-compat", "vlm"])
+    def test_invalid_multimodal_mode_rejected(self, mode: str) -> None:
         with pytest.raises(ValueError, match="Invalid VLLM_METAL_MULTIMODAL_MODE"):
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
@@ -164,7 +154,7 @@ class TestMetalConfig:
                 mlx_device="gpu",
                 debug=False,
                 use_paged_attention=True,
-                multimodal_mode="vlm",  # type: ignore[arg-type]
+                multimodal_mode=mode,  # type: ignore[arg-type]
             )
 
     def test_turboquant_requires_paged_attention(self) -> None:

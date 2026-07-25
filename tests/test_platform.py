@@ -1484,54 +1484,6 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_check_and_update_config_text_only_compat_preserves_generic_vlm(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-        try:
-            sentinel = SimpleNamespace(language_model_only=False)
-            model_config = SimpleNamespace(
-                model="test-model",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=128,
-                multimodal_config=sentinel,
-                hf_config=SimpleNamespace(model_type="phi3_v"),
-                is_hybrid=False,
-            )
-            vllm_config = SimpleNamespace(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                    enable_prefix_caching=False,
-                ),
-                model_config=model_config,
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=False,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=2048,
-                    max_num_scheduled_tokens=None,
-                ),
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert model_config.multimodal_config is sentinel
-
-        finally:
-            reset_config()
-
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

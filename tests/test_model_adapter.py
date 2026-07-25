@@ -70,32 +70,6 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
 
-    def test_text_only_compat_mode_forces_allowlisted_text_backbone(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        hf_config = SimpleNamespace(
-            model_type="qwen3_6",
-            architectures=["Qwen3_6MoeForConditionalGeneration"],
-            quantization_config={"quant_method": "fp8"},
-        )
-        adapter = DefaultModelAdapter()
-        result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
-
-    def test_text_only_compat_mode_does_not_force_generic_vlm(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        hf_config = SimpleNamespace(model_type="phi3_v")
-        adapter = DefaultModelAdapter()
-        result = adapter.should_force_text_backbone(hf_config)
-        assert result is False
-
     def test_multimodal_native_mode_disables_auto_override(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
@@ -335,39 +309,6 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
-    def test_text_only_compat_mode_clears_multimodal_for_allowlisted_vlm(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        model_config = SimpleNamespace(
-            multimodal_config=SimpleNamespace(language_model_only=False),
-            hf_config=SimpleNamespace(
-                model_type="qwen3_6",
-                architectures=["Qwen3_6ForConditionalGeneration"],
-                quantization_config={"quant_method": "fp8"},
-            ),
-        )
-
-        DefaultModelAdapter().normalize_model_config(model_config)
-
-        assert model_config.multimodal_config is None
-
-    def test_text_only_compat_mode_preserves_generic_vlm(self, monkeypatch) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        sentinel = SimpleNamespace(language_model_only=False)
-        model_config = SimpleNamespace(
-            multimodal_config=sentinel,
-            hf_config=SimpleNamespace(model_type="phi3_v"),
-        )
-
-        DefaultModelAdapter().normalize_model_config(model_config)
-
-        assert model_config.multimodal_config is sentinel
-
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
@@ -408,22 +349,6 @@ class TestNormalizeModelConfig:
         DefaultModelAdapter().normalize_model_config(model_config)
 
         assert model_config.multimodal_config is None
-
-    def test_text_only_compat_mode_preserves_missing_hf_config(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        sentinel = SimpleNamespace(language_model_only=False)
-        model_config = SimpleNamespace(
-            multimodal_config=sentinel,
-            hf_config=None,
-        )
-
-        DefaultModelAdapter().normalize_model_config(model_config)
-
-        assert model_config.multimodal_config is sentinel
 
 
 class TestTextModel:

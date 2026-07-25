@@ -510,32 +510,9 @@ class TestModelLifecycle:
         assert runner.tokenizer is vlm_tokenizer
         assert runner._is_vlm is True
 
-    def test_load_text_only_compat_mode_keeps_generic_vlm_native(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-        _stub_generation_model(
-            monkeypatch,
-            config=SimpleNamespace(text_config=_text_config()),
-            is_vlm=True,
-        )
-        lifecycle, runner = _make_lifecycle(
-            model_config=_runner_model_config(
-                hf_config=SimpleNamespace(model_type="phi3_v"),
-                is_multimodal_model=True,
-            )
-        )
-
-        lifecycle.load()
-
-        assert runner._is_vlm is True
-
     @pytest.mark.slow
-    def test_load_text_only_compat_real_qwen_fp8_checkpoint(
+    def test_load_auto_mode_real_qwen_fp8_checkpoint(
         self,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         model_path = os.environ.get("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH")
         if not model_path:
@@ -547,8 +524,6 @@ class TestModelLifecycle:
 
         from vllm_metal.compat import _patch_mlx_lm_qwen35_fp8_sanitize
 
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
         Gemma4MTPAssistantLoader.clear_cache()
         _patch_mlx_lm_qwen35_fp8_sanitize()
 

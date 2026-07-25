@@ -251,8 +251,8 @@ class DefaultModelAdapter(ModelAdapter):
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
 
-        ``multimodal-native`` disables compatibility overrides. ``auto`` and
-        ``text-only-compat`` share the same compatibility allowlist.
+        ``multimodal-native`` disables compatibility overrides. ``auto`` uses
+        the compatibility allowlist.
         """
         multimodal_mode = self._multimodal_mode()
         if multimodal_mode == "multimodal-native":
