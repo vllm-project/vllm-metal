@@ -83,6 +83,10 @@ from vllm_metal.v1.model_adapter import (
     TargetModelForwardOutput,
 )
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
+from vllm_metal.v1.mtp_heads.registry import (
+    NativeMTPBuildContext,
+    NativeMTPHeadRegistry,
+)
 from vllm_metal.v1.pooling import (
     finish_paged_pooling_batch,
     forward_sequence_hidden_states,
@@ -771,10 +775,24 @@ class MetalModelRunner:
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
             )
+        elif spec.method == "mtp":
+            head = NativeMTPHeadRegistry.find(spec)
+            if head is None:
+                raise NotImplementedError(
+                    NativeMTPHeadRegistry.unsupported_message(spec)
+                )
+            context = NativeMTPBuildContext(
+                speculative_config=spec,
+                controller=self._spec_decode_controller,
+                vllm_config=self.vllm_config,
+                target_config=self.model_args,
+            )
+            self._drafter = head.build_proposer(context)
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, native MTP heads "
+                f"{NativeMTPHeadRegistry.registered_types()}, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(
