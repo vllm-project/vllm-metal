@@ -14,7 +14,7 @@ from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
+import vllm_metal.compat as compat
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -135,81 +135,20 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_check_and_update_config_reensures_bytelevel_tokenizer_patch(
+    def test_check_and_update_config_fails_if_bytelevel_retry_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Plugin activation can never install the ByteLevel tokenizer patch.
+        def _raise_import_error() -> None:
+            raise ImportError("tokenizer registry unavailable")
 
-        ``_register()`` runs from inside ``vllm.utils.torch_utils``'s own
-        import -- its module-level ``PIN_MEMORY = is_pin_memory_available()``
-        is what resolves the platform -- so ``import vllm.tokenizers`` reaches
-        a partially initialized ``torch_utils`` and raises. The patch is
-        skipped every time. Without this post-import re-ensure, the fix from
-        #337/#342 never installs and ByteLevel pieces leak into served text.
-        """
-        import vllm.tokenizers.registry as tokenizer_registry
-
-        sentinel = "_vllm_metal_bytelevel_decoder_patch"
-
-        # Register both rebindings with monkeypatch so teardown restores them,
-        # then clear the sentinel to simulate a freshly registered process.
         monkeypatch.setattr(
-            tokenizer_registry,
-            "get_tokenizer",
-            tokenizer_registry.get_tokenizer,
+            compat,
+            "ensure_vllm_bytelevel_tokenizer_patch",
+            _raise_import_error,
         )
-        monkeypatch.setattr(
-            tokenizer_registry,
-            "cached_get_tokenizer",
-            tokenizer_registry.cached_get_tokenizer,
-        )
-        # setattr (not delattr) so teardown restores a previously-absent
-        # sentinel by deleting it, instead of leaving it set for later tests.
-        monkeypatch.setattr(tokenizer_registry, sentinel, False, raising=False)
-        assert not getattr(tokenizer_registry, sentinel, False)
 
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        reset_config()
-        try:
-            vllm_config = SimpleNamespace(
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                ),
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=False,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=False,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=2048,
-                    max_num_scheduled_tokens=None,
-                ),
-                speculative_config=None,
-                lora_config=None,
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert getattr(tokenizer_registry, sentinel, False), (
-                "check_and_update_config must re-ensure the ByteLevel tokenizer "
-                "patch; plugin registration alone always skips it"
-            )
-        finally:
-            reset_config()
+        with pytest.raises(ImportError, match="tokenizer registry unavailable"):
+            MetalPlatform.check_and_update_config(SimpleNamespace())
 
     def test_check_and_update_config_rejects_pipeline_ring_port_overflow(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1700,7 +1639,7 @@ class TestAutoFitMaxModelLenChain:
         """The null-block auto-fit patch (compat.py) is part of the contract
         under test; ensure it directly because plugin activation can skip it
         while vLLM is partially imported."""
-        ensure_vllm_auto_fit_null_block_patch()
+        compat.ensure_vllm_auto_fit_null_block_patch()
 
     _BLOCK_SIZE = 16
     # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —

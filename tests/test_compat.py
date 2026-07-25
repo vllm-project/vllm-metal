@@ -246,7 +246,7 @@ class TestGemma4MTPConfigCompatPatch:
         assert config.text_config.num_kv_shared_layers == 0
         assert get_hf_text_config(config).model_type == "gemma4_text"
 
-    def test_missing_gemma4_config_module_does_not_stop_other_patches(
+    def test_registration_time_failures_do_not_stop_other_patches(
         self,
         monkeypatch,
     ) -> None:
@@ -267,10 +267,15 @@ class TestGemma4MTPConfigCompatPatch:
             "_gemma4_assistant_config_class",
             _raise_missing_gemma4_config,
         )
+
+        def _raise_bytelevel_import_error() -> None:
+            calls.append("bytelevel")
+            raise ImportError("partial vLLM import")
+
         monkeypatch.setattr(
             compat,
             "ensure_vllm_bytelevel_tokenizer_patch",
-            lambda: calls.append("bytelevel"),
+            _raise_bytelevel_import_error,
         )
         monkeypatch.setattr(
             compat,
