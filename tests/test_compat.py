@@ -127,7 +127,7 @@ class TestByteLevelTokenizerCompatPatch:
         from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
         _write_mismatched_bytelevel_tokenizer_repo(tmp_path)
-        compat._patch_vllm_bytelevel_tokenizer_loading()
+        compat.ensure_vllm_bytelevel_tokenizer_patch()
 
         tokenizer = tokenizer_registry.get_tokenizer(tmp_path, tokenizer_mode="hf")
         decoded = tokenizer.decode([0, 1])
@@ -269,7 +269,7 @@ class TestGemma4MTPConfigCompatPatch:
         )
         monkeypatch.setattr(
             compat,
-            "_patch_vllm_bytelevel_tokenizer_loading",
+            "ensure_vllm_bytelevel_tokenizer_patch",
             lambda: calls.append("bytelevel"),
         )
         monkeypatch.setattr(

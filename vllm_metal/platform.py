@@ -332,6 +332,14 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
+
+        # Runs after vLLM is fully imported, in every process that builds a
+        # config, and before the serving tokenizer is created: the reliable
+        # spot to (re-)install the ByteLevel tokenizer patch that plugin
+        # activation always skips mid-import.
+        ensure_vllm_bytelevel_tokenizer_patch()
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
