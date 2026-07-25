@@ -347,7 +347,11 @@ static void dispatch_paged_attention_v2_online(
     const array* v_centroids = nullptr,
     bool use_turboquant = false,
     int k_bits = 8,
-    int v_bits = 3) {
+    int v_bits = 3,
+    // Attention sinks (optional): one float per query head, a learned logit
+    // that joins the softmax denominator without contributing a value row.
+    // nullptr for every model that has no sinks, which is the common case.
+    const array* sinks = nullptr) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -370,7 +374,12 @@ static void dispatch_paged_attention_v2_online(
   const bool window_batch =
       has_prefill && window_seqlen_q > 1 && head_size <= kWindowMaxHeadSize;
 
-  if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
+  // Sinks join TurboQuant in being excluded from the tiled kernel:
+  // pagedattention_tiled.metal has no sink code path at all, so a sinks batch
+  // must fall through to the per-token kernel below, which does.  Routing it
+  // to the tiled kernel would silently drop the sink term.
+  if (has_prefill && !window_batch && !use_turboquant && dtype_ok
+      && sinks == nullptr) {
     if (auto cfg = select_tile_config(head_size)) {
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
@@ -433,7 +442,7 @@ static void dispatch_paged_attention_v2_online(
   bool use_partitioning  = partition;
   bool use_alibi         = false;
   bool use_fp8           = false;
-  bool use_sinks         = false;
+  bool use_sinks         = sinks != nullptr;
   bool use_tq_fc         = use_turboquant;
   int  k_bits_i          = k_bits;
   int  v_bits_i          = v_bits;
@@ -445,7 +454,8 @@ static void dispatch_paged_attention_v2_online(
       + "_tq" + (use_tq_fc ? "1" : "0")
       + "_kb" + std::to_string(k_bits_i)
       + "_vb" + std::to_string(v_bits_i)
-      + "_wq" + std::to_string(window_q_fc);
+      + "_wq" + std::to_string(window_q_fc)
+      + "_sk" + (use_sinks ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto* kernel = d.get_kernel(
@@ -492,6 +502,13 @@ static void dispatch_paged_attention_v2_online(
     enc.set_input_array(*v_centroids, 27);
   };
 
+  // Sink logits (slot 18); bound only when the kernel was specialized with
+  // use_sinks, since the argument is declared under that function constant.
+  auto bind_sinks = [&]() {
+    if (!use_sinks) return;
+    enc.set_input_array(*sinks, 18);
+  };
+
   if (!partition) {
     // Single-pass path (grid.z = 1): the original decode/per-token kernel.
     enc.set_compute_pipeline_state(kernel);
@@ -501,6 +518,7 @@ static void dispatch_paged_attention_v2_online(
                             cu_seqlens_q, sliding_window);
     enc.set_bytes(scale, 9);
     bind_turboquant();
+    bind_sinks();
     enc.dispatch_threadgroups(
         MTL::Size::Make(num_heads, grid_y, 1),
         MTL::Size::Make(NUM_THREADS, 1, 1));
@@ -537,6 +555,10 @@ static void dispatch_paged_attention_v2_online(
   enc.set_output_array(exp_sums, 0);
   enc.set_output_array(max_logits, 1);
   bind_turboquant();
+  // The partitioned kernel does not fold the sink itself (the reduce does, so
+  // it is counted once rather than once per partition), but slot 18 is still a
+  // declared argument under function constant 40, so it must be bound here.
+  bind_sinks();
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, grid_y, max_num_partitions),
       MTL::Size::Make(NUM_THREADS, 1, 1));
@@ -548,7 +570,8 @@ static void dispatch_paged_attention_v2_online(
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
   // other function constants are inert for it.  TurboQuant batches take this
   // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
-  // sinks are unsupported and stay false.  The cache key MUST encode every
+  // and sinks are folded here rather than in the partitioned kernel so the
+  // sink logit is counted once globally.  The cache key MUST encode every
   // constant the pipeline is specialized on — otherwise the first compile
   // wins and a later caller with different constants silently reuses the
   // wrong pipeline.
@@ -574,6 +597,9 @@ static void dispatch_paged_attention_v2_online(
   enc.set_input_array(seq_lens, 4);
   int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
   enc.set_bytes(max_num_partitions_i, 5);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 6);
+  }
   enc.set_input_array(cu_seqlens_q, 7);
   int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
   enc.set_bytes(num_seqs_i, 8);
@@ -596,13 +622,13 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       Stream stream, int num_kv_heads, float scale, float softcap,
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
-      int window_seqlen_q = 1)
+      int window_seqlen_q = 1, bool use_sinks = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
         use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
-        window_seqlen_q_(window_seqlen_q) {}
+        window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -613,11 +639,14 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
     // Non-TQ inputs: [query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q]
     // TQ inputs:     [query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
     //                 key_scale_cache, value_scale_cache, key_zero_cache, v_centroids]
+    // Sinks append one array at slot 6.  TQ and sinks are mutually exclusive
+    // (rejected in paged_attention_primitive_fn), so the two never collide.
     out.set_data(allocator::malloc(out.nbytes()));
     const array* ks = use_turboquant_ ? &inputs[6] : nullptr;
     const array* vs = use_turboquant_ ? &inputs[7] : nullptr;
     const array* kz = use_turboquant_ ? &inputs[8] : nullptr;
     const array* vc = use_turboquant_ ? &inputs[9] : nullptr;
+    const array* sk = use_sinks_ ? &inputs[6] : nullptr;
     dispatch_paged_attention_v2_online(
         out,
         inputs[0],               // query
@@ -626,7 +655,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
         stream(),
-        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_);
+        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -641,7 +670,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->use_turboquant_ == use_turboquant_
         && rhs->k_bits_ == k_bits_
         && rhs->v_bits_ == v_bits_
-        && rhs->window_seqlen_q_ == window_seqlen_q_;
+        && rhs->window_seqlen_q_ == window_seqlen_q_
+        && rhs->use_sinks_ == use_sinks_;
   }
 
  private:
@@ -655,6 +685,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int k_bits_;
   int v_bits_;
   int window_seqlen_q_;
+  bool use_sinks_;
 };
 
 static array paged_attention_primitive_fn(
@@ -669,7 +700,37 @@ static array paged_attention_primitive_fn(
     const array* value_scale_cache = nullptr,
     const array* key_zero_cache = nullptr,
     const array* v_centroids = nullptr,
-    int v_bits = 3, int window_seqlen_q = 1) {
+    int v_bits = 3, int window_seqlen_q = 1,
+    const array* sinks = nullptr) {
+  if (sinks != nullptr) {
+    // Upstream MLX refuses the same combination
+    // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
+    // sinks"), and the TurboQuant reduce already owns the deferred inverse
+    // FWHT, so folding a sink there would need its own derivation.  Reject
+    // rather than silently drop the sink term.
+    if (use_turboquant) {
+      throw std::invalid_argument(
+          "attention sinks are not supported with TurboQuant quantized KV; "
+          "pass sinks=None or disable TurboQuant for this layer");
+    }
+    if (sinks->ndim() != 1) {
+      throw std::invalid_argument(
+          "sinks must be 1-D with one entry per query head, got ndim=" +
+          std::to_string(sinks->ndim()));
+    }
+    const int num_q_heads = static_cast<int>(query.shape(1));
+    if (static_cast<int>(sinks->shape(0)) != num_q_heads) {
+      throw std::invalid_argument(
+          "sinks must have one entry per query head (" +
+          std::to_string(num_q_heads) + "), got " +
+          std::to_string(sinks->shape(0)));
+    }
+    if (sinks->dtype() != float32) {
+      throw std::invalid_argument(
+          "sinks must be float32; the kernel reads them as device float and "
+          "folds them into a float32 softmax accumulator");
+    }
+  }
   // window_seqlen_q must equal the longest cu_seqlens_q segment: window-mode
   // threadgroups only exist for ceil(window_seqlen_q / kWindowRows)
   // sub-windows per segment, so an understated value leaves the tail rows of
@@ -734,12 +795,18 @@ static array paged_attention_primitive_fn(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
-      use_turboquant, k_bits, v_bits, window_seqlen_q);
+      use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr);
   if (use_turboquant) {
     return array(
         query.shape(), query.dtype(), std::move(prim),
         {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
          *key_scale_cache, *value_scale_cache, *key_zero_cache, *v_centroids});
+  }
+  if (sinks != nullptr) {
+    return array(
+        query.shape(), query.dtype(), std::move(prim),
+        {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
+         *sinks});
   }
   return array(
       query.shape(), query.dtype(), std::move(prim),
@@ -1458,7 +1525,10 @@ NB_MODULE(_paged_ops, m) {
            bool use_turboquant,
            const std::string& quant_type,
            int v_bits,
-           int window_seqlen_q) {
+           int window_seqlen_q,
+           nb::object sinks_h) {
+          const array* sk = sinks_h.is_none()
+              ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* ks = use_turboquant
               ? nb::inst_ptr<array>(key_scale_cache_h) : nullptr;
           const array* vs = use_turboquant
@@ -1477,7 +1547,7 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q);
+              window_seqlen_q, sk);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1496,11 +1566,15 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("quant_type") = "",
         nb::arg("v_bits") = 3,
         nb::arg("window_seqlen_q") = 1,
+        nb::arg("sinks") = nb::none(),
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
         "multi-token batches (spec-decode verification windows) route to "
-        "the per-token kernel's window mode.");
+        "the per-token kernel's window mode.  sinks is an optional float32 "
+        "array of one learned logit per query head (GPT-OSS style attention "
+        "sinks); it joins the softmax denominator without contributing a "
+        "value row, and is rejected together with TurboQuant.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),

@@ -1245,20 +1245,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   // merges sequentially. Simple and barrier-safe (all barriers are
   // reached by all threads in the threadgroup).
 
-  // For non-partitioned mode, include the sink in each warp's state.
-  // Sinks are raw linear-space bias values; lift to log2 space (matches the
-  // log2-space convention adopted at the warp_scores write above).
-  if (!USE_PARTITIONING && use_sinks) {
-    float sink_val = sinks[head_idx] * M_LOG2E_F;
-    float new_m = max(warp_m, sink_val);
-    float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
-#pragma unroll
-    for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
-      v_accs[i] *= old_corr;
-    }
-    warp_l = warp_l * old_corr + exp2(sink_val - new_m);
-    warp_m = new_m;
-  }
+  // NOTE: the sink is deliberately NOT folded here.  This point is per-warp,
+  // and the merge below sums all NUM_WARPS states, so folding here would count
+  // the sink NUM_WARPS times over.  It is folded once after the merge instead.
 
   // Shared memory layout for merge:
   //   merge_m[NUM_WARPS]: per-warp max values
@@ -1315,6 +1304,27 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       }
       warp_m = new_m;
       warp_l = warp_l * my_corr + other_l * other_corr;
+    }
+
+    // Fold the attention sink into the merged state, exactly once per
+    // threadgroup.  Sinks are raw linear-space bias values; lift to log2 space
+    // to match the convention used for warp_scores above.  The sink is a
+    // denominator-only logit: it rescales the accumulated O and adds its own
+    // exp term to l, but contributes no value row.
+    //
+    // Partitioned mode skips this: paged_attention_v2_reduce folds the sink
+    // into the global max and exp-sum instead, so it is counted once across
+    // all partitions rather than once per partition.
+    if (!USE_PARTITIONING && use_sinks) {
+      const float sink_val = sinks[head_idx] * M_LOG2E_F;
+      const float new_m = max(warp_m, sink_val);
+      const float old_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
+#pragma unroll
+      for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+        v_accs[j] *= old_corr;
+      }
+      warp_l = warp_l * old_corr + exp2(sink_val - new_m);
+      warp_m = new_m;
     }
 
     // For partitioned mode, persist the merged partition statistics for the
@@ -1757,20 +1767,10 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   for (int r = 0; r < rows_per_tg; r++) {
     if (r >= num_rows) break;
 
-    // For non-partitioned mode, include the sink in each warp's state.
-    // Sinks are raw linear-space bias values; lift to log2 space (matches
-    // the log2-space convention adopted at the warp_scores write above).
-    if (!USE_PARTITIONING && use_sinks) {
-      float sink_val = sinks[head_idx] * M_LOG2E_F;
-      float new_m = max(warp_m[r], sink_val);
-      float old_corr = (warp_m[r] == -FLT_MAX) ? 0.f : exp2(warp_m[r] - new_m);
-#pragma unroll
-      for (int i = 0; i < V_ELEMS_PER_THREAD; i++) {
-        v_accs[r][i] *= old_corr;
-      }
-      warp_l[r] = warp_l[r] * old_corr + exp2(sink_val - new_m);
-      warp_m[r] = new_m;
-    }
+    // NOTE: the sink is deliberately NOT folded here.  This point is per-warp,
+    // and the merge below sums all NUM_WARPS states, so folding here would
+    // count the sink NUM_WARPS times over.  It is folded once per row after
+    // the merge instead.
 
     // All warps write this row's state to shared memory.
     if (lane == 0) {
@@ -1817,6 +1817,22 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         }
         warp_m[r] = new_m;
         warp_l[r] = warp_l[r] * my_corr + other_l * other_corr;
+      }
+
+      // Fold the attention sink into this row's merged state, exactly once.
+      // See the equivalent block in the per-token kernel for the rationale;
+      // partitioned mode defers to paged_attention_v2_reduce.
+      if (!USE_PARTITIONING && use_sinks) {
+        const float sink_val = sinks[head_idx] * M_LOG2E_F;
+        const float new_m = max(warp_m[r], sink_val);
+        const float old_corr =
+            (warp_m[r] == -FLT_MAX) ? 0.f : exp2(warp_m[r] - new_m);
+#pragma unroll
+        for (int j = 0; j < V_ELEMS_PER_THREAD; j++) {
+          v_accs[r][j] *= old_corr;
+        }
+        warp_l[r] = warp_l[r] * old_corr + exp2(sink_val - new_m);
+        warp_m[r] = new_m;
       }
 
       // Global query row this iteration writes.

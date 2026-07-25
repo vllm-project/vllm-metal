@@ -437,6 +437,20 @@ def sdpa_forward(
     n_heads = getattr(inner, "n_heads", None) or inner.num_attention_heads
     n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
 
+    # Softmax scale — GPT-OSS names it sm_scale rather than scale.
+    attn_scale = getattr(inner, "scale", None)
+    if attn_scale is None:
+        attn_scale = inner.sm_scale
+
+    # Attention sinks: a learned per-head logit that joins the softmax
+    # denominator without contributing a value row (GPT-OSS). Models without
+    # sinks leave this None and the kernel keeps its plain-softmax path.
+    # The kernel reads them as device float, so cast only when the checkpoint
+    # stored them in another dtype; this is the per-layer hot path.
+    sinks = getattr(inner, "sinks", None)
+    if sinks is not None and sinks.dtype != mx.float32:
+        sinks = sinks.astype(mx.float32)
+
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,
         x,
@@ -618,7 +632,7 @@ def sdpa_forward(
             kernel_k_cache,
             kernel_v_cache,
             cache_kv_heads,
-            inner.scale,
+            attn_scale,
             0.0,  # softcap (0 = disabled)
             block_tables,
             seq_lens,
@@ -627,6 +641,10 @@ def sdpa_forward(
             max_seq_len,
             layer_sliding_window,
             out,
+            # Passed through rather than dropped: the primitive rejects
+            # sinks + TurboQuant outright, so a sink model on a quantized
+            # cache fails loudly instead of silently losing the sink term.
+            sinks=sinks,
             key_scale_cache=kernel_key_scale,
             value_scale_cache=kernel_value_scale,
             key_zero_cache=kernel_key_zero,
@@ -642,7 +660,7 @@ def sdpa_forward(
             kernel_k_cache,
             kernel_v_cache,
             cache_kv_heads,
-            inner.scale,
+            attn_scale,
             0.0,  # softcap (0 = disabled)
             block_tables,
             seq_lens,
@@ -652,6 +670,7 @@ def sdpa_forward(
             layer_sliding_window,
             out,
             window_seqlen_q=ctx.verify_window_q,
+            sinks=sinks,
         )
 
     # Reshape + strip padding back to actual head_dim before o_proj.
