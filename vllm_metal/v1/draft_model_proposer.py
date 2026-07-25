@@ -49,12 +49,14 @@ from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal import envs
 from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     prepare_unified,
 )
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 
@@ -107,11 +109,20 @@ class DraftModelProposer:
         num_layers: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
+        merge_ingest_windows: bool = False,
     ) -> None:
         self._model = model
         self._block_size = block_size
         self._controller = controller
         self._extract_logits = extract_logits
+        # Structural half of the ingest window gate (see `build`); the
+        # operator half (VLLM_METAL_SPEC_VERIFY_WINDOW) is read per call
+        # like the runner's `merge_verify_windows` property.  The same
+        # env governs the target's verify layout and this ingest layout;
+        # each side still applies its own structural gate, so an
+        # ineligible target does not block an eligible draft (or vice
+        # versa).
+        self._merge_ingest_windows = merge_ingest_windows
         # Stateless RoPE/mask shims for the draft forward (one per layer). The
         # real per-request offsets come from the paged context, so these carry
         # no state — allocate once and reuse across steps, not per propose().
@@ -165,6 +176,13 @@ class DraftModelProposer:
             num_layers=dims.num_layers,
             controller=controller,
             extract_logits=extract_logits,
+            # Mirror of the runner's `merge_verify_windows` structural
+            # conditions, reduced to what can arise here: this proposer
+            # patches drafts through `MHAPagedAttentionRuntime`, so the
+            # runner's MLA-native-decode and GDN-pure-decode arms are
+            # vacuous, and `_load_draft_model` resolves one uniform
+            # head_dim.  Only the decode kernel's head bound remains.
+            merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
         )
 
     # -- MetalProposer protocol ---------------------------------------------
@@ -306,7 +324,19 @@ class DraftModelProposer:
                 (plan.block_ids, plan.draft_seq_len, len(plan.ingest_tokens))
                 for plan in plans
             ]
-            prepare_unified(decode_specs, [], self._block_size)
+            # Same opt-in as the target's verify path (#534): when the
+            # operator sets VLLM_METAL_SPEC_VERIFY_WINDOW and the draft
+            # fits the window kernel, keep each plan's ingest as ONE
+            # merged segment so K/V block loads are shared across its
+            # rows; otherwise the expanded per-token layout below is
+            # bit-for-bit the pre-window behavior.
+            prepare_unified(
+                decode_specs,
+                [],
+                self._block_size,
+                merge_verify_windows=self._merge_ingest_windows
+                and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
+            )
         else:
             prefill_specs = [
                 (plan.block_ids, len(plan.ingest_tokens), plan.draft_seq_len)

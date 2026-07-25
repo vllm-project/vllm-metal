@@ -263,11 +263,29 @@ def test_windowed_matches_expanded_block_sizes(block_size: int) -> None:
 
 def test_windowed_matches_expanded_large_window() -> None:
     """Windows past the old 8-row cap still take window mode (sub-window count
-    is unbounded) and stay bitwise identical."""
-    expanded, windowed, _ = _expanded_and_windowed(
-        16, 8, mx.float16, 2048, [12], sliding_window=-1, seed=7
-    )
-    assert mx.array_equal(expanded, windowed)
+    is unbounded) and stay bitwise identical.  16 is the widest structurally
+    pinned window: the draft proposer's merged ingest caps at
+    ``_DECODE_INGEST_MAX_TOKENS`` (verify windows follow the unbounded
+    ``num_speculative_tokens``)."""
+    for window in (12, 16):
+        expanded, windowed, _ = _expanded_and_windowed(
+            16, 8, mx.float16, 2048, [window], sliding_window=-1, seed=7
+        )
+        assert mx.array_equal(expanded, windowed), f"window={window}"
+
+
+def test_windowed_matches_expanded_zero_context_window() -> None:
+    """A merged window over an empty prefix stays bitwise identical.
+
+    The verify path never makes this shape, but the draft proposer's
+    merged ingest does: the first ingest of a short prompt starts at
+    offset 0, and it recurs on every resume once release-and-resume
+    (#551) drops the draft's committed length."""
+    for window in (2, 4, 16):
+        expanded, windowed, _ = _expanded_and_windowed(
+            16, 8, mx.float16, 0, [window], sliding_window=-1, seed=9
+        )
+        assert mx.array_equal(expanded, windowed), f"window={window}"
 
 
 def test_windowed_single_partition_family() -> None:

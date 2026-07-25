@@ -143,6 +143,12 @@ from RedHatAI/speculator_benchmarks:
 - **Batched (concurrency 32):** K=3 gives +11% throughput; K=5 turns
   net-negative as draft compute exceeds the savings.
 
+With `VLLM_METAL_SPEC_VERIFY_WINDOW=1` (see [Configuration](configuration.md))
+the draft's per-round committed-token ingest also rides the window layout of
+the paged decode kernel, sharing KV block loads across its rows like the
+target's verification window; generated tokens are identical either way, and
+single-stream TPOT is within run-to-run noise of the expanded layout.
+
 ---
 
 ## N-gram
