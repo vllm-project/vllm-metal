@@ -270,7 +270,7 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     )
     mx.eval(k_ref, v_ref)
 
-    slot = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    slot = mx.arange(num_tokens, dtype=mx.int64)
     mx.eval(slot)
     _fill_cache(cache, k_packed, v_packed, k_scale, v_scale, k_zero, slot)
     mx.eval(
@@ -360,10 +360,14 @@ def test_tq_encode_kernel_supports_head_dim_512() -> None:
         v_quant=v_quant,
     )
 
-    np.random.seed(512)
-    k = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
-    v = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
-    slot_mapping = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    rng = np.random.default_rng(seed=512)
+    k = mx.array(
+        rng.standard_normal((num_tokens, num_kv_heads, head_dim)).astype(np.float16)
+    )
+    v = mx.array(
+        rng.standard_normal((num_tokens, num_kv_heads, head_dim)).astype(np.float16)
+    )
+    slot_mapping = mx.arange(num_tokens, dtype=mx.int64)
     mx.eval(k, v, slot_mapping)
 
     ops = get_ops()
@@ -686,10 +690,15 @@ def test_metal_encode_python_decode_roundtrip(
         v_quant=v_quant,
     )
 
-    np.random.seed(hash((head_dim, k_quant, v_bits)) & 0xFFFF)
-    k = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
-    v = mx.array(np.random.randn(num_tokens, num_kv_heads, head_dim).astype(np.float16))
-    slot_mapping = mx.array(list(range(num_tokens)), dtype=mx.int64)
+    seed = head_dim * 100 + QUANT_PARAMS[k_quant]["bits"] * 10 + v_bits
+    rng = np.random.default_rng(seed=seed)
+    k = mx.array(
+        rng.standard_normal((num_tokens, num_kv_heads, head_dim)).astype(np.float16)
+    )
+    v = mx.array(
+        rng.standard_normal((num_tokens, num_kv_heads, head_dim)).astype(np.float16)
+    )
+    slot_mapping = mx.arange(num_tokens, dtype=mx.int64)
     mx.eval(k, v, slot_mapping)
 
     # ---- Metal encode ----
