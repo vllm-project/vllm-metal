@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
+    _RNG_KEY,
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
@@ -36,12 +37,12 @@ from vllm_metal.v1.cache_policy import (
 )
 
 
-def _cosine_similarity(a: mx.array, b: mx.array) -> float:
+def mean_cosine_similarity(a: mx.array, b: mx.array) -> float:
     a_f = a.reshape(-1, a.shape[-1]).astype(mx.float32)
     b_f = b.reshape(-1, b.shape[-1]).astype(mx.float32)
     dot = mx.sum(a_f * b_f, axis=-1)
-    a_norm = mx.sqrt(mx.sum(a_f**2, axis=-1))
-    b_norm = mx.sqrt(mx.sum(b_f**2, axis=-1))
+    a_norm = mx.linalg.norm(a_f, axis=-1)
+    b_norm = mx.linalg.norm(b_f, axis=-1)
     return mx.mean(dot / (a_norm * b_norm + 1e-8)).item()
 
 
@@ -129,8 +130,6 @@ def _parse_metal_sign_table(head_size: int) -> np.ndarray:
 
 def _python_signs(head_size: int) -> np.ndarray:
     """Reproduce the Python sign vector using the same RNG recipe as ``fwht``."""
-    from vllm_metal.attention.caches.turboquant import _RNG_KEY
-
     sign01 = mx.random.randint(0, 2, shape=(head_size,), key=_RNG_KEY)
     signs = (1 - 2 * sign01).astype(mx.float32)
     return np.asarray(signs)
@@ -742,8 +741,8 @@ def test_metal_encode_python_decode_roundtrip(
     # ---- Compare to original ----
     k_mse = mx.mean((k.astype(mx.float32) - k_hat.astype(mx.float32)) ** 2).item()
     v_mse = mx.mean((v.astype(mx.float32) - v_hat.astype(mx.float32)) ** 2).item()
-    k_cos = _cosine_similarity(k, k_hat)
-    v_cos = _cosine_similarity(v, v_hat)
+    k_cos = mean_cosine_similarity(k, k_hat)
+    v_cos = mean_cosine_similarity(v, v_hat)
 
     # K tolerance: q8_0 random-input MSE ≈ 1e-4, q4_0 ≈ 5e-3 to 1e-2.  We
     # set thresholds at ~5x the typical observed value so a bit-layout bug
