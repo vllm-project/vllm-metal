@@ -10,6 +10,9 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
@@ -477,23 +480,22 @@ def test_turboquant_per_layer_shapes_raise_early() -> None:
 # Last config is the 2-bit edge case that used to produce a negative
 # ``head_size_v`` under the pre-subclass strategy.
 _TQ_SPEC_CONFIGS = [
-    # (label,          block_size, num_kv_heads, head_dim, k_quant, v_quant)
-    ("default_q8_q3", 16, 4, 128, "q8_0", "q3_0"),
-    ("q4_q3_gqa", 16, 8, 128, "q4_0", "q3_0"),
-    ("wide_head_256", 16, 2, 256, "q8_0", "q3_0"),
-    ("wide_head_512", 16, 2, 512, "q8_0", "q3_0"),
-    ("narrow_head_64", 16, 8, 64, "q8_0", "q3_0"),
-    ("aggressive_2b", 16, 8, 128, "int2", "q2_0"),
+    # (block_size, num_kv_heads, head_dim, k_quant, v_quant)
+    pytest.param(16, 4, 128, "q8_0", "q3_0", id="default_q8_q3"),
+    pytest.param(16, 8, 128, "q4_0", "q3_0", id="q4_q3_gqa"),
+    pytest.param(16, 2, 256, "q8_0", "q3_0", id="wide_head_256"),
+    pytest.param(16, 2, 512, "q8_0", "q3_0", id="wide_head_512"),
+    pytest.param(16, 8, 64, "q8_0", "q3_0", id="narrow_head_64"),
+    pytest.param(16, 8, 128, "int2", "q2_0", id="aggressive_2b"),
 ]
 
 
 @pytest.mark.parametrize(
-    "_label, block_size, num_kv_heads, head_dim, k_quant, v_quant",
+    "block_size, num_kv_heads, head_dim, k_quant, v_quant",
     _TQ_SPEC_CONFIGS,
-    ids=[c[0] for c in _TQ_SPEC_CONFIGS],
 )
 def test_tq_spec_real_page_size_bytes_matches_helper(
-    _label, block_size, num_kv_heads, head_dim, k_quant, v_quant
+    block_size, num_kv_heads, head_dim, k_quant, v_quant
 ):
     spec = TurboQuantAttentionSpec(
         block_size=block_size,
@@ -515,12 +517,11 @@ def test_tq_spec_real_page_size_bytes_matches_helper(
 
 
 @pytest.mark.parametrize(
-    "_label, block_size, num_kv_heads, head_dim, k_quant, v_quant",
+    "block_size, num_kv_heads, head_dim, k_quant, v_quant",
     _TQ_SPEC_CONFIGS,
-    ids=[c[0] for c in _TQ_SPEC_CONFIGS],
 )
 def test_tq_spec_head_size_stays_honest(
-    _label, block_size, num_kv_heads, head_dim, k_quant, v_quant
+    block_size, num_kv_heads, head_dim, k_quant, v_quant
 ):
     """``head_size`` must equal the real model head_dim — no reverse-engineering.
 
@@ -603,10 +604,6 @@ def test_tq_spec_resolves_to_full_attention_manager():
         k_quant="q8_0",
         v_quant="q3_0",
     )
-
-    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
     assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
     assert KVCacheSpecRegistry.get_uniform_type_base_spec(spec) is FullAttentionSpec
