@@ -17,7 +17,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheTensor,
     SlidingWindowSpec,
 )
 
@@ -307,37 +306,39 @@ class TestCachePolicyPerLayerBytes:
 class TestMHAKVCacheLayout:
     """vLLM-managed standard-MHA cache layout contracts."""
 
-    @staticmethod
-    def _mixed_mha_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
-        full = FullAttentionSpec(
-            block_size=32,
-            num_kv_heads=4,
-            head_size=512,
-            dtype=torch.bfloat16,
-        )
-        sliding = SlidingWindowSpec(
-            block_size=16,
-            num_kv_heads=16,
-            head_size=256,
-            dtype=torch.bfloat16,
-            sliding_window=1024,
-        )
+    def _mixed_mha_config(self) -> tuple[KVCacheConfig, tuple[str, ...]]:
         names = tuple(f"layers.{index}.self_attn" for index in range(4))
-        groups = [
-            KVCacheGroupSpec([names[0], names[2]], full),
-            KVCacheGroupSpec([names[1], names[3]], sliding),
-        ]
-        assert full.page_size_bytes == sliding.page_size_bytes
-        size = full.page_size_bytes * 3
-        config = KVCacheConfig(
-            num_blocks=3,
-            kv_cache_tensors=[
-                KVCacheTensor(size=size, shared_by=[names[0], names[1]]),
-                KVCacheTensor(size=size, shared_by=[names[2], names[3]]),
-            ],
-            kv_cache_groups=groups,
-        )
-        return config, names
+        specs = {
+            names[0]: FullAttentionSpec(
+                block_size=32,
+                num_kv_heads=4,
+                head_size=512,
+                dtype=torch.bfloat16,
+            ),
+            names[1]: SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=16,
+                head_size=256,
+                dtype=torch.bfloat16,
+                sliding_window=1024,
+            ),
+            names[2]: FullAttentionSpec(
+                block_size=32,
+                num_kv_heads=4,
+                head_size=512,
+                dtype=torch.bfloat16,
+            ),
+            names[3]: SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=16,
+                head_size=256,
+                dtype=torch.bfloat16,
+                sliding_window=1024,
+            ),
+        }
+        groups = get_kv_cache_groups(vllm_config_for_kv_grouping(), specs)
+        assert len(groups) == 2
+        return config_from_vllm_groups(groups, 3), names
 
     def test_translates_upstream_slots_and_groups(self) -> None:
         config, names = self._mixed_mha_config()
