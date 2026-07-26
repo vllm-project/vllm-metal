@@ -147,6 +147,12 @@ class NgramProposer:
         # N-gram matches token ids only; it never reads the target's hidden states.
         return False
 
+    def release_requests(self, req_ids: set[str]) -> None:
+        # The miss-streak throttle is per-request bookkeeping, not a bounded
+        # resource: a preempted request keeps its counters across resume, and
+        # they are dropped when its id finishes.
+        del req_ids
+
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         # Bookkeeping runs unconditionally, before the num_speculative_tokens
         # check: a step with drafting disabled still needs finished ids

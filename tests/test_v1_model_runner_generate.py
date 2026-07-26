@@ -85,6 +85,35 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
 
+class TestDrafterReleaseOnLifecycle:
+    def test_reconcile_releases_drafter_state_for_invalidated_requests(self) -> None:
+        released: list[set[str]] = []
+
+        class _RecordingDrafter:
+            def needs_target_hidden_states(self, *args, **kwargs) -> bool:
+                return False
+
+            def propose(self, ctx) -> None:
+                return None
+
+            def release_requests(self, req_ids: set[str]) -> None:
+                released.append(set(req_ids))
+
+        runner = make_stub_runner(tokenizer=object())
+        runner._drafter = _RecordingDrafter()
+
+        # Eviction + preemption + resume all invalidate the drafter's per-request
+        # state, mirroring the runtime recurrent-state release path.
+        runner._reconcile_request_lifecycle(
+            {"done"},
+            preempted_req_ids={"paused"},
+            resumed_req_ids={"back"},
+            materialize_runtime_state=False,
+        )
+
+        assert released == [{"done", "paused", "back"}]
+
+
 class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())

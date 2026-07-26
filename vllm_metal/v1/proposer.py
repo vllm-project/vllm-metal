@@ -63,11 +63,7 @@ class ProposeContext:
 
 
 class MetalProposer(Protocol):
-    """Uniform drafting seam.
-
-    Implementations: :class:`Gemma4MTPProposer`, and (draft-model SD) a
-    ``DraftModelProposer``.
-    """
+    """Uniform drafting seam."""
 
     def needs_target_hidden_states(
         self,
@@ -80,6 +76,16 @@ class MetalProposer(Protocol):
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         """Return per-request draft tokens for the next step, or ``None``."""
+        ...
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        """Release any per-request drafter state for these evicted/preempted ids.
+
+        Called from the runner's lifecycle reconcile on eviction, preemption, and
+        resume. A proposer that pins a bounded per-request resource (draft cache
+        blocks) must release it here rather than hold it while the request waits;
+        a stateless proposer is a no-op.
+        """
         ...
 
 
@@ -105,6 +111,11 @@ class Gemma4MTPProposer:
         # decode and final-prefill rows; intermediate prefill chunks never
         # sample, so they cannot seed a draft.
         return bool(decode_segments) or has_final_prefill
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        # The assistant reads the target's paged KV (released by the runtime);
+        # the proposer holds no per-request state of its own.
+        del req_ids
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         if ctx.num_speculative_tokens <= 0:

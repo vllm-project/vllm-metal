@@ -2208,14 +2208,22 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
+        invalidated = set(evicted_req_ids)
+        if preempted_req_ids:
+            invalidated.update(preempted_req_ids)
+        if resumed_req_ids:
+            invalidated.update(resumed_req_ids)
+
+        # A drafter that pins a bounded per-request resource (draft cache blocks)
+        # releases it on the same events as the runtime's recurrent state: a
+        # waiting or preempted request must not keep holding the resource, and a
+        # resumed request re-acquires it during recompute.
+        if invalidated and self._drafter is not None:
+            self._drafter.release_requests(invalidated)
+
         if runtime is not None:
-            runtime_invalidated = set(evicted_req_ids)
-            if preempted_req_ids:
-                runtime_invalidated.update(preempted_req_ids)
-            if resumed_req_ids:
-                runtime_invalidated.update(resumed_req_ids)
-            if runtime_invalidated:
-                runtime.release_requests(runtime_invalidated)
+            if invalidated:
+                runtime.release_requests(invalidated)
             if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
