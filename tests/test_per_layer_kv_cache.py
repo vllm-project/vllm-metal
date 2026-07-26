@@ -8,6 +8,11 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 import torch
+from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -23,6 +28,56 @@ from vllm_metal.attention.runtime.mha import (
     MHAPagedAttentionRuntime,
 )
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
+
+
+def vllm_config_for_kv_grouping() -> VllmConfig:
+    return VllmConfig()
+
+
+def config_from_vllm_groups(
+    groups: list[KVCacheGroupSpec], num_blocks: int
+) -> KVCacheConfig:
+    if len(groups) == 1:
+        available = groups[0].kv_cache_spec.page_size_bytes * num_blocks
+    else:
+        group_size = max(len(group.layer_names) for group in groups)
+        available = groups[0].kv_cache_spec.page_size_bytes * num_blocks * group_size
+    return get_kv_cache_config_from_groups(
+        vllm_config_for_kv_grouping(), groups, available
+    )
+
+
+def merged_full_mha_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
+    names = tuple(f"layers.{index}.self_attn" for index in range(4))
+    specs = {
+        names[0]: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=16,
+            head_size=256,
+            dtype=torch.bfloat16,
+        ),
+        names[1]: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=16,
+            head_size=256,
+            dtype=torch.bfloat16,
+        ),
+        names[2]: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=512,
+            dtype=torch.bfloat16,
+        ),
+        names[3]: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=512,
+            dtype=torch.bfloat16,
+        ),
+    }
+    groups = get_kv_cache_groups(vllm_config_for_kv_grouping(), specs)
+    assert len(groups) == 1
+    return config_from_vllm_groups(groups, 3), names
 
 
 class TestMetalPagedKVCachePerLayer:
@@ -354,6 +409,55 @@ class TestMHAKVCacheLayout:
         assert backend.kv_cache.block_size_for_layer(1) == 16
         assert runner._paged_scheduler_group_indices == (0, 1)
         assert runner._paged_group_block_sizes == (32, 16)
+
+    def test_cache_policy_keeps_merged_single_group_on_existing_runtime(
+        self, monkeypatch
+    ) -> None:
+        config, _ = merged_full_mha_config()
+        runner = make_stub_runner(
+            num_layers=4,
+            num_kv_cache_layers=4,
+            num_kv_heads=16,
+            head_dim=256,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=SimpleNamespace(block_size=16),
+            kv_heads_per_layer=[16, 16, 4, 4],
+            head_dim_per_layer=[256, 256, 512, 512],
+        )
+        backend = MHAPagedAttentionRuntime(
+            num_layers=4,
+            num_kv_heads=16,
+            head_dim=256,
+            block_size=16,
+            dtype=mx.bfloat16,
+            kv_heads_per_layer=[16, 16, 4, 4],
+            head_dim_per_layer=[256, 256, 512, 512],
+        )
+        backend.initialize(num_blocks=config.num_blocks)
+        original_cache = backend.kv_cache
+        runner.install_paged_attention_runtime(backend, block_size=16)
+
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                memory_fraction=AUTO_MEMORY_FRACTION,
+                use_mlx=True,
+                mlx_device="gpu",
+                debug=False,
+                turboquant=False,
+            ),
+        )
+        monkeypatch.setattr(
+            backend,
+            "adopt_layout",
+            lambda layout: pytest.fail("single scheduler group should not reallocate"),
+        )
+
+        runner.initialize_kv_cache(config)
+
+        assert backend.kv_cache is original_cache
+        assert runner._paged_scheduler_group_indices == (0,)
+        assert runner._paged_group_block_sizes == (16,)
 
     def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
         config, names = self._mixed_mha_config()
