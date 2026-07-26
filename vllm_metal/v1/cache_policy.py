@@ -383,15 +383,17 @@ class ModelCachePolicy:
             raise RuntimeError("MHA cache config requires MHAPagedAttentionRuntime")
 
         model_layer_names = self._mha_model_layer_names()
+        group_indices = self._scheduler_group_indices_for_layers(
+            kv_cache_config,
+            model_layer_names,
+        )
         if get_config().turboquant:
-            group_indices = self._scheduler_group_indices_for_layers(
-                kv_cache_config,
-                model_layer_names,
-            )
             if group_indices != (0,):
                 raise NotImplementedError(
                     "TurboQuant MHA currently supports one scheduler KV group"
                 )
+            return
+        if len(group_indices) == 1:
             return
 
         layout = MHAKVCacheLayout.from_config(kv_cache_config, model_layer_names)
