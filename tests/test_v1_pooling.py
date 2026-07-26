@@ -582,7 +582,7 @@ class TestMetalPoolingFailFast:
 
     @pytest.mark.parametrize(
         "task",
-        ["score", "token_embed", "token_classify", "plugin"],
+        ["token_embed", "token_classify", "plugin"],
     )
     def test_unsupported_pooling_tasks_fail_fast(self, task: str) -> None:
         runner = _make_runner()

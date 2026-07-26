@@ -820,7 +820,7 @@ class MetalPlatform(Platform):
         user_block_size = (
             cache_config.block_size if cache_config.user_specified_block_size else None
         )
-        hash_block_size = cache_config.hash_block_size
+        hash_block_size = cache_config.prefix_match_unit
         super().update_block_size_for_backend(vllm_config)
 
         cls._realign_hybrid_block_size_for_turboquant(

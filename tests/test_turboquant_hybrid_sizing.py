@@ -245,8 +245,8 @@ class TestTurboQuantHybridAlignment:
         "cache_kwargs,hash_consumer",
         [
             ({"block_size": 64}, False),
-            ({"block_size": 64, "hash_block_size": 64}, True),
-            ({"hash_block_size": 64}, True),
+            ({"block_size": 64, "prefix_match_unit": 64}, True),
+            ({"prefix_match_unit": 64}, True),
         ],
         ids=["user_block", "user_block_and_hash", "hash_only"],
     )
@@ -279,9 +279,9 @@ class TestTurboQuantHybridAlignment:
         assert {group.kv_cache_spec.page_size_bytes for group in groups} == {
             cache_config.block_size * self._TQ_PAGE_1_TOKEN
         }
-        if cache_config.hash_block_size is None:
+        if cache_config.prefix_match_unit is None:
             assert hash_block_size == scheduler_block_size
         else:
-            assert cache_config.block_size % cache_config.hash_block_size == 0
-            assert scheduler_block_size % cache_config.hash_block_size == 0
-            assert hash_block_size == cache_config.hash_block_size
+            assert cache_config.block_size % cache_config.prefix_match_unit == 0
+            assert scheduler_block_size % cache_config.prefix_match_unit == 0
+            assert hash_block_size == cache_config.prefix_match_unit
