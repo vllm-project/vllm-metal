@@ -28,6 +28,8 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -157,6 +159,54 @@ def _build_block_tables(
         bt_arr.shape[0], -1
     )
     return expanded, kernel_bs
+
+
+@dataclass(frozen=True, eq=False)
+class _KernelMetadata:
+    """Kernel-format copies of the per-forward paged metadata.
+
+    ``eq=False``: the generated ``__eq__`` would compare mx arrays, which
+    raises on ``bool()``; identity comparison is the only meaningful one.
+    """
+
+    slot_mapping: mx.array
+    seq_lens: mx.array
+    cu_seqlens_q: mx.array
+    block_tables: mx.array
+    block_size: int
+
+
+def _kernel_metadata(
+    ctx: PagedAttentionContext,
+    group_index: int | None,
+    raw_slot_mapping: list[int],
+    raw_block_tables: list[list[int]],
+    cache_block_size: int,
+) -> _KernelMetadata:
+    """Kernel-format metadata for one KV group, built once per forward.
+
+    The paged context is fixed for the duration of one forward pass and
+    every layer of a KV group needs the same converted arrays, so the
+    conversion runs on the group's first layer and is cached on the
+    context; the remaining layers reuse it instead of re-serializing
+    O(rows × blocks) Python lists per layer.  The context dies with the
+    forward, so entries can never go stale.
+    """
+    key = (group_index, cache_block_size)
+    meta = ctx.kernel_metadata_cache.get(key)
+    if meta is None:
+        block_tables, kernel_block_size = _build_block_tables(
+            raw_block_tables, cache_block_size
+        )
+        meta = _KernelMetadata(
+            slot_mapping=mx.array(raw_slot_mapping, dtype=mx.int64),
+            seq_lens=mx.array(ctx.context_lens, dtype=mx.int32),
+            cu_seqlens_q=mx.array(ctx.cu_seqlens, dtype=mx.int32),
+            block_tables=block_tables,
+            block_size=kernel_block_size,
+        )
+        ctx.kernel_metadata_cache[key] = meta
+    return meta
 
 
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
@@ -477,20 +527,26 @@ def sdpa_forward(
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     v_3d = mx.contiguous(values[0].transpose(1, 0, 2).astype(kv_cache.dtype))
 
-    slot_mapping = mx.array(raw_slot_mapping, dtype=mx.int64)
-    seq_lens = mx.array(ctx.context_lens, dtype=mx.int32)
-    cu_seqlens_q = mx.array(ctx.cu_seqlens, dtype=mx.int32)
-    max_seq_len = max(ctx.context_lens)
-
-    # --- Block tables (with hybrid block-size translation) ---
+    # --- Kernel-format metadata (memoized per forward) ---
+    # Converted on the group's first layer and reused by the rest (see
+    # _kernel_metadata).  Includes the hybrid block-size translation:
     # vLLM may inflate block_size (e.g. 544) to align attention pages with
-    # mamba pages in hybrid models.  The Metal kernel only supports small
-    # block sizes (8, 16, 32).  _build_block_tables handles the translation:
-    # it expands each vLLM block into multiple kernel blocks and returns the
-    # kernel-compatible block_size.  The cache is reshaped to match (zero-copy).
-    block_tables, kernel_block_size = _build_block_tables(
-        raw_block_tables, cache_block_size
+    # mamba pages in hybrid models, while the Metal kernel only supports
+    # small block sizes (8, 16, 32); _build_block_tables expands each vLLM
+    # block into multiple kernel blocks and returns the kernel-compatible
+    # block_size.  The cache is reshaped to match (zero-copy).
+    meta = _kernel_metadata(
+        ctx,
+        None if ctx.kv_groups is None else group_index,
+        raw_slot_mapping,
+        raw_block_tables,
+        cache_block_size,
     )
+    slot_mapping = meta.slot_mapping
+    seq_lens = meta.seq_lens
+    cu_seqlens_q = meta.cu_seqlens_q
+    block_tables, kernel_block_size = meta.block_tables, meta.block_size
+    max_seq_len = max(ctx.context_lens)
 
     if shared_kv is not None or read_existing_kv:
         # YOCO shared layer / MTP read-existing layer: the authoritative K/V

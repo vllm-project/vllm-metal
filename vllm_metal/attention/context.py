@@ -84,6 +84,14 @@ class PagedAttentionContext:
     # ``slot_mapping`` / ``block_tables`` above mirror group zero for the
     # legacy single-group path.
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
+    # Kernel-format metadata memo, keyed by (KV group index, cache block
+    # size).  The context lives for exactly one forward pass, so entries
+    # never go stale; every layer of a group reuses the first layer's
+    # conversion instead of re-serializing the Python lists above (see
+    # ``impls.sdpa._kernel_metadata``).
+    kernel_metadata_cache: dict[tuple[int | None, int], Any] = field(
+        default_factory=dict
+    )
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
