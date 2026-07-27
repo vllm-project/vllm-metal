@@ -285,7 +285,7 @@ static void dispatch_paged_attention_tiled(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    TileConfig cfg, Stream s) {
+    TileConfig cfg, Stream s, const array* sinks = nullptr) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -293,18 +293,22 @@ static void dispatch_paged_attention_tiled(
   int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
   int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
+  bool use_sinks = sinks != nullptr;
 
   auto dt = dtype_to_metal(query.dtype());
-  std::string kname =
+  std::string base_kname =
       "paged_attention_tiled_" + dt +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size) +
       "_bq" + std::to_string(cfg.BQ) +
       "_tk" + std::to_string(cfg.TILE_KV) +
       "_nt" + std::to_string(cfg.NUM_THREADS);
+  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_v2_kern");
-  auto* kernel = d.get_kernel(kname, lib, kname, {});
+  auto* kernel = d.get_kernel(
+      base_kname, lib, hash_name,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
 
   const int t_size = static_cast<int>(query.itemsize());
   // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
@@ -326,6 +330,9 @@ static void dispatch_paged_attention_tiled(
                           num_kv_heads, softcap, block_tables, seq_lens,
                           cu_seqlens_q, sliding_window);
   enc.set_bytes(scale, 9);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 18);
+  }
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, total_q_blocks, 1),
@@ -374,18 +381,16 @@ static void dispatch_paged_attention_v2_online(
   const bool window_batch =
       has_prefill && window_seqlen_q > 1 && head_size <= kWindowMaxHeadSize;
 
-  // Sinks join TurboQuant in being excluded from the tiled kernel:
-  // pagedattention_tiled.metal has no sink code path at all, so a sinks batch
-  // must fall through to the per-token kernel below, which does.  Routing it
-  // to the tiled kernel would silently drop the sink term.
-  if (has_prefill && !window_batch && !use_turboquant && dtype_ok
-      && sinks == nullptr) {
+  // TurboQuant stays excluded from the tiled kernel.  Sink prefill can use it:
+  // pagedattention_tiled.metal folds the sink into each row's denominator-only
+  // softmax state before final normalization.
+  if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
     if (auto cfg = select_tile_config(head_size)) {
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
           block_tables, seq_lens, cu_seqlens_q,
-          block_size, max_seq_len, sliding_window, *cfg, s);
+          block_size, max_seq_len, sliding_window, *cfg, s, sinks);
       return;
     }
   }

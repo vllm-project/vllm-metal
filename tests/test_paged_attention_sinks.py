@@ -109,6 +109,64 @@ def _run_decode(
     return out.reshape(num_q_heads, head_size), ref[0, :, 0, :]
 
 
+def _run_prefill(
+    ctx: int,
+    query_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    sinks: mx.array,
+    dtype: mx.Dtype = mx.float16,
+    seed: int = 0,
+) -> tuple[mx.array, mx.array]:
+    """One ordinary multi-token prefill segment against the MLX oracle."""
+    mx.random.seed(seed)
+    kv_len = ctx + query_len
+    blocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    key_cache = mx.random.normal(
+        shape=(blocks, BLOCK_SIZE, num_kv_heads, HEAD_SIZE)
+    ).astype(dtype)
+    value_cache = mx.random.normal(
+        shape=(blocks, BLOCK_SIZE, num_kv_heads, HEAD_SIZE)
+    ).astype(dtype)
+    query = mx.random.normal(shape=(query_len, num_q_heads, HEAD_SIZE)).astype(dtype)
+    mx.eval(key_cache, value_cache, query)
+
+    scale = HEAD_SIZE**-0.5
+    out = mx.array(0)
+    get_ops().paged_attention_primitive(
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        0.0,
+        mx.array([list(range(blocks))], dtype=mx.int32),
+        mx.array([kv_len], dtype=mx.int32),
+        mx.array([0, query_len], dtype=mx.int32),
+        BLOCK_SIZE,
+        kv_len,
+        -1,
+        out,
+        sinks=sinks,
+    )
+    mx.eval(out)
+
+    flat_k = key_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, HEAD_SIZE)[:kv_len]
+    flat_v = value_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, HEAD_SIZE)[:kv_len]
+    ref = mx.fast.scaled_dot_product_attention(
+        mx.transpose(query, (1, 0, 2))[None],
+        mx.transpose(flat_k, (1, 0, 2))[None],
+        mx.transpose(flat_v, (1, 0, 2))[None],
+        scale=scale,
+        mask="causal",
+        sinks=sinks.astype(dtype),
+    )
+    mx.eval(ref)
+    return out.reshape(query_len, num_q_heads, HEAD_SIZE), mx.transpose(
+        ref[0], (1, 0, 2)
+    )
+
+
 def _assert_close(got: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
     atol, rtol = _TOLERANCES[dtype]
     assert mx.allclose(got, ref, atol=atol, rtol=rtol), (
@@ -170,6 +228,14 @@ class TestSinkParity:
         got, ref = _run_decode(64, 8, 8, _sinks(8, 2.0))
         # 8x over-counting showed up as ~2e-1 here, 6 orders above this bound.
         assert float(mx.max(mx.abs(got - ref))) < 1e-4
+
+
+class TestSinkPrefillMode:
+    """Ordinary prefill with sinks stays on the tiled sink path."""
+
+    def test_prefill_matches_mlx_oracle(self) -> None:
+        got, ref = _run_prefill(64, 4, 8, 8, _sinks(8, 2.0))
+        _assert_close(got, ref, mx.float16)
 
 
 def _run_window(

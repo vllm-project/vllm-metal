@@ -127,6 +127,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    device const float *sinks
+    [[buffer(18), function_constant(use_sinks)]],
     device const int32_t *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
@@ -472,6 +474,23 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     threadgroup_barrier(mem_flags::mem_threadgroup);
   } // end KV tile loop
 
+  // Fold the attention sink into each valid row's online-softmax state once.
+  // It contributes one learned logit to the denominator and no value row, so
+  // O is only rescaled by the max correction.
+  if (use_sinks && (sg_idx * 8 + fm) < valid_q) {
+    const float sink_score = sinks[head_idx] * M_LOG2E_F;
+    const float new_max = max(max_score, sink_score);
+    const float old_corr =
+        (max_score == -INFINITY) ? 0.0f : fast::exp2(max_score - new_max);
+    const float sink_exp = fast::exp2(sink_score - new_max);
+    sum_score = sum_score * old_corr + sink_exp;
+    max_score = new_max;
+    #pragma unroll
+    for (int d = 0; d < TD; d++) {
+      Oreg[d] *= old_corr;
+    }
+  }
+
   // ─ Final normalize: O /= sum_score, then store ────────────────────────
   // sum_score is broadcast-replicated across lanes with same fm.
   float inv_sum = 1.0f / (sum_score + 1e-6f);
@@ -527,6 +546,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       const constant int &q_stride [[buffer(15)]],                             \
       const constant int &kv_block_stride [[buffer(16)]],                      \
       const constant int &kv_head_stride [[buffer(17)]],                       \
+      device const float *sinks                                                \
+      [[buffer(18), function_constant(use_sinks)]],                            \
       device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
       const constant int &num_seqs [[buffer(20)]],                             \
       const constant int &sliding_window [[buffer(21)]],                       \
