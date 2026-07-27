@@ -755,6 +755,77 @@ class TestSDPAForward:
 
         assert captured["num_kv_heads"] == actual_kv_heads
 
+    def test_gpt_oss_scale_and_sinks_reach_kernel(self) -> None:
+        """GPT-OSS exposes ``sm_scale`` and per-head attention sinks."""
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        expected_scale = 0.125
+        fp16_sinks = mx.arange(_N_HEADS, dtype=mx.float16)
+        inner = SimpleNamespace(
+            num_attention_heads=_N_HEADS,
+            num_key_value_heads=_N_KV_HEADS,
+            sm_scale=expected_scale,
+            sinks=fp16_sinks,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, object] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _key,
+                _value,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self,
+                _query,
+                _key_cache,
+                _value_cache,
+                _num_kv_heads,
+                scale,
+                *_args,
+                sinks=None,
+                **_kwargs,
+            ) -> None:
+                captured["scale"] = scale
+                captured["sinks"] = sinks
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        sinks = captured["sinks"]
+        assert captured["scale"] == expected_scale
+        assert isinstance(sinks, mx.array)
+        assert sinks.dtype == mx.float32
+
     def test_shared_kv_path_does_not_rebind_cache_arrays(self) -> None:
         """Shared-KV attention must read the existing cache without writing."""
         cache = MetalPagedKVCache(
