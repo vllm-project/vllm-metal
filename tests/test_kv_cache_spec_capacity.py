@@ -23,7 +23,15 @@ def _engine_blocks(specs: dict, metal_per_block: int) -> int:
     return available // get_uniform_page_size(list(specs.values())) // len(specs)
 
 
-def _policy(*, num_layers, is_mla=False, yoco=None, num_kv_heads=4, head_dim=256):
+def _policy(
+    *,
+    num_layers,
+    is_mla=False,
+    yoco=None,
+    num_kv_heads=4,
+    head_dim=256,
+    sliding_window_per_layer=None,
+):
     # ``is_mla``/``is_hybrid`` are derived from the model config, not settable.
     model_args = {"kv_lora_rank": head_dim} if is_mla else {}
     runner = make_stub_runner(
@@ -36,6 +44,7 @@ def _policy(*, num_layers, is_mla=False, yoco=None, num_kv_heads=4, head_dim=256
         cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         kv_heads_per_layer=None,
         head_dim_per_layer=None,
+        sliding_window_per_layer=sliding_window_per_layer,
     )
     return runner._cache_policy
 
@@ -56,10 +65,15 @@ def test_mla_spec_matches_single_latent_cache() -> None:
 def test_yoco_shared_layers_get_no_spec() -> None:
     """Only the layers that own a cache may appear in the spec."""
     layers, owned = 35, 15
-    policy = _policy(num_layers=layers, yoco=(owned, list(range(owned))))
+    policy = _policy(
+        num_layers=layers,
+        yoco=(owned, list(range(owned))),
+        sliding_window_per_layer=[512] * owned,
+    )
     specs = policy.get_kv_cache_spec()
 
     assert len(specs) == owned
+    assert all(type(s) is FullAttentionSpec for s in specs.values())
 
     metal_per_block = 2 * BLOCK_SIZE * DTYPE.itemsize * owned * 4 * 256
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
