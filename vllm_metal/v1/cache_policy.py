@@ -282,6 +282,7 @@ class ModelCachePolicy:
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
         sliding_windows = self._runner.sliding_window_per_layer
+        vllm_config = self._runner.vllm_config
         return (
             kv_heads is not None
             and head_dims is not None
@@ -292,6 +293,8 @@ class ModelCachePolicy:
             and not self._use_turboquant(get_config())
             and self._runner.vllm_config.speculative_config is None
             and self._runner._gemma4_mtp_assistant is None
+            and not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and vllm_config.cache_config.num_gpu_blocks_override is None
             and any(window >= 0 for window in sliding_windows)
             and any(window < 0 for window in sliding_windows)
         )

@@ -11,6 +11,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
+    get_kv_cache_configs,
     get_kv_cache_groups,
 )
 from vllm.v1.kv_cache_interface import (
@@ -27,7 +28,11 @@ from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.mha import (
     MHAPagedAttentionRuntime,
 )
-from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
+from vllm_metal.config import (
+    AUTO_MEMORY_FRACTION,
+    PAGED_ATTENTION_MIN_BLOCKS,
+    MetalConfig,
+)
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
@@ -309,6 +314,84 @@ class TestCachePolicyPerLayerBytes:
 class TestMHAKVCacheLayout:
     """vLLM-managed standard-MHA cache layout contracts."""
 
+    def gemma4_mixed_runner(
+        self,
+        *,
+        num_layers: int,
+        sliding_kv_heads: int,
+        full_kv_heads: int,
+        disable_hybrid_manager: bool = False,
+        num_gpu_blocks_override: int | None = None,
+    ):
+        layer_types = [
+            "full_attention" if (index + 1) % 6 == 0 else "sliding_attention"
+            for index in range(num_layers)
+        ]
+        model_args = {
+            "global_head_dim": 512,
+            "num_global_key_value_heads": full_kv_heads,
+            "sliding_window": 1024,
+            "layer_types": layer_types,
+        }
+        adapter = DefaultModelAdapter()
+        per_layer = adapter.build_per_layer_kv_shapes(
+            model_args,
+            num_layers=num_layers,
+            num_kv_heads=sliding_kv_heads,
+            head_dim=256,
+        )
+        sliding_windows = adapter.build_sliding_window_per_layer(
+            model_args,
+            num_layers=num_layers,
+        )
+        assert per_layer is not None
+        assert sliding_windows is not None
+        kv_heads_per_layer, head_dim_per_layer = per_layer
+        cache_config = SimpleNamespace(
+            block_size=16,
+            gpu_memory_utilization=1.0,
+            num_gpu_blocks_override=num_gpu_blocks_override,
+            kv_cache_memory_bytes=None,
+            enable_prefix_caching=False,
+            prefix_match_unit=None,
+        )
+        scheduler_config = SimpleNamespace(
+            disable_hybrid_kv_cache_manager=disable_hybrid_manager,
+        )
+        vllm_config = SimpleNamespace(
+            speculative_config=None,
+            max_in_flight_tokens=16,
+            model_config=SimpleNamespace(
+                max_model_len=16,
+                original_max_model_len=16,
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            scheduler_config=scheduler_config,
+            cache_config=cache_config,
+            kv_transfer_config=None,
+        )
+        return make_stub_runner(
+            model_args=model_args,
+            num_layers=num_layers,
+            num_kv_cache_layers=num_layers,
+            num_kv_heads=sliding_kv_heads,
+            head_dim=512,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=cache_config,
+            scheduler_config=scheduler_config,
+            vllm_config=vllm_config,
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(self_attn=object()) for _ in range(num_layers)]
+            ),
+            _model_adapter=adapter,
+            kv_heads_per_layer=kv_heads_per_layer,
+            head_dim_per_layer=head_dim_per_layer,
+            sliding_window_per_layer=sliding_windows,
+        )
+
     def _mixed_mha_config(self) -> tuple[KVCacheConfig, tuple[str, ...]]:
         names = tuple(f"layers.{index}.self_attn" for index in range(4))
         specs = {
@@ -478,52 +561,75 @@ class TestMHAKVCacheLayout:
         full_kv_heads: int,
         expected_slots: int,
     ) -> None:
-        layer_types = [
-            "full_attention" if (index + 1) % 6 == 0 else "sliding_attention"
-            for index in range(num_layers)
-        ]
-        model_args = {
-            "global_head_dim": 512,
-            "num_global_key_value_heads": full_kv_heads,
-            "sliding_window": 1024,
-            "layer_types": layer_types,
-        }
-        adapter = DefaultModelAdapter()
-        per_layer = adapter.build_per_layer_kv_shapes(
-            model_args,
+        runner = self.gemma4_mixed_runner(
             num_layers=num_layers,
-            num_kv_heads=sliding_kv_heads,
-            head_dim=256,
+            sliding_kv_heads=sliding_kv_heads,
+            full_kv_heads=full_kv_heads,
         )
-        sliding_windows = adapter.build_sliding_window_per_layer(
-            model_args,
-            num_layers=num_layers,
+        metal_config = MetalConfig(
+            memory_fraction=1.0,
+            use_mlx=True,
+            mlx_device="gpu",
+            debug=False,
+            turboquant=False,
         )
-        assert per_layer is not None
-        assert sliding_windows is not None
-        kv_heads_per_layer, head_dim_per_layer = per_layer
-        runner = make_stub_runner(
-            model_args=model_args,
-            num_layers=num_layers,
-            num_kv_cache_layers=num_layers,
-            num_kv_heads=sliding_kv_heads,
-            head_dim=512,
-            kv_cache_dtype=mx.bfloat16,
-            cache_config=SimpleNamespace(block_size=16),
-            vllm_config=SimpleNamespace(
-                speculative_config=None,
-                cache_config=SimpleNamespace(
-                    block_size=16,
-                    gpu_memory_utilization=1.0,
-                ),
-            ),
-            model=SimpleNamespace(
-                layers=[SimpleNamespace(self_attn=object()) for _ in range(num_layers)]
-            ),
-            _model_adapter=adapter,
-            kv_heads_per_layer=kv_heads_per_layer,
-            head_dim_per_layer=head_dim_per_layer,
-            sliding_window_per_layer=sliding_windows,
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: metal_config,
+        )
+        reported_dense_blocks = 2
+        dense_block_bytes = runner.get_cache_block_size_bytes()
+        worker = SimpleNamespace(
+            model_runner=runner,
+            metal_config=metal_config,
+            vllm_config=runner.vllm_config,
+            get_cache_block_size_bytes=runner.get_cache_block_size_bytes,
+        )
+        planner = WorkerCachePlanner(worker)
+        monkeypatch.setattr(runner, "profile_run", lambda: 0)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+        monkeypatch.setattr(
+            planner,
+            "_metal_limit_bytes",
+            lambda: dense_block_bytes * reported_dense_blocks,
+        )
+
+        available = planner.determine_available_memory()
+
+        specs = runner.get_kv_cache_spec()
+        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+
+        assert runner.paged_attention_runtime is None
+        assert available // dense_block_bytes == reported_dense_blocks
+        assert type(specs["layers.0.self_attn"]) is SlidingWindowSpec
+        assert type(specs["layers.5.self_attn"]) is FullAttentionSpec
+        assert len(config.kv_cache_groups) == 6
+        assert config.num_blocks > reported_dense_blocks
+        assert len(config.kv_cache_tensors) == expected_slots
+
+        runner.initialize_kv_cache(config)
+
+        backend = runner.paged_attention_runtime
+        assert isinstance(backend, MHAPagedAttentionRuntime)
+        assert backend.num_blocks() == config.num_blocks
+        assert runner._paged_scheduler_group_indices == (0, 1, 2, 3, 4, 5)
+        assert runner._paged_group_block_sizes == (16, 16, 16, 16, 16, 32)
+        assert backend.kv_cache.group_index_for_layer(5) == 5
+        assert backend.kv_cache.block_size_for_layer(5) == 32
+        assert backend.kv_cache.sliding_window_per_layer[0] == 1024
+        assert backend.kv_cache.sliding_window_per_layer[5] == -1
+        assert len(backend.kv_cache.key_caches) == num_layers
+        assert all(
+            isinstance(layer.self_attn, SDPAPagedAttentionWrapper)
+            for layer in runner.model.layers
+        )
+
+    def test_disabled_hybrid_manager_stays_on_dense_path(self, monkeypatch) -> None:
+        runner = self.gemma4_mixed_runner(
+            num_layers=60,
+            sliding_kv_heads=16,
+            full_kv_heads=4,
+            disable_hybrid_manager=True,
         )
         metal_config = MetalConfig(
             memory_fraction=1.0,
@@ -546,42 +652,63 @@ class TestMHAKVCacheLayout:
         planner = WorkerCachePlanner(worker)
         monkeypatch.setattr(runner, "profile_run", lambda: 0)
         monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
-        monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: dense_block_bytes)
+        monkeypatch.setattr(
+            planner,
+            "_metal_limit_bytes",
+            lambda: dense_block_bytes * PAGED_ATTENTION_MIN_BLOCKS,
+        )
 
         available = planner.determine_available_memory()
-
         specs = runner.get_kv_cache_spec()
-        groups = get_kv_cache_groups(vllm_config_for_kv_grouping(), specs)
-        config = get_kv_cache_config_from_groups(
-            vllm_config_for_kv_grouping(),
-            groups,
-            available,
-        )
-
-        assert runner.paged_attention_runtime is None
-        assert available // dense_block_bytes == 1
-        assert type(specs["layers.0.self_attn"]) is SlidingWindowSpec
-        assert type(specs["layers.5.self_attn"]) is FullAttentionSpec
-        assert len(groups) == 6
-        assert config.num_blocks > 1
-        assert len(config.kv_cache_tensors) == expected_slots
-
+        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
         runner.initialize_kv_cache(config)
 
-        backend = runner.paged_attention_runtime
-        assert isinstance(backend, MHAPagedAttentionRuntime)
-        assert backend.num_blocks() == config.num_blocks
-        assert runner._paged_scheduler_group_indices == (0, 1, 2, 3, 4, 5)
-        assert runner._paged_group_block_sizes == (16, 16, 16, 16, 16, 32)
-        assert backend.kv_cache.group_index_for_layer(5) == 5
-        assert backend.kv_cache.block_size_for_layer(5) == 32
-        assert backend.kv_cache.sliding_window_per_layer[0] == 1024
-        assert backend.kv_cache.sliding_window_per_layer[5] == -1
-        assert len(backend.kv_cache.key_caches) == num_layers
-        assert all(
-            isinstance(layer.self_attn, SDPAPagedAttentionWrapper)
-            for layer in runner.model.layers
+        assert all(type(spec) is FullAttentionSpec for spec in specs.values())
+        assert runner._paged_scheduler_group_indices == (0,)
+        assert runner.paged_attention_runtime is not None
+        assert runner.paged_attention_runtime.num_blocks() == config.num_blocks
+
+    def test_block_override_uses_existing_capacity_guard(self, monkeypatch) -> None:
+        runner = self.gemma4_mixed_runner(
+            num_layers=60,
+            sliding_kv_heads=16,
+            full_kv_heads=4,
+            num_gpu_blocks_override=100,
         )
+        metal_config = MetalConfig(
+            memory_fraction=1.0,
+            use_mlx=True,
+            mlx_device="gpu",
+            debug=False,
+            turboquant=False,
+        )
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: metal_config,
+        )
+        dense_block_bytes = runner.get_cache_block_size_bytes()
+        worker = SimpleNamespace(
+            model_runner=runner,
+            metal_config=metal_config,
+            vllm_config=runner.vllm_config,
+            get_cache_block_size_bytes=runner.get_cache_block_size_bytes,
+        )
+        planner = WorkerCachePlanner(worker)
+        monkeypatch.setattr(runner, "profile_run", lambda: 0)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+        monkeypatch.setattr(
+            planner,
+            "_metal_limit_bytes",
+            lambda: dense_block_bytes * PAGED_ATTENTION_MIN_BLOCKS,
+        )
+
+        available = planner.determine_available_memory()
+        specs = runner.get_kv_cache_spec()
+        config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+
+        assert config.num_blocks == 100
+        with pytest.raises(ValueError, match="Engine KV cache config requests 100"):
+            runner.initialize_kv_cache(config)
 
     def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
         config, names = self._mixed_mha_config()
