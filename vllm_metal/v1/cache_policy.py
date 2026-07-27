@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
 )
 
 from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
@@ -264,11 +265,36 @@ class ModelCachePolicy:
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
-    ) -> Literal["paged_attention_capacity", "single_sequence_estimate"]:
+    ) -> Literal[
+        "paged_attention_capacity",
+        "paged_attention_mha_layout_budget",
+        "single_sequence_estimate",
+    ]:
         """Return which scheduler memory-reporting mode worker should use."""
         if paged_attention_enabled:
+            if self._uses_deferred_mha_layout():
+                return "paged_attention_mha_layout_budget"
             return "paged_attention_capacity"
         return "single_sequence_estimate"
+
+    def _uses_deferred_mha_layout(self) -> bool:
+        """Return whether vLLM's grouped MHA config must own allocation."""
+        kv_heads = self._runner.kv_heads_per_layer
+        head_dims = self._runner.head_dim_per_layer
+        sliding_windows = self._runner.sliding_window_per_layer
+        return (
+            kv_heads is not None
+            and head_dims is not None
+            and sliding_windows is not None
+            and self._runner._yoco_cache_mapping is None
+            and not self._runner.is_hybrid
+            and not self._runner.is_mla
+            and not self._use_turboquant(get_config())
+            and self._runner.vllm_config.speculative_config is None
+            and self._runner._gemma4_mtp_assistant is None
+            and any(window >= 0 for window in sliding_windows)
+            and any(window < 0 for window in sliding_windows)
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
@@ -289,6 +315,7 @@ class ModelCachePolicy:
         if self._runner._yoco_cache_mapping is not None:
             num_spec_layers, _ = self._runner._yoco_cache_mapping
         specs: dict[str, KVCacheSpec] = {}
+        use_deferred_mha_layout = self._uses_deferred_mha_layout()
         for layer_idx in range(num_spec_layers):
             if (
                 self._runner.is_hybrid
@@ -322,17 +349,55 @@ class ModelCachePolicy:
                 # the 2x K/V factor in ``real_page_size_bytes``, so describing
                 # MLA with it makes the engine halve the block count it plans
                 # against relative to the pool actually allocated.
-                spec_cls = (
-                    MLAAttentionSpec if self._runner.is_mla else FullAttentionSpec
-                )
-                specs[layer_name] = spec_cls(
-                    block_size=block_size,
-                    num_kv_heads=kv_heads[layer_idx],
-                    head_size=head_dims[layer_idx],
-                    dtype=torch_dtype,
-                )
+                if self._runner.is_mla:
+                    specs[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=kv_heads[layer_idx],
+                        head_size=head_dims[layer_idx],
+                        dtype=torch_dtype,
+                    )
+                elif use_deferred_mha_layout:
+                    specs[layer_name] = self._build_mha_attention_spec(
+                        layer_idx=layer_idx,
+                        block_size=block_size,
+                        num_kv_heads=kv_heads[layer_idx],
+                        head_dim=head_dims[layer_idx],
+                        torch_dtype=torch_dtype,
+                    )
+                else:
+                    specs[layer_name] = FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=kv_heads[layer_idx],
+                        head_size=head_dims[layer_idx],
+                        dtype=torch_dtype,
+                    )
 
         return specs
+
+    def _build_mha_attention_spec(
+        self,
+        layer_idx: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        torch_dtype: torch.dtype,
+    ) -> FullAttentionSpec | SlidingWindowSpec:
+        """Build the scheduler spec for one standard MHA cache layer."""
+        sliding_windows = self._runner.sliding_window_per_layer
+        if sliding_windows is not None and sliding_windows[layer_idx] >= 0:
+            return SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                dtype=torch_dtype,
+                sliding_window=sliding_windows[layer_idx],
+            )
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_dim,
+            dtype=torch_dtype,
+        )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Accept engine KV cache config for API compatibility.
@@ -346,6 +411,19 @@ class ModelCachePolicy:
         adopt its grouping before serving.
         """
         runtime = self._runner.paged_attention_runtime
+        if self._uses_deferred_mha_layout():
+            if runtime is not None:
+                raise RuntimeError(
+                    "deferred MHA layout path must not preallocate paged KV cache"
+                )
+            self._initialize_deferred_mha_layout(kv_cache_config)
+            logger.info(
+                "KV cache config received: %d grouped blocks "
+                "(MLX layout initialized from vLLM config)",
+                kv_cache_config.num_blocks,
+            )
+            return
+
         if runtime is not None and kv_cache_config.num_blocks > runtime.num_blocks():
             raise ValueError(
                 f"Engine KV cache config requests {kv_cache_config.num_blocks} "
@@ -360,6 +438,17 @@ class ModelCachePolicy:
         logger.info(
             "KV cache config received: %d blocks (MLX manages cache internally)",
             kv_cache_config.num_blocks,
+        )
+
+    def _initialize_deferred_mha_layout(self, kv_cache_config: KVCacheConfig) -> None:
+        model_layer_names = self._mha_model_layer_names()
+        layout = MHAKVCacheLayout.from_config(kv_cache_config, model_layer_names)
+        runtime = self._build_mha_backend(block_size=layout.group_block_sizes[0])
+        runtime.adopt_layout(layout)
+        runtime.patch_model(self._runner.model)
+        self._runner.install_paged_attention_runtime(
+            runtime,
+            block_size=layout.group_block_sizes[0],
         )
 
     def _adopt_scheduler_groups(
@@ -802,6 +891,19 @@ class WorkerCachePlanner:
             )
             return available
 
+        if mode == "paged_attention_mha_layout_budget":
+            overhead = self._worker.model_runner.profile_run()
+            plan = self._paged_attention_plan(
+                overhead=overhead,
+                require_min_blocks=False,
+            )
+            logger.info(
+                "Mixed MHA paged attention: reporting %.2f GB KV budget; "
+                "runtime allocation deferred until vLLM KVCacheConfig",
+                plan.kv_budget / 1e9,
+            )
+            return plan.kv_budget
+
         available = self._worker._one_sequence_kv_bytes()
         logger.info(
             "MLX path: reporting %.2f GB for scheduler admission control "
@@ -821,7 +923,9 @@ class WorkerCachePlanner:
         """Return Metal-memory budget before hybrid GDN reservation."""
         return int(metal_limit * fraction) - model_memory - overhead
 
-    def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
+    def _paged_attention_plan(
+        self, *, overhead: int, require_min_blocks: bool = True
+    ) -> _PagedAttentionPlan:
         block_size = self._worker.vllm_config.cache_config.block_size
         fraction = self._memory_fraction()
         metal_limit = self._metal_limit_bytes()
@@ -849,17 +953,22 @@ class WorkerCachePlanner:
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
         )
-        self._validate_paged_attention_plan(plan)
+        self._validate_paged_attention_plan(
+            plan,
+            require_min_blocks=require_min_blocks,
+        )
         return plan
 
-    def _validate_paged_attention_plan(self, plan: _PagedAttentionPlan) -> None:
+    def _validate_paged_attention_plan(
+        self, plan: _PagedAttentionPlan, *, require_min_blocks: bool
+    ) -> None:
         if plan.kv_budget <= 0:
             raise ValueError(
                 "Paged attention: not enough Metal memory for KV cache. "
                 f"{plan.format_breakdown()}. {plan.format_mitigations()}"
             )
 
-        if plan.num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
+        if require_min_blocks and plan.num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
             raise ValueError(
                 "Paged attention: computed num_blocks too low "
                 f"({plan.num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "

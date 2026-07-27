@@ -69,8 +69,7 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     def adopt_layout(self, layout: MHAKVCacheLayout) -> None:
-        """Replace the legacy dense cache with vLLM's grouped MHA layout."""
-        self._require_initialized("adopt_layout")
+        """Use vLLM's grouped MHA layout as the runtime KV cache."""
         if self._turboquant:
             raise NotImplementedError(
                 "layout-backed MHA runtime does not support TurboQuant"

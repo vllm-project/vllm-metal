@@ -117,6 +117,7 @@ logger = init_logger(__name__)
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
     "paged_attention_capacity",
+    "paged_attention_mha_layout_budget",
     "single_sequence_estimate",
 ]
 
