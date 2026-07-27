@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import mlx.core as mx
 import torch
 
 import vllm_metal.v1.model_runner as mr
@@ -87,3 +88,85 @@ def make_stub_runner(
         runner._vocab_size = _model_args["vocab_size"]
 
     return runner
+
+
+def make_gemma4_mixed_mha_runner(
+    num_layers: int,
+    sliding_kv_heads: int,
+    full_kv_heads: int,
+    max_model_len: int = 16,
+    original_max_model_len: int | None = 16,
+    max_in_flight_tokens: int = 16,
+    disable_hybrid_manager: bool = False,
+    num_gpu_blocks_override: int | None = None,
+) -> mr.MetalModelRunner:
+    """Create a Gemma4 mixed sliding/full MHA runner stub."""
+    layer_types = [
+        "full_attention" if (index + 1) % 6 == 0 else "sliding_attention"
+        for index in range(num_layers)
+    ]
+    model_args = {
+        "global_head_dim": 512,
+        "num_global_key_value_heads": full_kv_heads,
+        "sliding_window": 1024,
+        "layer_types": layer_types,
+    }
+    adapter = DefaultModelAdapter()
+    per_layer = adapter.build_per_layer_kv_shapes(
+        model_args,
+        num_layers=num_layers,
+        num_kv_heads=sliding_kv_heads,
+        head_dim=256,
+    )
+    sliding_windows = adapter.build_sliding_window_per_layer(
+        model_args,
+        num_layers=num_layers,
+    )
+    assert per_layer is not None
+    assert sliding_windows is not None
+    kv_heads_per_layer, head_dim_per_layer = per_layer
+    cache_config = SimpleNamespace(
+        block_size=16,
+        gpu_memory_utilization=1.0,
+        num_gpu_blocks_override=num_gpu_blocks_override,
+        kv_cache_memory_bytes=None,
+        enable_prefix_caching=False,
+        prefix_match_unit=None,
+    )
+    scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=max_in_flight_tokens,
+        disable_hybrid_kv_cache_manager=disable_hybrid_manager,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        max_in_flight_tokens=max_in_flight_tokens,
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len,
+            original_max_model_len=original_max_model_len,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        scheduler_config=scheduler_config,
+        cache_config=cache_config,
+        kv_transfer_config=None,
+    )
+    return make_stub_runner(
+        model_args=model_args,
+        num_layers=num_layers,
+        num_kv_cache_layers=num_layers,
+        num_kv_heads=sliding_kv_heads,
+        head_dim=512,
+        kv_cache_dtype=mx.bfloat16,
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+        vllm_config=vllm_config,
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=object()) for _ in range(num_layers)]
+        ),
+        _model_adapter=adapter,
+        kv_heads_per_layer=kv_heads_per_layer,
+        head_dim_per_layer=head_dim_per_layer,
+        sliding_window_per_layer=sliding_windows,
+    )

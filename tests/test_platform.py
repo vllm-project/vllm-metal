@@ -8,13 +8,21 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import ParallelConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_capacity,
+    get_kv_cache_configs,
+)
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 
 import vllm_metal.compat as compat
+from tests.stub_runner import make_gemma4_mixed_mha_runner
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
@@ -1576,15 +1584,15 @@ class TestKvBudgetBytes:
 class TestAutoFitMaxModelLenChain:
     """The -1 sentinel drives the Metal null-block auto-fit contract.
 
-    Builds the gemma-4-31B KV shape (the all-FullAttentionSpec specs vllm-metal
-    emits today: 50 sliding-shaped 16x256 layers + 10 global-shaped 4x512
-    layers) and runs vLLM's ``get_kv_cache_configs`` against fixed synthetic
-    memory budgets. These tests do not re-test upstream's fitting algorithm;
-    they only check Metal's null-block reservation and too-small-pool failure.
+    Builds the gemma-4-31B mixed-MHA KV shape and runs vLLM's
+    ``get_kv_cache_configs`` against fixed synthetic memory budgets. These
+    tests do not re-test upstream's fitting algorithm; they check Metal's
+    null-block reservation, too-small-pool failure, and current mixed-layout
+    budget shape for issue #505.
     """
 
     _NUM_LAYERS = 60
-    _FULL_EVERY = 6  # gemma-4's 5:1 sliding:full layer pattern
+    _MAX_BATCH_TOKENS = 2048
 
     @pytest.fixture(autouse=True)
     def _ensure_compat_patches(self) -> None:
@@ -1593,46 +1601,24 @@ class TestAutoFitMaxModelLenChain:
         while vLLM is partially imported."""
         compat.ensure_vllm_auto_fit_null_block_patch()
 
-    _BLOCK_SIZE = 16
     # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
     # equals the packed per-block bytes the Metal pool reports.
     _PACKED_BLOCK_BYTES = 14_417_920
     _DERIVED_MAX_LEN = 262_144
+    _FULL_CONTEXT_BUDGET_BYTES = int(22.5 * 1024**3)
 
-    @classmethod
-    def _specs(cls) -> dict[str, KVCacheSpec]:
-        """Fresh specs per call: upstream grouping mutates specs in place."""
-        specs: dict[str, KVCacheSpec] = {}
-        for i in range(cls._NUM_LAYERS):
-            is_full = (i + 1) % cls._FULL_EVERY == 0
-            specs[f"layers.{i}.self_attn"] = FullAttentionSpec(
-                block_size=cls._BLOCK_SIZE,
-                num_kv_heads=4 if is_full else 16,
-                head_size=512 if is_full else 256,
-                dtype=torch.bfloat16,
-            )
-        return specs
-
-    @classmethod
-    def _vllm_config(cls, *, original_max_model_len: int | None) -> SimpleNamespace:
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                max_model_len=cls._DERIVED_MAX_LEN,
-                original_max_model_len=original_max_model_len,
-            ),
-            parallel_config=SimpleNamespace(
-                decode_context_parallel_size=1,
-                prefill_context_parallel_size=1,
-            ),
-            scheduler_config=SimpleNamespace(
-                max_num_batched_tokens=2048,
-                disable_hybrid_kv_cache_manager=False,
-            ),
-            cache_config=SimpleNamespace(
-                num_gpu_blocks_override=None,
-                kv_cache_memory_bytes=None,
-            ),
+    def gemma4_config_and_specs(
+        self, *, original_max_model_len: int | None
+    ) -> tuple[VllmConfig, dict[str, KVCacheSpec]]:
+        runner = make_gemma4_mixed_mha_runner(
+            num_layers=self._NUM_LAYERS,
+            sliding_kv_heads=16,
+            full_kv_heads=4,
+            max_model_len=self._DERIVED_MAX_LEN,
+            original_max_model_len=original_max_model_len,
+            max_in_flight_tokens=self._MAX_BATCH_TOKENS,
         )
+        return runner.vllm_config, runner.get_kv_cache_spec()
 
     def test_reduced_length_reserves_the_null_block(self) -> None:
         """The fitted length must never need the whole pool: BlockPool keeps
@@ -1640,16 +1626,45 @@ class TestAutoFitMaxModelLenChain:
         would otherwise starve in the scheduler forever."""
         num_pool_blocks = 1500
         available = num_pool_blocks * self._PACKED_BLOCK_BYTES
-        vllm_config = self._vllm_config(original_max_model_len=-1)
+        vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
-        get_kv_cache_configs(vllm_config, [self._specs()], [available])
+        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
 
-        resolved_blocks = -(-vllm_config.model_config.max_model_len // self._BLOCK_SIZE)
-        assert resolved_blocks == num_pool_blocks - 1
+        capacity, _ = get_kv_cache_capacity(vllm_config, config)
+        assert vllm_config.model_config.max_model_len < self._DERIVED_MAX_LEN
+        assert capacity > vllm_config.model_config.max_model_len
+
+    def test_mixed_layout_keeps_full_context_under_sufficient_budget(self) -> None:
+        available = self._FULL_CONTEXT_BUDGET_BYTES
+        vllm_config, specs = self.gemma4_config_and_specs(
+            original_max_model_len=self._DERIVED_MAX_LEN
+        )
+
+        config = get_kv_cache_configs(vllm_config, [specs], [available])[0]
+
+        full_groups = [
+            group
+            for group in config.kv_cache_groups
+            if type(group.kv_cache_spec) is FullAttentionSpec
+        ]
+        sliding_groups = [
+            group
+            for group in config.kv_cache_groups
+            if type(group.kv_cache_spec) is SlidingWindowSpec
+        ]
+        assert len(sliding_groups) == 5
+        assert len(full_groups) == 1
+        assert sum(len(group.layer_names) for group in sliding_groups) == 50
+        assert sum(len(group.layer_names) for group in full_groups) == 10
+        assert len(config.kv_cache_tensors) == 10
+        capacity, _ = get_kv_cache_capacity(vllm_config, config)
+        assert vllm_config.model_config.max_model_len == self._DERIVED_MAX_LEN
+        assert capacity >= self._DERIVED_MAX_LEN
+        assert sum(tensor.size for tensor in config.kv_cache_tensors) <= available
 
     def test_insufficient_memory_for_one_block_raises(self) -> None:
         available = self._PACKED_BLOCK_BYTES - 1
-        vllm_config = self._vllm_config(original_max_model_len=-1)
+        vllm_config, specs = self.gemma4_config_and_specs(original_max_model_len=-1)
 
         with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
-            get_kv_cache_configs(vllm_config, [self._specs()], [available])
+            get_kv_cache_configs(vllm_config, [specs], [available])

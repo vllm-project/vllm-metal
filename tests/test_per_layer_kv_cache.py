@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_gemma4_mixed_mha_runner, make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
@@ -34,7 +34,6 @@ from vllm_metal.config import (
     MetalConfig,
 )
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
-from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 def vllm_config_for_kv_grouping() -> VllmConfig:
@@ -323,73 +322,12 @@ class TestMHAKVCacheLayout:
         disable_hybrid_manager: bool = False,
         num_gpu_blocks_override: int | None = None,
     ):
-        layer_types = [
-            "full_attention" if (index + 1) % 6 == 0 else "sliding_attention"
-            for index in range(num_layers)
-        ]
-        model_args = {
-            "global_head_dim": 512,
-            "num_global_key_value_heads": full_kv_heads,
-            "sliding_window": 1024,
-            "layer_types": layer_types,
-        }
-        adapter = DefaultModelAdapter()
-        per_layer = adapter.build_per_layer_kv_shapes(
-            model_args,
+        return make_gemma4_mixed_mha_runner(
             num_layers=num_layers,
-            num_kv_heads=sliding_kv_heads,
-            head_dim=256,
-        )
-        sliding_windows = adapter.build_sliding_window_per_layer(
-            model_args,
-            num_layers=num_layers,
-        )
-        assert per_layer is not None
-        assert sliding_windows is not None
-        kv_heads_per_layer, head_dim_per_layer = per_layer
-        cache_config = SimpleNamespace(
-            block_size=16,
-            gpu_memory_utilization=1.0,
+            sliding_kv_heads=sliding_kv_heads,
+            full_kv_heads=full_kv_heads,
+            disable_hybrid_manager=disable_hybrid_manager,
             num_gpu_blocks_override=num_gpu_blocks_override,
-            kv_cache_memory_bytes=None,
-            enable_prefix_caching=False,
-            prefix_match_unit=None,
-        )
-        scheduler_config = SimpleNamespace(
-            disable_hybrid_kv_cache_manager=disable_hybrid_manager,
-        )
-        vllm_config = SimpleNamespace(
-            speculative_config=None,
-            max_in_flight_tokens=16,
-            model_config=SimpleNamespace(
-                max_model_len=16,
-                original_max_model_len=16,
-            ),
-            parallel_config=SimpleNamespace(
-                decode_context_parallel_size=1,
-                prefill_context_parallel_size=1,
-            ),
-            scheduler_config=scheduler_config,
-            cache_config=cache_config,
-            kv_transfer_config=None,
-        )
-        return make_stub_runner(
-            model_args=model_args,
-            num_layers=num_layers,
-            num_kv_cache_layers=num_layers,
-            num_kv_heads=sliding_kv_heads,
-            head_dim=512,
-            kv_cache_dtype=mx.bfloat16,
-            cache_config=cache_config,
-            scheduler_config=scheduler_config,
-            vllm_config=vllm_config,
-            model=SimpleNamespace(
-                layers=[SimpleNamespace(self_attn=object()) for _ in range(num_layers)]
-            ),
-            _model_adapter=adapter,
-            kv_heads_per_layer=kv_heads_per_layer,
-            head_dim_per_layer=head_dim_per_layer,
-            sliding_window_per_layer=sliding_windows,
         )
 
     def _mixed_mha_config(self) -> tuple[KVCacheConfig, tuple[str, ...]]:
