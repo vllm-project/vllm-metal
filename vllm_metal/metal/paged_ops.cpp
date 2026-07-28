@@ -285,7 +285,7 @@ static void dispatch_paged_attention_tiled(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    TileConfig cfg, Stream s, const array* sinks = nullptr) {
+    TileConfig cfg, Stream s, const array* sinks) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
