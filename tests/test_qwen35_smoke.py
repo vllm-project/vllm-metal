@@ -34,10 +34,11 @@ PROMPTS = [
 
 # fmt: off
 # Golden token IDs from MLX inline cache, greedy decoding (Qwen3.5-0.8B).
+# Environment: mlx 0.32.0, mlx-lm 0.31.3
 GOLDEN_MLX = {
     "The capital of France is":                     [11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13],
     "The weather today is not":                     [1603, 13, 198, 760, 8831, 3242, 369, 524, 1603, 13],
-    "One plus one equals":                          [1330, 13, 198, 3833, 5346, 799, 16327, 1330, 13, 198],
+    "One plus one equals":                          [220, 17, 13, 198, 3833, 5346, 799, 16327, 220, 17],
     "The largest planet in our solar system is":    [279, 7806, 13, 271, 248068, 271, 248069, 271, 332, 2665],
     "Water boils at a temperature of":              [220, 16, 15, 15, 29922, 13, 1368, 264, 1637, 369],
 }
