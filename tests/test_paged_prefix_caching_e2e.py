@@ -7,9 +7,12 @@ first ``generate`` populates the cache; the second triggers cache hits
 that walk the model_runner's ``start_pos > 0`` path because the upstream
 scheduler reports ``num_computed_tokens > 0``.
 
-Two assertions (in code order):
+Three assertions (in code order):
+  0. Spy reach — the ``prepare_grouped`` patch actually fired.  Without
+     this the two checks below fail on an empty sample and read as a
+     prefix-cache bug when the harness is what broke.
   1. Cache-hit reach — at least one prefill in the second pass is issued
-     with ``start_pos > 0``.  Verified by spying on ``prepare_unified``
+     with ``start_pos > 0``.  Verified by spying on ``prepare_grouped``
      (which receives per-prefill ``start_pos`` tuples).  Fails fast if
      the cache-hit branch was never taken.
   2. Determinism — second pass produces identical tokens to the first
@@ -74,14 +77,18 @@ def _run_prefix_cache_correctness() -> None:
     from vllm_metal.attention import context as pac
 
     seen_start_pos: list[int] = []
-    orig_prepare = pac.prepare_unified
+    orig_prepare = pac.prepare_grouped
 
-    def patched_prepare(decode_requests, prefill_requests, block_size):
+    # Only the leading two arguments are this spy's contract; the rest pass
+    # straight through, so adding a parameter to prepare_grouped cannot
+    # silently unhook the test again (#534 added merge_verify_windows and
+    # did exactly that).
+    def patched_prepare(decode_requests, prefill_requests, *args, **kwargs):
         for _, _, start_pos in prefill_requests:
             seen_start_pos.append(start_pos)
-        return orig_prepare(decode_requests, prefill_requests, block_size)
+        return orig_prepare(decode_requests, prefill_requests, *args, **kwargs)
 
-    pac.prepare_unified = patched_prepare
+    pac.prepare_grouped = patched_prepare
 
     try:
         llm = LLM(
@@ -95,7 +102,17 @@ def _run_prefix_cache_correctness() -> None:
         prime_count = len(seen_start_pos)
         out_second = llm.generate(PROMPTS, sp)
     finally:
-        pac.prepare_unified = orig_prepare
+        pac.prepare_grouped = orig_prepare
+
+    # Tell a broken spy apart from a broken cache: if the runner stops
+    # routing prefills through prepare_grouped, every start_pos assertion
+    # below fails for a reason unrelated to prefix caching.
+    if not seen_start_pos:
+        raise AssertionError(
+            "prepare_grouped spy never fired, so this test observed nothing. "
+            "The runner no longer routes prefills through it, or it was "
+            "imported before the patch was installed."
+        )
 
     # Cache-hit reach: at least one prefill in the second pass must
     # advance past the cached prefix.
