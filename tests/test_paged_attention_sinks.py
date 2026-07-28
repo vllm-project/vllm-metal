@@ -11,7 +11,7 @@ The oracle is MLX's own ``mx.fast.scaled_dot_product_attention(..., sinks=...)``
 (MLX >= 0.32), so these compare the kernel against the same reference the model
 path would use.
 
-Three kernel paths fold sinks, and each is covered here:
+Four kernel paths fold sinks, and each is covered here:
 
 - non-partitioned: the sink joins the merged threadgroup state once, AFTER the
   per-warp merge.  Folding it before the merge counts it ``NUM_WARPS`` times;
@@ -19,6 +19,7 @@ Three kernel paths fold sinks, and each is covered here:
 - split-KV: ``paged_attention_v2_reduce`` folds the sink into the global max and
   exp-sum, so it is counted once across partitions rather than once per
   partition.
+- tiled prefill: same softmax update as non-partitioned, one sink per query row.
 - window mode: same as non-partitioned, per window row.
 
 Deterministic, no model load.
@@ -36,6 +37,11 @@ from vllm_metal.metal import get_ops
 
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
+GPT_OSS_HEAD_SIZE = 64
+GPT_OSS_NUM_Q_HEADS = 64
+GPT_OSS_NUM_KV_HEADS = 8
+GPT_OSS_PREFILL_CTX = 64
+GPT_OSS_PREFILL_LEN = 64
 
 # Matched to the repo's existing paged-attention parity tolerances.
 _TOLERANCES = {
@@ -114,8 +120,9 @@ def _run_prefill(
     query_len: int,
     num_q_heads: int,
     num_kv_heads: int,
+    head_size: int,
+    dtype: mx.Dtype,
     sinks: mx.array,
-    dtype: mx.Dtype = mx.float16,
     seed: int = 0,
 ) -> tuple[mx.array, mx.array]:
     """One ordinary multi-token prefill segment against the MLX oracle."""
@@ -123,15 +130,15 @@ def _run_prefill(
     kv_len = ctx + query_len
     blocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     key_cache = mx.random.normal(
-        shape=(blocks, BLOCK_SIZE, num_kv_heads, HEAD_SIZE)
+        shape=(blocks, BLOCK_SIZE, num_kv_heads, head_size)
     ).astype(dtype)
     value_cache = mx.random.normal(
-        shape=(blocks, BLOCK_SIZE, num_kv_heads, HEAD_SIZE)
+        shape=(blocks, BLOCK_SIZE, num_kv_heads, head_size)
     ).astype(dtype)
-    query = mx.random.normal(shape=(query_len, num_q_heads, HEAD_SIZE)).astype(dtype)
+    query = mx.random.normal(shape=(query_len, num_q_heads, head_size)).astype(dtype)
     mx.eval(key_cache, value_cache, query)
 
-    scale = HEAD_SIZE**-0.5
+    scale = head_size**-0.5
     out = mx.array(0)
     get_ops().paged_attention_primitive(
         query,
@@ -151,8 +158,8 @@ def _run_prefill(
     )
     mx.eval(out)
 
-    flat_k = key_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, HEAD_SIZE)[:kv_len]
-    flat_v = value_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, HEAD_SIZE)[:kv_len]
+    flat_k = key_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, head_size)[:kv_len]
+    flat_v = value_cache.reshape(blocks * BLOCK_SIZE, num_kv_heads, head_size)[:kv_len]
     ref = mx.fast.scaled_dot_product_attention(
         mx.transpose(query, (1, 0, 2))[None],
         mx.transpose(flat_k, (1, 0, 2))[None],
@@ -162,7 +169,7 @@ def _run_prefill(
         sinks=sinks.astype(dtype),
     )
     mx.eval(ref)
-    return out.reshape(query_len, num_q_heads, HEAD_SIZE), mx.transpose(
+    return out.reshape(query_len, num_q_heads, head_size), mx.transpose(
         ref[0], (1, 0, 2)
     )
 
@@ -234,8 +241,16 @@ class TestSinkPrefillMode:
     """Ordinary prefill with sinks stays on the tiled sink path."""
 
     def test_prefill_matches_mlx_oracle(self) -> None:
-        got, ref = _run_prefill(64, 4, 8, 8, _sinks(8, 2.0))
-        _assert_close(got, ref, mx.float16)
+        got, ref = _run_prefill(
+            GPT_OSS_PREFILL_CTX,
+            GPT_OSS_PREFILL_LEN,
+            GPT_OSS_NUM_Q_HEADS,
+            GPT_OSS_NUM_KV_HEADS,
+            GPT_OSS_HEAD_SIZE,
+            mx.bfloat16,
+            _sinks(GPT_OSS_NUM_Q_HEADS),
+        )
+        _assert_close(got, ref, mx.bfloat16)
 
 
 def _run_window(
