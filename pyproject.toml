@@ -36,6 +36,13 @@ dependencies = [
     "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
+    # Temporary cap: xgrammar's prebuilt wheels are compiled against a specific
+    # apache-tvm-ffi C++ ABI but declare only `apache-tvm-ffi>=0.1.9`, so a
+    # clean install resolves 0.1.13 and segfaults inside
+    # `xgrammar::__TVMFFIStaticInitFunc0()` before vLLM starts (#569).  We never
+    # import tvm-ffi; this bounds the resolver only.
+    # TODO: remove once xgrammar bounds its own apache-tvm-ffi range.
+    "apache-tvm-ffi>=0.1.9,<0.1.13; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
