@@ -196,6 +196,18 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_6MoeForConditionalGeneration",
     }
 )
+# MLX-quantized wrappers are only force-texted when no native multimodal
+# adapter covers the architecture (see _QWEN3_VL_ARCHITECTURES):
+# Qwen3_5ForConditionalGeneration has one, so its MLX checkpoints keep the
+# native path and image serving; the rest would run the bare language model
+# with unset mrope state and generate garbled output.
+_MLX_QUANT_TEXT_BACKBONE_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_6ForConditionalGeneration",
+        "Qwen3_6MoeForConditionalGeneration",
+    }
+)
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
@@ -224,9 +236,13 @@ class DefaultModelAdapter(ModelAdapter):
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
-        marked multimodal even when served text-only. Route them through
-        mlx_lm's qwen3_5 text loader so FP8 `*_weight_scale_inv` tensors are
-        consumed correctly instead of failing inside mlx_vlm.load().
+        marked multimodal even when served text-only, and both quantized
+        families diverge under mlx_vlm.load() — FP8 fails on
+        `*_weight_scale_inv` tensors, while MLX affine checkpoints load but,
+        for architectures with no native multimodal adapter, run the bare
+        language model with unset mrope state and generate garbled output.
+        Both route through the mlx_lm text loader instead; MLX-quant
+        wrappers covered by a native adapter keep the multimodal path.
         """
         if hf_config is None:
             return False
@@ -246,7 +262,17 @@ class DefaultModelAdapter(ModelAdapter):
             quant_method = quantization_config.get("quant_method")
         else:
             quant_method = getattr(quantization_config, "quant_method", None)
-        return quant_method == "fp8"
+        if quant_method == "fp8":
+            return True
+        # MLX affine checkpoints carry a top-level `quantization` dict; only
+        # architectures without a native multimodal adapter are force-texted
+        # (see _MLX_QUANT_TEXT_BACKBONE_ARCHITECTURES).
+        if not any(
+            arch in _MLX_QUANT_TEXT_BACKBONE_ARCHITECTURES for arch in architectures
+        ):
+            return False
+        mlx_quantization = getattr(hf_config, "quantization", None)
+        return isinstance(mlx_quantization, dict) and "bits" in mlx_quantization
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.

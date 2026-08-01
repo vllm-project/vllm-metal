@@ -54,6 +54,98 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is True
 
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            # The real pair of the motivating checkpoints
+            # (Qwen3.6-35B-A3B MLX 4-bit, issue #571).
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_conditional_generation_uses_auto_override(
+        self, model_type: str, architecture: str, bits: int
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": bits, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            # The flagship native-multimodal checkpoint family
+            # (mlx-community Qwen3-VL MLX conversions carry the same
+            # top-level quantization dict) must keep the native path.
+            ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
+            # A natively-adapted Qwen3.5 VL wrapper keeps image serving.
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            # An arbitrary non-allowlisted multimodal model.
+            ("llava", "LlavaForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_natively_adapted_arch_skips_auto_override(
+        self, model_type: str, architecture: str
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_multimodal_native_mode_disables_mlx_quant_override(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6MoeForConditionalGeneration"],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_omitted_quantization_key_skips_auto_override(self) -> None:
+        # The common dense-checkpoint case: no `quantization` key at all.
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_non_dict_quantization_value_skips_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+            quantization="int4",
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_quantization_dict_without_bits_skips_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+            quantization={"group_size": 64},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
     def test_qwen35_non_fp8_conditional_generation_skips_auto_override(self) -> None:
         hf_config = SimpleNamespace(
             model_type="qwen3_5",
@@ -302,6 +394,20 @@ class TestNormalizeModelConfig:
                 model_type="qwen3_5",
                 architectures=["Qwen3_5ForConditionalGeneration"],
                 quantization_config={"quant_method": "fp8"},
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_clears_multimodal_config_for_mlx_quant_moe_in_auto_mode(self) -> None:
+        model_config = SimpleNamespace(
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5_moe",
+                architectures=["Qwen3_5MoeForConditionalGeneration"],
+                quantization={"group_size": 64, "bits": 4, "mode": "affine"},
             ),
         )
 
