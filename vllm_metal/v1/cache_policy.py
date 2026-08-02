@@ -656,8 +656,23 @@ class ModelCachePolicy:
             self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
         if self._runner.is_hybrid:
-            return sdpa_kv_bytes + self.linear_cache_bytes_per_slot()
+            return sdpa_kv_bytes + self._linear_spec_bytes_per_slot()
         return sdpa_kv_bytes
+
+    def _linear_spec_bytes_per_slot(self) -> int:
+        """Per-slot linear-state bytes as the reported MambaSpec charges them.
+
+        vLLM admits against the specs this worker reports, and the linear
+        MambaSpec carries ``mamba_page_size_padded`` — an unpadded estimate
+        falls short of that requirement by the padding margin.
+        """
+        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
+        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
+        # this mirror must follow.
+        padded = self._runner.cache_config.mamba_page_size_padded
+        if padded is not None:
+            return self._runner.num_linear_layers * padded
+        return self.linear_cache_bytes_per_slot()
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()

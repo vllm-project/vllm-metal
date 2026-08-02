@@ -162,6 +162,39 @@ class TestOneSequenceKvBytes:
         linear_bytes = 3 * (conv_bytes + recurrent_bytes)
         assert result == sdpa_bytes + linear_bytes
 
+    def test_hybrid_uses_padded_mamba_page_size_when_set(self) -> None:
+        # vLLM checks admission against the reported MambaSpec, whose page
+        # size is padded to align with attention pages. The one-sequence
+        # estimate must count the padded pages, or admission of a max-length
+        # sequence falls short by the padding on every linear layer.
+        padded_page = 4096
+        model_runner = make_stub_runner(
+            model_args={"full_attention_interval": 2},
+            num_sdpa_layers=8,
+            num_kv_heads=4,
+            head_dim=256,
+            kv_cache_dtype=mx.float16,
+            linear_conv_kernel_dim=3,
+            linear_conv_dim=5,
+            linear_num_v_heads=2,
+            linear_value_head_dim=7,
+            linear_key_head_dim=11,
+            num_linear_layers=3,
+            cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
+
+        # Act
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        # Assert — SDPA bytes + padded linear pages (not raw state bytes)
+        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        assert result == sdpa_bytes + 3 * padded_page
+
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner.model_args = {"full_attention_interval": 2}
