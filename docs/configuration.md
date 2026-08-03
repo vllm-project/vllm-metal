@@ -17,6 +17,16 @@
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
 
+## MLX Command-Buffer Defaults
+
+On macOS the plugin defaults `MLX_MAX_OPS_PER_BUFFER` and
+`MLX_MAX_MB_PER_BUFFER` to `2000` via `setdefault`, so a value you export
+yourself always wins; the two limits default independently, so setting
+one keeps the plugin default for the other. MLX's own defaults are sized for small generate
+loops; a vLLM decode step on a large MoE model builds thousands of lazy
+ops per step, and the resulting per-buffer commit overhead slows the step
+submit. `2000` sits on the measured plateau. Outputs are unaffected.
+
 ## Multimodal Serve Modes
 
 - `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.

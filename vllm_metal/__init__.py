@@ -60,6 +60,28 @@ def _apply_macos_defaults() -> None:
     )
 
 
+# MLX splits each lazy evaluation into command buffers after this many ops /
+# this much memory; its defaults suit small generate loops, while a vLLM
+# decode step builds thousands of lazy ops per submit. 2000 sits on the
+# measured plateau, and ``setdefault`` keeps user values authoritative.
+_MLX_BUFFER_ENV_DEFAULTS = {
+    "MLX_MAX_OPS_PER_BUFFER": "2000",
+    "MLX_MAX_MB_PER_BUFFER": "2000",
+}
+
+
+def _apply_mlx_buffer_defaults() -> None:
+    """Default MLX command-buffer limits to decode-step-sized values."""
+    if sys.platform != "darwin":
+        return
+    for name, value in _MLX_BUFFER_ENV_DEFAULTS.items():
+        if name not in os.environ:
+            logger.debug(
+                "Defaulting %s=%s (set it explicitly to override).", name, value
+            )
+        os.environ.setdefault(name, value)
+
+
 # Lazy imports to avoid loading vLLM dependencies when just importing the Rust extension
 def __getattr__(name):
     """Lazy import module components."""
@@ -103,6 +125,7 @@ def _register() -> str | None:
     """
     _configure_logging()
     _apply_macos_defaults()
+    _apply_mlx_buffer_defaults()
 
     # Register our env vars with vLLM's registry so validate_environ()
     # does not warn about unknown VLLM_METAL_* / VLLM_MLX_* variables.
