@@ -35,7 +35,10 @@ class HybridRuntimeStub:
     def gdn_state_manager(self) -> HybridGDNStateManager:
         return self._gdn_state_manager
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
+    ) -> None:
+        del state_block_ids, step_positions
         self._gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
@@ -55,8 +58,10 @@ class ForwardOutputRuntimeStub:
     def needs_step_context(self) -> bool:
         return False
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
-        del req_ids, ctx
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
+    ) -> None:
+        del req_ids, ctx, state_block_ids, step_positions
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         outputs.extend(self._arrays)

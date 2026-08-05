@@ -99,6 +99,10 @@ class GDNPagedStateCache:
         self.pending_recurrent_slot_ids: list[list[int] | None] = [
             None for _ in range(num_layers)
         ]
+        # One mamba-cache-group ordinal per linear layer (all zeros until the
+        # runtime adopts the scheduler's group layout; see
+        # ``set_layer_group_ordinals``).
+        self._layer_group_ordinals: list[int] = [0] * num_layers
         self._eval_state_arrays()
 
     def _conv_shape(self, num_seqs: int) -> tuple[int, int, int]:
@@ -172,6 +176,83 @@ class GDNPagedStateCache:
 
             recurrent = self.recurrent_states[layer_idx]
             recurrent[slot] = mx.zeros_like(recurrent[slot])
+            self.recurrent_states[layer_idx] = recurrent
+
+    def set_layer_group_ordinals(self, ordinals: list[int]) -> None:
+        """Record each linear layer's mamba-cache-group ordinal.
+
+        ``ordinals[cache_idx]`` selects which entry of the context's
+        ``gdn_group_slot_mappings`` addresses that layer's state slabs.
+        Defaults to all zeros (one shared mapping) until the runtime adopts
+        the scheduler's group layout.
+        """
+        if len(ordinals) != self.num_layers:
+            raise ValueError(
+                f"expected one group ordinal per linear layer "
+                f"({self.num_layers}), got {len(ordinals)}"
+            )
+        self._layer_group_ordinals = list(ordinals)
+
+    def layer_group_ordinal(self, cache_idx: int) -> int:
+        """Return the mamba-cache-group ordinal for one linear layer."""
+        return self._layer_group_ordinals[cache_idx]
+
+    def layers_for_group_ordinal(self, ordinal: int) -> list[int]:
+        """Return the cache indices of layers in one mamba cache group."""
+        return [idx for idx, o in enumerate(self._layer_group_ordinals) if o == ordinal]
+
+    def copy_slots(
+        self, src_ids: list[int], dst_ids: list[int], layer_indices: list[int]
+    ) -> None:
+        """Copy state slabs ``src → dst`` for the given layers (batched, lazy).
+
+        Sources are left untouched — align-mode prefix caching relies on a
+        checkpointed block's slab staying immutable once the request advances
+        to its next block.
+        """
+        if not src_ids or not layer_indices:
+            return
+        self.require_allocated_slots(src_ids)
+        self.require_allocated_slots(dst_ids)
+        src = mx.array(src_ids, dtype=mx.int32)
+        dst = mx.array(dst_ids, dtype=mx.int32)
+        for layer_idx in layer_indices:
+            conv = self.conv_states[layer_idx]
+            conv[dst] = conv[src]
+            self.conv_states[layer_idx] = conv
+
+            recurrent = self.recurrent_states[layer_idx]
+            recurrent[dst] = recurrent[src]
+            self.recurrent_states[layer_idx] = recurrent
+
+    def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None:
+        """Zero state slabs for the given layers (batched, lazy).
+
+        Align-mode slabs are addressed by scheduler block id, so a freshly
+        allocated block may carry a previous request's bytes; fresh requests
+        must start from zero state.
+        """
+        if not slot_ids or not layer_indices:
+            return
+        self.require_allocated_slots(slot_ids)
+        ids = mx.array(slot_ids, dtype=mx.int32)
+        # Every layer's pool has the same per-slab shape, so build one zeros
+        # block per pool and reuse it across layers.
+        conv_zeros = mx.zeros(
+            (len(slot_ids),) + self.conv_states[0].shape[1:],
+            dtype=self.conv_states[0].dtype,
+        )
+        recurrent_zeros = mx.zeros(
+            (len(slot_ids),) + self.recurrent_states[0].shape[1:],
+            dtype=self.recurrent_states[0].dtype,
+        )
+        for layer_idx in layer_indices:
+            conv = self.conv_states[layer_idx]
+            conv[ids] = conv_zeros
+            self.conv_states[layer_idx] = conv
+
+            recurrent = self.recurrent_states[layer_idx]
+            recurrent[ids] = recurrent_zeros
             self.recurrent_states[layer_idx] = recurrent
 
     def set_pending_conv_state(

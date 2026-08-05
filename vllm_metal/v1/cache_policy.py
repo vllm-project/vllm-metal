@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.worker.mamba_utils import get_mamba_groups
 
 from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
@@ -531,7 +532,50 @@ class ModelCachePolicy:
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
-        runtime.adopt_scheduler_group(group_index, block_size)
+        # Align mode keys GDN state slabs by scheduler block id.  The engine
+        # stripes same-spec linear layers across several mamba cache groups
+        # (each group hands every request one block-table row), so the runtime
+        # needs all those groups plus each linear layer's group ordinal.  None
+        # mode keeps a private per-request slot pool and ignores the
+        # scheduler's mamba groups.
+        state_group_indices: tuple[int, ...] = ()
+        layer_group_ordinals: list[int] | None = None
+        if self._runner.cache_config.mamba_cache_mode == "align":
+            # Upstream's helper finds the groups by spec type (and asserts
+            # they all share one MambaSpec) — no layer-name inference.
+            mamba_group_ids, _ = get_mamba_groups(kv_cache_config)
+            state_group_indices = tuple(mamba_group_ids)
+            cache_idx_by_name = {
+                f"layers.{layer_idx}.linear_attn": cache_idx
+                for cache_idx, layer_idx in enumerate(
+                    layer_idx
+                    for layer_idx in range(self._runner.num_layers)
+                    if layer_idx not in self._runner.sdpa_layer_indices
+                )
+            }
+            layer_group_ordinals = [-1] * len(cache_idx_by_name)
+            for ordinal, mamba_group_id in enumerate(mamba_group_ids):
+                group = kv_cache_config.kv_cache_groups[mamba_group_id]
+                for layer_name in group.layer_names:
+                    cache_idx = cache_idx_by_name.get(layer_name)
+                    if cache_idx is None:
+                        raise RuntimeError(
+                            f"mamba cache group {mamba_group_id} holds "
+                            f"{layer_name!r}, which is not one of the "
+                            "runner's linear-attention layers"
+                        )
+                    layer_group_ordinals[cache_idx] = ordinal
+            if -1 in layer_group_ordinals:
+                raise RuntimeError(
+                    "scheduler mamba cache groups do not cover every "
+                    "linear-attention layer"
+                )
+        runtime.adopt_scheduler_group(
+            group_index,
+            block_size,
+            state_group_indices=state_group_indices,
+            layer_group_ordinals=layer_group_ordinals,
+        )
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
     def _scheduler_group_indices_for_layers(
@@ -694,6 +738,7 @@ class ModelCachePolicy:
             linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
+            mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
             turboquant=config.turboquant,
             k_quant=config.k_quant if config.turboquant else None,
             v_quant=config.v_quant if config.turboquant else None,
@@ -953,6 +998,11 @@ class WorkerCachePlanner:
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
+        # Align-mode hybrid caching addresses GDN state by scheduler block id:
+        # any pool block can become a mamba state slab, so every planned block
+        # carries the linear-state bytes alongside its SDPA pages (the pool is
+        # fungible; the per-request reservation below stays zero instead).
+        per_block_bytes += self._hybrid_align_state_bytes_per_block()
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
@@ -999,10 +1049,22 @@ class WorkerCachePlanner:
                 f"{plan.format_mitigations()}"
             )
 
+    def _hybrid_align_state_bytes_per_block(self) -> int:
+        """Per-pool-block linear-state bytes under align-mode prefix caching."""
+        runner = self._worker.model_runner
+        if not runner.is_hybrid:
+            return 0
+        if runner.cache_config.mamba_cache_mode != "align":
+            return 0
+        return runner.linear_cache_bytes_per_slot()
+
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
         """Return lazy GDN headroom reserved outside the paged KV pool."""
         runner = self._worker.model_runner
         if not runner.is_hybrid:
+            return _HybridGDNReservation()
+        if runner.cache_config.mamba_cache_mode == "align":
+            # Align mode folds the state pool into per-block sizing above.
             return _HybridGDNReservation()
         max_num_seqs = runner.scheduler_config.max_num_seqs
         if max_num_seqs <= 0:
