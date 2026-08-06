@@ -99,12 +99,8 @@ class GDNPagedStateCache:
         self.pending_recurrent_slot_ids: list[list[int] | None] = [
             None for _ in range(num_layers)
         ]
-        # Scheduler layout, adopted via ``set_layer_layout``.  Until then every
-        # layer is its own pool (the identity layout none mode always keeps):
-        # group ordinal selects the block-table row addressing a layer's
-        # slabs; layers sharing a physical pool alias one stable array, which
-        # is safe because their groups own disjoint block ids (vLLM's
-        # ``kv_cache_tensors.shared_by`` layout).
+        # Scheduler layout, adopted via ``set_layer_layout``; until then every
+        # layer is its own pool (none mode keeps this identity layout).
         self._layer_group_ordinals: list[int] = [0] * num_layers
         self._pool_siblings: list[list[int]] = [[i] for i in range(num_layers)]
         self._canonical_layers: list[int] = list(range(num_layers))
@@ -171,11 +167,9 @@ class GDNPagedStateCache:
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
 
-            # Materialize this pool's grown copy before touching the next one
-            # so each old pool is released as soon as it has been copied: the
-            # transient peak stays ~one pool above the new size instead of
-            # holding every old pool alongside every new pool (the plan
-            # budgets the final size only).
+            # Materialize now so each old pool is released as it is copied;
+            # the transient peak stays ~one pool above the new size (the
+            # plan budgets the final size only).
             mx.eval(conv, recurrent)
             self.store_conv_state(layer_idx, conv)
             self.store_recurrent_state(layer_idx, recurrent)
@@ -209,14 +203,11 @@ class GDNPagedStateCache:
     ) -> None:
         """Adopt the scheduler's layer layout: group + physical pool per layer.
 
-        ``group_ordinals[cache_idx]`` selects which entry of the context's
-        ``gdn_group_slot_mappings`` addresses that layer's slabs;
-        ``pool_ordinals[cache_idx]`` names the physical pool the layer stores
-        state in (vLLM's ``kv_cache_tensors.shared_by``: one pool per
-        within-group position, shared by one layer from each group).  Layers
-        sharing a pool must belong to different groups — their groups then own
-        disjoint block ids, so their slab rows never collide.
-
+        ``group_ordinals[cache_idx]`` selects the block-table row addressing a
+        layer's slabs; ``pool_ordinals[cache_idx]`` names its physical pool
+        (vLLM's ``kv_cache_tensors.shared_by``: one pool per within-group
+        position).  Layers sharing a pool must belong to different groups —
+        their groups then own disjoint block ids, so slab rows never collide.
         Must be called before any state is written (pool arrays are rebuilt).
         """
         if not (len(group_ordinals) == len(pool_ordinals) == self.num_layers):

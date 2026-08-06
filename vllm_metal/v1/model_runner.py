@@ -337,12 +337,10 @@ class MetalModelRunner:
         self._paged_state_group_indices: tuple[int, ...] = ()
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         # req_id → per-mamba-group scheduler block ids; keys GDN state slabs
-        # for hybrid models (empty for runtimes without state groups).
-        # Deliberately not a RequestState field: align-mode populate needs
-        # these ids *before* the forward, and a single-chunk request's
-        # RequestState is only created *after* its forward completes — this
-        # dict is the one store whose lifetime spans admission through
-        # completion for every request shape.
+        # for hybrid models (empty for runtimes without state groups).  Not a
+        # RequestState field: align populate needs these before the forward,
+        # and a single-chunk request's RequestState exists only after it —
+        # this dict spans admission through completion for every shape.
         self._state_block_ids_by_req: dict[str, list[list[int]]] = {}
         self.kv_cache_dtype: mx.Dtype | None = None
 

@@ -2191,25 +2191,13 @@ class TestStateBlockIdLifecycle:
             lora_request=None,
         )
 
-    def test_admission_tracks_mamba_groups_only(self) -> None:
+    def test_admission_tracks_mamba_groups_and_restore_pos(self) -> None:
         runner = self._make_runner()
         batch = mr._ExecutionBatch()
 
         runner._handle_new_requests(
             batch,
-            [self._new_req("r")],
-            SimpleNamespace(num_scheduled_tokens={"r": 2}),
-        )
-
-        assert runner._state_block_ids_by_req["r"] == [[10, 11], [20, 21], [30, 31]]
-
-    def test_prefix_hit_admission_tracks_ids_and_start_pos(self) -> None:
-        runner = self._make_runner()
-        batch = mr._ExecutionBatch()
-
-        runner._handle_new_requests(
-            batch,
-            [self._new_req("hit", num_computed_tokens=2)],
+            [self._new_req("hit", num_computed_tokens=2)],  # prefix-hit admission
             SimpleNamespace(num_scheduled_tokens={"hit": 2}),
         )
 

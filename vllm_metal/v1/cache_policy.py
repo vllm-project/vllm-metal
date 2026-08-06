@@ -56,12 +56,10 @@ logger = init_logger(__name__)
 def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int:
     """Physical GDN state pools under align mode, as the memory plan sees it.
 
-    The engine shares one kv_cache tensor between one layer from each cache
-    group, so a hybrid model gets one state pool per within-group position.
-    Striping yields mamba groups the size of the attention group, hence
-    ``num_sdpa_layers`` pools; layouts that do not divide evenly fall back to
-    one pool per layer so the plan never under-budgets.  The adopted engine
-    layout is validated against this count at install time.
+    Striping yields mamba groups the size of the attention group and one
+    pool per within-group position, hence ``num_sdpa_layers`` pools; layouts
+    that do not divide evenly fall back to one pool per layer so the plan
+    never under-budgets.  Validated against the adopted layout at install.
     """
     if num_sdpa_layers > 0 and num_linear_layers % num_sdpa_layers == 0:
         return num_sdpa_layers
