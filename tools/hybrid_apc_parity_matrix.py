@@ -25,11 +25,21 @@ prefill — is mathematically but not bitwise equal, so downstream greedy
 near-ties may flip (observed: identical top-2 logprobs at the flip).  This
 is the same fp-path caveat as upstream's decode-KV block reuse.
 
+Both children assert reach so the gate cannot silently test the wrong
+thing: the cached child must resolve to align mode with
+``mamba_block_size == block_size`` and must admit at least one request at a
+block-aligned ``num_computed_tokens > 0`` (a genuine restore).
+
+This is the single cache-on/off parity harness;
+``tests/test_hybrid_prefix_caching_e2e.py`` is a thin slow-pytest wrapper
+around ``--quick``.
+
 Not in CI — requires local model weights.
 
 Usage:
     python tools/hybrid_apc_parity_matrix.py
     python tools/hybrid_apc_parity_matrix.py --model /path/to/Qwen3.5-0.8B
+    python tools/hybrid_apc_parity_matrix.py --quick           # pytest gate
     python tools/hybrid_apc_parity_matrix.py --shared-corpus   # tie-level demo
 """
 
@@ -74,16 +84,24 @@ def _child_env() -> None:
         os.environ.setdefault(key, val)
 
 
-def build_cases(tok, block_size: int, shared_corpus: bool):
+def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
     ids_edge = tok(CORPUS_A)["input_ids"]
     ids_hit = ids_edge if shared_corpus else tok(CORPUS_B)["input_ids"]
     assert min(len(ids_edge), len(ids_hit)) > 3 * block_size + 64
 
     singles: list[tuple[str, list[int]]] = []
-    for k in (1, 2, 3):
+    for k in (1,) if quick else (1, 2, 3):
         for d in (-1, 0, 1):
             singles.append((f"edge_k{k}{d:+d}", ids_edge[: k * block_size + d]))
-    for depth_name, depth in (("1B", block_size), ("2B", 2 * block_size)):
+    depths = (
+        (("1B", block_size),)
+        if quick
+        else (
+            ("1B", block_size),
+            ("2B", 2 * block_size),
+        )
+    )
+    for depth_name, depth in depths:
         prefix = ids_hit[:depth]
         for i, suffix in enumerate(SUFFIXES):
             sids = tok(suffix, add_special_tokens=False)["input_ids"]
@@ -103,47 +121,71 @@ def build_cases(tok, block_size: int, shared_corpus: bool):
     return singles, batch
 
 
-def run_child(model, enable_prefix_caching, mnbt, shared_corpus, queue):
+def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
     _child_env()
     from vllm import LLM, SamplingParams
 
-    kwargs = {
-        "model": model,
-        "max_model_len": 2048,
-        "max_num_seqs": 4,
-        "enable_prefix_caching": enable_prefix_caching,
-    }
-    if mnbt is not None:
-        kwargs["max_num_batched_tokens"] = mnbt
-        kwargs["enable_chunked_prefill"] = True
-    llm = LLM(**kwargs)
-    cache_config = llm.llm_engine.vllm_config.cache_config
-    expected_mode = "align" if enable_prefix_caching else "none"
-    assert cache_config.mamba_cache_mode == expected_mode
-    block_size = cache_config.block_size
+    import vllm_metal.v1.model_runner as mr_mod
 
-    tok = llm.get_tokenizer()
-    singles, batch = build_cases(tok, block_size, shared_corpus)
-    sp = SamplingParams(temperature=0, max_tokens=24)
+    # Reach spy: record every admission's num_computed_tokens so the cached
+    # arm can prove a genuine block-aligned restore happened (not just a
+    # config that silently fell back to the none path).
+    admissions: list[int] = []
+    orig = mr_mod.MetalModelRunner._handle_new_requests
 
-    results: dict[str, list[int]] = {}
-    for rnd in (1, 2):
-        for tag, token_ids in singles:
-            out = llm.generate([{"prompt_token_ids": token_ids}], sp)[0]
-            results[f"{tag}/r{rnd}"] = list(out.outputs[0].token_ids)
-    outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
-    for (tag, _), out in zip(batch, outs, strict=True):
-        results[f"{tag}/batched"] = list(out.outputs[0].token_ids)
+    def spy(self, batch, new_reqs, scheduler_output):
+        admissions.extend(req.num_computed_tokens for req in new_reqs)
+        return orig(self, batch, new_reqs, scheduler_output)
+
+    mr_mod.MetalModelRunner._handle_new_requests = spy
+    try:
+        kwargs = {
+            "model": model,
+            "max_model_len": 2048,
+            "max_num_seqs": 4,
+            "enable_prefix_caching": enable_prefix_caching,
+        }
+        if mnbt is not None:
+            kwargs["max_num_batched_tokens"] = mnbt
+            kwargs["enable_chunked_prefill"] = True
+        llm = LLM(**kwargs)
+        cache_config = llm.llm_engine.vllm_config.cache_config
+        expected_mode = "align" if enable_prefix_caching else "none"
+        assert cache_config.mamba_cache_mode == expected_mode
+        if enable_prefix_caching:
+            assert cache_config.mamba_block_size == cache_config.block_size
+        block_size = cache_config.block_size
+
+        tok = llm.get_tokenizer()
+        singles, batch = build_cases(tok, block_size, shared_corpus, quick)
+        sp = SamplingParams(temperature=0, max_tokens=24)
+
+        results: dict[str, list[int]] = {}
+        for rnd in (1, 2):
+            for tag, token_ids in singles:
+                out = llm.generate([{"prompt_token_ids": token_ids}], sp)[0]
+                results[f"{tag}/r{rnd}"] = list(out.outputs[0].token_ids)
+        outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
+        for (tag, _), out in zip(batch, outs, strict=True):
+            results[f"{tag}/batched"] = list(out.outputs[0].token_ids)
+    finally:
+        mr_mod.MetalModelRunner._handle_new_requests = orig
+
+    if enable_prefix_caching:
+        hits = [n for n in admissions if n > 0]
+        assert hits and any(n % block_size == 0 for n in hits), (
+            f"cached arm admitted no block-aligned restore: {admissions}"
+        )
     queue.put(results)
 
 
-def run_pair(model, mnbt, shared_corpus):
+def run_pair(model, mnbt, shared_corpus, quick=False):
     ctx = mp.get_context("spawn")
     per_mode: dict[bool, dict[str, list[int]]] = {}
     for enable in (False, True):
         queue = ctx.Queue()
         proc = ctx.Process(
-            target=run_child, args=(model, enable, mnbt, shared_corpus, queue)
+            target=run_child, args=(model, enable, mnbt, shared_corpus, quick, queue)
         )
         proc.start()
         try:
@@ -172,11 +214,20 @@ def main() -> int:
         help="use one corpus for edge and hit cases (reproduces the "
         "documented decode-completed-checkpoint tie-level divergence)",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="reduced gate for the slow pytest wrapper: defaults arm only, "
+        "1-block edges and 1-block-depth hits",
+    )
     args = parser.parse_args()
 
+    arms = (("defaults", None),)
+    if not args.quick:
+        arms = (("defaults", None), ("mnbt1088", 1088))
     failed = False
-    for arm_name, mnbt in (("defaults", None), ("mnbt1088", 1088)):
-        n_cases, mismatches = run_pair(args.model, mnbt, args.shared_corpus)
+    for arm_name, mnbt in arms:
+        n_cases, mismatches = run_pair(args.model, mnbt, args.shared_corpus, args.quick)
         failed = failed or bool(mismatches)
         print(
             f"[{arm_name}] {n_cases} comparisons, {len(mismatches)} mismatches",
