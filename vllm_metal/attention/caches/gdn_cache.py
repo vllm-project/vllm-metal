@@ -165,16 +165,22 @@ class GDNPagedStateCache:
             conv = mx.zeros(self._conv_shape(num_seqs), dtype=self.dtype)
             if old_allocated:
                 conv[:old_allocated] = old_conv
-            self.store_conv_state(layer_idx, conv)
 
             old_recurrent = self.recurrent_states[layer_idx]
             recurrent = mx.zeros(self._recurrent_shape(num_seqs), dtype=mx.float32)
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
+
+            # Materialize this pool's grown copy before touching the next one
+            # so each old pool is released as soon as it has been copied: the
+            # transient peak stays ~one pool above the new size instead of
+            # holding every old pool alongside every new pool (the plan
+            # budgets the final size only).
+            mx.eval(conv, recurrent)
+            self.store_conv_state(layer_idx, conv)
             self.store_recurrent_state(layer_idx, recurrent)
 
         self.allocated_seqs = num_seqs
-        self._eval_state_arrays()
 
     def require_allocated_slots(self, slot_ids: list[int]) -> None:
         """Validate slots against both the scheduler cap and allocated rows."""

@@ -131,6 +131,40 @@ class TestAlignGDNStateManager:
         conv, _ = _slab(cache, 0, 3)  # group 1's checkpoint intact in the pool
         np.testing.assert_array_equal(conv, 8.0)
 
+    def test_ensure_capacity_releases_old_pools_while_growing(self) -> None:
+        # Growing 32 -> 64 slots across 8 pools must not hold every old pool
+        # alongside every new pool: the memory plan budgets the final size
+        # only, so the transient peak stays within a few pools of it.
+        cache = GDNPagedStateCache(
+            num_layers=8,
+            max_seqs=64,
+            conv_kernel_dim=2,
+            conv_dim=64,
+            num_v_heads=4,
+            value_head_dim=64,
+            key_head_dim=128,
+            initial_seqs=32,
+            dtype=mx.float32,
+        )
+        _fill_slab(cache, 0, 3, 5.0)
+        per_slab = (4 * 64 * 128 + 64) * 4  # recurrent + conv bytes, fp32
+        new_total = 8 * 64 * per_slab
+        old_pool = 32 * per_slab
+        active_before = mx.get_active_memory()
+        mx.reset_peak_memory()
+
+        cache.ensure_capacity(64)
+
+        peak_delta = mx.get_peak_memory() - active_before
+        assert peak_delta < new_total + 3 * old_pool, (
+            f"transient growth peak {peak_delta} exceeds final size "
+            f"{new_total} plus headroom; old pools are not being released"
+        )
+        assert cache.allocated_seqs == 64
+        conv, rec = _slab(cache, 0, 3)
+        np.testing.assert_array_equal(conv, 5.0)
+        np.testing.assert_array_equal(rec, 5.0)
+
     def test_pool_materializes_lazily_by_high_water_block_id(self) -> None:
         cache = _make_cache(num_blocks=8, initial_blocks=2)
         manager = AlignGDNStateManager(cache, BLOCK)
