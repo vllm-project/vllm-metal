@@ -2162,3 +2162,129 @@ class TestDummyForwardOutputsPPRouting:
         assert evaled == [hidden]  # eval saw exactly the stage-shaped output
         assert overhead == 80
         assert limits == [80]
+
+
+class TestStateBlockIdLifecycle:
+    """Fast coverage for the mamba block-id tracking the align runtime keys on.
+
+    Each test drives the real runner method for one lifecycle transition and
+    asserts _state_block_ids_by_req holds exactly the mamba groups' rows
+    (state groups (0, 1, 2); group 3 is the attention group).
+    """
+
+    def _make_runner(self) -> mr.MetalModelRunner:
+        return make_stub_runner(
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_scheduler_group_indices=(3,),
+            _paged_state_group_indices=(0, 1, 2),
+        )
+
+    def _new_req(self, req_id: str, *, num_computed_tokens: int = 0) -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=[1, 2, 3, 4, 5, 6],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11], [20, 21], [30, 31], [40, 41]),
+            num_computed_tokens=num_computed_tokens,
+            lora_request=None,
+        )
+
+    def test_admission_tracks_mamba_groups_only(self) -> None:
+        runner = self._make_runner()
+        batch = mr._ExecutionBatch()
+
+        runner._handle_new_requests(
+            batch,
+            [self._new_req("r")],
+            SimpleNamespace(num_scheduled_tokens={"r": 2}),
+        )
+
+        assert runner._state_block_ids_by_req["r"] == [[10, 11], [20, 21], [30, 31]]
+
+    def test_prefix_hit_admission_tracks_ids_and_start_pos(self) -> None:
+        runner = self._make_runner()
+        batch = mr._ExecutionBatch()
+
+        runner._handle_new_requests(
+            batch,
+            [self._new_req("hit", num_computed_tokens=2)],
+            SimpleNamespace(num_scheduled_tokens={"hit": 2}),
+        )
+
+        assert runner._state_block_ids_by_req["hit"] == [
+            [10, 11],
+            [20, 21],
+            [30, 31],
+        ]
+        entry = batch.paged_prefill_entries[0]
+        assert entry.prefill.start_pos == 2  # restore position, not zero
+
+    def test_cached_append_extends_every_mamba_group(self) -> None:
+        runner = self._make_runner()
+        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            block_ids=[[40]],
+        )
+
+        runner._update_cached_request_blocks(
+            CachedRequestData(
+                req_ids=["r"],
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[([12], [22], [32], [42])],
+                num_computed_tokens=[1],
+                num_output_tokens=[0],
+            )
+        )
+
+        assert runner._state_block_ids_by_req["r"] == [[10, 12], [20, 22], [30, 32]]
+        assert runner._request_states["r"].block_ids == [[40, 42]]
+
+    def test_resume_replaces_the_whole_table(self) -> None:
+        runner = self._make_runner()
+        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            block_ids=[[40]],
+        )
+
+        runner._update_cached_request_blocks(
+            CachedRequestData(
+                req_ids=["r"],
+                resumed_req_ids={"r"},
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[([50], [60], [70], [80])],
+                num_computed_tokens=[0],
+                num_output_tokens=[0],
+            )
+        )
+
+        assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
+        assert runner._request_states["r"].block_ids == [[80]]
+
+    def test_finish_drops_tracking(self) -> None:
+        runner = self._make_runner()
+        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            block_ids=[[40]],
+        )
+        runner._paged_request_seq_lens["r"] = 1
+
+        runner._reconcile_request_lifecycle({"r"}, materialize_runtime_state=False)
+
+        assert "r" not in runner._state_block_ids_by_req
