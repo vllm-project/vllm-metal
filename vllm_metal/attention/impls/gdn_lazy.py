@@ -285,7 +285,7 @@ class GDNLazyKernels:
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
         state_pool[slot_ids_arr] = conv_state_updates
-        state_cache.conv_states[cache_idx] = state_pool
+        state_cache.store_conv_state(cache_idx, state_pool)
         if state_view.uses_compact_state:
             state_cache.clear_pending_conv_state(cache_idx)
         return conv_silu_out.reshape(1, total_tokens, conv_dim)
@@ -413,7 +413,7 @@ class GDNLazyKernels:
             output_dtypes=[request.output_dtype, mx.float32],
         )
         state_pool[slot_ids_arr] = state_updates
-        state_cache.recurrent_states[request.cache_idx] = state_pool
+        state_cache.store_recurrent_state(request.cache_idx, state_pool)
         if state_view.uses_compact_state:
             state_cache.clear_pending_recurrent_state(request.cache_idx)
         return y_out
@@ -499,7 +499,7 @@ class GDNLazyKernels:
             state_in[slot_ids_arr] = state_updates
             if request.materialize_outputs:
                 state_in = mx.contiguous(state_in)
-            request.state_cache.recurrent_states[request.cache_idx] = state_in
+            request.state_cache.store_recurrent_state(request.cache_idx, state_in)
             state_to_materialize = state_in
         y_out = _astype_if_needed(y_out, request.output_dtype)
         if request.materialize_outputs:

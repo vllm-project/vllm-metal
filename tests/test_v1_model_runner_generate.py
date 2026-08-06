@@ -1560,8 +1560,10 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._submit_paged_forward_outputs(logits)
 
         assert len(submitted) == 1
-        assert submitted[0][1] is pending_conv
-        assert submitted[0][2] is pending_recurrent
+        # Pending compact updates ride the submission; stable pool arrays may
+        # accompany them (shared pools carry sibling layers' state).
+        assert any(a is pending_conv for a in submitted[0])
+        assert any(a is pending_recurrent for a in submitted[0])
         assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 

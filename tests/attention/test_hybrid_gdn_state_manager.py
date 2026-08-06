@@ -88,8 +88,10 @@ class TestHybridGDNStateManager:
         manager.extend_forward_eval_outputs(outputs)
 
         assert outputs[0] is logits
-        assert outputs[1] is cache.pending_conv_states[0]
-        assert outputs[2] is cache.pending_recurrent_states[0]
+        # Pending compact updates ride the submission; stable pool arrays may
+        # accompany them (shared pools carry sibling layers' state).
+        assert any(a is cache.pending_conv_states[0] for a in outputs[1:])
+        assert any(a is cache.pending_recurrent_states[0] for a in outputs[1:])
 
     def test_release_requests_applies_pending_states_before_reuse(self) -> None:
         cache = GDNPagedStateCache(

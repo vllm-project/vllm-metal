@@ -99,10 +99,15 @@ class GDNPagedStateCache:
         self.pending_recurrent_slot_ids: list[list[int] | None] = [
             None for _ in range(num_layers)
         ]
-        # One mamba-cache-group ordinal per linear layer (all zeros until the
-        # runtime adopts the scheduler's group layout; see
-        # ``set_layer_group_ordinals``).
+        # Scheduler layout, adopted via ``set_layer_layout``.  Until then every
+        # layer is its own pool (the identity layout none mode always keeps):
+        # group ordinal selects the block-table row addressing a layer's
+        # slabs; layers sharing a physical pool alias one stable array, which
+        # is safe because their groups own disjoint block ids (vLLM's
+        # ``kv_cache_tensors.shared_by`` layout).
         self._layer_group_ordinals: list[int] = [0] * num_layers
+        self._pool_siblings: list[list[int]] = [[i] for i in range(num_layers)]
+        self._canonical_layers: list[int] = list(range(num_layers))
         self._eval_state_arrays()
 
     def _conv_shape(self, num_seqs: int) -> tuple[int, int, int]:
@@ -117,9 +122,28 @@ class GDNPagedStateCache:
         )
 
     def _eval_state_arrays(self) -> None:
-        arrays = [*self.conv_states, *self.recurrent_states]
+        arrays = [
+            array
+            for layer_idx in self._canonical_layers
+            for array in (self.conv_states[layer_idx], self.recurrent_states[layer_idx])
+        ]
         if arrays:
             mx.eval(*arrays)
+
+    @property
+    def num_state_pools(self) -> int:
+        """Number of distinct physical state pools under the adopted layout."""
+        return len(self._canonical_layers)
+
+    def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
+        """Store a layer's updated conv pool, keeping pool siblings aliased."""
+        for sibling in self._pool_siblings[layer_idx]:
+            self.conv_states[sibling] = array
+
+    def store_recurrent_state(self, layer_idx: int, array: mx.array) -> None:
+        """Store a layer's updated recurrent pool, keeping siblings aliased."""
+        for sibling in self._pool_siblings[layer_idx]:
+            self.recurrent_states[sibling] = array
 
     def ensure_capacity(self, num_seqs: int) -> None:
         """Grow stable state pools so slots ``[0, num_seqs)`` are valid."""
@@ -136,23 +160,19 @@ class GDNPagedStateCache:
         self.apply_pending_states()
         old_allocated = self.allocated_seqs
 
-        conv_states: list[mx.array] = []
-        recurrent_states: list[mx.array] = []
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self._canonical_layers:
             old_conv = self.conv_states[layer_idx]
             conv = mx.zeros(self._conv_shape(num_seqs), dtype=self.dtype)
             if old_allocated:
                 conv[:old_allocated] = old_conv
-            conv_states.append(conv)
+            self.store_conv_state(layer_idx, conv)
 
             old_recurrent = self.recurrent_states[layer_idx]
             recurrent = mx.zeros(self._recurrent_shape(num_seqs), dtype=mx.float32)
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
-            recurrent_states.append(recurrent)
+            self.store_recurrent_state(layer_idx, recurrent)
 
-        self.conv_states = conv_states
-        self.recurrent_states = recurrent_states
         self.allocated_seqs = num_seqs
         self._eval_state_arrays()
 
@@ -169,29 +189,64 @@ class GDNPagedStateCache:
         """Clear state for one allocated slot before it is reused."""
         self.require_allocated_slots([slot])
         self.apply_pending_states()
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self._canonical_layers:
             conv = self.conv_states[layer_idx]
             conv[slot] = mx.zeros_like(conv[slot])
-            self.conv_states[layer_idx] = conv
+            self.store_conv_state(layer_idx, conv)
 
             recurrent = self.recurrent_states[layer_idx]
             recurrent[slot] = mx.zeros_like(recurrent[slot])
-            self.recurrent_states[layer_idx] = recurrent
+            self.store_recurrent_state(layer_idx, recurrent)
 
-    def set_layer_group_ordinals(self, ordinals: list[int]) -> None:
-        """Record each linear layer's mamba-cache-group ordinal.
+    def set_layer_layout(
+        self, group_ordinals: list[int], pool_ordinals: list[int]
+    ) -> None:
+        """Adopt the scheduler's layer layout: group + physical pool per layer.
 
-        ``ordinals[cache_idx]`` selects which entry of the context's
-        ``gdn_group_slot_mappings`` addresses that layer's state slabs.
-        Defaults to all zeros (one shared mapping) until the runtime adopts
-        the scheduler's group layout.
+        ``group_ordinals[cache_idx]`` selects which entry of the context's
+        ``gdn_group_slot_mappings`` addresses that layer's slabs;
+        ``pool_ordinals[cache_idx]`` names the physical pool the layer stores
+        state in (vLLM's ``kv_cache_tensors.shared_by``: one pool per
+        within-group position, shared by one layer from each group).  Layers
+        sharing a pool must belong to different groups — their groups then own
+        disjoint block ids, so their slab rows never collide.
+
+        Must be called before any state is written (pool arrays are rebuilt).
         """
-        if len(ordinals) != self.num_layers:
+        if not (len(group_ordinals) == len(pool_ordinals) == self.num_layers):
             raise ValueError(
-                f"expected one group ordinal per linear layer "
-                f"({self.num_layers}), got {len(ordinals)}"
+                f"expected one group and one pool ordinal per linear layer "
+                f"({self.num_layers}), got {len(group_ordinals)}/"
+                f"{len(pool_ordinals)}"
             )
-        self._layer_group_ordinals = list(ordinals)
+        pool_members: dict[int, list[int]] = {}
+        for layer_idx, pool in enumerate(pool_ordinals):
+            pool_members.setdefault(pool, []).append(layer_idx)
+        for pool, members in pool_members.items():
+            groups = [group_ordinals[i] for i in members]
+            if len(set(groups)) != len(groups):
+                raise ValueError(
+                    f"state pool {pool} is shared by two layers of the same "
+                    f"mamba cache group (layers {members}); their slab rows "
+                    "would collide"
+                )
+        if any(
+            self.pending_conv_states[i] is not None
+            or self.pending_recurrent_states[i] is not None
+            for i in range(self.num_layers)
+        ):
+            raise RuntimeError("set_layer_layout() called with pending state")
+
+        self._layer_group_ordinals = list(group_ordinals)
+        self._pool_siblings = [pool_members[pool] for pool in pool_ordinals]
+        self._canonical_layers = sorted(members[0] for members in pool_members.values())
+        # Rebuild storage so pool siblings alias one array.  Pre-adopt state
+        # is all zeros, so aliasing to the canonical member's array is exact.
+        for members in pool_members.values():
+            canonical = members[0]
+            for layer_idx in members:
+                self.conv_states[layer_idx] = self.conv_states[canonical]
+                self.recurrent_states[layer_idx] = self.recurrent_states[canonical]
 
     def layer_group_ordinal(self, cache_idx: int) -> int:
         """Return the mamba-cache-group ordinal for one linear layer."""
@@ -219,11 +274,11 @@ class GDNPagedStateCache:
         for layer_idx in layer_indices:
             conv = self.conv_states[layer_idx]
             conv[dst] = conv[src]
-            self.conv_states[layer_idx] = conv
+            self.store_conv_state(layer_idx, conv)
 
             recurrent = self.recurrent_states[layer_idx]
             recurrent[dst] = recurrent[src]
-            self.recurrent_states[layer_idx] = recurrent
+            self.store_recurrent_state(layer_idx, recurrent)
 
     def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None:
         """Zero state slabs for the given layers (batched, lazy).
@@ -249,11 +304,11 @@ class GDNPagedStateCache:
         for layer_idx in layer_indices:
             conv = self.conv_states[layer_idx]
             conv[ids] = conv_zeros
-            self.conv_states[layer_idx] = conv
+            self.store_conv_state(layer_idx, conv)
 
             recurrent = self.recurrent_states[layer_idx]
             recurrent[ids] = recurrent_zeros
-            self.recurrent_states[layer_idx] = recurrent
+            self.store_recurrent_state(layer_idx, recurrent)
 
     def set_pending_conv_state(
         self, layer_idx: int, slot_ids: list[int], state_updates: mx.array
@@ -378,16 +433,16 @@ class GDNPagedStateCache:
         return self.pending_recurrent_states[layer_idx] is not None
 
     def updated_state_arrays(self) -> list[mx.array]:
-        """Return the minimal GDN state arrays to submit after a forward."""
-        arrays = [
-            self.updated_conv_state_array(layer_idx)
-            for layer_idx in range(self.num_layers)
-        ]
-        for layer_idx, recurrent_state in enumerate(self.recurrent_states):
-            pending_state = self.pending_recurrent_states[layer_idx]
-            arrays.append(
-                pending_state if pending_state is not None else recurrent_state
-            )
+        """Return the GDN state arrays to submit after a forward.
+
+        One entry per physical pool plus any pending compact updates — with
+        shared pools a stable array carries several layers' state, so it is
+        submitted even when one of its layers also has a pending update.
+        """
+        arrays = [self.conv_states[i] for i in self._canonical_layers]
+        arrays.extend(p for p in self.pending_conv_states if p is not None)
+        arrays.extend(self.recurrent_states[i] for i in self._canonical_layers)
+        arrays.extend(p for p in self.pending_recurrent_states if p is not None)
         return arrays
 
     def apply_pending_conv_state(self, layer_idx: int) -> None:
@@ -401,7 +456,7 @@ class GDNPagedStateCache:
         slot_ids_arr = mx.array(pending_slots, dtype=mx.int32)
         conv_state = self.conv_states[layer_idx]
         conv_state[slot_ids_arr] = pending_state
-        self.conv_states[layer_idx] = conv_state
+        self.store_conv_state(layer_idx, conv_state)
         self.clear_pending_conv_state(layer_idx)
 
     def apply_pending_conv_states(self) -> None:
@@ -420,7 +475,7 @@ class GDNPagedStateCache:
         slot_ids_arr = mx.array(pending_slots, dtype=mx.int32)
         recurrent_state = self.recurrent_states[layer_idx]
         recurrent_state[slot_ids_arr] = pending_state
-        self.recurrent_states[layer_idx] = recurrent_state
+        self.store_recurrent_state(layer_idx, recurrent_state)
         self.clear_pending_recurrent_state(layer_idx)
 
     def apply_pending_recurrent_states(self) -> None:

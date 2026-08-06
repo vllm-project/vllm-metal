@@ -33,10 +33,10 @@ def _make_cache(
 def _fill_slab(cache: GDNPagedStateCache, layer: int, slab: int, value: float) -> None:
     conv = cache.conv_states[layer]
     conv[slab] = value
-    cache.conv_states[layer] = conv
+    cache.store_conv_state(layer, conv)
     rec = cache.recurrent_states[layer]
     rec[slab] = value
-    cache.recurrent_states[layer] = rec
+    cache.store_recurrent_state(layer, rec)
     mx.eval(cache.conv_states[layer], cache.recurrent_states[layer])
 
 
@@ -109,9 +109,13 @@ class TestAlignGDNStateManager:
         np.testing.assert_array_equal(conv, 5.0)
         np.testing.assert_array_equal(rec, 5.0)
 
-    def test_striped_groups_move_only_their_layers(self) -> None:
+    def test_striped_groups_share_one_pool_without_colliding(self) -> None:
+        # Two layers from different groups sharing one physical pool, the
+        # layout kv_cache_tensors.shared_by produces: each group's motion
+        # must touch only its own block rows of the shared array.
         cache = _make_cache(num_layers=2)
-        cache.set_layer_group_ordinals([0, 1])  # layer 0 → group 0, layer 1 → group 1
+        cache.set_layer_layout([0, 1], [0, 0])
+        assert cache.num_state_pools == 1
         manager = AlignGDNStateManager(cache, BLOCK)
         _fill_slab(cache, 0, 2, 5.0)
         _fill_slab(cache, 1, 3, 8.0)
@@ -121,11 +125,11 @@ class TestAlignGDNStateManager:
 
         assert ctx.gdn_group_slot_mappings == ([6], [7])
         conv, _ = _slab(cache, 0, 6)
-        np.testing.assert_array_equal(conv, 5.0)  # layer 0 moved via group 0 ids
+        np.testing.assert_array_equal(conv, 5.0)  # group 0 moved its rows
         conv, _ = _slab(cache, 1, 7)
-        np.testing.assert_array_equal(conv, 8.0)  # layer 1 moved via group 1 ids
-        conv, _ = _slab(cache, 0, 7)  # layer 0 untouched by group 1 motion
-        np.testing.assert_array_equal(conv, 0.0)
+        np.testing.assert_array_equal(conv, 8.0)  # group 1 moved its rows
+        conv, _ = _slab(cache, 0, 3)  # group 1's checkpoint intact in the pool
+        np.testing.assert_array_equal(conv, 8.0)
 
     def test_pool_materializes_lazily_by_high_water_block_id(self) -> None:
         cache = _make_cache(num_blocks=8, initial_blocks=2)

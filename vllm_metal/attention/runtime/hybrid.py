@@ -203,6 +203,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         *,
         state_group_indices: tuple[int, ...] = (),
         layer_group_ordinals: list[int] | None = None,
+        layer_pool_ordinals: list[int] | None = None,
     ) -> None:
         """Select the vLLM scheduler groups backing this runtime.
 
@@ -211,7 +212,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         block ids key the GDN recurrent state slabs;
         ``layer_group_ordinals[cache_idx]`` records which of those groups
         each linear layer belongs to (the engine stripes same-spec layers
-        across several groups).
+        across several groups) and ``layer_pool_ordinals[cache_idx]`` which
+        physical state pool it shares (one pool per within-group position,
+        following ``kv_cache_tensors.shared_by``).
         """
         self._require_initialized("adopt_scheduler_group")
         if block_size != self._block_size:
@@ -223,7 +226,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._group_block_sizes = (block_size,)
         self._state_group_indices = tuple(state_group_indices)
         if layer_group_ordinals is not None:
-            self.state_cache.set_layer_group_ordinals(layer_group_ordinals)
+            pool_ordinals = (
+                layer_pool_ordinals
+                if layer_pool_ordinals is not None
+                else list(range(len(layer_group_ordinals)))
+            )
+            self.state_cache.set_layer_layout(layer_group_ordinals, pool_ordinals)
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by SDPA layers."""
