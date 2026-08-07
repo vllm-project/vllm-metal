@@ -162,6 +162,18 @@ class SamplingBatch:
 
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
+        return self.params_allow_native_greedy(self.sampling_params_list)
+
+    @staticmethod
+    def params_allow_native_greedy(
+        sampling_params_list: Sequence[SamplingParams],
+    ) -> bool:
+        """Whether MLX argmax matches *sampling_params_list* exactly.
+
+        Single source of truth for the native-greedy decision so callers that
+        gate before constructing a :class:`SamplingBatch` (e.g. the decode
+        pipeline) cannot drift from the sampling-time check.
+        """
         return all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             and sampling_params.top_k <= 0
@@ -172,7 +184,7 @@ class SamplingBatch:
             and sampling_params.logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
-            for sampling_params in self.sampling_params_list
+            for sampling_params in sampling_params_list
         )
 
     def _make_temperature(self) -> torch.Tensor | None:
@@ -322,9 +334,13 @@ class SamplingBatch:
 # ---------------------------------------------------------------------------
 
 
-def _mlx_greedy_sample(logits: mx.array) -> mx.array:
-    """Native MLX greedy sampling — avoids PyTorch round-trip."""
-    return mx.argmax(logits, axis=-1)
+def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
+    """Lazy native-greedy token ids for pre-sliced 2D logits.
+
+    Pure graph construction — callers own evaluation, which lets the decode
+    pipeline submit the argmax asynchronously and defer the sync one step.
+    """
+    return mx.argmax(logits_2d, axis=-1)
 
 
 def sample_from_logits(
@@ -341,7 +357,7 @@ def sample_from_logits(
     satisfy the OpenAI serving contract.
     """
     if batch.can_use_native_greedy() and not batch.needs_logprobs:
-        tokens = _mlx_greedy_sample(logits_2d)
+        tokens = mlx_greedy_tokens(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
             return _SamplingResult([int(tokens.item())])

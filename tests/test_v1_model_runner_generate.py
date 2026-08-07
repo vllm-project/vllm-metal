@@ -11,7 +11,12 @@ import pytest
 import torch
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    GrammarOutput,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.v1.model_runner as mr
@@ -23,6 +28,7 @@ from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
+from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 
 class HybridRuntimeStub:
@@ -344,6 +350,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
     def _make_gemma4_mtp_config(self) -> SimpleNamespace:
         return SimpleNamespace(
+            parallel_config=SimpleNamespace(distributed_executor_backend=None),
             speculative_config=SimpleNamespace(
                 method="mtp",
                 draft_model_config=SimpleNamespace(
@@ -352,7 +359,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
                         architectures=["Gemma4AssistantForCausalLM"],
                     )
                 ),
-            )
+            ),
         )
 
     def _make_grammar_output(
@@ -1526,6 +1533,7 @@ class TestV1MetalModelRunnerExecuteModel:
         runner = self._make_runner()
         runner.use_async_scheduling = True
         runner.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(distributed_executor_backend=None),
             speculative_config=SimpleNamespace(
                 method="mtp",
                 draft_model_config=SimpleNamespace(
@@ -1534,7 +1542,7 @@ class TestV1MetalModelRunnerExecuteModel:
                         architectures=["Gemma4AssistantForCausalLM"],
                     )
                 ),
-            )
+            ),
         )
         scheduler_output = self._make_scheduler_output(
             scheduled_new_reqs=[self._make_new_request()]
@@ -2189,3 +2197,490 @@ class TestDummyForwardOutputsPPRouting:
         assert evaled == [hidden]  # eval saw exactly the stage-shaped output
         assert overhead == 80
         assert limits == [80]
+
+
+class TestPipelineGateSpecDecodeDerivation:
+    """Runner-side gate derivation: spec decode disables the pipeline."""
+
+    def _runner(self, drafter: object | None = None) -> mr.MetalModelRunner:
+        runner = make_stub_runner()
+        runner._drafter = drafter
+        runner._paged_attention_runtime = object()
+        return runner
+
+    def _scheduler_output(
+        self, scheduled_spec_decode_tokens: dict[str, list[int]]
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=0,
+        )
+
+    def _cached_decode_output(self, req_id: str) -> SchedulerOutput:
+        cached = CachedRequestData(
+            req_ids=[req_id],
+            resumed_req_ids=set(),
+            new_token_ids=[[7]],
+            all_token_ids={req_id: [1, 7]},
+            new_block_ids=[None],
+            num_computed_tokens=[1],
+            num_output_tokens=[1],
+        )
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached,
+            num_scheduled_tokens={req_id: 1},
+            total_num_scheduled_tokens=1,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=0,
+        )
+
+    def test_prompt_logprobs_request_disables_pipeline(self) -> None:
+        # Arrange — a decode-phase request asking for prompt logprobs must
+        # keep the synchronous sample path (logprobs need eager logits).
+        runner = self._runner(drafter=None)
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=[1, 7],
+                prompt_len=1,
+                cache=[],
+                sampling_params=SamplingParams(temperature=0.0, prompt_logprobs=5),
+                generator=None,
+                generated_tokens=1,
+            )
+        }
+        scheduler_output = self._cached_decode_output("r0")
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "prompt logprobs requested"
+
+    def test_clean_decode_step_is_eligible(self) -> None:
+        # Arrange
+        runner = self._runner(drafter=None)
+        scheduler_output = self._scheduler_output({})
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is True
+        assert decision.reason == "eligible"
+
+    def test_multiproc_executor_backend_disables_pipeline(self) -> None:
+        # Arrange — the mp executor resolves async outputs on another
+        # thread; the pipeline's pending state is single-threaded.
+        runner = self._runner(drafter=None)
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=None,
+            parallel_config=SimpleNamespace(distributed_executor_backend="mp"),
+        )
+        scheduler_output = self._scheduler_output({})
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "multiproc executor"
+
+    def test_installed_drafter_disables_pipeline_for_whole_serve(self) -> None:
+        # A configured drafter turns the pipeline off even on steps that
+        # schedule no draft tokens — the honest stated limit of the feature.
+        # Arrange
+        runner = self._runner(drafter=object())
+        scheduler_output = self._scheduler_output({})
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "speculative decode"
+
+    def test_active_spec_tokens_disable_pipeline_without_drafter(self) -> None:
+        # Arrange — scheduler-driven drafts (e.g. ngram) with no drafter
+        runner = self._runner(drafter=None)
+        scheduler_output = self._scheduler_output({"req-0": [7, 9]})
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "speculative decode"
+
+    def test_configured_spec_decode_disables_pipeline_without_drafter(self) -> None:
+        # A speculative_config alone must disable the pipeline — the
+        # whole-serve exclusion is structural, not dependent on a drafter
+        # having been installed or drafts being scheduled this step.
+        # Arrange
+        runner = self._runner(drafter=None)
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(method="ngram"),
+            parallel_config=SimpleNamespace(distributed_executor_backend=None),
+        )
+        scheduler_output = self._scheduler_output({})
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "speculative decode"
+
+
+class TestDeferredDecodeSampleThreading:
+    """Runner-side threading for the deferred (pipelined) sample path."""
+
+    def _decode_state(self, req_id: str) -> mr.RequestState:
+        return mr.RequestState(
+            token_ids=[3, 9],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            generated_tokens=1,
+        )
+
+    def _paged_state(
+        self, runner: mr.MetalModelRunner, decode_reqs, *, prefill_reqs=()
+    ) -> mr._PagedForwardState:
+        batch = mr._ExecutionBatch()
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={rid: 1 for rid, _ in decode_reqs},
+            total_num_scheduled_tokens=len(decode_reqs),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=0,
+        )
+        return mr._PagedForwardState(
+            batch=batch,
+            prefill_reqs=list(prefill_reqs),
+            decode_reqs=list(decode_reqs),
+            scheduler_output=scheduler_output,
+            logits=mx.array([[[0.0, 10.0, 0.0, 0.0]] * len(decode_reqs)]),
+            target_hidden_states=None,
+            pooling_hidden_states=None,
+            cu_seqlens=list(range(len(decode_reqs) + 1)),
+            decode_segments=[],
+            num_decode_tokens=len(decode_reqs),
+            mm_prefill_deltas={},
+        )
+
+    def test_submit_advances_bookkeeping_and_returns_async_output(self) -> None:
+        # Arrange
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        # Act
+        output = runner._submit_deferred_decode_sample()
+
+        # Assert — placeholder appended, counts advanced BEFORE resolve,
+        # and the async output wrapper is the upstream-facing return type.
+        assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
+        assert state.token_ids[-1] == mr.PENDING_TOKEN_PLACEHOLDER
+        assert state.generated_tokens == 2
+        assert runner._paged_request_seq_lens["r0"] == 2
+
+    def test_resolve_backfills_the_submitted_token(self) -> None:
+        # Arrange
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        output = runner._submit_deferred_decode_sample()
+
+        # Act — the wrapper's own resolution path fills the placeholder.
+        result = output.get_output()
+
+        # Assert
+        assert state.token_ids[-1] == 1  # argmax of the logits row
+        assert result.sampled_token_ids == [[1]]
+
+    def test_assembled_pending_tokens_reach_the_forward_input(
+        self, monkeypatch
+    ) -> None:
+        # Step k defers its sample; step k+1's forward must consume the lazy
+        # sampled tokens as its decode input (device gather) while the host
+        # token list still ends in the placeholder.
+        # Arrange
+        runner = make_stub_runner(model=SimpleNamespace())
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        runner._submit_deferred_decode_sample()
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        captured: dict[str, object] = {}
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            captured["input_ids"] = input_ids.tolist()
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 4)), hidden_states=None
+            )
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+        scheduler_output = self._paged_state(runner, [("r0", state)]).scheduler_output
+
+        # Act
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", state)],
+            scheduler_output=scheduler_output,
+        )
+
+        # Assert — argmax of step k's logits row is 1; the forward saw that
+        # deferred value while the host list still holds the placeholder.
+        assert captured["input_ids"] == [[1]]
+        assert state.token_ids[-1] == mr.PENDING_TOKEN_PLACEHOLDER
+
+    def test_pending_tokens_with_prefill_work_raise_gate_desync(
+        self, monkeypatch
+    ) -> None:
+        # Arrange — a pending deferred sample plus prefill work on an
+        # (incorrectly) eligible step must fail fast, not mix inputs.
+        runner = make_stub_runner(model=SimpleNamespace())
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        runner._submit_deferred_decode_sample()
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        prefill = mr.PrefillRequest(
+            req_id="p0",
+            token_ids=[5],
+            sampling_params=SamplingParams(),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=1,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        scheduler_output = self._paged_state(runner, [("r0", state)]).scheduler_output
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="gate desynced"):
+            runner._start_paged_forward(
+                mr._ExecutionBatch(),
+                prefill_reqs=[prefill],
+                decode_reqs=[("r0", state)],
+                scheduler_output=scheduler_output,
+            )
+
+    def test_sample_tokens_routes_eligible_step_to_deferred_submit(self) -> None:
+        # The public engine seam: an eligible step's sample_tokens call must
+        # return the deferred async output, not a synchronous one.
+        # Arrange
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        # Act
+        output = runner.sample_tokens(None)
+
+        # Assert
+        assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
+
+    def test_sample_tokens_routes_ineligible_step_to_synchronous_path(
+        self, monkeypatch
+    ) -> None:
+        # Arrange
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=False, reason="prefill-phase requests")
+        )
+        calls: list[str] = []
+        paged_state = runner._execute_model_state
+
+        def fake_sample_paged_batch(grammar_output=None):
+            calls.append("sync")
+            return mr._ExecutionBatch(), paged_state.scheduler_output
+
+        def unexpected_deferred_submit():
+            raise AssertionError("ineligible step must not defer its sample")
+
+        monkeypatch.setattr(runner, "_sample_paged_batch", fake_sample_paged_batch)
+        monkeypatch.setattr(
+            runner, "_submit_deferred_decode_sample", unexpected_deferred_submit
+        )
+
+        # Act
+        output = runner.sample_tokens(None)
+
+        # Assert
+        assert calls == ["sync"]
+        assert isinstance(output, ModelRunnerOutput)
+
+    def test_sample_tokens_rejects_grammar_output_on_eligible_step(self) -> None:
+        # Arrange — the gate blocks structured-output steps, so a grammar
+        # bitmask arriving on an eligible step is a desync, not a fallback.
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        grammar_output = GrammarOutput(
+            structured_output_request_ids=[], grammar_bitmask=None
+        )
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="gate must block structured-output"):
+            runner.sample_tokens(grammar_output)
+
+    def test_execute_model_gates_pipeline_before_any_state_mutation(
+        self, monkeypatch
+    ) -> None:
+        # begin_step must run before the first runner-owned mutation
+        # (encoder-output free), so an ineligible step drains the pending
+        # deferred sample before any state changes underneath it.
+        # Arrange
+        runner = make_stub_runner()
+        events: list[str] = []
+        monkeypatch.setattr(
+            runner._decode_pipeline,
+            "begin_step",
+            lambda decision: events.append("begin_step"),
+        )
+
+        class _StopError(Exception):
+            pass
+
+        def record_free(mm_hashes):
+            events.append("free_encoder_outputs")
+            raise _StopError
+
+        monkeypatch.setattr(runner, "_free_encoder_outputs", record_free)
+        scheduler_output = self._paged_state(runner, []).scheduler_output
+
+        # Act
+        with pytest.raises(_StopError):
+            runner.execute_model(scheduler_output)
+
+        # Assert
+        assert events == ["begin_step", "free_encoder_outputs"]
+
+    def test_finished_request_between_steps_backfills_evicted_state(self) -> None:
+        # A request that finishes (and is evicted) between submit and resolve
+        # still receives its token through the direct state reference, the
+        # next step's assembly gathers only the surviving row, and the
+        # runner's dicts are not re-populated for the evicted request.
+        # Arrange
+        runner = make_stub_runner()
+        state0 = self._decode_state("r0")
+        state1 = self._decode_state("r1")
+        runner._request_states = {"r0": state0, "r1": state1}
+        runner._paged_request_seq_lens = {"r0": 1, "r1": 1}
+        runner._execute_model_state = self._paged_state(
+            runner, [("r0", state0), ("r1", state1)]
+        )
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        output = runner._submit_deferred_decode_sample()
+        del runner._request_states["r0"]
+        del runner._paged_request_seq_lens["r0"]
+        surviving_segment = PagedDecodeSegment(
+            req_id="r1",
+            input_token_ids=(mr.PENDING_TOKEN_PLACEHOLDER,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=2,
+            block_ids=((0,),),
+        )
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        # Act
+        input_ids = runner._decode_pipeline.assemble_decode_input_ids(
+            [surviving_segment]
+        )
+        result = output.get_output()
+
+        # Assert
+        assert input_ids is not None
+        assert input_ids.tolist() == [[1]]  # r1's row only (argmax of its logits)
+        assert state0.token_ids[-1] == 1  # evicted state backfilled by reference
+        assert state1.token_ids[-1] == 1
+        assert result.sampled_token_ids == [[1], [1]]
+        assert "r0" not in runner._request_states
+        assert "r0" not in runner._paged_request_seq_lens
+
+    def test_prefill_rows_in_deferred_submit_raise(self) -> None:
+        # Arrange
+        runner = make_stub_runner()
+        state = self._decode_state("r0")
+        prefill = mr.PrefillRequest(
+            req_id="p0",
+            token_ids=[5],
+            sampling_params=SamplingParams(),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=1,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        runner._execute_model_state = self._paged_state(
+            runner, [("r0", state)], prefill_reqs=[prefill]
+        )
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="pure single-token decode batch"):
+            runner._submit_deferred_decode_sample()

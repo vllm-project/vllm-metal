@@ -19,7 +19,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_metal.config import get_config
@@ -278,7 +282,7 @@ class MetalWorker(WorkerBase):
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Return sampled tokens for the previously executed batch."""
         return self.model_runner.sample_tokens(grammar_output)
 

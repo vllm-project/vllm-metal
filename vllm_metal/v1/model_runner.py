@@ -36,6 +36,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     DraftTokenIds,
     LogprobsLists,
     ModelRunnerOutput,
@@ -71,6 +72,15 @@ from vllm_metal.v1.contiguous_cache import (
     _extract_kv_cache,
     _merge_kv_caches,
 )
+from vllm_metal.v1.decode_pipeline import (
+    PENDING_TOKEN_PLACEHOLDER,
+    DecodePipeline,
+    MetalAsyncModelRunnerOutput,
+    PendingBackfillEntry,
+    PendingSampleStep,
+    PipelineGateDecision,
+    PipelineGateInputs,
+)
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -101,6 +111,7 @@ from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
     _SamplingResult,
+    mlx_greedy_tokens,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -358,6 +369,14 @@ class MetalModelRunner:
 
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
+
+        # One-step-ahead decode pipelining (owner: decode_pipeline.py).
+        # Gate-eligible pure-decode greedy steps defer the sampling sync one
+        # step so the next step's graph build overlaps the in-flight forward.
+        self._decode_pipeline = DecodePipeline(
+            build_output=self._build_output,
+            validate=self._validate_scheduled_outputs,
+        )
 
         # YOCO layer->cache mapping, replaced by _install_yoco_cache_mapping
         # during model load.  Declared here so readers can treat it as always
@@ -1113,7 +1132,22 @@ class MetalModelRunner:
 
             # ---- forward (lazy graph + async submit) ----
             offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
-            input_ids = mx.array([all_token_ids], dtype=mx.int32)
+            # On a pipeline-eligible step with a pending deferred sample, the
+            # decode inputs are the previous step's lazy tokens (device
+            # gather) — the host list still ends in placeholders there.
+            pipeline_input_ids = self._decode_pipeline.assemble_decode_input_ids(
+                decode_segments
+            )
+            if pipeline_input_ids is not None and prefill_reqs:
+                raise RuntimeError(
+                    "Pipelined decode input assembled on a step with prefill "
+                    "work — the pipeline gate desynced from the batch."
+                )
+            input_ids = (
+                pipeline_input_ids
+                if pipeline_input_ids is not None
+                else mx.array([all_token_ids], dtype=mx.int32)
+            )
             if has_pooling_work:
                 pooling_hidden_states = forward_sequence_hidden_states(
                     self._forward_model,
@@ -1195,6 +1229,73 @@ class MetalModelRunner:
             num_decode_tokens=num_decode_tokens,
             mm_prefill_deltas=mm_prefill_deltas,
         )
+
+    def _evaluate_pipeline_gate(
+        self, scheduler_output: SchedulerOutput
+    ) -> PipelineGateDecision:
+        """Collect value-independent step facts and gate the decode pipeline."""
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        has_prefill_phase = False
+        has_mm_decode = False
+        states_missing = False
+        decode_params: list[SamplingParams] = []
+        for req_id in cached_reqs.req_ids:
+            state = self._request_states.get(req_id)
+            if state is None:
+                states_missing = True
+                break
+            if state.generated_tokens == 0:
+                has_prefill_phase = True
+                continue
+            if state.mrope_position_delta is not None:
+                has_mm_decode = True
+            if state.sampling_params is not None:
+                decode_params.append(state.sampling_params)
+
+        adapter = self._multimodal_adapter
+        mm_forward_forced = (
+            adapter is not None
+            and adapter.forward_ready
+            and adapter.requires_explicit_positions
+        )
+        native_greedy = not states_missing and SamplingBatch.params_allow_native_greedy(
+            decode_params
+        )
+        spec_tokens = self._spec_decode_controller.active_spec_decode_tokens(
+            scheduler_output
+        )
+        inputs = PipelineGateInputs(
+            pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
+            use_async_scheduling=self.use_async_scheduling,
+            paged_runtime_active=self._paged_attention_runtime is not None,
+            is_pooling=self._is_pooling,
+            pp_active=self.pp is not None and self.pp.size > 1,
+            hybrid_without_lazy_gdn=(
+                self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
+            ),
+            has_new_requests=(
+                bool(scheduler_output.scheduled_new_reqs) or states_missing
+            ),
+            has_prefill_phase_requests=has_prefill_phase,
+            has_resumed_requests=bool(cached_reqs.resumed_req_ids),
+            has_preempted_requests=bool(scheduler_output.preempted_req_ids),
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            has_spec_decode=(
+                self.vllm_config.speculative_config is not None
+                or self._drafter is not None
+                or bool(spec_tokens)
+            ),
+            has_structured_output=scheduler_output.has_structured_output_requests,
+            has_mm_decode=has_mm_decode or mm_forward_forced,
+            native_greedy=native_greedy,
+            has_prompt_logprobs=any(
+                sp.prompt_logprobs is not None for sp in decode_params
+            ),
+            multiproc_executor=(
+                self.vllm_config.parallel_config.distributed_executor_backend == "mp"
+            ),
+        )
+        return DecodePipeline.evaluate_gate(inputs)
 
     def _sample_paged_batch(
         self,
@@ -2252,6 +2353,11 @@ class MetalModelRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
+        # Gate the decode pipeline for this step BEFORE any state mutation:
+        # an ineligible step must resolve the pending deferred sample first so
+        # the synchronous path never observes a pending token placeholder.
+        self._decode_pipeline.begin_step(self._evaluate_pipeline_gate(scheduler_output))
+
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -2380,13 +2486,15 @@ class MetalModelRunner:
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Wait for GPU forward, sample tokens, and postprocess.
 
         Called by the vLLM v1 engine after ``execute_model`` returns ``None``.
         For the paged path, this is where the actual GPU synchronization,
         token sampling, and request state updates happen — allowing the
         scheduler to run while the GPU was computing the forward pass.
+        On pipeline-eligible steps the sync itself is deferred one step:
+        a lazy greedy sample is submitted and an async output is returned.
         """
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
@@ -2400,6 +2508,13 @@ class MetalModelRunner:
                 if runtime is not None:
                     runtime.materialize_pending_state()
                 return EMPTY_MODEL_RUNNER_OUTPUT
+            if self._decode_pipeline.step_eligible:
+                if grammar_output is not None:
+                    raise RuntimeError(
+                        "Grammar output arrived on a pipeline-eligible step; "
+                        "the gate must block structured-output steps."
+                    )
+                return self._submit_deferred_decode_sample()
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             runtime = self._paged_attention_runtime
             if runtime is not None:
@@ -2420,6 +2535,70 @@ class MetalModelRunner:
             "neither _execute_model_state nor _pending_output was set."
         )
         return None
+
+    def _submit_deferred_decode_sample(self) -> MetalAsyncModelRunnerOutput:
+        """Submit a lazy greedy sample and defer its sync one step.
+
+        All value-independent bookkeeping happens here so the next step's
+        ``execute_model`` sees advanced ``generated_tokens`` / seq lens; the
+        token VALUES land later via ``DecodePipeline.resolve`` through direct
+        ``RequestState`` references (never through runner dicts).
+        """
+        paged_state = self._execute_model_state
+        assert paged_state is not None
+        self._execute_model_state = None
+        batch = paged_state.batch
+        decode_reqs = paged_state.decode_reqs
+        if paged_state.prefill_reqs or paged_state.num_decode_tokens != len(
+            decode_reqs
+        ):
+            raise RuntimeError(
+                "Deferred sampling requires a pure single-token decode batch "
+                f"(prefills={len(paged_state.prefill_reqs)}, "
+                f"decode_tokens={paged_state.num_decode_tokens}, "
+                f"decode_reqs={len(decode_reqs)}) — gate desync."
+            )
+        logits = paged_state.logits
+        assert logits is not None
+        self._draft_token_ids = None
+
+        tokens = mlx_greedy_tokens(logits[0, : len(decode_reqs), :])
+        # Submit now: the token buffer is scheduled right after this step's
+        # forward and ahead of the next step's encode, so the deferred
+        # resolve is a pure wait on already-queued GPU work.
+        mx.async_eval(tokens)
+
+        entries: list[PendingBackfillEntry] = []
+        for row, (req_id, state) in enumerate(decode_reqs):
+            state.token_ids.append(PENDING_TOKEN_PLACEHOLDER)
+            state.generated_tokens += 1
+            # Same seq-len advance as the synchronous path (one new token);
+            # the .get default matches its post-append equation.
+            self._paged_request_seq_lens[req_id] = (
+                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
+            )
+            output_idx = batch.add_output(req_id, [])
+            entries.append(
+                PendingBackfillEntry(
+                    req_id=req_id,
+                    state=state,
+                    row=row,
+                    token_index=len(state.token_ids) - 1,
+                    output_idx=output_idx,
+                )
+            )
+
+        runtime = self._paged_attention_runtime
+        if runtime is not None:
+            runtime.materialize_pending_state()
+        return self._decode_pipeline.submit(
+            PendingSampleStep(
+                tokens=tokens,
+                entries=tuple(entries),
+                batch=batch,
+                scheduler_output=paged_state.scheduler_output,
+            )
+        )
 
     def generate(
         self,
