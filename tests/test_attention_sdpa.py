@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
@@ -32,6 +33,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.sdpa import (
+    apply_g_proj_gate,
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
     sdpa_forward,
@@ -945,3 +947,44 @@ class TestSDPAForward:
         assert cache.value_caches[0] is original_v_cache
         assert captured["key_cache"] is original_k_cache
         assert captured["value_cache"] is original_v_cache
+
+
+# === Laguna g_proj per-head gating ===
+
+
+class TestApplyGProjGate:
+    """Cover Laguna-style ``g_proj`` + softplus per-head output gating."""
+
+    def test_noop_without_g_proj(self) -> None:
+        """Modules without ``g_proj`` (every non-Laguna SDPA model) pass through."""
+        inner = SimpleNamespace()  # no g_proj, no gating
+        out = mx.ones((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+        assert result is out
+
+    def test_noop_when_gating_disabled(self) -> None:
+        """A ``g_proj`` with ``gating=False`` is ignored (defensive guard)."""
+        inner = SimpleNamespace(gating=False, g_proj=nn.Linear(_HIDDEN, _N_HEADS))
+        out = mx.ones((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+        assert result is out
+
+    def test_matches_reference_gating(self) -> None:
+        """Output matches the mlx_lm Laguna reference gating computation."""
+        g_proj = nn.Linear(_HIDDEN, _N_HEADS, bias=False)
+        inner = SimpleNamespace(gating=True, g_proj=g_proj)
+        x = mx.random.normal((_BATCH, _SEQ_LEN, _HIDDEN))
+        out = mx.random.normal((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+
+        # Reference: gate = softplus(g_proj(x)); out *= gate per head.
+        gate = nn.softplus(g_proj(x).astype(mx.float32)).astype(out.dtype)
+        expected = (
+            out.reshape(_BATCH, _SEQ_LEN, _N_HEADS, _HEAD_DIM) * gate[..., None]
+        ).reshape(_BATCH, _SEQ_LEN, -1)
+
+        assert result.shape == out.shape
+        assert mx.allclose(result, expected, atol=1e-6).item()
