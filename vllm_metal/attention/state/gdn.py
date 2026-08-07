@@ -49,9 +49,21 @@ class HybridGDNStateManager:
         return self._needs_materialize
 
     def populate_step_context(
-        self, *, req_ids: list[str], ctx: PagedAttentionContext
+        self,
+        *,
+        req_ids: list[str],
+        ctx: PagedAttentionContext,
+        state_block_ids: list[list[list[int]]] | None = None,
+        step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
-        """Attach stable GDN slot ids to one forward-pass context."""
+        """Attach stable GDN slot ids to one forward-pass context.
+
+        Scheduler block ids and step positions drive align-mode state motion
+        (see ``AlignGDNStateManager``); this manager keeps one private slot
+        per request for its whole lifetime, so it ignores them.  Accepting
+        them keeps both managers on one signature.
+        """
+        del state_block_ids, step_positions
         ctx.gdn_slot_mapping = self.assign_step_slots(req_ids)
 
     def assign_step_slots(self, req_ids: list[str]) -> list[int]:

@@ -484,14 +484,29 @@ class MetalPlatform(Platform):
                     "--mamba-ssm-cache-dtype float32 because recurrent state is "
                     "stored in fp32."
                 )
+            if cache_config.enable_prefix_caching and not config.use_paged_attention:
+                raise NotImplementedError(
+                    "Prefix caching for hybrid GDN models requires paged "
+                    "attention on Metal (VLLM_METAL_USE_PAGED_ATTENTION=1); "
+                    "the non-paged MLX path has no block-indexed state to "
+                    "restore from."
+                )
+            if cache_config.mamba_cache_mode == "all":
+                raise NotImplementedError(
+                    "mamba_cache_mode='all' is not supported for hybrid GDN "
+                    "models on Metal (nor upstream, which falls back to "
+                    "'align' for models without SupportsMambaPrefixCaching). "
+                    "Use align mode: --enable-prefix-caching resolves to it."
+                )
             if (
                 cache_config.enable_prefix_caching
-                or cache_config.mamba_cache_mode != "none"
+                and vllm_config.speculative_config is not None
             ):
                 raise NotImplementedError(
-                    "Prefix caching and Mamba cache modes are not supported for "
-                    "hybrid GDN models on Metal because GDN recurrent state cannot "
-                    "be restored from KV blocks."
+                    "Prefix caching for hybrid GDN models on Metal does not "
+                    "support speculative decoding yet: draft-state rollback "
+                    "across mamba state blocks (num_speculative_blocks) is "
+                    "not implemented. Disable one of the two."
                 )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its

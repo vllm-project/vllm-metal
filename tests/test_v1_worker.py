@@ -326,6 +326,7 @@ class TestPagedAttentionPlanDiagnostics:
             profile_run=MagicMock(return_value=3_900_000_000),
             validate_paged_attention_support=MagicMock(),
             scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         worker = _make_worker(runner, use_paged_attention=True)
@@ -365,6 +366,7 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         planner = self._make_planner(
@@ -405,6 +407,7 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         planner = self._make_planner(
