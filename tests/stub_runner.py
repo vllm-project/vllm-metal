@@ -11,6 +11,7 @@ import torch
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.v1.cache_policy import ModelCachePolicy
+from vllm_metal.v1.decode_pipeline import DecodePipeline
 from vllm_metal.v1.lora import MetalLoRARuntime
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -33,7 +34,10 @@ def make_stub_runner(
     _model_args = model_args or {}
 
     defaults: dict[str, Any] = {
-        "vllm_config": SimpleNamespace(speculative_config=None),
+        "vllm_config": SimpleNamespace(
+            speculative_config=None,
+            parallel_config=SimpleNamespace(distributed_executor_backend=None),
+        ),
         "cache_config": SimpleNamespace(
             mamba_page_size_padded=None,
             mamba_block_size=2048,
@@ -86,6 +90,11 @@ def make_stub_runner(
         )
 
     runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
+    if "_decode_pipeline" not in attrs:
+        runner._decode_pipeline = DecodePipeline(
+            build_output=runner._build_output,
+            validate=runner._validate_scheduled_outputs,
+        )
 
     # Derive _vocab_size from model_args — single source of truth.
     if "vocab_size" in _model_args:

@@ -278,6 +278,7 @@ class _RecordingAdapter:
     """Adapter stub that records ``encode_multimodal`` invocations."""
 
     forward_ready = True
+    requires_explicit_positions = False
 
     def __init__(self) -> None:
         self.encode_calls: list[list[MultiModalFeatureSpec]] = []
