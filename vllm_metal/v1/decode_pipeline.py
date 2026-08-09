@@ -49,8 +49,8 @@ PENDING_TOKEN_PLACEHOLDER: Final[int] = -1
 
 
 @dataclass(frozen=True)
-class PipelineGateInputs:
-    """Value-independent step facts the runner collects for gating."""
+class RunnerCapabilities:
+    """Serve-level facts about the runner; fixed for a server's lifetime."""
 
     pipeline_enabled: bool
     use_async_scheduling: bool
@@ -58,17 +58,83 @@ class PipelineGateInputs:
     is_pooling: bool
     pp_active: bool
     hybrid_without_lazy_gdn: bool
+    spec_decode_configured: bool
+    uniproc_executor: bool
+
+    def block_reason(self) -> str | None:
+        """First capability that rules the pipeline out, or ``None``."""
+        blockers = (
+            (not self.pipeline_enabled, "pipeline disabled"),
+            (not self.use_async_scheduling, "async scheduling off"),
+            (not self.paged_runtime_active, "non-paged path"),
+            (self.is_pooling, "pooling model"),
+            (self.pp_active, "pipeline parallelism"),
+            (
+                self.hybrid_without_lazy_gdn,
+                "hybrid model without lazy GDN kernels",
+            ),
+            (self.spec_decode_configured, "speculative decode"),
+            # Positive check: the pipeline's pending-step state assumes the
+            # in-process uniproc executor's single-threaded output ordering;
+            # mp/ray/custom executors do not share that contract.
+            (not self.uniproc_executor, "non-uniproc executor"),
+        )
+        for blocked, reason in blockers:
+            if blocked:
+                return reason
+        return None
+
+
+@dataclass(frozen=True)
+class SchedulerStepShape:
+    """Shape of one scheduled step as handed over by the scheduler."""
+
     has_new_requests: bool
     has_prefill_phase_requests: bool
     has_resumed_requests: bool
     has_preempted_requests: bool
     has_encoder_inputs: bool
-    has_spec_decode: bool
+    has_spec_tokens: bool
     has_structured_output: bool
     has_mm_decode: bool
+    # Decode-phase membership of this step: the pipeline cross-checks it
+    # against its pending rows (a cached request can re-enter after being
+    # absent from the previous step and then has no pending row).
+    decode_req_ids: tuple[str, ...]
+
+    def block_reason(self) -> str | None:
+        """First step-shape fact that rules the pipeline out, or ``None``."""
+        blockers = (
+            (self.has_new_requests, "new requests scheduled"),
+            (self.has_prefill_phase_requests, "prefill-phase requests"),
+            (self.has_resumed_requests, "resumed requests"),
+            (self.has_preempted_requests, "preempted requests"),
+            (self.has_encoder_inputs, "encoder inputs scheduled"),
+            (self.has_spec_tokens, "speculative decode"),
+            (self.has_structured_output, "structured output"),
+            (self.has_mm_decode, "multimodal decode state"),
+        )
+        for blocked, reason in blockers:
+            if blocked:
+                return reason
+        return None
+
+
+@dataclass(frozen=True)
+class SamplingShape:
+    """Sampling-side facts for the decode requests of one step."""
+
     native_greedy: bool
     has_prompt_logprobs: bool
-    multiproc_executor: bool
+
+    def block_reason(self) -> str | None:
+        """First sampling fact that rules the pipeline out, or ``None``."""
+        if not self.native_greedy:
+            return "non-native-greedy sampling"
+        # Prompt logprobs need eager logits on the sampling step.
+        if self.has_prompt_logprobs:
+            return "prompt logprobs requested"
+        return None
 
 
 @dataclass(frozen=True)
@@ -135,38 +201,43 @@ class DecodePipeline:
         self._rows: dict[str, int] = {}
         self._step_eligible = False
 
-    @staticmethod
-    def evaluate_gate(inputs: PipelineGateInputs) -> PipelineGateDecision:
-        """Decide whether the upcoming step may defer its sampling sync."""
-        blockers = (
-            (not inputs.pipeline_enabled, "pipeline disabled"),
-            (not inputs.use_async_scheduling, "async scheduling off"),
-            (not inputs.paged_runtime_active, "non-paged path"),
-            (inputs.is_pooling, "pooling model"),
-            (inputs.pp_active, "pipeline parallelism"),
-            (
-                inputs.hybrid_without_lazy_gdn,
-                "hybrid model without lazy GDN kernels",
-            ),
-            (inputs.has_new_requests, "new requests scheduled"),
-            (inputs.has_prefill_phase_requests, "prefill-phase requests"),
-            (inputs.has_resumed_requests, "resumed requests"),
-            (inputs.has_preempted_requests, "preempted requests"),
-            (inputs.has_encoder_inputs, "encoder inputs scheduled"),
-            (inputs.has_spec_decode, "speculative decode"),
-            (inputs.has_structured_output, "structured output"),
-            (inputs.has_mm_decode, "multimodal decode state"),
-            (not inputs.native_greedy, "non-native-greedy sampling"),
-            # Prompt logprobs need eager logits on the sampling step.
-            (inputs.has_prompt_logprobs, "prompt logprobs requested"),
-            # The multiproc executor resolves async outputs on a separate
-            # thread; the pipeline's pending-step state is single-threaded.
-            (inputs.multiproc_executor, "multiproc executor"),
-        )
-        for blocked, reason in blockers:
-            if blocked:
+    def evaluate_gate(
+        self,
+        capabilities: RunnerCapabilities,
+        step: SchedulerStepShape,
+        sampling: SamplingShape,
+    ) -> PipelineGateDecision:
+        """Decide whether the upcoming step may defer its sampling sync.
+
+        The runner only collects facts; each shape owns its block reasons,
+        and the pipeline adds the one check against its own state: every
+        decode request of the step must map to a pending row. Shapes are
+        checked capabilities, then step, then sampling, then pending
+        coverage; the reported reason is the first match.
+        """
+        for reason in (
+            capabilities.block_reason(),
+            step.block_reason(),
+            sampling.block_reason(),
+            self._pending_coverage_reason(step),
+        ):
+            if reason is not None:
                 return PipelineGateDecision(eligible=False, reason=reason)
         return PipelineGateDecision(eligible=True, reason="eligible")
+
+    def _pending_coverage_reason(self, step: SchedulerStepShape) -> str | None:
+        """Block a step whose decode membership exceeds the pending rows.
+
+        A cached request can re-enter a step after being absent from the
+        previous one (the scheduler re-syncs it via ``all_token_ids``); it
+        then has no pending lazy token to feed the next forward, so the step
+        must resolve the pending sample and take the synchronous path.
+        """
+        if self._pending is None:
+            return None
+        if any(req_id not in self._rows for req_id in step.decode_req_ids):
+            return "cached request without a pending row"
+        return None
 
     def begin_step(self, decision: PipelineGateDecision) -> None:
         """Record the gate decision; barrier the pending step if ineligible.

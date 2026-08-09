@@ -2202,6 +2202,11 @@ class TestDummyForwardOutputsPPRouting:
 class TestPipelineGateSpecDecodeDerivation:
     """Runner-side gate derivation: spec decode disables the pipeline."""
 
+    @pytest.fixture(autouse=True)
+    def _opt_in_pipeline(self, monkeypatch) -> None:
+        # The pipeline is opt-in; gate derivation is tested with it enabled.
+        monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+
     def _runner(self, drafter: object | None = None) -> mr.MetalModelRunner:
         runner = make_stub_runner()
         runner._drafter = drafter
@@ -2284,13 +2289,14 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is True
         assert decision.reason == "eligible"
 
-    def test_multiproc_executor_backend_disables_pipeline(self) -> None:
-        # Arrange — the mp executor resolves async outputs on another
-        # thread; the pipeline's pending state is single-threaded.
+    @pytest.mark.parametrize("backend", ["mp", "ray", "external_launcher", None])
+    def test_non_uniproc_executor_backend_disables_pipeline(self, backend) -> None:
+        # Arrange — the pipeline's pending state assumes the in-process
+        # uniproc executor; anything else takes the synchronous path.
         runner = self._runner(drafter=None)
         runner.vllm_config = SimpleNamespace(
             speculative_config=None,
-            parallel_config=SimpleNamespace(distributed_executor_backend="mp"),
+            parallel_config=SimpleNamespace(distributed_executor_backend=backend),
         )
         scheduler_output = self._scheduler_output({})
 
@@ -2299,7 +2305,7 @@ class TestPipelineGateSpecDecodeDerivation:
 
         # Assert
         assert decision.eligible is False
-        assert decision.reason == "multiproc executor"
+        assert decision.reason == "non-uniproc executor"
 
     def test_installed_drafter_disables_pipeline_for_whole_serve(self) -> None:
         # A configured drafter turns the pipeline off even on steps that
@@ -2514,6 +2520,55 @@ class TestDeferredDecodeSampleThreading:
                 decode_reqs=[("r0", state)],
                 scheduler_output=scheduler_output,
             )
+
+    def test_reentrant_cached_request_blocks_next_gate(self, monkeypatch) -> None:
+        # A cached request that was absent from the deferred step re-enters
+        # on the next one; it has no pending row, so the gate must route the
+        # step through the synchronous path instead of crashing assembly.
+        # Arrange
+        monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+        runner = make_stub_runner()
+        runner._paged_attention_runtime = SimpleNamespace(
+            materialize_pending_state=lambda: None
+        )
+        state0 = self._decode_state("r0")
+        state1 = self._decode_state("r1")
+        runner._request_states = {"r0": state0, "r1": state1}
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state0)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        runner._submit_deferred_decode_sample()
+        cached = CachedRequestData(
+            req_ids=["r0", "r1"],
+            resumed_req_ids=set(),
+            new_token_ids=[[7], [7]],
+            all_token_ids={"r0": [3, 9, 7], "r1": [3, 9, 7]},
+            new_block_ids=[None, None],
+            num_computed_tokens=[2, 2],
+            num_output_tokens=[2, 2],
+        )
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached,
+            num_scheduled_tokens={"r0": 1, "r1": 1},
+            total_num_scheduled_tokens=2,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=0,
+        )
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "cached request without a pending row"
 
     def test_sample_tokens_routes_eligible_step_to_deferred_submit(self) -> None:
         # The public engine seam: an eligible step's sample_tokens call must

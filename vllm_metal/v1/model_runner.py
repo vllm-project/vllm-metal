@@ -79,7 +79,9 @@ from vllm_metal.v1.decode_pipeline import (
     PendingBackfillEntry,
     PendingSampleStep,
     PipelineGateDecision,
-    PipelineGateInputs,
+    RunnerCapabilities,
+    SamplingShape,
+    SchedulerStepShape,
 )
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
@@ -1238,6 +1240,7 @@ class MetalModelRunner:
         has_prefill_phase = False
         has_mm_decode = False
         states_missing = False
+        decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
         for req_id in cached_reqs.req_ids:
             state = self._request_states.get(req_id)
@@ -1249,6 +1252,7 @@ class MetalModelRunner:
                 continue
             if state.mrope_position_delta is not None:
                 has_mm_decode = True
+            decode_req_ids.append(req_id)
             if state.sampling_params is not None:
                 decode_params.append(state.sampling_params)
 
@@ -1258,13 +1262,7 @@ class MetalModelRunner:
             and adapter.forward_ready
             and adapter.requires_explicit_positions
         )
-        native_greedy = not states_missing and SamplingBatch.params_allow_native_greedy(
-            decode_params
-        )
-        spec_tokens = self._spec_decode_controller.active_spec_decode_tokens(
-            scheduler_output
-        )
-        inputs = PipelineGateInputs(
+        capabilities = RunnerCapabilities(
             pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
             use_async_scheduling=self.use_async_scheduling,
             paged_runtime_active=self._paged_attention_runtime is not None,
@@ -1273,6 +1271,15 @@ class MetalModelRunner:
             hybrid_without_lazy_gdn=(
                 self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
+            spec_decode_configured=(
+                self.vllm_config.speculative_config is not None
+                or self._drafter is not None
+            ),
+            uniproc_executor=(
+                self.vllm_config.parallel_config.distributed_executor_backend == "uni"
+            ),
+        )
+        step = SchedulerStepShape(
             has_new_requests=(
                 bool(scheduler_output.scheduled_new_reqs) or states_missing
             ),
@@ -1280,22 +1287,23 @@ class MetalModelRunner:
             has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
-            has_spec_decode=(
-                self.vllm_config.speculative_config is not None
-                or self._drafter is not None
-                or bool(spec_tokens)
+            has_spec_tokens=bool(
+                self._spec_decode_controller.active_spec_decode_tokens(scheduler_output)
             ),
             has_structured_output=scheduler_output.has_structured_output_requests,
             has_mm_decode=has_mm_decode or mm_forward_forced,
-            native_greedy=native_greedy,
+            decode_req_ids=tuple(decode_req_ids),
+        )
+        sampling = SamplingShape(
+            native_greedy=(
+                not states_missing
+                and SamplingBatch.params_allow_native_greedy(decode_params)
+            ),
             has_prompt_logprobs=any(
                 sp.prompt_logprobs is not None for sp in decode_params
             ),
-            multiproc_executor=(
-                self.vllm_config.parallel_config.distributed_executor_backend == "mp"
-            ),
         )
-        return DecodePipeline.evaluate_gate(inputs)
+        return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 
     def _sample_paged_batch(
         self,

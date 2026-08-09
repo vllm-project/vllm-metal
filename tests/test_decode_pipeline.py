@@ -20,28 +20,51 @@ from vllm_metal.v1.decode_pipeline import (
     MetalAsyncModelRunnerOutput,
     PendingBackfillEntry,
     PendingSampleStep,
-    PipelineGateInputs,
+    RunnerCapabilities,
+    SamplingShape,
+    SchedulerStepShape,
 )
 
-_ELIGIBLE_KWARGS = {
+_CAPABLE_KWARGS = {
     "pipeline_enabled": True,
     "use_async_scheduling": True,
     "paged_runtime_active": True,
     "is_pooling": False,
     "pp_active": False,
     "hybrid_without_lazy_gdn": False,
+    "spec_decode_configured": False,
+    "uniproc_executor": True,
+}
+
+_CLEAN_STEP_KWARGS = {
     "has_new_requests": False,
     "has_prefill_phase_requests": False,
     "has_resumed_requests": False,
     "has_preempted_requests": False,
     "has_encoder_inputs": False,
-    "has_spec_decode": False,
+    "has_spec_tokens": False,
     "has_structured_output": False,
     "has_mm_decode": False,
+    "decode_req_ids": (),
+}
+
+_GREEDY_SAMPLING_KWARGS = {
     "native_greedy": True,
     "has_prompt_logprobs": False,
-    "multiproc_executor": False,
 }
+
+
+def _gate(
+    pipeline: DecodePipeline,
+    capability_overrides: dict | None = None,
+    step_overrides: dict | None = None,
+    sampling_overrides: dict | None = None,
+):
+    return pipeline.evaluate_gate(
+        RunnerCapabilities(**{**_CAPABLE_KWARGS, **(capability_overrides or {})}),
+        SchedulerStepShape(**{**_CLEAN_STEP_KWARGS, **(step_overrides or {})}),
+        SamplingShape(**{**_GREEDY_SAMPLING_KWARGS, **(sampling_overrides or {})}),
+    )
 
 
 @dataclass
@@ -106,9 +129,7 @@ def _make_pipeline() -> tuple[DecodePipeline, list]:
 
 
 def _eligible(pipeline: DecodePipeline) -> None:
-    pipeline.begin_step(
-        DecodePipeline.evaluate_gate(PipelineGateInputs(**_ELIGIBLE_KWARGS))
-    )
+    pipeline.begin_step(_gate(pipeline))
 
 
 def _submit_step(
@@ -148,7 +169,8 @@ class TestGate:
     """Decision table for the pipeline eligibility gate."""
 
     def test_pure_decode_greedy_step_is_eligible(self):
-        decision = DecodePipeline.evaluate_gate(PipelineGateInputs(**_ELIGIBLE_KWARGS))
+        pipeline, _ = _make_pipeline()
+        decision = _gate(pipeline)
         assert decision.eligible
         assert decision.reason == "eligible"
 
@@ -165,24 +187,79 @@ class TestGate:
                 True,
                 "hybrid model without lazy GDN kernels",
             ),
+            ("spec_decode_configured", True, "speculative decode"),
+            ("uniproc_executor", False, "non-uniproc executor"),
+        ],
+    )
+    def test_each_capability_blocker_rejects_with_its_reason(self, flag, value, reason):
+        pipeline, _ = _make_pipeline()
+        decision = _gate(pipeline, capability_overrides={flag: value})
+        assert not decision.eligible
+        assert decision.reason == reason
+
+    @pytest.mark.parametrize(
+        ("flag", "value", "reason"),
+        [
             ("has_new_requests", True, "new requests scheduled"),
             ("has_prefill_phase_requests", True, "prefill-phase requests"),
             ("has_resumed_requests", True, "resumed requests"),
             ("has_preempted_requests", True, "preempted requests"),
             ("has_encoder_inputs", True, "encoder inputs scheduled"),
-            ("has_spec_decode", True, "speculative decode"),
-            ("multiproc_executor", True, "multiproc executor"),
+            ("has_spec_tokens", True, "speculative decode"),
             ("has_structured_output", True, "structured output"),
             ("has_mm_decode", True, "multimodal decode state"),
+        ],
+    )
+    def test_each_step_blocker_rejects_with_its_reason(self, flag, value, reason):
+        pipeline, _ = _make_pipeline()
+        decision = _gate(pipeline, step_overrides={flag: value})
+        assert not decision.eligible
+        assert decision.reason == reason
+
+    @pytest.mark.parametrize(
+        ("flag", "value", "reason"),
+        [
             ("native_greedy", False, "non-native-greedy sampling"),
             ("has_prompt_logprobs", True, "prompt logprobs requested"),
         ],
     )
-    def test_each_blocker_rejects_with_its_reason(self, flag, value, reason):
-        inputs = PipelineGateInputs(**{**_ELIGIBLE_KWARGS, flag: value})
-        decision = DecodePipeline.evaluate_gate(inputs)
+    def test_each_sampling_blocker_rejects_with_its_reason(self, flag, value, reason):
+        pipeline, _ = _make_pipeline()
+        decision = _gate(pipeline, sampling_overrides={flag: value})
         assert not decision.eligible
         assert decision.reason == reason
+
+    def test_reentrant_decode_request_without_pending_row_is_blocked(self):
+        # Arrange — a pending step covers only "a"; a cached request "b"
+        # re-enters after being absent, so it has no pending lazy token.
+        pipeline, _ = _make_pipeline()
+        _eligible(pipeline)
+        _submit_step(pipeline, [11], ["a"])
+
+        # Act
+        decision = _gate(pipeline, step_overrides={"decode_req_ids": ("a", "b")})
+
+        # Assert
+        assert not decision.eligible
+        assert decision.reason == "cached request without a pending row"
+
+    def test_shrunk_decode_membership_stays_eligible(self):
+        # Arrange — "b" finished between steps; a subset of the pending rows
+        # is fine (the assembly gathers the surviving rows).
+        pipeline, _ = _make_pipeline()
+        _eligible(pipeline)
+        _submit_step(pipeline, [11, 22], ["a", "b"])
+
+        # Act
+        decision = _gate(pipeline, step_overrides={"decode_req_ids": ("a",)})
+
+        # Assert
+        assert decision.eligible
+
+    def test_decode_membership_is_unchecked_without_pending_step(self):
+        pipeline, _ = _make_pipeline()
+        decision = _gate(pipeline, step_overrides={"decode_req_ids": ("a", "b")})
+        assert decision.eligible
 
 
 class TestSubmitResolve:
@@ -261,11 +338,7 @@ class TestSubmitResolve:
         # Arrange
         pipeline, _ = _make_pipeline()
         pipeline.begin_step(
-            DecodePipeline.evaluate_gate(
-                PipelineGateInputs(
-                    **{**_ELIGIBLE_KWARGS, "has_structured_output": True}
-                )
-            )
+            _gate(pipeline, step_overrides={"has_structured_output": True})
         )
 
         # Act / Assert
@@ -285,11 +358,7 @@ class TestBarrier:
         # Act: next step brings a prefill — gate ineligible; then the engine
         # pops the deferred output.
         pipeline.begin_step(
-            DecodePipeline.evaluate_gate(
-                PipelineGateInputs(
-                    **{**_ELIGIBLE_KWARGS, "has_prefill_phase_requests": True}
-                )
-            )
+            _gate(pipeline, step_overrides={"has_prefill_phase_requests": True})
         )
         output = handle.get_output()
 

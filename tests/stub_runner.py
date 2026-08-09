@@ -36,7 +36,8 @@ def make_stub_runner(
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(
             speculative_config=None,
-            parallel_config=SimpleNamespace(distributed_executor_backend=None),
+            # The value MetalPlatform resolves for the in-process executor.
+            parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         ),
         "cache_config": SimpleNamespace(
             mamba_page_size_padded=None,
