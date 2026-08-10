@@ -470,6 +470,16 @@ class MetalPlatform(Platform):
                     "--mamba-ssm-cache-dtype float32 because recurrent state is "
                     "stored in fp32."
                 )
+            # Conv hybrids (LFM2 ShortConv) keep their state in a private
+            # per-request pool; align-mode block-keyed conv state is not
+            # implemented, so prefix caching would silently reuse stale state.
+            hf_layer_types = getattr(model_config.hf_config, "layer_types", None) or ()
+            if "conv" in hf_layer_types and cache_config.enable_prefix_caching:
+                raise NotImplementedError(
+                    "Prefix caching for conv hybrid models (LFM2 ShortConv) is "
+                    "not supported on Metal yet; align-mode conv state caching "
+                    "is not implemented. Re-run with --no-enable-prefix-caching."
+                )
             if cache_config.enable_prefix_caching and not config.use_paged_attention:
                 raise NotImplementedError(
                     "Prefix caching for hybrid GDN models requires paged "

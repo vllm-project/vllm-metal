@@ -91,8 +91,8 @@ class GenerationLoadRequest:
         gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
 
         # A pipeline-parallel stage prunes its non-owned layers right after load, so
-        # the generic MLX loaders stay lazy until the stage-owned weights are known.
-        # The custom GGUF and AWQ loaders cannot honor this contract.
+        # the generic mlx_lm weights load lazily and per-stage peak stays owned-only.
+        # Only the mlx_lm path honors this; GGUF/AWQ/VLM ignore it and load eager.
         pp = runner.pp
         lazy_weights = pp is not None and pp.size > 1
 
@@ -273,7 +273,7 @@ class ModelLifecycle:
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(model_name, lazy=lazy_weights)
+            model, tokenizer = mlx_vlm_load(model_name)
 
         elif awq_loader is not None:
             load_label = "AWQ model"
@@ -478,6 +478,7 @@ class ModelLifecycle:
 
     def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
         """Install hybrid linear-attention dimensions for GDN-style models."""
+        self._install_conv_hybrid_dims(args)
         if self._runner.is_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
@@ -498,6 +499,33 @@ class ModelLifecycle:
                 self._runner.linear_num_k_heads * self._runner.linear_key_head_dim * 2
                 + self._runner.linear_num_v_heads * self._runner.linear_value_head_dim
             )
+
+    def _install_conv_hybrid_dims(self, args: dict[str, Any]) -> None:
+        """Install conv-hybrid (LFM2 ShortConv) dimensions from layer_types."""
+        if not self._runner.is_conv_hybrid:
+            return
+        layer_types = list(args["layer_types"])
+        unsupported = set(layer_types) - {"conv", "full_attention"}
+        if unsupported:
+            raise NotImplementedError(
+                "conv hybrid models support only 'conv' and 'full_attention' "
+                f"layer_types; got {sorted(unsupported)}"
+            )
+        runner = self._runner
+        runner.conv_layer_types = layer_types
+        runner.sdpa_layer_indices = frozenset(
+            i for i, lt in enumerate(layer_types) if lt == "full_attention"
+        )
+        runner.num_sdpa_layers = len(runner.sdpa_layer_indices)
+        runner.conv_layer_indices = tuple(
+            i for i, lt in enumerate(layer_types) if lt == "conv"
+        )
+        runner.num_conv_layers = len(runner.conv_layer_indices)
+        # ShortConv keeps the last conv_L_cache - 1 rows of B*x per request;
+        # mirror GDN's naming: kernel dim is the conv kernel size, conv_dim is
+        # the per-row width (the model's hidden size).
+        runner.conv_kernel_dim = int(args["conv_L_cache"])
+        runner.conv_hidden_size = int(args["hidden_size"])
 
     def _install_runtime_extensions(
         self,

@@ -466,6 +466,23 @@ class MetalModelRunner:
         return isinstance(fai, int) and fai > 0
 
     @property
+    def is_conv_hybrid(self) -> bool:
+        """Whether the model mixes SDPA and ShortConv (causal-conv) layers.
+
+        Conv hybrid models (LFM2/LFM2.5) list ``"conv"`` entries in their
+        config's ``layer_types``.  Gemma-style models also carry
+        ``layer_types`` (``"sliding_attention"`` / ``"full_attention"``)
+        and must NOT classify as hybrid, hence the explicit ``"conv"`` check.
+        """
+        layer_types = self.model_args.get("layer_types") or ()
+        return "conv" in layer_types
+
+    @property
+    def has_state_layers(self) -> bool:
+        """Whether the model has per-request state (mamba/conv) layers."""
+        return self.is_hybrid or self.is_conv_hybrid
+
+    @property
     def merge_verify_windows(self) -> bool:
         """Whether spec-verify windows stay one cu_seqlens segment.
 
@@ -488,7 +505,7 @@ class MetalModelRunner:
         return (
             envs.VLLM_METAL_SPEC_VERIFY_WINDOW
             and not self.is_mla
-            and not self.is_hybrid
+            and not self.has_state_layers
             and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
         )
 
@@ -656,7 +673,7 @@ class MetalModelRunner:
 
         unsupported = (
             self._yoco_cache_mapping is not None
-            or self.is_hybrid
+            or self.has_state_layers
             or self.is_mla
             or self._is_pooling
             or self._is_vlm
@@ -1861,7 +1878,7 @@ class MetalModelRunner:
             scheduler_output,
             self._spec_decode_preflight_reqs(scheduler_output),
             paged_attention_enabled=self._paged_attention_runtime is not None,
-            is_hybrid=self.is_hybrid,
+            is_hybrid=self.has_state_layers,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
         )

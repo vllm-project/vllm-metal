@@ -320,6 +320,8 @@ class TestPagedAttentionPlanDiagnostics:
     def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_capacity"
             ),
@@ -366,6 +368,8 @@ class TestPagedAttentionPlanDiagnostics:
     def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
@@ -408,6 +412,8 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
@@ -440,6 +446,8 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
             num_layers=24,
             sdpa_layer_indices=list(range(6)),
@@ -478,6 +486,8 @@ class TestPagedAttentionPlanDiagnostics:
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
+            is_conv_hybrid=False,
+            has_state_layers=False,
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, memory_fraction=0.1)
@@ -517,7 +527,10 @@ class TestPagedAttentionPlanDiagnostics:
         expected_fraction: float,
     ) -> None:
         worker = _make_worker(
-            SimpleNamespace(is_hybrid=False), use_paged_attention=True
+            SimpleNamespace(
+                is_hybrid=False, is_conv_hybrid=False, has_state_layers=False
+            ),
+            use_paged_attention=True,
         )
         worker.metal_config.is_auto_memory = is_auto
         worker.metal_config.memory_fraction = memory_fraction
