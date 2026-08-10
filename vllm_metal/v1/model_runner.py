@@ -1211,6 +1211,7 @@ class MetalModelRunner:
                     input_ids,
                     cache=offset_caches,
                     model_config=self.model_config,
+                    segment_lengths=[len(pr.token_ids) for pr in prefill_reqs],
                 )
             elif use_mm_forward:
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(

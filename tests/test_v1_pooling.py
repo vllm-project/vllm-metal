@@ -20,6 +20,7 @@ from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
+from vllm_metal.v1.encoder_embeddings import MlxEmbeddingsEncoderModel  # noqa: E402
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
 
@@ -298,9 +299,48 @@ def _execute_pooling(runner, sched):
     return out
 
 
+def _encoder_hf_config(**overrides):
+    values = {
+        "architectures": ["XLMRobertaModel"],
+        "model_type": "xlm-roberta",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _encoder_pooling_model_config(**overrides):
+    values = {
+        "hf_config": _encoder_hf_config(),
+        "pooler_config": _pooler_config(task="embed", seq_pooling_type="CLS"),
+    }
+    values.update(overrides)
+    return _pooling_model_config(**values)
+
+
+class _FakeEncoderOutput:
+    def __init__(self, hidden_states: mx.array) -> None:
+        self.last_hidden_state = hidden_states
+
+
+class _FakeEncoderModule:
+    def __call__(self, input_ids, attention_mask=None):
+        del attention_mask
+        token_ids = np.array(input_ids).reshape(-1).tolist()
+        rows = [[float(tok), float(tok + 1), 1.0] for tok in token_ids]
+        return _FakeEncoderOutput(mx.array([rows], dtype=mx.float32))
+
+
 class TestMetalPoolingCapabilities:
     def test_supported_worker_tasks_for_last_text_embedding_model(self) -> None:
         runner = _make_runner()
+
+        assert runner.supported_worker_tasks() == ("embed",)
+
+    def test_supported_worker_tasks_for_encoder_cls_embedding_model(self) -> None:
+        runner = _make_runner(
+            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model_config=_encoder_pooling_model_config(),
+        )
 
         assert runner.supported_worker_tasks() == ("embed",)
 
@@ -434,6 +474,27 @@ class TestMetalPoolingRunnerOutput:
         assert out.pooler_output is not None
         _assert_embedding(out.pooler_output[0], 5)
         _assert_embedding(out.pooler_output[1], 9)
+
+    def test_paged_encoder_cls_embed_uses_first_token(self) -> None:
+        runner = _make_runner(
+            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model_config=_encoder_pooling_model_config(),
+        )
+        req_b = _new_req("req-b", [4, 5])
+        req_a = _new_req("req-a", [7, 8, 9])
+        sched = _scheduler_output(new_reqs=[req_b, req_a])
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, sched)
+
+        assert out.req_ids == ["req-b", "req-a"]
+        assert out.pooler_output is not None
+        # CLS uses the first token of each packed segment, not the last.
+        _assert_embedding(out.pooler_output[0], 4)
+        _assert_embedding(out.pooler_output[1], 7)
 
     def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(self) -> None:
         runner = _make_runner()
@@ -571,7 +632,10 @@ class TestMetalPoolingFailFast:
         )
         req = _new_req("req-0", [1, 2], task="embed")
 
-        with pytest.raises(NotImplementedError, match="decoder-style checkpoint"):
+        with pytest.raises(
+            NotImplementedError,
+            match="decoder-style embedding checkpoint or an encoder embedding",
+        ):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
     def test_pooling_requires_paged_attention(self) -> None:
@@ -583,13 +647,23 @@ class TestMetalPoolingFailFast:
 
     @pytest.mark.parametrize(
         "task",
-        ["token_embed", "token_classify", "plugin"],
+        ["token_embed", "plugin"],
     )
     def test_unsupported_pooling_tasks_fail_fast(self, task: str) -> None:
         runner = _make_runner()
         req = _new_req("req-0", [1, 2], task=task)
 
         with pytest.raises(NotImplementedError, match="task"):
+            runner.execute_model(_scheduler_output(new_reqs=[req]))
+
+    def test_token_classify_fail_fast_mentions_sparse_followup(self) -> None:
+        runner = _make_runner(
+            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model_config=_encoder_pooling_model_config(),
+        )
+        req = _new_req("req-0", [1, 2], task="token_classify")
+
+        with pytest.raises(NotImplementedError, match="sparse lexical weights"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
     def test_classify_hidden_state_shape_fails_fast(self) -> None:
