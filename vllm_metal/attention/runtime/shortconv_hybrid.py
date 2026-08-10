@@ -29,7 +29,6 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
-from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.impls.shortconv import (
@@ -37,8 +36,7 @@ from vllm_metal.attention.impls.shortconv import (
     is_shortconv,
 )
 from vllm_metal.attention.patching import walk_and_wrap
-from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-from vllm_metal.attention.state import HybridGDNStateManager
+from vllm_metal.attention.runtime.base import StateHybridRuntimeBase
 
 logger = init_logger(__name__)
 
@@ -68,12 +66,18 @@ def _build_shortconv_layer_spec(
     )
 
 
-class ShortConvHybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
+class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
     """Paged attention runtime for hybrid SDPA + ShortConv models.
 
     SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
     Conv layers: MLX-native state management (via ShortConvPagedWrapper)
+
+    Conv state is not block-keyed yet, so only ``none`` mode is supported;
+    align-mode conv caching would add the pooling layout and ``copy_blocks``
+    the GDN state cache already carries.
     """
+
+    SUPPORTED_MAMBA_CACHE_MODES = ("none",)
 
     def __init__(
         self,
@@ -96,15 +100,11 @@ class ShortConvHybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         k_quant: str | None = None,
         v_quant: str | None = None,
     ) -> None:
-        if mamba_cache_mode != "none":
-            raise NotImplementedError(
-                "conv hybrid paged attention does not support "
-                f"mamba_cache_mode={mamba_cache_mode!r} (only 'none'); "
-                "align-mode conv state caching is not implemented yet"
-            )
-        self._mamba_cache_mode = mamba_cache_mode
-        self._max_num_seqs = max_num_seqs
-        self._block_size = block_size
+        self._init_state_hybrid(
+            block_size=block_size,
+            max_num_seqs=max_num_seqs,
+            mamba_cache_mode=mamba_cache_mode,
+        )
         self._dtype = dtype
 
         # SDPA params
@@ -136,34 +136,11 @@ class ShortConvHybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 )
 
         self._cache = None
-        self._state_cache: ShortConvStateCache | None = None
-        self._state_manager: HybridGDNStateManager | None = None
-        self._scheduler_group_indices = (0,)
-        self._group_block_sizes = (block_size,)
 
     def initialize(self, num_blocks: int) -> None:
-        self._cache = MetalPagedKVCache(
-            num_layers=len(self._sdpa_indices),
-            num_kv_heads=self._num_kv_heads,
-            head_dim=self._head_dim,
-            num_blocks=num_blocks,
-            block_size=self._block_size,
-            dtype=self._dtype,
-            turboquant=self._turboquant,
-            k_quant=self._k_quant,
-            v_quant=self._v_quant,
-        )
+        self._init_sdpa_kv_cache(num_blocks)
 
-        # None mode keeps one slab per resident request and grows on demand.
-        self._state_cache = ShortConvStateCache(
-            num_layers=len(self._conv_indices),
-            max_seqs=self._max_num_seqs,
-            conv_kernel_dim=self._conv_kernel_dim,
-            conv_dim=self._conv_dim,
-            initial_seqs=0,
-            dtype=self._dtype,
-        )
-        self._state_manager = HybridGDNStateManager(self._state_cache)
+        self._initialize_state_lifecycle(num_blocks)
 
         logger.info(
             "ShortConv hybrid cache initialized: %d SDPA layers (%d blocks), "
@@ -175,45 +152,6 @@ class ShortConvHybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             self._state_cache.max_seqs,
             self._mamba_cache_mode,
         )
-
-    def adopt_scheduler_group(
-        self,
-        group_index: int,
-        block_size: int,
-        *,
-        state_group_indices: tuple[int, ...] = (),
-        layer_group_ordinals: list[int] | None = None,
-        layer_pool_ordinals: list[int] | None = None,
-    ) -> None:
-        """Select the vLLM scheduler group that owns SDPA KV blocks.
-
-        Conv hybrids run none mode, where conv state lives in a private
-        per-request slot pool rather than scheduler blocks, so the mamba
-        group arguments the GDN runtime consumes must stay empty here.
-        """
-        self._require_initialized("adopt_scheduler_group")
-        if block_size != self._block_size:
-            raise NotImplementedError(
-                "conv hybrid paged attention requires the SDPA scheduler group "
-                f"block size to stay {self._block_size}, got {block_size}"
-            )
-        if state_group_indices or layer_group_ordinals or layer_pool_ordinals:
-            raise NotImplementedError(
-                "conv hybrid paged attention does not consume scheduler mamba "
-                "cache groups (none mode keeps a private per-request pool)"
-            )
-        self._scheduler_group_indices = (group_index,)
-        self._group_block_sizes = (block_size,)
-
-    def kv_scheduler_group_indices(self) -> tuple[int, ...]:
-        """Return scheduler KV groups consumed by SDPA layers."""
-        self._require_initialized("kv_scheduler_group_indices")
-        return self._scheduler_group_indices
-
-    def kv_group_block_sizes(self) -> tuple[int, ...]:
-        """Return SDPA scheduler group page sizes."""
-        self._require_initialized("kv_group_block_sizes")
-        return self._group_block_sizes
 
     def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")
@@ -262,41 +200,14 @@ class ShortConvHybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def kv_cache(self) -> MetalPagedKVCache:
         return self._require_initialized("kv_cache")
 
-    @property
-    def state_cache(self) -> ShortConvStateCache:
-        if self._state_cache is None:
-            raise RuntimeError("state_cache accessed before initialize()")
-        return self._state_cache
-
-    @property
-    def state_manager(self) -> HybridGDNStateManager:
-        if self._state_manager is None:
-            raise RuntimeError("state_manager accessed before initialize()")
-        return self._state_manager
-
-    def needs_step_context(self) -> bool:
-        return True
-
-    def populate_step_context(
-        self,
-        *,
-        req_ids: list[str],
-        ctx: PagedAttentionContext,
-        state_block_ids: list[list[list[int]]] | None = None,
-        step_positions: list[tuple[int, int]] | None = None,
-    ) -> None:
-        self.state_manager.populate_step_context(
-            req_ids=req_ids,
-            ctx=ctx,
-            state_block_ids=state_block_ids,
-            step_positions=step_positions,
+    def _new_state_cache(
+        self, *, max_seqs: int, initial_seqs: int
+    ) -> ShortConvStateCache:
+        return ShortConvStateCache(
+            num_layers=len(self._conv_indices),
+            max_seqs=max_seqs,
+            conv_kernel_dim=self._conv_kernel_dim,
+            conv_dim=self._conv_dim,
+            initial_seqs=initial_seqs,
+            dtype=self._dtype,
         )
-
-    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        self.state_manager.extend_forward_eval_outputs(outputs)
-
-    def release_requests(self, req_ids: set[str]) -> None:
-        self.state_manager.release_requests(req_ids)
-
-    def materialize_pending_state(self) -> None:
-        self.state_manager.materialize_pending_state()
