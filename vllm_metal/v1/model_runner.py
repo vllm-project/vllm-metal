@@ -386,6 +386,10 @@ class MetalModelRunner:
         # model, not only the YOCO ones that install a real mapping.
         self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
 
+        # One-shot visibility guard: warn once when the body-only
+        # intermediate forward cannot resolve a transformer body.
+        self._warned_no_intermediate_body = False
+
     @property
     def is_mla(self) -> bool:
         """Whether the model uses Multi-head Latent Attention (MLA).
@@ -585,6 +589,24 @@ class MetalModelRunner:
         # forward (recv -> local layers -> final norm + head on the last stage);
         # the runner owns the downstream send (see the PP branch in the forward).
         self._pp_model = PipelinedModel(self._forward_model, pp)
+
+    def _transformer_body_for_intermediate(self) -> Any | None:
+        """Resolve the transformer body for a body-only intermediate forward.
+
+        Model-structure knowledge lives in the adapter; ``None`` (unknown
+        structure) keeps the full-logits forward — a safe fallback, logged
+        once so the lost lm_head skip is visible instead of silent.
+        """
+        forward_model = self._forward_model
+        body = self._model_adapter.transformer_body(forward_model)
+        if body is None and not self._warned_no_intermediate_body:
+            self._warned_no_intermediate_body = True
+            logger.warning(
+                "Metal: could not resolve a transformer body on %s; "
+                "intermediate prefill chunks run the full lm_head forward.",
+                type(forward_model).__name__,
+            )
+        return body
 
     def _submit_paged_forward_outputs(
         self,
@@ -1114,6 +1136,7 @@ class MetalModelRunner:
         logits: mx.array | None = None
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
+        intermediate_hidden: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
@@ -1183,14 +1206,40 @@ class MetalModelRunner:
                     pp_send_handle = pipeline_send(stage_output, self.pp)
                 target_hidden_states = None
             else:
-                target_output = self._target_forward(
-                    input_ids,
-                    cache=offset_caches,
-                    collect_hidden_states=collect_target_hidden_states,
+                # Intermediate-only prefill steps sample nothing: no chunk of
+                # theirs contributes a token, so the lm_head projection over
+                # the whole chunk (and the sampling sync) is pure waste. Run
+                # the transformer body only — the KV cache and GDN state
+                # writes are the step's real output — and let the graph
+                # evaluate under the next chunk's backpressure.
+                # Any installed drafter is excluded outright: propose() runs
+                # unconditional per-step bookkeeping (finished-id pruning,
+                # pending-draft resolution) that the no-logits short-circuit
+                # would skip, leaking per-request throttle state.
+                intermediate_only = (
+                    not decode_reqs
+                    and bool(prefill_reqs)
+                    and all(pr.prompt_len is None for pr in prefill_reqs)
+                    and self._drafter is None
                 )
-                logits = target_output.logits
-                target_hidden_states = target_output.hidden_states
-                del target_output
+                body = (
+                    self._transformer_body_for_intermediate()
+                    if intermediate_only
+                    else None
+                )
+                if body is not None:
+                    intermediate_hidden = body(input_ids, cache=offset_caches)
+                    logits = None
+                    target_hidden_states = None
+                else:
+                    target_output = self._target_forward(
+                        input_ids,
+                        cache=offset_caches,
+                        collect_hidden_states=collect_target_hidden_states,
+                    )
+                    logits = target_output.logits
+                    target_hidden_states = target_output.hidden_states
+                    del target_output
         finally:
             clear_context()
 
@@ -1198,6 +1247,10 @@ class MetalModelRunner:
         if has_pooling_work:
             assert pooling_hidden_states is not None
             self._submit_paged_forward_outputs(pooling_hidden_states)
+        elif intermediate_hidden is not None:
+            # Intermediate-only prefill: the KV/GDN cache writes are the real
+            # output; the hidden states force them through the lazy graph.
+            self._submit_paged_forward_outputs(intermediate_hidden)
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
             # the next stage, plus any runtime-owned forward side effects.
@@ -1346,7 +1399,23 @@ class MetalModelRunner:
             )
             return batch, scheduler_output
 
-        assert logits is not None
+        if logits is None:
+            # Intermediate-only prefill step (body-only forward): nothing to
+            # sample and nothing to wait for — outputs were pre-filled empty,
+            # and the forward evaluates under the next step's backpressure.
+            if decode_reqs or any(
+                entry.result_mode != "intermediate"
+                for entry in batch.paged_prefill_entries
+            ):
+                raise RuntimeError(
+                    "Forward produced no logits but the batch has rows that "
+                    "must sample — intermediate-only routing desynced."
+                )
+            for pr in prefill_reqs:
+                self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
+                    pr.token_ids
+                )
+            return batch, scheduler_output
 
         # ---- wait for MLX forward to complete ----
         # Only force logits here when something before sampling consumes them

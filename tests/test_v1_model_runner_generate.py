@@ -2739,3 +2739,332 @@ class TestDeferredDecodeSampleThreading:
         # Act / Assert
         with pytest.raises(RuntimeError, match="pure single-token decode batch"):
             runner._submit_deferred_decode_sample()
+
+
+def _body_stub(input_ids, cache=None):
+    return input_ids
+
+
+class TestIntermediateBodyResolution:
+    """_transformer_body_for_intermediate resolution chain."""
+
+    def test_resolves_text_model_body(self) -> None:
+        # Arrange
+        runner = make_stub_runner(model=SimpleNamespace(model=_body_stub))
+
+        # Act / Assert
+        assert runner._transformer_body_for_intermediate() is _body_stub
+
+    def test_resolves_language_model_body_for_wrapped_text_model(self) -> None:
+        # Arrange
+        model = SimpleNamespace(language_model=SimpleNamespace(model=_body_stub))
+        runner = make_stub_runner(model=model)
+
+        # Act / Assert
+        assert runner._transformer_body_for_intermediate() is _body_stub
+
+    def test_unresolvable_body_warns_once_and_returns_none(self, caplog) -> None:
+        # Arrange — no .model on either level: the fallback must be visible.
+        runner = make_stub_runner(model=SimpleNamespace())
+
+        # Act
+        with caplog.at_level("WARNING"):
+            first = runner._transformer_body_for_intermediate()
+            second = runner._transformer_body_for_intermediate()
+
+        # Assert
+        assert first is None
+        assert second is None
+        warnings_ = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings_) == 1
+        assert warnings_[0].getMessage() == (
+            "Metal: could not resolve a transformer body on SimpleNamespace; "
+            "intermediate prefill chunks run the full lm_head forward."
+        )
+
+
+class TestIntermediateBodyOnlyForward:
+    """Intermediate-only prefill chunks run the transformer body only."""
+
+    def _intermediate_prefill_request(
+        self, req_id: str = "r0", start_pos: int = 0
+    ) -> mr.PrefillRequest:
+        return mr.PrefillRequest(
+            req_id=req_id,
+            token_ids=[5, 6],
+            sampling_params=SamplingParams(),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=None,
+            start_pos=start_pos,
+            full_prompt_token_ids=None,
+        )
+
+    def _make_scheduler_output(
+        self, num_scheduled_tokens: dict[str, int] | None = None
+    ) -> SchedulerOutput:
+        scheduled = (
+            num_scheduled_tokens if num_scheduled_tokens is not None else {"r0": 2}
+        )
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens=scheduled,
+            total_num_scheduled_tokens=sum(scheduled.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=0,
+        )
+
+    def test_intermediate_only_step_runs_body_and_skips_lm_head(
+        self, monkeypatch
+    ) -> None:
+        # Arrange
+        captured: dict[str, object] = {}
+        hidden = mx.zeros((1, 2, 8))
+
+        def body(input_ids, cache=None):
+            captured["body_input_ids"] = input_ids.tolist()
+            return hidden
+
+        runner = make_stub_runner(model=SimpleNamespace(model=body))
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+
+        def unexpected_target_forward(*args, **kwargs):
+            raise AssertionError("intermediate-only step must not run lm_head")
+
+        def record_submit(*outputs):
+            captured["submitted"] = outputs
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", unexpected_target_forward)
+        monkeypatch.setattr(runner, "_submit_paged_forward_outputs", record_submit)
+
+        # Act
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[self._intermediate_prefill_request()],
+            decode_reqs=[],
+            scheduler_output=self._make_scheduler_output(),
+        )
+
+        # Assert — the body ran on the chunk tokens, its hidden states were
+        # submitted (forcing the KV/GDN cache writes through the lazy graph),
+        # and no logits exist for the sampling step.
+        assert captured["body_input_ids"] == [[5, 6]]
+        assert any(out is hidden for out in captured["submitted"])
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.logits is None
+        assert state.target_hidden_states is None
+        assert state.cu_seqlens == [0, 2]
+
+    @pytest.mark.parametrize("case", ["final_prefill", "with_decode", "drafter"])
+    def test_non_intermediate_only_steps_run_full_forward(
+        self, monkeypatch, case
+    ) -> None:
+        # A final chunk, a decode row, or any installed drafter (its
+        # propose() bookkeeping must run every step) keeps the full forward.
+        # Arrange
+        captured: dict[str, object] = {}
+
+        def body(input_ids, cache=None):
+            raise AssertionError("body-only path must not run on this step")
+
+        runner = make_stub_runner(model=SimpleNamespace(model=body))
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        prefill_reqs = [self._intermediate_prefill_request()]
+        decode_reqs: list[tuple[str, mr.RequestState]] = []
+        scheduled = {"r0": 2}
+        if case == "final_prefill":
+            final = mr.PrefillRequest(
+                req_id="r1",
+                token_ids=[7, 8],
+                sampling_params=SamplingParams(),
+                block_ids=[[1]],
+                generator=None,
+                prompt_len=2,
+                start_pos=0,
+                full_prompt_token_ids=[7, 8],
+            )
+            prefill_reqs.append(final)
+            scheduled["r1"] = 2
+        elif case == "with_decode":
+            state = mr.RequestState(
+                token_ids=[3, 9],
+                prompt_len=1,
+                cache=[],
+                sampling_params=SamplingParams(temperature=0.0),
+                generator=None,
+                generated_tokens=1,
+                block_ids=[[2]],
+            )
+            decode_reqs = [("d0", state)]
+            runner._paged_request_seq_lens = {"d0": 1}
+            scheduled["d0"] = 1
+        else:
+            runner._drafter = SimpleNamespace(
+                needs_target_hidden_states=lambda decode_segments, has_final_prefill: (
+                    False
+                )
+            )
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            captured["full_forward_tokens"] = input_ids.tolist()
+            num_tokens = input_ids.shape[1]
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, num_tokens, 16)),
+                hidden_states=None,
+            )
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        # Act
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=prefill_reqs,
+            decode_reqs=decode_reqs,
+            scheduler_output=self._make_scheduler_output(scheduled),
+        )
+
+        # Assert
+        assert "full_forward_tokens" in captured
+        state_after = runner._execute_model_state
+        assert state_after is not None
+        assert state_after.logits is not None
+
+    def test_drafter_needing_hidden_states_forces_full_forward(
+        self, monkeypatch
+    ) -> None:
+        # A drafter that wants target hidden states from this step excludes
+        # the body-only path even when every chunk is intermediate — the
+        # hidden states only exist on the full forward.
+        # Arrange
+        captured: dict[str, object] = {}
+
+        def body(input_ids, cache=None):
+            raise AssertionError("body-only path must not run for the drafter")
+
+        runner = make_stub_runner(model=SimpleNamespace(model=body))
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._drafter = SimpleNamespace(
+            needs_target_hidden_states=lambda decode_segments, has_final_prefill: True
+        )
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache
+            captured["collect_hidden_states"] = collect_hidden_states
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 2, 16)),
+                hidden_states=mx.zeros((1, 2, 8)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        # Act
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[self._intermediate_prefill_request()],
+            decode_reqs=[],
+            scheduler_output=self._make_scheduler_output(),
+        )
+
+        # Assert
+        assert captured["collect_hidden_states"] is True
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.target_hidden_states is not None
+
+    def _no_logits_state(
+        self,
+        batch: mr._ExecutionBatch,
+        prefill_reqs: list[mr.PrefillRequest],
+        decode_reqs: list[tuple[str, mr.RequestState]],
+    ) -> mr._PagedForwardState:
+        return mr._PagedForwardState(
+            batch=batch,
+            prefill_reqs=prefill_reqs,
+            decode_reqs=decode_reqs,
+            scheduler_output=self._make_scheduler_output(),
+            logits=None,
+            target_hidden_states=None,
+            pooling_hidden_states=None,
+            cu_seqlens=[0, 2],
+            decode_segments=[],
+            num_decode_tokens=len(decode_reqs),
+            mm_prefill_deltas={},
+        )
+
+    def test_sample_paged_batch_books_seq_lens_without_logits(self) -> None:
+        # Arrange — a continuation chunk (start_pos=3) stashes logits=None;
+        # sampling must advance the seq len exactly like the full path
+        # (start_pos + chunk length) and leave the pre-filled empty output.
+        runner = make_stub_runner(model=SimpleNamespace())
+        request = self._intermediate_prefill_request(start_pos=3)
+        batch = mr._ExecutionBatch()
+        output_idx = batch.add_output("r0", [])
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(
+                output_idx=output_idx,
+                prefill=request,
+                result_mode="intermediate",
+            )
+        )
+        runner._paged_request_seq_lens = {"r0": 3}
+        runner._execute_model_state = self._no_logits_state(batch, [request], [])
+
+        # Act
+        result_batch, _ = runner._sample_paged_batch()
+
+        # Assert
+        assert result_batch.sampled_tokens == [[]]
+        assert runner._paged_request_seq_lens["r0"] == 5
+
+    def test_sample_paged_batch_rejects_final_rows_without_logits(self) -> None:
+        # Arrange — a final chunk must sample; reaching the no-logits path
+        # with one is a routing desync, not a case to book silently.
+        runner = make_stub_runner(model=SimpleNamespace())
+        request = self._intermediate_prefill_request()
+        batch = mr._ExecutionBatch()
+        output_idx = batch.add_output("r0", [])
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(
+                output_idx=output_idx,
+                prefill=request,
+                result_mode="new_final",
+            )
+        )
+        runner._execute_model_state = self._no_logits_state(batch, [request], [])
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="must sample"):
+            runner._sample_paged_batch()
+
+    def test_sample_paged_batch_rejects_decode_rows_without_logits(self) -> None:
+        # Arrange
+        runner = make_stub_runner(model=SimpleNamespace())
+        state = mr.RequestState(
+            token_ids=[3, 9],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            generated_tokens=1,
+        )
+        runner._execute_model_state = self._no_logits_state(
+            mr._ExecutionBatch(), [], [("d0", state)]
+        )
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="must sample"):
+            runner._sample_paged_batch()

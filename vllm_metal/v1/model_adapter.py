@@ -130,6 +130,9 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
+    def transformer_body(self, model: Any) -> Any | None:
+        """Return the transformer body (no lm_head) of *model*, or ``None``."""
+
     def target_forward(
         self,
         model: Any,
@@ -350,6 +353,16 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         if hasattr(model, "language_model"):
             return model.language_model
         return model
+
+    def transformer_body(self, model: Any) -> Any | None:
+        """Return the transformer body (no lm_head) of *model*, or ``None``.
+
+        mlx_lm text models expose it at ``model.model``; conditional-
+        generation wrappers served text-only nest it under the
+        ``language_model`` sub-model that :meth:`text_model` resolves.
+        """
+        body = getattr(self.text_model(model), "model", None)
+        return body if callable(body) else None
 
     def target_forward(
         self,
