@@ -140,6 +140,9 @@ def _runner(adapter: _MmAdapter, *, num_layers: int = 1):
 def _scheduler_output() -> MagicMock:
     out = MagicMock()
     out.scheduled_spec_decode_tokens = {}
+    # Real SchedulerOutput defaults this to None; a bare MagicMock attribute
+    # would be truthy and send the runner down the block-copy path.
+    out.kv_cache_block_copies = None
     return out
 
 

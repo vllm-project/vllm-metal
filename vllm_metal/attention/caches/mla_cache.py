@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 
 
@@ -39,3 +41,19 @@ class MLAPagedLatentCache:
         ]
         # Force allocation so Metal buffers exist before use
         mx.eval(*self.latent_caches)
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler copy-on-write operations to latent-cache blocks."""
+        if not block_copies:
+            return
+
+        src_ids, dst_ids = zip(*block_copies, strict=True)
+        if any(
+            block_id < 0 or block_id >= self.num_blocks
+            for block_id in (*src_ids, *dst_ids)
+        ):
+            raise RuntimeError("paged MLA block copy contains an out-of-range block id")
+        src = mx.array(src_ids, dtype=mx.int32)
+        dst = mx.array(dst_ids, dtype=mx.int32)
+        for cache in self.latent_caches:
+            cache[dst] = cache[src]

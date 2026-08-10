@@ -253,6 +253,7 @@ def _scheduler_output(
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=None,
+        kv_cache_block_copies=None,
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         finished_req_ids=set(),

@@ -1034,73 +1034,13 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    @pytest.mark.parametrize(
-        "cache_config,err_match",
-        [
-            (
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="none",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-                "Prefix caching",
-            ),
-            (
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=False,
-                    mamba_cache_mode="all",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-                "Mamba cache modes",
-            ),
-        ],
-        ids=["prefix_caching", "mamba_cache_mode"],
-    )
-    def test_check_and_update_config_rejects_hybrid_state_cache_modes(
+    def _hybrid_vllm_config(
         self,
         cache_config: SimpleNamespace,
-        err_match: str,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
-        reset_config()
-        try:
-            vllm_config = self._hybrid_vllm_config(cache_config)
-
-            with pytest.raises(NotImplementedError, match=err_match):
-                MetalPlatform.check_and_update_config(vllm_config)
-        finally:
-            reset_config()
-
-    @pytest.mark.parametrize(
-        ("dtype", "reject"),
-        [("auto", False), ("float16", True), ("bfloat16", True)],
-    )
-    def test_check_and_update_config_hybrid_gdn_state_dtype(
-        self, dtype: str, reject: bool, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        cache_config = CacheConfig(
-            enable_prefix_caching=False, mamba_ssm_cache_dtype=dtype
-        )
-        vllm_config = self._hybrid_vllm_config(cache_config)
-
-        if reject:
-            with pytest.raises(NotImplementedError, match="require.*float32"):
-                MetalPlatform.check_and_update_config(vllm_config)
-        else:
-            self._patch_stt_resolution(monkeypatch, is_stt=False)
-            MetalPlatform.check_and_update_config(vllm_config)
-            assert cache_config.mamba_ssm_cache_dtype == "float32"
-
-    @staticmethod
-    def _hybrid_vllm_config(cache_config: object) -> SimpleNamespace:
+        speculative_config: SimpleNamespace | None = None,
+    ) -> SimpleNamespace:
         return SimpleNamespace(
-            speculative_config=None,
+            speculative_config=speculative_config,
             lora_config=None,
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
@@ -1124,8 +1064,115 @@ class TestMetalPlatform:
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=2048,
                 max_num_scheduled_tokens=None,
+                long_prefill_token_threshold=0,
             ),
         )
+
+    @pytest.mark.parametrize(
+        "paged,cache_config,speculative,err_match",
+        [
+            (
+                "0",
+                SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                None,
+                "requires paged",
+            ),
+            (
+                "1",
+                SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="all",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                None,
+                "mamba_cache_mode='all'",
+            ),
+            (
+                "1",
+                SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                SimpleNamespace(
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=2,
+                ),
+                "speculative decoding",
+            ),
+        ],
+        ids=["prefix_caching_non_paged", "mamba_cache_mode_all", "prefix_and_sd"],
+    )
+    def test_check_and_update_config_rejects_unsupported_hybrid_cache_modes(
+        self,
+        paged: str,
+        cache_config: SimpleNamespace,
+        speculative: SimpleNamespace | None,
+        err_match: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                cache_config, speculative_config=speculative
+            )
+            with pytest.raises(NotImplementedError, match=err_match):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_accepts_hybrid_align_prefix_caching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Paged hybrid + prefix caching (align mode) passes config checks."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=None,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+            )
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        ("dtype", "reject"),
+        [("auto", False), ("float16", True), ("bfloat16", True)],
+    )
+    def test_check_and_update_config_hybrid_gdn_state_dtype(
+        self, dtype: str, reject: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache_config = CacheConfig(
+            enable_prefix_caching=False, mamba_ssm_cache_dtype=dtype
+        )
+        vllm_config = self._hybrid_vllm_config(cache_config)
+
+        if reject:
+            with pytest.raises(NotImplementedError, match="require.*float32"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        else:
+            self._patch_stt_resolution(monkeypatch, is_stt=False)
+            MetalPlatform.check_and_update_config(vllm_config)
+            assert cache_config.mamba_ssm_cache_dtype == "float32"
 
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch

@@ -57,6 +57,8 @@ def make_stub_runner(
         "_paged_block_size": 0,
         "_paged_scheduler_group_indices": (),
         "_paged_group_block_sizes": (),
+        "_paged_state_group_indices": (),
+        "_state_block_ids_by_req": {},
         "_request_states": {},
         "_paged_request_seq_lens": {},
         "_pending_output": None,

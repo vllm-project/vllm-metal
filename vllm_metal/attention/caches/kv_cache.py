@@ -17,6 +17,8 @@ Block allocation is managed externally by the scheduler's KV cache manager.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 from vllm.logger import init_logger
 
@@ -323,6 +325,35 @@ class MetalPagedKVCache:
             shape = self._layout.layers[shared_layer].cache_shape(self.num_blocks)
             self.key_caches[shared_layer] = key_cache.reshape(shape)
             self.value_caches[shared_layer] = value_cache.reshape(shape)
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler copy-on-write operations to physical KV blocks."""
+        if not block_copies:
+            return
+
+        src_ids, dst_ids = zip(*block_copies, strict=True)
+        if any(
+            block_id < 0 or block_id >= self.num_blocks
+            for block_id in (*src_ids, *dst_ids)
+        ):
+            raise RuntimeError("paged KV block copy contains an out-of-range block id")
+
+        src = mx.array(src_ids, dtype=mx.int32)
+        dst = mx.array(dst_ids, dtype=mx.int32)
+        if self._layout is None:
+            arrays = [*self.key_caches, *self.value_caches]
+            if self.turboquant:
+                arrays.extend(self.key_scale_caches)
+                arrays.extend(self.value_scale_caches)
+                arrays.extend(self.key_zero_caches)
+        else:
+            # Logical layer views can share one upstream tensor slot. Copy the
+            # physical arrays once instead of repeating the same write through
+            # every alias.
+            arrays = [*self._key_slots, *self._value_slots]
+
+        for array in arrays:
+            array[dst] = array[src]
 
     _DTYPE_SIZES = {
         mx.float16: 2,

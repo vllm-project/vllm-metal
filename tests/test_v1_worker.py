@@ -326,6 +326,7 @@ class TestPagedAttentionPlanDiagnostics:
             profile_run=MagicMock(return_value=3_900_000_000),
             validate_paged_attention_support=MagicMock(),
             scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         worker = _make_worker(runner, use_paged_attention=True)
@@ -365,6 +366,7 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         planner = self._make_planner(
@@ -405,6 +407,7 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
         )
         planner = self._make_planner(
@@ -428,6 +431,45 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.hybrid_gdn_reservation.reserved_slots == 1
         assert plan.hybrid_gdn_reservation.total_bytes == 64_400_000
         assert plan.num_blocks == 34
+
+    def test_align_plan_budgets_one_old_physical_pool_for_growth(
+        self, monkeypatch
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            cache_config=SimpleNamespace(mamba_cache_mode="align"),
+            num_layers=24,
+            sdpa_layer_indices=list(range(6)),
+            # 18 logical GDN layers at 100 bytes per layer/slot. Striping
+            # produces six physical pools: 600 steady bytes per block plus
+            # one 100-byte old pool retained during growth.
+            linear_cache_bytes_per_slot=MagicMock(return_value=1_800),
+        )
+        planner = self._make_planner(
+            runner,
+            memory_fraction=1.0,
+            per_block_bytes=100,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 1_000,
+        )
+
+        plan = planner._paged_attention_plan(
+            overhead=1_000,
+            require_min_blocks=False,
+        )
+
+        assert plan.per_block_bytes == 800
+        assert plan.hybrid_gdn_reservation.total_bytes == 0
+        assert plan.kv_budget == 8_000
+        assert plan.num_blocks == 10
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(is_hybrid=False)

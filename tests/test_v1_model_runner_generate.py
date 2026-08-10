@@ -42,7 +42,10 @@ class HybridRuntimeStub:
     def gdn_state_manager(self) -> HybridGDNStateManager:
         return self._gdn_state_manager
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
+    ) -> None:
+        del state_block_ids, step_positions
         self._gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
@@ -62,8 +65,10 @@ class ForwardOutputRuntimeStub:
     def needs_step_context(self) -> bool:
         return False
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
-        del req_ids, ctx
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
+    ) -> None:
+        del req_ids, ctx, state_block_ids, step_positions
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         outputs.extend(self._arrays)
@@ -569,6 +574,43 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state is not None
         assert runner._execute_model_state.target_hidden_states is None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
+
+    def test_start_paged_forward_applies_cow_before_step_context(
+        self, monkeypatch
+    ) -> None:
+        runtime = Mock()
+        runtime.needs_step_context.return_value = True
+        runner = self._make_runner()
+        runner._paged_attention_runtime = runtime
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_group_block_sizes = (4,)
+        runner._paged_request_seq_lens["r0"] = 1
+        monkeypatch.setattr(
+            runner,
+            "_target_forward",
+            lambda *args, **kwargs: mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 16))
+            ),
+        )
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [[0, 1]]
+        scheduler_output = self._make_scheduler_output({"r0": 1}, {})
+        scheduler_output.kv_cache_block_copies = [(2, 6)]
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        runtime.copy_blocks.assert_called_once_with([(2, 6)])
+        method_order = [call[0] for call in runtime.mock_calls]
+        assert method_order.index("copy_blocks") < method_order.index(
+            "populate_step_context"
+        )
 
     def test_start_paged_forward_clears_context_on_gdn_slot_error(self) -> None:
         state_cache = GDNPagedStateCache(
@@ -1597,8 +1639,10 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._submit_paged_forward_outputs(logits)
 
         assert len(submitted) == 1
-        assert submitted[0][1] is pending_conv
-        assert submitted[0][2] is pending_recurrent
+        # Pending compact updates ride the submission; stable pool arrays may
+        # accompany them (shared pools carry sibling layers' state).
+        assert any(a is pending_conv for a in submitted[0])
+        assert any(a is pending_recurrent for a in submitted[0])
         assert cache.has_pending_conv_state(0)
         assert cache.has_pending_recurrent_state(0)
 
@@ -3068,3 +3112,96 @@ class TestIntermediateBodyOnlyForward:
         # Act / Assert
         with pytest.raises(RuntimeError, match="must sample"):
             runner._sample_paged_batch()
+
+
+class TestStateBlockIdLifecycle:
+    """Track the mamba group rows that the align runtime keys on."""
+
+    def _make_runner(self) -> mr.MetalModelRunner:
+        return make_stub_runner(
+            _paged_attention_runtime=ForwardOutputRuntimeStub([]),
+            _paged_scheduler_group_indices=(3,),
+            _paged_state_group_indices=(0, 1, 2),
+        )
+
+    def _new_req(self, req_id: str, *, num_computed_tokens: int = 0) -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=[1, 2, 3, 4, 5, 6],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11], [20, 21], [30, 31], [40, 41]),
+            num_computed_tokens=num_computed_tokens,
+            lora_request=None,
+        )
+
+    def test_admission_tracks_mamba_groups_and_restore_pos(self) -> None:
+        runner = self._make_runner()
+        batch = mr._ExecutionBatch()
+
+        runner._handle_new_requests(
+            batch,
+            [self._new_req("hit", num_computed_tokens=2)],  # prefix-hit admission
+            SimpleNamespace(num_scheduled_tokens={"hit": 2}),
+        )
+
+        assert runner._state_block_ids_by_req["hit"] == [
+            [10, 11],
+            [20, 21],
+            [30, 31],
+        ]
+        entry = batch.paged_prefill_entries[0]
+        assert entry.prefill.start_pos == 2  # restore position, not zero
+
+    def test_cached_append_extends_every_mamba_group(self) -> None:
+        runner = self._make_runner()
+        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            block_ids=[[40]],
+        )
+
+        runner._update_cached_request_blocks(
+            CachedRequestData(
+                req_ids=["r"],
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[([12], [22], [32], [42])],
+                num_computed_tokens=[1],
+                num_output_tokens=[0],
+            )
+        )
+
+        assert runner._state_block_ids_by_req["r"] == [[10, 12], [20, 22], [30, 32]]
+        assert runner._request_states["r"].block_ids == [[40, 42]]
+
+    def test_resume_replaces_the_whole_table(self) -> None:
+        runner = self._make_runner()
+        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(),
+            block_ids=[[40]],
+        )
+
+        runner._update_cached_request_blocks(
+            CachedRequestData(
+                req_ids=["r"],
+                resumed_req_ids={"r"},
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[([50], [60], [70], [80])],
+                num_computed_tokens=[0],
+                num_output_tokens=[0],
+            )
+        )
+
+        assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
+        assert runner._request_states["r"].block_ids == [[80]]

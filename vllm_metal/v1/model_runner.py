@@ -342,7 +342,14 @@ class MetalModelRunner:
         self._paged_block_size: int = 0
         self._paged_scheduler_group_indices: tuple[int, ...] = ()
         self._paged_group_block_sizes: tuple[int, ...] = ()
+        self._paged_state_group_indices: tuple[int, ...] = ()
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
+        # req_id → per-mamba-group scheduler block ids; keys GDN state slabs
+        # for hybrid models (empty for runtimes without state groups).  Not a
+        # RequestState field: align populate needs these before the forward,
+        # and a single-chunk request's RequestState exists only after it —
+        # this dict spans admission through completion for every shape.
+        self._state_block_ids_by_req: dict[str, list[list[int]]] = {}
         self.kv_cache_dtype: mx.Dtype | None = None
 
         # Layer counts derived from the model config by ModelLifecycle after
@@ -756,22 +763,36 @@ class MetalModelRunner:
         self._paged_block_size = block_size
         self._paged_scheduler_group_indices = backend.kv_scheduler_group_indices()
         self._paged_group_block_sizes = backend.kv_group_block_sizes()
+        self._paged_state_group_indices = backend.state_scheduler_group_indices()
 
     def _copy_paged_block_ids(
         self, block_ids: Sequence[Sequence[int]]
     ) -> list[list[int]]:
         """Copy scheduler cache groups owned by the installed paged runtime."""
+        return self._copy_group_block_ids(
+            block_ids, self._paged_scheduler_group_indices
+        )
+
+    def _copy_state_block_ids(
+        self, block_ids: Sequence[Sequence[int]]
+    ) -> list[list[int]]:
+        """Copy scheduler state (mamba) groups owned by the paged runtime."""
+        return self._copy_group_block_ids(block_ids, self._paged_state_group_indices)
+
+    def _copy_group_block_ids(
+        self,
+        block_ids: Sequence[Sequence[int]],
+        group_indices: tuple[int, ...],
+    ) -> list[list[int]]:
         missing_group_indices = [
-            index
-            for index in self._paged_scheduler_group_indices
-            if index >= len(block_ids)
+            index for index in group_indices if index >= len(block_ids)
         ]
         if missing_group_indices:
             raise ValueError(
                 "scheduler block_ids does not include required cache groups "
                 f"{missing_group_indices}"
             )
-        return [list(block_ids[index]) for index in self._paged_scheduler_group_indices]
+        return [list(block_ids[index]) for index in group_indices]
 
     def install_gemma4_mtp_kv_sharing(
         self,
@@ -1150,10 +1171,44 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            if runtime is not None and scheduler_output.kv_cache_block_copies:
+                # vLLM has already rewritten request block tables to the CoW
+                # destinations. Populate those physical blocks before the
+                # hybrid state manager reads the rewritten tables.
+                runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
-                runtime.populate_step_context(req_ids=step_req_ids, ctx=ctx)
+                step_state_ids: list[list[list[int]]] | None = None
+                step_positions: list[tuple[int, int]] | None = None
+                if self._paged_state_group_indices:
+                    try:
+                        step_state_ids = [
+                            self._state_block_ids_by_req[req_id]
+                            for req_id in step_req_ids
+                        ]
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            f"no mamba block ids tracked for request {exc}; "
+                            "scheduler admission and state tracking are out "
+                            "of sync"
+                        ) from exc
+                    # (num_computed, num_scheduled) per request, decode rows
+                    # first — same order as step_req_ids (decode_segments is
+                    # built by iterating decode_reqs).
+                    step_positions = [
+                        (segment.cache_start_pos, segment.num_query_tokens)
+                        for segment in decode_segments
+                    ]
+                    step_positions.extend(
+                        (pr.start_pos, len(pr.token_ids)) for pr in prefill_reqs
+                    )
+                runtime.populate_step_context(
+                    req_ids=step_req_ids,
+                    ctx=ctx,
+                    state_block_ids=step_state_ids,
+                    step_positions=step_positions,
+                )
 
             # ---- forward (lazy graph + async submit) ----
             offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
@@ -2044,6 +2099,10 @@ class MetalModelRunner:
 
             if self._paged_attention_runtime is not None:
                 sched_block_ids = self._copy_paged_block_ids(new_req.block_ids)
+                if self._paged_state_group_indices:
+                    self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
+                        new_req.block_ids
+                    )
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
@@ -2127,6 +2186,10 @@ class MetalModelRunner:
                     else []
                 ),
             )
+            if self._paged_state_group_indices and new_req.block_ids:
+                self._state_block_ids_by_req[new_req.req_id] = (
+                    self._copy_state_block_ids(new_req.block_ids)
+                )
 
         cached = scheduler_output.scheduled_cached_reqs
         if not cached.new_token_ids:
@@ -2164,10 +2227,20 @@ class MetalModelRunner:
                         self._copy_paged_block_ids(new_block_ids)
                     ):
                         state.block_ids[group_index].extend(group_block_ids)
+                    if self._paged_state_group_indices:
+                        req_state_ids = self._state_block_ids_by_req[req_id]
+                        for group_index, group_block_ids in enumerate(
+                            self._copy_state_block_ids(new_block_ids)
+                        ):
+                            req_state_ids[group_index].extend(group_block_ids)
                 continue
 
             assert new_block_ids is not None
             state.block_ids = self._copy_paged_block_ids(new_block_ids)
+            if self._paged_state_group_indices:
+                self._state_block_ids_by_req[req_id] = self._copy_state_block_ids(
+                    new_block_ids
+                )
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
 
@@ -2398,6 +2471,7 @@ class MetalModelRunner:
 
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
+            self._state_block_ids_by_req.pop(req_id, None)
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:

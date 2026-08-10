@@ -155,9 +155,13 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        if ctx.gdn_slot_mapping is None:
+        if ctx.gdn_group_slot_mappings is not None:
+            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
+            slot_ids = ctx.gdn_group_slot_mappings[ordinal]
+        elif ctx.gdn_slot_mapping is not None:
+            slot_ids = ctx.gdn_slot_mapping
+        else:
             raise RuntimeError("GDN wrapper requires gdn_slot_mapping in context")
-        slot_ids = ctx.gdn_slot_mapping
         if len(slot_ids) != num_requests:
             raise RuntimeError("GDN wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):
@@ -250,7 +254,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             else:
                 cs = state_cache.conv_states[cache_idx]
                 cs[slot : slot + 1] = new_conv
-                state_cache.conv_states[cache_idx] = cs
+                state_cache.store_conv_state(cache_idx, cs)
 
             conv_out = nn.silu(inner.conv1d(conv_input))
             # Take only the output tokens (not the conv state prefix)
