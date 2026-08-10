@@ -36,6 +36,7 @@ validation guidance. The reranker requires Qwen3 sequence-classification
 | --- | --- | --- | --- |
 | Qwen3-Embedding | 🔵 | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
 | Qwen3-Reranker | 🔵 | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
+| BGE-M3 / XLM-RoBERTa | 🔵 | `pooling` / dense `embed` only (`vllm-metal[embeddings]`) | `mlx-community/bge-m3-mlx-8bit` |
 
 ## Multimodal Language Models
 

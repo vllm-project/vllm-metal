@@ -81,15 +81,21 @@ stt = [
     "librosa>=0.10.2",
     "numba>=0.59.0",  # Required by librosa on Python 3.12+
 ]
+embeddings = [
+    # Encoder embedding models (XLM-RoBERTa / BGE-M3 dense embed). Required for
+    # mlx-community BGE-M3 checkpoints; sparse token_classify is a follow-up.
+    "mlx-embeddings>=0.1.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=0.21.0",
     "ruff==0.16.0",
     "mypy>=1.19.1",
     "gguf>=0.17.0",
+    "mlx-embeddings>=0.1.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 all = [
-    "vllm-metal[gguf,stt,dev]",
+    "vllm-metal[gguf,stt,embeddings,dev]",
 ]
 
 [project.urls]

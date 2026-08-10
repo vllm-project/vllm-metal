@@ -21,20 +21,30 @@ Current scope is intentionally narrow:
   `Qwen3ForSequenceClassification`, `classifier_from_token=["no", "yes"]`,
   and `is_original_qwen3_reranker=True`
 - decoder-style text models that expose token hidden states through the MLX
-  transformer body
-- sequence embeddings from the final prompt-token hidden state with LAST
-  pooling and L2 normalization on the paged Metal V1 path
+  transformer body (LAST pooling)
+- encoder embedding checkpoints loaded through optional `mlx-embeddings`
+  (`XLMRobertaModel` / `RobertaEmbeddingModel` / `BgeM3EmbeddingModel`), with
+  CLS pooling and L2 normalization for dense vectors
 - Qwen3 reranker cross-encoder scores from the final prompt-token hidden state,
   using `lm_head` for untied checkpoints or `embed_tokens.as_linear` when word
   embeddings are tied
+
+Install the encoder path with:
+
+```bash
+pip install "vllm-metal[embeddings]"
+```
 
 ## Unsupported
 
 The Metal runner rejects these cases with diagnostic errors:
 
 - generic classification heads, generic reranking models, and late interaction
-- sequence pooling strategies other than LAST (`MEAN`, `CLS`, `ALL`, `STEP`)
-- token-level pooling
+- sequence pooling strategies other than LAST for decoder embed models, and
+  other than CLS/LAST for encoder embed models (`MEAN`, `ALL`, `STEP`)
+- token-level pooling, including BGE-M3 sparse `token_classify` lexical weights
+  (tracked as a follow-up to
+  [#589](https://github.com/vllm-project/vllm-metal/issues/589))
 - chunked long-input embedding aggregation (`enable_chunked_processing`)
 - non-paged pooling execution
 - multimodal embeddings and scheduled encoder inputs
@@ -56,6 +66,20 @@ from vllm import LLM
 
 llm = LLM(
     model="mlx-community/Qwen3-Embedding-0.6B-8bit",
+    runner="pooling",
+    max_model_len=512,
+)
+outputs = llm.embed(["hello metal", "semantic search"])
+print(len(outputs), len(outputs[0].outputs.embedding))
+```
+
+Dense BGE-M3 / XLM-RoBERTa (requires `vllm-metal[embeddings]`):
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="mlx-community/bge-m3-mlx-8bit",
     runner="pooling",
     max_model_len=512,
 )

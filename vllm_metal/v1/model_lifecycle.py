@@ -19,6 +19,10 @@ from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
+from vllm_metal.v1.encoder_embeddings import (
+    load_mlx_embeddings_model,
+    requires_mlx_embeddings_load,
+)
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -215,6 +219,14 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
+        elif requires_mlx_embeddings_load(model_config):
+            load_label = "MLX-Embeddings model"
+            model, tokenizer = self._load_mlx_embeddings_model(
+                model_name,
+                tokenizer_config,
+                lazy=lazy_weights,
+            )
+
         else:
             load_label = "MLX-LM model"
             model, tokenizer = self._load_mlx_lm_text_model(
@@ -280,6 +292,19 @@ class ModelLifecycle:
                 lazy=lazy,
             )
         return model, tokenizer
+
+    def _load_mlx_embeddings_model(
+        self,
+        model_name: str,
+        tokenizer_config: Mapping[str, Any],
+        *,
+        lazy: bool = False,
+    ) -> tuple[Any, Any]:
+        return load_mlx_embeddings_model(
+            model_name,
+            tokenizer_config=dict(tokenizer_config),
+            lazy=lazy,
+        )
 
     def _install_generation_model(
         self,

@@ -12,11 +12,13 @@ from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.encoder_embeddings import is_encoder_embedding_config
 
 _EMBED_POOLER_TASKS = (None, "embed")
 _CLASSIFY_POOLER_TASKS = (None, "classify")
 _SUPPORTED_POOLER_TASKS = (None, "embed", "classify")
 _LAST_POOLING = (None, "LAST")
+_ENCODER_SEQUENCE_POOLING = (None, "CLS", "LAST")
 _QWEN3_RERANKER_TOKENS = ("no", "yes")
 
 
@@ -62,9 +64,24 @@ def _sequence_pooling_types(model_config: Any) -> tuple[str | None, str | None]:
     )
 
 
-def _unsupported_sequence_pooling_type(model_config: Any) -> str | None:
+def _allowed_sequence_pooling_types(model_config: Any) -> tuple[str | None, ...]:
+    if is_encoder_embedding_config(model_config):
+        return _ENCODER_SEQUENCE_POOLING
+    return _LAST_POOLING
+
+
+def _effective_sequence_pooling_type(model_config: Any) -> str:
+    """Resolve the sequence pooling strategy Metal will apply."""
     for pooling_type in _sequence_pooling_types(model_config):
-        if pooling_type not in _LAST_POOLING:
+        if pooling_type is not None:
+            return pooling_type
+    return "CLS" if is_encoder_embedding_config(model_config) else "LAST"
+
+
+def _unsupported_sequence_pooling_type(model_config: Any) -> str | None:
+    allowed = _allowed_sequence_pooling_types(model_config)
+    for pooling_type in _sequence_pooling_types(model_config):
+        if pooling_type not in allowed:
             return pooling_type
     return None
 
@@ -100,8 +117,12 @@ def _reject_unsupported_pooler_config(model_config: Any) -> None:
 
     seq_pooling_type = _unsupported_sequence_pooling_type(model_config)
     if seq_pooling_type is not None:
+        allowed = ", ".join(
+            repr(value) for value in _allowed_sequence_pooling_types(model_config)
+        )
         raise NotImplementedError(
-            "Metal pooling currently supports only LAST sequence pooling; "
+            "Metal pooling currently supports only "
+            f"{allowed} sequence pooling for this model; "
             f"got {seq_pooling_type!r} for model={_model_label(model_config)}."
         )
     if _chunked_processing_enabled(model_config):
@@ -119,6 +140,12 @@ def _is_decoder_embedding_config(model_config: Any) -> bool:
         or arch.endswith("ForTextEncoding")
         or arch.endswith("EmbeddingModel")
         for arch in architectures
+    )
+
+
+def _is_embed_capable_config(model_config: Any) -> bool:
+    return _is_decoder_embedding_config(model_config) or is_encoder_embedding_config(
+        model_config
     )
 
 
@@ -170,7 +197,7 @@ def _classifier_logits_fn(model: Any, model_config: Any) -> Any | None:
 
 
 def supports_embed_pooling(model: Any, model_config: Any) -> bool:
-    """Return whether this loaded model can use Metal's LAST embed path."""
+    """Return whether this loaded model can use Metal's dense embed path."""
     if getattr(model_config, "multimodal_config", None) is not None:
         return False
     if _pooler_task(model_config) not in _EMBED_POOLER_TASKS:
@@ -181,9 +208,7 @@ def supports_embed_pooling(model: Any, model_config: Any) -> bool:
         return False
     if _chunked_processing_enabled(model_config):
         return False
-    return sequence_model(model) is not None and _is_decoder_embedding_config(
-        model_config
-    )
+    return sequence_model(model) is not None and _is_embed_capable_config(model_config)
 
 
 def _resolve_token_id(tokenizer: Any, token: str) -> int | None:
@@ -283,7 +308,7 @@ def validate_pooling_params(
     pooling_params: PoolingParams,
     model_config: Any,
 ) -> None:
-    """Validate the narrow text-only LAST pooling contract."""
+    """Validate the narrow text-only Metal pooling contract."""
     model = _model_label(model_config)
     if getattr(model_config, "runner_type", None) != "pooling":
         raise NotImplementedError(
@@ -294,9 +319,11 @@ def validate_pooling_params(
 
     task = pooling_params.task
     if task in (None, "embed"):
-        if not _is_decoder_embedding_config(model_config):
+        if not _is_embed_capable_config(model_config):
             raise NotImplementedError(
-                "Metal embed pooling requires a decoder-style checkpoint; got "
+                "Metal embed pooling requires a decoder-style embedding "
+                "checkpoint or an encoder embedding checkpoint "
+                "(XLM-RoBERTa / RoBERTa / BGE-M3); got "
                 f"architectures={_architecture_names(model_config)!r} for model="
                 f"{model}."
             )
@@ -310,6 +337,13 @@ def validate_pooling_params(
                 f"architectures={_architecture_names(model_config)!r} for model="
                 f"{model}."
             )
+    elif task == "token_classify":
+        raise NotImplementedError(
+            "Metal pooling does not yet support task='token_classify' "
+            "(BGE-M3 sparse lexical weights). Dense embed for encoder models "
+            "is supported; sparse token_classify is tracked as a follow-up "
+            f"to #589 for model={model}."
+        )
     else:
         raise NotImplementedError(
             "Metal pooling supports only text-only task='embed' and the "
@@ -361,6 +395,7 @@ def forward_sequence_hidden_states(
     *,
     cache: Any,
     model_config: Any,
+    segment_lengths: list[int] | None = None,
 ) -> mx.array:
     """Run the transformer body and return per-token hidden states."""
     _reject_unsupported_pooler_config(model_config)
@@ -372,7 +407,17 @@ def forward_sequence_hidden_states(
             "runner='pooling'."
         )
 
-    hidden_states = body(input_ids) if cache is None else body(input_ids, cache=cache)
+    if is_encoder_embedding_config(model_config):
+        hidden_states = _forward_encoder_sequence_hidden_states(
+            body,
+            input_ids,
+            segment_lengths=segment_lengths,
+            model_config=model_config,
+        )
+    else:
+        hidden_states = (
+            body(input_ids) if cache is None else body(input_ids, cache=cache)
+        )
 
     if not hasattr(hidden_states, "shape") or not hasattr(hidden_states, "dtype"):
         raise ValueError(
@@ -381,6 +426,36 @@ def forward_sequence_hidden_states(
             f"{_model_label(model_config)}."
         )
     return hidden_states
+
+
+def _forward_encoder_sequence_hidden_states(
+    body: Any,
+    input_ids: mx.array,
+    *,
+    segment_lengths: list[int] | None,
+    model_config: Any,
+) -> mx.array:
+    """Forward each packed encoder segment independently (bidirectional)."""
+    flat = input_ids.reshape(-1)
+    total_tokens = int(flat.shape[0])
+    if not segment_lengths:
+        segment_lengths = [total_tokens]
+    if sum(segment_lengths) != total_tokens:
+        raise ValueError(
+            "Encoder pooling segment_lengths "
+            f"{segment_lengths!r} do not cover input tokens "
+            f"{total_tokens} for model={_model_label(model_config)}."
+        )
+
+    parts: list[mx.array] = []
+    offset = 0
+    for length in segment_lengths:
+        segment = flat[offset : offset + length].reshape(1, length)
+        parts.append(body(segment))
+        offset += length
+    if len(parts) == 1:
+        return parts[0]
+    return mx.concatenate(parts, axis=1)
 
 
 def pooling_dummy_forward_outputs(
@@ -427,7 +502,7 @@ def pool_sequence_embedding(
     token_index: int,
     model_config: Any,
 ) -> torch.Tensor:
-    """Return a normalized CPU LAST embedding for one finished request."""
+    """Return a normalized CPU sequence embedding for one finished request."""
     if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
         raise ValueError(
             "Metal embed pooling expected hidden states with shape "
@@ -582,6 +657,8 @@ def pool_paged_prefill_batch(
 
         if entry.result_mode == "intermediate":
             token_indices.append(None)
+        elif _effective_sequence_pooling_type(model_config) == "CLS":
+            token_indices.append(cu_seqlens[num_decode_segments + i])
         else:
             token_indices.append(cu_seqlens[num_decode_segments + i + 1] - 1)
 
