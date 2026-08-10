@@ -18,21 +18,16 @@ config time until the align-mode conv state work lands.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
 from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
-from vllm_metal.attention.impls.sdpa import is_sdpa
-from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.impls.shortconv import (
     ShortConvPagedWrapper,
     is_shortconv,
 )
-from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import StateHybridRuntimeBase
 
 logger = init_logger(__name__)
@@ -50,6 +45,9 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
     """
 
     SUPPORTED_MAMBA_CACHE_MODES = ("none",)
+    STATE_WRAPPER = ShortConvPagedWrapper
+    STATE_LAYER_DETECTOR = staticmethod(is_shortconv)
+    STATE_LAYER_LABEL = "ShortConv"
 
     def __init__(
         self,
@@ -94,12 +92,12 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
 
         # Classify layers from the config's layer_types list.
         self._sdpa_indices: list[int] = []
-        self._conv_indices: list[int] = []
+        self._state_indices: list[int] = []
         for i, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
                 self._sdpa_indices.append(i)
             elif layer_type == "conv":
-                self._conv_indices.append(i)
+                self._state_indices.append(i)
             else:
                 raise NotImplementedError(
                     f"conv hybrid paged attention: unsupported layer_types "
@@ -119,54 +117,11 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
             "%d conv layers (%d/%d state slots allocated, mamba_cache_mode=%s)",
             len(self._sdpa_indices),
             num_blocks,
-            len(self._conv_indices),
+            len(self._state_indices),
             self._state_cache.allocated_seqs,
             self._state_cache.max_seqs,
             self._mamba_cache_mode,
         )
-
-    def patch_model(self, model: nn.Module) -> int:
-        kv_cache = self._require_initialized("patch_model")
-        if self._state_cache is None:
-            raise RuntimeError("patch_model() called before initialize()")
-        state_cache = self._state_cache
-
-        sdpa_cache_map = {
-            layer_idx: cache_idx
-            for cache_idx, layer_idx in enumerate(self._sdpa_indices)
-        }
-        conv_cache_map = {
-            layer_idx: cache_idx
-            for cache_idx, layer_idx in enumerate(self._conv_indices)
-        }
-
-        def wrap_layer(layer_idx: int, attn: Any) -> Any:
-            if isinstance(attn, SDPAPagedAttentionWrapper):
-                # Already patched (cached model reuse) — refresh cache refs.
-                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
-                attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
-                return attn
-            if isinstance(attn, ShortConvPagedWrapper):
-                # Already patched — refresh state cache ref.
-                cache_idx = conv_cache_map.get(layer_idx, layer_idx)
-                object.__setattr__(attn, "_sc_cache_idx", cache_idx)
-                object.__setattr__(attn, "_sc_state_cache", state_cache)
-                return attn
-            if is_sdpa(attn):
-                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
-                return SDPAPagedAttentionWrapper(
-                    attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
-                )
-            if is_shortconv(attn):
-                cache_idx = conv_cache_map.get(layer_idx, layer_idx)
-                return ShortConvPagedWrapper(attn, cache_idx, state_cache)
-            raise RuntimeError(
-                f"ShortConv hybrid patch_model: layer {layer_idx} attention "
-                f"{type(attn).__name__} is neither SDPA nor ShortConv; "
-                "refusing to leave it unpatched (it would silently run unpaged)."
-            )
-
-        return walk_and_wrap(model, wrap_layer)
 
     @property
     def kv_cache(self) -> MetalPagedKVCache:
@@ -176,7 +131,7 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
         self, *, max_seqs: int, initial_seqs: int
     ) -> ShortConvStateCache:
         return ShortConvStateCache(
-            num_layers=len(self._conv_indices),
+            num_layers=len(self._state_indices),
             max_seqs=max_seqs,
             conv_kernel_dim=self._conv_kernel_dim,
             conv_dim=self._conv_dim,

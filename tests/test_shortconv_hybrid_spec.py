@@ -195,7 +195,7 @@ def test_conv_hybrid_backend_routing():
 
     assert isinstance(runtime, ShortConvHybridPagedAttentionRuntime)
     assert runtime._sdpa_indices == sorted(SDPA_LAYERS)
-    assert runtime._conv_indices == list(CONV_LAYERS)
+    assert runtime._state_indices == list(CONV_LAYERS)
 
 
 # ---------------------------------------------------------------------------

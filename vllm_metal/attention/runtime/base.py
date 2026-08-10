@@ -9,10 +9,11 @@ one copy instead of three.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from vllm_metal.metal import warm_up_kernels
 
@@ -103,14 +104,22 @@ class StateHybridRuntimeBase(PagedAttentionRuntimeBase):
     (LFM2/LFM2.5) — pair a paged SDPA KV cache with a per-request state cache
     driven by one of the state managers.  Everything about that pairing is
     identical between them: which scheduler groups they adopt, how the state
-    cache and manager are built for ``none`` vs ``align`` mode, and how the
-    per-step hooks delegate to the manager.  Only the state cache's own type,
-    the layer classification, and layer wrapping differ, so subclasses
-    override ``_new_state_cache`` and implement ``patch_model``.
+    cache and manager are built for ``none`` vs ``align`` mode, how the
+    per-step hooks delegate to the manager, and how layers are wrapped.  A
+    subclass supplies its state cache type (``_new_state_cache``) and names
+    its state layer's wrapper and detector in the three class attributes
+    below.
     """
 
     #: Scheduler-side state caching strategies this runtime implements.
     SUPPORTED_MAMBA_CACHE_MODES: tuple[str, ...] = ("none",)
+
+    #: Wrapper installed on this family's state layers.
+    STATE_WRAPPER: ClassVar[type]
+    #: Predicate matching an unwrapped state layer module.
+    STATE_LAYER_DETECTOR: ClassVar[Callable[[Any], bool]]
+    #: How the family's state layers are named in errors.
+    STATE_LAYER_LABEL: ClassVar[str] = "state"
 
     def _init_state_hybrid(
         self, *, block_size: int, max_num_seqs: int, mamba_cache_mode: str
@@ -135,6 +144,61 @@ class StateHybridRuntimeBase(PagedAttentionRuntimeBase):
     def _new_state_cache(self, *, max_seqs: int, initial_seqs: int) -> Any:
         """Build this runtime's per-request state cache."""
         raise NotImplementedError
+
+    def patch_model(self, model: nn.Module) -> int:
+        """Install paged wrappers on this model's SDPA and state layers.
+
+        Both caches are indexed compactly (SDPA layer *n* is the *n*-th KV
+        cache layer, not model layer *n*), so each family gets its own
+        layer_idx -> cache_idx map.  Already-wrapped layers are rebound in
+        place, which is how a cached model survives re-initialization.
+        """
+        from vllm_metal.attention.impls.sdpa import is_sdpa
+        from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
+        from vllm_metal.attention.patching import walk_and_wrap
+
+        kv_cache = self._require_initialized("patch_model")
+        if self._state_cache is None:
+            raise RuntimeError("patch_model() called before initialize()")
+        state_cache = self._state_cache
+
+        sdpa_cache_map = {
+            layer_idx: cache_idx
+            for cache_idx, layer_idx in enumerate(self._sdpa_indices)
+        }
+        state_cache_map = {
+            layer_idx: cache_idx
+            for cache_idx, layer_idx in enumerate(self._state_indices)
+        }
+
+        def wrap_layer(layer_idx: int, attn: Any) -> Any:
+            if isinstance(attn, SDPAPagedAttentionWrapper):
+                # Already patched (cached model reuse) — refresh cache refs.
+                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
+                attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
+                return attn
+            if isinstance(attn, self.STATE_WRAPPER):
+                # Already patched — refresh state cache ref.
+                cache_idx = state_cache_map.get(layer_idx, layer_idx)
+                object.__setattr__(attn, "_state_cache_idx", cache_idx)
+                object.__setattr__(attn, "_state_cache", state_cache)
+                return attn
+            if is_sdpa(attn):
+                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
+                return SDPAPagedAttentionWrapper(
+                    attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
+                )
+            if type(self).STATE_LAYER_DETECTOR(attn):
+                cache_idx = state_cache_map.get(layer_idx, layer_idx)
+                return self.STATE_WRAPPER(attn, cache_idx, state_cache)
+            raise RuntimeError(
+                f"{type(self).__name__} patch_model: layer {layer_idx} attention "
+                f"{type(attn).__name__} is neither SDPA nor "
+                f"{self.STATE_LAYER_LABEL}; refusing to leave it unpatched "
+                "(it would silently run unpaged)."
+            )
+
+        return walk_and_wrap(model, wrap_layer)
 
     def _init_sdpa_kv_cache(self, num_blocks: int) -> None:
         """Allocate the paged KV cache backing this runtime's SDPA layers."""

@@ -111,15 +111,13 @@ class GDNPagedAttentionWrapper(nn.Module):
     def __init__(
         self,
         inner: nn.Module,
-        layer_idx: int,
         cache_idx: int,
         state_cache: GDNPagedStateCache,
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
-        object.__setattr__(self, "_gdn_layer_idx", layer_idx)
-        object.__setattr__(self, "_gdn_cache_idx", cache_idx)
-        object.__setattr__(self, "_gdn_state_cache", state_cache)
+        object.__setattr__(self, "_state_cache_idx", cache_idx)
+        object.__setattr__(self, "_state_cache", state_cache)
         object.__setattr__(self, "_gdn_lazy", GDNLazyKernels.shared())
         object.__setattr__(self, "_gdn_lazy_policy", _GDNLazyPolicy.from_module(inner))
 
@@ -153,7 +151,7 @@ class GDNPagedAttentionWrapper(nn.Module):
 
         num_requests = len(cu_seqlens) - 1
         if ctx.gdn_group_slot_mappings is not None:
-            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
+            ordinal = self._state_cache.layer_group_ordinal(self._state_cache_idx)
             slot_ids = ctx.gdn_group_slot_mappings[ordinal]
         elif ctx.gdn_slot_mapping is not None:
             slot_ids = ctx.gdn_slot_mapping
@@ -163,7 +161,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):
             raise RuntimeError("GDN wrapper requires unique slots per request")
-        self._gdn_state_cache.require_allocated_slots(slot_ids)
+        self._state_cache.require_allocated_slots(slot_ids)
 
         return _GDNForwardState(
             x=x,
@@ -210,8 +208,8 @@ class GDNPagedAttentionWrapper(nn.Module):
     def _run_conv(self, mixed_qkv: mx.array, state: _GDNForwardState) -> mx.array:
         # === Step 2: Conv1d (per-request, needs conv_state) ===
         inner = self._inner
-        state_cache = self._gdn_state_cache
-        cache_idx = self._gdn_cache_idx
+        state_cache = self._state_cache
+        cache_idx = self._state_cache_idx
         slot_ids = state.slot_ids
 
         if state.num_decode_requests == state.num_requests:
@@ -311,8 +309,8 @@ class GDNPagedAttentionWrapper(nn.Module):
                 v=v,
                 g=g,
                 beta=beta,
-                state_cache=self._gdn_state_cache,
-                cache_idx=self._gdn_cache_idx,
+                state_cache=self._state_cache,
+                cache_idx=self._state_cache_idx,
                 slot_ids=state.slot_ids,
                 output_dtype=state.x.dtype,
                 threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
@@ -327,8 +325,8 @@ class GDNPagedAttentionWrapper(nn.Module):
                 v=v,
                 g=g,
                 beta=beta,
-                state_cache=self._gdn_state_cache,
-                cache_idx=self._gdn_cache_idx,
+                state_cache=self._state_cache,
+                cache_idx=self._state_cache_idx,
                 slot_ids=state.slot_ids,
                 output_dtype=state.x.dtype,
                 cu_seqlens=state.cu_seqlens,
@@ -338,7 +336,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             y_flat = self._gdn_lazy.try_recurrent_prefill(request)
             if y_flat is not None:
                 return y_flat
-        self._gdn_state_cache.apply_pending_recurrent_state(self._gdn_cache_idx)
+        self._state_cache.apply_pending_recurrent_state(self._state_cache_idx)
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
 
     def _should_try_recurrent_prefill_containing_lazy(
@@ -402,7 +400,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # C++ Metal fallback path.
-        self._gdn_state_cache.apply_pending_recurrent_state(self._gdn_cache_idx)
+        self._state_cache.apply_pending_recurrent_state(self._state_cache_idx)
         inner = self._inner
         total_tokens = state.total_tokens
         n_hk = inner.num_k_heads
@@ -425,7 +423,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
 
         y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
-        recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
+        recurrent_pool = self._state_cache.recurrent_states[self._state_cache_idx]
 
         mx.eval(
             q_flat,

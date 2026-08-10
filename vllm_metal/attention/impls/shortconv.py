@@ -63,8 +63,8 @@ class ShortConvPagedWrapper(nn.Module):
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
-        object.__setattr__(self, "_sc_cache_idx", cache_idx)
-        object.__setattr__(self, "_sc_state_cache", state_cache)
+        object.__setattr__(self, "_state_cache_idx", cache_idx)
+        object.__setattr__(self, "_state_cache", state_cache)
 
     def __call__(
         self,
@@ -112,7 +112,7 @@ class ShortConvPagedWrapper(nn.Module):
             raise RuntimeError("ShortConv wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):
             raise RuntimeError("ShortConv wrapper requires unique slots per request")
-        self._sc_state_cache.require_allocated_slots(slot_ids)
+        self._state_cache.require_allocated_slots(slot_ids)
 
         return _ShortConvForwardState(
             cu_seqlens=cu_seqlens,
@@ -129,8 +129,8 @@ class ShortConvPagedWrapper(nn.Module):
         # rollback) and none-mode never replays a step.  Revisit if either
         # constraint is lifted.
         inner = self._inner
-        state_cache = self._sc_state_cache
-        cache_idx = self._sc_cache_idx
+        state_cache = self._state_cache
+        cache_idx = self._state_cache_idx
         n_keep = inner.L_cache - 1
 
         pool = state_cache.conv_states[cache_idx]
