@@ -115,6 +115,7 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
             mamba_page_size_padded=None,
             mamba_block_size=max_model_len,
             mamba_cache_mode="none",
+            mamba_ssm_cache_dtype="float32",
         ),
         linear_conv_kernel_dim=4,
         linear_conv_dim=64,

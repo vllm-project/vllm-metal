@@ -483,6 +483,11 @@ class MetalModelRunner:
         return self.is_hybrid or self.is_conv_hybrid
 
     @property
+    def num_state_layers(self) -> int:
+        """Number of per-request state layers (GDN linear or ShortConv)."""
+        return self.num_conv_layers if self.is_conv_hybrid else self.num_linear_layers
+
+    @property
     def merge_verify_windows(self) -> bool:
         """Whether spec-verify windows stay one cu_seqlens segment.
 

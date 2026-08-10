@@ -5,12 +5,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import prod
 from typing import TYPE_CHECKING, Literal
 
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -29,16 +33,12 @@ from vllm_metal.attention.caches.turboquant import (
     V_QUANT_PARAMS,
     packed_dim,
 )
-from vllm_metal.attention.runtime.hybrid import (
-    HybridPagedAttentionRuntime,
-    _build_linear_layer_spec,
-)
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.attention.runtime.shortconv_hybrid import (
     ShortConvHybridPagedAttentionRuntime,
-    _build_shortconv_layer_spec,
 )
 from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
@@ -326,6 +326,60 @@ class ModelCachePolicy:
             and any(window < 0 for window in sliding_windows)
         )
 
+    def _state_layer_geometry(
+        self,
+    ) -> tuple[
+        tuple[tuple[int, ...], ...], tuple[torch.dtype, ...], MambaAttentionBackendEnum
+    ]:
+        """Return one state layer's shapes, dtypes, and backend.
+
+        Shapes mirror what the MLX state pools allocate.  Dtypes come from
+        vLLM's own calculator, so the fp32 recurrent pool follows the
+        ``--mamba-ssm-cache-dtype`` the platform forces instead of being
+        decided a second time here.  ``mamba_cache_dtype`` is pinned to
+        ``"auto"``: the pools allocate at the KV cache dtype and do not honor
+        that flag, so reporting anything else would charge the scheduler for
+        a pool the worker never allocates.
+        """
+        runner = self._runner
+        model_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
+        if runner.is_conv_hybrid:
+            return (
+                ((runner.conv_kernel_dim - 1, runner.conv_hidden_size),),
+                MambaStateDtypeCalculator.short_conv_state_dtype(model_dtype, "auto"),
+                MambaAttentionBackendEnum.SHORT_CONV,
+            )
+        return (
+            (
+                (runner.linear_conv_kernel_dim - 1, runner.linear_conv_dim),
+                (
+                    runner.linear_num_v_heads,
+                    runner.linear_value_head_dim,
+                    runner.linear_key_head_dim,
+                ),
+            ),
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                model_dtype, "auto", runner.cache_config.mamba_ssm_cache_dtype
+            ),
+            MambaAttentionBackendEnum.GDN_ATTN,
+        )
+
+    def _state_layer_spec(self) -> MambaSpec:
+        """Build the scheduler-visible spec for one per-request state layer."""
+        shapes, dtypes, mamba_type = self._state_layer_geometry()
+        cache_config = self._runner.cache_config
+        mamba_block_size = cache_config.mamba_block_size
+        # Upstream resolves this during config setup and asserts it here.
+        assert mamba_block_size is not None
+        return MambaSpec(
+            shapes=shapes,
+            dtypes=dtypes,
+            block_size=mamba_block_size,
+            page_size_padded=cache_config.mamba_page_size_padded,
+            mamba_type=mamba_type,
+            mamba_cache_mode=cache_config.mamba_cache_mode,
+        )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
         pooling_backend = self._runner._pooling_backend
@@ -355,43 +409,13 @@ class ModelCachePolicy:
         use_deferred_mha_layout = self._uses_deferred_mha_layout()
         for layer_idx in range(num_spec_layers):
             if (
-                self._runner.is_hybrid
+                self._runner.has_state_layers
                 and layer_idx not in self._runner.sdpa_layer_indices
             ):
-                layer_name = f"layers.{layer_idx}.linear_attn"
-                cache_config = self._runner.cache_config
-                mamba_block_size = cache_config.mamba_block_size
-                # Upstream resolves this during config setup and asserts it here.
-                assert mamba_block_size is not None
-                specs[layer_name] = _build_linear_layer_spec(
-                    conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-                    conv_dim=self._runner.linear_conv_dim,
-                    num_v_heads=self._runner.linear_num_v_heads,
-                    value_head_dim=self._runner.linear_value_head_dim,
-                    key_head_dim=self._runner.linear_key_head_dim,
-                    torch_dtype=torch_dtype,
-                    page_size_padded=cache_config.mamba_page_size_padded,
-                    mamba_block_size=mamba_block_size,
-                    mamba_cache_mode=cache_config.mamba_cache_mode,
-                )
-            elif (
-                self._runner.is_conv_hybrid
-                and layer_idx not in self._runner.sdpa_layer_indices
-            ):
-                # Same canonical suffix upstream vLLM's Lfm2 model uses for
-                # its ShortConv layers' KV cache spec.
-                layer_name = f"layers.{layer_idx}.conv"
-                cache_config = self._runner.cache_config
-                mamba_block_size = cache_config.mamba_block_size
-                assert mamba_block_size is not None
-                specs[layer_name] = _build_shortconv_layer_spec(
-                    conv_kernel_dim=self._runner.conv_kernel_dim,
-                    conv_dim=self._runner.conv_hidden_size,
-                    torch_dtype=torch_dtype,
-                    page_size_padded=cache_config.mamba_page_size_padded,
-                    mamba_block_size=mamba_block_size,
-                    mamba_cache_mode=cache_config.mamba_cache_mode,
-                )
+                # Same canonical suffixes upstream vLLM's models use for their
+                # state layers' KV cache specs.
+                suffix = "conv" if self._runner.is_conv_hybrid else "linear_attn"
+                specs[f"layers.{layer_idx}.{suffix}"] = self._state_layer_spec()
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = _build_turboquant_attention_spec(
@@ -865,30 +889,21 @@ class ModelCachePolicy:
         return sum(spec.real_page_size_bytes for spec in specs.values())
 
     def linear_cache_bytes_per_slot(self) -> int:
-        """Return bytes for one request's linear-attention or conv state."""
-        if self._runner.is_conv_hybrid:
-            return (
-                self._runner.num_conv_layers
-                * (self._runner.conv_kernel_dim - 1)
-                * self._runner.conv_hidden_size
-                * self._require_kv_cache_dtype().size
+        """Return bytes one request's state pools actually occupy.
+
+        Unpadded, unlike ``_state_spec_bytes_per_slot`` — this is what the
+        pools allocate, not what the scheduler is charged.
+        """
+        if not self._runner.has_state_layers:
+            raise RuntimeError(
+                "linear_cache_bytes_per_slot() requires a state-layer model"
             )
-        if not self._runner.is_hybrid:
-            raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
-        dtype_size = self._require_kv_cache_dtype().size
-        recurrent_dtype_size = mx.float32.size
-        conv_bytes = (
-            (self._runner.linear_conv_kernel_dim - 1)
-            * self._runner.linear_conv_dim
-            * dtype_size
+        shapes, dtypes, _ = self._state_layer_geometry()
+        bytes_per_layer = sum(
+            prod(shape) * get_dtype_size(dtype)
+            for shape, dtype in zip(shapes, dtypes, strict=True)
         )
-        recurrent_bytes = (
-            self._runner.linear_num_v_heads
-            * self._runner.linear_value_head_dim
-            * self._runner.linear_key_head_dim
-            * recurrent_dtype_size
-        )
-        return self._runner.num_linear_layers * (conv_bytes + recurrent_bytes)
+        return self._runner.num_state_layers * bytes_per_layer
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -952,27 +967,19 @@ class ModelCachePolicy:
             self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
         if self._runner.has_state_layers:
-            return sdpa_kv_bytes + self._linear_spec_bytes_per_slot()
+            return sdpa_kv_bytes + self._state_spec_bytes_per_slot()
         return sdpa_kv_bytes
 
-    def _linear_spec_bytes_per_slot(self) -> int:
-        """Per-slot linear-state bytes as the reported MambaSpec charges them.
+    def _state_spec_bytes_per_slot(self) -> int:
+        """Per-slot state bytes as the reported MambaSpec charges them.
 
-        vLLM admits against the specs this worker reports, and the linear
+        vLLM admits against the specs this worker reports, and the state
         MambaSpec carries ``mamba_page_size_padded`` — an unpadded estimate
         falls short of that requirement by the padding margin.
         """
-        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
-        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
-        # this mirror must follow.
-        num_state_layers = (
-            self._runner.num_conv_layers
-            if self._runner.is_conv_hybrid
-            else self._runner.num_linear_layers
-        )
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
-            return num_state_layers * padded
+            return self._runner.num_state_layers * padded
         return self.linear_cache_bytes_per_slot()
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:

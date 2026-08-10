@@ -22,10 +22,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import torch
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
@@ -39,31 +36,6 @@ from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import StateHybridRuntimeBase
 
 logger = init_logger(__name__)
-
-
-def _build_shortconv_layer_spec(
-    *,
-    conv_kernel_dim: int,
-    conv_dim: int,
-    torch_dtype: torch.dtype,
-    page_size_padded: int | None = None,
-    mamba_block_size: int,
-    mamba_cache_mode: str = "none",
-) -> MambaSpec:
-    """Build the scheduler-visible ShortConv state spec.
-
-    Mirrors upstream's ``ShortConv.get_kv_cache_spec``: one state tensor of
-    ``(conv_kernel - 1, conv_dim)`` at the model dtype.  See
-    ``_build_linear_layer_spec`` for the ``mamba_block_size`` semantics.
-    """
-    return MambaSpec(
-        shapes=((conv_kernel_dim - 1, conv_dim),),
-        dtypes=(torch_dtype,),
-        block_size=mamba_block_size,
-        page_size_padded=page_size_padded,
-        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
-        mamba_cache_mode=mamba_cache_mode,
-    )
 
 
 class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):

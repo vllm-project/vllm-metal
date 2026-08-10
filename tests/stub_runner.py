@@ -46,6 +46,8 @@ def make_stub_runner(
             mamba_page_size_padded=None,
             mamba_block_size=2048,
             mamba_cache_mode="none",
+            # What MetalPlatform forces for state-layer models.
+            mamba_ssm_cache_dtype="float32",
         ),
         "model_config": SimpleNamespace(
             runner_type="generate", get_head_size=lambda: 128, max_model_len=2048

@@ -180,7 +180,10 @@ class TestOneSequenceKvBytes:
             linear_value_head_dim=7,
             linear_key_head_dim=11,
             num_linear_layers=3,
-            cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
+            cache_config=SimpleNamespace(
+                mamba_page_size_padded=padded_page,
+                mamba_ssm_cache_dtype="float32",
+            ),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -207,6 +210,8 @@ class TestOneSequenceKvBytes:
         runner.linear_value_head_dim = 7
         runner.linear_key_head_dim = 11
         runner.num_linear_layers = 3
+        # The recurrent pool's fp32 comes from the dtype MetalPlatform forces.
+        runner.cache_config = SimpleNamespace(mamba_ssm_cache_dtype="float32")
 
         conv_bytes = (
             (runner.linear_conv_kernel_dim - 1)
