@@ -234,6 +234,71 @@ def test_runtime_rejects_state_caching_modes(mode: str):
         )
 
 
+def _conv_hybrid_vllm_config(**cache_overrides):
+    """A minimal LFM2 vllm_config for MetalPlatform.check_and_update_config."""
+    cache_config = {
+        "block_size": None,
+        "kv_cache_dtype_skip_layers": [],
+        "enable_prefix_caching": True,
+        "mamba_cache_mode": "none",
+        "mamba_ssm_cache_dtype": "float32",
+    }
+    cache_config.update(cache_overrides)
+    return SimpleNamespace(
+        speculative_config=None,
+        lora_config=None,
+        additional_config={},
+        parallel_config=SimpleNamespace(
+            worker_cls="auto",
+            distributed_executor_backend="auto",
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            world_size=1,
+            disable_custom_all_reduce=False,
+        ),
+        cache_config=SimpleNamespace(**cache_config),
+        model_config=SimpleNamespace(
+            model="test-lfm2",
+            disable_cascade_attn=False,
+            tokenizer=None,
+            max_model_len=2048,
+            multimodal_config=None,
+            hf_config=SimpleNamespace(model_type="lfm2", layer_types=list(LAYER_TYPES)),
+            is_hybrid=True,
+        ),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=True,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=2048,
+            max_num_scheduled_tokens=None,
+            long_prefill_token_threshold=0,
+        ),
+    )
+
+
+@pytest.mark.parametrize("ssm_dtype", ["auto", "float16", "float32"])
+def test_platform_accepts_any_ssm_dtype_for_conv_hybrids(monkeypatch, ssm_dtype):
+    """ShortConv has no recurrent SSM pool, so GDN's fp32 rule must not apply.
+
+    The dtype is left untouched rather than forced to float32: nothing in the
+    conv path reads it, and rewriting it would misreport the model's state.
+    """
+    from vllm_metal.config import reset_config
+    from vllm_metal.platform import MetalPlatform
+
+    monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+    reset_config()
+    try:
+        vllm_config = _conv_hybrid_vllm_config(
+            enable_prefix_caching=False, mamba_ssm_cache_dtype=ssm_dtype
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.cache_config.mamba_ssm_cache_dtype == ssm_dtype
+    finally:
+        reset_config()
+
+
 def test_platform_rejects_prefix_caching_for_conv_hybrids(monkeypatch):
     """Conv state is not block-keyed yet, so APC would reuse stale state."""
     from vllm_metal.config import reset_config
@@ -242,45 +307,7 @@ def test_platform_rejects_prefix_caching_for_conv_hybrids(monkeypatch):
     monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
     reset_config()
     try:
-        vllm_config = SimpleNamespace(
-            speculative_config=None,
-            lora_config=None,
-            additional_config={},
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=1,
-                data_parallel_size=1,
-                world_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(
-                block_size=None,
-                kv_cache_dtype_skip_layers=[],
-                enable_prefix_caching=True,
-                mamba_cache_mode="none",
-                mamba_ssm_cache_dtype="float32",
-            ),
-            model_config=SimpleNamespace(
-                model="test-lfm2",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                max_model_len=2048,
-                multimodal_config=None,
-                hf_config=SimpleNamespace(
-                    model_type="lfm2", layer_types=list(LAYER_TYPES)
-                ),
-                is_hybrid=True,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=True,
-                max_num_batched_tokens=2048,
-                max_num_scheduled_tokens=None,
-                long_prefill_token_threshold=0,
-            ),
-        )
+        vllm_config = _conv_hybrid_vllm_config(enable_prefix_caching=True)
         with pytest.raises(NotImplementedError, match="conv hybrid"):
             MetalPlatform.check_and_update_config(vllm_config)
     finally:

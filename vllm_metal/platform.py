@@ -462,18 +462,23 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_ssm_cache_dtype == "auto":
-                cache_config.mamba_ssm_cache_dtype = "float32"
-            elif cache_config.mamba_ssm_cache_dtype != "float32":
-                raise NotImplementedError(
-                    "Hybrid GDN models on Metal require "
-                    "--mamba-ssm-cache-dtype float32 because recurrent state is "
-                    "stored in fp32."
-                )
+            hf_layer_types = getattr(model_config.hf_config, "layer_types", None) or ()
+            # ShortConv layers keep only model-dtype conv state, with no
+            # recurrent SSM pool, so the fp32 requirement is GDN's alone.
+            # Anything that is not a conv hybrid keeps it: dropping it for an
+            # unrecognized state family would silently under-size fp32 state.
+            if "conv" not in hf_layer_types:
+                if cache_config.mamba_ssm_cache_dtype == "auto":
+                    cache_config.mamba_ssm_cache_dtype = "float32"
+                elif cache_config.mamba_ssm_cache_dtype != "float32":
+                    raise NotImplementedError(
+                        "Hybrid GDN models on Metal require "
+                        "--mamba-ssm-cache-dtype float32 because recurrent "
+                        "state is stored in fp32."
+                    )
             # Conv hybrids (LFM2 ShortConv) keep their state in a private
             # per-request pool; align-mode block-keyed conv state is not
             # implemented, so prefix caching would silently reuse stale state.
-            hf_layer_types = getattr(model_config.hf_config, "layer_types", None) or ()
             if "conv" in hf_layer_types and cache_config.enable_prefix_caching:
                 raise NotImplementedError(
                     "Prefix caching for conv hybrid models (LFM2 ShortConv) is "
