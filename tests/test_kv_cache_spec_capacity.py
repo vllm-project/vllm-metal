@@ -33,7 +33,7 @@ def _policy(
     head_dim=256,
     sliding_window_per_layer=None,
 ):
-    # ``is_mla``/``is_hybrid`` are derived from the model config, not settable.
+    # ``is_mla``/``is_gdn_hybrid`` are derived from the model config, not settable.
     model_args = {"kv_lora_rank": head_dim} if is_mla else {}
     runner = make_stub_runner(
         model_args=model_args,

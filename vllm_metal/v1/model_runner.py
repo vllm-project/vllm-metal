@@ -456,11 +456,13 @@ class MetalModelRunner:
         return "kv_lora_rank" in self.model_args
 
     @property
-    def is_hybrid(self) -> bool:
-        """Whether the model mixes SDPA and linear attention layers.
+    def is_gdn_hybrid(self) -> bool:
+        """Whether the model mixes SDPA and GDN linear attention layers.
 
-        Hybrid models (Qwen3.5) have ``full_attention_interval`` in their
+        GDN hybrids (Qwen3.5) have ``full_attention_interval`` in their
         config: every N-th layer uses SDPA, the rest use GDN linear attention.
+        Ask :attr:`has_state_layers` for "any per-request state family", which
+        is what vLLM's own ``ModelConfig.is_hybrid`` means.
         """
         fai = self.model_args.get("full_attention_interval", 0)
         return isinstance(fai, int) and fai > 0
@@ -480,7 +482,7 @@ class MetalModelRunner:
     @property
     def has_state_layers(self) -> bool:
         """Whether the model has per-request state (mamba/conv) layers."""
-        return self.is_hybrid or self.is_conv_hybrid
+        return self.is_gdn_hybrid or self.is_conv_hybrid
 
     @property
     def num_state_layers(self) -> int:
@@ -1468,7 +1470,7 @@ class MetalModelRunner:
             is_pooling=self._is_pooling,
             pp_active=self.pp is not None and self.pp.size > 1,
             hybrid_without_lazy_gdn=(
-                self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
+                self.is_gdn_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
             spec_decode_configured=(
                 self.vllm_config.speculative_config is not None
@@ -1883,7 +1885,7 @@ class MetalModelRunner:
             scheduler_output,
             self._spec_decode_preflight_reqs(scheduler_output),
             paged_attention_enabled=self._paged_attention_runtime is not None,
-            is_hybrid=self.has_state_layers,
+            has_state_layers=self.has_state_layers,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
         )

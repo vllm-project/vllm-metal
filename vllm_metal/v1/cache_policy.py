@@ -197,7 +197,7 @@ class _HybridGDNReservation:
         return self.total_bytes > 0
 
     @property
-    def is_hybrid(self) -> bool:
+    def has_state_layers(self) -> bool:
         return self.bytes_per_slot > 0 and self.max_num_seqs > 0
 
 
@@ -225,7 +225,7 @@ class _PagedAttentionPlan:
         ]
         if self.hybrid_gdn_reservation.enabled:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
-        if self.hybrid_gdn_reservation.is_hybrid:
+        if self.hybrid_gdn_reservation.has_state_layers:
             parts.append(self._hybrid_gdn_detail())
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
@@ -248,7 +248,7 @@ class _PagedAttentionPlan:
 
     def _hybrid_gdn_detail(self) -> str:
         reservation = self.hybrid_gdn_reservation
-        if not reservation.is_hybrid:
+        if not reservation.has_state_layers:
             return ""
         return (
             "hybrid_gdn_state=lazy "
@@ -661,7 +661,7 @@ class ModelCachePolicy:
         layer_pool_ordinals: list[int] | None = None
         if (
             self._runner.cache_config.mamba_cache_mode == "align"
-            and self._runner.is_hybrid
+            and self._runner.is_gdn_hybrid
         ):
             cache_idx_by_name = {
                 f"layers.{layer_idx}.linear_attn": cache_idx
@@ -912,7 +912,7 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         if self._runner.is_conv_hybrid:
             return self._build_shortconv_hybrid_backend(block_size)
-        if self._runner.is_hybrid:
+        if self._runner.is_gdn_hybrid:
             return self._build_hybrid_backend(block_size)
         if self._runner.is_mla:
             return self._build_mla_backend(block_size)
@@ -1339,7 +1339,7 @@ class WorkerCachePlanner:
     def _hybrid_align_state_bytes_per_block(self) -> int:
         """Per-pool-block linear-state bytes under align-mode prefix caching."""
         runner = self._worker.model_runner
-        if not runner.is_hybrid:
+        if not runner.is_gdn_hybrid:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
@@ -1350,7 +1350,7 @@ class WorkerCachePlanner:
     def _hybrid_align_growth_bytes_per_block(self) -> int:
         """One old physical state pool retained during align-cache growth."""
         runner = self._worker.model_runner
-        if not runner.is_hybrid:
+        if not runner.is_gdn_hybrid:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0

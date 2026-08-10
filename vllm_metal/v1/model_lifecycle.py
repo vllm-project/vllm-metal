@@ -479,7 +479,7 @@ class ModelLifecycle:
     def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
         """Install hybrid linear-attention dimensions for GDN-style models."""
         self._install_conv_hybrid_dims(args)
-        if self._runner.is_hybrid:
+        if self._runner.is_gdn_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
             self._runner.sdpa_layer_indices = frozenset(

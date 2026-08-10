@@ -98,7 +98,7 @@ def test_lfm2_attention_layer_detected_as_sdpa():
 def test_lfm2_layer_types_classify_as_conv_hybrid():
     runner = make_stub_runner(model_args={"layer_types": list(LAYER_TYPES)})
     assert runner.is_conv_hybrid
-    assert not runner.is_hybrid
+    assert not runner.is_gdn_hybrid
 
 
 def test_gemma_layer_types_do_not_classify_as_conv_hybrid():
@@ -108,12 +108,12 @@ def test_gemma_layer_types_do_not_classify_as_conv_hybrid():
         }
     )
     assert not runner.is_conv_hybrid
-    assert not runner.is_hybrid
+    assert not runner.is_gdn_hybrid
 
 
 def test_gdn_hybrid_does_not_classify_as_conv_hybrid():
     runner = make_stub_runner(model_args={"full_attention_interval": 4})
-    assert runner.is_hybrid
+    assert runner.is_gdn_hybrid
     assert not runner.is_conv_hybrid
 
 

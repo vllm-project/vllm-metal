@@ -324,7 +324,7 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
             is_conv_hybrid=False,
             has_state_layers=True,
             scheduler_memory_reporting_mode=MagicMock(
@@ -372,7 +372,7 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
             is_conv_hybrid=False,
             has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
@@ -416,7 +416,7 @@ class TestPagedAttentionPlanDiagnostics:
         self, monkeypatch
     ) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
             is_conv_hybrid=False,
             has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
@@ -450,7 +450,7 @@ class TestPagedAttentionPlanDiagnostics:
         self, monkeypatch
     ) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
             is_conv_hybrid=False,
             has_state_layers=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
@@ -490,7 +490,7 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=False,
+            is_gdn_hybrid=False,
             is_conv_hybrid=False,
             has_state_layers=False,
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
@@ -533,7 +533,7 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> None:
         worker = _make_worker(
             SimpleNamespace(
-                is_hybrid=False, is_conv_hybrid=False, has_state_layers=False
+                is_gdn_hybrid=False, is_conv_hybrid=False, has_state_layers=False
             ),
             use_paged_attention=True,
         )
