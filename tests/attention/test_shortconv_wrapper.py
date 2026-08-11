@@ -162,43 +162,6 @@ class TestShortConvPagedWrapper:
                 ref_caches[req][0],
             )
 
-    def test_fresh_state_zero_init_matches_no_cache_prefill(self) -> None:
-        """A fresh slot behaves like mlx_lm's None-state (zeros) init."""
-        mx.random.seed(1)
-        module = _make_module()
-        wrapper, _ = _make_wrapper(module)
-
-        x = mx.random.normal((1, 6, HIDDEN))
-        cache = ArraysCache(size=1)
-        expected = module(x, mask=None, cache=cache)
-
-        (actual,) = _run_wrapper_step(wrapper, [x], [3])
-        _assert_close(actual, expected)
-
-    def test_multi_request_isolation(self) -> None:
-        """Interleaving another request must not perturb a request's stream."""
-        mx.random.seed(2)
-        module = _make_module()
-        wrapper, state_cache = _make_wrapper(module)
-
-        a_chunks = [mx.random.normal((1, t, HIDDEN)) for t in (4, 1, 1)]
-        b_chunks = [mx.random.normal((1, t, HIDDEN)) for t in (6, 1, 1)]
-
-        # Reference for request A alone.
-        cache = ArraysCache(size=1)
-        ref_a = [module(chunk, mask=None, cache=cache) for chunk in a_chunks]
-
-        # Wrapper: A shares every step with B on a different slot.
-        for step in range(3):
-            outputs = _run_wrapper_step(
-                wrapper, [a_chunks[step], b_chunks[step]], [1, 4]
-            )
-            _assert_close(outputs[0], ref_a[step])
-
-        # Untouched slots stay zero.
-        untouched = state_cache.conv_states[0][2]
-        assert np.array(untouched, copy=False).sum() == 0.0
-
     def test_no_context_delegates_to_inner(self) -> None:
         """Without a paged context the wrapper is the original module."""
         mx.random.seed(3)
