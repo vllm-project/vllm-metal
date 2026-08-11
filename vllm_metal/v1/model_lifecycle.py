@@ -19,10 +19,7 @@ from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.encoder_embeddings import (
-    load_mlx_embeddings_model,
-    requires_mlx_embeddings_load,
-)
+from vllm_metal.v1.encoder_embeddings import EncoderEmbeddingAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -219,7 +216,7 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        elif requires_mlx_embeddings_load(model_config):
+        elif EncoderEmbeddingAdapter.requires_load(model_config):
             load_label = "MLX-Embeddings model"
             model, tokenizer = self._load_mlx_embeddings_model(
                 model_name,
@@ -300,11 +297,15 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
     ) -> tuple[Any, Any]:
-        return load_mlx_embeddings_model(
+        model, tokenizer, adapter = EncoderEmbeddingAdapter.load(
             model_name,
             tokenizer_config=dict(tokenizer_config),
             lazy=lazy,
         )
+        # Stash for _install_generation_model; avoids a second from_loaded_model
+        # dance when the load path already constructed the adapter.
+        self._pending_encoder_embedding_adapter = adapter
+        return model, tokenizer
 
     def _install_generation_model(
         self,
@@ -329,6 +330,12 @@ class ModelLifecycle:
         runner._multimodal_adapter = multimodal_adapter
         runner.encoder_cache = (
             EncoderCache() if multimodal_adapter is not None else None
+        )
+
+        pending = getattr(self, "_pending_encoder_embedding_adapter", None)
+        self._pending_encoder_embedding_adapter = None
+        runner._encoder_embedding_adapter = pending or (
+            EncoderEmbeddingAdapter.from_loaded_model(loaded_model.model)
         )
 
         # Dimension resolution reads model_args immediately after this phase.

@@ -950,15 +950,16 @@ class WorkerCachePlanner:
             backend,
             block_size=plan.block_size,
         )
-        # Encoder embedding models (mlx-embeddings XLM-RoBERTa / BGE-M3) own
-        # bidirectional attention internally. They still use the paged scheduler
-        # for pooling batch bookkeeping, but there are no mlx-lm-style
-        # ``model.layers`` to wrap — skip patching rather than fail loud.
-        model = self._worker.model_runner.model
-        if getattr(model, "is_mlx_embeddings_encoder", False):
+        # Encoder embedding adapters own bidirectional attention. They still use
+        # the paged scheduler for pooling batch bookkeeping, but there are no
+        # mlx-lm-style ``model.layers`` to wrap — skip patching rather than fail.
+        encoder_adapter = getattr(
+            self._worker.model_runner, "_encoder_embedding_adapter", None
+        )
+        if encoder_adapter is not None and encoder_adapter.skip_paged_attention_patch:
             n_patched = 0
         else:
-            n_patched = backend.patch_model(model)
+            n_patched = backend.patch_model(self._worker.model_runner.model)
         self._worker.model_runner.install_drafter(
             num_blocks=plan.num_blocks,
             block_size=plan.block_size,

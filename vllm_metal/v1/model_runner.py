@@ -83,6 +83,7 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.encoder_embeddings import EncoderEmbeddingAdapter
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -322,6 +323,7 @@ class MetalModelRunner:
             getattr(self.model_config, "runner_type", None) == "pooling"
         )
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
+        self._encoder_embedding_adapter: EncoderEmbeddingAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
         self.encoder_cache: EncoderCache | None = None
@@ -704,6 +706,7 @@ class MetalModelRunner:
                 self._forward_model,
                 input_ids,
                 model_config=self.model_config,
+                encoder_adapter=self._encoder_embedding_adapter,
             )
 
         if self.pp is not None and self.pp.size > 1:
@@ -1212,6 +1215,7 @@ class MetalModelRunner:
                     cache=offset_caches,
                     model_config=self.model_config,
                     segment_lengths=[len(pr.token_ids) for pr in prefill_reqs],
+                    encoder_adapter=self._encoder_embedding_adapter,
                 )
             elif use_mm_forward:
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(

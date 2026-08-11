@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the mlx-embeddings encoder load path (#589 PR1)."""
+"""Tests for the encoder embedding adapter (#589 PR1)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 
 from vllm_metal.v1.encoder_embeddings import (
+    EncoderEmbeddingAdapter,
     MlxEmbeddingsEncoderModel,
     is_encoder_embedding_config,
     load_mlx_embeddings_model,
@@ -74,9 +75,12 @@ class _FakeEmbeddingsModule:
 
 class TestEncoderEmbeddingDetection:
     def test_detects_xlm_roberta_and_bge_architectures(self) -> None:
+        assert EncoderEmbeddingAdapter.matches_config(_encoder_model_config())
+        assert EncoderEmbeddingAdapter.requires_load(_encoder_model_config())
+        # Compatibility aliases keep older imports working.
         assert is_encoder_embedding_config(_encoder_model_config())
         assert requires_mlx_embeddings_load(_encoder_model_config())
-        assert is_encoder_embedding_config(
+        assert EncoderEmbeddingAdapter.matches_config(
             _encoder_model_config(
                 hf_config=SimpleNamespace(
                     architectures=["BgeM3EmbeddingModel"],
@@ -92,8 +96,17 @@ class TestEncoderEmbeddingDetection:
                 model_type="qwen3",
             )
         )
-        assert not is_encoder_embedding_config(config)
-        assert not requires_mlx_embeddings_load(config)
+        assert not EncoderEmbeddingAdapter.matches_config(config)
+        assert not EncoderEmbeddingAdapter.requires_load(config)
+
+    def test_owns_cls_pooling_defaults(self) -> None:
+        assert EncoderEmbeddingAdapter.default_sequence_pooling_type == "CLS"
+        assert EncoderEmbeddingAdapter.allowed_sequence_pooling_types == (
+            None,
+            "CLS",
+            "LAST",
+        )
+        assert EncoderEmbeddingAdapter.skip_paged_attention_patch is True
 
 
 class TestMlxEmbeddingsLoad:
@@ -109,9 +122,9 @@ class TestMlxEmbeddingsLoad:
             ),
             pytest.raises(ImportError, match=r"vllm-metal\[embeddings\]"),
         ):
-            load_mlx_embeddings_model("mlx-community/bge-m3-mlx-8bit")
+            EncoderEmbeddingAdapter.load("mlx-community/bge-m3-mlx-8bit")
 
-    def test_wraps_loaded_model_with_sequence_body(self) -> None:
+    def test_wraps_loaded_model_with_adapter(self) -> None:
         fake = _FakeEmbeddingsModule()
         tokenizer = object()
         load_mock = MagicMock(return_value=(fake, tokenizer))
@@ -119,7 +132,7 @@ class TestMlxEmbeddingsLoad:
             "vllm_metal.v1.encoder_embeddings._import_mlx_embeddings_load",
             return_value=load_mock,
         ):
-            model, loaded_tokenizer = load_mlx_embeddings_model(
+            model, loaded_tokenizer, adapter = EncoderEmbeddingAdapter.load(
                 "mlx-community/bge-m3-mlx-8bit",
                 tokenizer_config={"trust_remote_code": True},
                 lazy=True,
@@ -132,21 +145,40 @@ class TestMlxEmbeddingsLoad:
         )
         assert loaded_tokenizer is tokenizer
         assert isinstance(model, MlxEmbeddingsEncoderModel)
-        assert model.is_mlx_embeddings_encoder is True
+        assert isinstance(adapter, EncoderEmbeddingAdapter)
+        assert adapter.model is model
+        assert EncoderEmbeddingAdapter.from_loaded_model(model) is not None
+        assert EncoderEmbeddingAdapter.from_loaded_model(object()) is None
         hidden = model.model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=MagicMock())
         assert hidden.shape == (1, 3, 4)
         assert fake.calls == [((1, 3), (1, 3))]
 
+    def test_compatibility_load_helper_still_works(self) -> None:
+        fake = _FakeEmbeddingsModule()
+        tokenizer = object()
+        load_mock = MagicMock(return_value=(fake, tokenizer))
+        with patch(
+            "vllm_metal.v1.encoder_embeddings._import_mlx_embeddings_load",
+            return_value=load_mock,
+        ):
+            model, loaded_tokenizer = load_mlx_embeddings_model(
+                "mlx-community/bge-m3-mlx-8bit"
+            )
+        assert isinstance(model, MlxEmbeddingsEncoderModel)
+        assert loaded_tokenizer is tokenizer
+
 
 class TestEncoderPagedSetup:
-    def test_setup_paged_attention_skips_patching_encoder_models(self) -> None:
+    def test_setup_paged_attention_skips_patching_via_adapter(self) -> None:
         from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
         fake = _FakeEmbeddingsModule()
         model = MlxEmbeddingsEncoderModel(fake)
+        adapter = EncoderEmbeddingAdapter(model)
         runner = SimpleNamespace(
             model=model,
             is_mla=False,
+            _encoder_embedding_adapter=adapter,
             validate_paged_attention_support=MagicMock(),
             build_paged_attention_runtime=MagicMock(),
             install_gemma4_mtp_kv_sharing=MagicMock(),
@@ -202,12 +234,14 @@ class TestEncoderPoolingForward:
     def test_forwards_packed_segments_independently(self) -> None:
         fake = _FakeEmbeddingsModule()
         model = MlxEmbeddingsEncoderModel(fake)
+        adapter = EncoderEmbeddingAdapter(model)
         hidden = forward_sequence_hidden_states(
             model,
             mx.array([[10, 11, 20, 21, 22]], dtype=mx.int32),
             cache=[MagicMock()],
             model_config=_encoder_model_config(),
             segment_lengths=[2, 3],
+            encoder_adapter=adapter,
         )
         assert hidden.shape == (1, 5, 4)
         assert fake.calls == [((1, 2), (1, 2)), ((1, 3), (1, 3))]
