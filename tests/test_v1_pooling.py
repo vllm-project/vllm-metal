@@ -20,7 +20,10 @@ from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
-from vllm_metal.v1.encoder_embeddings import MlxEmbeddingsEncoderModel  # noqa: E402
+from vllm_metal.v1.encoder_embeddings import (  # noqa: E402
+    EncoderEmbeddingAdapter,
+    MlxEmbeddingsEncoderModel,
+)
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
 
@@ -170,8 +173,9 @@ def _make_runner(
     model_config: object | None = None,
     tokenizer: object | None = None,
 ):
-    return make_stub_runner(
-        model=model or _PoolingModel(),
+    resolved_model = model or _PoolingModel()
+    runner = make_stub_runner(
+        model=resolved_model,
         model_config=model_config or _pooling_model_config(),
         tokenizer=tokenizer,
         _paged_attention_runtime=(
@@ -187,7 +191,11 @@ def _make_runner(
         ),
         _paged_block_size=4,
         num_layers=1,
+        _encoder_embedding_adapter=EncoderEmbeddingAdapter.from_loaded_model(
+            resolved_model
+        ),
     )
+    return runner
 
 
 def _pooling_params(task: str | None = None, **overrides) -> PoolingParams:
