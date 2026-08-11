@@ -437,14 +437,24 @@ class MetalModelRunner:
         return "kv_lora_rank" in self.model_args
 
     @property
+    def is_bailing_hybrid(self) -> bool:
+        """Whether the model interleaves Bailing KDA and MLA layers."""
+        layer_group_size = self.model_args.get("layer_group_size", 0)
+        return (
+            self.model_args.get("model_type") == "bailing_hybrid"
+            and isinstance(layer_group_size, int)
+            and layer_group_size > 0
+        )
+
+    @property
     def is_hybrid(self) -> bool:
         """Whether the model mixes SDPA and linear attention layers.
 
-        Hybrid models (Qwen3.5) have ``full_attention_interval`` in their
-        config: every N-th layer uses SDPA, the rest use GDN linear attention.
+        Qwen hybrids use ``full_attention_interval`` for SDPA/GDN placement;
+        Bailing hybrids use ``layer_group_size`` for MLA/KDA placement.
         """
         fai = self.model_args.get("full_attention_interval", 0)
-        return isinstance(fai, int) and fai > 0
+        return (isinstance(fai, int) and fai > 0) or self.is_bailing_hybrid
 
     @property
     def merge_verify_windows(self) -> bool:
