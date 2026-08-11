@@ -138,6 +138,61 @@ class TestMlxEmbeddingsLoad:
         assert fake.calls == [((1, 3), (1, 3))]
 
 
+class TestEncoderPagedSetup:
+    def test_setup_paged_attention_skips_patching_encoder_models(self) -> None:
+        from vllm_metal.v1.cache_policy import WorkerCachePlanner
+
+        fake = _FakeEmbeddingsModule()
+        model = MlxEmbeddingsEncoderModel(fake)
+        runner = SimpleNamespace(
+            model=model,
+            is_mla=False,
+            validate_paged_attention_support=MagicMock(),
+            build_paged_attention_runtime=MagicMock(),
+            install_gemma4_mtp_kv_sharing=MagicMock(),
+            install_drafter=MagicMock(),
+            install_paged_attention_runtime=MagicMock(),
+            model_args={
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 2,
+                "hidden_size": 4,
+            },
+            kv_cache_dtype=mx.float16,
+            metal_config=SimpleNamespace(use_paged_attention=True),
+        )
+        backend = MagicMock()
+        backend.patch_model = MagicMock(return_value=2)
+        backend.initialize = MagicMock()
+        runner.build_paged_attention_runtime.return_value = backend
+
+        worker = SimpleNamespace(model_runner=runner)
+        planner = WorkerCachePlanner(worker)
+
+        plan = SimpleNamespace(
+            block_size=16,
+            num_blocks=4,
+            per_block_bytes=1024,
+            format_breakdown=lambda: "stub",
+        )
+        with (
+            patch.object(planner, "_paged_attention_plan", return_value=plan),
+            patch(
+                "vllm_metal.v1.cache_policy.get_config",
+                return_value=SimpleNamespace(turboquant=False, k_quant=None),
+            ),
+            patch(
+                "vllm_metal.v1.cache_policy.try_enable_gemma4_yoco_fast_prefill",
+                return_value=None,
+            ),
+        ):
+            planner.setup_paged_attention(overhead=0)
+
+        backend.patch_model.assert_not_called()
+        runner.install_paged_attention_runtime.assert_called_once()
+
+
 class TestEncoderPoolingForward:
     def test_supports_embed_for_encoder_adapter(self) -> None:
         fake = _FakeEmbeddingsModule()

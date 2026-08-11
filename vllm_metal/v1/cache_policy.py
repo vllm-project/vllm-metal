@@ -950,7 +950,15 @@ class WorkerCachePlanner:
             backend,
             block_size=plan.block_size,
         )
-        n_patched = backend.patch_model(self._worker.model_runner.model)
+        # Encoder embedding models (mlx-embeddings XLM-RoBERTa / BGE-M3) own
+        # bidirectional attention internally. They still use the paged scheduler
+        # for pooling batch bookkeeping, but there are no mlx-lm-style
+        # ``model.layers`` to wrap — skip patching rather than fail loud.
+        model = self._worker.model_runner.model
+        if getattr(model, "is_mlx_embeddings_encoder", False):
+            n_patched = 0
+        else:
+            n_patched = backend.patch_model(model)
         self._worker.model_runner.install_drafter(
             num_blocks=plan.num_blocks,
             block_size=plan.block_size,
