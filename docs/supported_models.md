@@ -88,6 +88,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
+| LFM2 / LFM2.5 | 🔵 | Hybrid SDPA + ShortConv gated causal conv | ❌ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | Gemma 4 | ✅ | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-E2B-it` |
 | Gemma 3 | ✅ | GQA (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
 | Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
