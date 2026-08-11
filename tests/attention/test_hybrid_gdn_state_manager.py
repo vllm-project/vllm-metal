@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 
 from tests.stub_runner import make_gdn_hybrid_plan
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.impls.linear import KDAPagedAttentionWrapper
+from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.runtime.hybrid import (
+    BailingHybridPagedAttentionRuntime,
+    HybridPagedAttentionRuntime,
+)
 from vllm_metal.attention.state import HybridGDNStateManager
 
 
@@ -266,3 +274,112 @@ class TestHybridPagedAttentionRuntime:
         assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
         assert runtime.gdn_state_manager.needs_materialize is False
+
+
+class _FakeBailingKDA(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = object()
+        self.k_proj = object()
+        self.v_proj = object()
+        self.q_conv1d = object()
+        self.k_conv1d = object()
+        self.v_conv1d = object()
+        self.projection_size = 4
+        self.conv_kernel_size = 2
+
+
+class _FakeBailingMLA(nn.Module):
+    pass
+
+
+class _FakeBailingLayer:
+    def __init__(self, attention: nn.Module) -> None:
+        self.attention = attention
+
+
+class TestBailingHybridPagedAttentionRuntime:
+    def test_patches_interleaved_layers_with_compact_cache_indices(self) -> None:
+        runtime = BailingHybridPagedAttentionRuntime(
+            num_layers=4,
+            layer_group_size=2,
+            max_num_seqs=2,
+            latent_dim=6,
+            linear_num_heads=1,
+            linear_head_dim=4,
+            linear_conv_kernel_dim=2,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runtime.initialize(num_blocks=3)
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    _FakeBailingLayer(_FakeBailingKDA()),
+                    _FakeBailingLayer(_FakeBailingMLA()),
+                    _FakeBailingLayer(_FakeBailingKDA()),
+                    _FakeBailingLayer(_FakeBailingMLA()),
+                ]
+            )
+        )
+
+        assert runtime.patch_model(model) == 4
+
+        layers = model.model.layers
+        assert isinstance(layers[0].attention, KDAPagedAttentionWrapper)
+        assert isinstance(layers[1].attention, MLAPagedAttentionWrapper)
+        assert isinstance(layers[2].attention, KDAPagedAttentionWrapper)
+        assert isinstance(layers[3].attention, MLAPagedAttentionWrapper)
+        assert layers[0].attention._kda_cache_idx == 0
+        assert layers[2].attention._kda_cache_idx == 1
+        assert layers[1].attention._mla_layer_idx == 0
+        assert layers[3].attention._mla_layer_idx == 1
+        assert runtime._cache.num_layers == 2
+        assert runtime.state_cache.num_layers == 2
+
+    def test_repatches_wrapped_layers_and_rebinds_caches(self) -> None:
+        runtime = BailingHybridPagedAttentionRuntime(
+            num_layers=2,
+            layer_group_size=2,
+            max_num_seqs=2,
+            latent_dim=6,
+            linear_num_heads=1,
+            linear_head_dim=4,
+            linear_conv_kernel_dim=2,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runtime.initialize(num_blocks=3)
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    _FakeBailingLayer(_FakeBailingKDA()),
+                    _FakeBailingLayer(_FakeBailingMLA()),
+                ]
+            )
+        )
+
+        assert runtime.patch_model(model) == 2
+        runtime.initialize(num_blocks=4)
+        assert runtime.patch_model(model) == 2
+
+        kda = model.model.layers[0].attention
+        mla = model.model.layers[1].attention
+        assert kda._kda_state_cache is runtime.state_cache
+        assert mla._mla_latent_cache is runtime._cache
+
+    def test_classifies_incomplete_tail_as_mla(self) -> None:
+        runtime = BailingHybridPagedAttentionRuntime(
+            num_layers=5,
+            layer_group_size=2,
+            max_num_seqs=2,
+            latent_dim=6,
+            linear_num_heads=1,
+            linear_head_dim=4,
+            linear_conv_kernel_dim=2,
+            block_size=4,
+            dtype=mx.float32,
+        )
+
+        assert runtime._linear_indices == [0, 2]
+        assert runtime._sdpa_indices == [1, 3, 4]
