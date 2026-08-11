@@ -1156,7 +1156,7 @@ class WorkerCachePlanner:
         1. Numeric VLLM_METAL_MEMORY_FRACTION, for example 0.6, wins.
         2. Otherwise, VLLM_METAL_MEMORY_FRACTION=auto uses the user-provided
            --gpu-memory-utilization value.
-        3. If the user did not provide --gpu-memory-utilization, vLLM 0.26.0
+        3. If the user did not provide --gpu-memory-utilization, vLLM 0.27.0
            supplies its default value, 0.92.
         """
         metal_config = self._worker.metal_config
