@@ -995,7 +995,7 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
-        if self._runner.is_bailing_hybrid:
+        if self._runner.is_bailing_v3:
             if config.turboquant:
                 raise NotImplementedError(
                     "TurboQuant is not supported for Bailing hybrid models"

@@ -502,12 +502,12 @@ class ModelLifecycle:
     def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
         """Install hybrid attention dimensions for GDN- and KDA-style models."""
         if self._runner.is_hybrid:
-            if self._runner.is_bailing_hybrid:
+            if self._runner.is_bailing_v3:
                 fai = int(args["layer_group_size"])
             else:
                 fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
-            if self._runner.is_bailing_hybrid:
+            if self._runner.is_bailing_v3:
                 self._runner.sdpa_layer_indices = frozenset(
                     i
                     for i in range(self._runner.num_layers)
@@ -521,7 +521,7 @@ class ModelLifecycle:
             self._runner.num_linear_layers = (
                 self._runner.num_layers - self._runner.num_sdpa_layers
             )
-            if self._runner.is_bailing_hybrid:
+            if self._runner.is_bailing_v3:
                 num_heads = int(args["num_attention_heads"])
                 head_dim = int(args["head_dim"])
                 self._runner.linear_num_k_heads = num_heads
