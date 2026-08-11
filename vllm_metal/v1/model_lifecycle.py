@@ -91,8 +91,8 @@ class GenerationLoadRequest:
         gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
 
         # A pipeline-parallel stage prunes its non-owned layers right after load, so
-        # the generic mlx_lm weights load lazily and per-stage peak stays owned-only.
-        # Only the mlx_lm path honors this; GGUF/AWQ/VLM ignore it and load eager.
+        # the generic MLX loaders stay lazy until the stage-owned weights are known.
+        # The custom GGUF and AWQ loaders cannot honor this contract.
         pp = runner.pp
         lazy_weights = pp is not None and pp.size > 1
 
@@ -273,7 +273,7 @@ class ModelLifecycle:
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(model_name)
+            model, tokenizer = mlx_vlm_load(model_name, lazy=lazy_weights)
 
         elif awq_loader is not None:
             load_label = "AWQ model"
