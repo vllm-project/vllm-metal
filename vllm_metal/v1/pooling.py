@@ -16,7 +16,8 @@ from vllm_metal.v1.encoder_embeddings import EncoderEmbeddingAdapter
 
 _EMBED_POOLER_TASKS = (None, "embed")
 _CLASSIFY_POOLER_TASKS = (None, "classify")
-_SUPPORTED_POOLER_TASKS = (None, "embed", "classify")
+_TOKEN_CLASSIFY_POOLER_TASKS = (None, "token_classify")
+_SUPPORTED_POOLER_TASKS = (None, "embed", "classify", "token_classify")
 _LAST_POOLING = (None, "LAST")
 _QWEN3_RERANKER_TOKENS = ("no", "yes")
 
@@ -113,7 +114,8 @@ def _reject_unsupported_pooler_config(model_config: Any) -> None:
     if task not in _SUPPORTED_POOLER_TASKS:
         raise NotImplementedError(
             "Metal pooling supports only pooler_config.task unset, 'embed', "
-            f"or 'classify'; got {task!r} for model={_model_label(model_config)}."
+            f"'classify', or 'token_classify'; got {task!r} for "
+            f"model={_model_label(model_config)}."
         )
 
     seq_pooling_type = _unsupported_sequence_pooling_type(model_config)
@@ -267,10 +269,29 @@ def supports_classify_pooling(
     )
 
 
+def supports_token_classify_pooling(
+    model_config: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None,
+) -> bool:
+    """Return whether the loaded adapter owns a BGE-M3 sparse head."""
+    if getattr(model_config, "multimodal_config", None) is not None:
+        return False
+    if _pooler_task(model_config) not in _TOKEN_CLASSIFY_POOLER_TASKS:
+        return False
+    if _chunked_processing_enabled(model_config):
+        return False
+    return bool(
+        EncoderEmbeddingAdapter.supports_sparse_model_config(model_config)
+        and encoder_adapter is not None
+        and encoder_adapter.supports_token_classify
+    )
+
+
 def supported_pooling_tasks(
     model: Any,
     model_config: Any,
     tokenizer: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> tuple[SupportedTask, ...]:
     """Return Metal pooling tasks supported by this loaded model."""
     tasks: list[SupportedTask] = []
@@ -278,6 +299,8 @@ def supported_pooling_tasks(
         tasks.append("embed")
     if supports_classify_pooling(model, model_config, tokenizer):
         tasks.append("classify")
+    if supports_token_classify_pooling(model_config, encoder_adapter):
+        tasks.append("token_classify")
     return tuple(tasks)
 
 
@@ -287,7 +310,7 @@ def _unsupported_pooling_option(
 ) -> str | None:
     if pooling_params.late_interaction_params is not None:
         return "late-interaction parameters"
-    if pooling_params.requires_token_ids:
+    if pooling_params.requires_token_ids and pooling_params.task != "token_classify":
         return "token-level ALL pooling outputs"
     if pooling_params.step_tag_id is not None:
         return "STEP pooling parameters"
@@ -295,7 +318,10 @@ def _unsupported_pooling_option(
         return "returned_token_ids"
     if pooling_params.extra_kwargs:
         return "extra pooling kwargs"
-    if pooling_params.task != "classify" and pooling_params.use_activation is False:
+    if (
+        pooling_params.task not in ("classify", "token_classify")
+        and pooling_params.use_activation is False
+    ):
         return "use_activation=False"
     if (
         pooling_params.dimensions is not None
@@ -308,6 +334,7 @@ def _unsupported_pooling_option(
 def validate_pooling_params(
     pooling_params: PoolingParams,
     model_config: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> None:
     """Validate the narrow text-only Metal pooling contract."""
     model = _model_label(model_config)
@@ -339,16 +366,16 @@ def validate_pooling_params(
                 f"{model}."
             )
     elif task == "token_classify":
-        raise NotImplementedError(
-            "Metal pooling does not yet support task='token_classify' "
-            "(BGE-M3 sparse lexical weights). Dense embed for encoder models "
-            "is supported; sparse token_classify is tracked as a follow-up "
-            f"to #589 for model={model}."
-        )
+        if not supports_token_classify_pooling(model_config, encoder_adapter):
+            raise NotImplementedError(
+                "Metal token_classify requires the supported BGE-M3 encoder "
+                f"and a loaded sparse head; model={model}."
+            )
     else:
         raise NotImplementedError(
-            "Metal pooling supports only text-only task='embed' and the "
-            "Qwen3 reranker task='classify' for now; "
+            "Metal pooling supports only text-only task='embed', the "
+            "Qwen3 reranker task='classify', and supported BGE-M3 "
+            "task='token_classify'; "
             f"got task={task!r} for model={model}."
         )
 
@@ -364,13 +391,18 @@ def validate_pooling_request(
     model_config: Any,
     *,
     paged_attention_enabled: bool,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> None:
     """Validate the request-level contract for Metal text pooling."""
     pooling_params = new_req.pooling_params
     if pooling_params is None:
         return
 
-    validate_pooling_params(pooling_params, model_config)
+    validate_pooling_params(
+        pooling_params,
+        model_config,
+        encoder_adapter=encoder_adapter,
+    )
     if new_req.mm_features:
         raise NotImplementedError(
             "Multimodal pooling inputs are not supported on Metal yet."
@@ -387,6 +419,26 @@ def validate_pooling_request(
     if not (new_req.prompt_token_ids or []):
         raise ValueError(
             f"Metal pooling requires prompt_token_ids for request {new_req.req_id!r}."
+        )
+
+
+def validate_token_classify_prefill(
+    pooling_params: PoolingParams | None,
+    *,
+    req_id: str,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int,
+    prompt_len: int,
+    cached_request: bool,
+) -> None:
+    """Reject partial token pooling before encoder work is constructed."""
+    if pooling_params is None or pooling_params.task != "token_classify":
+        return
+    if cached_request or num_computed_tokens != 0 or num_scheduled_tokens != prompt_len:
+        raise NotImplementedError(
+            "Metal token_classify requires one complete, uncached prefill; "
+            f"request={req_id!r}, computed={num_computed_tokens}, "
+            f"scheduled={num_scheduled_tokens}, prompt_len={prompt_len}."
         )
 
 
@@ -503,6 +555,20 @@ def _classifier_use_activation(
     return getattr(_pooler_config(model_config), "use_activation", None) is not False
 
 
+def _calibrate_classifier_logits(
+    logits: mx.array,
+    model_config: Any,
+) -> mx.array:
+    pooler_config = _pooler_config(model_config)
+    logit_mean = getattr(pooler_config, "logit_mean", None)
+    logit_sigma = getattr(pooler_config, "logit_sigma", None)
+    if logit_mean is not None:
+        logits = logits - float(logit_mean)
+    if logit_sigma is not None:
+        logits = logits / float(logit_sigma)
+    return logits
+
+
 def pool_sequence_classification(
     hidden_states: mx.array,
     *,
@@ -546,14 +612,9 @@ def pool_sequence_classification(
         )
 
     token_logits = vocab_logits[mx.array([no_id, yes_id], dtype=mx.int32)]
-    score = token_logits[1] - token_logits[0]
-    pooler_config = _pooler_config(model_config)
-    logit_mean = getattr(pooler_config, "logit_mean", None)
-    logit_sigma = getattr(pooler_config, "logit_sigma", None)
-    if logit_mean is not None:
-        score = score - float(logit_mean)
-    if logit_sigma is not None:
-        score = score / float(logit_sigma)
+    score = _calibrate_classifier_logits(
+        token_logits[1] - token_logits[0], model_config
+    )
     if _classifier_use_activation(pooling_params, model_config):
         score = mx.sigmoid(score)
 
@@ -561,19 +622,65 @@ def pool_sequence_classification(
     return tensor.detach().clone()
 
 
+def pool_bge_m3_token_classification(
+    sparse_logits: mx.array,
+    *,
+    token_span: tuple[int, int],
+    token_ids: list[int],
+    pooling_params: PoolingParams,
+    model_config: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None,
+) -> torch.Tensor:
+    """Return per-token BGE-M3 lexical weights for one complete request."""
+    if encoder_adapter is None or not encoder_adapter.supports_token_classify:
+        raise NotImplementedError(
+            "Metal token_classify requires a loaded BGE-M3 sparse head."
+        )
+
+    start, end = token_span
+    if start < 0 or end < start or end > sparse_logits.shape[0]:
+        raise ValueError(
+            f"Metal token_classify span {token_span!r} is outside sparse logit "
+            f"shape {sparse_logits.shape} for model={_model_label(model_config)}."
+        )
+    calibrated_logits = _calibrate_classifier_logits(
+        sparse_logits[start:end],
+        model_config,
+    )
+    weights = encoder_adapter.filter_sparse_token_weights(
+        calibrated_logits,
+        token_ids=token_ids,
+        use_activation=_classifier_use_activation(pooling_params, model_config),
+    )
+    if weights.size == 0:
+        return torch.empty((0,), dtype=torch.float32, device="cpu")
+    tensor = mlx_to_torch(mx.contiguous(weights), device="cpu", already_contiguous=True)
+    return tensor.detach().clone()
+
+
 def pool_sequence_batch(
     hidden_states: mx.array,
     *,
     token_indices: list[int | None],
+    token_spans: list[tuple[int, int] | None],
+    prompt_token_ids: list[list[int]],
     pooling_params: list[PoolingParams],
     model: Any,
     tokenizer: Any,
     model_config: Any,
+    sparse_logits: mx.array | None = None,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> list[torch.Tensor | None]:
     """Pool a paged prefill batch; unfinished chunks return ``None``."""
     outputs: list[torch.Tensor | None] = []
-    for token_index, params in zip(token_indices, pooling_params, strict=True):
-        if token_index is None:
+    for token_index, token_span, token_ids, params in zip(
+        token_indices,
+        token_spans,
+        prompt_token_ids,
+        pooling_params,
+        strict=True,
+    ):
+        if token_index is None and token_span is None:
             outputs.append(None)
             continue
         task = params.task
@@ -586,6 +693,7 @@ def pool_sequence_batch(
                 )
             )
         elif task == "classify":
+            assert token_index is not None
             outputs.append(
                 pool_sequence_classification(
                     hidden_states,
@@ -596,10 +704,27 @@ def pool_sequence_batch(
                     model_config=model_config,
                 )
             )
+        elif task == "token_classify":
+            assert token_span is not None
+            if sparse_logits is None:
+                raise RuntimeError(
+                    "Metal token_classify batch is missing packed sparse logits."
+                )
+            outputs.append(
+                pool_bge_m3_token_classification(
+                    sparse_logits,
+                    token_span=token_span,
+                    token_ids=token_ids,
+                    pooling_params=params,
+                    model_config=model_config,
+                    encoder_adapter=encoder_adapter,
+                )
+            )
         else:
             raise NotImplementedError(
-                "Metal pooling supports only text-only task='embed' and the "
-                "Qwen3 reranker task='classify' for now; "
+                "Metal pooling supports only text-only task='embed', the "
+                "Qwen3 reranker task='classify', and supported BGE-M3 "
+                "task='token_classify'; "
                 f"got task={task!r} for model={_model_label(model_config)}."
             )
     return outputs
@@ -614,11 +739,12 @@ def pool_paged_prefill_batch(
     model: Any,
     tokenizer: Any,
     model_config: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> list[torch.Tensor | None]:
     """Pool a paged prefill batch; unfinished chunks return ``None``."""
-    mx.eval(hidden_states)
-
     token_indices: list[int | None] = []
+    token_spans: list[tuple[int, int] | None] = []
+    prompt_token_ids: list[list[int]] = []
     pooling_params: list[PoolingParams] = []
     for i, entry in enumerate(prefill_entries):
         pooling_params_for_req = entry.prefill.pooling_params
@@ -627,6 +753,26 @@ def pool_paged_prefill_batch(
                 "Paged pooling batch contained a non-pooling prefill request."
             )
         pooling_params.append(pooling_params_for_req)
+        prompt_token_ids.append(entry.prefill.token_ids)
+
+        span_start = cu_seqlens[num_decode_segments + i]
+        span_end = cu_seqlens[num_decode_segments + i + 1]
+        if pooling_params_for_req.task == "token_classify":
+            prefill = entry.prefill
+            if (
+                entry.result_mode != "new_final"
+                or prefill.start_pos != 0
+                or prefill.prompt_len != len(prefill.token_ids)
+            ):
+                raise NotImplementedError(
+                    "Metal token_classify requires one complete, uncached prefill; "
+                    f"request={prefill.req_id!r}, mode={entry.result_mode!r}, "
+                    f"start_pos={prefill.start_pos}, prompt_len={prefill.prompt_len}, "
+                    f"forwarded={len(prefill.token_ids)}."
+                )
+            token_indices.append(None)
+            token_spans.append((span_start, span_end))
+            continue
 
         if entry.result_mode == "intermediate":
             token_indices.append(None)
@@ -634,14 +780,36 @@ def pool_paged_prefill_batch(
             token_indices.append(cu_seqlens[num_decode_segments + i])
         else:
             token_indices.append(cu_seqlens[num_decode_segments + i + 1] - 1)
+        token_spans.append(None)
+
+    sparse_logits = None
+    if any(params.task == "token_classify" for params in pooling_params):
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ValueError(
+                "Metal token_classify expected hidden states with shape "
+                f"[1, tokens, hidden], got {hidden_states.shape} "
+                f"for model={_model_label(model_config)}."
+            )
+        if encoder_adapter is None or not encoder_adapter.supports_token_classify:
+            raise NotImplementedError(
+                "Metal token_classify requires a loaded BGE-M3 sparse head."
+            )
+        sparse_logits = encoder_adapter.sparse_token_logits(hidden_states[0])
+        mx.eval(sparse_logits)
+    else:
+        mx.eval(hidden_states)
 
     return pool_sequence_batch(
         hidden_states,
         token_indices=token_indices,
+        token_spans=token_spans,
+        prompt_token_ids=prompt_token_ids,
         pooling_params=pooling_params,
         model=model,
         tokenizer=tokenizer,
         model_config=model_config,
+        sparse_logits=sparse_logits,
+        encoder_adapter=encoder_adapter,
     )
 
 
@@ -654,6 +822,7 @@ def finish_paged_pooling_batch(
     model: Any,
     tokenizer: Any,
     model_config: Any,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ) -> None:
     """Convert final paged prefill hidden states into batch pooler outputs."""
     pooler_outputs = pool_paged_prefill_batch(
@@ -664,6 +833,7 @@ def finish_paged_pooling_batch(
         model=model,
         tokenizer=tokenizer,
         model_config=model_config,
+        encoder_adapter=encoder_adapter,
     )
     for entry, pooler_output in zip(
         batch.paged_prefill_entries, pooler_outputs, strict=True

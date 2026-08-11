@@ -21,6 +21,7 @@ from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.encoder_embeddings import (  # noqa: E402
+    BgeM3SparseHead,
     EncoderEmbeddingAdapter,
     MlxEmbeddingsEncoderModel,
 )
@@ -172,6 +173,7 @@ def _make_runner(
     model: object | None = None,
     model_config: object | None = None,
     tokenizer: object | None = None,
+    encoder_adapter: EncoderEmbeddingAdapter | None = None,
 ):
     resolved_model = model or _PoolingModel()
     runner = make_stub_runner(
@@ -191,8 +193,10 @@ def _make_runner(
         ),
         _paged_block_size=4,
         num_layers=1,
-        _encoder_embedding_adapter=EncoderEmbeddingAdapter.from_loaded_model(
-            resolved_model
+        _encoder_embedding_adapter=(
+            encoder_adapter
+            if encoder_adapter is not None
+            else EncoderEmbeddingAdapter.from_loaded_model(resolved_model)
         ),
     )
     return runner
@@ -210,6 +214,7 @@ def _new_req(
     num_computed_tokens: int = 0,
     block_ids: list[int] | None = None,
     pooling_params: PoolingParams | None = None,
+    lora_request: object | None = None,
 ) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
@@ -219,7 +224,7 @@ def _new_req(
         pooling_params=pooling_params or _pooling_params(task),
         block_ids=(block_ids or [0, 1],),
         num_computed_tokens=num_computed_tokens,
-        lora_request=None,
+        lora_request=lora_request,
         prompt_embeds=None,
     )
 
@@ -325,17 +330,57 @@ def _encoder_pooling_model_config(**overrides):
     return _pooling_model_config(**values)
 
 
+def _bge_m3_sparse_model_config(**overrides):
+    values = {
+        "model": "mlx-community/bge-m3-mlx-8bit",
+        "served_model_name": "mlx-community/bge-m3-mlx-8bit",
+        "hf_config": _encoder_hf_config(
+            hidden_size=3,
+            bos_token_id=0,
+            eos_token_id=2,
+        ),
+        "pooler_config": _pooler_config(
+            task="token_classify",
+            seq_pooling_type="CLS",
+            enable_chunked_processing=False,
+        ),
+    }
+    values.update(overrides)
+    return _pooling_model_config(**values)
+
+
 class _FakeEncoderOutput:
     def __init__(self, hidden_states: mx.array) -> None:
         self.last_hidden_state = hidden_states
 
 
 class _FakeEncoderModule:
+    def __init__(self) -> None:
+        self.calls: list[list[int]] = []
+
     def __call__(self, input_ids, attention_mask=None):
         del attention_mask
         token_ids = np.array(input_ids).reshape(-1).tolist()
+        self.calls.append(token_ids)
         rows = [[float(tok), float(tok + 1), 1.0] for tok in token_ids]
         return _FakeEncoderOutput(mx.array([rows], dtype=mx.float32))
+
+
+def _sparse_encoder_components() -> tuple[
+    MlxEmbeddingsEncoderModel,
+    EncoderEmbeddingAdapter,
+    _FakeEncoderModule,
+]:
+    encoder = _FakeEncoderModule()
+    model = MlxEmbeddingsEncoderModel(encoder)
+    sparse_head = BgeM3SparseHead(
+        weight=mx.array([[1.0, 0.0, 0.0]], dtype=mx.float32),
+        bias=mx.array([-5.5], dtype=mx.float32),
+        bos_token_id=0,
+        eos_token_id=2,
+    )
+    adapter = EncoderEmbeddingAdapter(model, sparse_head=sparse_head)
+    return model, adapter, encoder
 
 
 class TestMetalPoolingCapabilities:
@@ -351,6 +396,16 @@ class TestMetalPoolingCapabilities:
         )
 
         assert runner.supported_worker_tasks() == ("embed",)
+
+    def test_supported_worker_tasks_for_bge_m3_sparse_model(self) -> None:
+        model, adapter, _encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(),
+            encoder_adapter=adapter,
+        )
+
+        assert runner.supported_worker_tasks() == ("token_classify",)
 
     def test_supported_worker_tasks_rejects_incompatible_pooling_model(self) -> None:
         runner = make_stub_runner(
@@ -503,6 +558,121 @@ class TestMetalPoolingRunnerOutput:
         # CLS uses the first token of each packed segment, not the last.
         _assert_embedding(out.pooler_output[0], 4)
         _assert_embedding(out.pooler_output[1], 7)
+
+    def test_paged_bge_m3_sparse_preserves_token_spans_and_request_order(
+        self,
+    ) -> None:
+        model, adapter, encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(),
+            encoder_adapter=adapter,
+        )
+        req_b = _new_req(
+            "req-b",
+            [0, 4, 6, 2],
+            pooling_params=_pooling_params(
+                task="token_classify",
+                requires_token_ids=True,
+            ),
+        )
+        req_a = _new_req(
+            "req-a",
+            [0, 9, 2],
+            pooling_params=_pooling_params(
+                task="token_classify",
+                requires_token_ids=True,
+            ),
+        )
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+            patch.object(
+                adapter,
+                "sparse_token_logits",
+                wraps=adapter.sparse_token_logits,
+            ) as sparse_projection,
+        ):
+            out = _execute_pooling(runner, _scheduler_output(new_reqs=[req_b, req_a]))
+
+        assert out.req_ids == ["req-b", "req-a"]
+        assert out.sampled_token_ids == [[], []]
+        assert out.pooler_output is not None
+        assert torch.equal(out.pooler_output[0], torch.tensor([0.0, 0.5]))
+        assert torch.equal(out.pooler_output[1], torch.tensor([3.5]))
+        assert encoder.calls == [[0, 4, 6, 2], [0, 9, 2]]
+        sparse_projection.assert_called_once()
+
+    def test_paged_bge_m3_sparse_calibrates_before_relu(self) -> None:
+        model, adapter, _encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(
+                pooler_config=_pooler_config(
+                    task="token_classify",
+                    seq_pooling_type="CLS",
+                    enable_chunked_processing=False,
+                    logit_mean=1.5,
+                    logit_sigma=2.0,
+                )
+            ),
+            encoder_adapter=adapter,
+        )
+        req = _new_req(
+            "req-0",
+            [0, 6, 2],
+            pooling_params=_pooling_params(task="token_classify"),
+        )
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+        ):
+            out = _execute_pooling(runner, _scheduler_output(new_reqs=[req]))
+
+        assert out.pooler_output is not None
+        assert torch.equal(out.pooler_output[0], torch.tensor([0.0]))
+
+    def test_paged_bge_m3_sparse_returns_empty_tensor_for_boundary_only_input(
+        self,
+    ) -> None:
+        model, adapter, _encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(),
+            encoder_adapter=adapter,
+        )
+        empty_req = _new_req(
+            "empty",
+            [0, 2],
+            pooling_params=_pooling_params(task="token_classify"),
+        )
+        body_req = _new_req(
+            "body",
+            [0, 6, 2],
+            pooling_params=_pooling_params(task="token_classify"),
+        )
+
+        with (
+            patch("vllm_metal.v1.model_runner.prepare_grouped"),
+            patch("vllm_metal.v1.model_runner.clear_context"),
+            patch.object(
+                adapter,
+                "sparse_token_logits",
+                wraps=adapter.sparse_token_logits,
+            ) as sparse_projection,
+        ):
+            out = _execute_pooling(
+                runner,
+                _scheduler_output(new_reqs=[empty_req, body_req]),
+            )
+
+        assert out.req_ids == ["empty", "body"]
+        assert out.pooler_output is not None
+        assert torch.equal(out.pooler_output[0], torch.empty(0))
+        assert torch.equal(out.pooler_output[1], torch.tensor([0.5]))
+        sparse_projection.assert_called_once()
 
     def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(self) -> None:
         runner = _make_runner()
@@ -664,15 +834,87 @@ class TestMetalPoolingFailFast:
         with pytest.raises(NotImplementedError, match="task"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
-    def test_token_classify_fail_fast_mentions_sparse_followup(self) -> None:
+    def test_token_classify_rejects_encoder_without_sparse_head(self) -> None:
         runner = _make_runner(
             model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
-            model_config=_encoder_pooling_model_config(),
+            model_config=_bge_m3_sparse_model_config(),
         )
         req = _new_req("req-0", [1, 2], task="token_classify")
 
-        with pytest.raises(NotImplementedError, match="sparse lexical weights"):
+        with pytest.raises(NotImplementedError, match="sparse head"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
+
+    @pytest.mark.parametrize(
+        ("num_computed_tokens", "num_scheduled_tokens"),
+        [
+            (0, 2),
+            (1, 3),
+        ],
+    )
+    def test_token_classify_rejects_partial_or_prefix_cached_new_request(
+        self,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+    ) -> None:
+        model, adapter, encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(),
+            encoder_adapter=adapter,
+        )
+        req = _new_req(
+            "req-0",
+            [0, 4, 5, 2],
+            num_computed_tokens=num_computed_tokens,
+            pooling_params=_pooling_params(task="token_classify"),
+            lora_request=SimpleNamespace(lora_int_id=7),
+        )
+        runner._lora = MagicMock()
+        sched = _scheduler_output(
+            new_reqs=[req],
+            num_scheduled_tokens={"req-0": num_scheduled_tokens},
+        )
+
+        with pytest.raises(NotImplementedError, match="complete, uncached prefill"):
+            runner.execute_model(sched)
+
+        assert encoder.calls == []
+        assert "req-0" not in runner._request_states
+        runner._lora.add_adapter.assert_not_called()
+
+    def test_token_classify_rejects_resumed_cache_before_state_mutation(self) -> None:
+        model, adapter, encoder = _sparse_encoder_components()
+        runner = _make_runner(
+            model=model,
+            model_config=_bge_m3_sparse_model_config(),
+            encoder_adapter=adapter,
+        )
+        runner._request_states["req-0"] = mr.RequestState(
+            token_ids=[0, 4, 5, 2, 9],
+            prompt_len=4,
+            cache=[],
+            sampling_params=mr.SamplingParams(),
+            pooling_params=_pooling_params(task="token_classify"),
+            generated_tokens=1,
+            block_ids=[[0, 1]],
+        )
+        runner._paged_request_seq_lens["req-0"] = 5
+        sched = _scheduler_output(
+            cached_req_ids=["req-0"],
+            cached_num_computed_tokens=[2],
+            num_scheduled_tokens={"req-0": 2},
+        )
+        sched.scheduled_cached_reqs.resumed_req_ids = {"req-0"}
+        sched.scheduled_cached_reqs.new_block_ids = [([7, 8],)]
+
+        with pytest.raises(NotImplementedError, match="complete, uncached prefill"):
+            runner.execute_model(sched)
+
+        assert encoder.calls == []
+        state = runner._request_states["req-0"]
+        assert state.block_ids == [[0, 1]]
+        assert state.generated_tokens == 1
+        assert runner._paged_request_seq_lens["req-0"] == 5
 
     def test_classify_hidden_state_shape_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="hidden states with shape"):

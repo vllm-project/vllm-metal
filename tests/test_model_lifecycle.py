@@ -288,6 +288,57 @@ class TestModelLifecycle:
         lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
         assert captured["lazy"] is False
 
+    def test_load_mlx_embeddings_forwards_model_config_for_sparse_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+        model = object()
+        tokenizer = object()
+        adapter = object()
+        model_config = _runner_model_config(
+            model="mlx-community/bge-m3-mlx-8bit",
+            pooler_config=SimpleNamespace(task="token_classify"),
+        )
+
+        def _fake_load(
+            model_name: str,
+            *,
+            model_config: object,
+            tokenizer_config: dict[str, object],
+            lazy: bool,
+        ) -> tuple[object, object, object]:
+            captured.update(
+                model_name=model_name,
+                model_config=model_config,
+                tokenizer_config=tokenizer_config,
+                lazy=lazy,
+            )
+            return model, tokenizer, adapter
+
+        monkeypatch.setattr(
+            model_lifecycle.EncoderEmbeddingAdapter,
+            "load",
+            _fake_load,
+        )
+        lifecycle, _runner = _make_lifecycle(model_config=model_config)
+
+        loaded_model, loaded_tokenizer = lifecycle._load_mlx_embeddings_model(
+            "cached/model/path",
+            {"trust_remote_code": True},
+            model_config=model_config,
+            lazy=True,
+        )
+
+        assert loaded_model is model
+        assert loaded_tokenizer is tokenizer
+        assert captured == {
+            "model_name": "cached/model/path",
+            "model_config": model_config,
+            "tokenizer_config": {"trust_remote_code": True},
+            "lazy": True,
+        }
+
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
         monkeypatch: pytest.MonkeyPatch,

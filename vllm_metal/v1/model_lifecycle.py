@@ -221,6 +221,7 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_embeddings_model(
                 model_name,
                 tokenizer_config,
+                model_config=model_config,
                 lazy=lazy_weights,
             )
 
@@ -295,10 +296,12 @@ class ModelLifecycle:
         model_name: str,
         tokenizer_config: Mapping[str, Any],
         *,
+        model_config: Any | None = None,
         lazy: bool = False,
     ) -> tuple[Any, Any]:
         model, tokenizer, adapter = EncoderEmbeddingAdapter.load(
             model_name,
+            model_config=model_config,
             tokenizer_config=dict(tokenizer_config),
             lazy=lazy,
         )

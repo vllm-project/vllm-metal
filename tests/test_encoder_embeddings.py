@@ -3,15 +3,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+import torch
 
 from vllm_metal.v1.encoder_embeddings import (
+    BgeM3SparseHead,
     EncoderEmbeddingAdapter,
     MlxEmbeddingsEncoderModel,
+    _load_bge_m3_sparse_head,
     is_encoder_embedding_config,
     load_mlx_embeddings_model,
     requires_mlx_embeddings_load,
@@ -19,6 +23,23 @@ from vllm_metal.v1.encoder_embeddings import (
 from vllm_metal.v1.pooling import (
     forward_sequence_hidden_states,
     supports_embed_pooling,
+)
+
+_BGE_M3_MODEL_ID = "mlx-community/bge-m3-mlx-8bit"
+_BGE_M3_MODEL_REVISION = "7eca4a1c6ea1a0c5efc37598b369012f3985910f"
+_BGE_M3_HI_TOKEN_ID = 2673
+_BGE_M3_HI_REFERENCE_WEIGHT = 0.26710861921310425
+_BGE_M3_8BIT_REFERENCE_REL_TOLERANCE = 0.02
+_BGE_M3_REQUIRED_FILES = (
+    "config.json",
+    "config_sentence_transformers.json",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "modules.json",
+    "sentence_bert_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
 )
 
 
@@ -30,6 +51,9 @@ def _encoder_model_config(**overrides):
         "hf_config": SimpleNamespace(
             architectures=["XLMRobertaModel"],
             model_type="xlm-roberta",
+            hidden_size=4,
+            bos_token_id=0,
+            eos_token_id=2,
         ),
         "pooler_config": SimpleNamespace(
             task="embed",
@@ -61,6 +85,8 @@ class _FakeEmbeddingsModule:
             num_key_value_heads=2,
             head_dim=2,
             max_position_embeddings=32,
+            bos_token_id=0,
+            eos_token_id=2,
         )
         self.calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
 
@@ -166,6 +192,247 @@ class TestMlxEmbeddingsLoad:
             )
         assert isinstance(model, MlxEmbeddingsEncoderModel)
         assert loaded_tokenizer is tokenizer
+
+    def test_loads_sparse_head_only_for_explicit_bge_m3_token_classify(
+        self,
+    ) -> None:
+        fake = _FakeEmbeddingsModule()
+        tokenizer = object()
+        sparse_head = BgeM3SparseHead(
+            weight=mx.ones((1, 4), dtype=mx.float32),
+            bias=mx.zeros((1,), dtype=mx.float32),
+            bos_token_id=0,
+            eos_token_id=2,
+        )
+        load_mock = MagicMock(return_value=(fake, tokenizer))
+        sparse_load_mock = MagicMock(return_value=sparse_head)
+        config = _encoder_model_config(
+            pooler_config=SimpleNamespace(task="token_classify")
+        )
+
+        with (
+            patch(
+                "vllm_metal.v1.encoder_embeddings._import_mlx_embeddings_load",
+                return_value=load_mock,
+            ),
+            patch(
+                "vllm_metal.v1.encoder_embeddings._load_bge_m3_sparse_head",
+                sparse_load_mock,
+            ),
+        ):
+            _model, _tokenizer, adapter = EncoderEmbeddingAdapter.load(
+                "cached/model/path",
+                model_config=config,
+            )
+
+        sparse_load_mock.assert_called_once_with(config.hf_config)
+        assert adapter.supports_token_classify
+
+    def test_dense_bge_m3_load_does_not_fetch_sparse_head(self) -> None:
+        fake = _FakeEmbeddingsModule()
+        load_mock = MagicMock(return_value=(fake, object()))
+        with (
+            patch(
+                "vllm_metal.v1.encoder_embeddings._import_mlx_embeddings_load",
+                return_value=load_mock,
+            ),
+            patch(
+                "vllm_metal.v1.encoder_embeddings._load_bge_m3_sparse_head"
+            ) as sparse_load_mock,
+        ):
+            _model, _tokenizer, adapter = EncoderEmbeddingAdapter.load(
+                "cached/model/path",
+                model_config=_encoder_model_config(),
+            )
+
+        sparse_load_mock.assert_not_called()
+        assert not adapter.supports_token_classify
+
+    def test_token_classify_rejects_unrelated_encoder_model(self) -> None:
+        config = _encoder_model_config(
+            model="other/xlm-roberta",
+            served_model_name="other/xlm-roberta",
+            pooler_config=SimpleNamespace(task="token_classify"),
+        )
+        with pytest.raises(NotImplementedError, match="mlx-community/bge-m3"):
+            EncoderEmbeddingAdapter.load(
+                "cached/model/path",
+                model_config=config,
+            )
+
+
+class TestBgeM3SparseHead:
+    def test_applies_bias_relu_and_filters_bos_eos(self) -> None:
+        head = BgeM3SparseHead(
+            weight=mx.array([[1.0, 0.0, 0.0]], dtype=mx.float32),
+            bias=mx.array([-1.5], dtype=mx.float32),
+            bos_token_id=0,
+            eos_token_id=2,
+        )
+        hidden_states = mx.array(
+            [
+                [100.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [100.0, 0.0, 0.0],
+            ],
+            dtype=mx.float32,
+        )
+
+        token_logits = head.project_token_logits(hidden_states)
+        activated = head.filter_token_weights(
+            token_logits,
+            token_ids=[0, 41, 0, 2, 42, 2],
+            use_activation=True,
+        )
+        raw = head.filter_token_weights(
+            token_logits,
+            token_ids=[0, 41, 0, 2, 42, 2],
+            use_activation=False,
+        )
+
+        assert mx.allclose(
+            activated,
+            mx.array([1.5, 0.0, 2.5, 0.0], dtype=mx.float32),
+        )
+        assert mx.allclose(
+            raw,
+            mx.array([1.5, -0.5, 2.5, -0.5], dtype=mx.float32),
+        )
+
+    def test_rejects_invalid_weight_shape(self) -> None:
+        with pytest.raises(ValueError, match=r"\[1, hidden\]"):
+            BgeM3SparseHead(
+                weight=mx.ones((2, 4), dtype=mx.float32),
+                bias=mx.zeros((1,), dtype=mx.float32),
+                bos_token_id=0,
+                eos_token_id=2,
+            )
+
+    def test_official_head_loader_is_revision_pinned(self) -> None:
+        state = {
+            "weight": torch.ones((1, 4), dtype=torch.float16),
+            "bias": torch.zeros((1,), dtype=torch.float16),
+        }
+        config = SimpleNamespace(hidden_size=4, bos_token_id=0, eos_token_id=2)
+
+        with (
+            patch(
+                "vllm_metal.v1.encoder_embeddings.hf_hub_download",
+                return_value="/tmp/sparse_linear.pt",
+            ) as download_mock,
+            patch(
+                "vllm_metal.v1.encoder_embeddings.torch.load",
+                return_value=state,
+            ) as torch_load_mock,
+        ):
+            head = _load_bge_m3_sparse_head(config)
+
+        download_mock.assert_called_once_with(
+            repo_id="BAAI/bge-m3",
+            filename="sparse_linear.pt",
+            revision="5617a9f61b028005a4858fdac845db406aefb181",
+        )
+        torch_load_mock.assert_called_once_with(
+            "/tmp/sparse_linear.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert head.supports_hidden_size(4)
+
+    def test_official_head_loader_rejects_nonfinite_weights(self) -> None:
+        state = {
+            "weight": torch.tensor([[float("nan"), 0.0]], dtype=torch.float16),
+            "bias": torch.zeros((1,), dtype=torch.float16),
+        }
+        config = SimpleNamespace(hidden_size=2, bos_token_id=0, eos_token_id=2)
+
+        with (
+            patch(
+                "vllm_metal.v1.encoder_embeddings.hf_hub_download",
+                return_value="/tmp/sparse_linear.pt",
+            ),
+            patch(
+                "vllm_metal.v1.encoder_embeddings.torch.load",
+                return_value=state,
+            ),
+            pytest.raises(ValueError, match="must be finite"),
+        ):
+            _load_bge_m3_sparse_head(config)
+
+    @pytest.mark.slow
+    def test_cached_real_bge_m3_hi_matches_upstream_sparse_reference(self) -> None:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_model_files = {
+            filename: try_to_load_from_cache(
+                _BGE_M3_MODEL_ID,
+                filename,
+                revision=_BGE_M3_MODEL_REVISION,
+            )
+            for filename in _BGE_M3_REQUIRED_FILES
+        }
+        head_path = try_to_load_from_cache(
+            "BAAI/bge-m3",
+            "sparse_linear.pt",
+            revision="5617a9f61b028005a4858fdac845db406aefb181",
+        )
+        missing_files = [
+            filename
+            for filename, path in cached_model_files.items()
+            if not isinstance(path, str)
+        ]
+        if not isinstance(head_path, str):
+            missing_files.append("BAAI/bge-m3/sparse_linear.pt")
+        if missing_files:
+            pytest.skip(
+                "Pinned BGE-M3 files not in the Hugging Face cache: "
+                f"{missing_files}; "
+                f"pre-pull with `hf download {_BGE_M3_MODEL_ID} "
+                f"--revision {_BGE_M3_MODEL_REVISION}`"
+            )
+
+        config_path = cached_model_files["config.json"]
+        assert isinstance(config_path, str)
+        assert isinstance(head_path, str)
+        model_config = _encoder_model_config(
+            pooler_config=SimpleNamespace(task="token_classify"),
+            hf_config=SimpleNamespace(
+                architectures=["XLMRobertaModel"],
+                model_type="xlm-roberta",
+                hidden_size=1024,
+                bos_token_id=0,
+                eos_token_id=2,
+            ),
+        )
+        with patch(
+            "vllm_metal.v1.encoder_embeddings.hf_hub_download",
+            return_value=head_path,
+        ):
+            _model, tokenizer, adapter = EncoderEmbeddingAdapter.load(
+                str(Path(config_path).parent),
+                model_config=model_config,
+            )
+        token_ids = tokenizer.encode("Hi", add_special_tokens=True)
+        hidden_states = adapter.forward_sequence_hidden_states(
+            mx.array(token_ids, dtype=mx.int32),
+            segment_lengths=[len(token_ids)],
+        )
+        weights = adapter.filter_sparse_token_weights(
+            adapter.sparse_token_logits(hidden_states[0]),
+            token_ids=token_ids,
+            use_activation=True,
+        )
+        mx.eval(weights)
+
+        assert token_ids == [0, _BGE_M3_HI_TOKEN_ID, 2]
+        assert tuple(weights.shape) == (1,)
+        assert float(weights.item()) == pytest.approx(
+            _BGE_M3_HI_REFERENCE_WEIGHT,
+            rel=_BGE_M3_8BIT_REFERENCE_REL_TOLERANCE,
+        )
 
 
 class TestEncoderPagedSetup:

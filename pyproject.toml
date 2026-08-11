@@ -85,8 +85,8 @@ stt = [
     "numba>=0.59.0",  # Required by librosa on Python 3.12+
 ]
 embeddings = [
-    # Encoder embedding models (XLM-RoBERTa / BGE-M3 dense embed). Required for
-    # mlx-community BGE-M3 checkpoints; sparse token_classify is a follow-up.
+    # Encoder embedding models (XLM-RoBERTa / BGE-M3 dense and sparse pooling).
+    # Required for mlx-community BGE-M3 checkpoints.
     "mlx-embeddings>=0.1.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 dev = [

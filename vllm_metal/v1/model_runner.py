@@ -104,6 +104,7 @@ from vllm_metal.v1.pooling import (
     pooling_dummy_forward_outputs,
     supported_pooling_tasks,
     validate_pooling_request,
+    validate_token_classify_prefill,
 )
 from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
@@ -495,7 +496,10 @@ class MetalModelRunner:
             if self._paged_attention_runtime is None:
                 return ()
             return supported_pooling_tasks(
-                self._forward_model, self.model_config, self.tokenizer
+                self._forward_model,
+                self.model_config,
+                self.tokenizer,
+                self._encoder_embedding_adapter,
             )
         return ("generate",)
 
@@ -1403,6 +1407,7 @@ class MetalModelRunner:
                 model=self._forward_model,
                 tokenizer=self.tokenizer,
                 model_config=self.model_config,
+                encoder_adapter=self._encoder_embedding_adapter,
             )
             return batch, scheduler_output
 
@@ -2017,6 +2022,7 @@ class MetalModelRunner:
                 new_req,
                 self.model_config,
                 paged_attention_enabled=self._paged_attention_runtime is not None,
+                encoder_adapter=self._encoder_embedding_adapter,
             )
 
             # mm_features were pre-registered before encoder dispatch in
@@ -2042,6 +2048,14 @@ class MetalModelRunner:
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
+                validate_token_classify_prefill(
+                    pooling_params,
+                    req_id=req_id,
+                    num_computed_tokens=computed_tokens,
+                    num_scheduled_tokens=scheduled_tokens,
+                    prompt_len=prompt_len,
+                    cached_request=False,
+                )
                 cur_len = computed_tokens + scheduled_tokens
                 is_intermediate = cur_len < prompt_len
 
@@ -2098,6 +2112,42 @@ class MetalModelRunner:
                 generated_tokens=1,
                 block_ids=[],
                 lora_id=lora_id,
+            )
+
+    def _validate_token_classify_scheduler_output(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Reject partial or cached token pooling before request mutation."""
+        for new_req in scheduler_output.scheduled_new_reqs:
+            pooling_params = new_req.pooling_params
+            if pooling_params is None or pooling_params.task != "token_classify":
+                continue
+            token_ids = new_req.prompt_token_ids or []
+            validate_token_classify_prefill(
+                pooling_params,
+                req_id=new_req.req_id,
+                num_computed_tokens=new_req.num_computed_tokens,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens[
+                    new_req.req_id
+                ],
+                prompt_len=len(token_ids),
+                cached_request=False,
+            )
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for idx, req_id in enumerate(cached_reqs.req_ids):
+            state = self._request_states[req_id]
+            pooling_params = state.pooling_params
+            if pooling_params is None or pooling_params.task != "token_classify":
+                continue
+            validate_token_classify_prefill(
+                pooling_params,
+                req_id=req_id,
+                num_computed_tokens=cached_reqs.num_computed_tokens[idx],
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens[req_id],
+                prompt_len=state.prompt_len,
+                cached_request=True,
             )
 
     def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -2202,6 +2252,14 @@ class MetalModelRunner:
                 computed_tokens = cached_reqs.num_computed_tokens[idx]
                 scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 target_len = computed_tokens + scheduled_tokens
+                validate_token_classify_prefill(
+                    state.pooling_params,
+                    req_id=req_id,
+                    num_computed_tokens=computed_tokens,
+                    num_scheduled_tokens=scheduled_tokens,
+                    prompt_len=state.prompt_len,
+                    cached_request=True,
+                )
                 is_intermediate = target_len < len(state.token_ids)
 
                 output_idx = batch.add_output(req_id, [])
@@ -2459,6 +2517,12 @@ class MetalModelRunner:
             self._validate_spec_decode_supported(scheduler_output)
         except (NotImplementedError, ValueError) as exc:
             spec_decode_error = exc
+        token_classify_schedule_error: Exception | None = None
+        if not missing_cached_state_req_ids:
+            try:
+                self._validate_token_classify_scheduler_output(scheduler_output)
+            except (NotImplementedError, ValueError) as exc:
+                token_classify_schedule_error = exc
         has_unsupported_non_paged_structured_output = (
             self._paged_attention_runtime is None
             and scheduler_output.has_structured_output_requests
@@ -2466,6 +2530,7 @@ class MetalModelRunner:
         will_fail_fast_before_model_work = (
             has_scheduled_encoder_inputs
             or spec_decode_error is not None
+            or token_classify_schedule_error is not None
             or has_unsupported_non_paged_structured_output
             or bool(missing_cached_state_req_ids)
         )
@@ -2485,6 +2550,8 @@ class MetalModelRunner:
                 f"{missing_cached_state_req_ids[:16]}. "
                 "This is a scheduler/runner state desync."
             )
+        if token_classify_schedule_error is not None:
+            raise token_classify_schedule_error
         # Pre-register mm_features so a new request whose first encoder input
         # lands in the same SchedulerOutput is already known to the encoder
         # cache when dispatch runs.
