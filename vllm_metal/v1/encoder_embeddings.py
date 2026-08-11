@@ -89,6 +89,13 @@ class MlxEmbeddingsEncoderModel:
         self.args = self.config
         self.model = _EncoderSequenceBody(model)
 
+    def modules(self) -> list[Any]:
+        """Expose child modules for vLLM engine cleanup hooks."""
+        inner_modules = getattr(self._model, "modules", None)
+        if callable(inner_modules):
+            return list(inner_modules())
+        return [self._model]
+
 
 def _import_mlx_embeddings_load() -> Any:
     try:
