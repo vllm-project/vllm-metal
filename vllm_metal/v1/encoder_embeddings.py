@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Encoder embedding adapter via optional mlx-embeddings (#589 PR1).
+"""Encoder embedding adapter via native Apache-2.0 MLX XLM-RoBERTa.
 
 Owns load, bidirectional segment forward, CLS pooling defaults, and paged
 attention patch-skipping so encoder special-cases stay in one place.
+
+Does **not** depend on GPLv3 ``mlx-embeddings``.
 """
 
 from __future__ import annotations
@@ -10,6 +12,9 @@ from __future__ import annotations
 from typing import Any
 
 import mlx.core as mx
+
+from vllm_metal.v1.encoder.loader import load_encoder_model
+from vllm_metal.v1.encoder.xlm_roberta import XLMRobertaModel
 
 _ENCODER_EMBEDDING_ARCHITECTURES = frozenset(
     {
@@ -32,7 +37,7 @@ _ENCODER_SEQUENCE_POOLING = (None, "CLS", "LAST")
 class _EncoderSequenceBody:
     """Callable transformer body returning ``[1, tokens, hidden]`` states."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: XLMRobertaModel) -> None:
         self._model = model
 
     def __call__(self, input_ids: mx.array, cache: Any = None) -> mx.array:
@@ -40,20 +45,13 @@ class _EncoderSequenceBody:
         if input_ids.ndim == 1:
             input_ids = input_ids.reshape(1, -1)
         attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
-        output = self._model(input_ids, attention_mask=attention_mask)
-        hidden_states = getattr(output, "last_hidden_state", None)
-        if hidden_states is None:
-            raise ValueError(
-                "mlx-embeddings encoder forward did not return last_hidden_state; "
-                f"got {type(output)!r}."
-            )
-        return hidden_states
+        return self._model(input_ids, attention_mask=attention_mask)
 
 
-class MlxEmbeddingsEncoderModel:
+class NativeEncoderModel:
     """Weight wrapper exposing a Metal-compatible ``.model`` body."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: XLMRobertaModel) -> None:
         self._model = model
         self.config = getattr(model, "config", None)
         self.args = self.config
@@ -67,26 +65,18 @@ class MlxEmbeddingsEncoderModel:
         return [self._model]
 
 
-def _import_mlx_embeddings_load() -> Any:
-    try:
-        from mlx_embeddings import load as mlx_embeddings_load
-    except ImportError as exc:
-        raise ImportError(
-            "Loading encoder embedding models such as XLM-RoBERTa / BGE-M3 "
-            "requires the optional 'mlx-embeddings' package. Install it with: "
-            'pip install "vllm-metal[embeddings]"'
-        ) from exc
-    return mlx_embeddings_load
+# Back-compat alias used by older tests/docs wording.
+MlxEmbeddingsEncoderModel = NativeEncoderModel
 
 
 class EncoderEmbeddingAdapter:
-    """Single owner for mlx-embeddings encoder embedding behavior on Metal."""
+    """Single owner for native encoder embedding behavior on Metal."""
 
     skip_paged_attention_patch = True
     default_sequence_pooling_type = "CLS"
     allowed_sequence_pooling_types = _ENCODER_SEQUENCE_POOLING
 
-    def __init__(self, model: MlxEmbeddingsEncoderModel) -> None:
+    def __init__(self, model: NativeEncoderModel) -> None:
         self.model = model
 
     @staticmethod
@@ -119,7 +109,7 @@ class EncoderEmbeddingAdapter:
 
     @classmethod
     def requires_load(cls, model_config: Any) -> bool:
-        """True when Metal should load weights through mlx-embeddings."""
+        """True when Metal should load weights through the native encoder path."""
         return cls.matches_config(model_config)
 
     @classmethod
@@ -129,21 +119,20 @@ class EncoderEmbeddingAdapter:
         *,
         tokenizer_config: dict[str, Any] | None = None,
         lazy: bool = False,
-    ) -> tuple[MlxEmbeddingsEncoderModel, Any, EncoderEmbeddingAdapter]:
-        """Load an encoder embedding checkpoint and return model + adapter."""
-        mlx_embeddings_load = _import_mlx_embeddings_load()
-        raw_model, tokenizer = mlx_embeddings_load(
+    ) -> tuple[NativeEncoderModel, Any, EncoderEmbeddingAdapter]:
+        """Load a native encoder embedding checkpoint and return model + adapter."""
+        raw_model, tokenizer = load_encoder_model(
             model_name,
-            tokenizer_config=dict(tokenizer_config or {}),
+            tokenizer_config=tokenizer_config,
             lazy=lazy,
         )
-        model = MlxEmbeddingsEncoderModel(raw_model)
+        model = NativeEncoderModel(raw_model)
         return model, tokenizer, cls(model)
 
     @classmethod
     def from_loaded_model(cls, model: Any) -> EncoderEmbeddingAdapter | None:
         """Return an adapter when ``model`` is the encoder weight wrapper."""
-        if isinstance(model, MlxEmbeddingsEncoderModel):
+        if isinstance(model, NativeEncoderModel):
             return cls(model)
         return None
 
@@ -178,7 +167,6 @@ class EncoderEmbeddingAdapter:
         return mx.concatenate(parts, axis=1)
 
 
-# Compatibility aliases used by older call sites / tests.
 def is_encoder_embedding_architecture(architecture: str) -> bool:
     return EncoderEmbeddingAdapter.matches_architecture(architecture)
 
@@ -192,6 +180,7 @@ def is_encoder_embedding_config(model_config: Any) -> bool:
 
 
 def requires_mlx_embeddings_load(model_config: Any) -> bool:
+    """Deprecated alias: native encoder load gate."""
     return EncoderEmbeddingAdapter.requires_load(model_config)
 
 
@@ -200,7 +189,8 @@ def load_mlx_embeddings_model(
     *,
     tokenizer_config: dict[str, Any] | None = None,
     lazy: bool = False,
-) -> tuple[MlxEmbeddingsEncoderModel, Any]:
+) -> tuple[NativeEncoderModel, Any]:
+    """Deprecated alias for native encoder load (no mlx-embeddings)."""
     model, tokenizer, _adapter = EncoderEmbeddingAdapter.load(
         model_name,
         tokenizer_config=tokenizer_config,

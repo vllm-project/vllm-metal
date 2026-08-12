@@ -22,7 +22,7 @@ from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noq
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.encoder_embeddings import (  # noqa: E402
     EncoderEmbeddingAdapter,
-    MlxEmbeddingsEncoderModel,
+    NativeEncoderModel,
 )
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
@@ -331,11 +331,11 @@ class _FakeEncoderOutput:
 
 
 class _FakeEncoderModule:
-    def __call__(self, input_ids, attention_mask=None):
-        del attention_mask
+    def __call__(self, input_ids, attention_mask=None, token_type_ids=None):
+        del attention_mask, token_type_ids
         token_ids = np.array(input_ids).reshape(-1).tolist()
         rows = [[float(tok), float(tok + 1), 1.0] for tok in token_ids]
-        return _FakeEncoderOutput(mx.array([rows], dtype=mx.float32))
+        return mx.array([rows], dtype=mx.float32)
 
 
 class TestMetalPoolingCapabilities:
@@ -346,7 +346,7 @@ class TestMetalPoolingCapabilities:
 
     def test_supported_worker_tasks_for_encoder_cls_embedding_model(self) -> None:
         runner = _make_runner(
-            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model=NativeEncoderModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
 
@@ -485,7 +485,7 @@ class TestMetalPoolingRunnerOutput:
 
     def test_paged_encoder_cls_embed_uses_first_token(self) -> None:
         runner = _make_runner(
-            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model=NativeEncoderModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
         req_b = _new_req("req-b", [4, 5])
@@ -666,7 +666,7 @@ class TestMetalPoolingFailFast:
 
     def test_token_classify_fail_fast_mentions_sparse_followup(self) -> None:
         runner = _make_runner(
-            model=MlxEmbeddingsEncoderModel(_FakeEncoderModule()),
+            model=NativeEncoderModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
         req = _new_req("req-0", [1, 2], task="token_classify")

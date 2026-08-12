@@ -217,7 +217,7 @@ class ModelLifecycle:
             )
 
         elif EncoderEmbeddingAdapter.requires_load(model_config):
-            load_label = "MLX-Embeddings model"
+            load_label = "Native encoder model"
             model, tokenizer = self._load_mlx_embeddings_model(
                 model_name,
                 tokenizer_config,
