@@ -1151,9 +1151,9 @@ static int mla_num_threads_for_g(int heads_per_tg) {
 static int mla_partition_size_for_context(int max_seq_len) {
   // Use only the partition sizes instantiated in mla.metal. MLA partial output
   // is 512-wide, so the split count is bounded separately below by scratch
-  // traffic; the size choice just picks enough sequence parallelism to keep
-  // long single-request decode busy.
-  if (max_seq_len > 131072) return 32768;
+  // traffic; 16K chunks win in the 80K-98K band, but switch back to 32K at
+  // 128K so the reduce/scratch cost does not jump to 8 partitions.
+  if (max_seq_len >= 131072) return 32768;
   if (max_seq_len >= 81920) return 16384;
   if (max_seq_len >= 49152) return 32768;
   if (max_seq_len >= 32768) return 16384;
