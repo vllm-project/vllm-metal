@@ -55,6 +55,14 @@ class MLAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_mla_latent_cache", latent_cache)
         is_absorbed = hasattr(inner, "embed_q") and hasattr(inner, "unembed_out")
         object.__setattr__(self, "_is_absorbed", is_absorbed)
+        kernel_embed_q = getattr(inner, "embed_q", None)
+        kernel_unembed_out = getattr(inner, "unembed_out", None)
+        if not is_absorbed:
+            absorbed = self._try_absorb_kv_b_proj(inner)
+            if absorbed is not None:
+                kernel_embed_q, kernel_unembed_out = absorbed
+        object.__setattr__(self, "_kernel_embed_q", kernel_embed_q)
+        object.__setattr__(self, "_kernel_unembed_out", kernel_unembed_out)
         if is_absorbed:
             object.__setattr__(
                 self, "_apply_mla_attention", self._apply_absorbed_mla_attention
@@ -70,6 +78,103 @@ class MLAPagedAttentionWrapper(nn.Module):
         if scale is None:
             scale = inner.softmax_scale
         return scale
+
+    @staticmethod
+    def _try_absorb_kv_b_proj(inner: nn.Module) -> tuple[nn.Module, nn.Module] | None:
+        """Build absorbed-MLA helpers from a non-absorbed ``kv_b_proj``.
+
+        For kv_b_proj-style MLA, ``K_nope`` and ``V`` are produced by one
+        projection from the cached latent. The no-PE score term can be rewritten:
+
+            q_nope · (kv_norm W_k^T) == (q_nope W_k) · kv_norm
+
+        and the value projection can be applied after the weighted latent sum:
+
+            softmax(scores) · (kv_norm W_v^T)
+              == (softmax(scores) · kv_norm) W_v^T
+
+        These two identities give the same ``embed_q`` / ``unembed_out`` shape
+        used by absorbed GLM-style MLA, so compatible non-absorbed decode can use
+        the existing Metal kernel. Bias-bearing kv_b_proj modules are rejected:
+        current DeepSeek/MiniCPM MLA checkpoints use bias-free projections, and
+        carrying value bias would need an extra post-attention add.
+        """
+        if not hasattr(inner, "kv_b_proj"):
+            return None
+        required = (
+            "num_heads",
+            "qk_nope_head_dim",
+            "kv_lora_rank",
+            "v_head_dim",
+        )
+        if not all(hasattr(inner, name) for name in required):
+            return None
+
+        proj = inner.kv_b_proj
+        if "bias" in proj:
+            return None
+
+        num_heads = int(inner.num_heads)
+        qk_nope = int(inner.qk_nope_head_dim)
+        kv_lora = int(inner.kv_lora_rank)
+        v_dim = int(inner.v_head_dim)
+        out_per_head = qk_nope + v_dim
+
+        weight = getattr(proj, "weight", None)
+        if weight is None or int(weight.shape[0]) != num_heads * out_per_head:
+            return None
+
+        from mlx_lm.models.mla import MultiLinear, QuantizedMultiLinear
+
+        if type(proj).__name__ == "Linear":
+            w = weight.reshape(num_heads, out_per_head, kv_lora)
+            k_w = w[:, :qk_nope, :]
+            v_w = w[:, qk_nope:, :]
+
+            embed_q = MultiLinear(qk_nope, kv_lora, num_heads)
+            embed_q.weight = k_w.swapaxes(-1, -2)
+            unembed_out = MultiLinear(kv_lora, v_dim, num_heads)
+            unembed_out.weight = v_w
+            return embed_q, unembed_out
+
+        if type(proj).__name__ == "QuantizedLinear":
+            group_size = int(proj.group_size)
+            bits = int(proj.bits)
+            mode = proj.mode
+
+            q_w = proj.weight.reshape(num_heads, out_per_head, -1)
+            q_s = proj.scales.reshape(num_heads, out_per_head, -1)
+            q_b = None
+            if proj.biases is not None:
+                q_b = proj.biases.reshape(num_heads, out_per_head, -1)
+
+            # K absorption transposes the projection. Transposing packed 4-bit
+            # weights is not layout-preserving, and requantizing the transposed
+            # matrix adds extra error. Keep this one helper dense after the
+            # one-time dequantization; for DeepSeek-V2-Lite this is only a few
+            # MB per layer and avoids repeated ctx_len-wide kv_b_proj work.
+            k_dense = mx.dequantize(
+                q_w[:, :qk_nope, :],
+                q_s[:, :qk_nope, :],
+                None if q_b is None else q_b[:, :qk_nope, :],
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            k_absorbed = k_dense.swapaxes(-1, -2)
+
+            embed_q = MultiLinear(qk_nope, kv_lora, num_heads)
+            embed_q.weight = k_absorbed
+
+            unembed_out = QuantizedMultiLinear(
+                kv_lora, v_dim, num_heads, group_size, bits, mode
+            )
+            unembed_out.weight = q_w[:, qk_nope:, :]
+            unembed_out.scales = q_s[:, qk_nope:, :]
+            unembed_out.biases = None if q_b is None else q_b[:, qk_nope:, :]
+            return embed_q, unembed_out
+
+        return None
 
     @staticmethod
     def _causal_valid_mask(
@@ -102,7 +207,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         ``Ship one kernel, prove it wins'')."""
         if not envs.VLLM_METAL_MLA_KERNEL:
             return False
-        if not self._is_absorbed:
+        if self._kernel_embed_q is None or self._kernel_unembed_out is None:
             return False
         if inner.kv_lora_rank != self._KERNEL_KV_LORA_RANK:
             return False
@@ -155,7 +260,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         # already fp16/bf16); test fixtures with default fp32 Linear
         # weights need the cast.
         target_dtype = latent_cache.dtype
-        q_nope_proj = inner.embed_q(q_nope).astype(target_dtype)
+        q_nope_proj = self._kernel_embed_q(q_nope).astype(target_dtype)
         q_pe_t = q_pe.astype(target_dtype)
         q_nope_kernel = q_nope_proj.transpose(0, 2, 1, 3).reshape(
             seq_len, inner.num_heads, inner.kv_lora_rank
@@ -191,7 +296,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         out_for_unembed = out_kvr.reshape(
             1, seq_len, inner.num_heads, inner.kv_lora_rank
         ).transpose(0, 2, 1, 3)
-        out_unembedded = inner.unembed_out(out_for_unembed)
+        out_unembedded = self._kernel_unembed_out(out_for_unembed)
         return out_unembedded.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
 
     def _materialized_prefill_ok(self, inner: nn.Module, ctx: Any) -> bool:

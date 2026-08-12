@@ -255,6 +255,7 @@ class _MiniCPM3StyleInner(nn.Module):
         self.qk_nope_head_dim = _NOPE_DIM
         self.qk_rope_head_dim = _ROPE_DIM
         self.kv_lora_rank = _KV_RANK
+        self.v_head_dim = _V_DIM
         self.softmax_scale = 0.37
 
         self.q_a_proj = nn.Linear(_HIDDEN, _Q_LORA_RANK, bias=False)
@@ -575,6 +576,28 @@ class _KernelDimsAbsorbedInner(nn.Module):
         self.unembed_out = nn.Linear(_KERNEL_KV_RANK, _KERNEL_V_DIM, bias=False)
 
 
+class _KernelDimsKVBProjInner(nn.Module):
+    """Non-absorbed MLA inner with DeepSeek-V2-Lite kernel-compatible dims."""
+
+    def __init__(self, *, quantized: bool = False) -> None:
+        super().__init__()
+        self.q_lora_rank = _Q_LORA_RANK
+        self.num_heads = 16
+        self.q_head_dim = _KERNEL_NOPE_DIM + _KERNEL_ROPE_DIM
+        self.qk_nope_head_dim = _KERNEL_NOPE_DIM
+        self.qk_rope_head_dim = _KERNEL_ROPE_DIM
+        self.kv_lora_rank = _KERNEL_KV_RANK
+        self.v_head_dim = _KERNEL_V_DIM
+        self.softmax_scale = 1.0 / math.sqrt(_KERNEL_KV_RANK)
+        self.kv_b_proj = nn.Linear(
+            _KERNEL_KV_RANK,
+            self.num_heads * (_KERNEL_NOPE_DIM + _KERNEL_V_DIM),
+            bias=False,
+        )
+        if quantized:
+            self.kv_b_proj = self.kv_b_proj.to_quantized(group_size=64, bits=4)
+
+
 def _make_kernel_dims_wrapper(
     *, block_size: int = 16, dtype: mx.Dtype = mx.float16
 ) -> MLAPagedAttentionWrapper:
@@ -629,7 +652,7 @@ class TestSinglePassRouting:
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
         """Inner without embed_q / unembed_out (kv_b_proj-style models
-        like MiniCPM3) is not routed through the absorbed-MLA kernel."""
+        like MiniCPM3) still rejects when its dimensions are unsupported."""
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
         cache = MLAPagedLatentCache(
             num_layers=1,
@@ -646,6 +669,88 @@ class TestSinglePassRouting:
                 wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
             )
             is False
+        )
+
+    def test_non_absorbed_kernel_dims_accept_after_absorption(self, monkeypatch) -> None:
+        """DeepSeek-V2-Lite style kv_b_proj layers can be algebraically absorbed
+        into embed_q/unembed_out helpers and routed through the same decode kernel."""
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(
+            inner=_KernelDimsKVBProjInner(), layer_idx=0, latent_cache=cache
+        )
+
+        assert wrapper._kernel_embed_q is not None
+        assert wrapper._kernel_unembed_out is not None
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_kv_b_proj_absorption_matches_original_math(self, quantized: bool) -> None:
+        inner = _KernelDimsKVBProjInner(quantized=quantized)
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner=inner, layer_idx=0, latent_cache=cache)
+        assert wrapper._kernel_embed_q is not None
+        assert wrapper._kernel_unembed_out is not None
+
+        mx.random.seed(123)
+        ctx_len = 5
+        q_nope = mx.random.normal(
+            (1, inner.num_heads, 1, inner.qk_nope_head_dim)
+        ).astype(mx.float16)
+        kv_norm = mx.random.normal((1, ctx_len, inner.kv_lora_rank)).astype(mx.float16)
+
+        kv = inner.kv_b_proj(kv_norm)
+        kv = kv.reshape(1, ctx_len, inner.num_heads, -1).transpose(0, 2, 1, 3)
+        k_nope, values = mx.split(kv, [inner.qk_nope_head_dim], axis=-1)
+
+        original_scores = q_nope @ k_nope.swapaxes(-1, -2)
+        q_absorbed = wrapper._kernel_embed_q(q_nope)
+        absorbed_scores = q_absorbed @ kv_norm.reshape(
+            1, 1, ctx_len, inner.kv_lora_rank
+        ).swapaxes(-1, -2)
+
+        weights = mx.softmax(original_scores.astype(mx.float32), axis=-1).astype(
+            mx.float16
+        )
+        original_out = weights @ values
+        latent_out = weights @ kv_norm.reshape(1, 1, ctx_len, inner.kv_lora_rank)
+        absorbed_out = wrapper._kernel_unembed_out(latent_out)
+        mx.eval(original_scores, absorbed_scores, original_out, absorbed_out)
+
+        atol = 8e-2 if quantized else 1e-2
+        rtol = 8e-2 if quantized else 1e-2
+        assert bool(
+            mx.allclose(
+                original_scores.astype(mx.float32),
+                absorbed_scores.astype(mx.float32),
+                rtol=rtol,
+                atol=atol,
+            )
+        )
+        assert bool(
+            mx.allclose(
+                original_out.astype(mx.float32),
+                absorbed_out.astype(mx.float32),
+                rtol=rtol,
+                atol=atol,
+            )
         )
 
     def test_wrong_kv_lora_rank_rejects(self, monkeypatch) -> None:
