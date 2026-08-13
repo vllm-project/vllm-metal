@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.v1.pooling import sequence_model
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
@@ -400,11 +402,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
 
     def _transformer_body(self, model: Any) -> Any | None:
-        # mlx_lm text models expose the body at ``model.model``; conditional-
-        # generation wrappers served text-only nest it under the
-        # ``language_model`` sub-model that text_model() resolves.
-        body = getattr(self.text_model(model), "model", None)
-        return body if callable(body) else None
+        # Reuses the pooling module's backbone helper — the one established
+        # definition of "the MLX transformer body" — on the text sub-model
+        # (conditional-generation wrappers nest it under ``language_model``).
+        return sequence_model(self.text_model(model))
 
     def target_forward(
         self,
