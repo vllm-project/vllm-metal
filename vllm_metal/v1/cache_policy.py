@@ -950,13 +950,16 @@ class WorkerCachePlanner:
             backend,
             block_size=plan.block_size,
         )
-        # Encoder embedding adapters own bidirectional attention. They still use
+        # Encoder embedding backends own bidirectional attention. They still use
         # the paged scheduler for pooling batch bookkeeping, but there are no
         # mlx-lm-style ``model.layers`` to wrap — skip patching rather than fail.
-        encoder_adapter = getattr(
-            self._worker.model_runner, "_encoder_embedding_adapter", None
+        encoder_backend = getattr(
+            self._worker.model_runner, "_encoder_embedding_backend", None
         )
-        if encoder_adapter is not None and encoder_adapter.skip_paged_attention_patch:
+        if (
+            encoder_backend is not None
+            and encoder_backend.pooling_policy.skip_paged_attention_patch
+        ):
             n_patched = 0
         else:
             n_patched = backend.patch_model(self._worker.model_runner.model)

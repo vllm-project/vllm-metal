@@ -19,7 +19,11 @@ from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
-from vllm_metal.v1.encoder_embeddings import EncoderEmbeddingAdapter
+from vllm_metal.v1.encoder.registry import (
+    backend_from_loaded_model,
+    encoder_family_for_config,
+    load_encoder_backend,
+)
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -216,10 +220,11 @@ class ModelLifecycle:
                 tokenizer_config,
             )
 
-        elif EncoderEmbeddingAdapter.requires_load(model_config):
+        elif encoder_family_for_config(model_config) is not None:
             load_label = "Native encoder model"
-            model, tokenizer = self._load_mlx_embeddings_model(
+            model, tokenizer = self._load_encoder_embedding_model(
                 model_name,
+                model_config,
                 tokenizer_config,
                 lazy=lazy_weights,
             )
@@ -290,21 +295,23 @@ class ModelLifecycle:
             )
         return model, tokenizer
 
-    def _load_mlx_embeddings_model(
+    def _load_encoder_embedding_model(
         self,
         model_name: str,
+        model_config: Any,
         tokenizer_config: Mapping[str, Any],
         *,
         lazy: bool = False,
     ) -> tuple[Any, Any]:
-        model, tokenizer, adapter = EncoderEmbeddingAdapter.load(
+        model, tokenizer, backend = load_encoder_backend(
             model_name,
+            model_config,
             tokenizer_config=dict(tokenizer_config),
             lazy=lazy,
         )
         # Stash for _install_generation_model; avoids a second from_loaded_model
-        # dance when the load path already constructed the adapter.
-        self._pending_encoder_embedding_adapter = adapter
+        # dance when the load path already constructed the backend.
+        self._pending_encoder_embedding_backend = backend
         return model, tokenizer
 
     def _install_generation_model(
@@ -332,10 +339,10 @@ class ModelLifecycle:
             EncoderCache() if multimodal_adapter is not None else None
         )
 
-        pending = getattr(self, "_pending_encoder_embedding_adapter", None)
-        self._pending_encoder_embedding_adapter = None
-        runner._encoder_embedding_adapter = pending or (
-            EncoderEmbeddingAdapter.from_loaded_model(loaded_model.model)
+        pending = getattr(self, "_pending_encoder_embedding_backend", None)
+        self._pending_encoder_embedding_backend = None
+        runner._encoder_embedding_backend = pending or backend_from_loaded_model(
+            loaded_model.model
         )
 
         # Dimension resolution reads model_args immediately after this phase.

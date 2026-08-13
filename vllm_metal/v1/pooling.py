@@ -12,7 +12,8 @@ from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
-from vllm_metal.v1.encoder_embeddings import EncoderEmbeddingAdapter
+from vllm_metal.v1.encoder.backend import EncoderEmbeddingBackend
+from vllm_metal.v1.encoder.registry import encoder_pooling_policy
 
 _EMBED_POOLER_TASKS = (None, "embed")
 _CLASSIFY_POOLER_TASKS = (None, "classify")
@@ -64,8 +65,9 @@ def _sequence_pooling_types(model_config: Any) -> tuple[str | None, str | None]:
 
 
 def _allowed_sequence_pooling_types(model_config: Any) -> tuple[str | None, ...]:
-    if EncoderEmbeddingAdapter.matches_config(model_config):
-        return EncoderEmbeddingAdapter.allowed_sequence_pooling_types
+    policy = encoder_pooling_policy(model_config)
+    if policy is not None:
+        return policy.allowed_sequence_pooling_types
     return _LAST_POOLING
 
 
@@ -74,8 +76,9 @@ def _effective_sequence_pooling_type(model_config: Any) -> str:
     for pooling_type in _sequence_pooling_types(model_config):
         if pooling_type is not None:
             return pooling_type
-    if EncoderEmbeddingAdapter.matches_config(model_config):
-        return EncoderEmbeddingAdapter.default_sequence_pooling_type
+    policy = encoder_pooling_policy(model_config)
+    if policy is not None:
+        return policy.default_sequence_pooling_type
     return "LAST"
 
 
@@ -145,9 +148,10 @@ def _is_decoder_embedding_config(model_config: Any) -> bool:
 
 
 def _is_embed_capable_config(model_config: Any) -> bool:
-    return _is_decoder_embedding_config(
-        model_config
-    ) or EncoderEmbeddingAdapter.matches_config(model_config)
+    return (
+        _is_decoder_embedding_config(model_config)
+        or encoder_pooling_policy(model_config) is not None
+    )
 
 
 def _is_qwen3_token_logit_classifier(model_config: Any) -> bool:
@@ -397,7 +401,7 @@ def forward_sequence_hidden_states(
     cache: Any,
     model_config: Any,
     segment_lengths: list[int] | None = None,
-    encoder_adapter: EncoderEmbeddingAdapter | None = None,
+    encoder_backend: EncoderEmbeddingBackend | None = None,
 ) -> mx.array:
     """Run the transformer body and return per-token hidden states."""
     _reject_unsupported_pooler_config(model_config)
@@ -409,8 +413,8 @@ def forward_sequence_hidden_states(
             "runner='pooling'."
         )
 
-    if encoder_adapter is not None:
-        hidden_states = encoder_adapter.forward_sequence_hidden_states(
+    if encoder_backend is not None:
+        hidden_states = encoder_backend.forward_sequence_hidden_states(
             input_ids,
             segment_lengths=segment_lengths,
             model_label=_model_label(model_config),
@@ -434,7 +438,7 @@ def pooling_dummy_forward_outputs(
     input_ids: mx.array,
     *,
     model_config: Any,
-    encoder_adapter: EncoderEmbeddingAdapter | None = None,
+    encoder_backend: EncoderEmbeddingBackend | None = None,
 ) -> list[mx.array]:
     """Return warm-up outputs for a pooling model."""
     return [
@@ -443,7 +447,7 @@ def pooling_dummy_forward_outputs(
             input_ids,
             cache=None,
             model_config=model_config,
-            encoder_adapter=encoder_adapter,
+            encoder_backend=encoder_backend,
         )
     ]
 

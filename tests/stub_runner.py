@@ -50,7 +50,7 @@ def make_stub_runner(
         "model": object(),
         "_is_vlm": False,
         "_multimodal_adapter": None,
-        "_encoder_embedding_adapter": None,
+        "_encoder_embedding_backend": None,
         "_gemma4_mtp_assistant": None,
         "_drafter": None,
         "encoder_cache": None,

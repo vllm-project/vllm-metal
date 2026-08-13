@@ -22,9 +22,10 @@ Current scope is intentionally narrow:
   and `is_original_qwen3_reranker=True`
 - decoder-style text models that expose token hidden states through the MLX
   transformer body (LAST pooling)
-- encoder embedding checkpoints loaded through Metal's native Apache-2.0
-  XLM-RoBERTa / RoBERTa MLX backend (`XLMRobertaModel` / `RobertaEmbeddingModel` /
-  `BgeM3EmbeddingModel`), with CLS pooling and L2 normalization for dense vectors
+- encoder embedding checkpoints loaded through Metal's typed encoder backend
+  (first family: native Apache-2.0 XLM-RoBERTa / RoBERTa, covering
+  `XLMRobertaModel` / `RobertaEmbeddingModel` / `BgeM3EmbeddingModel`), with
+  CLS pooling and L2 normalization for dense vectors
 - Qwen3 reranker cross-encoder scores from the final prompt-token hidden state,
   using `lm_head` for untied checkpoints or `embed_tokens.as_linear` when word
   embeddings are tied

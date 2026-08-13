@@ -20,9 +20,9 @@ from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
-from vllm_metal.v1.encoder_embeddings import (  # noqa: E402
-    EncoderEmbeddingAdapter,
-    NativeEncoderModel,
+from vllm_metal.v1.encoder.registry import backend_from_loaded_model  # noqa: E402
+from vllm_metal.v1.encoder.xlm_roberta_family import (  # noqa: E402
+    XLMRobertaSequenceModel,
 )
 from vllm_metal.v1.pooling import pool_sequence_classification  # noqa: E402
 
@@ -191,9 +191,7 @@ def _make_runner(
         ),
         _paged_block_size=4,
         num_layers=1,
-        _encoder_embedding_adapter=EncoderEmbeddingAdapter.from_loaded_model(
-            resolved_model
-        ),
+        _encoder_embedding_backend=backend_from_loaded_model(resolved_model),
     )
     return runner
 
@@ -346,7 +344,7 @@ class TestMetalPoolingCapabilities:
 
     def test_supported_worker_tasks_for_encoder_cls_embedding_model(self) -> None:
         runner = _make_runner(
-            model=NativeEncoderModel(_FakeEncoderModule()),
+            model=XLMRobertaSequenceModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
 
@@ -485,7 +483,7 @@ class TestMetalPoolingRunnerOutput:
 
     def test_paged_encoder_cls_embed_uses_first_token(self) -> None:
         runner = _make_runner(
-            model=NativeEncoderModel(_FakeEncoderModule()),
+            model=XLMRobertaSequenceModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
         req_b = _new_req("req-b", [4, 5])
@@ -666,7 +664,7 @@ class TestMetalPoolingFailFast:
 
     def test_token_classify_fail_fast_mentions_sparse_followup(self) -> None:
         runner = _make_runner(
-            model=NativeEncoderModel(_FakeEncoderModule()),
+            model=XLMRobertaSequenceModel(_FakeEncoderModule()),
             model_config=_encoder_pooling_model_config(),
         )
         req = _new_req("req-0", [1, 2], task="token_classify")
