@@ -387,6 +387,32 @@ class TestMLAPagedAttentionWrapperPagedPath:
         assert selected2 is True
         assert ("mla_route", 16, 1, 8, 1, 32768) in ctx.kernel_metadata_cache
 
+    def test_short_split_route_rejects_without_planner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_planner(**_: object) -> dict[str, object]:
+            raise AssertionError("short contexts should not call split planner")
+
+        monkeypatch.setattr("vllm_metal.metal.metal_mla_split_plan", fail_planner)
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[8191],
+            block_tables=[list(range(512))],
+            context_lens=[8192],
+            cu_seqlens=[0, 1],
+            offsets=[8191],
+        )
+
+        selected = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+
+        assert selected is False
+        assert ("mla_route", 16, 1, 8, 1, 8192) in ctx.kernel_metadata_cache
+
     def test_decode_output_shape(self) -> None:
         # 1 request, 3 cached tokens, 1 new decode token
         inner = _MinimalMLAInner()

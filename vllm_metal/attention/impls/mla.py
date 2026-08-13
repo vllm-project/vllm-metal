@@ -17,6 +17,7 @@ from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
 MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+_MLA_MIN_SPLIT_CONTEXT = 32768
 
 
 @dataclass(frozen=True, eq=False)
@@ -48,6 +49,11 @@ def _mla_split_route_selected(
         selected = cache.get(key)
         if selected is not None:
             return bool(selected)
+
+    if max_seq_len < _MLA_MIN_SPLIT_CONTEXT:
+        if cache is not None:
+            cache[key] = False
+        return False
 
     from vllm_metal.metal import metal_mla_split_plan
 
