@@ -91,6 +91,13 @@ class PoolingConfigView:
         )
 
     @property
+    def sequence_pooling_type(self) -> str | None:
+        for pooling_type in self.sequence_pooling_types:
+            if pooling_type is not None:
+                return pooling_type
+        return None
+
+    @property
     def embed_activation_allowed(self) -> bool:
         return self.pooler_config.use_activation is not False
 
@@ -159,14 +166,14 @@ class PoolingConfigView:
 def validate_pooling_request(
     new_req: NewRequestData,
     model_config: Any,
-    backend: PoolingBackend | None,
+    pooling_backend: PoolingBackend | None,
     paged_attention_enabled: bool,
 ) -> None:
     pooling_params = new_req.pooling_params
     if pooling_params is None:
         return
 
-    if backend is None:
+    if pooling_backend is None:
         raise RuntimeError("Metal pooling backend is not installed.")
 
     config = PoolingConfigView(model_config)
@@ -175,14 +182,13 @@ def validate_pooling_request(
             "Metal pooling requires runner_type='pooling'; got "
             f"{config.runner_type!r} for model={config.label}."
         )
-    config.reject_unsupported_pooler_config()
     unsupported_option = config.unsupported_pooling_option(pooling_params)
     if unsupported_option is not None:
         raise NotImplementedError(
             f"Metal pooling does not support {unsupported_option} "
             f"for model={config.label}."
         )
-    backend.validate_params(pooling_params)
+    pooling_backend.validate_params(pooling_params)
     if new_req.mm_features:
         raise NotImplementedError(
             "Multimodal pooling inputs are not supported on Metal yet."
@@ -191,7 +197,10 @@ def validate_pooling_request(
         raise NotImplementedError(
             "Prompt-embedding pooling inputs are not supported on Metal yet."
         )
-    if backend.capabilities.requires_paged_attention and not paged_attention_enabled:
+    if (
+        pooling_backend.capabilities.requires_paged_attention
+        and not paged_attention_enabled
+    ):
         raise NotImplementedError(
             "Metal pooling currently requires paged attention; "
             "set VLLM_METAL_USE_PAGED_ATTENTION=1."

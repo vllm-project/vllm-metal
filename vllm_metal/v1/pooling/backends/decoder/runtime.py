@@ -116,7 +116,12 @@ class LastTokenEmbeddingPooler:
 class MetalDecoderPoolingBackend:
     """Decoder pooling backend for current Metal text pooling behavior."""
 
-    capabilities = PoolingCapabilities(requires_paged_attention=True)
+    capabilities = PoolingCapabilities(
+        execution_kind="decoder",
+        requires_paged_attention=True,
+        uses_kv_cache=True,
+        supports_chunked_requests=True,
+    )
 
     def __init__(
         self,
@@ -132,16 +137,19 @@ class MetalDecoderPoolingBackend:
         return tuple(self.poolers_by_task)
 
     def validate_params(self, pooling_params: PoolingParams) -> None:
+        self.config.reject_unsupported_pooler_config()
         task = pooling_params.task or EMBED_TASK
         if task not in self.poolers_by_task:
             self._raise_unsupported_task(pooling_params.task)
+
+    def profile_forward(self, input_ids: mx.array) -> mx.array:
+        return self.forward_packed(input_ids, None)
 
     def forward_packed(
         self,
         input_ids: mx.array,
         offset_caches: list[OffsetCache] | None,
     ) -> mx.array:
-        self.config.reject_unsupported_pooler_config()
         if not self.model_view.has_sequence_model:
             raise NotImplementedError(
                 "Metal pooling requires an MLX model with a callable "

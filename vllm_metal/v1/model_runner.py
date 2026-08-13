@@ -14,7 +14,7 @@ Key contracts:
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
-from typing import Any, Literal, NamedTuple, TypeAlias
+from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
 import numpy as np
@@ -100,6 +100,8 @@ from vllm_metal.v1.pooling.contract import (
     DecoderPoolingBackend,
     DecoderPoolingBatch,
     DecoderPoolingSpan,
+    EncoderPoolingBackend,
+    ExecutablePoolingBackend,
 )
 from vllm_metal.v1.pooling.validation import validate_pooling_request
 from vllm_metal.v1.proposer import (
@@ -129,6 +131,7 @@ SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
     "paged_attention_capacity",
     "paged_attention_mha_layout_budget",
+    "pooling_no_kv",
     "single_sequence_estimate",
 ]
 
@@ -349,7 +352,7 @@ class MetalModelRunner:
         self._is_pooling: bool = (
             getattr(self.model_config, "runner_type", None) == "pooling"
         )
-        self._pooling_backend: DecoderPoolingBackend | None = None
+        self._pooling_backend: ExecutablePoolingBackend | None = None
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
@@ -523,16 +526,22 @@ class MetalModelRunner:
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
         if self._is_pooling:
-            backend = self._pooling_backend
-            if backend is None:
+            pooling_backend = self._pooling_backend
+            if pooling_backend is None:
                 return ()
             if (
-                backend.capabilities.requires_paged_attention
+                pooling_backend.capabilities.requires_paged_attention
                 and self._paged_attention_runtime is None
             ):
                 return ()
-            return backend.supported_tasks()
+            return pooling_backend.supported_tasks()
         return ("generate",)
+
+    def _uses_encoder_pooling_backend(self) -> bool:
+        return (
+            self._pooling_backend is not None
+            and self._pooling_backend.capabilities.execution_kind == "encoder"
+        )
 
     def _has_paged_pooling_work(
         self,
@@ -553,6 +562,8 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
+        if self._uses_encoder_pooling_backend():
+            return
         # Prune non-owned layers adjacent to the (lazy) load, before LoRA setup or
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
@@ -761,7 +772,7 @@ class MetalModelRunner:
     def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
         if self._is_pooling:
             assert self._pooling_backend is not None
-            return [self._pooling_backend.forward_packed(input_ids, None)]
+            return [self._pooling_backend.profile_forward(input_ids)]
 
         if self.pp is not None and self.pp.size > 1:
             # Profile the PP stage shape: non-first stages never embed and
@@ -1266,7 +1277,11 @@ class MetalModelRunner:
             )
             if has_pooling_work:
                 assert self._pooling_backend is not None
-                pooling_hidden_states = self._pooling_backend.forward_packed(
+                decoder_pooling_backend = cast(
+                    DecoderPoolingBackend,
+                    self._pooling_backend,
+                )
+                pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,
                 )
@@ -1475,12 +1490,16 @@ class MetalModelRunner:
 
         if pooling_hidden_states is not None:
             assert self._pooling_backend is not None
+            decoder_pooling_backend = cast(
+                DecoderPoolingBackend,
+                self._pooling_backend,
+            )
             mx.eval(pooling_hidden_states)
             pooling_batch = batch.decoder_pooling_batch(
                 cu_seqlens,
                 num_decode_segments,
             )
-            pooler_outputs = self._pooling_backend.pool_packed(
+            pooler_outputs = decoder_pooling_backend.pool_packed(
                 pooling_hidden_states,
                 pooling_batch,
             )
@@ -2119,7 +2138,7 @@ class MetalModelRunner:
             validate_pooling_request(
                 new_req,
                 self.model_config,
-                backend=self._pooling_backend,
+                pooling_backend=self._pooling_backend,
                 paged_attention_enabled=self._paged_attention_runtime is not None,
             )
 
@@ -2418,6 +2437,21 @@ class MetalModelRunner:
             pooler_output=batch.pooler_outputs,
         )
 
+    def _run_encoder_pooling_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> ModelRunnerOutput:
+        assert self._pooling_backend is not None
+        pooling_backend = cast(EncoderPoolingBackend, self._pooling_backend)
+        batch = _ExecutionBatch()
+        for output in pooling_backend.pool_scheduler_output(
+            scheduler_output,
+            self.model_config,
+        ):
+            batch.add_output(output.req_id, [], None, output.pooler_output)
+        self._validate_scheduled_outputs(batch, scheduler_output)
+        return self._build_output(batch)
+
     def _run_non_paged_decode_batch(self, batch: _ExecutionBatch) -> None:
         """Run non-paged decode work."""
         if batch.valid_decode_reqs:
@@ -2607,6 +2641,9 @@ class MetalModelRunner:
                 "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
                 "to use structured output."
             )
+
+        if self._uses_encoder_pooling_backend():
+            return self._run_encoder_pooling_batch(scheduler_output)
 
         batch = _ExecutionBatch()
         self._handle_new_requests(
