@@ -324,6 +324,9 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
     split_vs_mlx = (mlx_ms / metal_split_ms - 1.0) * 100.0
     split_vs_single = (metal_single_ms / metal_split_ms - 1.0) * 100.0
     route = "metal_split" if plan["partition"] else "mlx_fallback"
+    routed_ms = metal_split_ms if plan["partition"] else mlx_ms
+    routed_vs_mlx = split_vs_mlx if plan["partition"] else 0.0
+    routed_max_diff = max_diff_split if plan["partition"] else 0.0
     return {
         "ctx_len": shape.ctx_len,
         "batch": shape.batch_size,
@@ -336,15 +339,16 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         "partitions": plan["max_num_partitions"],
         "mlx_ms": mlx_ms,
         "route": route,
-        "routed_ms": metal_split_ms,
+        "routed_ms": routed_ms,
         "metal_single_ms": metal_single_ms,
         "metal_split_ms": metal_split_ms,
-        "routed_vs_mlx_pct": split_vs_mlx,
+        "routed_vs_mlx_pct": routed_vs_mlx,
         "single_vs_mlx_pct": single_vs_mlx,
         "split_vs_mlx_pct": split_vs_mlx,
         "split_vs_single_pct": split_vs_single,
         "max_abs_diff_single": max_diff_single,
         "max_abs_diff_split": max_diff_split,
+        "routed_max_abs_diff": routed_max_diff,
     }
 
 
@@ -361,7 +365,7 @@ def _print_markdown(rows: list[dict[str, object]]) -> None:
             f"{float(row['mlx_ms']):.3f} | "
             f"{float(row['routed_ms']):.3f} | "
             f"{float(row['routed_vs_mlx_pct']):+.1f}% | "
-            f"{float(row['max_abs_diff_split']):.5f} |"
+            f"{float(row['routed_max_abs_diff']):.5f} |"
         )
 
 
