@@ -2789,44 +2789,6 @@ def _body_stub(input_ids, cache=None):
     return input_ids
 
 
-class TestIntermediateBodyResolution:
-    """_transformer_body_for_intermediate resolution chain."""
-
-    def test_resolves_text_model_body(self) -> None:
-        # Arrange
-        runner = make_stub_runner(model=SimpleNamespace(model=_body_stub))
-
-        # Act / Assert
-        assert runner._transformer_body_for_intermediate() is _body_stub
-
-    def test_resolves_language_model_body_for_wrapped_text_model(self) -> None:
-        # Arrange
-        model = SimpleNamespace(language_model=SimpleNamespace(model=_body_stub))
-        runner = make_stub_runner(model=model)
-
-        # Act / Assert
-        assert runner._transformer_body_for_intermediate() is _body_stub
-
-    def test_unresolvable_body_warns_once_and_returns_none(self, caplog) -> None:
-        # Arrange — no .model on either level: the fallback must be visible.
-        runner = make_stub_runner(model=SimpleNamespace())
-
-        # Act
-        with caplog.at_level("WARNING"):
-            first = runner._transformer_body_for_intermediate()
-            second = runner._transformer_body_for_intermediate()
-
-        # Assert
-        assert first is None
-        assert second is None
-        warnings_ = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings_) == 1
-        assert warnings_[0].getMessage() == (
-            "Metal: could not resolve a transformer body on SimpleNamespace; "
-            "intermediate prefill chunks run the full lm_head forward."
-        )
-
-
 class TestIntermediateBodyOnlyForward:
     """Intermediate-only prefill chunks run the transformer body only."""
 
@@ -2984,6 +2946,61 @@ class TestIntermediateBodyOnlyForward:
         state_after = runner._execute_model_state
         assert state_after is not None
         assert state_after.logits is not None
+
+    def test_unsupported_capability_runs_full_forward_silently(
+        self, monkeypatch, caplog
+    ) -> None:
+        # A model the adapter cannot run projection-free keeps the full
+        # forward on intermediate steps, with no per-step warning noise.
+        # Arrange
+        captured: dict[str, object] = {}
+        runner = make_stub_runner(model=SimpleNamespace())
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._intermediate_forward_supported = False
+
+        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+            del cache, collect_hidden_states
+            captured["full_forward_tokens"] = input_ids.tolist()
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 2, 16)), hidden_states=None
+            )
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        # Act
+        with caplog.at_level("WARNING"):
+            runner._start_paged_forward(
+                mr._ExecutionBatch(),
+                prefill_reqs=[self._intermediate_prefill_request()],
+                decode_reqs=[],
+                scheduler_output=self._make_scheduler_output(),
+            )
+
+        # Assert
+        assert captured["full_forward_tokens"] == [[5, 6]]
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_load_model_resolves_capability_once_from_the_adapter(self) -> None:
+        # Arrange — the capability is a load-time fact, not a per-step probe.
+        events: list[str] = []
+        runner = make_stub_runner(
+            model=SimpleNamespace(model=_body_stub),
+            model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+            metal_config=SimpleNamespace(use_paged_attention=True),
+            scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
+            kv_cache_dtype=None,
+        )
+        runner._intermediate_forward_supported = False
+        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
+        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
+
+        # Act
+        runner.load_model()
+
+        # Assert
+        assert runner._intermediate_forward_supported is True
 
     def test_drafter_needing_hidden_states_forces_full_forward(
         self, monkeypatch

@@ -62,7 +62,7 @@ def make_stub_runner(
         "_request_states": {},
         "_paged_request_seq_lens": {},
         "_pending_output": None,
-        "_warned_no_intermediate_body": False,
+        "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
         "_execute_model_state": None,
         "pp": None,

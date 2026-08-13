@@ -27,6 +27,13 @@ class TargetModelForwardOutput:
     hidden_states: mx.array | None = None
 
 
+@dataclass(frozen=True)
+class IntermediateForwardOutput:
+    """Projection-free forward output for a no-sample intermediate step."""
+
+    hidden_states: mx.array
+
+
 class MultimodalEncodeResult(Protocol):
     """Adapter-owned vision output for one multimodal feature."""
 
@@ -130,8 +137,17 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
-    def transformer_body(self, model: Any) -> Any | None:
-        """Return the transformer body (no lm_head) of *model*, or ``None``."""
+    def supports_intermediate_forward(self, model: Any) -> bool:
+        """Whether :meth:`intermediate_forward` can run *model*."""
+
+    def intermediate_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+    ) -> IntermediateForwardOutput:
+        """Run *model* without the output projection (cache writes only)."""
 
     def target_forward(
         self,
@@ -354,13 +370,39 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return model.language_model
         return model
 
-    def transformer_body(self, model: Any) -> Any | None:
-        """Return the transformer body (no lm_head) of *model*, or ``None``.
+    def supports_intermediate_forward(self, model: Any) -> bool:
+        """Whether :meth:`intermediate_forward` can run *model*.
 
-        mlx_lm text models expose it at ``model.model``; conditional-
-        generation wrappers served text-only nest it under the
-        ``language_model`` sub-model that :meth:`text_model` resolves.
+        A capability probe for the runner to resolve once at load time; the
+        full-logits forward is the working default whenever it is ``False``.
         """
+        return self._transformer_body(model) is not None
+
+    def intermediate_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+    ) -> IntermediateForwardOutput:
+        """Run *model*'s transformer body without the output projection.
+
+        For a prefill chunk that samples nothing, the KV/GDN cache writes
+        are the real output; skipping the vocab projection over the chunk
+        is pure dead-compute elimination.
+        """
+        body = self._transformer_body(model)
+        if body is None:
+            raise ValueError(
+                f"{type(model).__name__} has no resolvable transformer body; "
+                "callers must gate on supports_intermediate_forward()."
+            )
+        return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
+
+    def _transformer_body(self, model: Any) -> Any | None:
+        # mlx_lm text models expose the body at ``model.model``; conditional-
+        # generation wrappers served text-only nest it under the
+        # ``language_model`` sub-model that text_model() resolves.
         body = getattr(self.text_model(model), "model", None)
         return body if callable(body) else None
 

@@ -393,9 +393,9 @@ class MetalModelRunner:
         # model, not only the YOCO ones that install a real mapping.
         self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
 
-        # One-shot visibility guard: warn once when the body-only
-        # intermediate forward cannot resolve a transformer body.
-        self._warned_no_intermediate_body = False
+        # Whether the adapter can run projection-free intermediate forwards
+        # for the loaded model; resolved once in load_model().
+        self._intermediate_forward_supported = False
 
     @property
     def is_mla(self) -> bool:
@@ -508,6 +508,11 @@ class MetalModelRunner:
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
+        # Resolve the intermediate-forward capability once; unsupported
+        # models keep the full-logits forward on every step.
+        self._intermediate_forward_supported = (
+            self._model_adapter.supports_intermediate_forward(self._forward_model)
+        )
         text_config = getattr(self.model_config.hf_config, "get_text_config", None)
         max_position_embeddings = None
         if callable(text_config):
@@ -596,24 +601,6 @@ class MetalModelRunner:
         # forward (recv -> local layers -> final norm + head on the last stage);
         # the runner owns the downstream send (see the PP branch in the forward).
         self._pp_model = PipelinedModel(self._forward_model, pp)
-
-    def _transformer_body_for_intermediate(self) -> Any | None:
-        """Resolve the transformer body for a body-only intermediate forward.
-
-        Model-structure knowledge lives in the adapter; ``None`` (unknown
-        structure) keeps the full-logits forward — a safe fallback, logged
-        once so the lost lm_head skip is visible instead of silent.
-        """
-        forward_model = self._forward_model
-        body = self._model_adapter.transformer_body(forward_model)
-        if body is None and not self._warned_no_intermediate_body:
-            self._warned_no_intermediate_body = True
-            logger.warning(
-                "Metal: could not resolve a transformer body on %s; "
-                "intermediate prefill chunks run the full lm_head forward.",
-                type(forward_model).__name__,
-            )
-        return body
 
     def _submit_paged_forward_outputs(
         self,
@@ -1263,27 +1250,22 @@ class MetalModelRunner:
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
                 # theirs contributes a token, so the lm_head projection over
-                # the whole chunk (and the sampling sync) is pure waste. Run
-                # the transformer body only — the KV cache and GDN state
-                # writes are the step's real output — and let the graph
-                # evaluate under the next chunk's backpressure.
-                # Any installed drafter is excluded outright: propose() runs
-                # unconditional per-step bookkeeping (finished-id pruning,
-                # pending-draft resolution) that the no-logits short-circuit
-                # would skip, leaking per-request throttle state.
+                # the whole chunk (and the sampling sync) is pure waste. The
+                # adapter runs the model without the projection — the KV and
+                # GDN cache writes are the step's real output. Any installed
+                # drafter is excluded outright: propose() runs unconditional
+                # per-step bookkeeping (finished-id pruning, pending-draft
+                # resolution) that the no-logits short-circuit would skip.
                 intermediate_only = (
                     not decode_reqs
                     and bool(prefill_reqs)
                     and all(pr.prompt_len is None for pr in prefill_reqs)
                     and self._drafter is None
                 )
-                body = (
-                    self._transformer_body_for_intermediate()
-                    if intermediate_only
-                    else None
-                )
-                if body is not None:
-                    intermediate_hidden = body(input_ids, cache=offset_caches)
+                if intermediate_only and self._intermediate_forward_supported:
+                    intermediate_hidden = self._model_adapter.intermediate_forward(
+                        self._forward_model, input_ids, cache=offset_caches
+                    ).hidden_states
                     logits = None
                     target_hidden_states = None
                 else:

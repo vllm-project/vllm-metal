@@ -12,6 +12,7 @@ from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
+    IntermediateForwardOutput,
     TargetModelForwardOutput,
 )
 
@@ -489,6 +490,57 @@ class TestTextModel:
         model = object()
         adapter = DefaultModelAdapter()
         assert adapter.text_model(model) is model
+
+
+def _body_stub(input_ids, cache=None):
+    return mx.array([[7.0]])
+
+
+class TestIntermediateForward:
+    """Adapter-owned projection-free forward for intermediate chunks."""
+
+    def test_supports_text_model_body(self) -> None:
+        adapter = DefaultModelAdapter()
+        assert adapter.supports_intermediate_forward(SimpleNamespace(model=_body_stub))
+
+    def test_supports_wrapped_language_model_body(self) -> None:
+        adapter = DefaultModelAdapter()
+        model = SimpleNamespace(language_model=SimpleNamespace(model=_body_stub))
+        assert adapter.supports_intermediate_forward(model)
+
+    def test_unresolvable_structure_is_unsupported(self) -> None:
+        adapter = DefaultModelAdapter()
+        assert not adapter.supports_intermediate_forward(SimpleNamespace())
+
+    def test_runs_body_and_returns_typed_hidden_states(self) -> None:
+        # Arrange
+        captured: dict[str, object] = {}
+        hidden = mx.zeros((1, 2, 8))
+        sentinel_cache = object()
+
+        def body(input_ids, cache=None):
+            captured["input_ids"] = input_ids.tolist()
+            captured["cache"] = cache
+            return hidden
+
+        adapter = DefaultModelAdapter()
+        model = SimpleNamespace(model=body)
+
+        # Act
+        output = adapter.intermediate_forward(
+            model, mx.array([[5, 6]]), cache=sentinel_cache
+        )
+
+        # Assert
+        assert isinstance(output, IntermediateForwardOutput)
+        assert output.hidden_states is hidden
+        assert captured["input_ids"] == [[5, 6]]
+        assert captured["cache"] is sentinel_cache
+
+    def test_unsupported_model_raises(self) -> None:
+        adapter = DefaultModelAdapter()
+        with pytest.raises(ValueError, match="supports_intermediate_forward"):
+            adapter.intermediate_forward(SimpleNamespace(), mx.array([[5]]))
 
 
 class _Qwen35LanguageModelStub:
