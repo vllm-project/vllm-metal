@@ -28,6 +28,11 @@ from vllm_metal.v1.model_adapter import ModelAdapter
 from vllm_metal.v1.pooling.backends.decoder.factory import (
     build_decoder_pooling_backend,
 )
+from vllm_metal.v1.pooling.backends.encoder.factory import (
+    load_encoder_pooling_backend,
+    supports_encoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.contract import ExecutablePoolingBackend
 
 # Engine-core subprocesses don't always re-invoke `vllm_metal._register()`,
 # so the compat patches applied there may be missing here. Reapply on import
@@ -108,11 +113,12 @@ class GenerationLoadRequest:
 
 @dataclass(frozen=True, slots=True)
 class LoadedGenerationModel:
-    """Loaded generation model plus metadata needed to wire the runner."""
+    """Loaded model plus metadata needed to wire the runner."""
 
     model: Any
     tokenizer: Any
     model_args: dict[str, Any]
+    pooling_backend: ExecutablePoolingBackend | None = None
 
 
 class ModelLifecycle:
@@ -125,12 +131,24 @@ class ModelLifecycle:
         self._model_adapter = model_adapter
 
     def load(self) -> None:
-        """Load the generation model and install runner runtime state."""
+        """Load the configured model and install runner runtime state."""
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
-        loaded_model = self._load_generation(request)
+        loaded_model = self._load_model(request)
 
         self._install_generation_model(loaded_model, request)
+        if loaded_model.pooling_backend is not None:
+            runner = self._runner
+            if runner.pp is not None and runner.pp.size > 1:
+                raise NotImplementedError(
+                    "Metal encoder pooling does not support pipeline parallelism yet."
+                )
+            if runner.vllm_config.lora_config is not None:
+                raise NotImplementedError(
+                    "Metal encoder pooling does not support LoRA yet."
+                )
+            self._runner._pooling_backend = loaded_model.pooling_backend
+            return
 
         # Runtime extensions may depend on dimensions derived from model_args.
         self.resolve_model_dims()
@@ -157,10 +175,23 @@ class ModelLifecycle:
         self._reject_pipeline_parallel_with_per_layer_metadata()
         self._install_hybrid_attention_dims(args)
 
-    def _load_generation(
+    def _load_model(
         self,
         request: GenerationLoadRequest,
     ) -> LoadedGenerationModel:
+        if self._runner._is_pooling and supports_encoder_pooling_backend(
+            request.model_config
+        ):
+            model, tokenizer, pooling_backend = load_encoder_pooling_backend(
+                request.model_config
+            )
+            return LoadedGenerationModel(
+                model=model,
+                tokenizer=tokenizer,
+                model_args=self._config_to_mapping(model.config),
+                pooling_backend=pooling_backend,
+            )
+
         model, tokenizer = self._load_generation_model(
             request.model_name,
             request.is_vlm,

@@ -283,9 +283,16 @@ class ModelCachePolicy:
     ) -> Literal[
         "paged_attention_capacity",
         "paged_attention_mha_layout_budget",
+        "pooling_no_kv",
         "single_sequence_estimate",
     ]:
         """Return which scheduler memory-reporting mode worker should use."""
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            return "pooling_no_kv"
         if paged_attention_enabled:
             if self._uses_deferred_mha_layout():
                 return "paged_attention_mha_layout_budget"
@@ -316,6 +323,13 @@ class ModelCachePolicy:
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            return {}
+
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
@@ -434,6 +448,23 @@ class ModelCachePolicy:
         adopt its grouping before serving.
         """
         runtime = self._runner.paged_attention_runtime
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            if (
+                kv_cache_config.num_blocks
+                or kv_cache_config.kv_cache_groups
+                or kv_cache_config.kv_cache_tensors
+            ):
+                raise ValueError(
+                    "Metal encoder pooling does not use KV cache, but vLLM "
+                    "returned a non-empty KV cache config."
+                )
+            logger.info("Encoder pooling: no KV cache initialized.")
+            return
+
         if self._uses_deferred_mha_layout():
             if runtime is not None:
                 raise RuntimeError(
@@ -1024,6 +1055,11 @@ class WorkerCachePlanner:
                 plan.kv_budget / 1e9,
             )
             return plan.kv_budget
+
+        if mode == "pooling_no_kv":
+            self._worker.model_runner.profile_run()
+            logger.info("Encoder pooling: reporting zero KV-cache bytes")
+            return 0
 
         available = self._worker._one_sequence_kv_bytes()
         logger.info(
