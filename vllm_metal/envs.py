@@ -69,10 +69,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
-    # through the single-pass Metal kernel when the workload matches
-    # the kernel's instantiated specialization (kv_lora_rank=512,
-    # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
-    # decode-only).
+    # through the Metal path when the workload matches the instantiated
+    # specialization (kv_lora_rank=512, qk_rope_head_dim=64,
+    # block_size ∈ {16, 32}, fp16/bf16, decode-only). The dispatcher
+    # selects one-pass or long-context split/reduce internally.
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)

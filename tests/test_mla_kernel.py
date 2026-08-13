@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from vllm_metal.metal import metal_mla_paged_attention
+from vllm_metal.metal import metal_mla_paged_attention, metal_mla_split_plan
 
 # Production shapes — only kv_lora_rank=512, qk_rope_head_dim=64 are
 # instantiated in mla.metal.
@@ -98,6 +98,73 @@ def _make_inputs(
         cu_seqlens_q,
         block_tables_np,
     )
+
+
+def _make_mixed_inputs(
+    *,
+    ctx_lens: list[int],
+    num_heads: int,
+    block_size: int,
+    dtype: mx.Dtype,
+    seed: int = 0,
+):
+    """Build a decode input set where rows share one block-table width but
+    each sequence can have a different valid context length."""
+    mx.random.seed(seed)
+
+    num_seqs = len(ctx_lens)
+    max_ctx_len = max(ctx_lens)
+    n_blocks_per_seq = max(1, (max_ctx_len + block_size - 1) // block_size)
+    num_blocks = n_blocks_per_seq * num_seqs
+
+    q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
+        dtype
+    )
+    latent_cache = mx.random.normal(shape=(num_blocks, block_size, _LATENT_DIM)).astype(
+        dtype
+    )
+    block_tables_np = np.arange(num_blocks, dtype=np.int32).reshape(
+        num_seqs, n_blocks_per_seq
+    )
+    block_tables = mx.array(block_tables_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+
+    return (
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    )
+
+
+def _assert_selected_split_plan(
+    *,
+    ctx_lens: list[int],
+    num_heads: int,
+    block_size: int,
+    heads_per_tg: int,
+    expected_partition_size: int,
+    expected_num_partitions: int,
+) -> None:
+    max_seq_len = ((max(ctx_lens) + block_size - 1) // block_size) * block_size
+    plan = metal_mla_split_plan(
+        total_q_tokens=len(ctx_lens),
+        num_seqs=len(ctx_lens),
+        num_heads=num_heads,
+        heads_per_tg=heads_per_tg,
+        max_seq_len=max_seq_len,
+    )
+    assert plan == {
+        "partition": True,
+        "partition_size": expected_partition_size,
+        "max_num_partitions": expected_num_partitions,
+        "gate_grid": (num_heads // heads_per_tg) * len(ctx_lens),
+    }
 
 
 def _expected_output(
@@ -440,22 +507,41 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
 
 
 @pytest.mark.parametrize(
-    ("ctx_len", "num_seqs", "num_heads", "heads_per_tg"),
+    (
+        "ctx_lens",
+        "block_size",
+        "dtype",
+        "num_heads",
+        "heads_per_tg",
+        "expected_partition_size",
+        "expected_num_partitions",
+    ),
     [
-        (32768, 1, 2, 2),
-        (32768, 2, 1, 1),
-        (81920, 1, 1, 1),
+        ([32768], 32, mx.float16, 2, 2, 16384, 2),
+        ([32768], 16, mx.bfloat16, 1, 1, 16384, 2),
+        ([32768, 32768], 32, mx.float16, 1, 1, 16384, 2),
+        ([1024, 32768], 16, mx.bfloat16, 1, 1, 16384, 2),
+        ([81920], 32, mx.float16, 1, 1, 16384, 5),
     ],
 )
 def test_decode_split_kv_long_context_matches_reference(
-    ctx_len: int,
-    num_seqs: int,
+    ctx_lens: list[int],
+    block_size: int,
+    dtype: mx.Dtype,
     num_heads: int,
     heads_per_tg: int,
+    expected_partition_size: int,
+    expected_num_partitions: int,
 ) -> None:
     """Exercise the MLA split-KV path, including multi-partition reduce."""
-    block_size = 32
-    dtype = mx.float16
+    _assert_selected_split_plan(
+        ctx_lens=ctx_lens,
+        num_heads=num_heads,
+        block_size=block_size,
+        heads_per_tg=heads_per_tg,
+        expected_partition_size=expected_partition_size,
+        expected_num_partitions=expected_num_partitions,
+    )
     (
         q_nope,
         q_pe,
@@ -464,10 +550,9 @@ def test_decode_split_kv_long_context_matches_reference(
         context_lens,
         cu_seqlens_q,
         block_tables_np,
-    ) = _make_inputs(
-        num_seqs=num_seqs,
+    ) = _make_mixed_inputs(
+        ctx_lens=ctx_lens,
         num_heads=num_heads,
-        ctx_len=ctx_len,
         block_size=block_size,
         dtype=dtype,
         seed=17,
@@ -489,7 +574,7 @@ def test_decode_split_kv_long_context_matches_reference(
         q_pe,
         latent_cache,
         block_tables_np,
-        ctx_lens=[ctx_len] * num_seqs,
+        ctx_lens=ctx_lens,
         scale=0.125,
     )
     rtol, atol = _tolerance(dtype)

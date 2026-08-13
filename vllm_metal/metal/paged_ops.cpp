@@ -1148,16 +1148,51 @@ static int mla_num_threads_for_g(int heads_per_tg) {
   }
 }
 
+struct MlaSplitPlan {
+  bool partition;
+  int partition_size;
+  int max_num_partitions;
+  int gate_grid;
+};
+
 static int mla_partition_size_for_context(int max_seq_len) {
   // Use only the partition sizes instantiated in mla.metal. MLA partial output
-  // is 512-wide, so the split count is bounded separately below by scratch
-  // traffic; 16K chunks win in the 80K-98K band, but switch back to 32K at
-  // 128K so the reduce/scratch cost does not jump to 8 partitions.
+  // is 512-wide, so keep the split count bounded; 16K chunks win in the
+  // 80K-98K band, but switch back to 32K at 128K so reduce cost does not jump
+  // to 8 partitions.
   if (max_seq_len >= 131072) return 32768;
   if (max_seq_len >= 81920) return 16384;
   if (max_seq_len >= 49152) return 32768;
   if (max_seq_len >= 32768) return 16384;
   return 0;
+}
+
+static MlaSplitPlan mla_split_plan_for_shape(
+    int total_q_tokens,
+    int num_seqs,
+    int num_heads,
+    int heads_per_tg,
+    int max_seq_len) {
+  const int partition_size = mla_partition_size_for_context(max_seq_len);
+  const int max_num_partitions =
+      partition_size > 0 ? (max_seq_len + partition_size - 1) / partition_size
+                         : 1;
+  const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
+
+  // MLA split-KV helps when one decode step has too little work to keep the GPU
+  // busy, but its 512-wide partial output makes oversplitting expensive. Keep
+  // the shape gate narrow and device-aware; the cap preserves the measured
+  // low-concurrency band while still letting smaller GPUs lower the threshold.
+  constexpr int kMlaMaxSinglePassGrid = 32;
+  constexpr int kMlaMaxNumPartitions = 8;
+  const int split_grid_limit = std::min(min_decode_grid(), kMlaMaxSinglePassGrid);
+  const bool pure_decode = total_q_tokens == num_seqs;
+  const bool partition =
+      pure_decode && gate_grid < split_grid_limit && partition_size > 0 &&
+      max_num_partitions >= 2 && max_num_partitions <= kMlaMaxNumPartitions;
+
+  return {partition, partition ? partition_size : 0, max_num_partitions,
+          gate_grid};
 }
 
 static void dispatch_mla_paged_attention(
@@ -1217,35 +1252,12 @@ static void dispatch_mla_paged_attention(
   });
 
   auto dt = dtype_to_metal(q_nope.dtype());
-  const bool pure_decode = total_q_tokens == num_seqs;
   const int max_seq_len = max_num_blocks_per_seq * block_size;
-  const int mla_partition_size = mla_partition_size_for_context(max_seq_len);
-  const int max_num_partitions =
-      mla_partition_size > 0
-          ? (max_seq_len + mla_partition_size - 1) / mla_partition_size
-          : 1;
-  const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
-  constexpr int kMlaMaxSinglePassGrid = 32;
-  const bool occupancy_limited = gate_grid < kMlaMaxSinglePassGrid;
-  // MLA split-KV manufactures more in-flight memory work by splitting the
-  // long-context scan across grid.z. Each partition writes a model-dtype
-  // partial output plus one fp32 LSE. Partition 0 reuses the final output buffer
-  // as scratch, so tmp_out only stores partitions 1..N-1. Keep both occupancy
-  // and scratch gates explicit: MLA's 512-wide partial output makes over-split
-  // cases much more expensive than MHA split-KV.
-  constexpr int kMlaMaxNumPartitions = 8;
-  constexpr int64_t kMlaSplitScratchByteLimit = 512 * 1024 * sizeof(float);
-  const int64_t split_scratch_bytes =
-      static_cast<int64_t>(total_q_tokens) * num_heads *
-      ((max_num_partitions - 1) * kv_lora_rank *
-           static_cast<int>(q_nope.itemsize()) +
-       max_num_partitions * sizeof(float));
-  const bool scratch_budget_ok =
-      split_scratch_bytes <= kMlaSplitScratchByteLimit;
-  const bool partition =
-      pure_decode && occupancy_limited && mla_partition_size > 0
-      && max_num_partitions >= 2
-      && max_num_partitions <= kMlaMaxNumPartitions && scratch_budget_ok;
+  const MlaSplitPlan split_plan = mla_split_plan_for_shape(
+      total_q_tokens, num_seqs, num_heads, heads_per_tg, max_seq_len);
+  const bool partition = split_plan.partition;
+  const int mla_partition_size = split_plan.partition_size;
+  const int max_num_partitions = split_plan.max_num_partitions;
 
   std::string kname = "paged_mla_attention_" + dt + "_kvr" +
                       std::to_string(kv_lora_rank) + "_pe" +
@@ -1701,6 +1713,23 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_mla_library", &init_mla_library,
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
+
+  m.def("mla_split_plan",
+        [](int total_q_tokens,
+           int num_seqs,
+           int num_heads,
+           int heads_per_tg,
+           int max_seq_len) {
+          auto plan = mla_split_plan_for_shape(
+              total_q_tokens, num_seqs, num_heads, heads_per_tg, max_seq_len);
+          return nb::make_tuple(plan.partition, plan.partition_size,
+                                plan.max_num_partitions, plan.gate_grid);
+        },
+        nb::arg("total_q_tokens"), nb::arg("num_seqs"),
+        nb::arg("num_heads"), nb::arg("heads_per_tg"),
+        nb::arg("max_seq_len"),
+        "Return the MLA split-KV dispatch plan for a shape as "
+        "(partition, partition_size, max_num_partitions, gate_grid).");
 
   m.def("mla_paged_attention_primitive",
         [](nb::handle q_nope_h,

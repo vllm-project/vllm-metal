@@ -90,16 +90,14 @@ class MLAPagedAttentionWrapper(nn.Module):
         latent_cache: MLAPagedLatentCache,
         ctx: Any,
     ) -> bool:
-        """Admission check for the single-pass Metal kernel fast path.
+        """Admission check for the opt-in Metal MLA decode path.
 
         Returns True only when every dimension matches the kernel's
         instantiated specialization and every request is decode-only.
         Workloads outside this set fall through to ``_slow_path_per_request``
-        (MLX SDPA) — no silent fallback, no scaffolding for routing
-        between kernel variants (this PR ships single-pass only;
-        FA / 2pass / pr_mma land in follow-ups once each has its own
-        real-model parity proof, per the alignment with reviewers on
-        ``Ship one kernel, prove it wins'')."""
+        (MLX SDPA). The C++ dispatcher then chooses the one-pass kernel or the
+        long-context split/reduce path for shapes that benefit from extra
+        parallelism."""
         if not envs.VLLM_METAL_MLA_KERNEL:
             return False
         if not self._is_absorbed:
@@ -120,13 +118,12 @@ class MLAPagedAttentionWrapper(nn.Module):
 
     @staticmethod
     def _pick_heads_per_tg(num_heads: int, batch_size: int) -> int:
-        """Pick HEADS_PER_TG (G) for the single-pass kernel. G=2 packs 2
-        query heads into one threadgroup so each K/V load is reused for
-        2 dot products; G=1 keeps the wider NUM_THREADS=1024 layout for
-        cells too small to saturate the GPU. Bench on M5 Max (RFC #360)
-        shows G=2 wins once B*H ≳ 30 launched threadgroups; B=1 with
-        small H stays on G=1. Falls back to G=1 when num_heads is odd
-        (kernel requires num_heads % G == 0)."""
+        """Pick HEADS_PER_TG (G) for the MLA kernel. G=2 packs 2 query heads
+        into one threadgroup so each K/V load is reused for 2 dot products;
+        G=1 keeps the wider NUM_THREADS=1024 layout for cells too small to
+        saturate the GPU. Bench on M5 Max (RFC #360) shows G=2 wins once
+        B*H ≳ 30 launched threadgroups; B=1 with small H stays on G=1.
+        Falls back to G=1 when num_heads is odd."""
         if num_heads % 2 != 0:
             return 1
         if batch_size == 1 and num_heads < 32:
@@ -143,11 +140,11 @@ class MLAPagedAttentionWrapper(nn.Module):
         ctx: Any,
         seq_len: int,
     ) -> mx.array:
-        """Single-pass MLA decode fast path: project q_nope through
-        embed_q, dispatch the kernel for the whole batch in one call,
-        recover v_head_dim through unembed_out, and concatenate for
-        o_proj. Replaces the per-request Python loop entirely when the
-        gate above accepts."""
+        """Metal MLA decode fast path: project q_nope through embed_q,
+        dispatch the kernel for the whole batch in one call, recover
+        v_head_dim through unembed_out, and concatenate for o_proj. The C++
+        dispatcher may use either the one-pass kernel or the long-context
+        split/reduce kernel family."""
         from vllm_metal.metal import metal_mla_paged_attention
 
         # Cast Q to the latent cache dtype so we hit a real kernel
@@ -414,7 +411,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             mx.async_eval(latent_cache.latent_caches[layer_idx])
             return inner.o_proj(final)
 
-        # Env-gated single-pass Metal kernel fast path. Falls through
+        # Env-gated Metal MLA kernel fast path. Falls through
         # to the per-request MLX SDPA loop below when the gate rejects
         # (VLLM_METAL_MLA_KERNEL unset, wrong inner dims, non-decode,
         # or unsupported block_size / dtype).
