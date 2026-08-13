@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -1185,11 +1186,16 @@ static MlaSplitPlan mla_split_plan_for_shape(
   // low-concurrency band while still letting smaller GPUs lower the threshold.
   constexpr int kMlaMaxSinglePassGrid = 32;
   constexpr int kMlaMaxNumPartitions = 8;
-  const int split_grid_limit = std::min(min_decode_grid(), kMlaMaxSinglePassGrid);
+  const int split_grid_limit =
+      std::min(min_decode_grid(), kMlaMaxSinglePassGrid);
+  const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
+  const bool split_enabled =
+      split_env == nullptr || std::string(split_env) != "0";
   const bool pure_decode = total_q_tokens == num_seqs;
   const bool partition =
-      pure_decode && gate_grid < split_grid_limit && partition_size > 0 &&
-      max_num_partitions >= 2 && max_num_partitions <= kMlaMaxNumPartitions;
+      split_enabled && pure_decode && gate_grid < split_grid_limit &&
+      partition_size > 0 && max_num_partitions >= 2 &&
+      max_num_partitions <= kMlaMaxNumPartitions;
 
   return {partition, partition ? partition_size : 0, max_num_partitions,
           gate_grid};

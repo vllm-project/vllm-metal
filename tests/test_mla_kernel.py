@@ -167,6 +167,24 @@ def _assert_selected_split_plan(
     }
 
 
+def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    kwargs = dict(
+        total_q_tokens=1,
+        num_seqs=1,
+        num_heads=16,
+        heads_per_tg=1,
+        max_seq_len=32768,
+    )
+    monkeypatch.delenv("VLLM_METAL_MLA_SPLIT_KV", raising=False)
+    assert metal_mla_split_plan(**kwargs)["partition"] is True
+
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "0")
+    plan = metal_mla_split_plan(**kwargs)
+    assert plan["partition"] is False
+    assert plan["partition_size"] == 0
+    assert plan["max_num_partitions"] == 2
+
+
 def _expected_output(
     q_nope: mx.array,
     q_pe: mx.array,
