@@ -1156,16 +1156,24 @@ struct MlaSplitPlan {
   int gate_grid;
 };
 
+constexpr int kMlaMinSplitContext = 32768;
+constexpr int kMlaSmallPartitionSize = 8192;
+constexpr int kMlaLargePartitionSize = 32768;
+constexpr int kMlaMaxNumPartitions = 8;
+
 static int mla_partition_size_for_context(int max_seq_len) {
-  // Use only the partition sizes instantiated in mla.metal. MLA partial output
-  // is 512-wide, so keep the split count bounded; 16K chunks win in the
-  // 80K-98K band, but switch back to 32K at 128K so reduce cost does not jump
-  // to 8 partitions.
-  if (max_seq_len >= 131072) return 32768;
-  if (max_seq_len >= 81920) return 16384;
-  if (max_seq_len >= 49152) return 32768;
-  if (max_seq_len >= 32768) return 16384;
-  return 0;
+  if (max_seq_len < kMlaMinSplitContext) return 0;
+
+  // Use the smallest compiled chunk while it keeps the reduce fan-in small.
+  // This gives low-concurrency 32K/49K decode more independent context reads,
+  // then switches to larger chunks once 8K chunks would create too many 512-wide
+  // partial MLA outputs for the reduce pass.
+  const int small_parts =
+      (max_seq_len + kMlaSmallPartitionSize - 1) / kMlaSmallPartitionSize;
+  if (small_parts <= 6) {
+    return kMlaSmallPartitionSize;
+  }
+  return kMlaLargePartitionSize;
 }
 
 static MlaSplitPlan mla_split_plan_for_shape(
@@ -1187,7 +1195,6 @@ static MlaSplitPlan mla_split_plan_for_shape(
   // still benefit from splitting at larger head grids. The 32 cap keeps the
   // path out of ordinary higher-concurrency decode.
   constexpr int kMlaMaxSinglePassGrid = 32;
-  constexpr int kMlaMaxNumPartitions = 8;
   const int split_grid_limit =
       std::min(kMlaMaxSinglePassGrid, std::max(8, gpu_core_count() / 2));
   const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");

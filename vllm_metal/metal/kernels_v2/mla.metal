@@ -544,5 +544,5 @@ instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 0);
   instantiate_mla_reduce(half, 512, partition_size);                          \
   instantiate_mla_reduce(bfloat16_t, 512, partition_size);
 
-instantiate_mla_partition_size(16384);
+instantiate_mla_partition_size(8192);
 instantiate_mla_partition_size(32768);

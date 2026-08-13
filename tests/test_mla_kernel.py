@@ -182,7 +182,7 @@ def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
     plan = metal_mla_split_plan(**kwargs)
     assert plan["partition"] is False
     assert plan["partition_size"] == 0
-    assert plan["max_num_partitions"] == 2
+    assert plan["max_num_partitions"] == 4
 
 
 def _expected_output(
@@ -535,11 +535,14 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
         "expected_num_partitions",
     ),
     [
-        ([32768], 32, mx.float16, 2, 2, 16384, 2),
-        ([32768], 16, mx.bfloat16, 1, 1, 16384, 2),
-        ([32768, 32768], 32, mx.float16, 1, 1, 16384, 2),
-        ([1024, 32768], 16, mx.bfloat16, 1, 1, 16384, 2),
-        ([81920], 32, mx.float16, 1, 1, 16384, 5),
+        ([32768], 32, mx.float16, 2, 2, 8192, 4),
+        ([32768], 16, mx.bfloat16, 1, 1, 8192, 4),
+        ([32768, 32768], 32, mx.float16, 1, 1, 8192, 4),
+        ([1024, 32768], 16, mx.bfloat16, 1, 1, 8192, 4),
+        ([49152], 32, mx.float16, 1, 1, 8192, 6),
+        ([65536], 32, mx.float16, 1, 1, 32768, 2),
+        ([81920], 32, mx.float16, 1, 1, 32768, 3),
+        ([98304], 32, mx.float16, 1, 1, 32768, 3),
     ],
 )
 def test_decode_split_kv_long_context_matches_reference(
