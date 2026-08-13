@@ -413,6 +413,21 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     return;
   }
 
+  if (num_partitions == 2) {
+    const float l0 = lse_ptr[0];
+    const float l1 = lse_ptr[1];
+    const float m = max(l0, l1);
+    const float w0 = fast::exp2(l0 - m);
+    const float w1 = fast::exp2(l1 - m);
+    const float inv = 1.0f / (w0 + w1);
+    for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+      const float p0 = float(out_ptr[d]);
+      const float p1 = float(tmp_out_ptr[d]);
+      out_ptr[d] = T((p0 * w0 + p1 * w1) * inv);
+    }
+    return;
+  }
+
   float thread_max = -INFINITY;
   for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
     const float l = lse_ptr[i];
