@@ -15,6 +15,7 @@ from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.impls.mla import _mla_kernel_metadata
+from vllm_metal.attention.impls.mla import _mla_split_route_selected
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 
@@ -357,6 +358,34 @@ class TestMLAPagedAttentionWrapperPagedPath:
         assert meta1.block_tables.shape == (1, 2)
         assert meta1.context_lens.dtype == mx.uint32
         assert meta1.cu_seqlens_q.dtype == mx.int32
+
+    def test_split_route_cached_on_context(self) -> None:
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[32767],
+            block_tables=[list(range(2048))],
+            context_lens=[32768],
+            cu_seqlens=[0, 1],
+            offsets=[32767],
+        )
+
+        selected1 = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+        selected2 = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+
+        assert selected1 is True
+        assert selected2 is True
+        assert ("mla_route", 16, 1, 8, 1, 32768) in ctx.kernel_metadata_cache
 
     def test_decode_output_shape(self) -> None:
         # 1 request, 3 cached tokens, 1 new decode token

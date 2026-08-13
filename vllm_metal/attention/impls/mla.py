@@ -26,6 +26,44 @@ class _MlaKernelMetadata:
     cu_seqlens_q: mx.array
 
 
+def _mla_split_route_selected(
+    ctx: Any,
+    *,
+    block_size: int,
+    total_q_tokens: int,
+    num_heads: int,
+    heads_per_tg: int,
+) -> bool:
+    cache = getattr(ctx, "kernel_metadata_cache", None)
+    max_seq_len = max(len(bt) for bt in ctx.block_tables) * block_size
+    key = (
+        "mla_route",
+        block_size,
+        total_q_tokens,
+        num_heads,
+        heads_per_tg,
+        max_seq_len,
+    )
+    if cache is not None:
+        selected = cache.get(key)
+        if selected is not None:
+            return bool(selected)
+
+    from vllm_metal.metal import metal_mla_split_plan
+
+    plan = metal_mla_split_plan(
+        total_q_tokens=total_q_tokens,
+        num_seqs=len(ctx.context_lens),
+        num_heads=num_heads,
+        heads_per_tg=heads_per_tg,
+        max_seq_len=max_seq_len,
+    )
+    selected = bool(plan["partition"])
+    if cache is not None:
+        cache[key] = selected
+    return selected
+
+
 def _mla_kernel_metadata(ctx: Any, block_size: int) -> _MlaKernelMetadata:
     """Kernel-format MLA metadata, cached once per forward when possible."""
     cache = getattr(ctx, "kernel_metadata_cache", None)
@@ -147,18 +185,14 @@ class MLAPagedAttentionWrapper(nn.Module):
         for i in range(len(ctx.context_lens)):
             if cu[i + 1] - cu[i] != 1:
                 return False
-        from vllm_metal.metal import metal_mla_split_plan
-
-        max_seq_len = max(len(bt) for bt in ctx.block_tables) * latent_cache.block_size
         heads_per_tg = self._pick_heads_per_tg(inner.num_heads, len(ctx.context_lens))
-        plan = metal_mla_split_plan(
+        if not _mla_split_route_selected(
+            ctx,
+            block_size=latent_cache.block_size,
             total_q_tokens=cu[-1],
-            num_seqs=len(ctx.context_lens),
             num_heads=inner.num_heads,
             heads_per_tg=heads_per_tg,
-            max_seq_len=max_seq_len,
-        )
-        if not plan["partition"]:
+        ):
             return False
         return True
 
