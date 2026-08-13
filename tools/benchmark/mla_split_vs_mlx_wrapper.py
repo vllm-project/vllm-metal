@@ -247,6 +247,7 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
     heads_per_tg = MLAPagedAttentionWrapper._pick_heads_per_tg(
         shape.num_heads, shape.batch_size
     )
+    os.environ.pop("VLLM_METAL_MLA_SPLIT_KV", None)
     plan = metal_mla_split_plan(
         total_q_tokens=shape.batch_size,
         num_seqs=shape.batch_size,
