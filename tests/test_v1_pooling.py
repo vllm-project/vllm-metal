@@ -10,11 +10,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from mlx.utils import tree_flatten
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from vllm.pooling_params import LateInteractionParams, PoolingParams  # noqa: E402
 from vllm.v1.core.sched.output import NewRequestData  # noqa: E402
+from vllm.v1.kv_cache_interface import KVCacheConfig  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
@@ -30,6 +32,13 @@ from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
 from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
     DecoderModelView,
     MetalDecoderPoolingBackend,
+)
+from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (  # noqa: E402
+    XLMRobertaArgs,
+    XLMRobertaModel,
+)
+from vllm_metal.v1.pooling.backends.encoder.runtime import (  # noqa: E402
+    MetalEncoderPoolingBackend,
 )
 from vllm_metal.v1.pooling.contract import (  # noqa: E402
     DecoderPoolingSpan,
@@ -106,6 +115,15 @@ class _NonArraySequenceModel:
         return object()
 
 
+class _EncoderModel:
+    def __call__(self, input_ids, attention_mask):
+        del attention_mask
+        rows = []
+        for row in np.array(input_ids).tolist():
+            rows.append([[float(tok), float(tok + 1), 1.0] for tok in row])
+        return mx.array(rows, dtype=mx.float32)
+
+
 class _PoolingModel:
     def __init__(self, sequence_model: object | None = None) -> None:
         self.model = sequence_model or _SequenceModel()
@@ -177,6 +195,7 @@ def _pooling_model_config(**overrides):
         "pooler_config": _pooler_config(),
         "quantization": None,
         "trust_remote_code": False,
+        "revision": None,
         "get_head_size": lambda: 128,
     }
     values.update(overrides)
@@ -187,6 +206,18 @@ def _classification_model_config(**overrides):
     values = {
         "hf_config": _qwen3_reranker_hf_config(),
         "pooler_config": _pooler_config(),
+    }
+    values.update(overrides)
+    return _pooling_model_config(**values)
+
+
+def _encoder_model_config(**overrides):
+    values = {
+        "hf_config": _hf_config(
+            architectures=["XLMRobertaModel"],
+            model_type="xlm-roberta",
+        ),
+        "pooler_config": _pooler_config(seq_pooling_type="CLS"),
     }
     values.update(overrides)
     return _pooling_model_config(**values)
@@ -351,6 +382,21 @@ class TestMetalPoolingCapabilities:
 
         assert runner.supported_worker_tasks() == ("classify",)
 
+    def test_supported_worker_tasks_for_encoder_embedding_model_without_paged_attention(
+        self,
+    ) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(),
+        )
+        runner._pooling_backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(runner.model_config),
+            _EncoderModel(),
+            pad_token_id=1,
+        )
+
+        assert runner.supported_worker_tasks() == ("embed",)
+
     def test_supported_worker_tasks_for_untied_qwen3_reranker_model(self) -> None:
         runner = _make_runner(
             model=_UntiedClassifierModel(),
@@ -440,13 +486,21 @@ class TestMetalPoolingCapabilities:
 
     def test_supported_worker_tasks_uses_backend_paged_capability(self) -> None:
         class _NoPagedBackend:
-            capabilities = PoolingCapabilities(requires_paged_attention=False)
+            capabilities = PoolingCapabilities(
+                execution_kind="encoder",
+                requires_paged_attention=False,
+                uses_kv_cache=False,
+                supports_chunked_requests=False,
+            )
 
             def supported_tasks(self):
                 return ("embed",)
 
             def validate_params(self, pooling_params):
                 del pooling_params
+
+            def profile_forward(self, input_ids):
+                return input_ids
 
         runner = _make_runner(paged=False)
         runner._pooling_backend = _NoPagedBackend()
@@ -459,6 +513,25 @@ class TestMetalPoolingCapabilities:
         )
 
         assert gen_runner.supported_worker_tasks() == ("generate",)
+
+    def test_encoder_pooling_reports_empty_kv_spec(self) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(),
+        )
+        runner._pooling_backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(runner.model_config),
+            _EncoderModel(),
+            pad_token_id=1,
+        )
+
+        assert runner.scheduler_memory_reporting_mode(
+            paged_attention_enabled=False
+        ) == ("pooling_no_kv")
+        assert runner.get_kv_cache_spec() == {}
+        runner.initialize_kv_cache(
+            KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+        )
 
     def test_load_model_installs_pooling_backend_after_lora_setup(self) -> None:
         events: list[str] = []
@@ -484,7 +557,7 @@ class TestMetalPoolingCapabilities:
             assert runner._pooling_backend is None
 
         with (
-            patch.object(lifecycle, "_load_generation", return_value=loaded),
+            patch.object(lifecycle, "_load_model", return_value=loaded),
             patch.object(lifecycle, "_install_generation_model"),
             patch.object(lifecycle, "resolve_model_dims"),
             patch.object(lifecycle, "_install_runtime_extensions"),
@@ -495,6 +568,39 @@ class TestMetalPoolingCapabilities:
         assert events == ["lora"]
         assert runner._pooling_backend is not None
         assert runner._pooling_backend.supported_tasks() == ("embed",)
+
+    def test_load_model_installs_encoder_backend_without_generation_extensions(
+        self,
+    ) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(),
+        )
+        runner._pooling_backend = None
+        pooling_backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(runner.model_config),
+            _EncoderModel(),
+            pad_token_id=1,
+        )
+        lifecycle = ModelLifecycle(runner, runner._model_adapter)
+        runner._model_lifecycle = lifecycle
+        loaded = LoadedGenerationModel(
+            model=SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
+            tokenizer=object(),
+            model_args={"vocab_size": 16},
+            pooling_backend=pooling_backend,
+        )
+
+        with (
+            patch.object(lifecycle, "_load_model", return_value=loaded),
+            patch.object(lifecycle, "resolve_model_dims") as resolve_dims,
+            patch.object(lifecycle, "_install_runtime_extensions") as extensions,
+        ):
+            runner.load_model()
+
+        assert runner._pooling_backend is pooling_backend
+        resolve_dims.assert_not_called()
+        extensions.assert_not_called()
 
     def test_duplicate_supported_pooler_tasks_fail_at_backend_construction(
         self,
@@ -519,6 +625,24 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
+    def test_xlm_roberta_model_uses_hf_weight_names(self) -> None:
+        model = XLMRobertaModel(
+            XLMRobertaArgs(
+                hidden_size=4,
+                num_hidden_layers=1,
+                intermediate_size=8,
+                num_attention_heads=2,
+                max_position_embeddings=8,
+                vocab_size=16,
+            )
+        )
+        names = {name for name, _ in tree_flatten(model.parameters())}
+
+        assert "embeddings.word_embeddings.weight" in names
+        assert "encoder.layer.0.attention.self.query.weight" in names
+        assert "encoder.layer.0.intermediate.dense.weight" in names
+        assert "encoder.layer.0.output.dense.weight" in names
+
 
 class TestMetalPoolingRunnerOutput:
     def test_paged_embed_preserves_request_order(self) -> None:
@@ -538,6 +662,31 @@ class TestMetalPoolingRunnerOutput:
         assert out.pooler_output is not None
         _assert_embedding(out.pooler_output[0], 5)
         _assert_embedding(out.pooler_output[1], 9)
+
+    def test_encoder_embed_preserves_request_order_without_paged_attention(
+        self,
+    ) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(),
+        )
+        runner._pooling_backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(runner.model_config),
+            _EncoderModel(),
+            pad_token_id=1,
+        )
+        req_b = _new_req("req-b", [4, 5])
+        req_a = _new_req("req-a", [7, 8, 9])
+
+        with patch("vllm_metal.v1.model_runner.prepare_grouped") as prepare:
+            out = _execute_pooling(runner, _scheduler_output(new_reqs=[req_b, req_a]))
+
+        prepare.assert_not_called()
+        assert out.req_ids == ["req-b", "req-a"]
+        assert out.sampled_token_ids == [[], []]
+        assert out.pooler_output is not None
+        _assert_embedding(out.pooler_output[0], 4)
+        _assert_embedding(out.pooler_output[1], 7)
 
     def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(self) -> None:
         runner = _make_runner()
@@ -684,6 +833,26 @@ class TestMetalPoolingFailFast:
 
         with pytest.raises(NotImplementedError, match="paged attention"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
+
+    def test_encoder_pooling_rejects_chunked_requests(self) -> None:
+        runner = _make_runner(
+            paged=False,
+            model_config=_encoder_model_config(),
+        )
+        runner._pooling_backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(runner.model_config),
+            _EncoderModel(),
+            pad_token_id=1,
+        )
+        req = _new_req("req-0", [1, 2, 3], num_computed_tokens=1)
+
+        with pytest.raises(NotImplementedError, match="full-prompt"):
+            runner.execute_model(
+                _scheduler_output(
+                    new_reqs=[req],
+                    num_scheduled_tokens={"req-0": 2},
+                )
+            )
 
     @pytest.mark.parametrize(
         "task",

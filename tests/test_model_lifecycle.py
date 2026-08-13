@@ -207,7 +207,7 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is False
 
-    def test_generation_load_request_resolves_effective_vlm_once(self) -> None:
+    def test_model_load_request_resolves_effective_vlm_once(self) -> None:
         hf_config = SimpleNamespace(model_type="custom")
         calls: list[object] = []
 
@@ -233,7 +233,7 @@ class TestModelLifecycle:
         assert request.tokenizer_config == {"trust_remote_code": True}
         assert calls == [hf_config]
 
-    def test_generation_load_request_marks_pipeline_stage_lazy(self) -> None:
+    def test_model_load_request_marks_pipeline_stage_lazy(self) -> None:
         # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
         # prune its non-owned layers before the first eval; a single-stage load
         # stays eager. lazy_weights is the typed contract the mlx_lm loader reads.
