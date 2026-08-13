@@ -171,7 +171,7 @@ def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
     kwargs = dict(
         total_q_tokens=1,
         num_seqs=1,
-        num_heads=16,
+        num_heads=4,
         heads_per_tg=1,
         max_seq_len=32768,
     )

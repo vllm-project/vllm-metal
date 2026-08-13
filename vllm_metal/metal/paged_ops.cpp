@@ -1181,13 +1181,15 @@ static MlaSplitPlan mla_split_plan_for_shape(
   const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
 
   // MLA split-KV helps when one decode step has too little work to keep the GPU
-  // busy, but its 512-wide partial output makes oversplitting expensive. Keep
-  // the shape gate narrow and device-aware; the cap preserves the measured
-  // low-concurrency band while still letting smaller GPUs lower the threshold.
+  // busy, but its 512-wide partial output makes oversplitting expensive. Scale
+  // the gate with GPU width: small laptop GPUs need fewer base threadgroups
+  // before single-pass decode is already busy, while Ultra/Max-class GPUs can
+  // still benefit from splitting at larger head grids. The 32 cap keeps the
+  // path out of ordinary higher-concurrency decode.
   constexpr int kMlaMaxSinglePassGrid = 32;
   constexpr int kMlaMaxNumPartitions = 8;
   const int split_grid_limit =
-      std::min(min_decode_grid(), kMlaMaxSinglePassGrid);
+      std::min(kMlaMaxSinglePassGrid, std::max(8, gpu_core_count() / 2));
   const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
   const bool split_enabled =
       split_env == nullptr || std::string(split_env) != "0";
