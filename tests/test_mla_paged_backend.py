@@ -14,6 +14,7 @@ from mlx_lm.models.base import scaled_dot_product_attention
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.impls.mla import _mla_kernel_metadata
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 
@@ -338,6 +339,24 @@ class TestMLAPagedAttentionWrapperPagedPath:
             block_size=4,
             dtype=mx.float16,
         )
+
+    def test_kernel_metadata_cached_on_context(self) -> None:
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[3],
+            block_tables=[[0, 1]],
+            context_lens=[8],
+            cu_seqlens=[0, 1],
+            offsets=[7],
+        )
+
+        meta1 = _mla_kernel_metadata(ctx, block_size=4)
+        meta2 = _mla_kernel_metadata(ctx, block_size=4)
+
+        assert meta1 is meta2
+        assert ("mla", 4) in ctx.kernel_metadata_cache
+        assert meta1.block_tables.shape == (1, 2)
+        assert meta1.context_lens.dtype == mx.uint32
+        assert meta1.cu_seqlens_q.dtype == mx.int32
 
     def test_decode_output_shape(self) -> None:
         # 1 request, 3 cached tokens, 1 new decode token

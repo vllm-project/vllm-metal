@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -16,6 +17,38 @@ from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
 MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+
+
+@dataclass(frozen=True, eq=False)
+class _MlaKernelMetadata:
+    block_tables: mx.array
+    context_lens: mx.array
+    cu_seqlens_q: mx.array
+
+
+def _mla_kernel_metadata(ctx: Any, block_size: int) -> _MlaKernelMetadata:
+    """Kernel-format MLA metadata, cached once per forward when possible."""
+    cache = getattr(ctx, "kernel_metadata_cache", None)
+    key = ("mla", block_size)
+    if cache is not None:
+        meta = cache.get(key)
+        if meta is not None:
+            return meta
+
+    # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
+    # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
+    # padding entries beyond n_context_blocks are never read.
+    bts = ctx.block_tables
+    max_blocks = max(len(bt) for bt in bts)
+    padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
+    meta = _MlaKernelMetadata(
+        block_tables=mx.array(padded, dtype=mx.int32),
+        context_lens=mx.array(list(ctx.context_lens), dtype=mx.uint32),
+        cu_seqlens_q=mx.array(list(ctx.cu_seqlens), dtype=mx.int32),
+    )
+    if cache is not None:
+        cache[key] = meta
+    return meta
 
 
 class MLAPagedAttentionWrapper(nn.Module):
@@ -161,24 +194,15 @@ class MLAPagedAttentionWrapper(nn.Module):
             seq_len, inner.num_heads, inner.qk_rope_head_dim
         )
 
-        # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
-        # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
-        # padding entries beyond n_context_blocks are never read.
-        bts = ctx.block_tables
-        max_blocks = max(len(bt) for bt in bts)
-        padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
-        block_tables_mx = mx.array(padded, dtype=mx.int32)
-
-        context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
-        cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
+        meta = _mla_kernel_metadata(ctx, latent_cache.block_size)
 
         out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
             q_pe=q_pe_kernel,
             latent_cache=latent_cache.latent_caches[layer_idx],
-            block_tables=block_tables_mx,
-            context_lens=context_lens_mx,
-            cu_seqlens_q=cu_seqlens_q_mx,
+            block_tables=meta.block_tables,
+            context_lens=meta.context_lens,
+            cu_seqlens_q=meta.cu_seqlens_q,
             scale=self._attention_scale(),
             heads_per_tg=self._pick_heads_per_tg(inner.num_heads, seq_len),
         )

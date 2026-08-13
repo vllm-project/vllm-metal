@@ -95,7 +95,7 @@ class PagedAttentionContext:
     # never go stale; every layer of a group reuses the first layer's
     # conversion instead of re-serializing the Python lists above (see
     # ``impls.sdpa._kernel_metadata``).
-    kernel_metadata_cache: dict[tuple[int | None, int], Any] = field(
+    kernel_metadata_cache: dict[tuple[Any, ...], Any] = field(
         default_factory=dict
     )
 
