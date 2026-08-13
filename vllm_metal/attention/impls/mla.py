@@ -69,7 +69,7 @@ class MLAPagedAttentionWrapper(nn.Module):
     When no PagedAttentionContext is active the original module is called as-is.
     """
 
-    # Single-pass Metal kernel admission: kv_lora_rank=512, qk_rope_head_dim=64,
+    # Metal split-kernel admission: kv_lora_rank=512, qk_rope_head_dim=64,
     # block_size ∈ {16, 32}, fp16 / bf16. Workloads outside this set fall
     # through to the MLX SDPA slow path.
     _KERNEL_KV_LORA_RANK = 512
@@ -128,9 +128,9 @@ class MLAPagedAttentionWrapper(nn.Module):
         Returns True only when every dimension matches the kernel's
         instantiated specialization and every request is decode-only.
         Workloads outside this set fall through to ``_slow_path_per_request``
-        (MLX SDPA). The C++ dispatcher then chooses the one-pass kernel or the
-        long-context split/reduce path for shapes that benefit from extra
-        parallelism."""
+        (MLX SDPA). The C++ planner is also consulted here so the wrapper only
+        routes shapes selected for long-context split/reduce; non-split shapes
+        stay on MLX instead of paying the custom kernel overhead."""
         if not envs.VLLM_METAL_MLA_KERNEL:
             return False
         if not self._is_absorbed:
@@ -147,6 +147,19 @@ class MLAPagedAttentionWrapper(nn.Module):
         for i in range(len(ctx.context_lens)):
             if cu[i + 1] - cu[i] != 1:
                 return False
+        from vllm_metal.metal import metal_mla_split_plan
+
+        max_seq_len = max(len(bt) for bt in ctx.block_tables) * latent_cache.block_size
+        heads_per_tg = self._pick_heads_per_tg(inner.num_heads, len(ctx.context_lens))
+        plan = metal_mla_split_plan(
+            total_q_tokens=cu[-1],
+            num_seqs=len(ctx.context_lens),
+            num_heads=inner.num_heads,
+            heads_per_tg=heads_per_tg,
+            max_seq_len=max_seq_len,
+        )
+        if not plan["partition"]:
+            return False
         return True
 
     @staticmethod

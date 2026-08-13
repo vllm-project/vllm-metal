@@ -609,18 +609,21 @@ def _make_kernel_dims_wrapper(
     )
 
 
-def _make_decode_ctx(num_seqs: int = 1) -> SimpleNamespace:
+def _make_decode_ctx(
+    num_seqs: int = 1, ctx_len: int = 16, block_size: int = 16
+) -> SimpleNamespace:
     """Single-token-per-seq decode context, just enough for
     ``_can_use_kernel`` to inspect."""
+    num_blocks = math.ceil(ctx_len / block_size)
     return SimpleNamespace(
-        context_lens=[16] * num_seqs,
+        context_lens=[ctx_len] * num_seqs,
         cu_seqlens=list(range(num_seqs + 1)),
-        block_tables=[[0]] * num_seqs,
+        block_tables=[list(range(num_blocks))] * num_seqs,
     )
 
 
-class TestSinglePassRouting:
-    """Focused tests for the env-gated single-pass kernel fast path.
+class TestSplitKernelRouting:
+    """Focused tests for the env-gated split kernel fast path.
     Each test exercises one admission rule of ``_can_use_kernel`` —
     no exhaustive cell sweeps. Per the alignment with reviewers on
     ``Ship one kernel, prove it wins'', the kernel routing is a
@@ -638,12 +641,24 @@ class TestSinglePassRouting:
 
     def test_env_on_accepts(self, monkeypatch) -> None:
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        wrapper = _make_kernel_dims_wrapper(block_size=16)
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner,
+                wrapper._mla_latent_cache,
+                _make_decode_ctx(ctx_len=32768, block_size=16),
+            )
+            is True
+        )
+
+    def test_short_context_rejects(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
         wrapper = _make_kernel_dims_wrapper()
         assert (
             wrapper._can_use_kernel(
                 wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
             )
-            is True
+            is False
         )
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
