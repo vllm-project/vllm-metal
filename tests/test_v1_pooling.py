@@ -23,6 +23,7 @@ from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.model_lifecycle import (  # noqa: E402
+    LoadedEncoderPoolingModel,
     LoadedGenerationModel,
     ModelLifecycle,
 )
@@ -557,7 +558,7 @@ class TestMetalPoolingCapabilities:
             assert runner._pooling_backend is None
 
         with (
-            patch.object(lifecycle, "_load_model", return_value=loaded),
+            patch.object(lifecycle, "_load_generation", return_value=loaded),
             patch.object(lifecycle, "_install_generation_model"),
             patch.object(lifecycle, "resolve_model_dims"),
             patch.object(lifecycle, "_install_runtime_extensions"),
@@ -584,7 +585,7 @@ class TestMetalPoolingCapabilities:
         )
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
         runner._model_lifecycle = lifecycle
-        loaded = LoadedGenerationModel(
+        loaded = LoadedEncoderPoolingModel(
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
             tokenizer=object(),
             model_args={"vocab_size": 16},
@@ -592,7 +593,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with (
-            patch.object(lifecycle, "_load_model", return_value=loaded),
+            patch.object(lifecycle, "_load_encoder_pooling", return_value=loaded),
             patch.object(lifecycle, "resolve_model_dims") as resolve_dims,
             patch.object(lifecycle, "_install_runtime_extensions") as extensions,
         ):
