@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import math
 import os
 import random
@@ -98,6 +99,19 @@ def _sync() -> None:
     mx.eval(mx.array(0))
     if hasattr(mx, "synchronize"):
         mx.synchronize()
+
+
+def _clear_allocator_cache() -> None:
+    """Drop cached allocations between shape rows.
+
+    The benchmark times repeated runs for one shape at a time. Without clearing
+    between rows, a previous long-context shape can leave enough cached memory
+    behind to perturb the next row, making cross-shape sweeps look choppier than
+    isolated per-shape runs.
+    """
+    gc.collect()
+    if hasattr(mx, "clear_cache"):
+        mx.clear_cache()
 
 
 def _make_context(shape: Shape) -> SimpleNamespace:
@@ -398,6 +412,7 @@ def main() -> None:
     for batch_size in args.batches:
         for num_heads in args.heads:
             for ctx_len in args.contexts:
+                _clear_allocator_cache()
                 row = _bench_shape(
                     args,
                     Shape(
