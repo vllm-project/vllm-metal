@@ -14,7 +14,7 @@ from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (
 from vllm_metal.v1.pooling.contract import EncoderPoolingBackend
 from vllm_metal.v1.pooling.validation import PoolingConfigView
 
-EncoderBackendLoadResult = tuple[Any, Any, EncoderPoolingBackend]
+EncoderBackendLoadResult = tuple[Any, Any, dict[str, Any], EncoderPoolingBackend]
 
 
 @dataclass(frozen=True, slots=True)

@@ -193,13 +193,13 @@ class ModelLifecycle:
                 "Metal encoder pooling does not support LoRA yet."
             )
 
-        model, tokenizer, pooling_backend = load_encoder_pooling_backend(
+        model, tokenizer, model_args, pooling_backend = load_encoder_pooling_backend(
             runner.model_config
         )
         return LoadedEncoderPoolingModel(
             model=model,
             tokenizer=tokenizer,
-            model_args=self._config_to_mapping(model.config),
+            model_args=model_args,
             pooling_backend=pooling_backend,
         )
 

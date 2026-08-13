@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -243,7 +243,7 @@ def supports_xlm_roberta_encoder(model_config: Any) -> bool:
 
 def load_xlm_roberta_backend(
     model_config: Any,
-) -> tuple[Any, Any, MetalEncoderPoolingBackend]:
+) -> tuple[Any, Any, dict[str, Any], MetalEncoderPoolingBackend]:
     model_path = Path(model_config.model)
     if not model_path.exists():
         model_path = Path(
@@ -260,7 +260,8 @@ def load_xlm_roberta_backend(
     if not weight_files:
         raise FileNotFoundError(f"No safetensors found in {model_path}.")
 
-    model = XLMRobertaModel(XLMRobertaArgs.from_config(config))
+    args = XLMRobertaArgs.from_config(config)
+    model = XLMRobertaModel(args)
     weights: dict[str, mx.array] = {}
     for weight_file in weight_files:
         weights.update(mx.load(str(weight_file)))
@@ -277,4 +278,4 @@ def load_xlm_roberta_backend(
         model,
         pad_token_id=int(config.get("pad_token_id", 1)),
     )
-    return model, tokenizer, pooling_backend
+    return model, tokenizer, asdict(args), pooling_backend
