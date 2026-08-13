@@ -10,7 +10,9 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
-from mlx.utils import tree_flatten
+from torch.nn.functional import normalize
+from transformers import XLMRobertaConfig as TorchXLMRobertaConfig
+from transformers import XLMRobertaModel as TorchXLMRobertaModel
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
@@ -21,6 +23,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig  # noqa: E402
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
+from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedEncoderPoolingModel,
@@ -35,8 +38,7 @@ from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
     MetalDecoderPoolingBackend,
 )
 from vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta import (  # noqa: E402
-    XLMRobertaArgs,
-    XLMRobertaModel,
+    load_xlm_roberta_backend,
 )
 from vllm_metal.v1.pooling.backends.encoder.runtime import (  # noqa: E402
     MetalEncoderPoolingBackend,
@@ -147,13 +149,18 @@ class _ClassifierTokenizer:
         return [] if token_id is None else [token_id]
 
 
+class _HFConfig(SimpleNamespace):
+    def to_dict(self):
+        return vars(self).copy()
+
+
 def _hf_config(**overrides):
     values = {
         "architectures": ["Qwen3ForCausalLM"],
         "model_type": "qwen3",
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return _HFConfig(**values)
 
 
 def _qwen3_reranker_hf_config(**overrides):
@@ -623,23 +630,97 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
-    def test_xlm_roberta_model_uses_hf_weight_names(self) -> None:
-        model = XLMRobertaModel(
-            XLMRobertaArgs(
-                hidden_size=4,
-                num_hidden_layers=1,
-                intermediate_size=8,
-                num_attention_heads=2,
-                max_position_embeddings=8,
-                vocab_size=16,
-            )
+    def test_xlm_roberta_checkpoint_matches_transformers(
+        self,
+        tmp_path,
+    ) -> None:
+        torch.manual_seed(0)
+        torch_config = TorchXLMRobertaConfig(
+            vocab_size=17,
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            max_position_embeddings=16,
+            type_vocab_size=1,
+            layer_norm_eps=1e-5,
+            pad_token_id=1,
+            hidden_act="gelu",
+            position_embedding_type="absolute",
         )
-        names = {name for name, _ in tree_flatten(model.parameters())}
+        transformers_model = TorchXLMRobertaModel(torch_config).eval()
+        transformers_model.save_pretrained(tmp_path, safe_serialization=True)
 
-        assert "embeddings.word_embeddings.weight" in names
-        assert "encoder.layer.0.attention.self.query.weight" in names
-        assert "encoder.layer.0.intermediate.dense.weight" in names
-        assert "encoder.layer.0.output.dense.weight" in names
+        model_config = _encoder_model_config(
+            model=str(tmp_path),
+            hf_config=torch_config,
+            dtype=torch.float32,
+        )
+
+        with patch(
+            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
+            "AutoTokenizer.from_pretrained",
+            return_value=object(),
+        ):
+            mlx_model, _, model_args, pooling_backend = load_xlm_roberta_backend(
+                model_config
+            )
+
+        input_ids = torch.tensor(
+            [
+                [0, 5, 6, 2, 1],
+                [0, 7, 2, 1, 1],
+            ],
+            dtype=torch.long,
+        )
+        attention_mask = (input_ids != torch_config.pad_token_id).to(torch.long)
+        with torch.no_grad():
+            expected_hidden = transformers_model(
+                input_ids,
+                attention_mask=attention_mask,
+            ).last_hidden_state
+
+        actual_hidden = mlx_model(
+            mx.array(input_ids.numpy(), dtype=mx.int32),
+            mx.array(attention_mask.numpy(), dtype=mx.int32),
+        )
+        actual_hidden_torch = mlx_to_torch(
+            actual_hidden.astype(mx.float32),
+            device="cpu",
+        )
+
+        assert model_args["hidden_size"] == torch_config.hidden_size
+        assert torch.allclose(
+            actual_hidden_torch,
+            expected_hidden,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+        request = _new_req("req-0", [0, 5, 6, 2], task="embed")
+        outputs = pooling_backend.pool_scheduler_output(
+            _scheduler_output(new_reqs=[request]),
+            model_config,
+        )
+        expected_cls = normalize(expected_hidden[0, 0].float(), dim=0)
+
+        assert len(outputs) == 1
+        assert torch.allclose(
+            outputs[0].pooler_output,
+            expected_cls,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_xlm_roberta_loader_rejects_quantization_before_download(self) -> None:
+        model_config = _encoder_model_config(
+            model="missing-xlm-roberta-model",
+            hf_config=TorchXLMRobertaConfig(),
+            quantization="awq",
+        )
+
+        with pytest.raises(NotImplementedError, match="quantization"):
+            load_xlm_roberta_backend(model_config)
 
 
 class TestMetalPoolingRunnerOutput:
