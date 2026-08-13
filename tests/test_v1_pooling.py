@@ -393,7 +393,6 @@ class TestMetalPoolingCapabilities:
         runner._pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
-            pad_token_id=1,
         )
 
         assert runner.supported_worker_tasks() == ("embed",)
@@ -523,7 +522,6 @@ class TestMetalPoolingCapabilities:
         runner._pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
-            pad_token_id=1,
         )
 
         assert runner.scheduler_memory_reporting_mode(
@@ -581,7 +579,6 @@ class TestMetalPoolingCapabilities:
         pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
-            pad_token_id=1,
         )
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
         runner._model_lifecycle = lifecycle
@@ -674,7 +671,6 @@ class TestMetalPoolingRunnerOutput:
         runner._pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
-            pad_token_id=1,
         )
         req_b = _new_req("req-b", [4, 5])
         req_a = _new_req("req-a", [7, 8, 9])
@@ -843,7 +839,6 @@ class TestMetalPoolingFailFast:
         runner._pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
-            pad_token_id=1,
         )
         req = _new_req("req-0", [1, 2, 3], num_computed_tokens=1)
 

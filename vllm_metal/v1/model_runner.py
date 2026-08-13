@@ -761,6 +761,8 @@ class MetalModelRunner:
         growth during serving (issue #234).
         """
         warmup_len = self.scheduler_config.max_num_batched_tokens
+        if self._uses_encoder_pooling_backend():
+            warmup_len = min(warmup_len, self.model_config.max_model_len)
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
@@ -2577,6 +2579,8 @@ class MetalModelRunner:
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if self._uses_encoder_pooling_backend():
+            return self._run_encoder_pooling_batch(scheduler_output)
 
         # Gate the decode pipeline for this step BEFORE any state mutation:
         # an ineligible step must resolve the pending deferred sample first so
@@ -2641,9 +2645,6 @@ class MetalModelRunner:
                 "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
                 "to use structured output."
             )
-
-        if self._uses_encoder_pooling_backend():
-            return self._run_encoder_pooling_batch(scheduler_output)
 
         batch = _ExecutionBatch()
         self._handle_new_requests(

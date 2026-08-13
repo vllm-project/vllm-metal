@@ -276,6 +276,5 @@ def load_xlm_roberta_backend(
     pooling_backend = MetalEncoderPoolingBackend(
         PoolingConfigView(model_config),
         model,
-        pad_token_id=int(config.get("pad_token_id", 1)),
     )
     return model, tokenizer, asdict(args), pooling_backend

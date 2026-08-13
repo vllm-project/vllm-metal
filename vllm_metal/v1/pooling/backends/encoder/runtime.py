@@ -57,11 +57,9 @@ class MetalEncoderPoolingBackend:
         self,
         config: PoolingConfigView,
         forward: Callable[[mx.array, mx.array], mx.array],
-        pad_token_id: int,
     ) -> None:
         self.config = config
         self._forward = forward
-        self._pad_token_id = pad_token_id
 
     def supported_tasks(self) -> tuple[PoolingTask, ...]:
         if self._supports_embed():
@@ -110,14 +108,12 @@ class MetalEncoderPoolingBackend:
         )
 
     def _pool_batch(self, batch: EncoderPoolingBatch) -> tuple[torch.Tensor, ...]:
-        if not batch.requests:
-            return ()
-
-        input_ids, attention_mask = self._padded_inputs(batch)
-        hidden_states = self.forward_padded(input_ids, attention_mask)
         outputs: list[torch.Tensor] = []
-        for row, request in enumerate(batch.requests):
-            outputs.append(self._pool_one(hidden_states, row, len(request.token_ids)))
+        for request in batch.requests:
+            input_ids = mx.array([request.token_ids], dtype=mx.int32)
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+            hidden_states = self.forward_padded(input_ids, attention_mask)
+            outputs.append(self._pool_one(hidden_states, 0, len(request.token_ids)))
         return tuple(outputs)
 
     def _batch_from_scheduler_output(
@@ -174,23 +170,6 @@ class MetalEncoderPoolingBackend:
             and self.config.sequence_pooling_type in _ENCODER_POOLING_TYPES
             and self.config.embed_activation_allowed
             and not self.config.chunked_processing_enabled
-        )
-
-    def _padded_inputs(
-        self,
-        batch: EncoderPoolingBatch,
-    ) -> tuple[mx.array, mx.array]:
-        max_len = max(len(request.token_ids) for request in batch.requests)
-        rows: list[list[int]] = []
-        masks: list[list[int]] = []
-        for request in batch.requests:
-            token_ids = list(request.token_ids)
-            padding = [self._pad_token_id] * (max_len - len(token_ids))
-            rows.append(token_ids + padding)
-            masks.append([1] * len(token_ids) + [0] * len(padding))
-        return (
-            mx.array(rows, dtype=mx.int32),
-            mx.array(masks, dtype=mx.int32),
         )
 
     def _pool_one(
