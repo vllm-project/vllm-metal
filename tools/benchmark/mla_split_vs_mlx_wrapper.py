@@ -129,6 +129,7 @@ def _make_context(shape: Shape) -> SimpleNamespace:
         context_lens=[shape.ctx_len] * shape.batch_size,
         cu_seqlens=list(range(shape.batch_size + 1)),
         offsets=[shape.ctx_len - 1] * shape.batch_size,
+        kernel_metadata_cache={},
     )
 
 
@@ -186,9 +187,9 @@ def _time_modes_paired(
     *,
     wrappers: dict[str, MLAPagedAttentionWrapper],
     caches: dict[str, MLAPagedLatentCache],
+    contexts: dict[str, SimpleNamespace],
     base_cache: mx.array,
     x: mx.array,
-    ctx: SimpleNamespace,
     modes: list[str],
     warmup: int,
     iters: int,
@@ -202,7 +203,7 @@ def _time_modes_paired(
                 cache=caches[mode],
                 base_cache=base_cache,
                 x=x,
-                ctx=ctx,
+                ctx=contexts[mode],
                 mode=mode,
             )
 
@@ -217,7 +218,7 @@ def _time_modes_paired(
                 cache=caches[mode],
                 base_cache=base_cache,
                 x=x,
-                ctx=ctx,
+                ctx=contexts[mode],
                 mode=mode,
             )
             samples[mode].append((time.perf_counter() - t0) * 1e3)
@@ -264,7 +265,11 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         v_head_dim=args.v_head_dim,
         inner=inner,
     )
-    ctx = _make_context(shape)
+    contexts = {
+        "mlx": _make_context(shape),
+        "metal_single": _make_context(shape),
+        "metal_split": _make_context(shape),
+    }
     heads_per_tg = MLAPagedAttentionWrapper._pick_heads_per_tg(
         shape.num_heads, shape.batch_size
     )
@@ -282,7 +287,7 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         cache=mlx_cache,
         base_cache=mlx_base_cache,
         x=x,
-        ctx=ctx,
+        ctx=contexts["mlx"],
         mode="mlx",
     )
     metal_single_out = _run_once(
@@ -290,7 +295,7 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         cache=metal_single_cache,
         base_cache=mlx_base_cache,
         x=x,
-        ctx=ctx,
+        ctx=contexts["metal_single"],
         mode="metal_single",
     )
     metal_split_out = _run_once(
@@ -298,7 +303,7 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         cache=metal_split_cache,
         base_cache=mlx_base_cache,
         x=x,
-        ctx=ctx,
+        ctx=contexts["metal_split"],
         mode="metal_split",
     )
     max_diff_single = float(
@@ -330,9 +335,9 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
             _time_modes_paired(
                 wrappers=wrappers,
                 caches=caches,
+                contexts=contexts,
                 base_cache=mlx_base_cache,
                 x=x,
-                ctx=ctx,
                 modes=modes,
                 warmup=args.warmup,
                 iters=args.iters,
