@@ -453,11 +453,7 @@ class ModelCachePolicy:
             pooling_backend is not None
             and not pooling_backend.capabilities.uses_kv_cache
         ):
-            if (
-                kv_cache_config.num_blocks
-                or kv_cache_config.kv_cache_groups
-                or kv_cache_config.kv_cache_tensors
-            ):
+            if kv_cache_config.kv_cache_groups or kv_cache_config.kv_cache_tensors:
                 raise ValueError(
                     "Metal encoder pooling does not use KV cache, but vLLM "
                     "returned a non-empty KV cache config."

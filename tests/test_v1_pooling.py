@@ -531,7 +531,7 @@ class TestMetalPoolingCapabilities:
         ) == ("pooling_no_kv")
         assert runner.get_kv_cache_spec() == {}
         runner.initialize_kv_cache(
-            KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+            KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
         )
 
     def test_load_model_installs_pooling_backend_after_lora_setup(self) -> None:
