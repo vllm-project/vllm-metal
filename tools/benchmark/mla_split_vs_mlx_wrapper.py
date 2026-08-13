@@ -182,40 +182,47 @@ def _run_once(
         pac.clear_context()
 
 
-def _time_mode(
+def _time_modes_paired(
     *,
-    wrapper: MLAPagedAttentionWrapper,
-    cache: MLAPagedLatentCache,
+    wrappers: dict[str, MLAPagedAttentionWrapper],
+    caches: dict[str, MLAPagedLatentCache],
     base_cache: mx.array,
     x: mx.array,
     ctx: SimpleNamespace,
+    modes: list[str],
     warmup: int,
     iters: int,
-    mode: str,
-) -> float:
+) -> dict[str, float]:
     for _ in range(warmup):
-        _run_once(
-            wrapper=wrapper,
-            cache=cache,
-            base_cache=base_cache,
-            x=x,
-            ctx=ctx,
-            mode=mode,
-        )
+        shuffled = modes[:]
+        random.shuffle(shuffled)
+        for mode in shuffled:
+            _run_once(
+                wrapper=wrappers[mode],
+                cache=caches[mode],
+                base_cache=base_cache,
+                x=x,
+                ctx=ctx,
+                mode=mode,
+            )
 
-    samples = []
+    samples: dict[str, list[float]] = {mode: [] for mode in modes}
     for _ in range(iters):
-        t0 = time.perf_counter()
-        _run_once(
-            wrapper=wrapper,
-            cache=cache,
-            base_cache=base_cache,
-            x=x,
-            ctx=ctx,
-            mode=mode,
-        )
-        samples.append((time.perf_counter() - t0) * 1e3)
-    return statistics.median(samples)
+        shuffled = modes[:]
+        random.shuffle(shuffled)
+        for mode in shuffled:
+            t0 = time.perf_counter()
+            _run_once(
+                wrapper=wrappers[mode],
+                cache=caches[mode],
+                base_cache=base_cache,
+                x=x,
+                ctx=ctx,
+                mode=mode,
+            )
+            samples[mode].append((time.perf_counter() - t0) * 1e3)
+
+    return {mode: statistics.median(samples[mode]) for mode in modes}
 
 
 def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
@@ -305,31 +312,32 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         ).item()
     )
 
+    wrappers = {
+        "mlx": mlx_wrapper,
+        "metal_single": metal_single_wrapper,
+        "metal_split": metal_split_wrapper,
+    }
+    caches = {
+        "mlx": mlx_cache,
+        "metal_single": metal_single_cache,
+        "metal_split": metal_split_cache,
+    }
+    modes = ["mlx", "metal_single", "metal_split"]
+
     trial_pairs = []
     for _ in range(args.trials):
-        modes = ["mlx", "metal_single", "metal_split"]
-        random.shuffle(modes)
-        trial = {}
-        for mode in modes:
-            trial[mode] = _time_mode(
-                wrapper={
-                    "mlx": mlx_wrapper,
-                    "metal_single": metal_single_wrapper,
-                    "metal_split": metal_split_wrapper,
-                }[mode],
-                cache={
-                    "mlx": mlx_cache,
-                    "metal_single": metal_single_cache,
-                    "metal_split": metal_split_cache,
-                }[mode],
+        trial_pairs.append(
+            _time_modes_paired(
+                wrappers=wrappers,
+                caches=caches,
                 base_cache=mlx_base_cache,
                 x=x,
                 ctx=ctx,
+                modes=modes,
                 warmup=args.warmup,
                 iters=args.iters,
-                mode=mode,
             )
-        trial_pairs.append(trial)
+        )
 
     mlx_ms = statistics.median(t["mlx"] for t in trial_pairs)
     metal_single_ms = statistics.median(t["metal_single"] for t in trial_pairs)
@@ -338,9 +346,12 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
     split_vs_mlx = (mlx_ms / metal_split_ms - 1.0) * 100.0
     split_vs_single = (metal_single_ms / metal_split_ms - 1.0) * 100.0
     route = "metal_split" if plan["partition"] else "mlx_fallback"
-    routed_ms = metal_split_ms if plan["partition"] else mlx_ms
-    routed_vs_mlx = split_vs_mlx if plan["partition"] else 0.0
-    routed_max_diff = max_diff_split if plan["partition"] else 0.0
+    # "metal_split" mode enables the opt-in Metal MLA wrapper and lets the
+    # production route decide. If the split planner rejects the shape this
+    # measures the actual MLX fallback path, including the route check.
+    routed_ms = metal_split_ms
+    routed_vs_mlx = split_vs_mlx
+    routed_max_diff = max_diff_split
     return {
         "ctx_len": shape.ctx_len,
         "batch": shape.batch_size,
