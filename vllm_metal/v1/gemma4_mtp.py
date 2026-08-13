@@ -21,6 +21,8 @@ from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig, SpeculativeConfig
+
     from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
@@ -256,7 +258,7 @@ class Gemma4MTPAssistantLoader:
     def load_if_needed(
         self,
         *,
-        speculative_config: Any | None,
+        speculative_config: SpeculativeConfig | None,
         target_model_args: Mapping[str, Any],
     ) -> Gemma4MTPAssistantRuntime | None:
         """Load the Gemma4 MTP assistant configured for this target model."""
@@ -428,39 +430,29 @@ class Gemma4MTPAssistantSource:
     revision: str | None
 
     @classmethod
-    def is_gemma4_mtp(cls, speculative_config: Any | None) -> bool:
-        if (
-            speculative_config is None
-            or getattr(speculative_config, "method", None) != "mtp"
-        ):
+    def is_gemma4_mtp(cls, speculative_config: SpeculativeConfig | None) -> bool:
+        if speculative_config is None or speculative_config.method != "mtp":
             return False
 
-        draft_model_config = getattr(speculative_config, "draft_model_config", None)
+        draft_model_config: ModelConfig | None = speculative_config.draft_model_config
         if draft_model_config is None:
             return False
 
-        hf_config = getattr(draft_model_config, "hf_config", None)
-        return Gemma4MTPAssistantMetadata.is_assistant_config(hf_config)
+        return Gemma4MTPAssistantMetadata.is_assistant_config(
+            draft_model_config.hf_config
+        )
 
     @classmethod
     def from_speculative_config(
         cls,
-        speculative_config: Any,
+        speculative_config: SpeculativeConfig,
     ) -> Gemma4MTPAssistantSource:
-        draft_model_config = getattr(speculative_config, "draft_model_config", None)
-        model_name = getattr(draft_model_config, "model", None) or getattr(
-            speculative_config,
-            "model",
-            None,
-        )
+        draft_model_config: ModelConfig = speculative_config.draft_model_config
+        model_name = draft_model_config.model
         if not model_name:
             raise ValueError("Gemma4 MTP speculative config is missing the draft model")
 
-        revision = getattr(draft_model_config, "revision", None) or getattr(
-            speculative_config,
-            "revision",
-            None,
-        )
+        revision = draft_model_config.revision
         return cls(
             model_name=str(model_name),
             revision=str(revision) if revision else None,

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import psutil
 import torch
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.platforms.interface import Platform, PlatformEnum
 
 import vllm_metal.envs as envs
 from vllm_metal.config import get_config
@@ -130,21 +130,6 @@ class MetalPlatform(Platform):
             return bool(mx.metal.is_available())
         except (ImportError, AttributeError, RuntimeError):
             return False
-
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        """Get device compute capability.
-
-        Returns a fake capability for compatibility with CUDA-centric code.
-
-        Args:
-            device_id: Device index (ignored)
-
-        Returns:
-            DeviceCapability with (major, minor) version
-        """
-        # Return a reasonable value for compatibility
-        return DeviceCapability(major=8, minor=0)
 
     @classmethod
     def get_device_count(cls) -> int:
@@ -1005,21 +990,6 @@ class MetalPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
-
-    @classmethod
-    def verify_quantization(cls, quant: str) -> None:
-        """Verify that quantization method is supported.
-
-        Args:
-            quant: Quantization method name
-
-        Raises:
-            ValueError: If quantization is not supported
-        """
-        # Allow all quantization methods to pass through - actual support
-        # depends on the model implementation. This avoids blocking models
-        # that use quantization formats we may be able to handle.
-        pass
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

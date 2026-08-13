@@ -93,6 +93,7 @@ def _validate_assistant_config(
 def _speculative_config(*, hf_config: object | None = None) -> SimpleNamespace:
     draft_config = SimpleNamespace(
         model="/assistant",
+        revision=None,
         hf_config=hf_config or SimpleNamespace(model_type="gemma4_mtp"),
     )
     return SimpleNamespace(
@@ -755,9 +756,9 @@ def test_loader_passes_revision_and_keeps_cache_keys_separate() -> None:
         model_path_resolver=lambda model_name: model_name,
     )
     spec_a = _speculative_config()
-    spec_a.revision = "rev-a"
+    spec_a.draft_model_config.revision = "rev-a"
     spec_b = _speculative_config()
-    spec_b.revision = "rev-b"
+    spec_b.draft_model_config.revision = "rev-b"
 
     first = loader.load_if_needed(
         speculative_config=spec_a,
@@ -776,28 +777,6 @@ def test_loader_passes_revision_and_keeps_cache_keys_separate() -> None:
     assert first is not third
     assert load_model_calls == 2
     assert download_calls == [("/assistant", "rev-a"), ("/assistant", "rev-b")]
-
-
-def test_loader_prefers_resolved_draft_model_revision() -> None:
-    download_calls: list[tuple[str, str | None]] = []
-
-    loader = Gemma4MTPAssistantLoader(
-        load_model_fn=lambda *args, **kwargs: (object(), _assistant_config()),
-        download_fn=lambda model_name, revision: (
-            download_calls.append((model_name, revision)) or Path(model_name)
-        ),
-        model_path_resolver=lambda model_name: model_name,
-    )
-    spec = _speculative_config()
-    spec.revision = "outer-rev"
-    spec.draft_model_config.revision = "draft-rev"
-
-    loader.load_if_needed(
-        speculative_config=spec,
-        target_model_args=_target_args(),
-    )
-
-    assert download_calls == [("/assistant", "draft-rev")]
 
 
 def test_model_args_preserve_text_config_vocab_size() -> None:

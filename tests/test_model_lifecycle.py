@@ -585,6 +585,7 @@ class TestModelLifecycle:
             method="mtp",
             draft_model_config=SimpleNamespace(
                 model="assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )
@@ -621,6 +622,7 @@ class TestModelLifecycle:
             method="mtp",
             draft_model_config=SimpleNamespace(
                 model="assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )
@@ -663,6 +665,7 @@ class TestModelLifecycle:
             revision=None,
             draft_model_config=SimpleNamespace(
                 model="/assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )

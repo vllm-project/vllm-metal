@@ -828,12 +828,6 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    def test_device_capability(self) -> None:
-        """Test device capability."""
-        major, minor = MetalPlatform.get_device_capability()
-        assert isinstance(major, int)
-        assert isinstance(minor, int)
-
     def test_get_attn_backend_cls_returns_cpu_backend(self) -> None:
         """Metal platform should return a concrete backend path."""
         cfg = AttentionSelectorConfig(

@@ -12,6 +12,8 @@ Handles models whose attention module exposes:
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
 - Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
+- Optionally ``g_proj`` (+ ``gating=True``) for Laguna-style per-head
+  softplus attention-output gating (see :func:`apply_g_proj_gate`)
 
 Gemma4 variants (see :func:`prepare_sdpa_qkv`):
 - **YOCO**: later layers reuse K/V from a reference layer via ``shared_kv``.
@@ -20,7 +22,7 @@ Gemma4 variants (see :func:`prepare_sdpa_qkv`):
   head_dim; Q/K/V are zero-padded up to the cache's allocated head_dim
   via :func:`pad_qkv_to_cache_head_dim`.
 
-Covers: Qwen3, Qwen3.5, Llama, Mistral, Gemma, Gemma4, and other
+Covers: Qwen3, Qwen3.5, Llama, Mistral, Gemma, Gemma4, Laguna, and other
 RoPE-based transformer architectures.
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
@@ -733,4 +735,39 @@ def sdpa_forward(
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
     if gate is not None:
         out = out * mx.sigmoid(gate)
+    out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
     return inner.o_proj(out), kv_for_sharing
+
+
+def apply_g_proj_gate(
+    inner: nn.Module,
+    out: mx.array,
+    x: mx.array,
+    n_heads: int,
+    head_dim: int,
+) -> mx.array:
+    """Apply Laguna-style per-head attention-output gating.
+
+    Laguna projects the layer input ``x`` through a dedicated ``g_proj``
+    linear to a per-head scalar, passes it through ``softplus`` (in
+    float32 for numerical stability) and multiplies the attention output
+    of each head by its gate value before ``o_proj`` — matching
+    ``mlx_lm.models.laguna.Attention``::
+
+        gate = softplus(g_proj(x))                # (B, L, n_heads)
+        out  = (out.reshape(B, L, H, hd) * gate[..., None])
+
+    This is distinct from the Qwen3.5/Qwen3Next gate (a split of the
+    ``q_proj`` output combined via ``sigmoid``), which is handled
+    separately in :func:`prepare_sdpa_qkv` / :func:`sdpa_forward`.
+
+    No-op for modules without a ``g_proj`` (or with gating disabled), so
+    every other SDPA model is unaffected.
+    """
+    if not getattr(inner, "gating", False) or not hasattr(inner, "g_proj"):
+        return out
+    B, L, _ = out.shape  # noqa: N806
+    gate = nn.softplus(inner.g_proj(x).astype(mx.float32)).astype(out.dtype)
+    out = out.reshape(B, L, n_heads, head_dim)
+    out = (out * gate[..., None]).reshape(B, L, -1)
+    return out

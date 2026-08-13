@@ -34,7 +34,10 @@ dependencies = [
     # a wheel built against one MLX is only ABI-safe against that exact MLX.
     # Rebuild and re-release the wheel on every MLX bump.
     "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    "mlx-lm>=0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Git SHA (2026-08-05), not a version: architectures merged after the
+    # 0.31.3 release (2026-04-22) never reach PyPI. main still self-reports
+    # "0.31.3", so this looks like a no-op upgrade -- it is not.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@254d153fdeb6f150edd4fc5a54f9828638481fa8 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
     # Temporary cap: xgrammar's prebuilt wheels are compiled against a specific
     # apache-tvm-ffi C++ ABI but declare only `apache-tvm-ffi>=0.1.9`, so a
@@ -46,7 +49,7 @@ dependencies = [
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
-    # Keep aligned with vLLM 0.26.0's Transformers lower bound.
+    # Keep aligned with vLLM 0.27.1's Transformers lower bound.
     # Temporary cap: transformers 5.13.0 (released 2026-07-03) breaks MLX Metal
     # availability inside the vLLM process on GitHub's macOS runner VMs, so
     # platform resolution falls back to CPU. Verified A/B on the same runner:
@@ -60,7 +63,7 @@ dependencies = [
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
-    # Keep aligned with vLLM 0.26.0's FastAPI/Starlette bounds. vLLM caps fastapi
+    # Keep aligned with vLLM 0.27.1's FastAPI/Starlette bounds. vLLM caps fastapi
     # itself (requirements/common.txt): 0.133.0 is the first release supporting
     # Starlette 1.0, and <0.137.0 avoids the FastAPI 0.137 route-tree change that
     # breaks its handler overrides. The earlier prometheus crash (vllm#45597) is

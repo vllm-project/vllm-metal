@@ -8,9 +8,8 @@ that walk the model_runner's ``start_pos > 0`` path because the upstream
 scheduler reports ``num_computed_tokens > 0``.
 
 Three assertions (in code order):
-  0. Spy reach — the ``prepare_grouped`` patch actually fired.  Without
-     this the two checks below fail on an empty sample and read as a
-     prefix-cache bug when the harness is what broke.
+  0. Spy reach — the ``model_runner.prepare_grouped`` patch fired during
+     priming.
   1. Cache-hit reach — at least one prefill in the second pass is issued
      with ``start_pos > 0``.  Verified by spying on ``prepare_grouped``
      (which receives per-prefill ``start_pos`` tuples).  Fails fast if
@@ -74,10 +73,10 @@ def _run_prefix_cache_correctness() -> None:
 
     from vllm import LLM, SamplingParams
 
-    from vllm_metal.attention import context as pac
+    from vllm_metal.v1 import model_runner
 
     seen_start_pos: list[int] = []
-    orig_prepare = pac.prepare_grouped
+    orig_prepare = model_runner.prepare_grouped
 
     # Only the leading two arguments are this spy's contract; the rest pass
     # straight through, so adding a parameter to prepare_grouped cannot
@@ -88,7 +87,7 @@ def _run_prefix_cache_correctness() -> None:
             seen_start_pos.append(start_pos)
         return orig_prepare(decode_requests, prefill_requests, *args, **kwargs)
 
-    pac.prepare_grouped = patched_prepare
+    model_runner.prepare_grouped = patched_prepare
 
     try:
         llm = LLM(
@@ -99,20 +98,12 @@ def _run_prefix_cache_correctness() -> None:
         )
         sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
         out_first = llm.generate(PROMPTS, sp)
+        if not seen_start_pos:
+            raise AssertionError("model_runner.prepare_grouped spy missed priming pass")
         prime_count = len(seen_start_pos)
         out_second = llm.generate(PROMPTS, sp)
     finally:
-        pac.prepare_grouped = orig_prepare
-
-    # Tell a broken spy apart from a broken cache: if the runner stops
-    # routing prefills through prepare_grouped, every start_pos assertion
-    # below fails for a reason unrelated to prefix caching.
-    if not seen_start_pos:
-        raise AssertionError(
-            "prepare_grouped spy never fired, so this test observed nothing. "
-            "The runner no longer routes prefills through it, or it was "
-            "imported before the patch was installed."
-        )
+        model_runner.prepare_grouped = orig_prepare
 
     # Cache-hit reach: at least one prefill in the second pass must
     # advance past the cached prefix.
