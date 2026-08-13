@@ -323,6 +323,7 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
     single_vs_mlx = (mlx_ms / metal_single_ms - 1.0) * 100.0
     split_vs_mlx = (mlx_ms / metal_split_ms - 1.0) * 100.0
     split_vs_single = (metal_single_ms / metal_split_ms - 1.0) * 100.0
+    route = "metal_split" if plan["partition"] else "mlx_fallback"
     return {
         "ctx_len": shape.ctx_len,
         "batch": shape.batch_size,
@@ -334,8 +335,11 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         "partition_size": plan["partition_size"],
         "partitions": plan["max_num_partitions"],
         "mlx_ms": mlx_ms,
+        "route": route,
+        "routed_ms": metal_split_ms,
         "metal_single_ms": metal_single_ms,
         "metal_split_ms": metal_split_ms,
+        "routed_vs_mlx_pct": split_vs_mlx,
         "single_vs_mlx_pct": single_vs_mlx,
         "split_vs_mlx_pct": split_vs_mlx,
         "split_vs_single_pct": split_vs_single,
@@ -346,19 +350,17 @@ def _bench_shape(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
 
 def _print_markdown(rows: list[dict[str, object]]) -> None:
     print(
-        "\n| ctx | B | H | dtype | split | parts | MLX ms | "
-        "single ms | split ms | split vs MLX | split vs single | max diff |"
+        "\n| ctx | B | H | dtype | route | parts | MLX ms | "
+        "routed ms | routed vs MLX | max diff |"
     )
-    print("|---:|---:|---:|:---|:---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("|---:|---:|---:|:---|:---|---:|---:|---:|---:|---:|")
     for row in rows:
         print(
             f"| {row['ctx_len']} | {row['batch']} | {row['heads']} | "
-            f"{row['dtype']} | {row['split']} | {row['partitions']} | "
+            f"{row['dtype']} | {row['route']} | {row['partitions']} | "
             f"{float(row['mlx_ms']):.3f} | "
-            f"{float(row['metal_single_ms']):.3f} | "
-            f"{float(row['metal_split_ms']):.3f} | "
-            f"{float(row['split_vs_mlx_pct']):+.1f}% | "
-            f"{float(row['split_vs_single_pct']):+.1f}% | "
+            f"{float(row['routed_ms']):.3f} | "
+            f"{float(row['routed_vs_mlx_pct']):+.1f}% | "
             f"{float(row['max_abs_diff_split']):.5f} |"
         )
 
@@ -406,10 +408,9 @@ def main() -> None:
                 print(
                     f"ctx={ctx_len} B={batch_size} H={num_heads}: "
                     f"MLX {float(row['mlx_ms']):.3f} ms, "
-                    f"single {float(row['metal_single_ms']):.3f} ms, "
-                    f"split {float(row['metal_split_ms']):.3f} ms, "
-                    f"split-vs-MLX {float(row['split_vs_mlx_pct']):+.1f}%, "
-                    f"split-vs-single {float(row['split_vs_single_pct']):+.1f}%"
+                    f"{row['route']} {float(row['routed_ms']):.3f} ms, "
+                    f"routed-vs-MLX "
+                    f"{float(row['routed_vs_mlx_pct']):+.1f}%"
                 )
 
     _print_markdown(rows)
