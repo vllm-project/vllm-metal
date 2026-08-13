@@ -1160,20 +1160,66 @@ constexpr int kMlaMinSplitContext = 32768;
 constexpr int kMlaSmallPartitionSize = 8192;
 constexpr int kMlaLargePartitionSize = 32768;
 constexpr int kMlaMaxNumPartitions = 8;
+constexpr int kMlaMaxSinglePassGrid = 32;
+constexpr int kMlaMergeCostTokens = 700;
 
-static int mla_partition_size_for_context(int max_seq_len) {
-  if (max_seq_len < kMlaMinSplitContext) return 0;
+static int ceil_div_int(int x, int y) {
+  return (x + y - 1) / y;
+}
 
-  // Use the smallest compiled chunk while it keeps the reduce fan-in small.
-  // This gives low-concurrency 32K/49K decode more independent context reads,
-  // then switches to larger chunks once 8K chunks would create too many 512-wide
-  // partial MLA outputs for the reduce pass.
-  const int small_parts =
-      (max_seq_len + kMlaSmallPartitionSize - 1) / kMlaSmallPartitionSize;
-  if (small_parts <= 6) {
-    return kMlaSmallPartitionSize;
+static double mla_estimated_work(
+    int gate_grid,
+    int max_seq_len,
+    int partition_size,
+    int target_grid) {
+  if (partition_size == 0) {
+    const int active_grid = std::max(1, std::min(gate_grid, target_grid));
+    return static_cast<double>(max_seq_len) * gate_grid / active_grid;
   }
-  return kMlaLargePartitionSize;
+
+  const int num_partitions = ceil_div_int(max_seq_len, partition_size);
+  const int split_grid = gate_grid * num_partitions;
+  const int active_grid = std::max(1, std::min(split_grid, target_grid));
+  const double scan_work =
+      static_cast<double>(max_seq_len) * gate_grid / active_grid;
+
+  // The reduce pass is the part split MLA has to pay back: every extra
+  // partition writes a 512-wide latent partial, then the reduce reads and
+  // combines those partials. Treat that as context-token-equivalent work and
+  // make it grow with fan-in, so the planner prefers a few useful chunks over
+  // many tiny chunks with heavy scratch traffic.
+  const int extra_partitions = num_partitions - 1;
+  const double merge_work = static_cast<double>(
+      extra_partitions * extra_partitions * kMlaMergeCostTokens);
+  return scan_work + merge_work;
+}
+
+static int mla_partition_size_for_shape(
+    int gate_grid,
+    int max_seq_len,
+    int target_grid) {
+  int best_partition_size = 0;
+  double best_work = mla_estimated_work(
+      gate_grid, max_seq_len, /*partition_size=*/0, target_grid);
+
+  const int candidate_partition_sizes[] = {
+      kMlaSmallPartitionSize,
+      kMlaLargePartitionSize,
+  };
+  for (int partition_size : candidate_partition_sizes) {
+    const int num_partitions = ceil_div_int(max_seq_len, partition_size);
+    if (num_partitions < 2 || num_partitions > kMlaMaxNumPartitions) {
+      continue;
+    }
+    const double work =
+        mla_estimated_work(gate_grid, max_seq_len, partition_size, target_grid);
+    if (work < best_work) {
+      best_work = work;
+      best_partition_size = partition_size;
+    }
+  }
+
+  return best_partition_size;
 }
 
 static MlaSplitPlan mla_split_plan_for_shape(
@@ -1182,27 +1228,20 @@ static MlaSplitPlan mla_split_plan_for_shape(
     int num_heads,
     int heads_per_tg,
     int max_seq_len) {
-  const int partition_size = mla_partition_size_for_context(max_seq_len);
-  const int max_num_partitions =
-      partition_size > 0 ? (max_seq_len + partition_size - 1) / partition_size
-                         : 1;
   const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
-
-  // MLA split-KV helps when one decode step has too little work to keep the GPU
-  // busy, but its 512-wide partial output makes oversplitting expensive. Scale
-  // the gate with GPU width: small laptop GPUs need fewer base threadgroups
-  // before single-pass decode is already busy, while Ultra/Max-class GPUs can
-  // still benefit from splitting at larger head grids. The 32 cap keeps the
-  // path out of ordinary higher-concurrency decode.
-  constexpr int kMlaMaxSinglePassGrid = 32;
-  const int split_grid_limit =
+  const int target_grid =
       std::min(kMlaMaxSinglePassGrid, std::max(8, gpu_core_count() / 2));
   const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
   const bool split_enabled =
       split_env == nullptr || std::string(split_env) != "0";
   const bool pure_decode = total_q_tokens == num_seqs;
+  const int partition_size =
+      split_enabled && pure_decode && max_seq_len >= kMlaMinSplitContext
+      ? mla_partition_size_for_shape(gate_grid, max_seq_len, target_grid)
+      : 0;
+  const int max_num_partitions =
+      partition_size > 0 ? ceil_div_int(max_seq_len, partition_size) : 1;
   const bool partition =
-      split_enabled && pure_decode && gate_grid < split_grid_limit &&
       partition_size > 0 && max_num_partitions >= 2 &&
       max_num_partitions <= kMlaMaxNumPartitions;
 
