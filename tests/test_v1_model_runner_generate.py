@@ -2868,6 +2868,7 @@ class TestIntermediateBodyOnlyForward:
         assert state is not None
         assert state.logits is None
         assert state.target_hidden_states is None
+        assert state.intermediate_only is True
         assert state.cu_seqlens == [0, 2]
 
     @pytest.mark.parametrize("case", ["final_prefill", "with_decode", "drafter"])
@@ -2978,8 +2979,12 @@ class TestIntermediateBodyOnlyForward:
                 scheduler_output=self._make_scheduler_output(),
             )
 
-        # Assert
+        # Assert — the full forward ran, the step is still marked
+        # intermediate-only (sampling skipped downstream), and no warning.
         assert captured["full_forward_tokens"] == [[5, 6]]
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.intermediate_only is True
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
     def test_load_model_resolves_capability_once_from_the_adapter(self) -> None:
@@ -3046,24 +3051,26 @@ class TestIntermediateBodyOnlyForward:
         assert state is not None
         assert state.target_hidden_states is not None
 
-    def _no_logits_state(
+    def _intermediate_only_state(
         self,
         batch: mr._ExecutionBatch,
         prefill_reqs: list[mr.PrefillRequest],
         decode_reqs: list[tuple[str, mr.RequestState]],
+        logits: mx.array | None = None,
     ) -> mr._PagedForwardState:
         return mr._PagedForwardState(
             batch=batch,
             prefill_reqs=prefill_reqs,
             decode_reqs=decode_reqs,
             scheduler_output=self._make_scheduler_output(),
-            logits=None,
+            logits=logits,
             target_hidden_states=None,
             pooling_hidden_states=None,
             cu_seqlens=[0, 2],
-            decode_segments=[],
+            decode_segments=(),
             num_decode_tokens=len(decode_reqs),
             mm_prefill_deltas={},
+            intermediate_only=True,
         )
 
     def test_sample_paged_batch_books_seq_lens_without_logits(self) -> None:
@@ -3082,7 +3089,9 @@ class TestIntermediateBodyOnlyForward:
             )
         )
         runner._paged_request_seq_lens = {"r0": 3}
-        runner._execute_model_state = self._no_logits_state(batch, [request], [])
+        runner._execute_model_state = self._intermediate_only_state(
+            batch, [request], []
+        )
 
         # Act
         result_batch, _ = runner._sample_paged_batch()
@@ -3090,6 +3099,55 @@ class TestIntermediateBodyOnlyForward:
         # Assert
         assert result_batch.sampled_tokens == [[]]
         assert runner._paged_request_seq_lens["r0"] == 5
+
+    def test_intermediate_only_skips_sampling_even_with_logits(
+        self, monkeypatch
+    ) -> None:
+        # An unsupported adapter ran the full forward, so logits exist —
+        # sampling must still be skipped so a seeded request's RNG never
+        # advances on a discarded token.
+        # Arrange
+        runner = make_stub_runner(model=SimpleNamespace())
+        generator = torch.Generator()
+        generator.manual_seed(7)
+        generator_state_before = generator.get_state()
+        request = mr.PrefillRequest(
+            req_id="r0",
+            token_ids=[5, 6],
+            sampling_params=SamplingParams(temperature=0.8, seed=7),
+            block_ids=[[0]],
+            generator=generator,
+            prompt_len=None,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        batch = mr._ExecutionBatch()
+        output_idx = batch.add_output("r0", [])
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(
+                output_idx=output_idx,
+                prefill=request,
+                result_mode="intermediate",
+            )
+        )
+        runner._paged_request_seq_lens = {"r0": 0}
+        runner._execute_model_state = self._intermediate_only_state(
+            batch, [request], [], logits=mx.zeros((1, 2, 16))
+        )
+
+        def unexpected_sample(*args, **kwargs):
+            raise AssertionError("intermediate-only step must not sample")
+
+        monkeypatch.setattr(mr, "sample_prefill_tokens", unexpected_sample)
+        monkeypatch.setattr(mr, "sample_decode_tokens", unexpected_sample)
+
+        # Act
+        result_batch, _ = runner._sample_paged_batch()
+
+        # Assert
+        assert result_batch.sampled_tokens == [[]]
+        assert runner._paged_request_seq_lens["r0"] == 2
+        assert torch.equal(generator.get_state(), generator_state_before)
 
     def test_sample_paged_batch_rejects_final_rows_without_logits(self) -> None:
         # Arrange — a final chunk must sample; reaching the no-logits path
@@ -3105,7 +3163,9 @@ class TestIntermediateBodyOnlyForward:
                 result_mode="new_final",
             )
         )
-        runner._execute_model_state = self._no_logits_state(batch, [request], [])
+        runner._execute_model_state = self._intermediate_only_state(
+            batch, [request], []
+        )
 
         # Act / Assert
         with pytest.raises(RuntimeError, match="must sample"):
@@ -3122,7 +3182,7 @@ class TestIntermediateBodyOnlyForward:
             generator=None,
             generated_tokens=1,
         )
-        runner._execute_model_state = self._no_logits_state(
+        runner._execute_model_state = self._intermediate_only_state(
             mr._ExecutionBatch(), [], [("d0", state)]
         )
 

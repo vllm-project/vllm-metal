@@ -274,6 +274,11 @@ class _PagedForwardState(NamedTuple):
     # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
     pooling_hidden_states: mx.array | None = None
+    # Every prefill row is an intermediate chunk and no decode rows exist:
+    # the step samples nothing, regardless of whether the projection-free
+    # forward was available (skip-sampling is decoupled from skip-projection
+    # so unsupported models cannot advance seeded RNG on a discarded token).
+    intermediate_only: bool = False
 
 
 class MetalModelRunner:
@@ -1145,6 +1150,7 @@ class MetalModelRunner:
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         intermediate_hidden: mx.array | None = None
+        intermediate_only = False
         mm_prefill_deltas: dict[str, int] = {}
         # Lazy send op for the non-last pipeline stage (None otherwise).
         pp_send_handle: mx.array | None = None
@@ -1320,6 +1326,7 @@ class MetalModelRunner:
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
             mm_prefill_deltas=mm_prefill_deltas,
+            intermediate_only=intermediate_only,
         )
 
     def _evaluate_pipeline_gate(
@@ -1436,17 +1443,18 @@ class MetalModelRunner:
             )
             return batch, scheduler_output
 
-        if logits is None:
-            # Intermediate-only prefill step (body-only forward): nothing to
-            # sample and nothing to wait for — outputs were pre-filled empty,
-            # and the forward evaluates under the next step's backpressure.
+        if paged_state.intermediate_only:
+            # Intermediate-only prefill step: nothing to sample — outputs were
+            # pre-filled empty, and skipping the sample applies even when the
+            # full forward ran (unsupported adapter), so seeded RNG never
+            # advances on a discarded token.
             if decode_reqs or any(
                 entry.result_mode != "intermediate"
                 for entry in batch.paged_prefill_entries
             ):
                 raise RuntimeError(
-                    "Forward produced no logits but the batch has rows that "
-                    "must sample — intermediate-only routing desynced."
+                    "Intermediate-only step has rows that must sample — "
+                    "routing desynced."
                 )
             for pr in prefill_reqs:
                 self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
