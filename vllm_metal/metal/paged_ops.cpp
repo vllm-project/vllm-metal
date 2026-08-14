@@ -1233,7 +1233,7 @@ static MlaSplitPlan mla_split_plan_for_shape(
       std::min(kMlaMaxSinglePassGrid, std::max(8, gpu_core_count() / 2));
   const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
   const bool split_enabled =
-      split_env == nullptr || std::string(split_env) != "0";
+      split_env != nullptr && std::string(split_env) == "1";
   const bool pure_decode = total_q_tokens == num_seqs;
   const int partition_size =
       split_enabled && pure_decode && max_seq_len >= kMlaMinSplitContext

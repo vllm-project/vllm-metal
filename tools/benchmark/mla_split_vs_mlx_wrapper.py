@@ -170,6 +170,8 @@ def _run_once(
     envs.VLLM_METAL_MLA_KERNEL = mode != "mlx"
     if mode == "metal_single":
         os.environ["VLLM_METAL_MLA_SPLIT_KV"] = "0"
+    elif mode == "metal_split":
+        os.environ["VLLM_METAL_MLA_SPLIT_KV"] = "1"
     else:
         os.environ.pop("VLLM_METAL_MLA_SPLIT_KV", None)
     cache.latent_caches[0] = base_cache

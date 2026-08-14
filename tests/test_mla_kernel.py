@@ -167,7 +167,7 @@ def _assert_selected_split_plan(
     }
 
 
-def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_decode_split_kv_must_be_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     kwargs = dict(
         total_q_tokens=1,
         num_seqs=1,
@@ -176,6 +176,12 @@ def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
         max_seq_len=32768,
     )
     monkeypatch.delenv("VLLM_METAL_MLA_SPLIT_KV", raising=False)
+    plan = metal_mla_split_plan(**kwargs)
+    assert plan["partition"] is False
+    assert plan["partition_size"] == 0
+    assert plan["max_num_partitions"] == 1
+
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
     assert metal_mla_split_plan(**kwargs)["partition"] is True
 
     monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "0")
@@ -185,7 +191,10 @@ def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
     assert plan["max_num_partitions"] == 1
 
 
-def test_decode_split_kv_skips_wide_decode_grid() -> None:
+def test_decode_split_kv_skips_wide_decode_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
     gate_grid = int(get_ops().min_decode_grid()) + 1
     plan = metal_mla_split_plan(
         total_q_tokens=1,
@@ -564,6 +573,7 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
     ],
 )
 def test_decode_split_kv_long_context_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
     ctx_lens: list[int],
     block_size: int,
     dtype: mx.Dtype,
@@ -573,6 +583,7 @@ def test_decode_split_kv_long_context_matches_reference(
     expected_num_partitions: int,
 ) -> None:
     """Exercise the MLA split-KV path, including multi-partition reduce."""
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
     _assert_selected_split_plan(
         ctx_lens=ctx_lens,
         num_heads=num_heads,

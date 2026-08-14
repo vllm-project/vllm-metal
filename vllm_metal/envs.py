@@ -71,8 +71,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
     # through the Metal path when the workload matches the instantiated
     # specialization (kv_lora_rank=512, qk_rope_head_dim=64,
-    # block_size ∈ {16, 32}, fp16/bf16, decode-only). The dispatcher
-    # selects one-pass or long-context split/reduce internally.
+    # block_size ∈ {16, 32}, fp16/bf16, decode-only). Long-context
+    # split/reduce is a separate experimental subpath gated by
+    # VLLM_METAL_MLA_SPLIT_KV.
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)

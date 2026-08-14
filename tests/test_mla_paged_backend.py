@@ -359,7 +359,10 @@ class TestMLAPagedAttentionWrapperPagedPath:
         assert meta1.context_lens.dtype == mx.uint32
         assert meta1.cu_seqlens_q.dtype == mx.int32
 
-    def test_split_route_cached_on_context(self) -> None:
+    def test_split_route_cached_on_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
         ctx = pac.PagedAttentionContext(
             slot_mapping=[32767],
             block_tables=[list(range(2048))],
@@ -696,6 +699,7 @@ class TestSplitKernelRouting:
 
     def test_env_on_accepts(self, monkeypatch) -> None:
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
         wrapper = _make_kernel_dims_wrapper(block_size=16)
         assert (
             wrapper._can_use_kernel(
