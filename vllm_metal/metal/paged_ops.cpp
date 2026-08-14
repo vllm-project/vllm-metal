@@ -1260,7 +1260,6 @@ static void dispatch_mla_paged_attention(
     int block_size,
     float scale,
     int heads_per_tg,
-    const array* unembed_weight,
     Stream s) {
   auto& d = metal::device(s.device);
 
@@ -1270,10 +1269,6 @@ static void dispatch_mla_paged_attention(
   int qk_rope_head_dim = static_cast<int>(q_pe.shape(2));
   int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
-  const bool project_output = unembed_weight != nullptr;
-  const int output_dim =
-      project_output ? static_cast<int>(unembed_weight->shape(1)) : kv_lora_rank;
-  const Dtype output_dtype = project_output ? float32 : q_nope.dtype();
 
   // Shape sanity — these must match what the kernel template was instantiated for.
   if (kv_lora_rank != 512) {
@@ -1307,29 +1302,10 @@ static void dispatch_mla_paged_attention(
       {"q_nope", &q_nope},
       {"q_pe", &q_pe},
       {"latent_cache", &latent_cache},
+      {"out", &out},
   });
-  if (!project_output && out.dtype() != q_nope.dtype()) {
-    throw std::runtime_error("MLA kernel: out dtype must match q_nope dtype");
-  }
-  if (project_output) {
-    if (out.dtype() != float32) {
-      throw std::runtime_error("MLA projected kernel: out dtype must be float32");
-    }
-    mla_validate_t_dtypes("MLA projected kernel", {
-        {"q_nope", &q_nope},
-        {"unembed_weight", unembed_weight},
-    });
-    if (static_cast<int>(unembed_weight->shape(0)) != num_heads ||
-        output_dim != 128 ||
-        static_cast<int>(unembed_weight->shape(2)) != kv_lora_rank) {
-      throw std::runtime_error(
-          "MLA projected kernel: unembed_weight must be "
-          "[num_heads, 128, kv_lora_rank]");
-    }
-  }
 
   auto dt = dtype_to_metal(q_nope.dtype());
-  auto out_dt = dtype_to_metal(output_dtype);
   const int max_seq_len = max_num_blocks_per_seq * block_size;
   const MlaSplitPlan split_plan = mla_split_plan_for_shape(
       total_q_tokens, num_seqs, num_heads, heads_per_tg, max_seq_len);
@@ -1337,33 +1313,27 @@ static void dispatch_mla_paged_attention(
   const int mla_partition_size = split_plan.partition_size;
   const int max_num_partitions = split_plan.max_num_partitions;
 
-  std::string kname =
-      std::string(project_output ? "paged_mla_attention_unembed_"
-                                 : "paged_mla_attention_") +
-      dt + "_kvr" + std::to_string(kv_lora_rank) + "_pe" +
-      std::to_string(qk_rope_head_dim) +
-      (project_output ? "_vd" + std::to_string(output_dim) : "") +
-      "_bs" + std::to_string(block_size) + "_g" +
-      std::to_string(heads_per_tg) + "_nt" + std::to_string(num_threads) +
-      "_nsl32_ps" + std::to_string(partition ? mla_partition_size : 0);
+  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
+                      std::to_string(kv_lora_rank) + "_pe" +
+                      std::to_string(qk_rope_head_dim) + "_bs" +
+                      std::to_string(block_size) + "_g" +
+                      std::to_string(heads_per_tg) + "_nt" +
+                      std::to_string(num_threads) + "_nsl32_ps" +
+                      std::to_string(partition ? mla_partition_size : 0);
 
   bool use_partitioning = partition;
-  bool use_project_output = project_output;
 
-  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0") +
-                          "_proj" + (use_project_output ? "1" : "0");
+  std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
 
   auto* lib = d.get_library("paged_mla_kern");
   auto* kernel = d.get_kernel(
       kname,
       lib,
       hash_name,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
-       {&use_project_output, MTL::DataType::DataTypeBool, NS::UInteger(11)}});
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
 
   // Threadgroup memory:
   //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]
-  //   + optional latent_out[KV_LORA_RANK] before projected writes.
   // The outputs buffer must be sized for the maximum write offset
   // `lane*BD + sg`, which reaches (BD-1)*BD + (BN-1). Using BD*BD always
   // (rather than BN*BD) gives enough room across all G; on G=1 (BN=BD=32)
@@ -1372,10 +1342,8 @@ static void dispatch_mla_paged_attention(
   // For G=2, NT=512:  2*2*16 + 32*32 = 1088 fp32 ≈ 4.3 KB.
   const int BD = 32;
   const int BN = num_threads / BD;
-  size_t shmem = static_cast<size_t>(
-      (2 * heads_per_tg * BN + BD * BD +
-       (project_output ? kv_lora_rank : 0)) *
-      sizeof(float));
+  size_t shmem =
+      static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
 
   auto& enc = metal::get_command_encoder(s);
 
@@ -1396,9 +1364,6 @@ static void dispatch_mla_paged_attention(
     enc.set_bytes(num_seqs_i, 9);
     enc.set_bytes(max_blocks_i, 10);
     enc.set_bytes(scale, 11);
-    if (project_output) {
-      enc.set_input_array(*unembed_weight, 13);
-    }
 
     // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
     // query heads sharing the same latent KV.
@@ -1415,8 +1380,8 @@ static void dispatch_mla_paged_attention(
     return a;
   };
   array tmp_out = make_temp(
-      Shape{total_q_tokens, num_heads, max_num_partitions - 1, output_dim},
-      output_dtype);
+      Shape{total_q_tokens, num_heads, max_num_partitions - 1, kv_lora_rank},
+      q_nope.dtype());
   array lse =
       make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
 
@@ -1440,9 +1405,6 @@ static void dispatch_mla_paged_attention(
   enc.set_bytes(max_blocks_i, 10);
   enc.set_bytes(scale, 11);
   enc.set_output_array(out, 12);
-  if (project_output) {
-    enc.set_input_array(*unembed_weight, 13);
-  }
 
   // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Each TG owns G
   // consecutive query heads sharing one partition of the latent KV.
@@ -1454,8 +1416,8 @@ static void dispatch_mla_paged_attention(
   // Pass 2: merge per-partition partials with the online-softmax reduce.
   constexpr int REDUCE_NUM_THREADS = 256;
   constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
-  std::string reduce_kname = "paged_mla_attention_reduce_" + out_dt + "_hs" +
-                             std::to_string(output_dim) + "_nt256_nsl32_ps" +
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
                              std::to_string(mla_partition_size);
   auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
 
@@ -1500,7 +1462,7 @@ class MlaPagedAttentionPrimitive : public UnaryPrimitive {
         out,
         inputs[0], inputs[1], inputs[2],
         inputs[3], inputs[4], inputs[5],
-        block_size_, scale_, heads_per_tg_, nullptr,
+        block_size_, scale_, heads_per_tg_,
         stream());
   }
 
@@ -1536,72 +1498,6 @@ static array mla_paged_attention_primitive_fn(
       q_nope.dtype(),
       std::move(prim),
       {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
-}
-
-class MlaPagedAttentionUnembeddedPrimitive : public UnaryPrimitive {
- public:
-  MlaPagedAttentionUnembeddedPrimitive(
-      Stream stream, int block_size, float scale, int heads_per_tg)
-      : UnaryPrimitive(stream),
-        block_size_(block_size),
-        scale_(scale),
-        heads_per_tg_(heads_per_tg) {}
-
-  void eval_cpu(const std::vector<array>&, array&) override {
-    throw std::runtime_error(
-        "MlaPagedAttentionUnembeddedPrimitive only supports GPU");
-  }
-
-  void eval_gpu(const std::vector<array>& inputs, array& out) override {
-    // Inputs:
-    //   [q_nope, q_pe, latent_cache, block_tables, context_lens,
-    //    cu_seqlens_q, unembed_weight]
-    out.set_data(allocator::malloc(out.nbytes()));
-    dispatch_mla_paged_attention(
-        out,
-        inputs[0], inputs[1], inputs[2],
-        inputs[3], inputs[4], inputs[5],
-        block_size_, scale_, heads_per_tg_, &inputs[6],
-        stream());
-  }
-
-  const char* name() const override { return "MlaPagedAttentionUnembedded"; }
-
-  bool is_equivalent(const Primitive& other) const override {
-    auto* rhs =
-        dynamic_cast<const MlaPagedAttentionUnembeddedPrimitive*>(&other);
-    return rhs && rhs->block_size_ == block_size_
-        && rhs->scale_ == scale_ && rhs->heads_per_tg_ == heads_per_tg_;
-  }
-
- private:
-  int block_size_;
-  float scale_;
-  int heads_per_tg_;
-};
-
-static array mla_paged_attention_unembedded_primitive_fn(
-    const array& q_nope,
-    const array& q_pe,
-    const array& latent_cache,
-    const array& block_tables,
-    const array& context_lens,
-    const array& cu_seqlens_q,
-    const array& unembed_weight,
-    int block_size,
-    float scale,
-    int heads_per_tg) {
-  auto prim = std::make_shared<MlaPagedAttentionUnembeddedPrimitive>(
-      default_stream(Device::gpu), block_size, scale, heads_per_tg);
-  const int total_q_tokens = static_cast<int>(q_nope.shape(0));
-  const int num_heads = static_cast<int>(q_nope.shape(1));
-  const int v_head_dim = static_cast<int>(unembed_weight.shape(1));
-  return array(
-      Shape{total_q_tokens, num_heads, v_head_dim},
-      float32,
-      std::move(prim),
-      {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q,
-       unembed_weight});
 }
 
 void gdn_linear_attention_impl(
@@ -1920,35 +1816,5 @@ NB_MODULE(_paged_ops, m) {
         "in the wrapper's lazy graph and avoids the per-call mx.eval "
         "boundary the eager binding requires. Saves ~200 μs at B=1 "
         "small-H cells where dispatch overhead dominates.");
-
-  m.def("mla_paged_attention_unembedded_primitive",
-        [](nb::handle q_nope_h,
-           nb::handle q_pe_h,
-           nb::handle latent_cache_h,
-           nb::handle block_tables_h,
-           nb::handle context_lens_h,
-           nb::handle cu_seqlens_q_h,
-           nb::handle unembed_weight_h,
-           int block_size, float scale, int heads_per_tg,
-           nb::handle out_h) {
-          auto result = mla_paged_attention_unembedded_primitive_fn(
-              *nb::inst_ptr<array>(q_nope_h),
-              *nb::inst_ptr<array>(q_pe_h),
-              *nb::inst_ptr<array>(latent_cache_h),
-              *nb::inst_ptr<array>(block_tables_h),
-              *nb::inst_ptr<array>(context_lens_h),
-              *nb::inst_ptr<array>(cu_seqlens_q_h),
-              *nb::inst_ptr<array>(unembed_weight_h),
-              block_size, scale, heads_per_tg);
-          nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
-        },
-        nb::arg("q_nope"), nb::arg("q_pe"),
-        nb::arg("latent_cache"),
-        nb::arg("block_tables"), nb::arg("context_lens"),
-        nb::arg("cu_seqlens_q"), nb::arg("unembed_weight"),
-        nb::arg("block_size"), nb::arg("scale"),
-        nb::arg("heads_per_tg") = 1,
-        nb::arg("out"),
-        "Paged MLA with fused dense unembed projection for split decode.");
 
 }

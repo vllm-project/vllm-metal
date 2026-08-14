@@ -149,65 +149,6 @@ def metal_mla_paged_attention(
     return out
 
 
-def metal_mla_paged_attention_unembedded(
-    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
-    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
-    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
-    block_tables,  # [num_seqs, max_blocks_per_seq], int32
-    context_lens,  # [num_seqs], uint32
-    cu_seqlens_q,  # [num_seqs + 1], int32
-    unembed_weight,  # [num_heads, v_head_dim, kv_lora_rank]
-    scale: float,
-    heads_per_tg: int = 1,
-):
-    """Paged MLA that writes projected per-head values.
-
-    ``unembed_weight`` maps the 512-wide latent attention output to
-    ``v_head_dim`` inside the Metal kernel. This is used by DeepSeek-style
-    ``kv_b_proj`` MLA, where the K and V projections can be split out of one
-    dense projection matrix for decode.
-    """
-    import mlx.core as mx
-
-    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
-        raise ValueError(
-            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
-            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
-            f"q_pe.shape[2] ({q_pe.shape[2]})"
-        )
-
-    total_q_tokens = int(q_nope.shape[0])
-    num_heads = int(q_nope.shape[1])
-    kv_lora_rank = int(q_nope.shape[2])
-    if len(unembed_weight.shape) != 3:
-        raise ValueError("unembed_weight must be [heads, v_head_dim, kv_lora_rank]")
-    if unembed_weight.shape[0] != num_heads or unembed_weight.shape[2] != kv_lora_rank:
-        raise ValueError(
-            "unembed_weight must be [num_heads, v_head_dim, kv_lora_rank]; got "
-            f"{unembed_weight.shape}"
-        )
-
-    block_size = latent_cache.shape[1]
-    v_head_dim = int(unembed_weight.shape[1])
-    out = mx.zeros((total_q_tokens, num_heads, v_head_dim), dtype=mx.float32)
-
-    ops = get_ops()
-    ops.mla_paged_attention_unembedded_primitive(
-        q_nope,
-        q_pe,
-        latent_cache,
-        block_tables,
-        context_lens,
-        cu_seqlens_q,
-        unembed_weight.astype(q_nope.dtype),
-        block_size,
-        scale,
-        heads_per_tg,
-        out,
-    )
-    return out
-
-
 def metal_mla_split_plan(
     *,
     total_q_tokens: int,

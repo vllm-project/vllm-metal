@@ -65,11 +65,6 @@ def _mla_split_route_selected(
         max_seq_len=max_seq_len,
     )
     selected = bool(plan["partition"])
-    # H=16 absorbed MLA did not beat the MLX fallback with the scalar
-    # split/reduce kernel. DeepSeek-style kv_b_proj H=16 has a separate
-    # projected Metal path below.
-    if total_q_tokens == len(ctx.context_lens) and num_heads == 16:
-        selected = False
     if cache is not None:
         cache[key] = selected
     return selected
@@ -154,46 +149,6 @@ class MLAPagedAttentionWrapper(nn.Module):
         return scale
 
     @staticmethod
-    def _dense_kv_b_weights(inner: nn.Module) -> tuple[mx.array, mx.array] | None:
-        cached = getattr(inner, "_vllm_metal_dense_kv_b_weights", None)
-        if cached is not None:
-            return cached
-
-        kv_b_proj = getattr(inner, "kv_b_proj", None)
-        weight = getattr(kv_b_proj, "weight", None)
-        if weight is None:
-            return None
-        if "bias" in kv_b_proj:
-            return None
-
-        if weight.dtype not in (mx.float16, mx.bfloat16, mx.float32):
-            if not all(
-                hasattr(kv_b_proj, name) for name in ("scales", "bits", "group_size")
-            ):
-                return None
-            weight = mx.dequantize(
-                kv_b_proj["weight"],
-                scales=kv_b_proj["scales"],
-                biases=kv_b_proj.get("biases"),
-                group_size=kv_b_proj.group_size,
-                bits=kv_b_proj.bits,
-                mode=kv_b_proj.mode,
-                dtype=mx.float16,
-            )
-
-        if len(weight.shape) != 2 or weight.shape[1] != inner.kv_lora_rank:
-            return None
-        per_head = inner.qk_nope_head_dim + inner.v_head_dim
-        if weight.shape[0] != inner.num_heads * per_head:
-            return None
-        weight = weight.reshape(inner.num_heads, per_head, inner.kv_lora_rank)
-        k_weight = weight[:, : inner.qk_nope_head_dim, :]
-        v_weight = weight[:, inner.qk_nope_head_dim :, :]
-        cached = (k_weight, v_weight)
-        object.__setattr__(inner, "_vllm_metal_dense_kv_b_weights", cached)
-        return cached
-
-    @staticmethod
     def _causal_valid_mask(
         *,
         num_new: int,
@@ -247,37 +202,6 @@ class MLAPagedAttentionWrapper(nn.Module):
             return False
         return True
 
-    def _can_use_kv_b_kernel(
-        self,
-        inner: nn.Module,
-        latent_cache: MLAPagedLatentCache,
-        ctx: Any,
-    ) -> bool:
-        if not envs.VLLM_METAL_MLA_KERNEL:
-            return False
-        if self._is_absorbed:
-            return False
-        if inner.num_heads != 16:
-            return False
-        if inner.kv_lora_rank != self._KERNEL_KV_LORA_RANK:
-            return False
-        if inner.qk_rope_head_dim != self._KERNEL_QK_ROPE_HEAD_DIM:
-            return False
-        if inner.v_head_dim != 128 or inner.qk_nope_head_dim != 128:
-            return False
-        if latent_cache.block_size not in self._KERNEL_BLOCK_SIZES:
-            return False
-        if latent_cache.dtype not in (mx.float16, mx.bfloat16):
-            return False
-        if self._dense_kv_b_weights(inner) is None:
-            return False
-        cu = ctx.cu_seqlens
-        for i in range(len(ctx.context_lens)):
-            if cu[i + 1] - cu[i] != 1:
-                return False
-        max_seq_len = max(len(bt) for bt in ctx.block_tables) * latent_cache.block_size
-        return max_seq_len >= _MLA_MIN_SPLIT_CONTEXT
-
     @staticmethod
     def _pick_heads_per_tg(num_heads: int, batch_size: int) -> int:
         """Pick HEADS_PER_TG (G) for the MLA kernel. G=2 packs 2 query heads
@@ -324,6 +248,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         )
 
         meta = _mla_kernel_metadata(ctx, latent_cache.block_size)
+
         out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
             q_pe=q_pe_kernel,
@@ -342,46 +267,6 @@ class MLAPagedAttentionWrapper(nn.Module):
         ).transpose(0, 2, 1, 3)
         out_unembedded = inner.unembed_out(out_for_unembed)
         return out_unembedded.transpose(0, 2, 1, 3).reshape(1, seq_len, -1)
-
-    def _kernel_fast_path_kv_b(
-        self,
-        inner: nn.Module,
-        latent_cache: MLAPagedLatentCache,
-        layer_idx: int,
-        q_nope: mx.array,  # [1, num_heads, seq_len, qk_nope_head_dim]
-        q_pe: mx.array,  # [1, num_heads, seq_len, qk_rope_head_dim] (post-RoPE)
-        ctx: Any,
-        seq_len: int,
-    ) -> mx.array:
-        from vllm_metal.metal import metal_mla_paged_attention_unembedded
-
-        weights = self._dense_kv_b_weights(inner)
-        if weights is None:
-            raise RuntimeError("kv_b MLA Metal path requires dense kv_b_proj weight")
-        k_weight, v_weight = weights
-        target_dtype = latent_cache.dtype
-        q_nope_proj = (
-            q_nope[0, :, :, None, :].astype(target_dtype)
-            @ k_weight[:, None, :, :].astype(target_dtype)
-        ).squeeze(-2)
-        q_nope_kernel = q_nope_proj.transpose(1, 0, 2)
-        q_pe_kernel = q_pe.astype(target_dtype).transpose(0, 2, 1, 3).reshape(
-            seq_len, inner.num_heads, inner.qk_rope_head_dim
-        )
-
-        meta = _mla_kernel_metadata(ctx, latent_cache.block_size)
-        out_v = metal_mla_paged_attention_unembedded(
-            q_nope=q_nope_kernel,
-            q_pe=q_pe_kernel,
-            latent_cache=latent_cache.latent_caches[layer_idx],
-            block_tables=meta.block_tables,
-            context_lens=meta.context_lens,
-            cu_seqlens_q=meta.cu_seqlens_q,
-            unembed_weight=v_weight.astype(target_dtype),
-            scale=self._attention_scale(),
-            heads_per_tg=self._pick_heads_per_tg(inner.num_heads, seq_len),
-        )
-        return out_v.astype(target_dtype).reshape(1, seq_len, -1)
 
     def _materialized_prefill_ok(self, inner: nn.Module, ctx: Any) -> bool:
         """Gate for the materialized-prefill fast path (RFC #360 Phase 2): an
@@ -609,11 +494,6 @@ class MLAPagedAttentionWrapper(nn.Module):
         # or unsupported block_size / dtype).
         if self._can_use_kernel(inner, latent_cache, ctx):
             final = self._kernel_fast_path_single_pass(
-                inner, latent_cache, layer_idx, q_nope, q_pe, ctx, seq_len
-            )
-            return inner.o_proj(final)
-        if self._can_use_kv_b_kernel(inner, latent_cache, ctx):
-            final = self._kernel_fast_path_kv_b(
                 inner, latent_cache, layer_idx, q_nope, q_pe, ctx, seq_len
             )
             return inner.o_proj(final)

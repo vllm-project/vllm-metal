@@ -649,27 +649,6 @@ class _KernelDimsAbsorbedInner(nn.Module):
         self.unembed_out = nn.Linear(_KERNEL_KV_RANK, _KERNEL_V_DIM, bias=False)
 
 
-class _KernelDimsKVBInner(nn.Module):
-    """DeepSeek-V2-style MLA stub with one kv_b_proj instead of absorbed
-    embed_q/unembed_out modules."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.q_lora_rank = None
-        self.num_heads = 16
-        self.q_head_dim = _KERNEL_NOPE_DIM + _KERNEL_ROPE_DIM
-        self.qk_nope_head_dim = _KERNEL_NOPE_DIM
-        self.qk_rope_head_dim = _KERNEL_ROPE_DIM
-        self.kv_lora_rank = _KERNEL_KV_RANK
-        self.v_head_dim = _KERNEL_V_DIM
-        self.scale = 1.0 / math.sqrt(_KERNEL_KV_RANK)
-        self.kv_b_proj = nn.Linear(
-            _KERNEL_KV_RANK,
-            self.num_heads * (_KERNEL_NOPE_DIM + _KERNEL_V_DIM),
-            bias=False,
-        )
-
-
 def _make_kernel_dims_wrapper(
     *, block_size: int = 16, dtype: mx.Dtype = mx.float16
 ) -> MLAPagedAttentionWrapper:
@@ -682,21 +661,6 @@ def _make_kernel_dims_wrapper(
     )
     return MLAPagedAttentionWrapper(
         inner=_KernelDimsAbsorbedInner(), layer_idx=0, latent_cache=cache
-    )
-
-
-def _make_kernel_dims_kv_b_wrapper(
-    *, block_size: int = 16, dtype: mx.Dtype = mx.float16
-) -> MLAPagedAttentionWrapper:
-    cache = MLAPagedLatentCache(
-        num_layers=1,
-        latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
-        num_blocks=4,
-        block_size=block_size,
-        dtype=dtype,
-    )
-    return MLAPagedAttentionWrapper(
-        inner=_KernelDimsKVBInner(), layer_idx=0, latent_cache=cache
     )
 
 
@@ -754,7 +718,7 @@ class TestSplitKernelRouting:
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
         """Inner without embed_q / unembed_out (kv_b_proj-style models
-        like DeepSeek-V2) is not routed through the absorbed-MLA kernel."""
+        like MiniCPM3) is not routed through the absorbed-MLA kernel."""
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
         cache = MLAPagedLatentCache(
             num_layers=1,
@@ -848,108 +812,3 @@ class TestSplitKernelRouting:
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
             == expected_g
         )
-
-
-class TestKVBProjectedKernelRouting:
-    def test_env_off_rejects(self, monkeypatch) -> None:
-        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", False)
-        wrapper = _make_kernel_dims_kv_b_wrapper()
-        assert (
-            wrapper._can_use_kv_b_kernel(
-                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
-            )
-            is False
-        )
-
-    def test_long_h16_decode_accepts(self, monkeypatch) -> None:
-        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
-        wrapper = _make_kernel_dims_kv_b_wrapper(block_size=16)
-        assert (
-            wrapper._can_use_kv_b_kernel(
-                wrapper._inner,
-                wrapper._mla_latent_cache,
-                _make_decode_ctx(ctx_len=32768, block_size=16),
-            )
-            is True
-        )
-
-    def test_quantized_kv_b_decode_accepts(self, monkeypatch) -> None:
-        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
-        wrapper = _make_kernel_dims_kv_b_wrapper(block_size=16)
-        wrapper._inner.kv_b_proj = nn.QuantizedLinear(
-            _KERNEL_KV_RANK,
-            wrapper._inner.num_heads * (_KERNEL_NOPE_DIM + _KERNEL_V_DIM),
-            bias=False,
-            group_size=64,
-            bits=4,
-        )
-        assert (
-            wrapper._can_use_kv_b_kernel(
-                wrapper._inner,
-                wrapper._mla_latent_cache,
-                _make_decode_ctx(ctx_len=32768, block_size=16),
-            )
-            is True
-        )
-
-    def test_short_context_rejects(self, monkeypatch) -> None:
-        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
-        wrapper = _make_kernel_dims_kv_b_wrapper()
-        assert (
-            wrapper._can_use_kv_b_kernel(
-                wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
-            )
-            is False
-        )
-
-    def test_non_h16_rejects(self, monkeypatch) -> None:
-        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
-        wrapper = _make_kernel_dims_kv_b_wrapper()
-        wrapper._inner.num_heads = 8
-        assert (
-            wrapper._can_use_kv_b_kernel(
-                wrapper._inner,
-                wrapper._mla_latent_cache,
-                _make_decode_ctx(ctx_len=32768),
-            )
-            is False
-        )
-
-    def test_kv_b_metal_path_matches_fallback(self) -> None:
-        mx.random.seed(0)
-        wrapper = _make_kernel_dims_kv_b_wrapper(block_size=16)
-        inner = wrapper._inner
-        cache = wrapper._mla_latent_cache
-        ctx_len = 64
-        num_blocks = math.ceil(ctx_len / cache.block_size)
-        cache.latent_caches[0] = mx.random.normal(
-            (num_blocks, cache.block_size, cache.latent_dim)
-        ).astype(cache.dtype)
-        q_nope = mx.random.normal(
-            (1, inner.num_heads, 1, inner.qk_nope_head_dim)
-        ).astype(cache.dtype)
-        q_pe = mx.random.normal(
-            (1, inner.num_heads, 1, inner.qk_rope_head_dim)
-        ).astype(cache.dtype)
-        ctx = SimpleNamespace(
-            context_lens=[ctx_len],
-            cu_seqlens=[0, 1],
-            block_tables=[list(range(num_blocks))],
-        )
-
-        all_latent = cache.latent_caches[0].reshape(-1, cache.latent_dim)[:ctx_len]
-        expected = wrapper._apply_kv_b_proj_attention(
-            rq_nope=q_nope,
-            rq_pe=q_pe,
-            all_kv_norm=all_latent[:, : inner.kv_lora_rank],
-            k_pe=all_latent[:, inner.kv_lora_rank :].reshape(
-                1, 1, ctx_len, inner.qk_rope_head_dim
-            ),
-            causal_mask=None,
-        )
-        actual = wrapper._kernel_fast_path_kv_b(
-            inner, cache, 0, q_nope, q_pe, ctx, seq_len=1
-        ).reshape(1, 1, inner.num_heads, inner.v_head_dim).transpose(0, 2, 1, 3)
-        mx.eval(expected, actual)
-
-        assert bool(mx.allclose(actual, expected, rtol=3e-2, atol=3e-2))
