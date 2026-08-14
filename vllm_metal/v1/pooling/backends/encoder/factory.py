@@ -24,6 +24,9 @@ class EncoderBackendLoader:
 
 
 _ENCODER_BACKEND_LOADERS = (
+    # Decoder pooling wraps the already-loaded generation model. Encoder pooling
+    # has model-family-owned loaders because it does not use the generation
+    # loader, paged attention, or KV cache.
     EncoderBackendLoader(
         supports=supports_xlm_roberta_encoder,
         load=load_xlm_roberta_backend,
