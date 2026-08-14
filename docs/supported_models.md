@@ -80,6 +80,15 @@ and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
+Ling-3.0 requires a vLLM release containing its
+[Bailing V3 model support](https://github.com/vllm-project/vllm/pull/51045)
+and [FP8 loading support](https://github.com/vllm-project/vllm/pull/51265);
+vLLM 0.27.1 contains neither change. It also depends on the MLX-LM model
+implementation in
+[mlx-lm#1711](https://github.com/ml-explore/mlx-lm/pull/1711). Before release,
+update vllm-metal's vLLM wheel and MLX-LM revision pins to versions containing
+both dependencies.
+
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -91,6 +100,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Mistral-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
 | Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| Ling-3.0 Tiny / Flash | 🔵 | Hybrid MLA + KDA (paged latent + recurrent state) | ❌ | `inclusionAI/Ling-3.0-tiny-fp8` |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
