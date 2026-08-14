@@ -291,7 +291,8 @@ def load_xlm_roberta_backend(
     mx.eval(model.parameters())
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
+        model_config.tokenizer,
+        revision=model_config.tokenizer_revision,
         trust_remote_code=model_config.trust_remote_code,
     )
     pooling_backend = MetalEncoderPoolingBackend(

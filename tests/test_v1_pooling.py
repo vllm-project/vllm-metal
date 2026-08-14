@@ -204,6 +204,8 @@ def _pooling_model_config(**overrides):
         "quantization": None,
         "trust_remote_code": False,
         "revision": None,
+        "tokenizer": "stub-pooling-model",
+        "tokenizer_revision": None,
         "get_head_size": lambda: 128,
     }
     values.update(overrides)
@@ -653,6 +655,8 @@ class TestMetalPoolingCapabilities:
 
         model_config = _encoder_model_config(
             model=str(tmp_path),
+            tokenizer="custom-tokenizer",
+            tokenizer_revision="tokenizer-revision",
             hf_config=torch_config,
             dtype=torch.float32,
         )
@@ -661,7 +665,7 @@ class TestMetalPoolingCapabilities:
             "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
             "AutoTokenizer.from_pretrained",
             return_value=object(),
-        ):
+        ) as load_tokenizer:
             mlx_model, _, model_args, pooling_backend = load_xlm_roberta_backend(
                 model_config
             )
@@ -710,6 +714,11 @@ class TestMetalPoolingCapabilities:
             expected_cls,
             atol=1e-5,
             rtol=1e-5,
+        )
+        load_tokenizer.assert_called_once_with(
+            "custom-tokenizer",
+            revision="tokenizer-revision",
+            trust_remote_code=False,
         )
 
     def test_xlm_roberta_loader_rejects_quantization_before_download(self) -> None:
