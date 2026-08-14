@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from vllm_metal.metal import metal_mla_paged_attention, metal_mla_split_plan
+from vllm_metal.metal import get_ops, metal_mla_paged_attention, metal_mla_split_plan
 
 # Production shapes — only kv_lora_rank=512, qk_rope_head_dim=64 are
 # instantiated in mla.metal.
@@ -186,10 +186,11 @@ def test_decode_split_kv_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_decode_split_kv_skips_wide_decode_grid() -> None:
+    gate_grid = int(get_ops().min_decode_grid()) + 1
     plan = metal_mla_split_plan(
         total_q_tokens=1,
         num_seqs=1,
-        num_heads=16,
+        num_heads=gate_grid,
         heads_per_tg=1,
         max_seq_len=65536,
     )
@@ -198,7 +199,7 @@ def test_decode_split_kv_skips_wide_decode_grid() -> None:
         "partition": False,
         "partition_size": 0,
         "max_num_partitions": 1,
-        "gate_grid": 16,
+        "gate_grid": gate_grid,
     }
 
 
