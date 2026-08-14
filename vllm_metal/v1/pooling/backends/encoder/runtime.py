@@ -35,12 +35,6 @@ _ENCODER_POOLING_TYPES = (None, "CLS", "LAST")
 class EncoderPoolingRequest:
     req_id: str
     token_ids: tuple[int, ...]
-    pooling_params: PoolingParams
-
-
-@dataclass(frozen=True, slots=True)
-class EncoderPoolingBatch:
-    requests: tuple[EncoderPoolingRequest, ...]
 
 
 class MetalEncoderPoolingBackend:
@@ -96,31 +90,26 @@ class MetalEncoderPoolingBackend:
         scheduler_output: SchedulerOutput,
         model_config: object,
     ) -> tuple[EncoderPoolingOutput, ...]:
-        batch = self._batch_from_scheduler_output(scheduler_output, model_config)
-        pooler_outputs = self._pool_batch(batch)
+        requests = self._requests_from_scheduler_output(
+            scheduler_output,
+            model_config,
+        )
         return tuple(
-            EncoderPoolingOutput(request.req_id, pooler_output)
-            for request, pooler_output in zip(
-                batch.requests,
-                pooler_outputs,
-                strict=True,
-            )
+            EncoderPoolingOutput(request.req_id, self._pool_request(request))
+            for request in requests
         )
 
-    def _pool_batch(self, batch: EncoderPoolingBatch) -> tuple[torch.Tensor, ...]:
-        outputs: list[torch.Tensor] = []
-        for request in batch.requests:
-            input_ids = mx.array([request.token_ids], dtype=mx.int32)
-            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
-            hidden_states = self.forward_padded(input_ids, attention_mask)
-            outputs.append(self._pool_one(hidden_states, 0, len(request.token_ids)))
-        return tuple(outputs)
+    def _pool_request(self, request: EncoderPoolingRequest) -> torch.Tensor:
+        input_ids = mx.array([request.token_ids], dtype=mx.int32)
+        attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+        hidden_states = self.forward_padded(input_ids, attention_mask)
+        return self._pool_one(hidden_states, 0, len(request.token_ids))
 
-    def _batch_from_scheduler_output(
+    def _requests_from_scheduler_output(
         self,
         scheduler_output: SchedulerOutput,
         model_config: object,
-    ) -> EncoderPoolingBatch:
+    ) -> tuple[EncoderPoolingRequest, ...]:
         self._reject_scheduler_state(scheduler_output)
         requests: list[EncoderPoolingRequest] = []
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -138,10 +127,9 @@ class MetalEncoderPoolingBackend:
                 EncoderPoolingRequest(
                     req_id=new_req.req_id,
                     token_ids=tuple(new_req.prompt_token_ids or ()),
-                    pooling_params=new_req.pooling_params,
                 )
             )
-        return EncoderPoolingBatch(tuple(requests))
+        return tuple(requests)
 
     def _reject_scheduler_state(self, scheduler_output: SchedulerOutput) -> None:
         cached_reqs = scheduler_output.scheduled_cached_reqs
