@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
-    VLLM_METAL_DECODE_PIPELINE: bool = False
+    VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -59,12 +59,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
     ),
-    # One-step-ahead decode pipelining (opt-in). Eligible pure-decode greedy
-    # steps defer the sampling sync one step so the next step's graph build
-    # and submit overlap the in-flight GPU forward. Set to "1" to enable;
-    # the default is the fully synchronous per-step sample path.
+    # One-step-ahead decode pipelining (default on). Eligible pure-decode
+    # greedy steps defer the sampling sync one step so the next step's graph
+    # build and submit overlap the in-flight GPU forward. Set to "0" to
+    # force the fully synchronous per-step sample path.
     "VLLM_METAL_DECODE_PIPELINE": lambda: (
-        os.getenv("VLLM_METAL_DECODE_PIPELINE", "0") == "1"
+        os.getenv("VLLM_METAL_DECODE_PIPELINE", "1") == "1"
     ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless

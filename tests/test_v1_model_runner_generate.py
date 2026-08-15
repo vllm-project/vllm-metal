@@ -19,6 +19,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
+import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
@@ -2252,9 +2253,15 @@ class TestPipelineGateSpecDecodeDerivation:
     """Runner-side gate derivation: spec decode disables the pipeline."""
 
     @pytest.fixture(autouse=True)
-    def _opt_in_pipeline(self, monkeypatch) -> None:
-        # The pipeline is opt-in; gate derivation is tested with it enabled.
+    def _enable_pipeline(self, monkeypatch) -> None:
+        # Set explicitly so gate derivation stays deterministic regardless
+        # of the flag's default.
         monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+
+    def test_pipeline_flag_defaults_on(self, monkeypatch) -> None:
+        # The kill switch defaults to enabled; "0" is the opt-out.
+        monkeypatch.delenv("VLLM_METAL_DECODE_PIPELINE", raising=False)
+        assert metal_envs.VLLM_METAL_DECODE_PIPELINE is True
 
     def _runner(self, drafter: object | None = None) -> mr.MetalModelRunner:
         runner = make_stub_runner()
