@@ -52,7 +52,7 @@ The lazy GDN decode fast path compiles two shaders directly through MLX
 | `pagedattention.metal` | Per-token paged-attention kernel with online softmax and sink support. Adapted from Apple MLX + vLLM. |
 | `pagedattention_tiled.metal` | Tiled Flash-Attention-style kernel using simdgroup 8×8 MMA; independent of the per-token kernel, same library. |
 | `turboquant.metal` | TurboQuant KV-cache compression (K: asymmetric uniform int8 / sub-8-bit; V: 3-bit Lloyd-Max + FWHT). Must be concatenated **after** `pagedattention.metal` declares `Vec<>`. |
-| `mla.metal` | Paged Multi-head Latent Attention kernel (RFC #360). Single-pass mode is wired today; partitioned 2-pass mode is scaffolded but inactive. |
+| `mla.metal` | Paged Multi-head Latent Attention kernel (RFC #360). Supports single-pass decode and gated partitioned split-KV decode for long contexts. |
 | `gdn_linear_attention.metal` | GDN (gated delta-net) linear-attention kernel for hybrid models (prefill / chunked path). |
 | `gdn_conv1d_silu_decode.metal` | Lazy GDN decode: causal conv1d + SiLU. Compiled via `mx.fast.metal_kernel`. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. Compiled via `mx.fast.metal_kernel`. |
