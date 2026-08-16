@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from vllm_metal.metal import metal_mla_paged_attention
+from vllm_metal.metal import get_ops, metal_mla_paged_attention, metal_mla_split_plan
 
 # Production shapes — only kv_lora_rank=512, qk_rope_head_dim=64 are
 # instantiated in mla.metal.
@@ -98,6 +98,126 @@ def _make_inputs(
         cu_seqlens_q,
         block_tables_np,
     )
+
+
+def _make_mixed_inputs(
+    *,
+    ctx_lens: list[int],
+    num_heads: int,
+    block_size: int,
+    dtype: mx.Dtype,
+    seed: int = 0,
+):
+    """Build a decode input set where rows share one block-table width but
+    each sequence can have a different valid context length."""
+    mx.random.seed(seed)
+
+    num_seqs = len(ctx_lens)
+    max_ctx_len = max(ctx_lens)
+    n_blocks_per_seq = max(1, (max_ctx_len + block_size - 1) // block_size)
+    num_blocks = n_blocks_per_seq * num_seqs
+
+    q_nope = mx.random.normal(shape=(num_seqs, num_heads, _KV_LORA_RANK)).astype(dtype)
+    q_pe = mx.random.normal(shape=(num_seqs, num_heads, _QK_ROPE_HEAD_DIM)).astype(
+        dtype
+    )
+    latent_cache = mx.random.normal(shape=(num_blocks, block_size, _LATENT_DIM)).astype(
+        dtype
+    )
+    block_tables_np = np.arange(num_blocks, dtype=np.int32).reshape(
+        num_seqs, n_blocks_per_seq
+    )
+    block_tables = mx.array(block_tables_np)
+    context_lens = mx.array(ctx_lens, dtype=mx.uint32)
+    cu_seqlens_q = mx.array(list(range(num_seqs + 1)), dtype=mx.int32)
+
+    return (
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    )
+
+
+def _assert_selected_split_plan(
+    *,
+    ctx_lens: list[int],
+    num_heads: int,
+    block_size: int,
+    heads_per_tg: int,
+    expected_partition: bool,
+    expected_partition_size: int | None = None,
+    expected_num_partitions: int | None = None,
+) -> None:
+    max_seq_len = ((max(ctx_lens) + block_size - 1) // block_size) * block_size
+    plan = metal_mla_split_plan(
+        total_q_tokens=len(ctx_lens),
+        num_seqs=len(ctx_lens),
+        num_heads=num_heads,
+        heads_per_tg=heads_per_tg,
+        max_seq_len=max_seq_len,
+    )
+    assert plan["partition"] is expected_partition
+    assert plan["gate_grid"] == (num_heads // heads_per_tg) * len(ctx_lens)
+    if expected_partition:
+        assert plan["partition_size"] > 0
+        assert plan["max_num_partitions"] >= 2
+        assert plan["max_num_partitions"] <= 64
+        if expected_partition_size is not None:
+            assert plan["partition_size"] == expected_partition_size
+        if expected_num_partitions is not None:
+            assert plan["max_num_partitions"] == expected_num_partitions
+    else:
+        assert plan["partition_size"] == 0
+        assert plan["max_num_partitions"] == 1
+
+
+def test_decode_split_kv_must_be_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    kwargs = {
+        "total_q_tokens": 1,
+        "num_seqs": 1,
+        "num_heads": 4,
+        "heads_per_tg": 1,
+        "max_seq_len": 65536,
+    }
+    monkeypatch.delenv("VLLM_METAL_MLA_SPLIT_KV", raising=False)
+    plan = metal_mla_split_plan(**kwargs)
+    assert plan["partition"] is False
+    assert plan["partition_size"] == 0
+    assert plan["max_num_partitions"] == 1
+
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    assert metal_mla_split_plan(**kwargs)["partition"] is True
+
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "0")
+    plan = metal_mla_split_plan(**kwargs)
+    assert plan["partition"] is False
+    assert plan["partition_size"] == 0
+    assert plan["max_num_partitions"] == 1
+
+
+def test_decode_split_kv_skips_wide_decode_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    gate_grid = int(get_ops().min_decode_grid()) + 1
+    plan = metal_mla_split_plan(
+        total_q_tokens=1,
+        num_seqs=1,
+        num_heads=gate_grid,
+        heads_per_tg=1,
+        max_seq_len=65536,
+    )
+
+    assert plan == {
+        "partition": False,
+        "partition_size": 0,
+        "max_num_partitions": 1,
+        "gate_grid": gate_grid,
+    }
 
 
 def _expected_output(
@@ -439,6 +559,206 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "ctx_lens",
+        "block_size",
+        "dtype",
+        "num_heads",
+        "heads_per_tg",
+        "expected_partition",
+    ),
+    [
+        ([32768], 32, mx.float16, 2, 2, False),
+        ([49152], 32, mx.float16, 1, 1, False),
+        ([65536], 32, mx.float16, 1, 1, True),
+        ([98304], 32, mx.float16, 1, 1, True),
+        ([32768], 16, mx.bfloat16, 20, 5, True),
+        ([32768], 32, mx.bfloat16, 20, 5, True),
+        ([40960], 32, mx.bfloat16, 20, 5, True),
+        ([49152], 32, mx.bfloat16, 20, 5, True),
+        ([57344], 32, mx.bfloat16, 20, 5, True),
+        ([65536], 32, mx.bfloat16, 20, 5, True),
+    ],
+)
+def test_decode_split_kv_long_context_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx_lens: list[int],
+    block_size: int,
+    dtype: mx.Dtype,
+    num_heads: int,
+    heads_per_tg: int,
+    expected_partition: bool,
+) -> None:
+    """Exercise the MLA split-KV path, including multi-partition reduce."""
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    _assert_selected_split_plan(
+        ctx_lens=ctx_lens,
+        num_heads=num_heads,
+        block_size=block_size,
+        heads_per_tg=heads_per_tg,
+        expected_partition=expected_partition,
+    )
+    (
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_mixed_inputs(
+        ctx_lens=ctx_lens,
+        num_heads=num_heads,
+        block_size=block_size,
+        dtype=dtype,
+        seed=17,
+    )
+
+    out = metal_mla_paged_attention(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+        heads_per_tg=heads_per_tg,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=ctx_lens,
+        scale=0.125,
+    )
+    rtol, atol = _tolerance(dtype)
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), f"split-KV MLA mismatch: max_abs_diff={max_abs:.5f}"
+
+
+@pytest.mark.parametrize(
+    ("ctx_len", "expected_partition_size", "expected_num_partitions"),
+    [
+        (32768, 512, 64),
+        (40960, 640, 64),
+        (49152, 768, 64),
+        (57344, 896, 64),
+        (61440, 1024, 60),
+        (65536, 1024, 64),
+    ],
+)
+def test_decode_split_kv_h20_uses_expected_partition_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx_len: int,
+    expected_partition_size: int,
+    expected_num_partitions: int,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    _assert_selected_split_plan(
+        ctx_lens=[ctx_len],
+        num_heads=20,
+        block_size=32,
+        heads_per_tg=5,
+        expected_partition=True,
+        expected_partition_size=expected_partition_size,
+        expected_num_partitions=expected_num_partitions,
+    )
+
+
+def test_decode_split_kv_h20_boundary_stays_off_below_24k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    _assert_selected_split_plan(
+        ctx_lens=[22528],
+        num_heads=20,
+        block_size=32,
+        heads_per_tg=5,
+        expected_partition=False,
+    )
+
+
+def test_decode_split_kv_h20_boundary_stays_off_without_enough_partitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    _assert_selected_split_plan(
+        ctx_lens=[24576],
+        num_heads=20,
+        block_size=32,
+        heads_per_tg=5,
+        expected_partition=False,
+    )
+
+
+def test_decode_split_kv_mixed_long_short_batch_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Split decode must respect each row's own context length in the batch."""
+    monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    ctx_lens = [40960, 2048]
+    block_size = 32
+    num_heads = 20
+    heads_per_tg = 5
+    dtype = mx.bfloat16
+    _assert_selected_split_plan(
+        ctx_lens=ctx_lens,
+        num_heads=num_heads,
+        block_size=block_size,
+        heads_per_tg=heads_per_tg,
+        expected_partition=True,
+        expected_partition_size=640,
+        expected_num_partitions=64,
+    )
+    (
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_mixed_inputs(
+        ctx_lens=ctx_lens,
+        num_heads=num_heads,
+        block_size=block_size,
+        dtype=dtype,
+        seed=23,
+    )
+
+    out = metal_mla_paged_attention(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+        heads_per_tg=heads_per_tg,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=ctx_lens,
+        scale=0.125,
+    )
+    rtol, atol = _tolerance(dtype)
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), f"mixed split-KV MLA mismatch: max_abs_diff={max_abs:.5f}"
+
+
 def test_decode_mixed_ctx_batch() -> None:
     """Batch with three sequences at different ctx_lens — exercises the
     per-seq context_lens read and ensures the kernel doesn't accidentally
@@ -652,10 +972,7 @@ def test_g_invalid_raises() -> None:
 
 
 def test_g_unsupported_raises() -> None:
-    """heads_per_tg outside {1, 2} should raise — only G=1 and G=2 are
-    currently instantiated. Catches accidental routing to a non-existent
-    PSO (e.g. a future picker change that emits G=4 without restoring
-    the instantiations)."""
+    """Unsupported heads_per_tg should raise before routing to a missing PSO."""
     q_nope = mx.zeros((1, 4, _KV_LORA_RANK), dtype=mx.float16)
     q_pe = mx.zeros((1, 4, _QK_ROPE_HEAD_DIM), dtype=mx.float16)
     latent_cache = mx.zeros((1, 16, _LATENT_DIM), dtype=mx.float16)
@@ -663,7 +980,7 @@ def test_g_unsupported_raises() -> None:
     context_lens = mx.array([1], dtype=mx.uint32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
 
-    with pytest.raises(RuntimeError, match=r"heads_per_tg must be in \{1, 2\}"):
+    with pytest.raises(RuntimeError, match=r"heads_per_tg must be in \{1, 2, 5\}"):
         out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,

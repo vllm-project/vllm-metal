@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -16,6 +17,82 @@ from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
 MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+_MLA_MIN_SPLIT_CONTEXT = 24576
+
+
+@dataclass(frozen=True, eq=False)
+class _MlaKernelMetadata:
+    block_tables: mx.array
+    context_lens: mx.array
+    cu_seqlens_q: mx.array
+
+
+def _mla_split_route_selected(
+    ctx: Any,
+    *,
+    block_size: int,
+    total_q_tokens: int,
+    num_heads: int,
+    heads_per_tg: int,
+) -> bool:
+    cache = getattr(ctx, "kernel_metadata_cache", None)
+    max_seq_len = max(len(bt) for bt in ctx.block_tables) * block_size
+    key = (
+        "mla_route",
+        block_size,
+        total_q_tokens,
+        num_heads,
+        heads_per_tg,
+        max_seq_len,
+    )
+    if cache is not None:
+        selected = cache.get(key)
+        if selected is not None:
+            return bool(selected)
+
+    if max_seq_len < _MLA_MIN_SPLIT_CONTEXT:
+        if cache is not None:
+            cache[key] = False
+        return False
+
+    from vllm_metal.metal import metal_mla_split_plan
+
+    plan = metal_mla_split_plan(
+        total_q_tokens=total_q_tokens,
+        num_seqs=len(ctx.context_lens),
+        num_heads=num_heads,
+        heads_per_tg=heads_per_tg,
+        max_seq_len=max_seq_len,
+    )
+    selected = bool(plan["partition"])
+    if cache is not None:
+        cache[key] = selected
+    return selected
+
+
+def _mla_kernel_metadata(ctx: Any, block_size: int) -> _MlaKernelMetadata:
+    """Kernel-format MLA metadata, cached once per forward when possible."""
+    cache = getattr(ctx, "kernel_metadata_cache", None)
+    key = ("mla", block_size)
+    if cache is not None:
+        meta = cache.get(key)
+        if meta is not None:
+            return meta
+
+    # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
+    # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
+    # padding entries beyond n_context_blocks are never read.
+    bts = ctx.block_tables
+    max_blocks = max(len(bt) for bt in bts)
+    padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
+    meta = _MlaKernelMetadata(
+        block_tables=mx.array(padded, dtype=mx.int32),
+        context_lens=mx.array(list(ctx.context_lens), dtype=mx.uint32),
+        cu_seqlens_q=mx.array(list(ctx.cu_seqlens), dtype=mx.int32),
+    )
+    if cache is not None:
+        cache[key] = meta
+    return meta
 
 
 class MLAPagedAttentionWrapper(nn.Module):
@@ -36,7 +113,7 @@ class MLAPagedAttentionWrapper(nn.Module):
     When no PagedAttentionContext is active the original module is called as-is.
     """
 
-    # Single-pass Metal kernel admission: kv_lora_rank=512, qk_rope_head_dim=64,
+    # Metal split-kernel admission: kv_lora_rank=512, qk_rope_head_dim=64,
     # block_size ∈ {16, 32}, fp16 / bf16. Workloads outside this set fall
     # through to the MLX SDPA slow path.
     _KERNEL_KV_LORA_RANK = 512
@@ -90,16 +167,15 @@ class MLAPagedAttentionWrapper(nn.Module):
         latent_cache: MLAPagedLatentCache,
         ctx: Any,
     ) -> bool:
-        """Admission check for the single-pass Metal kernel fast path.
+        """Admission check for the opt-in Metal MLA decode path.
 
         Returns True only when every dimension matches the kernel's
         instantiated specialization and every request is decode-only.
         Workloads outside this set fall through to ``_slow_path_per_request``
-        (MLX SDPA) — no silent fallback, no scaffolding for routing
-        between kernel variants (this PR ships single-pass only;
-        FA / 2pass / pr_mma land in follow-ups once each has its own
-        real-model parity proof, per the alignment with reviewers on
-        ``Ship one kernel, prove it wins'')."""
+        (MLX SDPA). Split/reduce remains a C++ dispatch choice inside this
+        Metal path so ``VLLM_METAL_MLA_KERNEL=1`` keeps the existing one-pass
+        Metal behavior when the split opt-in is off or the split planner
+        rejects the shape."""
         if not envs.VLLM_METAL_MLA_KERNEL:
             return False
         if not self._is_absorbed:
@@ -120,13 +196,12 @@ class MLAPagedAttentionWrapper(nn.Module):
 
     @staticmethod
     def _pick_heads_per_tg(num_heads: int, batch_size: int) -> int:
-        """Pick HEADS_PER_TG (G) for the single-pass kernel. G=2 packs 2
-        query heads into one threadgroup so each K/V load is reused for
-        2 dot products; G=1 keeps the wider NUM_THREADS=1024 layout for
-        cells too small to saturate the GPU. Bench on M5 Max (RFC #360)
-        shows G=2 wins once B*H ≳ 30 launched threadgroups; B=1 with
-        small H stays on G=1. Falls back to G=1 when num_heads is odd
-        (kernel requires num_heads % G == 0)."""
+        """Pick HEADS_PER_TG (G) for the one-pass MLA kernel. G=2 packs 2 query heads
+        into one threadgroup so each K/V load is reused for 2 dot products;
+        G=1 keeps the wider NUM_THREADS=1024 layout for cells too small to
+        saturate the GPU. Bench on M5 Max (RFC #360) shows G=2 wins once
+        B*H ≳ 30 launched threadgroups; B=1 with small H stays on G=1.
+        Falls back to G=1 when num_heads is odd."""
         if num_heads % 2 != 0:
             return 1
         if batch_size == 1 and num_heads < 32:
@@ -143,11 +218,11 @@ class MLAPagedAttentionWrapper(nn.Module):
         ctx: Any,
         seq_len: int,
     ) -> mx.array:
-        """Single-pass MLA decode fast path: project q_nope through
-        embed_q, dispatch the kernel for the whole batch in one call,
-        recover v_head_dim through unembed_out, and concatenate for
-        o_proj. Replaces the per-request Python loop entirely when the
-        gate above accepts."""
+        """Metal MLA decode fast path: project q_nope through embed_q,
+        dispatch the kernel for the whole batch in one call, recover
+        v_head_dim through unembed_out, and concatenate for o_proj. The C++
+        dispatcher may use either the one-pass kernel or the long-context
+        split/reduce kernel family."""
         from vllm_metal.metal import metal_mla_paged_attention
 
         # Cast Q to the latent cache dtype so we hit a real kernel
@@ -164,26 +239,27 @@ class MLAPagedAttentionWrapper(nn.Module):
             seq_len, inner.num_heads, inner.qk_rope_head_dim
         )
 
-        # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
-        # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
-        # padding entries beyond n_context_blocks are never read.
-        bts = ctx.block_tables
-        max_blocks = max(len(bt) for bt in bts)
-        padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
-        block_tables_mx = mx.array(padded, dtype=mx.int32)
-
-        context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
-        cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
+        meta = _mla_kernel_metadata(ctx, latent_cache.block_size)
+        batch_size = len(ctx.context_lens)
+        heads_per_tg = self._pick_heads_per_tg(inner.num_heads, batch_size)
+        if inner.num_heads == 20 and _mla_split_route_selected(
+            ctx,
+            block_size=latent_cache.block_size,
+            total_q_tokens=seq_len,
+            num_heads=inner.num_heads,
+            heads_per_tg=5,
+        ):
+            heads_per_tg = 5
 
         out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
             q_pe=q_pe_kernel,
             latent_cache=latent_cache.latent_caches[layer_idx],
-            block_tables=block_tables_mx,
-            context_lens=context_lens_mx,
-            cu_seqlens_q=cu_seqlens_q_mx,
+            block_tables=meta.block_tables,
+            context_lens=meta.context_lens,
+            cu_seqlens_q=meta.cu_seqlens_q,
             scale=self._attention_scale(),
-            heads_per_tg=self._pick_heads_per_tg(inner.num_heads, seq_len),
+            heads_per_tg=heads_per_tg,
         )
 
         # Recover v_head_dim and assemble [1, seq_len, num_heads * v_head_dim]
@@ -414,7 +490,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             mx.async_eval(latent_cache.latent_caches[layer_idx])
             return inner.o_proj(final)
 
-        # Env-gated single-pass Metal kernel fast path. Falls through
+        # Env-gated Metal MLA kernel fast path. Falls through
         # to the per-request MLX SDPA loop below when the gate rejects
         # (VLLM_METAL_MLA_KERNEL unset, wrong inner dims, non-decode,
         # or unsupported block_size / dtype).

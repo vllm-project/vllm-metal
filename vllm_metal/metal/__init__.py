@@ -191,6 +191,30 @@ def metal_mla_paged_attention(
     return out
 
 
+def metal_mla_split_plan(
+    *,
+    total_q_tokens: int,
+    num_seqs: int,
+    num_heads: int,
+    heads_per_tg: int,
+    max_seq_len: int,
+) -> dict[str, int | bool]:
+    """Return the C++ MLA split-KV plan for a shape."""
+    partition, partition_size, max_num_partitions, gate_grid = get_ops().mla_split_plan(
+        total_q_tokens,
+        num_seqs,
+        num_heads,
+        heads_per_tg,
+        max_seq_len,
+    )
+    return {
+        "partition": bool(partition),
+        "partition_size": int(partition_size),
+        "max_num_partitions": int(max_num_partitions),
+        "gate_grid": int(gate_grid),
+    }
+
+
 def get_ops() -> ModuleType:
     """Import the native paged_ops extension and initialise its Metal libraries.
 
