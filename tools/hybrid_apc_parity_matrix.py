@@ -49,7 +49,9 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import queue as queue_mod
 import sys
+import time
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
 
@@ -144,9 +146,15 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
             "max_model_len": 2048,
             "max_num_seqs": 4,
             "enable_prefix_caching": enable_prefix_caching,
+            # profile_run builds a single (1, max_num_batched_tokens) dummy
+            # sequence. Without a cap the LLM-class default (8192) makes that
+            # dummy four times longer than max_model_len, and its full-vocab
+            # logits alone can push the measured overhead past the KV budget
+            # on 16 GB hosts (negative kv_budget -> startup rejection). Keep
+            # the profile within the shapes this harness actually runs.
+            "max_num_batched_tokens": 2048 if mnbt is None else mnbt,
         }
         if mnbt is not None:
-            kwargs["max_num_batched_tokens"] = mnbt
             kwargs["enable_chunked_prefill"] = True
         llm = LLM(**kwargs)
         cache_config = llm.llm_engine.vllm_config.cache_config
@@ -189,7 +197,25 @@ def run_pair(model, mnbt, shared_corpus, quick=False):
         )
         proc.start()
         try:
-            per_mode[enable] = queue.get(timeout=1500)
+            # Poll instead of a single long get: if the child dies during
+            # engine startup (e.g. a capacity rejection) it never reaches
+            # queue.put, and a bare get(timeout=1500) would sit for 25
+            # minutes before surfacing an unrelated queue.Empty. Fail fast
+            # with the child's exit code instead.
+            deadline = time.monotonic() + 1500
+            while True:
+                try:
+                    per_mode[enable] = queue.get(timeout=5)
+                    break
+                except queue_mod.Empty:
+                    if proc.exitcode is not None:
+                        raise RuntimeError(
+                            f"child (prefix_caching={enable}) exited with "
+                            f"{proc.exitcode} before reporting results; "
+                            "see its traceback above"
+                        ) from None
+                    if time.monotonic() >= deadline:
+                        raise
         finally:
             proc.join(timeout=60)
             if proc.is_alive():
