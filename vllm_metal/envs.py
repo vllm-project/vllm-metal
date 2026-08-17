@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
+    VLLM_METAL_COMPILED_MLP: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -66,6 +67,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DECODE_PIPELINE": lambda: (
         os.getenv("VLLM_METAL_DECODE_PIPELINE", "1") == "1"
     ),
+    # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
+    # block calls run through an mx.compile trace, fusing the per-layer
+    # elementwise glue. Bitwise-identical on the quantized serving path;
+    # set to "1" to enable, the default keeps the eager per-op dispatch.
+    "VLLM_METAL_COMPILED_MLP": lambda: os.getenv("VLLM_METAL_COMPILED_MLP", "0") == "1",
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode

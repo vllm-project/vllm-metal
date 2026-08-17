@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
+from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
@@ -157,6 +158,19 @@ class ModelLifecycle:
             runner.model_config,
             runner.tokenizer,
         )
+
+    def install_decode_dispatch(self) -> None:
+        """Install the compiled-MLP decode dispatch."""
+        if self._runner._is_pooling:
+            # Pooling runners never decode; their backends may also wrap the
+            # model in non-nn.Module shims the installer must not walk.
+            return
+        if getattr(self._runner.vllm_config, "lora_config", None) is not None:
+            # LoRA setup rebinds projection modules inside the blocks after
+            # install and swaps adapter state per batch; a compiled trace
+            # would freeze that state at first call. LoRA serves stay eager.
+            return
+        CompiledMLPBlocks.install(self._runner._forward_model)
 
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""

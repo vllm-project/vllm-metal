@@ -2128,13 +2128,19 @@ class TestLoadModelPipelineSplitOrdering:
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
-        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: events.append("load"),
+            install_decode_dispatch=lambda: events.append("install"),
+        )
         runner.apply_pipeline_split = lambda pp: events.append("split")
         runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
 
         runner.load_model()
 
-        assert events == ["load", "split", "lora"]
+        # Decode-dispatch installs wrap model modules in place, so they
+        # come after the split prunes non-owned layers, and the split itself
+        # stays adjacent to the (lazy) load before LoRA setup.
+        assert events == ["load", "split", "install", "lora"]
 
 
 class _StageDummyRecorder:
@@ -3010,7 +3016,10 @@ class TestIntermediateBodyOnlyForward:
             kv_cache_dtype=None,
         )
         runner._intermediate_forward_supported = False
-        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: events.append("load"),
+            install_decode_dispatch=lambda: events.append("install"),
+        )
         runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
 
         # Act

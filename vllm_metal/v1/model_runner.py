@@ -568,6 +568,9 @@ class MetalModelRunner:
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
+        # Wraps modules in place, so it runs after the split prunes
+        # non-owned layers (load -> split -> install; ordering test pins it).
+        self._model_lifecycle.install_decode_dispatch()
         # Resolve the intermediate-forward capability once; unsupported
         # models keep the full-logits forward on every step.
         self._intermediate_forward_supported = (
