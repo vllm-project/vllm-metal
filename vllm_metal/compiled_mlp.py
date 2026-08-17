@@ -27,6 +27,7 @@ from typing import Any, ClassVar
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_unflatten
 from vllm.logger import init_logger
 
 from vllm_metal import envs as metal_envs
@@ -50,10 +51,10 @@ class CompiledMLPBlocks:
     def install(cls, model: Any) -> int:
         """Wrap every stateless MLP/MoE block in *model*.
 
-        Walks the module tree and replaces each exact-type target with a
-        :class:`CompiledMLPBlock` wrapper. Gated by
-        ``VLLM_METAL_COMPILED_MLP``; idempotent per module. Returns the
-        number of wrapped modules.
+        Collects targets via ``named_modules()`` and replaces them through
+        ``update_modules(tree_unflatten(...))`` — the same replacement
+        idiom the LoRA wrapper uses. Gated by ``VLLM_METAL_COMPILED_MLP``;
+        idempotent per module. Returns the number of wrapped modules.
         """
         if not metal_envs.VLLM_METAL_COMPILED_MLP:
             return 0
@@ -67,131 +68,133 @@ class CompiledMLPBlocks:
                 f"{type(model).__name__}"
             )
         policies = cls._target_policies()
-        targets = tuple(policies)
-        wrapped = 0
-
-        def walk_container(owner: nn.Module, sub: Any) -> None:
-            # children() rebuilds dict/list containers, so writes to them
-            # never reach the model — a bare target here would be an
-            # un-wrappable module and must not be skipped silently.
-            if type(sub) in targets:
-                raise RuntimeError(
-                    "CompiledMLPBlocks.install found a "
-                    f"{type(sub).__name__} inside a raw container of "
-                    f"{type(owner).__name__}; it can only wrap module "
-                    "attributes."
-                )
-            walk(sub)
-
-        def walk(mod: Any) -> None:
-            nonlocal wrapped
-            if not isinstance(mod, nn.Module):
-                return
-            for name, child in mod.children().items():
-                if type(child) in targets:
-                    setattr(mod, name, CompiledMLPBlock(child, policies[type(child)]))
-                    wrapped += 1
-                elif isinstance(child, CompiledMLPBlock):
-                    continue  # already wrapped (idempotency)
-                elif isinstance(child, nn.Module):
-                    walk(child)
-                elif isinstance(child, dict):
-                    for sub in child.values():
-                        walk_container(mod, sub)
-                elif isinstance(child, list):
-                    for sub in child:
-                        walk_container(mod, sub)
-
-        walk(model)
-        if wrapped:
+        # Everything under an already-installed wrapper (its inner and any
+        # target nested inside it, like the MoE block's shared expert) is a
+        # bare target instance in the module tree; exclude the whole
+        # subtree so a re-install is a no-op.
+        wrapper_prefixes = [
+            name + "."
+            for name, module in model.named_modules()
+            if isinstance(module, CompiledMLPBlock)
+        ]
+        candidates = {
+            name: module
+            for name, module in model.named_modules()
+            if type(module) in policies
+            and not any(name.startswith(prefix) for prefix in wrapper_prefixes)
+        }
+        # Wrap outermost targets only: a target nested inside another (the
+        # MoE block's shared-expert MLP) compiles as part of the outer trace.
+        outermost = [
+            name
+            for name in candidates
+            if not any(
+                name.startswith(other + ".") for other in candidates if other != name
+            )
+        ]
+        replacements = [
+            (name, policies[type(candidates[name])](candidates[name]))
+            for name in sorted(outermost)
+        ]
+        if replacements:
+            model.update_modules(tree_unflatten(replacements))
             logger.info(
                 "Metal: compiled MLP dispatch wrapped %d blocks "
                 "(mx.compile on decode-shaped calls).",
-                wrapped,
+                len(replacements),
             )
-        return wrapped
-
-    # The plain activations-only call per target type: every entry is an
-    # exact (args, kwargs) pair the wrapper may route through the trace.
-    _PLAIN_CALL: ClassVar[tuple[tuple[tuple[Any, ...], dict[str, Any]], ...]] = (
-        ((), {}),
-    )
-    _PLAIN_CALL_TARGET_VERIFY: ClassVar[
-        tuple[tuple[tuple[Any, ...], dict[str, Any]], ...]
-    ] = (
-        ((), {}),
-        ((False,), {}),
-        ((), {"target_verify": False}),
-    )
+        return len(replacements)
 
     @classmethod
-    def _target_policies(cls) -> dict[type, tuple]:
-        # The Qwen3-Next family blocks (Qwen3.5/3.6/3.8 share them via the
-        # qwen3_5 arch): the sparse MoE block (router + expert gathers +
-        # shared expert) and the dense MLP, plus mlx_vlm's dense MLP for
-        # conditional-generation checkpoints served through the VLM loader.
-        # All are stateless by construction — extending this table requires
-        # the same property. mlx_vlm's MLP takes a default-off target_verify
-        # flag; its signature is validated at install so an mlx-vlm bump
-        # that changes it fails fast instead of silently mis-routing.
+    def _target_policies(cls) -> dict[type, type]:
+        """Target block type -> wrapper class (one per calling convention).
+
+        The Qwen3-Next family blocks (Qwen3.5/3.6/3.8 share them via the
+        qwen3_5 arch) take a plain activations-only call; mlx_vlm's dense
+        and MoE variants add a default-off ``target_verify`` flag, whose
+        signatures are validated here so an mlx-vlm bump that changes them
+        fails fast instead of silently mis-routing. All targets are
+        stateless by construction — extending this table requires the same
+        property.
+        """
         import inspect
 
         from mlx_lm.models.qwen3_next import Qwen3NextMLP, Qwen3NextSparseMoeBlock
         from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            Qwen3_5MoeMLP,
+            Qwen3_5MoeSparseMoeBlock,
+        )
 
-        params = list(inspect.signature(Qwen3_5MLP.__call__).parameters)
-        if params != ["self", "x", "target_verify"]:
-            raise RuntimeError(
-                "mlx_vlm Qwen3_5MLP.__call__ signature changed "
-                f"({params}); update CompiledMLPBlocks' plain-call policy "
-                "before wrapping it."
-            )
+        for target in (Qwen3_5MLP, Qwen3_5MoeMLP, Qwen3_5MoeSparseMoeBlock):
+            params = list(inspect.signature(target.__call__).parameters)
+            if params != ["self", "x", "target_verify"]:
+                raise RuntimeError(
+                    f"mlx_vlm {target.__name__}.__call__ signature changed "
+                    f"({params}); update CompiledMLPBlocks' wrapper policy "
+                    "before wrapping it."
+                )
         return {
-            Qwen3NextSparseMoeBlock: cls._PLAIN_CALL,
-            Qwen3NextMLP: cls._PLAIN_CALL,
-            Qwen3_5MLP: cls._PLAIN_CALL_TARGET_VERIFY,
+            Qwen3NextSparseMoeBlock: CompiledMLPBlock,
+            Qwen3NextMLP: CompiledMLPBlock,
+            Qwen3_5MLP: CompiledTargetVerifyMLPBlock,
+            Qwen3_5MoeMLP: CompiledTargetVerifyMLPBlock,
+            Qwen3_5MoeSparseMoeBlock: CompiledTargetVerifyMLPBlock,
         }
 
 
 class CompiledMLPBlock(nn.Module):
-    """Per-module wrapper routing decode-shaped calls to a compiled trace.
+    """Wrapper for unary stateless blocks: ``__call__(x)``.
 
     The inner block stays a normally registered child, so its weights
     remain visible to ``model.parameters()``/``tree_flatten`` and
     ``train()``/``eval()`` propagate as usual. The compiled trace captures
-    the inner module's (load-final) weights; training-mode calls and
+    the inner module's (load-final) weights; training-mode and
     prefill-sized calls delegate to the eager inner block unchanged.
     """
 
-    def __init__(self, inner: Any, plain_calls: tuple) -> None:
+    def __init__(self, inner: Any) -> None:
         super().__init__()
         self.inner = inner
         # Inherit the inner module's mode: install runs on an already
         # eval'd model, and a fresh nn.Module defaults to training=True.
         self.train(inner.training)
-        self._plain_calls = plain_calls
         self._compiled = mx.compile(inner.__call__)
 
-    def routes_compiled(self, x: mx.array, args: tuple, kwargs: dict) -> bool:
-        """Whether this exact call goes through the compiled trace.
+    def routes_compiled(self, x: mx.array) -> bool:
+        """Whether a decode-shaped call goes through the compiled trace.
 
-        The single routing decision, shared with the parity harness's
-        reach spy: the call must match one of the target type's exact
-        plain-call forms, the wrapper must be in eval mode, and the input
-        must be a decode-shaped single-row batch in a serving dtype (the
-        layout/dtype checks also keep the compile cache bounded to at
-        most MAX_COMPILED_TOKENS x two dtypes specializations).
+        Shared with the parity harness's reach spy. The layout/dtype
+        checks also bound each module's compile cache to at most
+        MAX_COMPILED_TOKENS shapes per serving dtype.
         """
         return (
-            (args, kwargs) in self._plain_calls
-            and not self.training
+            not self.training
             and x.ndim == 3
             and x.shape[0] == 1
             and x.shape[1] <= CompiledMLPBlocks.MAX_COMPILED_TOKENS
             and x.dtype in (mx.float16, mx.bfloat16)
         )
 
-    def __call__(self, x: mx.array, *args: Any, **kwargs: Any) -> mx.array:
-        if self.routes_compiled(x, args, kwargs):
-            return self._compiled(x)
-        return self.inner(x, *args, **kwargs)
+    def dispatch_compiled(self, x: mx.array) -> mx.array:
+        """Run the compiled trace (the harness spy's single choke point)."""
+        return self._compiled(x)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.routes_compiled(x):
+            return self.dispatch_compiled(x)
+        return self.inner(x)
+
+
+class CompiledTargetVerifyMLPBlock(CompiledMLPBlock):
+    """Wrapper for blocks called as ``__call__(x, target_verify=False)``.
+
+    mlx_vlm's decoder layers pass the flag on every call; its default-off
+    form is the plain call, while a truthy flag (spec-decode verify)
+    delegates to the eager inner block unchanged.
+    """
+
+    def __call__(self, x: mx.array, target_verify: bool = False) -> mx.array:
+        if target_verify is False and self.routes_compiled(x):
+            return self.dispatch_compiled(x)
+        return self.inner(x, target_verify)

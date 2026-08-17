@@ -49,18 +49,17 @@ def run_child(model: str, enabled: bool, quick: bool, queue) -> None:
 
     import vllm_metal.compiled_mlp as cm
 
-    # Reach spy: count compiled-branch dispatches via the wrapper's own
-    # routing decision (routes_compiled), so the count cannot drift from
-    # what the wrapper actually sends through the trace.
+    # Reach spy on dispatch_compiled — the wrapper's single choke point
+    # into the trace — so the count cannot drift from what actually ran
+    # compiled.
     calls = {"n": 0}
-    orig_call = cm.CompiledMLPBlock.__call__
+    orig_dispatch = cm.CompiledMLPBlock.dispatch_compiled
 
-    def spy(self, x, *args, **kwargs):
-        if self.routes_compiled(x, args, kwargs):
-            calls["n"] += 1
-        return orig_call(self, x, *args, **kwargs)
+    def spy(self, x):
+        calls["n"] += 1
+        return orig_dispatch(self, x)
 
-    cm.CompiledMLPBlock.__call__ = spy
+    cm.CompiledMLPBlock.dispatch_compiled = spy
     try:
         llm = LLM(model=model, max_model_len=2048, max_num_seqs=4)
         prompts = PROMPTS[:1] if quick else PROMPTS
@@ -70,7 +69,7 @@ def run_child(model: str, enabled: bool, quick: bool, queue) -> None:
             out = llm.generate([prompt], sp)[0]
             results[prompt] = list(out.outputs[0].token_ids)
     finally:
-        cm.CompiledMLPBlock.__call__ = orig_call
+        cm.CompiledMLPBlock.dispatch_compiled = orig_dispatch
 
     if enabled:
         assert calls["n"] >= len(prompts), (

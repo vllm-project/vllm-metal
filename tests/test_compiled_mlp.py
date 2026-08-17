@@ -18,7 +18,11 @@ from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
 
 import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
-from vllm_metal.compiled_mlp import CompiledMLPBlock, CompiledMLPBlocks
+from vllm_metal.compiled_mlp import (
+    CompiledMLPBlock,
+    CompiledMLPBlocks,
+    CompiledTargetVerifyMLPBlock,
+)
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
 DIM = 64
@@ -169,9 +173,11 @@ class TestInstall:
         assert isinstance(deep.head.mlp, CompiledMLPBlock)
 
     def test_install_is_idempotent(self, monkeypatch):
-        # Arrange
+        # Arrange — the MoE block nests another target (its shared-expert
+        # MLP); a re-install must not wrap anything beneath the existing
+        # wrapper.
         _require_metal()
-        host = _Host(_dense_mlp())
+        host = _Host(_moe_block())
 
         # Act
         first = _install(monkeypatch, host)
@@ -182,26 +188,48 @@ class TestInstall:
         assert first == 1
         assert second == 0
         assert host.mlp is wrapper
+        assert not isinstance(wrapper.inner.shared_expert, CompiledMLPBlock)
+
+    def test_vlm_moe_family_is_registered(self, monkeypatch):
+        # Arrange — the qwen3_5_moe package's blocks use the target_verify
+        # convention; the dense variant is cheap to construct, the sparse
+        # block's registration and wrapper class are pinned via the policy.
+        _require_metal()
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            Qwen3_5MoeMLP,
+            Qwen3_5MoeSparseMoeBlock,
+        )
+
+        policies = CompiledMLPBlocks._target_policies()
+        assert policies[Qwen3_5MoeSparseMoeBlock] is CompiledTargetVerifyMLPBlock
+        mx.random.seed(15)
+        inner = Qwen3_5MoeMLP(DIM, HIDDEN)
+        inner.eval()
+        mx.eval(inner.parameters())
+        host = _Host(inner)
+        x = mx.random.normal((1, 2, DIM)).astype(mx.float16)
+        reference = inner(x)
+
+        # Act
+        assert _install(monkeypatch, host) == 1
+        calls = _spy_compiled(host.mlp)
+        out = host.mlp(x)
+        out_verify = host.mlp(x, True)
+
+        # Assert
+        assert isinstance(host.mlp, CompiledTargetVerifyMLPBlock)
+        assert calls["n"] == 1  # plain engaged; target_verify=True eager
+        mx.eval(reference, out, out_verify)
+        np.testing.assert_array_equal(
+            np.array(reference.astype(mx.float32)),
+            np.array(out.astype(mx.float32)),
+        )
 
     def test_non_module_install_target_fails_fast(self, monkeypatch):
         # Arrange / Act / Assert
         monkeypatch.setenv("VLLM_METAL_COMPILED_MLP", "1")
         with pytest.raises(TypeError, match="expects an mlx nn.Module"):
             CompiledMLPBlocks.install(object())
-
-    def test_bare_target_in_raw_container_fails_fast(self, monkeypatch):
-        # Arrange — children() rebuilds raw containers, so a bare target
-        # inside one would be un-wrappable; install must refuse loudly.
-        _require_metal()
-
-        class _RawHost(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.pair = [_dense_mlp()]
-
-        # Act / Assert
-        with pytest.raises(RuntimeError, match="raw container"):
-            _install(monkeypatch, _RawHost())
 
     def test_weights_stay_in_the_parameter_tree(self, monkeypatch):
         # Arrange — the wrapper registers the inner module normally.
@@ -287,9 +315,9 @@ class TestDispatch:
         calls = _spy_compiled(host.mlp)
 
         # Act — default-off target_verify (positional or named) is the
-        # plain call and engages; a truthy flag or an invalid duplicate
-        # stays eager (the duplicate raises in the inner block, exactly
-        # like the unwrapped module would).
+        # plain call and engages; a truthy flag stays eager, and an invalid
+        # duplicate raises at the wrapper exactly like the unwrapped module.
+        assert isinstance(host.mlp, CompiledTargetVerifyMLPBlock)
         out_plain = host.mlp(x)
         out_default = host.mlp(x, target_verify=False)
         out_verify = host.mlp(x, True)
