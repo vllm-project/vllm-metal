@@ -326,6 +326,144 @@ class TestTargetForward:
         assert output.hidden_states.tolist() == [[2.0, 3.0]]
         assert output.logits.tolist() == [[[6.0, 7.0]]]
 
+    def test_selective_logits_match_the_full_projection_rows(self) -> None:
+        # The head must see only the requested rows, and the result must equal
+        # those rows of the full projection.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
+
+        class Head:
+            def __init__(self) -> None:
+                self.seen_rows: int | None = None
+
+            def __call__(self, hidden_states):
+                self.seen_rows = hidden_states.shape[-2]
+                return hidden_states * 3.0
+
+        head = Head()
+        model = SimpleNamespace(
+            model=Backbone(), lm_head=head, final_logit_softcapping=None
+        )
+        adapter = DefaultModelAdapter()
+
+        full = adapter.target_forward(
+            model, mx.array([[1, 2, 3, 4]]), cache=[], collect_hidden_states=True
+        )
+        selected = adapter.target_forward(
+            model,
+            mx.array([[1, 2, 3, 4]]),
+            cache=[],
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+
+        assert head.seen_rows == 2
+        assert selected.logits.tolist() == [
+            [full.logits[0, 1].tolist(), full.logits[0, 3].tolist()]
+        ]
+
+    def test_selective_logits_keep_full_hidden_states_for_mtp(self) -> None:
+        # Gemma4 MTP seeds index target_hidden_row in the packed layout, so the
+        # hidden states must stay row-major over every input row.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=None,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2, 3]]),
+            cache=[],
+            collect_hidden_states=True,
+            logits_indices=mx.array([2], dtype=mx.int32),
+        )
+
+        assert output.hidden_states.shape == (3, 2)
+        assert output.logits.shape == (1, 1, 2)
+
+    def test_selective_logits_apply_softcapping_to_selected_rows(self) -> None:
+        # Post-projection scaling must not be skipped by the selective path.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[-2.0, 0.0], [2.0, 4.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=2.0,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2]]),
+            cache=[],
+            logits_indices=mx.array([1], dtype=mx.int32),
+        )
+
+        expected = mx.tanh(mx.array([[[2.0, 4.0]]]) / 2.0) * 2.0
+        mx.eval(output.logits, expected)
+        assert mx.allclose(output.logits, expected).item()
+
+
+class TestSupportsSelectiveLogits:
+    """The load-time probe that decides whether the split backbone/head path
+    reproduces a model's own output head.
+
+    A wrapper may scale inside its own ``__call__``, which the split path would
+    not reproduce, so the probe compares a one-row forward both ways and only
+    accepts an exact match."""
+
+    def test_accepts_a_head_reproduced_by_the_split_path(self) -> None:
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache))
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is True
+
+    def test_rejects_a_head_with_scaling_hidden_in_the_forward(self) -> None:
+        # The wrapper multiplies after the head, the way Cohere's logit_scale or
+        # Granite's logits_scaling do.  The split path cannot see that, so the
+        # probe must decline rather than return wrong logits.
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache)) * 0.5
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+    def test_rejects_a_model_the_split_path_cannot_drive(self) -> None:
+        # No `.model` backbone: the split path raises, so the probe declines
+        # instead of propagating out of load_model.
+        class Model:
+            def __call__(self, input_ids, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+
+class TestTargetForwardEmbeddings:
     def test_target_input_embeddings_use_target_embed_scale(self) -> None:
         class Embedding:
             def __call__(self, input_ids):

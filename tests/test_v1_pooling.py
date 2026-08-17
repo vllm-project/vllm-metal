@@ -619,7 +619,7 @@ class TestMetalPoolingCapabilities:
             patch.object(lifecycle, "resolve_model_dims"),
             patch.object(lifecycle, "_install_runtime_extensions"),
         ):
-            runner._lora = SimpleNamespace(setup=setup_lora)
+            runner._lora = SimpleNamespace(enabled=False, setup=setup_lora)
             runner.load_model()
 
         assert events == ["lora"]

@@ -256,6 +256,41 @@ class TestApplyGrammarBitmaskPaged:
         for row in [1, 2]:
             assert np.all(np.isfinite(result[0, row]))
 
+    def test_compact_mixed_layout_keeps_decode_rows_and_moves_prefill_rows(
+        self,
+    ) -> None:
+        """Compact layout: decode rows stay in place, prefill rows move down.
+
+        Packed rows are [d0][p0 x3] = 4 rows; the projected tensor is
+        [d0][p0 last] = 2 rows. The decode row keeps index 0 (that is why the
+        decode prefix is never gathered), and p0's row moves from 3 to 1.
+        """
+        allowed_decode = 7
+        allowed_prefill = 15
+        logits = _uniform_logits_3d(2)
+        decode_reqs = [_make_decode_req("d0")]
+        prefill_reqs = [_make_prefill_req("p0", 3)]
+        compact_cu = [0, 1, 2]
+        sched = _make_scheduler_output(["d0", "p0"])
+        bitmask = np.vstack(
+            [
+                _make_single_token_bitmask(allowed_decode),
+                _make_single_token_bitmask(allowed_prefill),
+            ]
+        )
+        grammar = _make_grammar_output(["d0", "p0"], bitmask)
+
+        result = _to_numpy(
+            _applier.apply_paged(
+                sched, grammar, decode_reqs, prefill_reqs, compact_cu, 1, logits
+            )
+        )
+
+        assert np.isfinite(result[0, 0, allowed_decode])
+        assert result[0, 0, (allowed_decode + 1) % VOCAB_SIZE] == float("-inf")
+        assert np.isfinite(result[0, 1, allowed_prefill])
+        assert result[0, 1, (allowed_prefill + 1) % VOCAB_SIZE] == float("-inf")
+
     def test_row_span_metadata_masks_verification_rows_and_prefill_tail(self) -> None:
         """Row-span metadata must mask structured rows while leaving plain spec rows alone."""
         allowed_decode_rows = (7, 8, 9)
@@ -783,6 +818,7 @@ class TestSampleTokensGrammarPagedPath:
             logits=logits,
             target_hidden_states=None,
             cu_seqlens=[0, 1],
+            logits_cu_seqlens=[0, 1],
             decode_segments=(
                 mr.PagedDecodeSegment(
                     req_id="r0",

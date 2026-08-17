@@ -156,8 +156,16 @@ class ModelAdapter(Protocol):
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target text model and optionally retain target hidden states."""
+        """Run the target text model and optionally retain target hidden states.
+
+        ``logits_indices`` requests logits for those input rows only, and is
+        valid only when :meth:`supports_selective_logits` returned ``True``.
+        """
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether ``target_forward`` may honour ``logits_indices`` for ``model``."""
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -410,9 +418,15 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target model and return logits plus optional hidden states."""
-        if not collect_hidden_states:
+        """Run the target model and return logits plus optional hidden states.
+
+        ``logits_indices`` projects the head outside the model's own
+        ``__call__``, so callers must gate it on
+        :meth:`supports_selective_logits`; this method trusts them.
+        """
+        if logits_indices is None and not collect_hidden_states:
             output = model(input_ids, cache=cache)
             return TargetModelForwardOutput(
                 logits=self.extract_logits(output),
@@ -424,11 +438,58 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             input_ids,
             cache=cache,
         )
-        logits = self._compute_target_logits(model, hidden_states)
+        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
+        if logits_indices is None:
+            logits = self._compute_target_logits(model, hidden_states)
+            return TargetModelForwardOutput(
+                logits=logits,
+                hidden_states=flat_hidden_states if collect_hidden_states else None,
+            )
+
+        # `[None]` restores the leading batch axis the callers' `logits[0, row]`
+        # indexing expects. The hidden states stay row-major over ALL input rows,
+        # so the drafter's `target_hidden_row` keeps indexing the packed layout.
+        selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
         return TargetModelForwardOutput(
-            logits=logits,
-            hidden_states=self._flatten_target_hidden_states(hidden_states),
+            logits=self._compute_target_logits(model, selected_hidden_states[None]),
+            hidden_states=flat_hidden_states if collect_hidden_states else None,
         )
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether the split backbone/head path reproduces this model's head.
+
+        No ``mlx_lm`` model exposes a ``compute_logits`` contract, and some scale
+        the head output inside their own ``__call__`` (Cohere's ``logit_scale``,
+        Granite's ``logits_scaling``), which `_compute_target_logits` would not
+        reproduce — a silent wrong-logits bug rather than a crash. Rather than
+        keep a model allowlist in sync with ``mlx_lm``, probe the loaded object
+        for bit-exact agreement on one row.
+
+        Resolved once after load: the probe runs a cacheless forward, which is
+        only safe while no ``PagedAttentionContext`` is installed.
+        """
+        probe_ids = mx.zeros((1, 1), dtype=mx.int32)
+        try:
+            reference = self.extract_logits(model(probe_ids, cache=None))
+            hidden_states = self._forward_target_hidden_states(
+                model, probe_ids, cache=None
+            )
+            split = self._compute_target_logits(model, hidden_states)
+            mx.eval(reference, split)
+            # array_equal is False on a shape mismatch, so this covers both.
+            matches = bool(mx.array_equal(reference, split).item())
+        except Exception:
+            # A wrapper the split path cannot drive (extra forward argument,
+            # missing backbone, unexpected output container).
+            matches = False
+
+        if not matches:
+            logger.info(
+                "Metal: %s output head is not reproducible outside its forward; "
+                "using full logits.",
+                type(model).__name__,
+            )
+        return matches
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for Gemma4 MTP feedback."""

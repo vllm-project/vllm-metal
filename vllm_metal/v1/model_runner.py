@@ -284,6 +284,18 @@ class _ExecutionBatch:
         return DecoderPoolingBatch(tuple(spans))
 
 
+class _PagedLogitsLayout(NamedTuple):
+    """How the head projects this step's packed rows.
+
+    ``indices`` is None when every packed row gets projected: unsupported
+    models and steps with nothing to drop both keep the model's own
+    ``__call__``. ``cu_seqlens`` always describes the resulting logits.
+    """
+
+    indices: mx.array | None
+    cu_seqlens: list[int]
+
+
 class _PagedForwardState(NamedTuple):
     """State stashed by ``_start_paged_forward`` for ``_sample_paged_batch``."""
 
@@ -296,6 +308,9 @@ class _PagedForwardState(NamedTuple):
     cu_seqlens: list[int]
     decode_segments: tuple[PagedDecodeSegment, ...]
     num_decode_tokens: int
+    # Boundaries in ``logits``; equals ``cu_seqlens`` unless the forward
+    # projected only the sampled rows.
+    logits_cu_seqlens: list[int]
     # ``{req_id: mrope_position_delta}`` from paged mm prefill;
     # ``_sample_paged_batch`` stashes each onto ``RequestState``.
     mm_prefill_deltas: dict[str, int]
@@ -399,6 +414,10 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+
+        # Resolved in load_model by probing the output head; False until then so
+        # a partially initialized runner keeps full logits.
+        self._selective_logits_supported: bool = False
 
         # Pipeline-parallel group (set by the worker when pipeline_parallel_size
         # > 1). None means single-stage: the forward and sampling paths run
@@ -589,6 +608,15 @@ class MetalModelRunner:
             dtype=self.kv_cache_dtype or mx.float16,
             max_position_embeddings=max_position_embeddings,
         )
+        # Probed here because it runs a cacheless one-token forward, which is
+        # only safe before a paged context is installed. PP and multimodal take
+        # other forward branches that never request selection.
+        self._selective_logits_supported = (
+            self.pp is None
+            and not self._is_vlm
+            and not self._lora.enabled
+            and self._model_adapter.supports_selective_logits(self._forward_model)
+        )
         if self._is_pooling:
             self._model_lifecycle.install_pooling_backend()
 
@@ -695,12 +723,50 @@ class MetalModelRunner:
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
             cache=cache,
             collect_hidden_states=collect_hidden_states,
+            logits_indices=logits_indices,
+        )
+
+    def _paged_logits_layout(
+        self,
+        cu_seqlens: list[int],
+        *,
+        num_decode_segments: int,
+    ) -> _PagedLogitsLayout:
+        """Pick the rows the sampler reads, and the boundaries they land on.
+
+        The packed order is ``[decode/spec rows][prefill 0 rows]...``. Every
+        decode row is consumed (spec verification reads its whole span), but
+        prefill sampling only ever reads each segment's last row, so the head
+        need not project the rest.
+
+        No ``indices`` means every row is already needed — a pure-decode step,
+        or one whose prefill segments are all single-token — so those keep the
+        model's own ``__call__``, pay no gather, and keep the packed
+        boundaries.
+        """
+        decode_bounds = cu_seqlens[: num_decode_segments + 1]
+        # Boundaries past the decode prefix are the prefill segment ends; the
+        # row before each is the one prefill sampling reads.
+        prefill_ends = cu_seqlens[num_decode_segments + 1 :]
+        num_decode_rows = decode_bounds[-1]
+        num_selected = num_decode_rows + len(prefill_ends)
+        if not self._selective_logits_supported or num_selected == cu_seqlens[-1]:
+            return _PagedLogitsLayout(None, cu_seqlens)
+        return _PagedLogitsLayout(
+            mx.array(
+                [*range(num_decode_rows), *(end - 1 for end in prefill_ends)],
+                dtype=mx.int32,
+            ),
+            # The decode/spec prefix keeps its boundaries; every prefill
+            # segment collapses to the single row that was projected.
+            [*decode_bounds, *range(num_decode_rows + 1, num_selected + 1)],
         )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
@@ -1202,7 +1268,18 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
+        # ---- build cu_seqlens for logit extraction ----
+        # Before the forward: the sampled-row selection derives from these.
+        cu_seqlens: list[int] = [0]
+        for segment in decode_segments:
+            cu_seqlens.append(cu_seqlens[-1] + segment.num_query_tokens)
+        for pr in prefill_reqs:
+            cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
+
         logits: mx.array | None = None
+        # Overwritten by the branch that runs the target forward; the other
+        # branches project nothing, so the packed boundaries stand.
+        logits_layout = _PagedLogitsLayout(None, cu_seqlens)
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         intermediate_hidden: mx.array | None = None
@@ -1334,10 +1411,15 @@ class MetalModelRunner:
                     logits = None
                     target_hidden_states = None
                 else:
+                    logits_layout = self._paged_logits_layout(
+                        cu_seqlens,
+                        num_decode_segments=len(decode_segments),
+                    )
                     target_output = self._target_forward(
                         input_ids,
                         cache=offset_caches,
                         collect_hidden_states=collect_target_hidden_states,
+                        logits_indices=logits_layout.indices,
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
@@ -1366,13 +1448,9 @@ class MetalModelRunner:
                 forward_outputs.append(target_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
-        # ---- build cu_seqlens for logit extraction ----
-        cu_seqlens: list[int] = [0]
-        for segment in decode_segments:
-            cu_seqlens.append(cu_seqlens[-1] + segment.num_query_tokens)
-        for pr in prefill_reqs:
-            cu_seqlens.append(cu_seqlens[-1] + len(pr.token_ids))
-
+        # `cu_seqlens` keeps describing the packed hidden states, which the
+        # pooler and the Gemma4 MTP proposer index; `logits_layout.cu_seqlens`
+        # describes the tensor the head actually produced.
         self._execute_model_state = _PagedForwardState(
             batch=batch,
             prefill_reqs=prefill_reqs,
@@ -1382,6 +1460,7 @@ class MetalModelRunner:
             target_hidden_states=target_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
+            logits_cu_seqlens=logits_layout.cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
             mm_prefill_deltas=mm_prefill_deltas,
@@ -1481,6 +1560,9 @@ class MetalModelRunner:
         target_hidden_states = paged_state.target_hidden_states
         pooling_hidden_states = paged_state.pooling_hidden_states
         cu_seqlens = paged_state.cu_seqlens
+        # Everything indexing `logits` uses these; `cu_seqlens` stays the packed
+        # hidden-state layout the pooler and MTP proposer index.
+        logits_cu_seqlens = paged_state.logits_cu_seqlens
         decode_segments = paged_state.decode_segments
         num_decode_segments = len(decode_segments)
         num_decode_tokens = paged_state.num_decode_tokens
@@ -1549,7 +1631,7 @@ class MetalModelRunner:
                 grammar_output,
                 decode_reqs,
                 prefill_reqs,
-                cu_seqlens,
+                logits_cu_seqlens,
                 num_decode_segments,
                 logits,
                 decode_segments=decode_segments,
@@ -1643,7 +1725,7 @@ class MetalModelRunner:
         prefill_result = sample_prefill_tokens(
             logits,
             prefill_reqs,
-            cu_seqlens,
+            logits_cu_seqlens,
             num_decode_segments,
             self._sampler,
             self.device,
