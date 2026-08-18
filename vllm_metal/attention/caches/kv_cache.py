@@ -155,7 +155,7 @@ class MetalPagedKVCache:
         if not turboquant:
             if layout is None:
                 self._allocate_dense_caches(dtype)
-                self._log_dense_cache(dtype)
+                self._log_dense_cache()
             else:
                 self._allocate_layout_caches(layout, dtype)
                 self._log_layout_cache(layout)
@@ -255,15 +255,13 @@ class MetalPagedKVCache:
                 )
             )
 
-    def _log_dense_cache(self, dtype: mx.Dtype) -> None:
-        kv_bytes = (
-            self.num_layers
-            * self.num_blocks
-            * self.block_size
-            * self.num_kv_heads
-            * self.head_dim
-            * 2
-            * self._dtype_size(dtype)
+    def _log_dense_cache(self) -> None:
+        # Sum the allocated arrays instead of multiplying the scalar
+        # ``num_kv_heads``/``head_dim``: heterogeneous layers are sized from
+        # ``kv_heads_per_layer``/``head_dim_per_layer`` while the scalars carry
+        # the widened dispatch shape, so the product over-bills narrow layers.
+        kv_bytes = sum(cache.nbytes for cache in self.key_caches) + sum(
+            cache.nbytes for cache in self.value_caches
         )
         logger.info(
             f"KV cache: {kv_bytes / 1e6:.1f} MB "
