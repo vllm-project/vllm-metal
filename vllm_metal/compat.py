@@ -8,8 +8,11 @@ diagnosable.
 
 from __future__ import annotations
 
+import importlib.abc
 import json
 import logging
+import os
+import sys
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -32,6 +35,7 @@ def apply_compat_patches() -> None:
     ensure_vllm_auto_fit_null_block_patch()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_transformers_exaone4_config()
+    ensure_vllm_uniproc_loopback_rendezvous_patch()
 
 
 def _apply_bytelevel_patch_during_registration() -> None:
@@ -889,3 +893,103 @@ def _wrap_model_sanitize(
     setattr(_patched_sanitize, sentinel_attr, True)
     model_cls.sanitize = _patched_sanitize
     return True
+
+
+def _install_uniproc_loopback_rendezvous(uniproc_executor: Any) -> None:
+    """Wrap ``UniProcExecutor._distributed_args`` to use a loopback rendezvous."""
+    if getattr(uniproc_executor, "_vllm_metal_uniproc_loopback_patched", False):
+        return
+
+    from vllm.utils.network_utils import get_tcp_uri
+
+    original = uniproc_executor.UniProcExecutor._distributed_args
+
+    def _distributed_args(self: Any) -> tuple[str, int, int]:
+        method, rank, local_rank = original(self)
+        if type(self) is not uniproc_executor.UniProcExecutor:
+            return method, rank, local_rank
+        if os.environ.get("VLLM_HOST_IP"):
+            return method, rank, local_rank
+        parallel = getattr(self.vllm_config, "parallel_config", None)
+        if parallel is None or getattr(parallel, "world_size", 1) != 1:
+            return method, rank, local_rank
+        if getattr(parallel, "distributed_executor_backend", None) not in (None, "uni"):
+            return method, rank, local_rank
+        try:
+            port = int(method.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            return method, rank, local_rank
+        return get_tcp_uri("127.0.0.1", port), rank, local_rank
+
+    uniproc_executor.UniProcExecutor._distributed_args = _distributed_args  # type: ignore[method-assign]
+    uniproc_executor._vllm_metal_uniproc_loopback_patched = True
+
+
+def ensure_vllm_uniproc_loopback_rendezvous_patch() -> None:
+    """Use loopback for the single-process rendezvous address.
+
+    ``get_ip()`` resolves the local address by opening a UDP socket toward
+    8.8.8.8 and returning ``getsockname()``. With a VPN active that yields the
+    tunnel interface, which gloo cannot bind for its local rendezvous, so
+    startup retries forever emitting only ``The server socket on [...] has timed
+    out, will retry.`` -- no error and no exit, so it reads as a slow model load
+    (vllm-metal#625).
+
+    A single-process engine has no peer to reach, so the rendezvous address only
+    needs to be bindable locally. The rewrite applies only when the executor is
+    exactly ``UniProcExecutor``, ``world_size == 1``, the executor backend is
+    ``uni`` or unset, and ``VLLM_HOST_IP`` is unset -- an explicit address always
+    wins. ``ExecutorWithExternalLauncher`` overrides ``_distributed_args`` with
+    ``env://`` and never reaches this code; Ray and multiproc executors build
+    their init method in their own modules. Ray, pipeline-parallel,
+    data-parallel and multi-node behaviour are unchanged.
+
+    Installed through a post-import hook rather than directly, because plugin
+    registration runs before ``vllm.v1.executor`` is importable (circular import
+    via ``vllm.utils.torch_utils``) and the executor is constructed in the
+    EngineCore subprocess, which does not re-run ``check_and_update_config``.
+    The hook fires when the module is first imported in whichever process needs
+    it. Patching ``network_utils.get_ip`` instead does not work: it is called
+    outside any ``set_current_vllm_config`` context, so the guard conditions
+    cannot be evaluated there.
+    """
+    module_name = "vllm.v1.executor.uniproc_executor"
+
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        _install_uniproc_loopback_rendezvous(existing)
+        return
+
+    if any(getattr(f, "_vllm_metal_uniproc_hook", False) for f in sys.meta_path):
+        return
+
+    class _UniprocLoopbackFinder(importlib.abc.MetaPathFinder):
+        _vllm_metal_uniproc_hook = True
+
+        def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+            if fullname != module_name:
+                return None
+            for finder in sys.meta_path:
+                if finder is self:
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None:
+                    break
+            else:
+                return None
+            loader = spec.loader
+            if loader is None:
+                return spec
+            original_exec = loader.exec_module
+
+            def exec_module(module: Any) -> None:
+                original_exec(module)
+                try:
+                    _install_uniproc_loopback_rendezvous(module)
+                except Exception as exc:  # noqa: BLE001 - never block the import
+                    logger.debug("Loopback rendezvous patch failed: %s", exc)
+
+            loader.exec_module = exec_module  # type: ignore[method-assign]
+            return spec
+
+    sys.meta_path.insert(0, _UniprocLoopbackFinder())
