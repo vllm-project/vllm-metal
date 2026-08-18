@@ -20,6 +20,7 @@ from vllm_metal.attention.impls.mla import (
 )
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
+from vllm_metal.metal import get_ops
 
 # Fixture dimensions matching GLM/DeepSeek-V2 defaults
 _KV_LORA_RANK = 512
@@ -640,10 +641,10 @@ class _KernelDimsAbsorbedInner(nn.Module):
     routing admission tests so ``_can_use_kernel`` actually exercises
     the accept path."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, num_heads: int = 8) -> None:
         super().__init__()
         self.q_lora_rank = None
-        self.num_heads = 8  # multiple of 2 so _pick_heads_per_tg returns 2
+        self.num_heads = num_heads
         self.q_head_dim = _KERNEL_NOPE_DIM + _KERNEL_ROPE_DIM
         self.qk_nope_head_dim = _KERNEL_NOPE_DIM
         self.qk_rope_head_dim = _KERNEL_ROPE_DIM
@@ -655,7 +656,7 @@ class _KernelDimsAbsorbedInner(nn.Module):
 
 
 def _make_kernel_dims_wrapper(
-    *, block_size: int = 16, dtype: mx.Dtype = mx.float16
+    *, block_size: int = 16, dtype: mx.Dtype = mx.float16, num_heads: int = 8
 ) -> MLAPagedAttentionWrapper:
     cache = MLAPagedLatentCache(
         num_layers=1,
@@ -665,7 +666,9 @@ def _make_kernel_dims_wrapper(
         dtype=dtype,
     )
     return MLAPagedAttentionWrapper(
-        inner=_KernelDimsAbsorbedInner(), layer_idx=0, latent_cache=cache
+        inner=_KernelDimsAbsorbedInner(num_heads=num_heads),
+        layer_idx=0,
+        latent_cache=cache,
     )
 
 
@@ -721,6 +724,21 @@ class TestMetalKernelRouting:
             )
             is True
         )
+
+    def test_glm_split_request_follows_device_plan(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+        wrapper = _make_kernel_dims_wrapper(block_size=32, num_heads=20)
+        ctx = _make_decode_ctx(ctx_len=32768, block_size=32)
+        gate_grid = (20 // 5) * len(ctx.context_lens)
+        target_partitions = min(
+            max((int(get_ops().min_decode_grid()) + gate_grid - 1) // gate_grid, 2),
+            64,
+        )
+
+        assert wrapper._can_use_kernel(
+            wrapper._inner, wrapper._mla_latent_cache, ctx
+        ) is (target_partitions >= 56)
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
         """Inner without embed_q / unembed_out (kv_b_proj-style models

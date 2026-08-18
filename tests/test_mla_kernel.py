@@ -175,6 +175,17 @@ def _assert_selected_split_plan(
         assert plan["max_num_partitions"] == 1
 
 
+def _h20_glm_target_partitions(num_rows: int) -> int:
+    gate_grid = (20 // 5) * num_rows
+    return min(
+        max((int(get_ops().min_decode_grid()) + gate_grid - 1) // gate_grid, 2), 64
+    )
+
+
+def _h20_glm_split_expected(num_rows: int) -> bool:
+    return _h20_glm_target_partitions(num_rows) >= 56
+
+
 def test_decode_split_kv_must_be_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     kwargs = {
         "total_q_tokens": 1,
@@ -592,6 +603,9 @@ def test_decode_split_kv_long_context_matches_reference(
 ) -> None:
     """Exercise the MLA split-KV path, including multi-partition reduce."""
     monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    use_glm_split_layout = num_heads == 20 and heads_per_tg == 5
+    if num_heads == 20 and heads_per_tg == 5:
+        expected_partition = _h20_glm_split_expected(num_rows=len(ctx_lens))
     _assert_selected_split_plan(
         ctx_lens=ctx_lens,
         num_heads=num_heads,
@@ -623,7 +637,9 @@ def test_decode_split_kv_long_context_matches_reference(
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
-        heads_per_tg=heads_per_tg,
+        heads_per_tg=(
+            heads_per_tg if expected_partition or not use_glm_split_layout else 1
+        ),
     )
 
     expected = _expected_output(
@@ -663,14 +679,15 @@ def test_decode_split_kv_h20_uses_expected_partition_buckets(
     expected_num_partitions: int,
 ) -> None:
     monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+    should_split = _h20_glm_split_expected(num_rows=1)
     _assert_selected_split_plan(
         ctx_lens=[ctx_len],
         num_heads=20,
         block_size=32,
         heads_per_tg=5,
-        expected_partition=True,
-        expected_partition_size=expected_partition_size,
-        expected_num_partitions=expected_num_partitions,
+        expected_partition=should_split,
+        expected_partition_size=expected_partition_size if should_split else None,
+        expected_num_partitions=expected_num_partitions if should_split else None,
     )
 
 
@@ -710,14 +727,15 @@ def test_decode_split_kv_mixed_long_short_batch_matches_reference(
     num_heads = 20
     heads_per_tg = 5
     dtype = mx.bfloat16
+    should_split = _h20_glm_split_expected(num_rows=len(ctx_lens))
     _assert_selected_split_plan(
         ctx_lens=ctx_lens,
         num_heads=num_heads,
         block_size=block_size,
         heads_per_tg=heads_per_tg,
-        expected_partition=True,
-        expected_partition_size=640,
-        expected_num_partitions=64,
+        expected_partition=should_split,
+        expected_partition_size=640 if should_split else None,
+        expected_num_partitions=64 if should_split else None,
     )
     (
         q_nope,
@@ -743,7 +761,7 @@ def test_decode_split_kv_mixed_long_short_batch_matches_reference(
         context_lens=context_lens,
         cu_seqlens_q=cu_seqlens_q,
         scale=0.125,
-        heads_per_tg=heads_per_tg,
+        heads_per_tg=heads_per_tg if should_split else 1,
     )
 
     expected = _expected_output(

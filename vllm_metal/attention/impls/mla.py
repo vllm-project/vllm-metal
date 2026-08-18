@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -174,8 +175,9 @@ class MLAPagedAttentionWrapper(nn.Module):
         Workloads outside this set fall through to ``_slow_path_per_request``
         (MLX SDPA). Split/reduce remains a C++ dispatch choice inside this
         Metal path so ``VLLM_METAL_MLA_KERNEL=1`` keeps the existing one-pass
-        Metal behavior when the split opt-in is off or the split planner
-        rejects the shape."""
+        Metal behavior when the split opt-in is off. For GLM-style long-context
+        decode with split explicitly requested, reject the Metal route when the
+        device planner says the split would not use enough partitions."""
         if not envs.VLLM_METAL_MLA_KERNEL:
             return False
         if not self._is_absorbed:
@@ -192,6 +194,20 @@ class MLAPagedAttentionWrapper(nn.Module):
         for i in range(len(ctx.context_lens)):
             if cu[i + 1] - cu[i] != 1:
                 return False
+        if (
+            os.getenv("VLLM_METAL_MLA_SPLIT_KV") == "1"
+            and inner.num_heads == 20
+            and max(len(bt) for bt in ctx.block_tables) * latent_cache.block_size
+            >= _MLA_MIN_SPLIT_CONTEXT
+        ):
+            total_q_tokens = int(cu[-1])
+            return _mla_split_route_selected(
+                ctx,
+                block_size=latent_cache.block_size,
+                total_q_tokens=total_q_tokens,
+                num_heads=inner.num_heads,
+                heads_per_tg=5,
+            )
         return True
 
     @staticmethod

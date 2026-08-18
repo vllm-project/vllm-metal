@@ -370,10 +370,19 @@ def _bench_shape(
     single_vs_mlx = (mlx_ms / metal_single_ms - 1.0) * 100.0
     split_vs_mlx = (mlx_ms / metal_split_ms - 1.0) * 100.0
     split_vs_single = (metal_single_ms / metal_split_ms - 1.0) * 100.0
-    route = "metal_split" if plan["partition"] else "metal_single"
+    split_request_falls_back_to_mlx = (
+        shape.num_heads == 20 and shape.ctx_len >= 24576 and not plan["partition"]
+    )
+    route = (
+        "metal_split"
+        if plan["partition"]
+        else "mlx_fallback"
+        if split_request_falls_back_to_mlx
+        else "metal_single"
+    )
     # "metal_split" mode enables the opt-in Metal MLA wrapper and lets the
-    # production route decide. If the split planner rejects the shape, this
-    # measures the preserved one-pass Metal path with the route check included.
+    # production route decide. If the GLM split planner rejects a long-context
+    # shape, the wrapper falls back to MLX instead of forcing a slow Metal path.
     selected_ms = metal_split_ms
     selected_vs_mlx = split_vs_mlx
     selected_max_diff = max_diff_split

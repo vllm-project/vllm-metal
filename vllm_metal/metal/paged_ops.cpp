@@ -1241,11 +1241,18 @@ static int mla_partition_size_for_shape(
   return best_partition_size;
 }
 
-static int mla_glm_partition_size_for_shape(int max_seq_len) {
-  constexpr int kTargetPartitions = kMlaMaxNumPartitions;
+static int mla_glm_partition_size_for_shape(
+    int gate_grid,
+    int max_seq_len,
+    int target_grid) {
   constexpr int kMinUsefulPartitions = 56;
+  const int target_partitions = std::clamp(
+      ceil_div_int(target_grid, gate_grid), 2, kMlaMaxNumPartitions);
+  if (target_partitions < kMinUsefulPartitions) {
+    return 0;
+  }
   const int ideal_partition_size =
-      ceil_div_int(max_seq_len, kTargetPartitions);
+      ceil_div_int(max_seq_len, target_partitions);
   const int candidate_partition_sizes[] = {
       kMlaMicroPartitionSize,
       kMlaGlmLowMidPartitionSize,
@@ -1276,10 +1283,7 @@ static MlaSplitPlan mla_split_plan_for_shape(
     int heads_per_tg,
     int max_seq_len) {
   const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
-  int target_grid = min_decode_grid();
-  if (num_heads == 20 && heads_per_tg == 5) {
-    target_grid *= 2;
-  }
+  const int target_grid = min_decode_grid();
   const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
   const bool split_enabled =
       split_env != nullptr && std::string(split_env) == "1";
@@ -1287,12 +1291,14 @@ static MlaSplitPlan mla_split_plan_for_shape(
   if (split_enabled && pure_decode && gate_grid < target_grid &&
       num_heads == 20 && heads_per_tg == 5 &&
       max_seq_len >= kMlaGlmMinSplitContext) {
-    const int partition_size = mla_glm_partition_size_for_shape(max_seq_len);
+    const int partition_size =
+        mla_glm_partition_size_for_shape(gate_grid, max_seq_len, target_grid);
     const int glm_partitions =
         partition_size > 0 ? ceil_div_int(max_seq_len, partition_size) : 1;
     if (partition_size > 0 && glm_partitions <= kMlaMaxNumPartitions) {
       return {true, partition_size, glm_partitions, gate_grid};
     }
+    return {false, 0, 1, gate_grid};
   }
   const int partition_size =
       split_enabled && pure_decode && gate_grid < target_grid &&
