@@ -950,6 +950,8 @@ instantiate_mla_partition_size(640);
 instantiate_mla_partition_size(768);
 instantiate_mla_partition_size(896);
 instantiate_mla_partition_size(1024);
+instantiate_mla_partition_size(1280);
+instantiate_mla_partition_size(1536);
 instantiate_mla_partition_size(2048);
 instantiate_mla_partition_size(4096);
 instantiate_mla_partition_size(8192);

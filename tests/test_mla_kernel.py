@@ -651,6 +651,9 @@ def test_decode_split_kv_long_context_matches_reference(
         (57344, 896, 64),
         (61440, 1024, 60),
         (65536, 1024, 64),
+        (81920, 1280, 64),
+        (98304, 1536, 64),
+        (131072, 2048, 64),
     ],
 )
 def test_decode_split_kv_h20_uses_expected_partition_buckets(
