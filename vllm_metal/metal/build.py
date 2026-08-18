@@ -70,8 +70,17 @@ def metallib_path(name: str) -> Path:
 # precompiled kernels diverge from the in-process source compile. We deliberately
 # do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
 # (already enabled), so matching keeps the prebuilt path numerically and
-# behaviourally identical to what users get today.
-_METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
+# behaviourally identical to what users get today. The deployment target matches
+# the macOS 15 CI/release runner; without it, newer local Xcode toolchains can
+# emit Metal libraries that macOS 15 cannot load.
+_METALLIB_FLAGS = (
+    "xcrun",
+    "-sdk",
+    "macosx",
+    "metal",
+    "-fno-fast-math",
+    "-mmacosx-version-min=15.0",
+)
 
 
 def _metallib_source(name: str) -> str:

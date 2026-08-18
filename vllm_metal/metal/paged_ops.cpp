@@ -1167,6 +1167,8 @@ constexpr int kMlaGlmLowMidPartitionSize = 640;
 constexpr int kMlaGlmMidPartitionSize = 768;
 constexpr int kMlaGlmHighMidPartitionSize = 896;
 constexpr int kMlaTinyPartitionSize = 1024;
+constexpr int kMlaGlmEightyKPartitionSize = 1280;
+constexpr int kMlaGlmNinetySixKPartitionSize = 1536;
 constexpr int kMlaMediumPartitionSize = 2048;
 constexpr int kMlaStripePartitionSize = 4096;
 constexpr int kMlaSmallPartitionSize = 8192;
@@ -1216,6 +1218,8 @@ static int mla_partition_size_for_shape(
       kMlaGlmMidPartitionSize,
       kMlaGlmHighMidPartitionSize,
       kMlaTinyPartitionSize,
+      kMlaGlmEightyKPartitionSize,
+      kMlaGlmNinetySixKPartitionSize,
       kMlaMediumPartitionSize,
       kMlaStripePartitionSize,
       kMlaSmallPartitionSize,
@@ -1248,6 +1252,9 @@ static int mla_glm_partition_size_for_shape(int max_seq_len) {
       kMlaGlmMidPartitionSize,
       kMlaGlmHighMidPartitionSize,
       kMlaTinyPartitionSize,
+      kMlaGlmEightyKPartitionSize,
+      kMlaGlmNinetySixKPartitionSize,
+      kMlaMediumPartitionSize,
   };
   for (int partition_size : candidate_partition_sizes) {
     if (partition_size < ideal_partition_size) {
@@ -1279,8 +1286,7 @@ static MlaSplitPlan mla_split_plan_for_shape(
   const bool pure_decode = total_q_tokens == num_seqs;
   if (split_enabled && pure_decode && gate_grid < target_grid &&
       num_heads == 20 && heads_per_tg == 5 &&
-      max_seq_len >= kMlaGlmMinSplitContext &&
-      max_seq_len < kMlaMinSplitContext) {
+      max_seq_len >= kMlaGlmMinSplitContext) {
     const int partition_size = mla_glm_partition_size_for_shape(max_seq_len);
     const int glm_partitions =
         partition_size > 0 ? ceil_div_int(max_seq_len, partition_size) : 1;
