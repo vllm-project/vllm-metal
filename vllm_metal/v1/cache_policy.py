@@ -45,6 +45,10 @@ from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
+from vllm_metal.v1.qwen_mtp_paged import (
+    QwenMTPAttentionSpec,
+    QwenMTPPagedState,
+)
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
@@ -321,6 +325,74 @@ class ModelCachePolicy:
             and any(window < 0 for window in sliding_windows)
         )
 
+    def _qwen_mtp_metadata(
+        self,
+    ) -> tuple[object, int, int, int, int] | None:
+        spec = self._runner.vllm_config.speculative_config
+        if spec is None or spec.method != "mtp":
+            return None
+        model = self._runner._forward_model
+        if not bool(getattr(model, "supports_mtp", False)):
+            raise ValueError(
+                "method='mtp' was configured but the loaded Qwen checkpoint "
+                "does not contain native MTP weights"
+            )
+        # Qwen3.5's multimodal-compatible MLX wrapper exposes the text model
+        # as ``language_model`` while delegating supports_mtp/mtp_forward at the
+        # top level. Cache ownership needs the text model itself because that is
+        # where the trained MTP module and TextModelArgs live. Dense/text-only
+        # models without the wrapper continue to use the object directly.
+        mtp_model = getattr(model, "language_model", model)
+        mtp = getattr(mtp_model, "mtp", None)
+        args = getattr(mtp_model, "args", None)
+        layers = list(getattr(mtp, "layers", ()))
+        if mtp is None or args is None or not layers:
+            raise ValueError(
+                "native Qwen MTP requires the loaded text model to expose "
+                "mtp.layers and args"
+            )
+        try:
+            num_kv_heads = int(args.num_key_value_heads)
+            head_dim = int(args.head_dim)
+            hidden_size = int(args.hidden_size)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "native Qwen MTP model metadata is missing KV/head dimensions"
+            ) from exc
+        return mtp_model, len(layers), num_kv_heads, head_dim, hidden_size
+
+    def qwen_mtp_aux_bytes_per_block(self) -> int:
+        metadata = self._qwen_mtp_metadata()
+        if metadata is None:
+            return 0
+        _, num_layers, num_kv_heads, head_dim, hidden_size = metadata
+        block_size = self._runner.cache_config.block_size
+        dtype_size = self._require_kv_cache_dtype().size
+        mtp_kv = num_layers * 2 * block_size * num_kv_heads * head_dim * dtype_size
+        # EAGLE recomputes one full hash unit on a warm hit. Only the hidden
+        # checkpoint at the end of each retained target block is durable.
+        boundary_hidden = hidden_size * dtype_size + 1
+        return mtp_kv + boundary_hidden
+
+    def _build_qwen_mtp_state(self) -> QwenMTPPagedState | None:
+        metadata = self._qwen_mtp_metadata()
+        if metadata is None:
+            return None
+        if self._use_turboquant(get_config()):
+            raise NotImplementedError(
+                "native Qwen MTP paged KV currently requires dense KV cache; "
+                "disable TurboQuant KV while using method='mtp'"
+            )
+        model, num_layers, num_kv_heads, head_dim, hidden_size = metadata
+        return QwenMTPPagedState(
+            model=model,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+            dtype=self._require_kv_cache_dtype(),
+        )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
         pooling_backend = self._runner._pooling_backend
@@ -368,6 +440,7 @@ class ModelCachePolicy:
                     page_size_padded=cache_config.mamba_page_size_padded,
                     mamba_block_size=mamba_block_size,
                     mamba_cache_mode=cache_config.mamba_cache_mode,
+                    num_speculative_blocks=self._num_speculative_blocks(),
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -408,6 +481,43 @@ class ModelCachePolicy:
                         head_size=head_dims[layer_idx],
                         dtype=torch_dtype,
                     )
+
+        metadata = self._qwen_mtp_metadata()
+        if metadata is not None:
+            if use_turboquant:
+                raise NotImplementedError(
+                    "native Qwen MTP paged KV does not support TurboQuant KV"
+                )
+            _, num_mtp_layers, mtp_kv_heads, mtp_head_dim, _ = metadata
+            mtp_spec = QwenMTPAttentionSpec(
+                block_size=block_size,
+                # HiddenStateCacheSpec reports one latent tensor. Doubling the
+                # logical head slots makes its page bytes equal the physical
+                # dense K+V arrays owned by MetalPagedKVCache.
+                num_kv_heads=2 * mtp_kv_heads,
+                head_size=mtp_head_dim,
+                dtype=torch_dtype,
+            )
+            target_page = FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self._runner.num_kv_heads,
+                head_size=self._runner.head_dim,
+                dtype=torch_dtype,
+            ).page_size_bytes
+            if mtp_spec.page_size_bytes != target_page:
+                raise NotImplementedError(
+                    "native Qwen MTP requires its KV page size to match the "
+                    "target full-attention page size"
+                )
+            # HiddenStateCacheSpec is vLLM's cache-only grouping path. Put the
+            # custom distinct subtype first so the early uniformity probe sees
+            # its own registered base, fails closed, and reaches cache-only
+            # extraction without reducing every target/GDN group to size one.
+            mtp_specs = {
+                f"mtp.layers.{layer_idx}.self_attn": mtp_spec
+                for layer_idx in range(num_mtp_layers)
+            }
+            specs = {**mtp_specs, **specs}
 
         return specs
 
@@ -573,6 +683,37 @@ class ModelCachePolicy:
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
+
+        mtp_group_index: int | None = None
+        mtp_block_size: int | None = None
+        metadata = self._qwen_mtp_metadata()
+        if metadata is not None:
+            _, num_mtp_layers, _, _, _ = metadata
+            mtp_names = tuple(
+                f"mtp.layers.{layer_idx}.self_attn"
+                for layer_idx in range(num_mtp_layers)
+            )
+            mtp_group_indices = self._scheduler_group_indices_for_layers(
+                kv_cache_config,
+                mtp_names,
+            )
+            if len(mtp_group_indices) != 1:
+                raise RuntimeError(
+                    "native Qwen MTP layers must share one scheduler cache group"
+                )
+            mtp_group_index = mtp_group_indices[0]
+            if mtp_group_index == group_index:
+                raise RuntimeError(
+                    "native Qwen MTP cache was incorrectly merged into the "
+                    "target SDPA scheduler group"
+                )
+            # vLLM treats method='mtp' as EAGLE. When no group is explicitly
+            # annotated, KVCacheCoordinator conservatively applies the lookahead
+            # drop to every group, preserving one shared prefix lineage across
+            # target SDPA, GDN, and this cache-only MTP group.
+            mtp_group = kv_cache_config.kv_cache_groups[mtp_group_index]
+            mtp_block_size = mtp_group.kv_cache_spec.block_size
+
         # Align mode keys GDN state slabs by scheduler block id.  The engine
         # stripes same-spec linear layers across several mamba cache groups
         # (each group hands every request one block-table row), so the runtime
@@ -656,6 +797,8 @@ class ModelCachePolicy:
             state_group_indices=state_group_indices,
             layer_group_ordinals=layer_group_ordinals,
             layer_pool_ordinals=layer_pool_ordinals,
+            mtp_group_index=mtp_group_index,
+            mtp_block_size=mtp_block_size,
         )
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
@@ -796,13 +939,13 @@ class ModelCachePolicy:
         MambaSpec carries ``mamba_page_size_padded`` — an unpadded estimate
         falls short of that requirement by the padding margin.
         """
-        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
-        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
-        # this mirror must follow.
+        # Mirrors MambaSpec.max_memory_usage_bytes in mamba_cache_mode
+        # "none": one live state plus one snapshot per speculative token.
+        multiplier = 1 + self._num_speculative_blocks()
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
-            return self._runner.num_linear_layers * padded
-        return self.linear_cache_bytes_per_slot()
+            return self._runner.num_linear_layers * padded * multiplier
+        return self.linear_cache_bytes_per_slot() * multiplier
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
@@ -820,6 +963,8 @@ class ModelCachePolicy:
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
+            num_speculative_blocks=self._num_speculative_blocks(),
+            qwen_mtp_state=self._build_qwen_mtp_state(),
             turboquant=config.turboquant,
             k_quant=config.k_quant if config.turboquant else None,
             v_quant=config.v_quant if config.turboquant else None,
@@ -942,6 +1087,12 @@ class ModelCachePolicy:
             self._runner.num_layers,
         )
         return num_cache_layers, cache_idx_map
+
+    def _num_speculative_blocks(self) -> int:
+        speculative_config = self._runner.vllm_config.speculative_config
+        if speculative_config is None:
+            return 0
+        return int(speculative_config.num_speculative_tokens or 0)
 
     def _require_kv_cache_dtype(self) -> mx.Dtype:
         if self._runner.kv_cache_dtype is None:
@@ -1092,6 +1243,11 @@ class WorkerCachePlanner:
         # replacement materializes, so budget that one-pool overlap too.
         per_block_bytes += self._hybrid_align_state_bytes_per_block()
         per_block_bytes += self._hybrid_align_growth_bytes_per_block()
+        # The MTP cache group shares vLLM's logical block pool, but Metal owns
+        # separate physical arrays for its KV and the target-boundary shadow.
+        # Reserve those bytes in the worker plan so the scheduler round-trips
+        # the same safe block count.
+        per_block_bytes += self._qwen_mtp_aux_bytes_per_block()
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
@@ -1180,6 +1336,22 @@ class WorkerCachePlanner:
             reserved_slots=(2 * cushion_slots) - 1,
             max_num_seqs=max_num_seqs,
         )
+
+    def _qwen_mtp_aux_bytes_per_block(self) -> int:
+        """Return optional native-Qwen MTP cache bytes for one block."""
+        reporter = getattr(
+            self._worker.model_runner,
+            "qwen_mtp_aux_bytes_per_block",
+            None,
+        )
+        if not callable(reporter):
+            return 0
+        aux_bytes = int(reporter())
+        if aux_bytes < 0:
+            raise ValueError(
+                "Qwen MTP auxiliary cache bytes per block cannot be negative"
+            )
+        return aux_bytes
 
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction.

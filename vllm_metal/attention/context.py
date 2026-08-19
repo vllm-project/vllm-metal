@@ -71,6 +71,12 @@ class PagedAttentionContext:
     # block id / state slab).
     gdn_slot_mapping: list[int] | None = None
     gdn_group_slot_mappings: tuple[list[int], ...] | None = None
+    # Align-mode speculative verification needs one observable GDN state after
+    # every input token. Per group, each request therefore receives a chain
+    # ``[initial, after_token_0, ..., after_token_K]``. Empty request entries
+    # keep the ordinary one-destination path. The runtime safety gate remains
+    # active until the GDN wrapper consumes this contract.
+    gdn_group_state_chains: tuple[list[list[int]], ...] | None = None
     # Number of decode requests packed at the front of the batch.
     # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
     # without reverse-engineering one-token segments from ``cu_seqlens``.

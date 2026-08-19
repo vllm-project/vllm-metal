@@ -68,6 +68,8 @@ class GDNRecurrentDecodeRequest(GDNRecurrentRequest):
     """Inputs for one lazy GDN recurrent decode attempt."""
 
     threadgroup_dv: int = 4
+    # Read from slot_ids while materializing updates into these slots.
+    write_slot_ids: list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -237,8 +239,13 @@ class GDNLazyKernels:
         state_cache: GDNPagedStateCache,
         cache_idx: int,
         slot_ids: list[int],
+        write_slot_ids: list[int] | None = None,
     ) -> mx.array | None:
-        """Run the lazy GDN conv decode fast path, or return None."""
+        """Run the lazy GDN conv decode fast path, or return None.
+
+        ``slot_ids`` address source state. ``write_slot_ids`` can select
+        different stable-cache destinations for the compact updates.
+        """
         num_requests = len(slot_ids)
         total_tokens = mixed_qkv.shape[1]
         if not (
@@ -251,12 +258,23 @@ class GDNLazyKernels:
         conv_dim = state_cache.conv_dim
         kernel_size = inner.conv_kernel_size
         state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
+        destination_slots = slot_ids if write_slot_ids is None else write_slot_ids
+        if len(destination_slots) != num_requests:
+            raise RuntimeError("GDN conv decode destination count mismatch")
+        state_cache.require_allocated_slots(destination_slots)
+        if destination_slots != slot_ids and state_view.uses_compact_state:
+            raise RuntimeError("copyless GDN conv decode requires stable source state")
         conv_state_in = state_view.state
         state_pool = state_cache.conv_states[cache_idx]
         weight = inner.conv1d.weight
 
         mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
         slot_ids_arr = state_view.cache_slot_ids
+        write_slot_ids_arr = (
+            slot_ids_arr
+            if destination_slots == slot_ids
+            else mx.array(destination_slots, dtype=mx.int32)
+        )
         state_slot_ids_arr = state_view.state_slot_ids
 
         grid_size = num_requests * conv_dim
@@ -284,7 +302,7 @@ class GDNLazyKernels:
             output_shapes=[(num_requests, conv_dim), state_updates_shape],
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
-        state_pool[slot_ids_arr] = conv_state_updates
+        state_pool[write_slot_ids_arr] = conv_state_updates
         state_cache.store_conv_state(cache_idx, state_pool)
         if state_view.uses_compact_state:
             state_cache.clear_pending_conv_state(cache_idx)
@@ -381,7 +399,27 @@ class GDNLazyKernels:
         state_view = state_cache.recurrent_state_for_decode(
             request.cache_idx, request.slot_ids
         )
+        destination_slots = (
+            request.slot_ids
+            if request.write_slot_ids is None
+            else request.write_slot_ids
+        )
+        if len(destination_slots) != num_requests:
+            raise RuntimeError("GDN recurrent destination count mismatch")
+        state_cache.require_allocated_slots(destination_slots)
+
+        materialize_update = request.write_slot_ids is not None
+        if materialize_update and state_view.uses_compact_state:
+            # A speculative checkpoint write needs both snapshots: publish
+            # the compact source update before the next update supersedes it.
+            state_cache.apply_pending_recurrent_state(request.cache_idx)
+
         state_in = state_view.state
+        write_slot_ids_arr = (
+            state_view.cache_slot_ids
+            if destination_slots == request.slot_ids
+            else mx.array(destination_slots, dtype=mx.int32)
+        )
         state_slot_ids_arr = state_view.state_slot_ids
 
         kernel_inputs = [
@@ -410,20 +448,19 @@ class GDNLazyKernels:
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[request.output_dtype, mx.float32],
         )
-        # Park the compact update instead of scattering it into the stable
-        # pool.  A steady-state decode chain then reads and writes only
-        # ``num_requests`` slabs per step; without this each step also copies
-        # the update into the pool, doubling recurrent state traffic.
-        #
-        # ``recurrent_state_for_decode`` above already drained any pending
-        # update whose slot order did not match, so the only pending state
-        # that can still be live here is this layer's own previous step —
-        # which ``state_updates`` supersedes.  Clear it rather than letting
-        # ``set_pending_recurrent_state`` scatter that stale slab first.
-        state_cache.clear_pending_recurrent_state(request.cache_idx)
-        state_cache.set_pending_recurrent_state(
-            request.cache_idx, request.slot_ids, state_updates
-        )
+        if materialize_update:
+            state_pool = state_cache.recurrent_states[request.cache_idx]
+            state_pool[write_slot_ids_arr] = state_updates
+            state_cache.store_recurrent_state(request.cache_idx, state_pool)
+        else:
+            # Park the compact update instead of scattering it into the stable
+            # pool. A steady-state decode chain then reads and writes only the
+            # compact request-local slabs. The prior matching pending state was
+            # consumed by this kernel and is superseded by ``state_updates``.
+            state_cache.clear_pending_recurrent_state(request.cache_idx)
+            state_cache.set_pending_recurrent_state(
+                request.cache_idx, request.slot_ids, state_updates
+            )
         return y_out
 
     def try_recurrent_prefill(

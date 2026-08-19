@@ -1,0 +1,149 @@
+name: Qwen MTP Speed Matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - pr/610-05-paged-qwen-mtp-prefix
+    paths:
+      - .github/workflows/qwen-mtp-serving-bench.yml
+      - benchmarks/qwen_mtp_speed_matrix.py
+      - vllm_metal/v1/proposer.py
+      - vllm_metal/v1/qwen_mtp_paged.py
+      - vllm_metal/attention/runtime/hybrid.py
+      - vllm_metal/attention/impls/linear.py
+      - vllm_metal/envs.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-speed-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  speed-matrix:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: "auto"
+      GLOO_SOCKET_IFNAME: lo0
+      MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+      MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      MATRIX_DIR: /tmp/qwen-mtp-matrix
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          import platform
+          import torch
+
+          print("machine:", platform.machine())
+          print("MPS available:", torch.backends.mps.is_available())
+          assert platform.machine() == "arm64"
+          assert torch.backends.mps.is_available()
+          PY
+
+      - name: Convert Qwen3.5-0.8B with MTP weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q \
+            --q-bits 4 \
+            --q-group-size 64
+
+      - name: Record runner metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MATRIX_DIR"
+          {
+            echo "git_sha=${GITHUB_SHA}"
+            echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType
+          } | tee "$MATRIX_DIR/runner.txt"
+
+      - name: Run baseline and native MTP speed matrix
+        id: matrix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          python benchmarks/qwen_mtp_speed_matrix.py \
+            --model-dir "$MODEL_DIR" \
+            --output-dir "$MATRIX_DIR" \
+            --repeats 2 \
+            --request-timeout-s 240 \
+            --server-ready-timeout-s 720 \
+            2>&1 | tee "$MATRIX_DIR/run.log"
+
+      - name: Publish matrix summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$MATRIX_DIR/matrix_summary.md" ]; then
+            cat "$MATRIX_DIR/matrix_summary.md" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Qwen MTP speed matrix" >>"$GITHUB_STEP_SUMMARY"
+            echo "The matrix stopped before producing a report." \
+              >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload speed matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-speed-matrix
+          path: ${{ env.MATRIX_DIR }}
+          if-no-files-found: error
+
+      - name: Fail when no complete MTP profile finished
+        if: steps.matrix.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "The speed matrix did not produce a complete MTP profile." >&2
+          exit 1
