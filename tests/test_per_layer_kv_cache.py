@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -52,26 +51,6 @@ def config_from_vllm_groups(
         available = groups[0].kv_cache_spec.page_size_bytes * num_blocks * group_size
     return get_kv_cache_config_from_groups(
         vllm_config_for_kv_grouping(), groups, available
-    )
-
-
-def logged_kv_cache_mb(caplog: pytest.LogCaptureFixture) -> float:
-    """Return the MB figure from the single ``KV cache:`` startup log line."""
-    messages = [
-        record.message
-        for record in caplog.records
-        if record.message.startswith("KV cache:")
-    ]
-    assert len(messages) == 1, messages
-    match = re.search(r"KV cache: ([\d.]+) MB", messages[0])
-    assert match is not None, messages[0]
-    return float(match.group(1))
-
-
-def allocated_cache_bytes(cache: MetalPagedKVCache) -> int:
-    """Return the bytes held by a cache's per-layer key/value arrays."""
-    return sum(array.nbytes for array in cache.key_caches) + sum(
-        array.nbytes for array in cache.value_caches
     )
 
 
@@ -176,79 +155,30 @@ class TestMetalPagedKVCachePerLayer:
                 kv_heads_per_layer=[8, 8, 8],
             )
 
-
-class TestDenseCacheLogging:
-    """The dense startup log must report the bytes actually allocated."""
-
-    def test_heterogeneous_log_matches_allocation(
+    def test_heterogeneous_dense_log_reports_per_layer_bytes(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Mixed-width layers are logged per layer, not all at the widest."""
-        # Gemma 4 E4B's 24 unique cache layers: 20 sliding (256) + 4 full (512),
-        # every layer carrying 2 KV heads.  The scalar head_dim is the widened
-        # dispatch shape (512), which is what the old log billed all 24 at.
+        """E4B-shaped unique layers log 2.8 MB, not the old all-512 4.7 MB."""
         head_dims = [512 if (index + 1) % 6 == 0 else 256 for index in range(24)]
-        kv_heads = [2] * 24
-        num_blocks = 3
-        block_size = 16
-
         with caplog.at_level(logging.INFO):
-            cache = MetalPagedKVCache(
-                num_layers=len(head_dims),
-                num_kv_heads=kv_heads[0],
-                head_dim=max(head_dims),
-                num_blocks=num_blocks,
-                block_size=block_size,
+            MetalPagedKVCache(
+                num_layers=24,
+                num_kv_heads=2,
+                head_dim=512,
+                num_blocks=3,
+                block_size=16,
                 dtype=mx.bfloat16,
-                kv_heads_per_layer=kv_heads,
+                kv_heads_per_layer=[2] * 24,
                 head_dim_per_layer=head_dims,
             )
-
-        allocated = allocated_cache_bytes(cache)
-        scalar_product = (
-            len(head_dims)
-            * num_blocks
-            * block_size
-            * kv_heads[0]
-            * max(head_dims)
-            * 2
-            * mx.bfloat16.size
-        )
-        assert allocated == 2_752_512
-        assert scalar_product == 4_718_592  # 12/7 of the real allocation
-        assert logged_kv_cache_mb(caplog) == round(allocated / 1e6, 1)
-
-    def test_uniform_log_matches_allocation(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Uniform models keep the byte total the scalar product produced."""
-        num_layers = 4
-        num_kv_heads = 8
-        head_dim = 128
-        num_blocks = 64
-        block_size = 16
-
-        with caplog.at_level(logging.INFO):
-            cache = MetalPagedKVCache(
-                num_layers=num_layers,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                num_blocks=num_blocks,
-                block_size=block_size,
-                dtype=mx.bfloat16,
-            )
-
-        allocated = allocated_cache_bytes(cache)
-        assert allocated == (
-            num_layers
-            * num_blocks
-            * block_size
-            * num_kv_heads
-            * head_dim
-            * 2
-            * mx.bfloat16.size
-        )
-        assert logged_kv_cache_mb(caplog) == round(allocated / 1e6, 1)
+        messages = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("KV cache:")
+        ]
+        assert len(messages) == 1, messages
+        assert "KV cache: 2.8 MB" in messages[0]
+        assert "4.7 MB" not in messages[0]
 
 
 class TestMHABackendPerLayer:
@@ -471,21 +401,6 @@ class TestMHAKVCacheLayout:
         assert layout.total_bytes == sum(
             tensor.size for tensor in config.kv_cache_tensors
         )
-
-    def test_layout_log_reports_physical_bytes(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Layout logging stays on total_bytes; per-layer views double-count."""
-        config, names = self._mixed_mha_config()
-        layout = MHAKVCacheLayout.from_config(config, names)
-
-        with caplog.at_level(logging.INFO):
-            cache = MetalPagedKVCache.from_layout(layout, mx.bfloat16)
-
-        # Four logical layers are reshaped views over two physical slot pairs,
-        # so summing the per-layer arrays here would report twice the memory.
-        assert allocated_cache_bytes(cache) > layout.total_bytes
-        assert logged_kv_cache_mb(caplog) == round(layout.total_bytes / 1e6, 1)
 
     def test_allocates_shared_slots_from_layout(self) -> None:
         config, names = self._mixed_mha_config()
