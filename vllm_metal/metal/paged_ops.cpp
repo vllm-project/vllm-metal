@@ -9,6 +9,8 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1240,13 +1242,179 @@ void init_mla_library(const std::string& src) {
 // footprint roughly constant (NUM_THREADS scaled inversely to G).
 //   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
 //   G=2 → NUM_THREADS=512  (16 simdgroups, 2× cross-head amortization).
+//   G=5 uses the split-only head-striped kernel for GLM-style H=20, where
+//   each head has its own simdgroup and each partition launches four
+//   threadgroups.
 // Returns 0 for an unsupported G so callers can validate.
 static int mla_num_threads_for_g(int heads_per_tg) {
   switch (heads_per_tg) {
     case 1: return 1024;
     case 2: return 512;
+    case 5: return 32;
     default: return 0;
   }
+}
+
+struct MlaSplitPlan {
+  bool partition;
+  int partition_size;
+  int max_num_partitions;
+  int gate_grid;
+};
+
+constexpr int kMlaMinSplitContext = 65536;
+constexpr int kMlaGlmMinSplitContext = 24576;
+constexpr int kMlaMicroPartitionSize = 512;
+constexpr int kMlaGlmLowMidPartitionSize = 640;
+constexpr int kMlaGlmMidPartitionSize = 768;
+constexpr int kMlaGlmHighMidPartitionSize = 896;
+constexpr int kMlaTinyPartitionSize = 1024;
+constexpr int kMlaGlmEightyKPartitionSize = 1280;
+constexpr int kMlaGlmNinetySixKPartitionSize = 1536;
+constexpr int kMlaMediumPartitionSize = 2048;
+constexpr int kMlaStripePartitionSize = 4096;
+constexpr int kMlaSmallPartitionSize = 8192;
+constexpr int kMlaLargePartitionSize = 32768;
+constexpr int kMlaMaxNumPartitions = 64;
+constexpr int kMlaMergeCostTokens = 32;
+
+static int ceil_div_int(int x, int y) {
+  return (x + y - 1) / y;
+}
+
+static double mla_estimated_work(
+    int gate_grid,
+    int max_seq_len,
+    int partition_size,
+    int target_grid) {
+  if (partition_size == 0) {
+    const int waves = ceil_div_int(gate_grid, target_grid);
+    return static_cast<double>(waves * max_seq_len);
+  }
+
+  const int num_partitions = ceil_div_int(max_seq_len, partition_size);
+  const int split_grid = gate_grid * num_partitions;
+  const int waves = ceil_div_int(split_grid, target_grid);
+  const double scan_work = static_cast<double>(waves * partition_size);
+
+  // The lightweight split kernels avoid the old per-partition cross-simdgroup
+  // merge. The reduce cost still grows with fan-in, so keep it in the planner
+  // even though the main cost is scanning the context.
+  const int extra_partitions = num_partitions - 1;
+  const double merge_work =
+      static_cast<double>(extra_partitions * kMlaMergeCostTokens);
+  return scan_work + merge_work;
+}
+
+static int mla_partition_size_for_shape(
+    int gate_grid,
+    int max_seq_len,
+    int target_grid) {
+  int best_partition_size = 0;
+  double best_work = mla_estimated_work(
+      gate_grid, max_seq_len, /*partition_size=*/0, target_grid);
+
+  const int candidate_partition_sizes[] = {
+      kMlaMicroPartitionSize,
+      kMlaGlmLowMidPartitionSize,
+      kMlaGlmMidPartitionSize,
+      kMlaGlmHighMidPartitionSize,
+      kMlaTinyPartitionSize,
+      kMlaGlmEightyKPartitionSize,
+      kMlaGlmNinetySixKPartitionSize,
+      kMlaMediumPartitionSize,
+      kMlaStripePartitionSize,
+      kMlaSmallPartitionSize,
+      kMlaLargePartitionSize,
+  };
+  for (int partition_size : candidate_partition_sizes) {
+    const int num_partitions = ceil_div_int(max_seq_len, partition_size);
+    if (num_partitions < 2 || num_partitions > kMlaMaxNumPartitions) {
+      continue;
+    }
+    const double work =
+        mla_estimated_work(gate_grid, max_seq_len, partition_size, target_grid);
+    if (work < best_work) {
+      best_work = work;
+      best_partition_size = partition_size;
+    }
+  }
+
+  return best_partition_size;
+}
+
+static int mla_glm_partition_size_for_shape(
+    int gate_grid,
+    int max_seq_len,
+    int target_grid) {
+  constexpr int kMinUsefulPartitions = 56;
+  const int target_partitions = std::clamp(
+      ceil_div_int(target_grid, gate_grid), 2, kMlaMaxNumPartitions);
+  if (target_partitions < kMinUsefulPartitions) {
+    return 0;
+  }
+  const int ideal_partition_size =
+      ceil_div_int(max_seq_len, target_partitions);
+  const int candidate_partition_sizes[] = {
+      kMlaMicroPartitionSize,
+      kMlaGlmLowMidPartitionSize,
+      kMlaGlmMidPartitionSize,
+      kMlaGlmHighMidPartitionSize,
+      kMlaTinyPartitionSize,
+      kMlaGlmEightyKPartitionSize,
+      kMlaGlmNinetySixKPartitionSize,
+      kMlaMediumPartitionSize,
+  };
+  for (int partition_size : candidate_partition_sizes) {
+    if (partition_size < ideal_partition_size) {
+      continue;
+    }
+    const int num_partitions = ceil_div_int(max_seq_len, partition_size);
+    if (num_partitions >= kMinUsefulPartitions &&
+        num_partitions <= kMlaMaxNumPartitions) {
+      return partition_size;
+    }
+  }
+  return 0;
+}
+
+static MlaSplitPlan mla_split_plan_for_shape(
+    int total_q_tokens,
+    int num_seqs,
+    int num_heads,
+    int heads_per_tg,
+    int max_seq_len) {
+  const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
+  const int target_grid = min_decode_grid();
+  const char* split_env = std::getenv("VLLM_METAL_MLA_SPLIT_KV");
+  const bool split_enabled =
+      split_env != nullptr && std::string(split_env) == "1";
+  const bool pure_decode = total_q_tokens == num_seqs;
+  if (split_enabled && pure_decode && gate_grid < target_grid &&
+      num_heads == 20 && heads_per_tg == 5 &&
+      max_seq_len >= kMlaGlmMinSplitContext) {
+    const int partition_size =
+        mla_glm_partition_size_for_shape(gate_grid, max_seq_len, target_grid);
+    const int glm_partitions =
+        partition_size > 0 ? ceil_div_int(max_seq_len, partition_size) : 1;
+    if (partition_size > 0 && glm_partitions <= kMlaMaxNumPartitions) {
+      return {true, partition_size, glm_partitions, gate_grid};
+    }
+    return {false, 0, 1, gate_grid};
+  }
+  const int partition_size =
+      split_enabled && pure_decode && gate_grid < target_grid &&
+          max_seq_len >= kMlaMinSplitContext
+      ? mla_partition_size_for_shape(gate_grid, max_seq_len, target_grid)
+      : 0;
+  const int max_num_partitions =
+      partition_size > 0 ? ceil_div_int(max_seq_len, partition_size) : 1;
+  const bool partition =
+      partition_size > 0 && max_num_partitions >= 2 &&
+      max_num_partitions <= kMlaMaxNumPartitions;
+
+  return {partition, partition ? partition_size : 0, max_num_partitions,
+          gate_grid};
 }
 
 static void dispatch_mla_paged_attention(
@@ -1289,7 +1457,7 @@ static void dispatch_mla_paged_attention(
   int num_threads = mla_num_threads_for_g(heads_per_tg);
   if (num_threads == 0) {
     throw std::runtime_error(
-        "MLA kernel: heads_per_tg must be in {1, 2}; got " +
+        "MLA kernel: heads_per_tg must be in {1, 2, 5}; got " +
         std::to_string(heads_per_tg));
   }
   if (num_heads % heads_per_tg != 0) {
@@ -1306,23 +1474,41 @@ static void dispatch_mla_paged_attention(
   });
 
   auto dt = dtype_to_metal(q_nope.dtype());
-  std::string kname = "paged_mla_attention_" + dt + "_kvr" +
-                      std::to_string(kv_lora_rank) + "_pe" +
-                      std::to_string(qk_rope_head_dim) + "_bs" +
-                      std::to_string(block_size) + "_g" +
-                      std::to_string(heads_per_tg) + "_nt" +
-                      std::to_string(num_threads) + "_nsl32_ps0";
+  const int max_seq_len = max_num_blocks_per_seq * block_size;
+  const MlaSplitPlan split_plan = mla_split_plan_for_shape(
+      total_q_tokens, num_seqs, num_heads, heads_per_tg, max_seq_len);
+  const bool partition = split_plan.partition;
+  const int mla_partition_size = split_plan.partition_size;
+  const int max_num_partitions = split_plan.max_num_partitions;
+  if (heads_per_tg == 5 && !partition) {
+    throw std::runtime_error(
+        "MLA kernel: heads_per_tg=5 is only instantiated for split decode");
+  }
 
-  bool use_partitioning = false;
+  const bool head_striped =
+      partition && num_heads == 20 && heads_per_tg == 5;
+  std::string kname =
+      std::string(head_striped ? "paged_mla_attention_head_striped_"
+                               : (partition ? "paged_mla_attention_striped_"
+                                            : "paged_mla_attention_")) +
+      dt + "_kvr" + std::to_string(kv_lora_rank) + "_pe" +
+      std::to_string(qk_rope_head_dim) + "_bs" + std::to_string(block_size) +
+      "_g" + std::to_string(heads_per_tg) + "_nt" +
+      std::to_string(partition ? 32 : num_threads) + "_nsl32_ps" +
+      std::to_string(partition ? mla_partition_size : 0);
+
+  bool use_partitioning = partition;
 
   std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
 
   auto* lib = d.get_library("paged_mla_kern");
-  auto* kernel = d.get_kernel(
-      kname,
-      lib,
-      hash_name,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
+  auto* kernel = partition
+      ? d.get_kernel(kname, lib, kname, {})
+      : d.get_kernel(
+            kname,
+            lib,
+            hash_name,
+            {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)}});
 
   // Threadgroup memory:
   //   max_scores[G * BN] + sum_exp_scores[G * BN] + outputs[BD * BD]
@@ -1338,10 +1524,52 @@ static void dispatch_mla_paged_attention(
       static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
 
   auto& enc = metal::get_command_encoder(s);
-  enc.set_compute_pipeline_state(kernel);
-  enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(out, 2);
+  if (!partition) {
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_threadgroup_memory_length(shmem, 0);
+
+    enc.set_output_array(out, 2);
+    enc.set_input_array(q_nope, 3);
+    enc.set_input_array(q_pe, 4);
+    enc.set_input_array(latent_cache, 5);
+    enc.set_input_array(block_tables, 6);
+    enc.set_input_array(context_lens, 7);
+    enc.set_input_array(cu_seqlens_q, 8);
+
+    int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+    int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+    enc.set_bytes(num_seqs_i, 9);
+    enc.set_bytes(max_blocks_i, 10);
+    enc.set_bytes(scale, 11);
+
+    // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
+    // query heads sharing the same latent KV.
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
+        MTL::Size::Make(num_threads, 1, 1));
+    return;
+  }
+
+  auto make_temp = [&](Shape shape, Dtype dtype) {
+    array a(std::move(shape), dtype, nullptr, {});
+    a.set_data(allocator::malloc(a.nbytes()));
+    enc.add_temporary(a);
+    return a;
+  };
+  array tmp_out = make_temp(
+      Shape{total_q_tokens, num_heads, max_num_partitions - 1, kv_lora_rank},
+      q_nope.dtype());
+  array lse =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+
+  // Pass 1: split the context into mla_partition_size-token chunks. The main MLA
+  // kernel writes normalized partial output plus LSE per partition.
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(0, 0);
+
+  enc.set_output_array(lse, 0);
+  enc.set_output_array(tmp_out, 2);
   enc.set_input_array(q_nope, 3);
   enc.set_input_array(q_pe, 4);
   enc.set_input_array(latent_cache, 5);
@@ -1354,20 +1582,43 @@ static void dispatch_mla_paged_attention(
   enc.set_bytes(num_seqs_i, 9);
   enc.set_bytes(max_blocks_i, 10);
   enc.set_bytes(scale, 11);
+  enc.set_output_array(out, 12);
 
-  // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
-  // query heads sharing the same latent KV.
+  // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Each TG owns G
+  // consecutive query heads sharing one partition of the latent KV.
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
-      MTL::Size::Make(num_threads, 1, 1));
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens,
+                      max_num_partitions),
+      MTL::Size::Make(32, head_striped ? heads_per_tg : 1, 1));
 
-  // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
-  // and inside a primitive MLX manages array lifetimes via the completion
-  // handler.
+  // Pass 2: merge per-partition partials with the online-softmax reduce.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(mla_partition_size);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_output_array(out, 0);
+  enc.set_input_array(lse, 1);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  // Inputs are kept alive by the primitive graph; split-KV scratch is registered
+  // as a temporary above so it survives both dispatches.
 }
 
-// MLA single-pass paged attention as an MLX Primitive so the kernel
-// dispatch participates in the lazy graph (no per-call mx.eval boundary).
+// MLA paged attention as an MLX Primitive so the kernel dispatch participates
+// in the lazy graph (no per-call mx.eval boundary).
 class MlaPagedAttentionPrimitive : public UnaryPrimitive {
  public:
   MlaPagedAttentionPrimitive(
@@ -1713,6 +1964,23 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
 
+  m.def("mla_split_plan",
+        [](int total_q_tokens,
+           int num_seqs,
+           int num_heads,
+           int heads_per_tg,
+           int max_seq_len) {
+          auto plan = mla_split_plan_for_shape(
+              total_q_tokens, num_seqs, num_heads, heads_per_tg, max_seq_len);
+          return nb::make_tuple(plan.partition, plan.partition_size,
+                                plan.max_num_partitions, plan.gate_grid);
+        },
+        nb::arg("total_q_tokens"), nb::arg("num_seqs"),
+        nb::arg("num_heads"), nb::arg("heads_per_tg"),
+        nb::arg("max_seq_len"),
+        "Return the MLA split-KV dispatch plan for a shape as "
+        "(partition, partition_size, max_num_partitions, gate_grid).");
+
   m.def("mla_paged_attention_primitive",
         [](nb::handle q_nope_h,
            nb::handle q_pe_h,
@@ -1739,7 +2007,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("scale"),
         nb::arg("heads_per_tg") = 1,
         nb::arg("out"),
-        "Paged MLA (single-pass), wrapped as an MLX Primitive — fills "
+        "Paged MLA, wrapped as an MLX Primitive — fills "
         "``out`` with a lazy descriptor so the kernel call participates "
         "in the wrapper's lazy graph and avoids the per-call mx.eval "
         "boundary the eager binding requires. Saves ~200 μs at B=1 "

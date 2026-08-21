@@ -13,9 +13,14 @@ from mlx_lm.models.base import scaled_dot_product_attention
 
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.impls.mla import (
+    MLAPagedAttentionWrapper,
+    _mla_kernel_metadata,
+    _mla_split_route_selected,
+)
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
+from vllm_metal.metal import get_ops
 
 # Fixture dimensions matching GLM/DeepSeek-V2 defaults
 _KV_LORA_RANK = 512
@@ -339,6 +344,81 @@ class TestMLAPagedAttentionWrapperPagedPath:
             dtype=mx.float16,
         )
 
+    def test_kernel_metadata_cached_on_context(self) -> None:
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[3],
+            block_tables=[[0, 1]],
+            context_lens=[8],
+            cu_seqlens=[0, 1],
+            offsets=[7],
+        )
+
+        meta1 = _mla_kernel_metadata(ctx, block_size=4)
+        meta2 = _mla_kernel_metadata(ctx, block_size=4)
+
+        assert meta1 is meta2
+        assert ("mla", 4) in ctx.kernel_metadata_cache
+        assert meta1.block_tables.shape == (1, 2)
+        assert meta1.context_lens.dtype == mx.uint32
+        assert meta1.cu_seqlens_q.dtype == mx.int32
+
+    def test_split_route_cached_on_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[65535],
+            block_tables=[list(range(4096))],
+            context_lens=[65536],
+            cu_seqlens=[0, 1],
+            offsets=[65535],
+        )
+
+        selected1 = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+        selected2 = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+
+        assert selected1 is True
+        assert selected2 is True
+        assert ("mla_route", 16, 1, 8, 1, 65536) in ctx.kernel_metadata_cache
+
+    def test_short_split_route_rejects_without_planner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_planner(**_: object) -> dict[str, object]:
+            raise AssertionError("short contexts should not call split planner")
+
+        monkeypatch.setattr("vllm_metal.metal.metal_mla_split_plan", fail_planner)
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[8191],
+            block_tables=[list(range(512))],
+            context_lens=[8192],
+            cu_seqlens=[0, 1],
+            offsets=[8191],
+        )
+
+        selected = _mla_split_route_selected(
+            ctx,
+            block_size=16,
+            total_q_tokens=1,
+            num_heads=8,
+            heads_per_tg=1,
+        )
+
+        assert selected is False
+        assert ("mla_route", 16, 1, 8, 1, 8192) in ctx.kernel_metadata_cache
+
     def test_decode_output_shape(self) -> None:
         # 1 request, 3 cached tokens, 1 new decode token
         inner = _MinimalMLAInner()
@@ -561,10 +641,10 @@ class _KernelDimsAbsorbedInner(nn.Module):
     routing admission tests so ``_can_use_kernel`` actually exercises
     the accept path."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, num_heads: int = 8) -> None:
         super().__init__()
         self.q_lora_rank = None
-        self.num_heads = 8  # multiple of 2 so _pick_heads_per_tg returns 2
+        self.num_heads = num_heads
         self.q_head_dim = _KERNEL_NOPE_DIM + _KERNEL_ROPE_DIM
         self.qk_nope_head_dim = _KERNEL_NOPE_DIM
         self.qk_rope_head_dim = _KERNEL_ROPE_DIM
@@ -576,7 +656,7 @@ class _KernelDimsAbsorbedInner(nn.Module):
 
 
 def _make_kernel_dims_wrapper(
-    *, block_size: int = 16, dtype: mx.Dtype = mx.float16
+    *, block_size: int = 16, dtype: mx.Dtype = mx.float16, num_heads: int = 8
 ) -> MLAPagedAttentionWrapper:
     cache = MLAPagedLatentCache(
         num_layers=1,
@@ -586,26 +666,30 @@ def _make_kernel_dims_wrapper(
         dtype=dtype,
     )
     return MLAPagedAttentionWrapper(
-        inner=_KernelDimsAbsorbedInner(), layer_idx=0, latent_cache=cache
+        inner=_KernelDimsAbsorbedInner(num_heads=num_heads),
+        layer_idx=0,
+        latent_cache=cache,
     )
 
 
-def _make_decode_ctx(num_seqs: int = 1) -> SimpleNamespace:
+def _make_decode_ctx(
+    num_seqs: int = 1, ctx_len: int = 16, block_size: int = 16
+) -> SimpleNamespace:
     """Single-token-per-seq decode context, just enough for
     ``_can_use_kernel`` to inspect."""
+    num_blocks = math.ceil(ctx_len / block_size)
     return SimpleNamespace(
-        context_lens=[16] * num_seqs,
+        context_lens=[ctx_len] * num_seqs,
         cu_seqlens=list(range(num_seqs + 1)),
-        block_tables=[[0]] * num_seqs,
+        block_tables=[list(range(num_blocks))] * num_seqs,
     )
 
 
-class TestSinglePassRouting:
-    """Focused tests for the env-gated single-pass kernel fast path.
+class TestMetalKernelRouting:
+    """Focused tests for the env-gated Metal MLA kernel fast path.
     Each test exercises one admission rule of ``_can_use_kernel`` —
-    no exhaustive cell sweeps. Per the alignment with reviewers on
-    ``Ship one kernel, prove it wins'', the kernel routing is a
-    single boolean gate, not a multi-variant priority chain."""
+    no exhaustive cell sweeps. Split/reduce is selected later by the C++
+    dispatch planner, so this gate preserves the existing one-pass Metal path."""
 
     def test_env_off_rejects(self, monkeypatch) -> None:
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", False)
@@ -618,6 +702,7 @@ class TestSinglePassRouting:
         )
 
     def test_env_on_accepts(self, monkeypatch) -> None:
+        monkeypatch.delenv("VLLM_METAL_MLA_SPLIT_KV", raising=False)
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
         wrapper = _make_kernel_dims_wrapper()
         assert (
@@ -626,6 +711,34 @@ class TestSinglePassRouting:
             )
             is True
         )
+
+    def test_split_env_on_accepts_long_context(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+        wrapper = _make_kernel_dims_wrapper(block_size=16)
+        assert (
+            wrapper._can_use_kernel(
+                wrapper._inner,
+                wrapper._mla_latent_cache,
+                _make_decode_ctx(ctx_len=65536, block_size=16),
+            )
+            is True
+        )
+
+    def test_glm_split_request_follows_device_plan(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        monkeypatch.setenv("VLLM_METAL_MLA_SPLIT_KV", "1")
+        wrapper = _make_kernel_dims_wrapper(block_size=32, num_heads=20)
+        ctx = _make_decode_ctx(ctx_len=32768, block_size=32)
+        gate_grid = (20 // 5) * len(ctx.context_lens)
+        target_partitions = min(
+            max((int(get_ops().min_decode_grid()) + gate_grid - 1) // gate_grid, 2),
+            64,
+        )
+
+        assert wrapper._can_use_kernel(
+            wrapper._inner, wrapper._mla_latent_cache, ctx
+        ) is (target_partitions >= 56)
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
         """Inner without embed_q / unembed_out (kv_b_proj-style models
@@ -712,6 +825,7 @@ class TestSinglePassRouting:
         [
             (1, 1, 1),  # odd num_heads → fall back to G=1
             (16, 1, 1),  # B=1 small H → G=1 (better single-TG utilization)
+            (20, 1, 1),  # GLM-style H=20 uses G=5 only after split is selected
             (16, 8, 2),  # B*H ≳ 30 → G=2 wins
             (32, 1, 2),  # B=1 but H≥32 → G=2 saturates GPU
         ],

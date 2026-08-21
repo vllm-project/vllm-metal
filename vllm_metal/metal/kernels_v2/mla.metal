@@ -5,11 +5,9 @@
 // Tracks RFC https://github.com/vllm-project/vllm-metal/issues/360.
 //
 // paged_mla_attention — fused score+softmax+V over a single threadgroup
-// per (head_group, q_token). The `use_partitioning` function constant and
-// PARTITION_SIZE template parameter are scaffolded for a future 2-pass
-// mode (each partition writes scratch max/lse/output, a separate reduce
-// kernel merges across partitions); only the single-pass mode
-// (use_partitioning=false, PARTITION_SIZE=0) is wired up today.
+// per (head_group, q_token). With PARTITION_SIZE > 0, each threadgroup owns
+// one KV partition and writes scratch partial output plus that partition's LSE.
+// paged_mla_attention_reduce merges those partials across partitions.
 //
 // Decode kernel parallelism scheme mirrors MLX's sdpa_vector
 // (mlx/backend/metal/kernels/sdpa_vector.h, ml-explore/mlx@v0.31.2):
@@ -49,13 +47,12 @@ constant bool mla_use_partitioning [[function_constant(10)]];
 //
 // Buffer layout:
 //
-//   0: exp_sums    [num_seqs, num_heads, max_num_partitions]  fp32
-//                  (only when mla_use_partitioning)
-//   1: max_logits  [num_seqs, num_heads, max_num_partitions]  fp32
-//                  (only when mla_use_partitioning)
+//   0: lse       [total_q_tokens, num_heads, max_num_partitions] fp32
+//                (only when mla_use_partitioning; log2-space LSE)
 //   2: out / tmp_out
 //        non-partitioned: [total_q_tokens, num_heads, KV_LORA_RANK] T
-//        partitioned    : [num_seqs, num_heads, max_num_partitions, KV_LORA_RANK] T
+//        partitioned    : [total_q_tokens, num_heads, max_num_partitions - 1,
+//                          KV_LORA_RANK] T
 //   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK] T  (post-embed_q)
 //   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM] T  (post-RoPE)
 //   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM] T
@@ -65,6 +62,8 @@ constant bool mla_use_partitioning [[function_constant(10)]];
 //   9: num_seqs (constant int)
 //  10: max_num_blocks_per_seq (constant int)
 //  11: scale (constant float)
+//  12: partition0_out [total_q_tokens, num_heads, KV_LORA_RANK] T
+//                      (only when mla_use_partitioning)
 //
 // Grid:
 //   non-partitioned: (num_heads / HEADS_PER_TG, total_q_tokens, 1)
@@ -89,10 +88,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
           int HEADS_PER_TG, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel, max_total_threads_per_threadgroup(NUM_THREADS)]] void paged_mla_attention(
-    device float *exp_sums
+    device float *lse
     [[buffer(0), function_constant(mla_use_partitioning)]],
-    device float *max_logits
-    [[buffer(1), function_constant(mla_use_partitioning)]],
     device T *out [[buffer(2)]],
     device const T *q_nope [[buffer(3)]],
     device const T *q_pe [[buffer(4)]],
@@ -103,6 +100,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     const constant int &num_seqs [[buffer(9)]],
     const constant int &max_num_blocks_per_seq [[buffer(10)]],
     const constant float &scale [[buffer(11)]],
+    device T *partition0_out
+    [[buffer(12), function_constant(mla_use_partitioning)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -146,7 +145,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
   const int token_end =
       USE_PARTITIONING ? min(token_start + PARTITION_SIZE, ctx_len) : ctx_len;
 
-  // Partition has no work — early-out (caller pre-zeros partial buffers).
+  // Partition has no work. The reduce kernel derives the valid partition count
+  // from ctx_len, so unused partition slots are ignored.
   if (USE_PARTITIONING && token_start >= ctx_len) {
     return;
   }
@@ -313,11 +313,22 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     // array would push larger HEADS_PER_TG variants over the per-thread
     // register budget.
     const int head_idx = head_idx_base + h;
-    device T *out_base = USE_PARTITIONING
-        ? (out +
-           ((q_token_idx * num_heads + head_idx) * max_num_partitions +
-            partition_idx) * KV_LORA_RANK)
-        : (out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK);
+    device T *out_base =
+        out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK;
+    if (USE_PARTITIONING) {
+      out_base = (partition_idx == 0)
+          ? (partition0_out +
+             (q_token_idx * num_heads + head_idx) * KV_LORA_RANK)
+          : (out +
+             ((q_token_idx * num_heads + head_idx) *
+                  (max_num_partitions - 1) +
+              (partition_idx - 1)) *
+                 KV_LORA_RANK);
+    }
+    device float *lse_base = USE_PARTITIONING
+        ? (lse + (q_token_idx * num_heads + head_idx) * max_num_partitions +
+           partition_idx)
+        : nullptr;
 #pragma unroll
     for (int p = 0; p < NUM_PASSES; p++) {
 #pragma unroll
@@ -328,23 +339,471 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
             (lane < BN) ? outputs[(p * BN + sg) * BD + lane] : 0.0f;
         const float final_val = simd_sum(other * rescale) * inv_global;
         if (lane == 0) {
-          out_base[(p * BN + sg) * V_PER_THREAD + i] = T(final_val);
+          const int out_dim = (p * BN + sg) * V_PER_THREAD + i;
+          out_base[out_dim] = T(final_val);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
     }
 
-    // ---- Phase D: per-head LSE / max metadata for the partitioned reduce ----
+    // ---- Phase D: per-head LSE metadata for the partitioned reduce ----
     if (USE_PARTITIONING) {
       if (lane == 0 && sg == 0) {
-        max_logits[(q_token_idx * num_heads + head_idx) * max_num_partitions +
-                   partition_idx] = global_max;
-        // exp_sums stores l (sum-of-exps at global_max) so reduce kernel can
-        // weight partitions correctly.
-        exp_sums[(q_token_idx * num_heads + head_idx) * max_num_partitions +
-                 partition_idx] = global_sum;
+        *lse_base = global_max + fast::log2(global_sum);
       }
     }
+  }
+}
+
+
+// ========================================== Striped split pass
+//
+// One simdgroup per contiguous stripe instead of a full threadgroup per chunk.
+// This avoids the expensive intra-partition cross-simdgroup merge in
+// paged_mla_attention while still increasing the number of in-flight context
+// reads. Each stripe writes the same normalized partial + log2 LSE contract
+// consumed by paged_mla_attention_reduce.
+
+template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
+          int HEADS_PER_TG, int NUM_SIMD_LANES, int PARTITION_SIZE>
+[[kernel, max_total_threads_per_threadgroup(NUM_SIMD_LANES)]] void
+paged_mla_attention_striped(
+    device float *lse [[buffer(0)]],
+    device T *out [[buffer(2)]],
+    device const T *q_nope [[buffer(3)]],
+    device const T *q_pe [[buffer(4)]],
+    device const T *latent_cache [[buffer(5)]],
+    device const uint32_t *block_tables [[buffer(6)]],
+    device const uint32_t *context_lens [[buffer(7)]],
+    device const int32_t *cu_seqlens_q [[buffer(8)]],
+    const constant int &num_seqs [[buffer(9)]],
+    const constant int &max_num_blocks_per_seq [[buffer(10)]],
+    const constant float &scale [[buffer(11)]],
+    device T *partition0_out [[buffer(12)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)cu_seqlens_q;
+  (void)num_seqs;
+
+  constexpr int LATENT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int BD = NUM_SIMD_LANES;
+  constexpr int QK_PER_THREAD = KV_LORA_RANK / BD;
+  constexpr int QPE_PER_THREAD = QK_ROPE_HEAD_DIM / BD;
+  constexpr int V_PER_THREAD = KV_LORA_RANK / BD;
+  static_assert(KV_LORA_RANK % BD == 0,
+                "KV_LORA_RANK must be divisible by NUM_SIMD_LANES");
+  static_assert(QK_ROPE_HEAD_DIM % BD == 0,
+                "QK_ROPE_HEAD_DIM must be divisible by NUM_SIMD_LANES");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "PARTITION_SIZE must be divisible by BLOCK_SIZE");
+
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int head_group_idx = threadgroup_position_in_grid.x;
+  const int num_head_groups = threadgroups_per_grid.x;
+  const int num_heads = num_head_groups * HEADS_PER_TG;
+  const int head_idx_base = head_group_idx * HEADS_PER_TG;
+  const int partition_idx = threadgroup_position_in_grid.z;
+  const int max_num_partitions = threadgroups_per_grid.z;
+  const int lane = (int)simd_lid;
+
+  const int seq_idx = q_token_idx;
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int num_partitions = (ctx_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  if (partition_idx >= num_partitions) {
+    return;
+  }
+
+  float q_nope_local[HEADS_PER_TG * QK_PER_THREAD];
+  float q_pe_local[HEADS_PER_TG * QPE_PER_THREAD];
+  float v_local[HEADS_PER_TG * V_PER_THREAD];
+  float max_score[HEADS_PER_TG];
+  float sum_exp_score[HEADS_PER_TG];
+
+#pragma unroll
+  for (int h = 0; h < HEADS_PER_TG; h++) {
+    const int head_idx = head_idx_base + h;
+    const device T *q_nope_ptr =
+        q_nope + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK +
+        lane * QK_PER_THREAD;
+    const device T *q_pe_ptr =
+        q_pe + (q_token_idx * num_heads + head_idx) * QK_ROPE_HEAD_DIM +
+        lane * QPE_PER_THREAD;
+#pragma unroll
+    for (int j = 0; j < QK_PER_THREAD; j++) {
+      q_nope_local[h * QK_PER_THREAD + j] = float(q_nope_ptr[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < QPE_PER_THREAD; j++) {
+      q_pe_local[h * QPE_PER_THREAD + j] = float(q_pe_ptr[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < V_PER_THREAD; j++) {
+      v_local[h * V_PER_THREAD + j] = 0.0f;
+    }
+    max_score[h] = -INFINITY;
+    sum_exp_score[h] = 0.0f;
+  }
+
+  const device uint32_t *block_table_row =
+      block_tables + (uint64_t)seq_idx * max_num_blocks_per_seq;
+
+  const int token_start = partition_idx * PARTITION_SIZE;
+  const int token_end = min(token_start + PARTITION_SIZE, ctx_len);
+  for (int t = token_start; t < token_end; t++) {
+    const int block_idx = t / BLOCK_SIZE;
+    const int block_offset = t % BLOCK_SIZE;
+    const uint32_t physical_block = block_table_row[block_idx];
+    const device T *token_ptr =
+        latent_cache + (uint64_t)physical_block * BLOCK_SIZE * LATENT_DIM +
+        block_offset * LATENT_DIM;
+
+    float k_norm_local[QK_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < QK_PER_THREAD; j++) {
+      k_norm_local[j] = float(token_ptr[lane * QK_PER_THREAD + j]);
+    }
+    float k_pe_local[QPE_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < QPE_PER_THREAD; j++) {
+      k_pe_local[j] =
+          float(token_ptr[KV_LORA_RANK + lane * QPE_PER_THREAD + j]);
+    }
+
+#pragma unroll
+    for (int h = 0; h < HEADS_PER_TG; h++) {
+      float partial = 0.0f;
+#pragma unroll
+      for (int j = 0; j < QK_PER_THREAD; j++) {
+        partial += q_nope_local[h * QK_PER_THREAD + j] * k_norm_local[j];
+      }
+#pragma unroll
+      for (int j = 0; j < QPE_PER_THREAD; j++) {
+        partial += q_pe_local[h * QPE_PER_THREAD + j] * k_pe_local[j];
+      }
+      const float score = simd_sum(partial) * scale * M_LOG2E_F;
+
+      const float new_max = max(max_score[h], score);
+      const float factor = (max_score[h] == -INFINITY) ? 0.0f
+                                                       : fast::exp2(max_score[h] - new_max);
+      const float exp_score = fast::exp2(score - new_max);
+      max_score[h] = new_max;
+      sum_exp_score[h] = sum_exp_score[h] * factor + exp_score;
+#pragma unroll
+      for (int j = 0; j < V_PER_THREAD; j++) {
+        v_local[h * V_PER_THREAD + j] =
+            v_local[h * V_PER_THREAD + j] * factor + exp_score * k_norm_local[j];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int h = 0; h < HEADS_PER_TG; h++) {
+    const int head_idx = head_idx_base + h;
+    device T *out_base = (partition_idx == 0)
+        ? (partition0_out +
+           (q_token_idx * num_heads + head_idx) * KV_LORA_RANK)
+        : (out +
+           ((q_token_idx * num_heads + head_idx) *
+                (max_num_partitions - 1) +
+            (partition_idx - 1)) *
+               KV_LORA_RANK);
+    device float *lse_base =
+        lse + (q_token_idx * num_heads + head_idx) * max_num_partitions +
+        partition_idx;
+    const float inv_sum =
+        (sum_exp_score[h] > 0.0f) ? (1.0f / sum_exp_score[h]) : 0.0f;
+#pragma unroll
+    for (int j = 0; j < V_PER_THREAD; j++) {
+      out_base[lane * V_PER_THREAD + j] =
+          T(v_local[h * V_PER_THREAD + j] * inv_sum);
+    }
+    if (lane == 0) {
+      *lse_base = max_score[h] + fast::log2(sum_exp_score[h]);
+    }
+  }
+}
+
+
+// ========================================== Reduce kernel
+//
+// Cross-partition online-softmax merge. One threadgroup per (head, q_token).
+// The main kernel stores normalized partial outputs plus per-partition LSE in
+// log2 space, so the reduce side weights partials with exp2(lse - global_lse).
+//
+// Buffer layout:
+//   0: out          [total_q_tokens, num_heads, HEAD_SIZE] T
+//   1: lse          [total_q_tokens, num_heads, max_num_partitions] fp32
+//   3: tmp_out      [total_q_tokens, num_heads, max_num_partitions - 1,
+//                    HEAD_SIZE] T
+//   4: context_lens [num_seqs] uint32
+//   5: max_num_partitions (constant int)
+
+template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
+          int PARTITION_SIZE>
+[[kernel]] void paged_mla_attention_reduce(
+    device T *out [[buffer(0)]],
+    const device float *lse [[buffer(1)]],
+    const device T *tmp_out [[buffer(3)]],
+    const device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int num_heads = threadgroups_per_grid.x;
+  const int thread_idx = thread_position_in_threadgroup.x;
+  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
+  const int warp_idx = (int)simd_tid;
+  const int lane = (int)simd_lid;
+
+  const int seq_idx = q_token_idx;
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int num_partitions =
+      (ctx_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+
+  threadgroup float *shared_weights = (threadgroup float *)shared_mem;
+  threadgroup float *red_smem = shared_weights + max_num_partitions;
+
+  device T *out_ptr =
+      out + (q_token_idx * num_heads + head_idx) * HEAD_SIZE;
+  const device float *lse_ptr =
+      lse + (q_token_idx * num_heads + head_idx) * max_num_partitions;
+  const device T *tmp_out_ptr =
+      tmp_out +
+      (q_token_idx * num_heads + head_idx) * (max_num_partitions - 1) *
+          HEAD_SIZE;
+
+  if (num_partitions <= 1) {
+    return;
+  }
+
+  if (num_partitions == 2) {
+    const float l0 = lse_ptr[0];
+    const float l1 = lse_ptr[1];
+    const float m = max(l0, l1);
+    const float w0 = fast::exp2(l0 - m);
+    const float w1 = fast::exp2(l1 - m);
+    const float inv = 1.0f / (w0 + w1);
+    for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+      const float p0 = float(out_ptr[d]);
+      const float p1 = float(tmp_out_ptr[d]);
+      out_ptr[d] = T((p0 * w0 + p1 * w1) * inv);
+    }
+    return;
+  }
+
+  float thread_max = -INFINITY;
+  for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
+    const float l = lse_ptr[i];
+    thread_max = max(thread_max, l);
+  }
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+    thread_max = max(thread_max, simd_shuffle_xor(thread_max, mask));
+  }
+  if (lane == 0) {
+    red_smem[warp_idx] = thread_max;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread_max = (lane < NUM_WARPS) ? red_smem[lane] : -INFINITY;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    thread_max = max(thread_max, simd_shuffle_xor(thread_max, mask));
+  }
+  const float global_max = simd_shuffle(thread_max, 0);
+
+  float thread_exp_sum = 0.0f;
+  for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
+    const float l = lse_ptr[i];
+    const float rescaled = fast::exp2(l - global_max);
+    shared_weights[i] = rescaled;
+    thread_exp_sum += rescaled;
+  }
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+    thread_exp_sum += simd_shuffle_xor(thread_exp_sum, mask);
+  }
+  if (lane == 0) {
+    red_smem[NUM_WARPS + warp_idx] = thread_exp_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread_exp_sum = (lane < NUM_WARPS) ? red_smem[NUM_WARPS + lane] : 0.0f;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    thread_exp_sum += simd_shuffle_xor(thread_exp_sum, mask);
+  }
+  const float global_exp_sum = simd_shuffle(thread_exp_sum, 0);
+  const float inv_global =
+      (global_exp_sum > 0.0f) ? (1.0f / global_exp_sum) : 0.0f;
+
+  for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+    float acc = 0.0f;
+    for (int j = 0; j < num_partitions; j++) {
+      const float partial =
+          (j == 0) ? float(out_ptr[d])
+                   : float(tmp_out_ptr[(j - 1) * HEAD_SIZE + d]);
+      acc += partial * shared_weights[j] * inv_global;
+    }
+    out_ptr[d] = T(acc);
+  }
+}
+
+
+// ========================================== Multi-head striped split pass
+//
+// One threadgroup owns a context stripe and several heads. Each simdgroup inside
+// the threadgroup computes one head, matching the way MLX's vector SDPA maps GQA
+// heads more closely than launching one tiny threadgroup per head.
+
+template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
+          int HEADS_PER_TG, int NUM_SIMD_LANES, int PARTITION_SIZE>
+[[kernel, max_total_threads_per_threadgroup(NUM_SIMD_LANES * HEADS_PER_TG)]]
+void paged_mla_attention_head_striped(
+    device float *lse [[buffer(0)]],
+    device T *out [[buffer(2)]],
+    device const T *q_nope [[buffer(3)]],
+    device const T *q_pe [[buffer(4)]],
+    device const T *latent_cache [[buffer(5)]],
+    device const uint32_t *block_tables [[buffer(6)]],
+    device const uint32_t *context_lens [[buffer(7)]],
+    device const int32_t *cu_seqlens_q [[buffer(8)]],
+    const constant int &num_seqs [[buffer(9)]],
+    const constant int &max_num_blocks_per_seq [[buffer(10)]],
+    const constant float &scale [[buffer(11)]],
+    device T *partition0_out [[buffer(12)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)cu_seqlens_q;
+  (void)num_seqs;
+
+  constexpr int LATENT_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+  constexpr int BD = NUM_SIMD_LANES;
+  constexpr int QK_PER_THREAD = KV_LORA_RANK / BD;
+  constexpr int QPE_PER_THREAD = QK_ROPE_HEAD_DIM / BD;
+  constexpr int V_PER_THREAD = KV_LORA_RANK / BD;
+  static_assert(KV_LORA_RANK % BD == 0,
+                "KV_LORA_RANK must be divisible by NUM_SIMD_LANES");
+  static_assert(QK_ROPE_HEAD_DIM % BD == 0,
+                "QK_ROPE_HEAD_DIM must be divisible by NUM_SIMD_LANES");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "PARTITION_SIZE must be divisible by BLOCK_SIZE");
+
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int head_group_idx = threadgroup_position_in_grid.x;
+  const int num_head_groups = threadgroups_per_grid.x;
+  const int num_heads = num_head_groups * HEADS_PER_TG;
+  const int local_head_idx = (int)thread_position_in_threadgroup.y;
+  const int head_idx = head_group_idx * HEADS_PER_TG + local_head_idx;
+  const int partition_idx = threadgroup_position_in_grid.z;
+  const int max_num_partitions = threadgroups_per_grid.z;
+  const int lane = (int)simd_lid;
+
+  const int seq_idx = q_token_idx;
+  const int ctx_len = (int)context_lens[seq_idx];
+  const int num_partitions = (ctx_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  if (partition_idx >= num_partitions) {
+    return;
+  }
+
+  float q_nope_local[QK_PER_THREAD];
+  float q_pe_local[QPE_PER_THREAD];
+  float v_local[V_PER_THREAD];
+
+  const device T *q_nope_ptr =
+      q_nope + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK +
+      lane * QK_PER_THREAD;
+  const device T *q_pe_ptr =
+      q_pe + (q_token_idx * num_heads + head_idx) * QK_ROPE_HEAD_DIM +
+      lane * QPE_PER_THREAD;
+#pragma unroll
+  for (int j = 0; j < QK_PER_THREAD; j++) {
+    q_nope_local[j] = float(q_nope_ptr[j]);
+  }
+#pragma unroll
+  for (int j = 0; j < QPE_PER_THREAD; j++) {
+    q_pe_local[j] = float(q_pe_ptr[j]);
+  }
+#pragma unroll
+  for (int j = 0; j < V_PER_THREAD; j++) {
+    v_local[j] = 0.0f;
+  }
+
+  float max_score = -INFINITY;
+  float sum_exp_score = 0.0f;
+
+  const device uint32_t *block_table_row =
+      block_tables + (uint64_t)seq_idx * max_num_blocks_per_seq;
+
+  const int token_start = partition_idx * PARTITION_SIZE;
+  const int token_end = min(token_start + PARTITION_SIZE, ctx_len);
+  for (int t = token_start; t < token_end; t++) {
+    const int block_idx = t / BLOCK_SIZE;
+    const int block_offset = t % BLOCK_SIZE;
+    const uint32_t physical_block = block_table_row[block_idx];
+    const device T *token_ptr =
+        latent_cache + (uint64_t)physical_block * BLOCK_SIZE * LATENT_DIM +
+        block_offset * LATENT_DIM;
+
+    float k_norm_local[QK_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < QK_PER_THREAD; j++) {
+      k_norm_local[j] = float(token_ptr[lane * QK_PER_THREAD + j]);
+    }
+    float k_pe_local[QPE_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < QPE_PER_THREAD; j++) {
+      k_pe_local[j] =
+          float(token_ptr[KV_LORA_RANK + lane * QPE_PER_THREAD + j]);
+    }
+
+    float partial = 0.0f;
+#pragma unroll
+    for (int j = 0; j < QK_PER_THREAD; j++) {
+      partial += q_nope_local[j] * k_norm_local[j];
+    }
+#pragma unroll
+    for (int j = 0; j < QPE_PER_THREAD; j++) {
+      partial += q_pe_local[j] * k_pe_local[j];
+    }
+    const float score = simd_sum(partial) * scale * M_LOG2E_F;
+
+    const float new_max = max(max_score, score);
+    const float factor = (max_score == -INFINITY)
+        ? 0.0f
+        : fast::exp2(max_score - new_max);
+    const float exp_score = fast::exp2(score - new_max);
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
+#pragma unroll
+    for (int j = 0; j < V_PER_THREAD; j++) {
+      v_local[j] = v_local[j] * factor + exp_score * k_norm_local[j];
+    }
+  }
+
+  device T *out_base = (partition_idx == 0)
+      ? (partition0_out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK)
+      : (out +
+         ((q_token_idx * num_heads + head_idx) * (max_num_partitions - 1) +
+          (partition_idx - 1)) *
+             KV_LORA_RANK);
+  device float *lse_base =
+      lse + (q_token_idx * num_heads + head_idx) * max_num_partitions +
+      partition_idx;
+  const float inv_sum =
+      (sum_exp_score > 0.0f) ? (1.0f / sum_exp_score) : 0.0f;
+#pragma unroll
+  for (int j = 0; j < V_PER_THREAD; j++) {
+    out_base[lane * V_PER_THREAD + j] = T(v_local[j] * inv_sum);
+  }
+  if (lane == 0) {
+    *lse_base = max_score + fast::log2(sum_exp_score);
   }
 }
 
@@ -363,10 +822,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
                        #partition_size)]] [[kernel]] void                      \
   paged_mla_attention<type, kv_lora_rank, qk_rope_head_dim, block_size,        \
                       heads_per_tg, num_threads, 32, partition_size>(          \
-      device float * exp_sums                                                  \
+      device float * lse                                                       \
       [[buffer(0), function_constant(mla_use_partitioning)]],                  \
-      device float *max_logits                                                 \
-      [[buffer(1), function_constant(mla_use_partitioning)]],                  \
       device type *out [[buffer(2)]],                                          \
       device const type *q_nope [[buffer(3)]],                                 \
       device const type *q_pe [[buffer(4)]],                                   \
@@ -377,10 +834,79 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
       const constant int &num_seqs [[buffer(9)]],                              \
       const constant int &max_num_blocks_per_seq [[buffer(10)]],               \
       const constant float &scale [[buffer(11)]],                              \
+      device type *partition0_out                                              \
+      [[buffer(12), function_constant(mla_use_partitioning)]],                 \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_mla_reduce(type, head_size, partition_size)                \
+  template [[host_name("paged_mla_attention_reduce_" #type "_hs" #head_size    \
+                       "_nt256_nsl32_ps" #partition_size)]] [[kernel]] void    \
+  paged_mla_attention_reduce<type, head_size, 256, 32, partition_size>(        \
+      device type * out [[buffer(0)]],                                         \
+      const device float *lse [[buffer(1)]],                                   \
+      const device type *tmp_out [[buffer(3)]],                                \
+      const device uint32_t *context_lens [[buffer(4)]],                       \
+      const constant int &max_num_partitions [[buffer(5)]],                    \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_mla_striped(type, kv_lora_rank, qk_rope_head_dim,          \
+                                block_size, heads_per_tg, partition_size)      \
+  template [[host_name("paged_mla_attention_striped_" #type "_kvr"             \
+                       #kv_lora_rank "_pe" #qk_rope_head_dim "_bs"             \
+                       #block_size "_g" #heads_per_tg "_nt32_nsl32_ps"         \
+                       #partition_size)]] [[kernel]] void                      \
+  paged_mla_attention_striped<type, kv_lora_rank, qk_rope_head_dim,            \
+                              block_size, heads_per_tg, 32, partition_size>(   \
+      device float * lse [[buffer(0)]],                                        \
+      device type *out [[buffer(2)]],                                          \
+      device const type *q_nope [[buffer(3)]],                                 \
+      device const type *q_pe [[buffer(4)]],                                   \
+      device const type *latent_cache [[buffer(5)]],                           \
+      device const uint32_t *block_tables [[buffer(6)]],                       \
+      device const uint32_t *context_lens [[buffer(7)]],                       \
+      device const int32_t *cu_seqlens_q [[buffer(8)]],                        \
+      const constant int &num_seqs [[buffer(9)]],                              \
+      const constant int &max_num_blocks_per_seq [[buffer(10)]],               \
+      const constant float &scale [[buffer(11)]],                              \
+      device type *partition0_out [[buffer(12)]],                              \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_mla_head_striped(type, kv_lora_rank, qk_rope_head_dim,     \
+                                     block_size, heads_per_tg,                 \
+                                     partition_size)                           \
+  template [[host_name("paged_mla_attention_head_striped_" #type "_kvr"        \
+                       #kv_lora_rank "_pe" #qk_rope_head_dim "_bs"             \
+                       #block_size "_g" #heads_per_tg "_nt32_nsl32_ps"         \
+                       #partition_size)]] [[kernel]] void                      \
+  paged_mla_attention_head_striped<type, kv_lora_rank, qk_rope_head_dim,       \
+                                   block_size, heads_per_tg, 32,               \
+                                   partition_size>(                            \
+      device float * lse [[buffer(0)]],                                        \
+      device type *out [[buffer(2)]],                                          \
+      device const type *q_nope [[buffer(3)]],                                 \
+      device const type *q_pe [[buffer(4)]],                                   \
+      device const type *latent_cache [[buffer(5)]],                           \
+      device const uint32_t *block_tables [[buffer(6)]],                       \
+      device const uint32_t *context_lens [[buffer(7)]],                       \
+      device const int32_t *cu_seqlens_q [[buffer(8)]],                        \
+      const constant int &num_seqs [[buffer(9)]],                              \
+      const constant int &max_num_blocks_per_seq [[buffer(10)]],               \
+      const constant float &scale [[buffer(11)]],                              \
+      device type *partition0_out [[buffer(12)]],                              \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
       uint simd_lid [[thread_index_in_simdgroup]]);
 
 // G=1 (single-head per TG, NUM_THREADS=1024).
@@ -394,3 +920,39 @@ instantiate_mla(half, 512, 64, 16, 2, 512, 0);
 instantiate_mla(half, 512, 64, 32, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 0);
+
+#define instantiate_mla_partition_size(partition_size)                         \
+  instantiate_mla(half, 512, 64, 16, 1, 1024, partition_size);                 \
+  instantiate_mla(half, 512, 64, 32, 1, 1024, partition_size);                 \
+  instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, partition_size);           \
+  instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, partition_size);           \
+  instantiate_mla(half, 512, 64, 16, 2, 512, partition_size);                  \
+  instantiate_mla(half, 512, 64, 32, 2, 512, partition_size);                  \
+  instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, partition_size);            \
+  instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, partition_size);            \
+  instantiate_mla_striped(half, 512, 64, 16, 1, partition_size);               \
+  instantiate_mla_striped(half, 512, 64, 32, 1, partition_size);               \
+  instantiate_mla_striped(bfloat16_t, 512, 64, 16, 1, partition_size);         \
+  instantiate_mla_striped(bfloat16_t, 512, 64, 32, 1, partition_size);         \
+  instantiate_mla_striped(half, 512, 64, 16, 2, partition_size);               \
+  instantiate_mla_striped(half, 512, 64, 32, 2, partition_size);               \
+  instantiate_mla_striped(bfloat16_t, 512, 64, 16, 2, partition_size);         \
+  instantiate_mla_striped(bfloat16_t, 512, 64, 32, 2, partition_size);         \
+  instantiate_mla_head_striped(half, 512, 64, 16, 5, partition_size);          \
+  instantiate_mla_head_striped(half, 512, 64, 32, 5, partition_size);          \
+  instantiate_mla_head_striped(bfloat16_t, 512, 64, 16, 5, partition_size);    \
+  instantiate_mla_head_striped(bfloat16_t, 512, 64, 32, 5, partition_size);    \
+  instantiate_mla_reduce(half, 512, partition_size);                          \
+  instantiate_mla_reduce(bfloat16_t, 512, partition_size);
+
+instantiate_mla_partition_size(512);
+instantiate_mla_partition_size(640);
+instantiate_mla_partition_size(768);
+instantiate_mla_partition_size(896);
+instantiate_mla_partition_size(1024);
+instantiate_mla_partition_size(1280);
+instantiate_mla_partition_size(1536);
+instantiate_mla_partition_size(2048);
+instantiate_mla_partition_size(4096);
+instantiate_mla_partition_size(8192);
+instantiate_mla_partition_size(32768);
