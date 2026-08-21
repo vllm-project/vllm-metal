@@ -289,9 +289,7 @@ def _bench_shape(
     heads_per_tg = MLAPagedAttentionWrapper._pick_heads_per_tg(
         shape.num_heads, shape.batch_size
     )
-    split_heads_per_tg = (
-        5 if shape.num_heads == 20 and shape.batch_size == 1 else heads_per_tg
-    )
+    split_heads_per_tg = 5 if shape.num_heads == 20 else heads_per_tg
     os.environ["VLLM_METAL_MLA_SPLIT_KV"] = "1"
     plan = metal_mla_split_plan(
         total_q_tokens=shape.batch_size,
