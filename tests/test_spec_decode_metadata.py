@@ -185,7 +185,7 @@ class TestSpecDecodePolicy:
             _scheduler_output(scheduled_spec_decode_tokens={}),
             (),
             paged_attention_enabled=False,
-            is_hybrid=True,
+            has_state_layers=True,
         )
 
     def test_gemma4_mtp_rejects_async_scheduling(self) -> None:
@@ -194,7 +194,7 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={}),
                 (),
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
                 use_async_scheduling=True,
                 speculative_config=_gemma4_mtp_speculative_config(),
             )
@@ -205,16 +205,16 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=False,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
-        with pytest.raises(NotImplementedError, match="hybrid GDN"):
+        with pytest.raises(NotImplementedError, match="per-request state layers"):
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=True,
+                has_state_layers=True,
             )
 
     def test_rejects_invalid_draft_token_sentinel(self) -> None:
@@ -223,7 +223,7 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
     def test_rejects_scheduler_invalid_spec_tokens(self) -> None:
@@ -235,7 +235,7 @@ class TestSpecDecodePolicy:
                 ),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
     def test_rejects_handoff_for_request_outside_decode_set(self) -> None:
@@ -244,7 +244,7 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"missing": [1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
     def test_rejects_empty_handoff_for_request_outside_decode_set(self) -> None:
@@ -253,7 +253,7 @@ class TestSpecDecodePolicy:
                 _scheduler_output(scheduled_spec_decode_tokens={"missing": []}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
     def test_rejects_mismatched_scheduler_token_accounting(self) -> None:
@@ -265,7 +265,7 @@ class TestSpecDecodePolicy:
                 ),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
-                is_hybrid=False,
+                has_state_layers=False,
             )
 
 
@@ -465,7 +465,7 @@ class TestSchedulerPaddedDrafts:
             scheduler_output,
             [],
             paged_attention_enabled=True,
-            is_hybrid=False,
+            has_state_layers=False,
         )
 
     def test_padded_drafts_reach_build_decode_segments_as_zero_drafts(self) -> None:

@@ -117,7 +117,7 @@ class SpeculativeDecodeController:
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
         *,
         paged_attention_enabled: bool,
-        is_hybrid: bool,
+        has_state_layers: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
     ) -> None:
@@ -150,10 +150,11 @@ class SpeculativeDecodeController:
                 "attention so draft-token rows can share scheduler-assigned "
                 "KV slots."
             )
-        if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
+        if (active_spec_tokens or has_invalid_spec_tokens) and has_state_layers:
             raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "GDN models on Metal yet."
+                "Speculative decode verification is not supported for models "
+                "with per-request state layers (GDN, ShortConv) on Metal yet: "
+                "rejected drafts would need state rollback."
             )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}

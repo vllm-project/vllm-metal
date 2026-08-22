@@ -37,8 +37,9 @@ def find_layers(model: Any) -> list[Any]:
         )
 
 
-# Attribute names to probe on each layer, in priority order.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention")
+# Attribute names to probe on each layer, in priority order.  ``conv`` is
+# the LFM2 ShortConv layer attribute (those layers have no self_attn).
+_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv")
 
 
 def find_attn_attr(layer: Any) -> str | None:

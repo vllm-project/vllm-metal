@@ -104,7 +104,13 @@ def is_sdpa(module: nn.Module) -> bool:
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "o_proj")
+        # LFM2 names its output projection ``out_proj``; GDN linear
+        # attention also has ``out_proj`` but no ``q_proj``/``k_proj``,
+        # so this stays tight.  Audited against every mlx_lm model as of
+        # mlx_lm 0.30/lfm2: no other module gains a match from the
+        # ``out_proj`` fallback — re-audit before relying on it for new
+        # architectures.
+        and (hasattr(module, "o_proj") or hasattr(module, "out_proj"))
         and (hasattr(module, "v_proj") or getattr(module, "use_k_eq_v", False))
     )
 
@@ -345,10 +351,15 @@ def prepare_sdpa_qkv(
                 values = keys
 
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
+        # LFM2 names the same per-head norms q_layernorm / k_layernorm.
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
+        elif hasattr(inner, "q_layernorm"):
+            queries = inner.q_layernorm(queries)
         if hasattr(inner, "k_norm"):
             keys = inner.k_norm(keys)
+        elif hasattr(inner, "k_layernorm"):
+            keys = inner.k_layernorm(keys)
         if hasattr(inner, "v_norm"):
             values = inner.v_norm(values)
 
@@ -736,7 +747,9 @@ def sdpa_forward(
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
-    return inner.o_proj(out), kv_for_sharing
+    # LFM2 names its output projection out_proj rather than o_proj.
+    out_proj = inner.o_proj if hasattr(inner, "o_proj") else inner.out_proj
+    return out_proj(out), kv_for_sharing
 
 
 def apply_g_proj_gate(

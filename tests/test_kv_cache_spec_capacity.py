@@ -33,7 +33,7 @@ def _policy(
     head_dim=256,
     sliding_window_per_layer=None,
 ):
-    # ``is_mla``/``is_hybrid`` are derived from the model config, not settable.
+    # ``is_mla``/``is_gdn_hybrid`` are derived from the model config, not settable.
     model_args = {"kv_lora_rank": head_dim} if is_mla else {}
     runner = make_stub_runner(
         model_args=model_args,
@@ -115,6 +115,7 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
             mamba_page_size_padded=None,
             mamba_block_size=max_model_len,
             mamba_cache_mode="none",
+            mamba_ssm_cache_dtype="float32",
         ),
         linear_conv_kernel_dim=4,
         linear_conv_dim=64,

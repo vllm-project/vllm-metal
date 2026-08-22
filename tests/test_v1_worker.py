@@ -180,7 +180,10 @@ class TestOneSequenceKvBytes:
             linear_value_head_dim=7,
             linear_key_head_dim=11,
             num_linear_layers=3,
-            cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
+            cache_config=SimpleNamespace(
+                mamba_page_size_padded=padded_page,
+                mamba_ssm_cache_dtype="float32",
+            ),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -207,6 +210,8 @@ class TestOneSequenceKvBytes:
         runner.linear_value_head_dim = 7
         runner.linear_key_head_dim = 11
         runner.num_linear_layers = 3
+        # The recurrent pool's fp32 comes from the dtype MetalPlatform forces.
+        runner.cache_config = SimpleNamespace(mamba_ssm_cache_dtype="float32")
 
         conv_bytes = (
             (runner.linear_conv_kernel_dim - 1)
@@ -319,7 +324,9 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_memory_reporting_mode=MagicMock(
                 return_value="paged_attention_capacity"
             ),
@@ -365,7 +372,9 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
@@ -407,7 +416,9 @@ class TestPagedAttentionPlanDiagnostics:
         self, monkeypatch
     ) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
@@ -439,7 +450,9 @@ class TestPagedAttentionPlanDiagnostics:
         self, monkeypatch
     ) -> None:
         runner = SimpleNamespace(
-            is_hybrid=True,
+            is_gdn_hybrid=True,
+            is_conv_hybrid=False,
+            has_state_layers=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
             num_layers=24,
             sdpa_layer_indices=list(range(6)),
@@ -477,7 +490,9 @@ class TestPagedAttentionPlanDiagnostics:
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
-            is_hybrid=False,
+            is_gdn_hybrid=False,
+            is_conv_hybrid=False,
+            has_state_layers=False,
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, memory_fraction=0.1)
@@ -517,7 +532,10 @@ class TestPagedAttentionPlanDiagnostics:
         expected_fraction: float,
     ) -> None:
         worker = _make_worker(
-            SimpleNamespace(is_hybrid=False), use_paged_attention=True
+            SimpleNamespace(
+                is_gdn_hybrid=False, is_conv_hybrid=False, has_state_layers=False
+            ),
+            use_paged_attention=True,
         )
         worker.metal_config.is_auto_memory = is_auto
         worker.metal_config.memory_fraction = memory_fraction

@@ -492,7 +492,8 @@ class ModelLifecycle:
 
     def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
         """Install hybrid linear-attention dimensions for GDN-style models."""
-        if self._runner.is_hybrid:
+        self._install_conv_hybrid_dims(args)
+        if self._runner.is_gdn_hybrid:
             fai = int(args["full_attention_interval"])
             self._runner.full_attention_interval = fai
             self._runner.sdpa_layer_indices = frozenset(
@@ -512,6 +513,33 @@ class ModelLifecycle:
                 self._runner.linear_num_k_heads * self._runner.linear_key_head_dim * 2
                 + self._runner.linear_num_v_heads * self._runner.linear_value_head_dim
             )
+
+    def _install_conv_hybrid_dims(self, args: dict[str, Any]) -> None:
+        """Install conv-hybrid (LFM2 ShortConv) dimensions from layer_types."""
+        if not self._runner.is_conv_hybrid:
+            return
+        layer_types = list(args["layer_types"])
+        unsupported = set(layer_types) - {"conv", "full_attention"}
+        if unsupported:
+            raise NotImplementedError(
+                "conv hybrid models support only 'conv' and 'full_attention' "
+                f"layer_types; got {sorted(unsupported)}"
+            )
+        runner = self._runner
+        runner.conv_layer_types = layer_types
+        runner.sdpa_layer_indices = frozenset(
+            i for i, lt in enumerate(layer_types) if lt == "full_attention"
+        )
+        runner.num_sdpa_layers = len(runner.sdpa_layer_indices)
+        runner.conv_layer_indices = tuple(
+            i for i, lt in enumerate(layer_types) if lt == "conv"
+        )
+        runner.num_conv_layers = len(runner.conv_layer_indices)
+        # ShortConv keeps the last conv_L_cache - 1 rows of B*x per request;
+        # mirror GDN's naming: kernel dim is the conv kernel size, conv_dim is
+        # the per-row width (the model's hidden size).
+        runner.conv_kernel_dim = int(args["conv_L_cache"])
+        runner.conv_hidden_size = int(args["hidden_size"])
 
     def _install_runtime_extensions(
         self,

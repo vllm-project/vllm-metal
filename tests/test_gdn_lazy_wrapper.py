@@ -140,9 +140,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -204,9 +202,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -255,9 +251,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", FakeLazy())
         state = attention_linear._GDNForwardState(
             x=mx.ones((1, 1, inner.conv_dim), dtype=mx.float32),
@@ -299,9 +293,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         state = attention_linear._GDNForwardState(
             x=mx.zeros((1, 3, inner.conv_dim), dtype=mx.float32),
@@ -348,9 +340,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -409,9 +399,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -475,9 +463,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -522,9 +508,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
 
         # Act / Assert
         assert wrapper._recurrent_decode_threadgroup_dv() == 8
@@ -553,10 +537,10 @@ class TestGDNPagedAttentionWrapperLazyKernels:
 
         # Act
         compact = GDNPagedAttentionWrapper(
-            compact_inner, layer_idx=0, cache_idx=0, state_cache=compact_cache
+            compact_inner, cache_idx=0, state_cache=compact_cache
         )
         combined = GDNPagedAttentionWrapper(
-            combined_inner, layer_idx=0, cache_idx=0, state_cache=combined_cache
+            combined_inner, cache_idx=0, state_cache=combined_cache
         )
 
         # Assert
@@ -590,9 +574,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         state = attention_linear._GDNForwardState(
             x=mx.zeros((1, 3, inner.conv_dim), dtype=mx.float32),
@@ -632,9 +614,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         eval_args: list[tuple[Any, ...]] = []
         monkeypatch.setattr(
             attention_linear.mx,
@@ -671,9 +651,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         cache.set_pending_conv_state(
             0, [2], mx.full((1, inner.conv_kernel_size - 1, inner.conv_dim), 5)
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         state = attention_linear._GDNForwardState(
             x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
             cu_seqlens=[0, 2, 4],
@@ -727,9 +705,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", FakeLazy())
         state = attention_linear._GDNForwardState(
             x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
@@ -775,9 +751,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         state = attention_linear._GDNForwardState(
             x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
@@ -809,9 +783,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         eval_args: list[tuple[Any, ...]] = []
         monkeypatch.setattr(
             attention_linear.mx,
@@ -862,9 +834,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -927,9 +897,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         object.__setattr__(wrapper, "_gdn_lazy", fake_lazy)
         monkeypatch.setattr(
             wrapper,
@@ -971,9 +939,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         set_context(
             PagedAttentionContext(
                 slot_mapping=[0, 1],
@@ -999,9 +965,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         set_context(
             PagedAttentionContext(
                 slot_mapping=[0, 1],
@@ -1026,9 +990,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         set_context(
             PagedAttentionContext(
                 slot_mapping=[0, 1],
@@ -1056,9 +1018,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         set_context(
             PagedAttentionContext(
                 slot_mapping=[0, 1],
@@ -1112,9 +1072,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             value_head_dim=inner.head_v_dim,
             key_head_dim=inner.head_k_dim,
         )
-        wrapper = GDNPagedAttentionWrapper(
-            inner, layer_idx=0, cache_idx=0, state_cache=cache
-        )
+        wrapper = GDNPagedAttentionWrapper(inner, cache_idx=0, state_cache=cache)
         set_context(
             PagedAttentionContext(
                 slot_mapping=[0, 1],
