@@ -30,6 +30,7 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
 )
 from vllm_metal.attention.runtime.hybrid import (
+    BailingHybridPagedAttentionRuntime,
     HybridPagedAttentionRuntime,
     _build_linear_layer_spec,
 )
@@ -534,10 +535,10 @@ class ModelCachePolicy:
         runtime: PagedAttentionRuntime,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        if self._runner.is_mla:
-            return
         if self._runner.is_hybrid:
             self._adopt_hybrid_scheduler_group(runtime, kv_cache_config)
+            return
+        if self._runner.is_mla:
             return
         self._adopt_mha_layout(runtime, kv_cache_config)
 
@@ -935,6 +936,23 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
+        if self._runner.is_bailing_v3:
+            if config.turboquant:
+                raise NotImplementedError(
+                    "TurboQuant is not supported for Bailing hybrid models"
+                )
+            return BailingHybridPagedAttentionRuntime(
+                num_layers=self._runner.num_layers,
+                layer_group_size=self._runner.full_attention_interval,
+                max_num_seqs=self._runner.scheduler_config.max_num_seqs,
+                latent_dim=self._runner.mla_latent_dim,
+                linear_num_heads=self._runner.linear_num_v_heads,
+                linear_head_dim=self._runner.linear_value_head_dim,
+                linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
+                block_size=block_size,
+                dtype=self._require_kv_cache_dtype(),
+                mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
+            )
         return HybridPagedAttentionRuntime(
             num_layers=self._runner.num_layers,
             full_attention_interval=self._runner.full_attention_interval,
