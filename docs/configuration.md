@@ -26,9 +26,20 @@ On macOS the plugin defaults `MLX_MAX_OPS_PER_BUFFER` to `2000` via
 `setdefault`, so a value you export yourself always wins. MLX's own default is
 sized for small generate loops; a vLLM decode step on a large MoE model builds
 thousands of lazy ops per step, and the resulting per-buffer commit overhead
-slows the step submit. `2000` sits on the measured plateau. The plugin does not
-default `MLX_MAX_MB_PER_BUFFER`; large global MB limits can inflate startup
-profile memory and reduce the KV budget. Outputs are unaffected.
+slows the step submit. `2000` sits on the measured plateau.
+
+`MLX_MAX_MB_PER_BUFFER` trades transient profile/prefill memory for the same
+per-step commit overhead, so its default is conditional on the usable memory
+budget (total unified memory times `VLLM_METAL_MEMORY_FRACTION`, or
+`--gpu-memory-utilization` in auto mode): `2000` from 90 GiB usable, `512`
+from 50 GiB, and no default below that, on Ray executors (workers do not
+share the driver's memory or environment), or whenever
+`max_num_batched_tokens` exceeds 4096 (large command buffers inflate the
+startup profile peak there and can push the KV budget negative — see #585).
+A value you export yourself always wins, and reconfiguration recomputes the
+plugin's own default rather than letting a later engine inherit it. On
+Qwen3.6-35B-A3B-4bit (M1 Ultra, serve defaults) the full tier is worth
+58 -> 91 tok/s single-stream decode. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 

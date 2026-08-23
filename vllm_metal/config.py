@@ -93,6 +93,18 @@ class MetalConfig:
         """Check if memory fraction is set to auto mode."""
         return self.memory_fraction == AUTO_MEMORY_FRACTION
 
+    def effective_memory_fraction(self, gpu_memory_utilization: float) -> float:
+        """Resolve the paged memory fraction against the engine config.
+
+        A numeric ``VLLM_METAL_MEMORY_FRACTION`` wins; auto defers to the
+        engine's ``--gpu-memory-utilization`` (vLLM defaults it to 0.92).
+        Single home for this precedence — the cache planner and the
+        command-buffer default both read it.
+        """
+        if self.is_auto_memory:
+            return gpu_memory_utilization
+        return self.memory_fraction
+
     @classmethod
     def from_env(cls) -> "MetalConfig":
         """Load configuration from environment variables."""

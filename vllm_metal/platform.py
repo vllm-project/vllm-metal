@@ -4,7 +4,7 @@
 import logging
 import os
 import platform as py_platform
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import psutil
 import torch
@@ -33,6 +33,28 @@ class MetalPlatform(Platform):
     device_name: str = "cpu"  # PyTorch device name (use CPU for compatibility)
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
+
+    # ``MLX_MAX_MB_PER_BUFFER`` tiers by USABLE memory (GiB): total unified
+    # memory times the effective KV budget fraction. Larger command buffers
+    # cut per-step commit overhead but raise the transient profile/prefill
+    # peak that profile_run charges against the KV budget, so each tier
+    # requires its measured overhead to stay a small share (~15%) of the
+    # budget. Sweep on Qwen3.6-35B-A3B-4bit, M1 Ultra, serve defaults —
+    # decode tok/s / profiled overhead: unset 58.2/1.0GB, 512 88.0/7.6GB,
+    # 2000 91.4/13.6GB. No default at all above
+    # ``_MB_BUFFER_MAX_BATCHED_TOKENS`` (#585: 2000 at 8192 batched tokens
+    # inflates the profiled overhead ~19x and fails startup).
+    _MB_BUFFER_TIERS_USABLE_GIB: ClassVar[tuple[tuple[int, str], ...]] = (
+        (90, "2000"),
+        (50, "512"),
+    )
+    _MB_BUFFER_MAX_BATCHED_TOKENS: ClassVar[int] = 4096
+    # The value this plugin installed into the environment, or ``None``.
+    # Distinguishes a plugin default from a user export so reconfiguration
+    # recomputes (or removes) its own default instead of sticking — a
+    # second engine with a larger batch shape must not inherit the first
+    # engine's value (#585 shape).
+    _mb_default_installed: ClassVar[str | None] = None
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -786,6 +808,11 @@ class MetalPlatform(Platform):
         ):
             os.environ["VLLM_HOST_IP"] = "127.0.0.1"
 
+        # Last, after every fail-fast: default the MLX command-buffer memory
+        # limit where the memory trade is safe (policy on the class constants
+        # above; spawned engine workers inherit the environment).
+        cls._default_mb_per_buffer(vllm_config)
+
         # Log memory configuration
         total_mem = cls.get_device_total_memory()
         available_mem = cls.get_device_available_memory()
@@ -814,6 +841,59 @@ class MetalPlatform(Platform):
         from vllm_metal.attention.synthetic_backend import MetalBackend
 
         return MetalBackend
+
+    @classmethod
+    def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
+        """Install, update, or remove the plugin's MB-per-buffer default.
+
+        A manual export always wins. The plugin's own previously installed
+        default is recomputed for the new config and removed when the new
+        shape does not qualify, so a later engine cannot inherit a stale
+        value (#585 shape).
+        """
+        current = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+        if current is not None and current != cls._mb_default_installed:
+            return
+        desired = cls._pick_mb_default(vllm_config)
+        if desired is None:
+            if current is not None:
+                del os.environ["MLX_MAX_MB_PER_BUFFER"]
+            cls._mb_default_installed = None
+            return
+        if desired != current:
+            os.environ["MLX_MAX_MB_PER_BUFFER"] = desired
+            logger.info(
+                "Metal: defaulting MLX_MAX_MB_PER_BUFFER=%s "
+                "(export it explicitly to override).",
+                desired,
+            )
+        cls._mb_default_installed = desired
+
+    @classmethod
+    def _pick_mb_default(cls, vllm_config: "VllmConfig") -> str | None:
+        """Pick the MB-per-buffer tier for this config, or ``None``.
+
+        Positive allowlist on the resolved executor: only the local
+        executors share this process's memory and inherit its environment;
+        Ray workers must not receive a value derived from driver-side facts.
+        Known limit: an engine created in a process whose MLX is already
+        initialized (in-process engines, ``VLLM_ENABLE_V1_MULTIPROCESSING=0``)
+        keeps MLX's earlier setting regardless of what is decided here.
+        """
+        backend = vllm_config.parallel_config.distributed_executor_backend
+        if backend not in ("uni", "mp"):
+            return None
+        max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        if max_batched > cls._MB_BUFFER_MAX_BATCHED_TOKENS:
+            return None
+        fraction = get_config().effective_memory_fraction(
+            vllm_config.cache_config.gpu_memory_utilization
+        )
+        usable_gib = psutil.virtual_memory().total / (1 << 30) * fraction
+        for threshold_gib, value in cls._MB_BUFFER_TIERS_USABLE_GIB:
+            if usable_gib >= threshold_gib:
+                return value
+        return None
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:

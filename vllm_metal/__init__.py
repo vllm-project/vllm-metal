@@ -64,6 +64,8 @@ def _apply_macos_defaults() -> None:
 # its defaults suit small generate loops, while a vLLM decode step builds
 # thousands of lazy ops per submit. 2000 sits on the measured plateau, and
 # ``setdefault`` keeps user values authoritative.
+# MLX_MAX_MB_PER_BUFFER is NOT defaulted here: its safe value depends on
+# the engine config, so ``MetalPlatform._default_mb_per_buffer`` owns it.
 _MLX_BUFFER_ENV_DEFAULTS = {
     "MLX_MAX_OPS_PER_BUFFER": "2000",
 }

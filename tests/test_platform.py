@@ -31,6 +31,20 @@ from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mb_buffer_default(monkeypatch):
+    """``check_and_update_config`` installs an env default when the machine
+    qualifies; snapshot/restore it so unrelated tests cannot leak it into
+    the session, and reset the plugin-ownership marker."""
+    saved = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+    monkeypatch.setattr(MetalPlatform, "_mb_default_installed", None)
+    yield
+    if saved is None:
+        os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
+    else:
+        os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
+
+
 class TestMetalPlatform:
     """Tests for MetalPlatform class."""
 
@@ -1566,6 +1580,64 @@ class TestMetalPlatform:
 
         MetalPlatform.synchronize()
         assert called is True
+
+    def test_check_and_update_config_installs_mb_default_after_resolution(
+        self, monkeypatch
+    ) -> None:
+        """Threading + ordering pin: the public hook installs the MB default,
+        and the allowlist sees the RESOLVED executor backend (the config
+        enters with the unset default and resolves to "uni" in the same
+        call)."""
+        import vllm_metal.config as vm_config
+        import vllm_metal.platform as platform_module
+
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+        assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "2000"
+        vm_config.reset_config()
+
+    def test_check_and_update_config_skips_mb_default_off_allowlist(
+        self, monkeypatch
+    ) -> None:
+        import vllm_metal.config as vm_config
+        import vllm_metal.platform as platform_module
+
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            parallel_config=SimpleNamespace(
+                distributed_executor_backend="external_launcher"
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+        vm_config.reset_config()
 
 
 class TestKvBudgetBytes:

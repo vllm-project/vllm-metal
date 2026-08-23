@@ -1314,32 +1314,25 @@ class WorkerCachePlanner:
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction.
 
-        Precedence:
-        1. Numeric VLLM_METAL_MEMORY_FRACTION, for example 0.6, wins.
-        2. Otherwise, VLLM_METAL_MEMORY_FRACTION=auto uses the user-provided
-           --gpu-memory-utilization value.
-        3. If the user did not provide --gpu-memory-utilization, vLLM 0.27.1
-           supplies its default value, 0.92.
+        Precedence lives in ``MetalConfig.effective_memory_fraction``; this
+        wrapper only adds the operator-facing log line.
         """
         metal_config = self._worker.metal_config
-
-        if not metal_config.is_auto_memory:
-            metal_memory_fraction = metal_config.memory_fraction
-            logger.info(
-                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
-                metal_memory_fraction,
-            )
-            return metal_memory_fraction
-
-        vllm_memory_fraction = (
+        fraction = metal_config.effective_memory_fraction(
             self._worker.vllm_config.cache_config.gpu_memory_utilization
         )
-        logger.info(
-            "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-            "using --gpu-memory-utilization=%.2f",
-            vllm_memory_fraction,
-        )
-        return vllm_memory_fraction
+        if metal_config.is_auto_memory:
+            logger.info(
+                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
+                "using --gpu-memory-utilization=%.2f",
+                fraction,
+            )
+        else:
+            logger.info(
+                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
+                fraction,
+            )
+        return fraction
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()

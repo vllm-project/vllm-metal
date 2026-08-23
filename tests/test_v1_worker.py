@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
+from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -25,7 +26,11 @@ from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
-    worker.metal_config = SimpleNamespace(use_paged_attention=use_paged_attention)
+    worker.metal_config = MetalConfig(
+        memory_fraction=AUTO_MEMORY_FRACTION,
+        mlx_device="gpu",
+        use_paged_attention=use_paged_attention,
+    )
     worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
@@ -312,7 +317,6 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> WorkerCachePlanner:
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.cache_config.block_size = block_size
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = memory_fraction
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
@@ -331,7 +335,6 @@ class TestPagedAttentionPlanDiagnostics:
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner, use_paged_attention=True)
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1)
         monkeypatch.setattr(
@@ -519,8 +522,9 @@ class TestPagedAttentionPlanDiagnostics:
         worker = _make_worker(
             SimpleNamespace(is_hybrid=False), use_paged_attention=True
         )
-        worker.metal_config.is_auto_memory = is_auto
-        worker.metal_config.memory_fraction = memory_fraction
+        worker.metal_config.memory_fraction = (
+            AUTO_MEMORY_FRACTION if is_auto else memory_fraction
+        )
         worker.cache_config.gpu_memory_utilization = gpu_mem_util
 
         fraction = WorkerCachePlanner(worker)._memory_fraction()
