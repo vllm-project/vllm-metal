@@ -217,6 +217,422 @@ class TestTargetForward:
         assert output.logits.tolist() == [[[1.0, 2.0]]]
         assert output.hidden_states is None
 
+    def test_plain_forward_with_backbone_still_uses_public_wrapper(self) -> None:
+        class BackboneMustNotRun:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                raise AssertionError("serving forward must not call the body")
+
+        class Model:
+            def __init__(self) -> None:
+                self.model = BackboneMustNotRun()
+                self.lm_head = lambda hidden_states: hidden_states
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[9.0]]])
+
+        output = DefaultModelAdapter().target_forward(
+            Model(),
+            mx.array([[1]]),
+            cache=[],
+            collect_hidden_states=False,
+        )
+
+        assert output.logits.tolist() == [[[9.0]]]
+        assert output.hidden_states is None
+
+    def test_logits_indices_projects_selected_hidden_rows_only(self) -> None:
+        head_inputs: list[mx.array] = []
+
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class Head:
+            def __call__(self, hidden_states):
+                head_inputs.append(hidden_states)
+                return hidden_states * 3.0
+
+        model = SimpleNamespace(model=Backbone(), lm_head=Head())
+        adapter = DefaultModelAdapter()
+        input_ids = mx.array([[10, 20, 30, 40]])
+        full = adapter.target_forward(model, input_ids, collect_hidden_states=True)
+        compact = adapter.target_forward(
+            model,
+            input_ids,
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+
+        mx.eval(full.logits, compact.logits)
+        assert head_inputs[1].shape == (1, 2, 2)
+        assert compact.hidden_states is None
+        assert compact.logits.tolist() == full.logits[:, [1, 3], :].tolist()
+
+    def test_logits_indices_with_no_cache_supplies_positions_to_body(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                seen["cache"] = cache
+                seen["position_ids"] = position_ids.tolist()
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class Model:
+            def __init__(self) -> None:
+                self.model = Backbone()
+                self.lm_head = lambda hidden_states: hidden_states * 3.0
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                raise AssertionError("row-selective profile must not call wrapper")
+
+        output = DefaultModelAdapter().target_forward(
+            Model(),
+            mx.array([[10, 20, 30, 40]]),
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+
+        assert seen == {"cache": None, "position_ids": [[0, 1, 2, 3]]}
+        assert output.hidden_states is None
+        assert output.logits.tolist() == [[[60.0, 60.0], [120.0, 120.0]]]
+
+    def test_selective_logits_probe_rejects_model_without_backbone(self) -> None:
+        class Model:
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values * 2], axis=-1)
+
+        model = Model()
+        adapter = DefaultModelAdapter()
+        assert not adapter.supports_selective_logits(model)
+        output = adapter.target_forward(model, mx.array([[10, 20, 30]]))
+        assert output.logits.tolist() == [[[10.0, 20.0], [20.0, 40.0], [30.0, 60.0]]]
+
+    def test_logits_indices_resolves_transformer_alias_on_vlm_wrapper(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Transformer:
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                seen["cache"] = cache
+                seen["position_ids"] = (
+                    None if position_ids is None else position_ids.tolist()
+                )
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class LanguageModel:
+            def __init__(self) -> None:
+                self.transformer = Transformer()
+                self.lm_head = lambda hidden_states: hidden_states * 2.0
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                raise AssertionError("row-selective profile must not call wrapper")
+
+        output = DefaultModelAdapter().target_forward(
+            SimpleNamespace(language_model=LanguageModel()),
+            mx.array([[1, 2, 3]]),
+            logits_indices=mx.array([0], dtype=mx.int32),
+        )
+
+        assert seen == {"cache": None, "position_ids": [[0, 1, 2]]}
+        assert output.logits.tolist() == [[[2.0, 2.0]]]
+
+    def test_logits_indices_parity_matches_wrapper_with_softcap_and_dtype(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                del cache, position_ids
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values + 1.0], axis=-1)
+
+        class Head:
+            def __call__(self, hidden_states):
+                return (hidden_states * 3.0).astype(mx.float16)
+
+        class Model:
+            def __init__(self) -> None:
+                self.model = Backbone()
+                self.lm_head = Head()
+                self.final_logit_softcapping = 2.0
+
+            def __call__(self, input_ids, *, cache=None):
+                hidden = self.model(input_ids, cache=cache)
+                logits = self.lm_head(hidden)
+                cap = self.final_logit_softcapping
+                return mx.tanh(logits / cap) * cap
+
+        adapter = DefaultModelAdapter()
+        model = Model()
+        input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        rows = mx.array([0, 3], dtype=mx.int32)
+        wrapper = adapter.extract_logits(model(input_ids))[:, rows, :]
+        selective = adapter.target_forward(model, input_ids, logits_indices=rows).logits
+
+        mx.eval(wrapper, selective)
+        assert wrapper.dtype == mx.float16
+        assert selective.dtype == mx.float16
+        assert mx.allclose(wrapper, selective).item()
+
+    @pytest.mark.parametrize("body_attr", ["model", "transformer", "backbone"])
+    def test_logits_indices_tied_embeddings_on_resolved_body(
+        self, body_attr: str
+    ) -> None:
+        class Embedding:
+            def as_linear(self, hidden_states):
+                return hidden_states + 5.0
+
+        class Body:
+            def __init__(self) -> None:
+                self.embed_tokens = Embedding()
+
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                del cache, position_ids
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class Model:
+            def __init__(self) -> None:
+                setattr(self, body_attr, Body())
+                self.tie_word_embeddings = True
+                self.wrapper_calls = 0
+
+            def __call__(self, input_ids, *, cache=None):
+                self.wrapper_calls += 1
+                body = getattr(self, body_attr)
+                return body.embed_tokens.as_linear(body(input_ids, cache=cache))
+
+        adapter = DefaultModelAdapter()
+        model = Model()
+        input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+        rows = mx.array([2], dtype=mx.int32)
+        wrapper = adapter.extract_logits(model(input_ids))[:, rows, :]
+
+        assert adapter.supports_selective_logits(model)
+        output = adapter.target_forward(model, input_ids, logits_indices=rows)
+        assert model.wrapper_calls == 2
+        assert output.logits.tolist() == [[[8.0, 8.0]]]
+        assert output.logits.tolist() == wrapper.tolist()
+
+    def test_tied_args_flag_uses_transformer_alias_on_language_model(self) -> None:
+        class Embedding:
+            def as_linear(self, hidden_states):
+                return hidden_states + 1.0
+
+        class Transformer:
+            def __init__(self) -> None:
+                self.embed_tokens = Embedding()
+
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                del cache, position_ids
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class LanguageModel:
+            def __init__(self) -> None:
+                self.transformer = Transformer()
+                self.args = SimpleNamespace(tie_word_embeddings=True)
+
+            def __call__(self, input_ids, *, cache=None):
+                hidden = self.transformer(input_ids, cache=cache)
+                return self.transformer.embed_tokens.as_linear(hidden)
+
+        language_model = LanguageModel()
+        model = language_model
+        adapter = DefaultModelAdapter()
+
+        assert adapter.supports_selective_logits(model)
+        output = adapter.target_forward(
+            model,
+            mx.array([[4, 5]], dtype=mx.int32),
+            logits_indices=mx.array([1], dtype=mx.int32),
+        )
+        assert output.logits.tolist() == [[[6.0, 6.0]]]
+
+    def test_tied_flag_without_callable_as_linear_does_not_claim_support(self) -> None:
+        class Body:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        model = SimpleNamespace(
+            transformer=Body(),
+            tie_word_embeddings=True,
+            embed_tokens=SimpleNamespace(as_linear=object()),
+        )
+        assert not DefaultModelAdapter().supports_selective_logits(model)
+
+    def test_non_callable_lm_head_does_not_claim_selective_logits_support(self) -> None:
+        class Body:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0]]])
+
+        model = SimpleNamespace(model=Body(), lm_head=object())
+        assert not DefaultModelAdapter().supports_selective_logits(model)
+
+    def test_probe_rejects_scaling_hidden_in_the_public_forward(self) -> None:
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.lm_head = lambda hidden_states: hidden_states * 3.0
+
+            def __call__(self, input_ids, *, cache=None):
+                hidden_states = self.model(input_ids, cache=cache)
+                return self.lm_head(hidden_states) * 0.5
+
+        assert not DefaultModelAdapter().supports_selective_logits(Model())
+
+    def test_callable_without_cache_is_not_a_transformer_body(self) -> None:
+        def not_a_body(input_ids):
+            return mx.array(input_ids, dtype=mx.float32)[..., None]
+
+        class Model:
+            def __init__(self) -> None:
+                self.transformer = not_a_body
+                self.lm_head = lambda hidden_states: hidden_states
+
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        adapter = DefaultModelAdapter()
+        model = Model()
+        assert not adapter.supports_selective_logits(model)
+        output = adapter.target_forward(model, mx.array([[10, 20, 30]]))
+        assert output.logits.tolist() == [[[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]]]
+
+    def test_body_returning_non_array_raises(self) -> None:
+        class Body:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return SimpleNamespace(hidden_states=mx.array([[[1.0]]]))
+
+        model = SimpleNamespace(model=Body(), lm_head=lambda hidden: hidden)
+        with pytest.raises(TypeError, match="hidden-state array"):
+            DefaultModelAdapter().target_forward(
+                model,
+                mx.array([[1]]),
+                logits_indices=mx.array([0], dtype=mx.int32),
+            )
+
+    def test_collect_hidden_states_with_logits_indices_returns_full_hidden(
+        self,
+    ) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values * 2], axis=-1)
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states * 3.0,
+        )
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[10, 20, 30, 40]]),
+            collect_hidden_states=True,
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+        assert output.logits.tolist() == [[[60.0, 120.0], [120.0, 240.0]]]
+        assert output.hidden_states.tolist() == [
+            [10.0, 20.0],
+            [20.0, 40.0],
+            [30.0, 60.0],
+            [40.0, 80.0],
+        ]
+
+    def test_collect_hidden_states_with_logits_indices_without_body_raises(
+        self,
+    ) -> None:
+        class Model:
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        with pytest.raises(NotImplementedError, match="callable transformer body"):
+            DefaultModelAdapter().target_forward(
+                Model(),
+                mx.array([[1, 2, 3]]),
+                collect_hidden_states=True,
+                logits_indices=mx.array([1], dtype=mx.int32),
+            )
+
+    def test_logits_indices_seq_len_one_selects_row_zero(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                del cache
+                assert position_ids.tolist() == [[0]]
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        class Model:
+            def __init__(self) -> None:
+                self.model = Backbone()
+                self.lm_head = lambda hidden_states: hidden_states * 2.0
+
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                raise AssertionError("seq_len=1 selective path must not call wrapper")
+
+        output = DefaultModelAdapter().target_forward(
+            Model(),
+            mx.array([[7]], dtype=mx.int32),
+            logits_indices=mx.array([0], dtype=mx.int32),
+        )
+        assert output.logits.tolist() == [[[14.0, 14.0]]]
+
+    def test_logits_indices_selects_from_2d_hidden_states(self) -> None:
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del cache
+                values = mx.array(input_ids[0], dtype=mx.float32)
+                return mx.stack([values, values * 2], axis=-1)
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states + 1.0,
+        )
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[10, 20, 30]]),
+            logits_indices=mx.array([0, 2], dtype=mx.int32),
+        )
+        assert output.logits.shape == (1, 2, 2)
+        assert output.logits.tolist() == [[[11.0, 21.0], [31.0, 61.0]]]
+
+    def test_logits_indices_position_ids_match_input_dtype_for_batch(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None, position_ids=None):
+                del cache
+                seen["dtype"] = position_ids.dtype
+                seen["shape"] = tuple(position_ids.shape)
+                seen["values"] = position_ids.tolist()
+                values = mx.array(input_ids, dtype=mx.float32)
+                return mx.stack([values, values], axis=-1)
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+        )
+        DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32),
+            logits_indices=mx.array([1], dtype=mx.int32),
+        )
+        assert seen["dtype"] == mx.int32
+        assert seen["shape"] == (2, 3)
+        assert seen["values"] == [[0, 1, 2], [0, 1, 2]]
+
     def test_collects_hidden_states_and_recomputes_logits(self) -> None:
         class Backbone:
             def __call__(self, input_ids, *, cache=None):
@@ -511,6 +927,20 @@ class TestIntermediateForward:
     def test_unresolvable_structure_is_unsupported(self) -> None:
         adapter = DefaultModelAdapter()
         assert not adapter.supports_intermediate_forward(SimpleNamespace())
+
+    def test_transformer_alias_does_not_enable_intermediate_forward(self) -> None:
+        adapter = DefaultModelAdapter()
+
+        class Model:
+            transformer = staticmethod(_body_stub)
+            lm_head = staticmethod(lambda hidden: hidden)
+
+            def __call__(self, input_ids, *, cache=None):
+                return self.lm_head(self.transformer(input_ids, cache=cache))
+
+        model = Model()
+        assert not adapter.supports_intermediate_forward(model)
+        assert adapter.supports_selective_logits(model)
 
     def test_runs_body_and_returns_typed_hidden_states(self) -> None:
         # Arrange

@@ -2216,6 +2216,139 @@ class TestDummyForwardOutputsPPRouting:
         assert outs == ["full-logits"]
         assert model.seen is ids
 
+    def test_single_stage_profile_projects_only_the_serving_row(self) -> None:
+        runner = make_stub_runner()
+        seen: dict[str, object] = {}
+        logits = mx.zeros((1, 1, 32), dtype=mx.float16)
+        runner._model_adapter.supports_selective_logits = lambda model: True
+
+        def target_forward(input_ids, *, logits_indices):
+            seen["shape"] = input_ids.shape
+            seen["rows"] = logits_indices.tolist()
+            return SimpleNamespace(logits=logits)
+
+        runner._target_forward = target_forward
+
+        outs = runner._dummy_forward_outputs(mx.zeros((1, 17), dtype=mx.int32))
+
+        assert outs == [logits]
+        assert seen == {"shape": (1, 17), "rows": [16]}
+
+    def test_single_stage_profile_falls_back_without_selective_logits_body(
+        self,
+    ) -> None:
+        class _RecordingModel:
+            seen: object = None
+
+            def __call__(self, input_ids: object) -> object:
+                self.seen = input_ids
+                return SimpleNamespace(logits="full-logits")
+
+        model = _RecordingModel()
+        runner = make_stub_runner(model=model)
+        runner._model_adapter.supports_selective_logits = lambda model: False
+        runner._model_adapter.supports_intermediate_forward = lambda model: False
+        ids = mx.zeros((1, 5), dtype=mx.int32)
+
+        outs = runner._dummy_forward_outputs(ids)
+
+        assert outs == ["full-logits"]
+        assert model.seen is ids
+
+    def test_legacy_adapter_without_logits_indices_keeps_full_profile(self) -> None:
+        class LegacyAdapter:
+            def supports_intermediate_forward(self, model: object) -> bool:
+                del model
+                return True
+
+            def extract_logits(self, output: object) -> object:
+                return output.logits
+
+            def target_forward(
+                self,
+                model,
+                input_ids,
+                *,
+                cache=None,
+                collect_hidden_states=False,
+            ):
+                del model, input_ids, cache, collect_hidden_states
+                raise AssertionError(
+                    "legacy adapters must not receive logits_indices from profile"
+                )
+
+        class RecordingModel:
+            seen: object = None
+
+            def __call__(self, input_ids: object) -> object:
+                self.seen = input_ids
+                return SimpleNamespace(logits="legacy-full-logits")
+
+        model = RecordingModel()
+        runner = make_stub_runner(model=model, _model_adapter=LegacyAdapter())
+        ids = mx.zeros((1, 5), dtype=mx.int32)
+
+        outs = runner._dummy_forward_outputs(ids)
+
+        assert outs == ["legacy-full-logits"]
+        assert model.seen is ids
+
+    def test_legacy_adapter_serving_omits_logits_indices_keyword(self) -> None:
+        seen: dict[str, object] = {}
+
+        class LegacyAdapter:
+            def target_forward(
+                self,
+                model,
+                input_ids,
+                *,
+                cache=None,
+                collect_hidden_states=False,
+            ):
+                del model
+                seen["cache"] = cache
+                seen["collect_hidden_states"] = collect_hidden_states
+                seen["shape"] = tuple(input_ids.shape)
+                return SimpleNamespace(logits=mx.array([[[1.0]]]), hidden_states=None)
+
+        runner = make_stub_runner(_model_adapter=LegacyAdapter())
+        output = runner._target_forward(
+            mx.array([[1]], dtype=mx.int32),
+            cache=[],
+            collect_hidden_states=False,
+        )
+
+        assert seen == {
+            "cache": [],
+            "collect_hidden_states": False,
+            "shape": (1, 1),
+        }
+        assert output.logits.tolist() == [[[1.0]]]
+
+    def test_single_stage_profile_seq_len_one_selects_row_zero(self) -> None:
+        runner = make_stub_runner()
+        seen: dict[str, object] = {}
+        logits = mx.zeros((1, 1, 8), dtype=mx.float16)
+        runner._model_adapter.supports_selective_logits = lambda model: True
+
+        def target_forward(input_ids, *, logits_indices):
+            seen["shape"] = tuple(input_ids.shape)
+            seen["rows"] = logits_indices.tolist()
+            return SimpleNamespace(logits=logits)
+
+        runner._target_forward = target_forward
+
+        outs = runner._dummy_forward_outputs(mx.zeros((1, 1), dtype=mx.int32))
+
+        assert outs == [logits]
+        assert seen == {"shape": (1, 1), "rows": [0]}
+
+    def test_profile_dummy_rejects_empty_sequence(self) -> None:
+        runner = make_stub_runner()
+        runner._model_adapter.supports_selective_logits = lambda model: True
+        with pytest.raises(ValueError, match="positive sequence length"):
+            runner._dummy_forward_outputs(mx.zeros((1, 0), dtype=mx.int32))
+
     def test_profile_run_profiles_the_stage_shape(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

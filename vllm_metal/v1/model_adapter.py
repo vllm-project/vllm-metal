@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -156,8 +157,16 @@ class ModelAdapter(Protocol):
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target text model and optionally retain target hidden states."""
+        """Run the target text model, optionally projecting selected rows.
+
+        ``logits_indices`` is valid only when
+        :meth:`supports_selective_logits` returned ``True``.
+        """
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether ``target_forward`` may honour ``logits_indices`` for *model*."""
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -378,6 +387,35 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         """
         return self._transformer_body(model) is not None
 
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether the split body/head path reproduces this model's output.
+
+        Some model wrappers apply output transformations inside ``__call__``
+        that a split projection would silently miss. Probe one cacheless row
+        for bit-exact agreement, following the ``logits_indices`` capability
+        contract introduced by #590. Unsupported models retain the full-logits
+        profile fallback.
+        """
+        probe_ids = mx.zeros((1, 1), dtype=mx.int32)
+        try:
+            reference = self.extract_logits(model(probe_ids, cache=None))
+            hidden_states = self._forward_target_hidden_states(
+                model, probe_ids, cache=None
+            )
+            split = self._compute_target_logits(model, hidden_states)
+            mx.eval(reference, split)
+            matches = bool(mx.array_equal(reference, split).item())
+        except Exception:
+            matches = False
+
+        if not matches:
+            logger.info(
+                "Metal: %s output head is not reproducible outside its forward; "
+                "using full logits for profiling.",
+                type(model).__name__,
+            )
+        return matches
+
     def intermediate_forward(
         self,
         model: Any,
@@ -410,9 +448,21 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target model and return logits plus optional hidden states."""
-        if not collect_hidden_states:
+        """Run the target model and return logits plus optional hidden states.
+
+        ``logits_indices`` selects flattened input rows for the output
+        projection so a caller can avoid materializing a full-sequence vocab
+        tensor. Callers must gate it on :meth:`supports_selective_logits`.
+        Serving leaves it unset and keeps the public forward unchanged.
+
+        Combined with ``collect_hidden_states=True``, logits are the selected
+        rows and ``hidden_states`` are the full body sequence. A model that
+        cannot run that path raises ``ValueError`` rather than dropping
+        hidden states.
+        """
+        if not collect_hidden_states and logits_indices is None:
             output = model(input_ids, cache=cache)
             return TargetModelForwardOutput(
                 logits=self.extract_logits(output),
@@ -424,10 +474,25 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             input_ids,
             cache=cache,
         )
-        logits = self._compute_target_logits(model, hidden_states)
+        if logits_indices is None:
+            logits = self._compute_target_logits(model, hidden_states)
+        else:
+            # Flattened-row semantics, matching #590's logits_indices
+            # contract: row index = batch_index * seq_len + token_index.
+            rows = (
+                hidden_states.reshape(-1, hidden_states.shape[-1])
+                if len(hidden_states.shape) == 3
+                else hidden_states
+            )
+            selected = mx.take(rows, logits_indices, axis=0)
+            logits = self._compute_target_logits(model, selected[None])
         return TargetModelForwardOutput(
             logits=logits,
-            hidden_states=self._flatten_target_hidden_states(hidden_states),
+            hidden_states=(
+                self._flatten_target_hidden_states(hidden_states)
+                if collect_hidden_states
+                else None
+            ),
         )
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
@@ -459,18 +524,34 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None,
     ) -> mx.array:
-        backbone = self._target_backbone(model)
+        backbone = self._resolve_callable_backbone(model)
         if backbone is None:
             raise NotImplementedError(
-                "Target hidden states require a text model with a `model` "
-                "backbone; this model output does not expose hidden states."
+                "Target hidden states require a callable transformer body "
+                "(text_model.model, .transformer, or .backbone)."
             )
-        return backbone(input_ids, cache=cache)
+        if cache is None and self._callable_accepts_keyword(backbone, "position_ids"):
+            # Some mlx-vlm bodies read positions from cache.offset and do not
+            # derive them when cache is absent. The public wrapper would, but
+            # it also persists RoPE state, so it is unsafe for a state-neutral
+            # dummy. If this body declares position_ids, supply text positions
+            # [0..seq-1]. Bodies without that parameter keep the cache-only
+            # call; **kwargs is not treated as a request for positions.
+            batch_size, sequence_length = input_ids.shape
+            position_ids = mx.broadcast_to(
+                mx.arange(sequence_length, dtype=input_ids.dtype)[None, :],
+                (batch_size, sequence_length),
+            )
+            return self._require_hidden_state_array(
+                backbone(input_ids, cache=None, position_ids=position_ids)
+            )
+        return self._require_hidden_state_array(backbone(input_ids, cache=cache))
 
     def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:
         text_model = self.text_model(model)
-        if hasattr(text_model, "compute_logits"):
-            return text_model.compute_logits(hidden_states)
+        compute_logits = getattr(text_model, "compute_logits", None)
+        if callable(compute_logits):
+            return compute_logits(hidden_states)
 
         args = getattr(text_model, "args", None)
         tie_word_embeddings = bool(
@@ -482,7 +563,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return self._apply_target_logit_postprocessing(text_model, logits)
 
         lm_head = getattr(text_model, "lm_head", None)
-        if lm_head is not None:
+        if callable(lm_head):
             logits = lm_head(hidden_states)
             return self._apply_target_logit_postprocessing(text_model, logits)
 
@@ -495,15 +576,14 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _compute_tied_embedding_logits(
         self, model: Any, hidden_states: mx.array
     ) -> mx.array:
-        backbone = self._target_backbone(model)
-        embed_tokens = getattr(backbone, "embed_tokens", None)
-        as_linear = getattr(embed_tokens, "as_linear", None)
-        if as_linear is None:
+        projector = self._tied_embedding_projector(model)
+        if projector is None:
             raise NotImplementedError(
                 "Target hidden states require either `lm_head` or tied "
-                "`model.embed_tokens.as_linear` logits projection."
+                "`embed_tokens.as_linear` logits projection on the resolved "
+                "transformer body."
             )
-        return as_linear(hidden_states)
+        return projector(hidden_states)
 
     def _flatten_target_hidden_states(self, hidden_states: mx.array) -> mx.array:
         ndim = len(hidden_states.shape)
@@ -526,6 +606,109 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
     def _target_backbone(self, model: Any) -> Any | None:
         return getattr(self.text_model(model), "model", None)
+
+    def _resolve_callable_backbone(self, model: Any) -> Any | None:
+        """Return a transformer body that can run ``body(ids, cache=...)``.
+
+        mlx-lm / mlx-vlm text models keep the body on ``.model``.  A few
+        families use ``.transformer`` or ``.backbone`` instead.  A candidate
+        counts only when it is callable and inspectable as that call; the
+        public language-model wrapper itself is never treated as the body.
+        Name alone is not a semantic contract.
+        """
+        text_model = self.text_model(model)
+        for attr in ("model", "transformer", "backbone"):
+            candidate = getattr(text_model, attr, None)
+            if self._is_transformer_body(candidate):
+                return candidate
+        return None
+
+    def _can_project_hidden_to_logits(self, model: Any) -> bool:
+        """Whether :meth:`_compute_target_logits` has a projection to call."""
+        text_model = self.text_model(model)
+        if callable(getattr(text_model, "compute_logits", None)):
+            return True
+        if callable(getattr(text_model, "lm_head", None)):
+            return True
+        return self._tied_embedding_projector(text_model) is not None
+
+    def _tied_embedding_projector(self, model: Any) -> Any | None:
+        """Return ``embed_tokens.as_linear`` from the same resolved body."""
+        backbone = self._resolve_callable_backbone(model)
+        embed_tokens = getattr(backbone, "embed_tokens", None)
+        as_linear = getattr(embed_tokens, "as_linear", None)
+        return as_linear if callable(as_linear) else None
+
+    @staticmethod
+    def _require_hidden_state_array(hidden_states: Any) -> mx.array:
+        if not hasattr(hidden_states, "ndim") or not hasattr(hidden_states, "shape"):
+            raise TypeError(
+                "transformer body must return a hidden-state array, "
+                f"got {type(hidden_states).__name__}"
+            )
+        if hidden_states.ndim not in (2, 3):
+            raise ValueError(
+                "transformer body must return [batch, seq, hidden] or "
+                f"[seq, hidden], got shape {tuple(hidden_states.shape)}"
+            )
+        return hidden_states
+
+    @staticmethod
+    def _callable_parameters(fn: Any) -> dict[str, inspect.Parameter] | None:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            try:
+                signature = inspect.signature(type(fn).__call__)
+            except (TypeError, ValueError):
+                return None
+        return dict(signature.parameters)
+
+    @classmethod
+    def _is_transformer_body(cls, candidate: Any) -> bool:
+        if not callable(candidate):
+            return False
+        parameters = cls._callable_parameters(candidate)
+        if not parameters:
+            return False
+        cache = parameters.get("cache")
+        if cache is None or cache.kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return False
+        for name, parameter in parameters.items():
+            if name in ("self", "cache"):
+                continue
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _callable_accepts_keyword(fn: Any, name: str) -> bool:
+        parameters = DefaultModelAdapter._callable_parameters(fn)
+        if not parameters:
+            return False
+        parameter = parameters.get(name)
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+
+    @staticmethod
+    def _select_token_rows(values: mx.array, rows: mx.array) -> mx.array:
+        if values.ndim == 3:
+            return values[:, rows, :]
+        if values.ndim == 2:
+            return values[rows, :]
+        raise ValueError(
+            "row selection expects [batch, seq, dim] or [seq, dim] tensors, "
+            f"got shape {tuple(values.shape)}"
+        )
 
     def apply_pipeline_split(
         self, model: Any, pp: PipelineGroup

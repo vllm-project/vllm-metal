@@ -714,12 +714,20 @@ class MetalModelRunner:
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
+        # Omit logits_indices unless a caller selected rows. Legacy adapters
+        # that never declared the keyword must keep working for serving.
+        kwargs: dict[str, Any] = {
+            "cache": cache,
+            "collect_hidden_states": collect_hidden_states,
+        }
+        if logits_indices is not None:
+            kwargs["logits_indices"] = logits_indices
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
-            cache=cache,
-            collect_hidden_states=collect_hidden_states,
+            **kwargs,
         )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
@@ -812,9 +820,26 @@ class MetalModelRunner:
                 return [output]
             return [self._extract_logits(output)]
 
+        # When the adapter opts into row-selective logits, profile the
+        # serving sample shape: the final row stands in for a last prefill
+        # chunk so the dummy does not materialize [batch, mnbt, vocab].
+        seq_len = int(input_ids.shape[-1])
+        if seq_len < 1:
+            raise ValueError("profile dummy requires a positive sequence length")
+        if self._supports_selective_logits_profile():
+            last_row = mx.array([seq_len - 1], dtype=mx.int32)
+            output = self._target_forward(input_ids, logits_indices=last_row)
+            return [output.logits]
+        # Adapters without the row-selective probe keep the full forward.
+        # supports_intermediate_forward is a different capability and must
+        # not be treated as permission to pass logits_indices.
         output = self._forward_model(input_ids)
         logits = self._extract_logits(output)
         return [logits]
+
+    def _supports_selective_logits_profile(self) -> bool:
+        probe = getattr(self._model_adapter, "supports_selective_logits", None)
+        return callable(probe) and bool(probe(self._forward_model))
 
     def build_paged_attention_runtime(
         self, *, block_size: int
