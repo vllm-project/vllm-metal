@@ -29,11 +29,11 @@ thousands of lazy ops per step, and the resulting per-buffer commit overhead
 slows the step submit. `2000` sits on the measured plateau.
 
 `MLX_MAX_MB_PER_BUFFER` trades transient profile memory for per-step commit
-overhead. The plugin defaults it from the usable budget (total memory times
-the effective memory fraction): `2000` from 90 GiB usable, `512` from 50 GiB,
-and none below that, on Ray executors, or when `max_num_batched_tokens`
-exceeds 4096 (the #585 startup-failure shape). A value you export yourself
-always wins. Outputs are unaffected.
+overhead. The plugin defaults it to `2000` when the usable budget (total
+memory times the effective memory fraction) is at least 90 GiB, and leaves it
+unset below that, on Ray executors, or when `max_num_batched_tokens` exceeds
+4096 (the #585 startup-failure shape). A value you export yourself always
+wins. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 

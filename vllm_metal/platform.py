@@ -22,6 +22,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Large command buffers cut per-step decode commit overhead but inflate the
+# transient profile peak that profile_run charges against the KV budget, so
+# the default applies only where its measured overhead stays a small share of
+# the usable budget, and never for #585's large-batch shape. Measurements in
+# PR #637.
+_MB_BUFFER_DEFAULT = "2000"
+_MB_BUFFER_MIN_USABLE_GIB = 90
+_MB_BUFFER_MAX_BATCHED_TOKENS = 4096
+# Only the local executors share this process's memory and inherit its
+# environment; Ray workers must not receive a driver-derived value.
+_MB_BUFFER_LOCAL_BACKENDS = ("uni", "mp")
+
+
+def _pick_mb_buffer_default(
+    *,
+    total_memory_bytes: int,
+    memory_fraction: float,
+    max_num_batched_tokens: int,
+    executor_backend: str | None,
+) -> str | None:
+    """Return the ``MLX_MAX_MB_PER_BUFFER`` default for this shape, or ``None``."""
+    if executor_backend not in _MB_BUFFER_LOCAL_BACKENDS:
+        return None
+    if max_num_batched_tokens > _MB_BUFFER_MAX_BATCHED_TOKENS:
+        return None
+    usable_gib = total_memory_bytes / (1 << 30) * memory_fraction
+    if usable_gib >= _MB_BUFFER_MIN_USABLE_GIB:
+        return _MB_BUFFER_DEFAULT
+    return None
+
+
 class MetalPlatform(Platform):
     """Platform implementation for Apple Silicon Metal/MLX.
 
@@ -34,26 +65,9 @@ class MetalPlatform(Platform):
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
 
-    # ``MLX_MAX_MB_PER_BUFFER`` tiers by USABLE memory (GiB): total unified
-    # memory times the effective KV budget fraction. Larger command buffers
-    # cut per-step commit overhead but raise the transient profile/prefill
-    # peak that profile_run charges against the KV budget, so each tier
-    # requires its measured overhead to stay a small share (~15%) of the
-    # budget. Sweep on Qwen3.6-35B-A3B-4bit, M1 Ultra, serve defaults —
-    # decode tok/s / profiled overhead: unset 58.2/1.0GB, 512 88.0/7.6GB,
-    # 2000 91.4/13.6GB. No default at all above
-    # ``_MB_BUFFER_MAX_BATCHED_TOKENS`` (#585: 2000 at 8192 batched tokens
-    # inflates the profiled overhead ~19x and fails startup).
-    _MB_BUFFER_TIERS_USABLE_GIB: ClassVar[tuple[tuple[int, str], ...]] = (
-        (90, "2000"),
-        (50, "512"),
-    )
-    _MB_BUFFER_MAX_BATCHED_TOKENS: ClassVar[int] = 4096
-    # The value this plugin installed into the environment, or ``None``.
-    # Distinguishes a plugin default from a user export so reconfiguration
-    # recomputes (or removes) its own default instead of sticking — a
-    # second engine with a larger batch shape must not inherit the first
-    # engine's value (#585 shape).
+    # The MLX_MAX_MB_PER_BUFFER value this plugin installed, or ``None`` —
+    # distinguishes a plugin default from a user export so reconfiguration
+    # recomputes instead of sticking (#585 shape via a second engine).
     _mb_default_installed: ClassVar[str | None] = None
 
     # --- Ray distributed executor support (Phase 1) ---
@@ -844,17 +858,27 @@ class MetalPlatform(Platform):
 
     @classmethod
     def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
-        """Install, update, or remove the plugin's MB-per-buffer default.
+        """Install or remove the plugin's MB-per-buffer default.
 
         A manual export always wins. The plugin's own previously installed
         default is recomputed for the new config and removed when the new
         shape does not qualify, so a later engine cannot inherit a stale
-        value (#585 shape).
+        value (#585 shape). Known limit: a process whose MLX is already
+        initialized (in-process engines) keeps MLX's earlier setting.
         """
         current = os.environ.get("MLX_MAX_MB_PER_BUFFER")
         if current is not None and current != cls._mb_default_installed:
             return
-        desired = cls._pick_mb_default(vllm_config)
+        desired = _pick_mb_buffer_default(
+            total_memory_bytes=psutil.virtual_memory().total,
+            memory_fraction=get_config().effective_memory_fraction(
+                vllm_config.cache_config.gpu_memory_utilization
+            ),
+            max_num_batched_tokens=(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            executor_backend=(vllm_config.parallel_config.distributed_executor_backend),
+        )
         if desired is None:
             if current is not None:
                 del os.environ["MLX_MAX_MB_PER_BUFFER"]
@@ -868,32 +892,6 @@ class MetalPlatform(Platform):
                 desired,
             )
         cls._mb_default_installed = desired
-
-    @classmethod
-    def _pick_mb_default(cls, vllm_config: "VllmConfig") -> str | None:
-        """Pick the MB-per-buffer tier for this config, or ``None``.
-
-        Positive allowlist on the resolved executor: only the local
-        executors share this process's memory and inherit its environment;
-        Ray workers must not receive a value derived from driver-side facts.
-        Known limit: an engine created in a process whose MLX is already
-        initialized (in-process engines, ``VLLM_ENABLE_V1_MULTIPROCESSING=0``)
-        keeps MLX's earlier setting regardless of what is decided here.
-        """
-        backend = vllm_config.parallel_config.distributed_executor_backend
-        if backend not in ("uni", "mp"):
-            return None
-        max_batched = vllm_config.scheduler_config.max_num_batched_tokens
-        if max_batched > cls._MB_BUFFER_MAX_BATCHED_TOKENS:
-            return None
-        fraction = get_config().effective_memory_fraction(
-            vllm_config.cache_config.gpu_memory_utilization
-        )
-        usable_gib = psutil.virtual_memory().total / (1 << 30) * fraction
-        for threshold_gib, value in cls._MB_BUFFER_TIERS_USABLE_GIB:
-            if usable_gib >= threshold_gib:
-                return value
-        return None
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
