@@ -1639,6 +1639,66 @@ class TestMetalPlatform:
         assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
         vm_config.reset_config()
 
+    def test_check_and_update_config_keeps_manual_mb_export(self, monkeypatch) -> None:
+        import vllm_metal.config as vm_config
+        import vllm_metal.platform as platform_module
+
+        monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "64")
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "64"
+        vm_config.reset_config()
+
+    def test_check_and_update_config_large_batch_clears_plugin_default(
+        self, monkeypatch
+    ) -> None:
+        """#585 shape: a later engine above the batched-token bound removes
+        the plugin's own earlier default instead of inheriting it."""
+        import vllm_metal.config as vm_config
+        import vllm_metal.platform as platform_module
+
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+
+        MetalPlatform.check_and_update_config(
+            self._platform_config(
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=2048, max_num_seqs=8
+                ),
+            )
+        )
+        installed = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+        MetalPlatform.check_and_update_config(
+            self._platform_config(
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=8192, max_num_seqs=8
+                ),
+            )
+        )
+
+        assert installed == "2000"
+        assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+        vm_config.reset_config()
+
 
 class TestKvBudgetBytes:
     """Tests for paged-attention base KV budget calculation.
