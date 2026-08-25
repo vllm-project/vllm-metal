@@ -225,10 +225,17 @@ class ModelLifecycle:
             gguf_source=request.gguf_source,
             lazy_weights=request.lazy_weights,
         )
+        model_args = self._extract_model_args(model, request.is_vlm)
+        if request.hf_config is not None:
+            architectures = self._config_to_mapping(request.hf_config).get(
+                "architectures"
+            )
+            if architectures is not None:
+                model_args.setdefault("architectures", architectures)
         return LoadedGenerationModel(
             model=model,
             tokenizer=tokenizer,
-            model_args=self._extract_model_args(model, request.is_vlm),
+            model_args=model_args,
         )
 
     def _install_encoder_pooling_model(

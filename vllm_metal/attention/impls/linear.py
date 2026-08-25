@@ -68,6 +68,19 @@ class KDAPagedAttentionWrapper(nn.Module):
         super().__init__()
         if not is_bailing_kda(inner):
             raise TypeError(f"{type(inner).__name__} is not a Bailing KDA module")
+        projection_size = int(inner.projection_size)
+        conv_kernel_size = int(inner.conv_kernel_size)
+        if 3 * projection_size != state_cache.conv_dim:
+            raise RuntimeError(
+                f"Bailing KDA projection_size={projection_size} does not match "
+                f"state cache conv_dim={state_cache.conv_dim} (expected "
+                f"3 * projection_size)"
+            )
+        if conv_kernel_size != state_cache.conv_kernel_dim:
+            raise RuntimeError(
+                f"Bailing KDA conv_kernel_size={conv_kernel_size} does not match "
+                f"state cache conv_kernel_dim={state_cache.conv_kernel_dim}"
+            )
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_kda_layer_idx", layer_idx)
         object.__setattr__(self, "_kda_cache_idx", cache_idx)
@@ -129,10 +142,12 @@ class KDAPagedAttentionWrapper(nn.Module):
             recurrent_updates.append(local_cache[3])
 
         slots = mx.array(slot_ids, dtype=mx.int32)
-        conv_pool[slots] = mx.concatenate(conv_updates, axis=0)
-        recurrent_pool[slots] = mx.concatenate(recurrent_updates, axis=0)
-        state_cache.store_conv_state(cache_idx, conv_pool)
-        state_cache.store_recurrent_state(cache_idx, recurrent_pool)
+        state_cache.write_conv_rows(
+            cache_idx, mx.concatenate(conv_updates, axis=0), slots
+        )
+        state_cache.write_recurrent_rows(
+            cache_idx, mx.concatenate(recurrent_updates, axis=0), slots
+        )
         return mx.concatenate(outputs, axis=1)
 
     def _slot_ids(self, ctx: PagedAttentionContext) -> list[int]:

@@ -581,6 +581,46 @@ class TestModelLifecycle:
         assert runner.hidden_size == 4096
         assert runner.kv_cache_dtype is not None
 
+    def test_load_preserves_hf_architectures_for_bailing_v3_detection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        args = {
+            "model_type": "bailing_hybrid",
+            "vocab_size": 157184,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "hidden_size": 1536,
+            "head_dim": 128,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "layer_group_size": 4,
+            "short_conv_kernel_size": 4,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+        }
+        fake_model = SimpleNamespace(args=SimpleNamespace(**args))
+        _stub_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(**args),
+            model=fake_model,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="bailing_hybrid",
+                    architectures=["BailingMoeV3ForCausalLM"],
+                )
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["architectures"] == ["BailingMoeV3ForCausalLM"]
+        assert runner.is_bailing_v3
+        assert runner.is_hybrid
+
     def test_load_wires_gemma4_mtp_assistant_after_target_dims(
         self,
         monkeypatch: pytest.MonkeyPatch,
