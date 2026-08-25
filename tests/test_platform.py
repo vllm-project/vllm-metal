@@ -25,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_metal.compat as compat
+import vllm_metal.config as vm_config
+import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_mha_runner
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
@@ -1588,9 +1590,6 @@ class TestMetalPlatform:
         and the allowlist sees the RESOLVED executor backend (the config
         enters with the unset default and resolves to "uni" in the same
         call)."""
-        import vllm_metal.config as vm_config
-        import vllm_metal.platform as platform_module
-
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
         monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
@@ -1614,9 +1613,6 @@ class TestMetalPlatform:
     def test_check_and_update_config_skips_mb_default_off_allowlist(
         self, monkeypatch
     ) -> None:
-        import vllm_metal.config as vm_config
-        import vllm_metal.platform as platform_module
-
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
         monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
@@ -1640,9 +1636,6 @@ class TestMetalPlatform:
         vm_config.reset_config()
 
     def test_check_and_update_config_keeps_manual_mb_export(self, monkeypatch) -> None:
-        import vllm_metal.config as vm_config
-        import vllm_metal.platform as platform_module
-
         monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "64")
         monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
@@ -1667,9 +1660,6 @@ class TestMetalPlatform:
     ) -> None:
         """#585 shape: a later engine above the batched-token bound removes
         the plugin's own earlier default instead of inheriting it."""
-        import vllm_metal.config as vm_config
-        import vllm_metal.platform as platform_module
-
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
         monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
