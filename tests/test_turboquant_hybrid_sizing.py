@@ -220,6 +220,31 @@ class TestTurboQuantHybridAlignment:
         assert expected_page >= self._MAMBA_PAGE
         assert vllm_config.cache_config.mamba_page_size_padded == expected_page
 
+    def test_realign_resyncs_mamba_block_size_under_align(self, monkeypatch) -> None:
+        """Growing the block size must drag mamba_block_size along under align.
+
+        vLLM 0.28.0 pins mamba_block_size = block_size for align mode before
+        the platform hook runs; without the re-sync the hybrid coordinator's
+        divisibility asserts fail at engine startup.
+        """
+        vllm_config = self._vllm_config(block_size=544)
+        vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.cache_config.mamba_block_size = 544
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
+        self._patch_model_cls(monkeypatch)
+
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(
+            vllm_config,
+            user_block_size=None,
+            hash_block_size=None,
+        )
+
+        assert vllm_config.cache_config.block_size != 544
+        assert (
+            vllm_config.cache_config.mamba_block_size
+            == vllm_config.cache_config.block_size
+        )
+
     def test_realign_noop_without_turboquant(self, monkeypatch) -> None:
         vllm_config = self._vllm_config(block_size=544)
         before_padded = vllm_config.cache_config.mamba_page_size_padded

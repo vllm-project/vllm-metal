@@ -1052,6 +1052,14 @@ class MetalPlatform(Platform):
             )
             cache_config.block_size = attn_block_size
 
+        # vLLM pins mamba_block_size = block_size under align mode before this
+        # hook runs; re-sync it after the TurboQuant realign grows the block
+        # size, or the hybrid KV coordinator's divisibility asserts fail at
+        # startup (mirrors upstream's own re-sync in
+        # Platform.update_block_size_for_backend).
+        if cache_config.mamba_cache_mode == "align":
+            cache_config.mamba_block_size = cache_config.block_size
+
         # Pad mamba page size to exactly match the packed attention page.
         attn_page_size = cache_config.block_size * tq_page_size_1_token
         assert attn_page_size >= mamba_page_size
