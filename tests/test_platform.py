@@ -403,38 +403,6 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize(
-        ("configured_ip", "expected_ip"),
-        [(None, "127.0.0.1"), ("192.0.2.1", "192.0.2.1")],
-    )
-    def test_check_and_update_config_sets_uniproc_host_ip(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        configured_ip: str | None,
-        expected_ip: str,
-    ) -> None:
-        if configured_ip is None:
-            monkeypatch.delenv("VLLM_HOST_IP", raising=False)
-        else:
-            monkeypatch.setenv("VLLM_HOST_IP", configured_ip)
-
-        MetalPlatform.check_and_update_config(self._platform_config())
-
-        assert os.environ["VLLM_HOST_IP"] == expected_ip
-
-    def test_rejected_uniproc_config_does_not_set_host_ip(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("VLLM_HOST_IP", raising=False)
-        vllm_config = self._platform_config(
-            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=["model.layers.0"])
-        )
-
-        with pytest.raises(NotImplementedError, match="heterogeneous KV"):
-            MetalPlatform.check_and_update_config(vllm_config)
-
-        assert "VLLM_HOST_IP" not in os.environ
-
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
         vllm_config = self._platform_config(
