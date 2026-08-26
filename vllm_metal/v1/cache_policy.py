@@ -74,28 +74,33 @@ HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
 class TurboQuantAttentionSpec(FullAttentionSpec):
     """FullAttentionSpec for TurboQuant-compressed KV cache.
 
-    Reports the true packed byte count per page via an override of
-    ``real_page_size_bytes`` so vLLM's scheduler can budget more blocks
-    than the FP16 formula would allow — without lying about ``head_size``
-    (the ``head_size_v`` reverse-engineering trick the previous version
-    used produced negative values for aggressive 2-bit configs).
-
-    Mirrors the upstream pattern of :class:`MLAAttentionSpec` which
-    overrides ``real_page_size_bytes`` for its ``fp8_ds_mla`` cache layout.
+    Publishes the packed per-(head, token) byte count through the base
+    spec's ``state_content_bytes`` field so vLLM's scheduler budgets
+    blocks from the true compressed page size — without lying about
+    ``head_size``. vLLM 0.28.0 computes ``page_size_bytes`` as
+    ``num_heads * storage_block_size * state_content_size_bytes`` and
+    demoted ``real_page_size_bytes`` to an alias, so overriding the
+    latter no longer reaches the scheduler; publishing the field is the
+    same mechanism upstream's ``TurboQuantAttentionBackend.customize_spec``
+    uses for its packed layout.
     """
 
     k_quant: str
     v_quant: str
 
-    @property
-    def real_page_size_bytes(self) -> int:
-        return turboquant_page_size_bytes(
-            block_size=self.block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_size,
-            k_quant=self.k_quant,
-            v_quant=self.v_quant,
-        )
+    def __post_init__(self) -> None:
+        # Derive the packed per-cell size here, not in the builder, so a
+        # bare construction can never fall back to the dense int8 formula
+        # (the same in-class derivation pattern as the base head_size_v).
+        super().__post_init__()
+        if self.state_content_bytes is None:
+            object.__setattr__(
+                self,
+                "state_content_bytes",
+                turboquant_state_content_bytes(
+                    self.head_size, self.k_quant, self.v_quant
+                ),
+            )
 
     @classmethod
     def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
@@ -141,18 +146,29 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
 
-def turboquant_page_size_bytes(
-    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
-) -> int:
-    """Calculate TurboQuant-compressed page size for one layer."""
+def turboquant_state_content_bytes(head_dim: int, k_quant: str, v_quant: str) -> int:
+    """Packed bytes for one (head, token) cell: K + V payload plus scales.
+
+    The scale term is 3 fp16 tensors (k_scale, v_scale, v_bias) per
+    ``TQ_BLOCK_SIZE``-wide group, hence ``3 * scale_groups * 2`` bytes.
+    """
     k_bits = QUANT_PARAMS[k_quant]["bits"]
     v_bits = V_QUANT_PARAMS[v_quant]["bits"]
     k_packed = packed_dim(head_dim, k_bits)
     v_packed = packed_dim(head_dim, v_bits)
-    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
     scale_groups = head_dim // TQ_BLOCK_SIZE
-    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
-    return kv_bytes + scale_bytes
+    return k_packed + v_packed + 3 * scale_groups * 2
+
+
+def turboquant_page_size_bytes(
+    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
+) -> int:
+    """Calculate TurboQuant-compressed page size for one layer."""
+    return (
+        block_size
+        * num_kv_heads
+        * turboquant_state_content_bytes(head_dim, k_quant, v_quant)
+    )
 
 
 def _build_turboquant_attention_spec(
@@ -164,9 +180,9 @@ def _build_turboquant_attention_spec(
 ) -> TurboQuantAttentionSpec:
     """Build a TurboQuantAttentionSpec for a single attention layer.
 
-    Reports the real compressed page size via ``real_page_size_bytes``
-    override, so the scheduler allocates the right number of blocks and
-    ``head_size`` stays equal to the model's real head_dim.
+    The spec derives its packed ``state_content_bytes`` itself, so the
+    scheduler allocates the right number of blocks and ``head_size``
+    stays equal to the model's real head_dim.
     """
     return TurboQuantAttentionSpec(
         block_size=block_size,
@@ -383,10 +399,11 @@ class ModelCachePolicy:
                 layer_name = f"layers.{layer_idx}.self_attn"
                 # MLA caches a single latent tensor per layer, not separate K
                 # and V (see ``MLAPagedLatentCache``), which is why
-                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` hardcodes
-                # the 2x K/V factor in ``real_page_size_bytes``, so describing
-                # MLA with it makes the engine halve the block count it plans
-                # against relative to the pool actually allocated.
+                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` bakes
+                # the 2x K/V factor into ``page_size_bytes`` (head_size +
+                # head_size_v), so describing MLA with it makes the engine
+                # halve the block count it plans against relative to the pool
+                # actually allocated.
                 if self._runner.is_mla:
                     specs[layer_name] = MLAAttentionSpec(
                         block_size=block_size,
@@ -827,14 +844,14 @@ class ModelCachePolicy:
 
         Derived from the same ``FullAttentionSpec`` objects
         ``_draft_layer_specs`` registers with the scheduler
-        (``real_page_size_bytes``), rather than a parallel hand-rolled
+        (``page_size_bytes``), rather than a parallel hand-rolled
         formula, so the two cannot drift apart. Naturally 0 when no draft is
         configured, since ``_draft_layer_specs`` returns ``{}`` in that case.
         """
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         specs = self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
-        return sum(spec.real_page_size_bytes for spec in specs.values())
+        return sum(spec.page_size_bytes for spec in specs.values())
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""

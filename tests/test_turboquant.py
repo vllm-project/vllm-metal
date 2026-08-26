@@ -471,9 +471,11 @@ def test_turboquant_per_layer_shapes_raise_early() -> None:
 
 # --- TurboQuantAttentionSpec (replacement for head_size_v hack) ------------
 #
-# ``TurboQuantAttentionSpec`` subclasses ``FullAttentionSpec`` and overrides
-# ``real_page_size_bytes`` so the scheduler sees the true compressed page size
-# without synthesising a bogus ``head_size_v`` (which used to go negative for
+# ``TurboQuantAttentionSpec`` subclasses ``FullAttentionSpec`` and derives the
+# packed ``state_content_bytes`` in ``__post_init__`` so the scheduler sees the
+# true compressed page size (vLLM 0.28.0 computes ``page_size_bytes`` from that
+# field; ``real_page_size_bytes`` is now just upstream's alias) without
+# synthesising a bogus ``head_size_v`` (which used to go negative for
 # aggressive 2-bit configs).
 
 # Last config is the 2-bit edge case that used to produce a negative
@@ -493,9 +495,16 @@ _TQ_SPEC_CONFIGS = [
     "block_size, num_kv_heads, head_dim, k_quant, v_quant",
     _TQ_SPEC_CONFIGS,
 )
-def test_tq_spec_real_page_size_bytes_matches_helper(
+def test_tq_spec_page_size_bytes_matches_helper(
     block_size, num_kv_heads, head_dim, k_quant, v_quant
 ):
+    """Even a bare construction bills the scheduler the packed page size.
+
+    vLLM 0.28.0 computes ``page_size_bytes`` from the ``state_content_bytes``
+    field (``real_page_size_bytes`` is a dead alias); ``__post_init__``
+    derives the field, so no construction path can fall back to the dense
+    int8 formula.
+    """
     spec = TurboQuantAttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
@@ -511,8 +520,8 @@ def test_tq_spec_real_page_size_bytes_matches_helper(
         k_quant=k_quant,
         v_quant=v_quant,
     )
-    assert spec.real_page_size_bytes == expected
     assert spec.page_size_bytes == expected
+    assert spec.real_page_size_bytes == expected
 
 
 @pytest.mark.parametrize(
