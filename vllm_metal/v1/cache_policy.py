@@ -29,12 +29,11 @@ from vllm_metal.attention.caches.turboquant import (
     V_QUANT_PARAMS,
     packed_dim,
 )
-from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.hybrid import (
     BailingHybridPagedAttentionRuntime,
     HybridPagedAttentionRuntime,
-    _build_linear_layer_spec,
 )
+from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
@@ -995,24 +994,14 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
+        runtime_cls = HybridPagedAttentionRuntime
         if self._runner.is_bailing_v3:
             if config.turboquant:
                 raise NotImplementedError(
                     "TurboQuant is not supported for Bailing hybrid models"
                 )
-            return BailingHybridPagedAttentionRuntime(
-                num_layers=self._runner.num_layers,
-                layer_group_size=self._runner.full_attention_interval,
-                max_num_seqs=self._runner.scheduler_config.max_num_seqs,
-                latent_dim=self._runner.mla_latent_dim,
-                linear_num_heads=self._runner.linear_num_v_heads,
-                linear_head_dim=self._runner.linear_value_head_dim,
-                linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-                block_size=block_size,
-                dtype=self._require_kv_cache_dtype(),
-                mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
-            )
-        return HybridPagedAttentionRuntime(
+            runtime_cls = BailingHybridPagedAttentionRuntime
+        return runtime_cls(
             hybrid_plan=self._hybrid_plan(),
             max_num_seqs=self._runner.scheduler_config.max_num_seqs,
             num_kv_heads=self._runner.num_kv_heads,

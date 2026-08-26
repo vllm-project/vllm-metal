@@ -487,26 +487,18 @@ class MetalModelRunner:
 
     @property
     def is_bailing_v3(self) -> bool:
-        """Whether the model is a supported Bailing V3 MLA/KDA hybrid."""
+        """Whether the loaded architecture is Bailing V3."""
         architectures = self.model_args.get("architectures") or ()
         if isinstance(architectures, str):
             architectures = (architectures,)
-        layer_group_size = self.model_args.get("layer_group_size", 0)
-        conv_kernel_size = self.model_args.get("short_conv_kernel_size", 0)
         return (
             self.model_args.get("model_type") == "bailing_hybrid"
             and "BailingMoeV3ForCausalLM" in architectures
-            and isinstance(layer_group_size, int)
-            and layer_group_size > 0
-            and isinstance(conv_kernel_size, int)
-            and conv_kernel_size > 0
-            and self.model_args.get("no_kda_lora") is True
-            and self.model_args.get("kda_safe_gate") is True
         )
 
     @property
     def is_hybrid(self) -> bool:
-        """Whether the model mixes SDPA and linear attention layers.
+        """Whether the model mixes full and recurrent attention layers.
 
         Qwen hybrids use ``full_attention_interval`` for SDPA/GDN placement;
         Bailing hybrids use ``layer_group_size`` for MLA/KDA placement.

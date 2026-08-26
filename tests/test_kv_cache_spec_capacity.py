@@ -11,7 +11,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
-from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
+from tests.stub_runner import (
+    make_bailing_hybrid_plan,
+    make_gdn_hybrid_plan,
+    make_stub_runner,
+)
 
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
@@ -130,3 +134,35 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     assert cdiv(prompt_tokens, attention_block_size) == 3
     assert spec.block_size == max_model_len
     assert cdiv(prompt_tokens, spec.block_size) == 1
+
+
+def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
+    runner = make_stub_runner(
+        model_args={
+            "model_type": "bailing_hybrid",
+            "architectures": ["BailingMoeV3ForCausalLM"],
+            "kv_lora_rank": 512,
+            "layer_group_size": 2,
+        },
+        num_layers=2,
+        hybrid_runtime_plan=make_bailing_hybrid_plan(
+            2,
+            num_attention_heads=16,
+            head_dim=128,
+            short_conv_kernel_size=4,
+        ),
+        num_kv_heads=1,
+        head_dim=576,
+        kv_cache_dtype=mx.bfloat16,
+        cache_config=SimpleNamespace(
+            block_size=BLOCK_SIZE,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+
+    assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
+    assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)

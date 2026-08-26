@@ -64,6 +64,13 @@ class MLAPagedAttentionWrapper(nn.Module):
                 self, "_apply_mla_attention", self._apply_kv_b_proj_attention
             )
 
+    def rebind_cache(
+        self, latent_cache: MLAPagedLatentCache, *, cache_idx: int
+    ) -> None:
+        """Refresh the latent cache and compact layer index for model reuse."""
+        object.__setattr__(self, "_mla_layer_idx", cache_idx)
+        object.__setattr__(self, "_mla_latent_cache", latent_cache)
+
     def _attention_scale(self) -> float:
         inner = self._inner
         scale = getattr(inner, "scale", None)
@@ -83,25 +90,21 @@ class MLAPagedAttentionWrapper(nn.Module):
         inner = self._inner
         if hasattr(inner, "o_proj"):
             return inner.o_proj(output)
-        if hasattr(inner, "dense"):
-            batch, length, _ = output.shape
-            output = output.reshape(batch, length, inner.num_heads, inner.v_head_dim)
-            g_proj = getattr(inner, "g_proj", None)
-            if g_proj is not None:
-                gate = mx.sigmoid(g_proj(x).astype(mx.float32)).astype(output.dtype)
-                if gate.shape[-1] == inner.num_heads:
-                    output = output * gate[..., None]
-                elif gate.shape[-1] == inner.num_heads * inner.v_head_dim:
-                    output = output * gate.reshape(output.shape)
-                else:
-                    raise RuntimeError(
-                        f"Unsupported MLA gate width {gate.shape[-1]} for "
-                        f"{type(inner).__name__}"
-                    )
-            return inner.dense(output.reshape(batch, length, -1))
-        raise RuntimeError(
-            f"Unsupported MLA output projection for {type(inner).__name__}"
-        )
+        if not hasattr(inner, "dense") or not hasattr(inner, "g_proj"):
+            raise RuntimeError(
+                f"Unsupported MLA output projection for {type(inner).__name__}"
+            )
+
+        batch, length, _ = output.shape
+        output = output.reshape(batch, length, inner.num_heads, inner.v_head_dim)
+        gate = mx.sigmoid(inner.g_proj(x).astype(mx.float32)).astype(output.dtype)
+        if gate.shape[-1] != inner.num_heads:
+            raise RuntimeError(
+                f"Unsupported MLA gate width {gate.shape[-1]} for "
+                f"{type(inner).__name__}; expected {inner.num_heads}"
+            )
+        output = output * gate[..., None]
+        return inner.dense(output.reshape(batch, length, -1))
 
     @staticmethod
     def _causal_valid_mask(

@@ -22,12 +22,6 @@ from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.context import PagedAttentionContext
-from vllm_metal.attention.impls.linear import (
-    GDNPagedAttentionWrapper,
-    KDAPagedAttentionWrapper,
-    is_bailing_kda,
-    is_linear_attention,
-)
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import (
@@ -39,46 +33,6 @@ from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
 
 logger = init_logger(__name__)
-
-
-def is_bailing_kda_layer(
-    layer_idx: int, layer_group_size: int, num_layers: int
-) -> bool:
-    """Return whether a Bailing V3 layer uses KDA instead of MLA."""
-    return not (
-        (layer_idx + 1) % layer_group_size == 0
-        or layer_idx >= num_layers // layer_group_size * layer_group_size
-    )
-
-
-def _build_linear_layer_spec(
-    *,
-    conv_kernel_dim: int,
-    conv_dim: int,
-    num_v_heads: int,
-    value_head_dim: int,
-    key_head_dim: int,
-    torch_dtype: torch.dtype,
-    page_size_padded: int | None = None,
-    mamba_block_size: int,
-    mamba_cache_mode: str = "none",
-) -> MambaSpec:
-    """Build the scheduler-visible GDN state spec.
-
-    A max-length Mamba block gives each request one block in ``none`` mode.
-    """
-    return MambaSpec(
-        shapes=(
-            (conv_kernel_dim - 1, conv_dim),
-            (num_v_heads, value_head_dim, key_head_dim),
-        ),
-        # Match the fp32 recurrent pool used for kernel accumulation.
-        dtypes=(torch_dtype, torch.float32),
-        block_size=mamba_block_size,
-        page_size_padded=page_size_padded,
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-        mamba_cache_mode=mamba_cache_mode,
-    )
 
 
 class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
@@ -136,8 +90,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
 
-    def initialize(self, num_blocks: int) -> None:
-        self._cache = MetalPagedKVCache(
+    def _create_attention_cache(
+        self, num_blocks: int
+    ) -> MetalPagedKVCache | MLAPagedLatentCache:
+        return MetalPagedKVCache(
             num_layers=self._hybrid_plan.layers.num_attention,
             num_kv_heads=self._num_kv_heads,
             head_dim=self._head_dim,
@@ -148,6 +104,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             k_quant=self._k_quant,
             v_quant=self._v_quant,
         )
+
+    def initialize(self, num_blocks: int) -> None:
+        self._cache = self._create_attention_cache(num_blocks)
 
         # Align-mode slabs are addressed directly by scheduler block id; any
         # of the pool's blocks can become a mamba state block (the block pool
@@ -180,11 +139,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
         logger.info(
-            "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d linear layers (%d/%d GDN slots allocated, mamba_cache_mode=%s)",
+            "Hybrid cache initialized: %d attention layers (%d blocks), "
+            "%d %s layers (%d/%d state slots allocated, mamba_cache_mode=%s)",
             self._hybrid_plan.layers.num_attention,
             num_blocks,
             self._hybrid_plan.layers.num_state,
+            self._hybrid_plan.family.label,
             self._state_cache.allocated_seqs,
             self._state_cache.max_seqs,
             self._mamba_cache_mode,
@@ -238,7 +198,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._group_block_sizes
 
     def patch_model(self, model: nn.Module) -> int:
-        kv_cache = self._require_initialized("patch_model")
+        self._require_initialized("patch_model")
         state_cache = self.state_cache
         layer_plan = self._hybrid_plan.layers
         state_family = self._hybrid_plan.family
@@ -259,22 +219,26 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                     f"{state_family.label!r} state module."
                 )
             cache_idx = layer_plan.attention_cache_index(layer_idx)
-            if isinstance(attn, SDPAPagedAttentionWrapper):
-                attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
-                return attn
-            if is_sdpa(attn):
-                return SDPAPagedAttentionWrapper(
-                    attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
-                )
-            raise RuntimeError(
-                f"Hybrid patch_model: layer {layer_idx} is an attention layer in "
-                f"the hybrid plan but {type(attn).__name__} is not SDPA."
-            )
+            return self._wrap_attention_layer(layer_idx, attn, cache_idx)
 
         return walk_and_wrap(model, wrap_layer)
 
+    def _wrap_attention_layer(self, layer_idx: int, attn: Any, cache_idx: int) -> Any:
+        kv_cache = self.kv_cache
+        if isinstance(attn, SDPAPagedAttentionWrapper):
+            attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
+            return attn
+        if is_sdpa(attn):
+            return SDPAPagedAttentionWrapper(
+                attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
+            )
+        raise RuntimeError(
+            f"Hybrid patch_model: layer {layer_idx} is an attention layer in "
+            f"the hybrid plan but {type(attn).__name__} is not SDPA."
+        )
+
     @property
-    def kv_cache(self) -> MetalPagedKVCache:
+    def kv_cache(self) -> MetalPagedKVCache | MLAPagedLatentCache:
         return self._require_initialized("kv_cache")
 
     @property
@@ -324,123 +288,26 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
 
 class BailingHybridPagedAttentionRuntime(HybridPagedAttentionRuntime):
-    """Paged latent MLA cache plus block-indexed Bailing KDA state."""
+    """Hybrid state management with an MLA latent cache for attention layers."""
 
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        layer_group_size: int,
-        max_num_seqs: int,
-        latent_dim: int,
-        linear_num_heads: int,
-        linear_head_dim: int,
-        linear_conv_kernel_dim: int,
-        block_size: int,
-        dtype: mx.Dtype,
-        mamba_cache_mode: str = "none",
-    ) -> None:
-        super().__init__(
-            num_layers=num_layers,
-            full_attention_interval=layer_group_size,
-            max_num_seqs=max_num_seqs,
-            num_kv_heads=1,
-            head_dim=latent_dim,
-            linear_num_v_heads=linear_num_heads,
-            linear_key_head_dim=linear_head_dim,
-            linear_value_head_dim=linear_head_dim,
-            linear_conv_kernel_dim=linear_conv_kernel_dim,
-            linear_conv_dim=3 * linear_num_heads * linear_head_dim,
-            block_size=block_size,
-            dtype=dtype,
-            mamba_cache_mode=mamba_cache_mode,
-        )
-        self._latent_dim = latent_dim
-        self._sdpa_indices = [
-            i
-            for i in range(num_layers)
-            if not is_bailing_kda_layer(i, layer_group_size, num_layers)
-        ]
-        self._linear_indices = [
-            i
-            for i in range(num_layers)
-            if is_bailing_kda_layer(i, layer_group_size, num_layers)
-        ]
-
-    def initialize(self, num_blocks: int) -> None:
-        self._cache = MLAPagedLatentCache(
-            num_layers=len(self._sdpa_indices),
-            latent_dim=self._latent_dim,
+    def _create_attention_cache(self, num_blocks: int) -> MLAPagedLatentCache:
+        return MLAPagedLatentCache(
+            num_layers=self._hybrid_plan.layers.num_attention,
+            latent_dim=self._head_dim,
             num_blocks=num_blocks,
             block_size=self._block_size,
             dtype=self._dtype,
         )
-        align = self._mamba_cache_mode == "align"
-        state_slots = num_blocks if align else self._max_num_seqs
-        self._state_cache = GDNPagedStateCache(
-            num_layers=len(self._linear_indices),
-            max_seqs=state_slots,
-            conv_kernel_dim=self._linear_conv_kernel_dim,
-            conv_dim=self._linear_conv_dim,
-            num_v_heads=self._linear_num_v_heads,
-            value_head_dim=self._linear_value_head_dim,
-            key_head_dim=self._linear_key_head_dim,
-            initial_seqs=0,
-            dtype=self._dtype,
-        )
-        self._gdn_state_manager = (
-            AlignGDNStateManager(self._state_cache, self._block_size)
-            if align
-            else HybridGDNStateManager(self._state_cache)
-        )
-        logger.info(
-            "Bailing hybrid cache initialized: %d MLA layers (%d blocks), "
-            "%d KDA layers (%d/%d state slots allocated, "
-            "mamba_cache_mode=%s)",
-            len(self._sdpa_indices),
-            num_blocks,
-            len(self._linear_indices),
-            self._state_cache.allocated_seqs,
-            self._state_cache.max_seqs,
-            self._mamba_cache_mode,
-        )
 
-    def patch_model(self, model: nn.Module) -> int:
-        latent_cache = self._require_initialized("patch_model")
-        state_cache = self.state_cache
-        mla_cache_map = {
-            layer_idx: cache_idx
-            for cache_idx, layer_idx in enumerate(self._sdpa_indices)
-        }
-        kda_cache_map = {
-            layer_idx: cache_idx
-            for cache_idx, layer_idx in enumerate(self._linear_indices)
-        }
+    def _wrap_attention_layer(
+        self, layer_idx: int, attn: Any, cache_idx: int
+    ) -> MLAPagedAttentionWrapper:
+        latent_cache = self.kv_cache
+        if isinstance(attn, MLAPagedAttentionWrapper):
+            attn.rebind_cache(latent_cache, cache_idx=cache_idx)
+            return attn
+        return MLAPagedAttentionWrapper(attn, cache_idx, latent_cache)
 
-        def wrap_layer(layer_idx: int, attn: Any) -> Any:
-            mla_cache_idx = mla_cache_map.get(layer_idx)
-            if mla_cache_idx is not None:
-                if isinstance(attn, MLAPagedAttentionWrapper):
-                    object.__setattr__(attn, "_mla_layer_idx", mla_cache_idx)
-                    object.__setattr__(attn, "_mla_latent_cache", latent_cache)
-                    return attn
-                return MLAPagedAttentionWrapper(attn, mla_cache_idx, latent_cache)
-
-            kda_cache_idx = kda_cache_map.get(layer_idx)
-            if kda_cache_idx is None:
-                raise RuntimeError(
-                    f"Bailing hybrid layer {layer_idx} has unsupported attention "
-                    f"module {type(attn).__name__}"
-                )
-            if isinstance(attn, KDAPagedAttentionWrapper):
-                object.__setattr__(attn, "_kda_cache_idx", kda_cache_idx)
-                object.__setattr__(attn, "_kda_state_cache", state_cache)
-                return attn
-            if not is_bailing_kda(attn):
-                raise RuntimeError(
-                    f"Bailing hybrid layer {layer_idx} has unsupported attention "
-                    f"module {type(attn).__name__}"
-                )
-            return KDAPagedAttentionWrapper(attn, layer_idx, kda_cache_idx, state_cache)
-
-        return walk_and_wrap(model, wrap_layer)
+    @property
+    def kv_cache(self) -> MLAPagedLatentCache:
+        return self._require_initialized("kv_cache")

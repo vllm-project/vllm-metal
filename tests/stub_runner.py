@@ -10,6 +10,7 @@ from typing import Any
 import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.attention.runtime.families.bailing import build_bailing_hybrid_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
@@ -231,6 +232,22 @@ _GDN_FAMILY_SPEC = build_gdn_hybrid_plan(
     },
     2,
 ).family
+
+
+def make_bailing_hybrid_plan(num_layers: int, **overrides: Any) -> HybridRuntimePlan:
+    """Build a small Bailing V3 plan through the production family owner."""
+    return build_bailing_hybrid_plan(
+        {
+            "layer_group_size": 2,
+            "num_attention_heads": 1,
+            "head_dim": 4,
+            "short_conv_kernel_size": 2,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+            **overrides,
+        },
+        num_layers,
+    )
 
 
 def make_gdn_hybrid_plan(
