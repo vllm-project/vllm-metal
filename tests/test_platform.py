@@ -1160,67 +1160,111 @@ class TestMetalPlatform:
             ),
         )
 
-    @pytest.mark.parametrize(
-        "paged,cache_config,speculative,err_match",
-        [
-            (
-                "0",
+    @pytest.mark.parametrize("paged", ["0", "1"])
+    def test_check_and_update_config_rejects_hybrid_all_cache_mode(
+        self, paged: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mamba_cache_mode='all' fails fast on every path, before downgrades."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
+        reset_config()
+        try:
+            # enable_prefix_caching=True so the non-paged parametrization also
+            # pins that the raise fires BEFORE the APC downgrade overwrites
+            # the mode.
+            vllm_config = self._hybrid_vllm_config(
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
-                    mamba_cache_mode="none",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-                None,
-                "requires paged",
-            ),
-            (
-                "1",
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=False,
                     mamba_cache_mode="all",
                     mamba_ssm_cache_dtype="float32",
                 ),
-                None,
-                "mamba_cache_mode='all'",
-            ),
+            )
+            with pytest.raises(NotImplementedError, match="mamba_cache_mode='all'"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        "paged,speculative",
+        [
+            ("0", None),
             (
                 "1",
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="align",
-                    mamba_ssm_cache_dtype="float32",
-                ),
                 SimpleNamespace(
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
                 ),
-                "speculative decoding",
             ),
         ],
-        ids=["prefix_caching_non_paged", "mamba_cache_mode_all", "prefix_and_sd"],
+        ids=["non_paged", "speculative_decoding"],
     )
-    def test_check_and_update_config_rejects_unsupported_hybrid_cache_modes(
+    def test_check_and_update_config_downgrades_default_hybrid_prefix_caching(
         self,
         paged: str,
-        cache_config: SimpleNamespace,
         speculative: SimpleNamespace | None,
-        err_match: str,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Hybrid combinations Metal cannot serve downgrade APC, not reject.
+
+        vLLM 0.28.0 enables prefix caching by default for hybrid models and
+        resolves mamba_cache_mode='align' / mamba_block_size=block_size before
+        the platform hook runs; failing here would fail every default launch.
+        The downgrade restores the upstream APC-off resolution.
+        """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
-                cache_config, speculative_config=speculative
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=speculative,
             )
-            with pytest.raises(NotImplementedError, match=err_match):
+            # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
+            # construction (models/config.py), so user_specified stays False.
+            vllm_config.cache_config.mamba_block_size = 16
+            assert vllm_config.cache_config.user_specified_mamba_block_size is False
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is False
+        assert cache_config.mamba_cache_mode == "none"
+        assert cache_config.mamba_block_size == 32768
+
+    def test_hybrid_prefix_caching_downgrade_rejects_user_mamba_block_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit --mamba-block-size fails fast when APC must be downgraded.
+
+        Once the hook disables prefix caching, upstream's
+        validate_mamba_block_size (an after-validator) would reject the kept
+        value with a misleading message; the Metal constraint wins instead.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_block_size=64,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+            )
+            assert vllm_config.cache_config.user_specified_mamba_block_size is True
+            with pytest.raises(NotImplementedError, match="mamba-block-size"):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()

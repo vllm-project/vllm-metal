@@ -506,29 +506,30 @@ class MetalPlatform(Platform):
                     "--mamba-ssm-cache-dtype float32 because recurrent state is "
                     "stored in fp32."
                 )
-            if cache_config.enable_prefix_caching and not config.use_paged_attention:
-                raise NotImplementedError(
-                    "Prefix caching for hybrid GDN models requires paged "
-                    "attention on Metal (VLLM_METAL_USE_PAGED_ATTENTION=1); "
-                    "the non-paged MLX path has no block-indexed state to "
-                    "restore from."
-                )
             if cache_config.mamba_cache_mode == "all":
+                # Before the downgrades below, which overwrite the mode: an
+                # explicit --mamba-cache-mode all must fail fast on every path.
                 raise NotImplementedError(
                     "mamba_cache_mode='all' is not supported for hybrid GDN "
                     "models on Metal (nor upstream, which falls back to "
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
+            if cache_config.enable_prefix_caching and not config.use_paged_attention:
+                cls._disable_hybrid_prefix_caching(
+                    vllm_config,
+                    "the non-paged MLX path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
+                    "has no block-indexed state to restore from",
+                )
             if (
                 cache_config.enable_prefix_caching
                 and vllm_config.speculative_config is not None
             ):
-                raise NotImplementedError(
-                    "Prefix caching for hybrid GDN models on Metal does not "
-                    "support speculative decoding yet: draft-state rollback "
-                    "across mamba state blocks (num_speculative_blocks) is "
-                    "not implemented. Disable one of the two."
+                cls._disable_hybrid_prefix_caching(
+                    vllm_config,
+                    "draft-state rollback across mamba state blocks "
+                    "(num_speculative_blocks) is not implemented for "
+                    "speculative decoding",
                 )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
@@ -834,6 +835,43 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    @staticmethod
+    def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
+        """Downgrade default-on prefix caching for a hybrid GDN model.
+
+        vLLM 0.28.0 enables prefix caching by default for hybrid models
+        (vllm#50991) and resolves ``mamba_cache_mode``/``mamba_block_size``
+        for the APC-on case before this platform hook runs. For hybrid
+        combinations Metal cannot serve, restore the APC-off resolution
+        (``mamba_cache_mode='none'``, ``mamba_block_size=max_model_len``)
+        the way upstream's ``MambaModelConfig.verify_and_update_config``
+        else-branch would have, instead of failing a default launch.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_mamba_block_size:
+            # --mamba-block-size requires prefix caching (upstream's
+            # validate_mamba_block_size rejects it once APC is off), so the
+            # user's two explicit choices conflict; fail with the Metal
+            # constraint before upstream's misleading error fires.
+            raise NotImplementedError(
+                "Prefix caching for hybrid GDN models on Metal cannot serve "
+                f"this configuration ({reason}), and --mamba-block-size "
+                "requires prefix caching. Drop --mamba-block-size or the "
+                "conflicting option."
+            )
+        logger.warning(
+            "Disabling prefix caching for this hybrid GDN model: %s. "
+            "(vLLM enables prefix caching by default for hybrid models; "
+            "pass --no-enable-prefix-caching to make this explicit.)",
+            reason,
+        )
+        cache_config.enable_prefix_caching = False
+        cache_config.mamba_cache_mode = "none"
+        # Restore upstream's APC-off resolution; validate_mamba_block_size
+        # (a pydantic after-validator, so it runs after this hook) rejects
+        # any other value once prefix caching is off.
+        cache_config.mamba_block_size = vllm_config.model_config.max_model_len
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
