@@ -3,7 +3,7 @@
 # Pinned by full URL because no index serves it: PyPI's vllm has no macOS
 # wheel yet. To bump, raise VLLM_VERSION to a release that attaches one —
 # not every release does; v0.26.0 was the first.
-VLLM_VERSION="0.27.1"
+VLLM_VERSION="0.28.0"
 VLLM_WHEEL_URL="https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
 
 _cleanup_dirs=()

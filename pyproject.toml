@@ -49,7 +49,7 @@ dependencies = [
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
-    # Keep aligned with vLLM 0.27.1's Transformers lower bound.
+    # Keep aligned with vLLM 0.28.0's Transformers lower bound.
     # Temporary cap: transformers 5.13.0 (released 2026-07-03) breaks MLX Metal
     # availability inside the vLLM process on GitHub's macOS runner VMs, so
     # platform resolution falls back to CPU. Verified A/B on the same runner:
@@ -58,12 +58,17 @@ dependencies = [
     "transformers>=5.5.3,<5.13",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
+    # Imported directly (model download/cache paths); keep aligned with vLLM
+    # 0.28.0's lower bound rather than relying on vLLM's transitive install.
+    # Unbounded like upstream's own form: vLLM's requirements/common.txt pins
+    # the effective range in every release and we re-derive it on each bump.
+    "huggingface_hub>=1.27.0",
     # Native Metal extension JIT build
     "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
-    # Keep aligned with vLLM 0.27.1's FastAPI/Starlette bounds. vLLM caps fastapi
+    # Keep aligned with vLLM 0.28.0's FastAPI/Starlette bounds. vLLM caps fastapi
     # itself (requirements/common.txt): 0.133.0 is the first release supporting
     # Starlette 1.0, and <0.137.0 avoids the FastAPI 0.137 route-tree change that
     # breaks its handler overrides. The earlier prometheus crash (vllm#45597) is
