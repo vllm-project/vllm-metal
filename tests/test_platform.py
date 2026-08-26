@@ -1160,6 +1160,27 @@ class TestMetalPlatform:
             ),
         )
 
+    def test_check_and_update_config_disables_async_scheduling_for_spec_decode(
+        self,
+    ) -> None:
+        """Async scheduling downgrades to synchronous when SD is configured.
+
+        vLLM 0.28.0 auto-enables async scheduling for draft-model SD
+        (vllm#48341) before the platform hook runs; Metal proposers hand
+        drafts back synchronously via take_draft_token_ids().
+        """
+        vllm_config = self._platform_config(
+            speculative_config=SimpleNamespace(
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=3,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.async_scheduling is False
+
     @pytest.mark.parametrize("paged", ["0", "1"])
     def test_check_and_update_config_rejects_hybrid_all_cache_mode(
         self, paged: str, monkeypatch: pytest.MonkeyPatch

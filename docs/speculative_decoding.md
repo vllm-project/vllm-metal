@@ -13,8 +13,10 @@ path. All require synchronous scheduling and greedy sampling.
 
 All three methods:
 
-- Require `--no-async-scheduling` (vLLM auto-disables async for most spec-decode
-  methods; pass it explicitly to be safe).
+- Run with synchronous scheduling. The Metal platform disables async
+  scheduling automatically whenever speculative decoding is configured
+  (vLLM 0.28.0 auto-enables async for draft-model spec decode); passing
+  `--no-async-scheduling` explicitly remains fine.
 - Only accelerate greedy requests (`temperature=0`). Non-greedy requests skip
   drafting silently.
 - Are lossless under greedy decoding.

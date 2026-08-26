@@ -496,6 +496,21 @@ class MetalPlatform(Platform):
                 "1 + num_speculative_tokens, or leave it unset."
             )
 
+        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
+        # to the scheduler synchronously via take_draft_token_ids(), so async
+        # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
+        # async scheduling for draft-model SD (vllm#48341); restore the working
+        # default, the same downgrade shape as the STT scheduler policy.
+        if (
+            speculative_config is not None
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            vllm_config.scheduler_config.async_scheduling = False
+            logger.warning(
+                "Speculative decoding on Metal requires synchronous "
+                "scheduling; disabled async_scheduling."
+            )
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
             if cache_config.mamba_ssm_cache_dtype == "auto":
