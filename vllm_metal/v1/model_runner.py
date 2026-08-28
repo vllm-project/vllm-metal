@@ -950,13 +950,15 @@ class MetalModelRunner:
     def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
         """Construct the polymorphic drafter once the paged cache is ready.
 
-        One factory for both speculative methods, keyed on the speculative
-        method. Gemma4 MTP uses the in-model assistant loaded in
-        ``ModelLifecycle`` (read lazily by the proposer); draft-model SD loads
-        its own model + a paged cache sized to the target's ``num_blocks`` —
-        which is why this runs after the paged backend exists. A configured but
-        unsupported method fails loud rather than silently degrading to plain
-        decode (which would look like a drafter that never accepts anything).
+        One factory for every speculative method, keyed on the method name.
+        Gemma4 MTP uses the in-model assistant loaded in ``ModelLifecycle``
+        (read lazily by the proposer); draft-model SD loads its own model + a
+        paged cache sized to the target's ``num_blocks`` — which is why this
+        runs after the paged backend exists. N-gram and ``custom_class``
+        proposers load no model at all, so ``num_blocks``/``block_size`` are
+        unused for them. A configured but unsupported method fails loud rather
+        than silently degrading to plain decode (which would look like a
+        drafter that never accepts anything).
         """
         spec = self.vllm_config.speculative_config
         if spec is None:
@@ -993,10 +995,33 @@ class MetalModelRunner:
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
             )
+        elif spec.method == "custom_class":
+            from vllm.utils.import_utils import resolve_obj_by_qualname
+
+            # Upstream's escape hatch for proposers it does not ship: `model`
+            # carries the dotted path of the class (see `SpeculativeConfig
+            # .__post_init__`, which routes this method past draft-model
+            # resolution entirely). Metal requires the class to expose the same
+            # `build(*, vllm_config, controller)` classmethod the in-tree
+            # proposers use, so this stays one uniform factory rather than a
+            # second, per-class wiring path. `vllm_metal.v1.grammar_proposer
+            # .GrammarProposer` is the proposer this exists for.
+            proposer_cls = resolve_obj_by_qualname(spec.model)
+            build = getattr(proposer_cls, "build", None)
+            if build is None:
+                raise NotImplementedError(
+                    f"Custom speculative proposer {spec.model!r} must expose a "
+                    "build(*, vllm_config, controller) classmethod to be usable "
+                    "on Metal."
+                )
+            self._drafter = build(
+                vllm_config=self.vllm_config,
+                controller=self._spec_decode_controller,
+            )
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, draft_model, ngram, custom_class)."
             )
 
     def estimate_one_sequence_kv_bytes(

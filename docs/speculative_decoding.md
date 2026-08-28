@@ -1,19 +1,19 @@
 # Speculative Decoding
 
-vllm-metal supports three speculative decoding methods on the paged-attention
+vllm-metal supports four speculative decoding methods on the paged-attention
 path. Use vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
 for method behavior and configuration details.
 
-| | MTP | Draft model | N-gram |
-|---|---|---|---|
-| `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
-| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
-| `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Additional model weights | Assistant checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
+| | MTP | Draft model | N-gram | Grammar-forced |
+|---|---|---|---|---|
+| `--speculative-config` method | `mtp` | `draft_model` | `ngram` | `custom_class` |
+| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history | The request's own grammar |
+| `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) | Configurable (8 typical) |
+| Additional model weights | Assistant checkpoint | Draft model | None | None |
+| Additional KV cache | None; reads target KV | Second scheduler-managed cache | None | None; one xgrammar matcher per request |
 
-All three methods currently have these Metal-specific constraints:
+All four methods currently have these Metal-specific constraints:
 
 - Only greedy requests (`temperature=0`) are drafted. Other requests run
   without speculation.
@@ -89,6 +89,114 @@ VLLM_METAL_USE_PAGED_ATTENTION=1 \
     --no-async-scheduling \
     --speculative-config '{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":3}'
 ```
+
+## Grammar-forced
+
+Grammar-forced drafting exploits the fact that a request under a JSON schema or a
+tool-call structural tag has most of its output decided before the model runs.
+The braces, quotes, key names and separators are the *grammar's* choice, not the
+model's; only the values are open. This proposer emits the decided part and stops
+at every genuine decision point. Like N-gram it loads no model and keeps no KV
+cache; unlike N-gram it needs no repetition in the text.
+
+Because vLLM already applies the grammar bitmask to **every** verification row
+(not just the bonus row) before `verify_greedy` runs, a drafted token is
+grammar-legal by construction. It is not *guaranteed* accepted, though — see
+Limitations.
+
+Measured on an M4 Pro. Two different workloads, because they exercise two
+different grammars:
+
+**Real tool calling** — OpenAI-API `tools` block, `tool_choice: "auto"`, hermes
+parser, so the grammar is a *structural tag* (free text until a `<tool_call>`
+trigger, then constrained JSON):
+
+| Model | Speedup | Tokens from drafts | Acceptance | Tool calls parsed |
+|---|---|---|---|---|
+| Qwen3-0.6B | **1.26x** | 43% | **100%** | 8/8, identical to baseline |
+
+**Constrained JSON generation** — `structured_outputs.json`, a plain JSON schema:
+
+| Model | Batch | Speedup | Tokens from drafts | Acceptance |
+|---|---|---|---|---|
+| Qwen3-0.6B | 1 | 1.49x | 47% | 100% |
+| Qwen3-0.6B | 4 | 1.95x | 43% | 83% |
+| Gemma-4 E2B | 1 | 1.28x | 48% | 59% |
+| Gemma-4 E2B | 4 | 1.56x | 43% | 47% |
+
+Tool calling shows the smaller speedup of the two because a structural tag leaves
+the model's prose free until the trigger fires, and nothing is drafted there. The
+structural tag pays it back elsewhere: its `begin` literal is
+`<tool_call>\n{"name": "get_weather", "arguments": ` — 44 characters including
+the tool name, forced in one run.
+
+Reproduce with `./grammar-spec-decode-runs/toolcall/run.sh` (tool calling) and
+`./grammar-spec-decode-runs/run_matrix.sh` (constrained JSON).
+
+### Serve
+
+```bash
+VLLM_METAL_USE_PAGED_ATTENTION=1 \
+vllm serve Qwen/Qwen3-8B \
+  --max-model-len 2048 \
+  --no-async-scheduling \
+  --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+  --speculative-config '{"method":"custom_class","model":"vllm_metal.v1.grammar_proposer.GrammarProposer","num_speculative_tokens":8}'
+```
+
+`method: custom_class` is upstream's escape hatch for proposers vLLM does not
+ship; `model` carries the dotted path of the class rather than a checkpoint.
+
+Confirm it is active: the server log shows
+`Grammar-forced speculative decoding enabled (...)` at startup.
+
+### Tuning
+
+- **`disable_any_whitespace: true` is close to mandatory.** It is the single
+  highest-impact setting here. With free whitespace allowed between JSON tokens
+  the grammar forces almost nothing, and measured step coverage collapses from
+  43% to 10% with every draft shrinking to one token.
+- `num_speculative_tokens` (K) — 8 rather than the 3–5 the other methods use.
+  Forced runs are long (`", "arguments": {"location": "` is about a dozen
+  tokens), and steps where nothing is forced cost nothing because the proposer
+  returns no draft at all.
+- The backend must be pinned to `xgrammar`. Requests routed to `outlines`,
+  `guidance` or `lm-format-enforcer` simply draft nothing.
+- For **tool calling** three further settings are load-bearing, and the proposer
+  silently drafts nothing without them:
+  1. a tool parser that declares a `structural_tag_model` (`hermes`,
+     `qwen_3_coder`, `llama`, ... — but *not* Gemma-4, see below);
+  2. `VLLM_ENFORCE_STRICT_TOOL_CALLING=1`, or `ToolParser.get_structural_tag`
+     returns `None`;
+  3. `"strict": true` on at least one tool, or `get_model_structural_tag`
+     returns `None` for `tool_choice: "auto"`.
+- Do not pass `--reasoning-parser` (see Limitations). For Qwen3 that means
+  sending `chat_template_kwargs: {"enable_thinking": false}` instead.
+
+### Limitations
+
+- Paged path only (`VLLM_METAL_USE_PAGED_ATTENTION=1`), greedy only, and
+  synchronous scheduling only — same as the other methods.
+- **Acceptance is empirical, not guaranteed.** Several *tokenizations* of a
+  forced string are legal (after `{` the grammar demands `"name"`, and `"`,
+  `"n`, `"na` and `"name` are all legal tokens), so the proposer drafts the
+  canonical greedy-BPE tokenization, which is what the model was trained to
+  emit. That matched perfectly on Qwen3 and about half the time on Gemma-4 E2B.
+  Verification is lossless either way, so a miss costs a wider step and nothing
+  else.
+- **Nothing is drafted for plain chat, for free-form string values, or for the
+  model's own choice of which tool to call.** Coverage is concentrated in the
+  structure, not the content.
+- **Gemma-4's own tool calling is not accelerated by this.** Its parser
+  (`gemma4_engine_tool_parser.py`) deliberately skips structured outputs because
+  Gemma-4 emits a native `<|tool_call>call:...` syntax, and it declares no
+  `structural_tag_model`. No bitmask is produced, so nothing is ever forced.
+  Explicit JSON-schema requests to Gemma-4 *are* accelerated.
+- Structural tags for `tool_choice: "auto"` only activate when
+  `VLLM_ENFORCE_STRICT_TOOL_CALLING=1` is set.
+- A configured reasoning parser is refused at construction. While reasoning is
+  unfinished the engine stops advancing its grammar matcher, which the worker
+  cannot observe, so the two would silently desynchronize.
 
 ## Benchmarking
 
