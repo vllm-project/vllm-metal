@@ -50,6 +50,7 @@ _CLEAN_STEP_KWARGS = {
 
 _GREEDY_SAMPLING_KWARGS = {
     "native_greedy": True,
+    "native_random": False,
     "has_prompt_logprobs": False,
 }
 
@@ -219,7 +220,7 @@ class TestGate:
     @pytest.mark.parametrize(
         ("flag", "value", "reason"),
         [
-            ("native_greedy", False, "non-native-greedy sampling"),
+            ("native_greedy", False, "non-native sampling"),
             ("has_prompt_logprobs", True, "prompt logprobs requested"),
         ],
     )
@@ -228,6 +229,15 @@ class TestGate:
         decision = _gate(pipeline, sampling_overrides={flag: value})
         assert not decision.eligible
         assert decision.reason == reason
+
+    def test_native_random_step_is_eligible_without_native_greedy(self):
+        pipeline, _ = _make_pipeline()
+        decision = _gate(
+            pipeline,
+            sampling_overrides={"native_greedy": False, "native_random": True},
+        )
+        assert decision.eligible
+        assert decision.reason == "eligible"
 
     def test_reentrant_decode_request_without_pending_row_is_blocked(self):
         # Arrange — a pending step covers only "a"; a cached request "b"

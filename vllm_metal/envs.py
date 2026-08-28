@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_COMPILED_MLP: bool = False
+    VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
@@ -74,6 +75,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # elementwise glue. Bitwise-identical on the quantized serving path;
     # set to "1" to enable, the default keeps the eager per-op dispatch.
     "VLLM_METAL_COMPILED_MLP": lambda: os.getenv("VLLM_METAL_COMPILED_MLP", "0") == "1",
+    # MLX-native non-greedy sampling for the decode pipeline (opt-in): the
+    # pipeline's deferred sampler learns a temperature/top-k/top-p graph, so
+    # eligible non-greedy pure-decode steps defer like greedy ones instead
+    # of dropping to the synchronous torch path. Requests with seeds,
+    # penalties, logprobs, or token constraints keep the torch path
+    # unchanged. Set to "1" to enable.
+    "VLLM_METAL_NATIVE_SAMPLING": lambda: (
+        os.getenv("VLLM_METAL_NATIVE_SAMPLING", "0") == "1"
+    ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode

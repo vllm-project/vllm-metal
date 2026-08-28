@@ -4,7 +4,9 @@
 Fully serial decode pays graph build + ``mx.async_eval`` encode while the GPU
 idles, then blocks on the sampling eval while the CPU idles. This module
 defers the sampling sync one step, the same overlap mlx_lm's generate loop
-uses: step ``k`` submits a lazy argmax over its logits and returns an
+uses: step ``k`` submits a lazy sample over its logits (greedy argmax, or a
+native temperature/top-k/top-p graph when ``VLLM_METAL_NATIVE_SAMPLING``
+admits the batch) and returns an
 :class:`AsyncModelRunnerOutput`; step ``k+1`` builds its graph with the lazy
 sampled tokens as decode input (a device gather, no host round-trip) while
 the GPU still executes step ``k``; the engine's deferred ``get_output()``
@@ -125,12 +127,18 @@ class SamplingShape:
     """Sampling-side facts for the decode requests of one step."""
 
     native_greedy: bool
+    native_random: bool
     has_prompt_logprobs: bool
 
     def block_reason(self) -> str | None:
-        """First sampling fact that rules the pipeline out, or ``None``."""
-        if not self.native_greedy:
-            return "non-native-greedy sampling"
+        """First sampling fact that rules the pipeline out, or ``None``.
+
+        Checked in order: native sampling mode first, then prompt logprobs.
+        Either native mode (greedy argmax or eligible random sampling with
+        ``VLLM_METAL_NATIVE_SAMPLING``) keeps the step deferrable.
+        """
+        if not (self.native_greedy or self.native_random):
+            return "non-native sampling"
         # Prompt logprobs need eager logits on the sampling step.
         if self.has_prompt_logprobs:
             return "prompt logprobs requested"

@@ -2339,6 +2339,47 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is False
         assert decision.reason == "prompt logprobs requested"
 
+    def _native_random_decode_setup(self, runner) -> SchedulerOutput:
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=[1, 7],
+                prompt_len=1,
+                cache=[],
+                sampling_params=SamplingParams(temperature=0.7, top_k=20, top_p=0.95),
+                generator=None,
+                generated_tokens=1,
+            )
+        }
+        return self._cached_decode_output("r0")
+
+    def test_native_random_decode_step_eligible_with_live_key(self) -> None:
+        # Arrange — a plain temperature/top-k/top-p decode step with the
+        # native sampling key chain live must defer like a greedy step.
+        runner = self._runner(drafter=None)
+        runner._native_sample_key = mx.random.key(0)
+        scheduler_output = self._native_random_decode_setup(runner)
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is True
+        assert decision.reason == "eligible"
+
+    def test_native_random_decode_step_blocked_without_key(self) -> None:
+        # Arrange — same step shape with native sampling disabled keeps the
+        # synchronous torch path.
+        runner = self._runner(drafter=None)
+        runner._native_sample_key = None
+        scheduler_output = self._native_random_decode_setup(runner)
+
+        # Act
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        # Assert
+        assert decision.eligible is False
+        assert decision.reason == "non-native sampling"
+
     def test_clean_decode_step_is_eligible(self) -> None:
         # Arrange
         runner = self._runner(drafter=None)
@@ -2458,6 +2499,89 @@ class TestDeferredDecodeSampleThreading:
             num_decode_tokens=len(decode_reqs),
             mm_prefill_deltas={},
         )
+
+    def _random_decode_state(self) -> mr.RequestState:
+        return mr.RequestState(
+            token_ids=[3, 9],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.7, top_k=1, top_p=1.0),
+            generator=None,
+            generated_tokens=1,
+        )
+
+    def test_deferred_random_step_samples_natively_and_backfills(
+        self, monkeypatch
+    ) -> None:
+        # Arrange — top_k=1 pins the categorical draw to the argmax row, so
+        # the backfilled value is deterministic while still exercising the
+        # native random graph.
+        runner = make_stub_runner(model_args={"vocab_size": 4})
+        runner._native_sample_key = mx.random.key(0)
+        state = self._random_decode_state()
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        initial_key = runner._native_sample_key
+        random_calls: list = []
+        real_random_tokens = mr.mlx_random_tokens
+
+        def spy_random_tokens(logits_2d, params, key):
+            random_calls.append((logits_2d, params, key))
+            return real_random_tokens(logits_2d, params, key)
+
+        monkeypatch.setattr(mr, "mlx_random_tokens", spy_random_tokens)
+
+        # Act
+        output = runner._submit_deferred_decode_sample()
+        result = output.get_output()
+
+        # Assert — the native random graph ran with a live step key, the key
+        # chain advanced, and the placeholder resolved to the only candidate
+        # top_k=1 leaves.
+        assert len(random_calls) == 1
+        assert random_calls[0][2] is not None
+        assert runner._native_sample_key.tolist() != initial_key.tolist()
+        assert state.token_ids[-1] == 1
+        assert result.sampled_token_ids == [[1]]
+
+    def test_deferred_random_step_never_samples_padded_vocab(self, monkeypatch) -> None:
+        """Columns past the model vocab must be unreachable even when a
+        padded column holds the largest logit."""
+        runner = make_stub_runner(model_args={"vocab_size": 4})
+        runner._native_sample_key = mx.random.key(0)
+        state = self._random_decode_state()
+        runner._paged_request_seq_lens = {"r0": 1}
+        paged_state = self._paged_state(runner, [("r0", state)])._replace(
+            logits=mx.array([[[0.0, 10.0, 0.0, 0.0, 99.0]]])
+        )
+        runner._execute_model_state = paged_state
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        output = runner._submit_deferred_decode_sample()
+        result = output.get_output()
+
+        assert result.sampled_token_ids == [[1]]
+
+    def test_deferred_ineligible_batch_raises_gate_desync(self) -> None:
+        # Arrange — a non-greedy batch with no live native sampling key must
+        # fail fast instead of silently sampling with the wrong semantics.
+        runner = make_stub_runner()
+        runner._native_sample_key = None
+        state = self._random_decode_state()
+        runner._paged_request_seq_lens = {"r0": 1}
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        # Act / Assert
+        with pytest.raises(RuntimeError, match="gate desync"):
+            runner._submit_deferred_decode_sample()
 
     def test_submit_advances_bookkeeping_and_returns_async_output(self) -> None:
         # Arrange
