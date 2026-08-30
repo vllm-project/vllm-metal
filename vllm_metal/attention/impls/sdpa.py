@@ -211,6 +211,7 @@ def _kernel_metadata(
     return meta
 
 
+# TODO(#660): Make Q/K norm placement relative to RoPE architecture-aware.
 def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
     """Return the first per-head norm present on *module* among *names*.
 
