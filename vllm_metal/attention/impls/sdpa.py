@@ -211,6 +211,23 @@ def _kernel_metadata(
     return meta
 
 
+def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
+    """Return the first per-head norm present on *module* among *names*.
+
+    mlx_lm spells the per-head Q/K norms differently per architecture:
+    Qwen3/Qwen3.5/Gemma4/OLMo use ``q_norm``/``k_norm``, while Hunyuan
+    (``hunyuan_v1_dense``) uses ``query_layernorm``/``key_layernorm``.
+    Probing by name keeps the caller from silently skipping the norm on
+    architectures that use the second spelling, which produces wrong
+    output rather than an error.
+    """
+    for name in names:
+        norm = getattr(module, name, None)
+        if norm is not None:
+            return norm
+    return None
+
+
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
 
 
@@ -322,8 +339,9 @@ def prepare_sdpa_qkv(
             values = keys
         else:
             keys, values = shared_kv
-        if hasattr(inner, "q_norm"):
-            queries = inner.q_norm(queries)
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm")
+        if q_norm is not None:
+            queries = q_norm(queries)
         queries = queries.transpose(0, 2, 1, 3)
         queries, _ = apply_attention_rope(
             inner,
@@ -345,10 +363,12 @@ def prepare_sdpa_qkv(
                 values = keys
 
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
-        if hasattr(inner, "q_norm"):
-            queries = inner.q_norm(queries)
-        if hasattr(inner, "k_norm"):
-            keys = inner.k_norm(keys)
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm")
+        k_norm = _named_norm(inner, "k_norm", "key_layernorm")
+        if q_norm is not None:
+            queries = q_norm(queries)
+        if k_norm is not None:
+            keys = k_norm(keys)
         if hasattr(inner, "v_norm"):
             values = inner.v_norm(values)
 
