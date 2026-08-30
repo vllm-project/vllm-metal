@@ -486,7 +486,12 @@ def sdpa_forward(
     # Resolve head counts — mlx_lm uses different attribute names:
     #   Qwen3/Llama/Gemma/Gemma4: n_heads, n_kv_heads
     #   Qwen3.5 (Qwen3Next):      num_attention_heads, num_key_value_heads
-    n_heads = getattr(inner, "n_heads", None) or inner.num_attention_heads
+    #   StableLM:                 num_heads, num_key_value_heads
+    n_heads = (
+        getattr(inner, "n_heads", None)
+        or getattr(inner, "num_attention_heads", None)
+        or inner.num_heads
+    )
     n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
 
     # Softmax scale — GPT-OSS names it sm_scale rather than scale.
