@@ -141,10 +141,10 @@ trigger, then constrained JSON):
 
 | Model | Batch | Speedup | Tokens from drafts | Acceptance |
 |---|---|---|---|---|
-| Qwen3-0.6B | 1 | 1.49x | 47% | 100% |
-| Qwen3-0.6B | 4 | 1.95x | 43% | 83% |
-| Gemma-4 E2B | 1 | 1.28x | 48% | 59% |
-| Gemma-4 E2B | 4 | 1.56x | 43% | 47% |
+| Qwen3-0.6B | 1 | 1.50x | 47% | 100% |
+| Qwen3-0.6B | 4 | 1.82x | 49% | 83% |
+| Gemma-4 E2B | 1 | 1.58x | 56% | 82% |
+| Gemma-4 E2B | 4 | 1.77x | 52% | 71% |
 
 Tool calling shows the smaller speedup of the two because a structural tag leaves
 the model's prose free until the trigger fires, and nothing is drafted there. The
@@ -201,9 +201,11 @@ Confirm it is active: the server log shows
   synchronous scheduling only — same as the other methods.
 - **Acceptance is empirical, not guaranteed.** Several *tokenizations* of a
   forced string are legal (after `{` the grammar demands `"name"`, and `"`,
-  `"n`, `"na` and `"name` are all legal tokens), so the proposer drafts the
-  canonical greedy-BPE tokenization, which is what the model was trained to
-  emit. That matched perfectly on Qwen3 and about half the time on Gemma-4 E2B.
+  `"n`, `"na` and `"name` are all legal tokens), so the proposer walks the
+  forced string taking the longest matching token at each step. That
+  *approximates* the canonical tokenization the model emits but does not
+  reproduce it — BPE merges by rank, not by length, and the two can disagree
+  (`celsius` walks to `cel|si|us` where the tokenizer produces `c|elsius`).
   Verification is lossless either way, so a miss costs a wider step and nothing
   else.
 - **Nothing is drafted for plain chat, for free-form string values, or for the

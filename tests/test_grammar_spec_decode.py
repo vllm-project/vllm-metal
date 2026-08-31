@@ -12,7 +12,9 @@ xgrammar backend actually reads (``disable_any_whitespace`` and
 
 from __future__ import annotations
 
+import functools
 import json
+import string
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,21 +22,37 @@ import pytest
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from vllm_metal.v1 import grammar_proposer as grammar_mod
-from vllm_metal.v1.grammar_proposer import GrammarProposer, _VocabPrefixTable
+from vllm_metal.v1.grammar_proposer import (
+    GrammarProposer,
+    _is_byte_fallback,
+    _VocabPrefixTable,
+)
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 _TOKENIZER_ID = "Qwen/Qwen3-0.6B"
+# A SentencePiece vocabulary, which carries byte-fallback tokens (`<0x29>`)
+# alongside the real ones. Qwen3 is byte-level BPE and has none, so the
+# token-id-selection tests below are vacuous without a second tokenizer.
+_BYTE_FALLBACK_TOKENIZER_ID = "google/gemma-4-E2B-it"
 
 
-def _load_tokenizer():
+@functools.cache
+def _load_tokenizer(name: str = _TOKENIZER_ID):
     """The locally cached tokenizer, or ``None`` when it is not available."""
     try:
         from transformers import AutoTokenizer
 
-        return AutoTokenizer.from_pretrained(_TOKENIZER_ID)
+        return AutoTokenizer.from_pretrained(name)
     except Exception:  # pragma: no cover - environment dependent
         return None
+
+
+def _require_tokenizer(name: str):
+    tokenizer = _load_tokenizer(name)
+    if tokenizer is None:  # pragma: no cover - environment dependent
+        pytest.skip(f"{name} tokenizer is not available locally")
+    return tokenizer
 
 
 _TOKENIZER = _load_tokenizer()
@@ -42,6 +60,11 @@ _needs_tokenizer = pytest.mark.skipif(
     _TOKENIZER is None,
     reason=f"{_TOKENIZER_ID} tokenizer is not available locally",
 )
+
+# Every character a JSON skeleton is built from. These are exactly the
+# positions a forced string walks through, so a vocabulary table that picks the
+# wrong id for any of them drafts tokens the model will never emit.
+_JSON_CHARS = string.ascii_letters + string.digits + '{}[]",:_-. '
 
 # A tool-call-shaped schema: a fixed skeleton, one enum the model picks from,
 # and one free string it writes itself. Exercises forced runs, decision points
@@ -193,6 +216,95 @@ class TestVocabPrefixTable:
         assert table.longest_prefix("") == (-1, 0)
 
 
+# Not nested under the Qwen-only skip: the point of the byte-fallback case is
+# that Qwen cannot exercise it.
+@pytest.mark.parametrize("tokenizer_id", [_TOKENIZER_ID, _BYTE_FALLBACK_TOKENIZER_ID])
+class TestVocabPrefixTableTokenSelection:
+    """The table must pick the id the *tokenizer itself* uses for a text.
+
+    Several vocabulary entries can decode to the same text. Picking the wrong
+    one still drafts a grammar-legal token -- it spells the right characters, so
+    ``accept_token`` accepts it -- but the model emits the other id, so the
+    target rejects it and the speedup quietly halves.
+
+    SentencePiece vocabularies make this concrete: Gemma-4 has ``<0x29>`` (a
+    byte-fallback token) and ``)`` both decoding to ``)``, with the fallback at
+    the lower id. A "lowest id wins" tiebreak picks the fallback for every ASCII
+    character. Qwen3 is byte-level BPE with no fallback tokens at all, which is
+    why a Qwen-only suite cannot catch this.
+    """
+
+    def test_single_characters_resolve_to_the_tokenizers_own_id(
+        self, tokenizer_id: str
+    ) -> None:
+        tokenizer = _require_tokenizer(tokenizer_id)
+        table = _VocabPrefixTable(tokenizer, len(tokenizer.get_vocab()))
+
+        mismatched = []
+        for char in _JSON_CHARS:
+            expected = tokenizer.encode(char, add_special_tokens=False)
+            if len(expected) != 1:
+                # The tokenizer does not spell this character with one token,
+                # so there is no single right answer to compare against.
+                continue
+            token_id, length = table.longest_prefix(char)
+            if token_id != expected[0] or length != 1:
+                mismatched.append((char, token_id, expected[0]))
+
+        assert not mismatched, (
+            f"{len(mismatched)} of {len(_JSON_CHARS)} JSON characters resolve to "
+            f"a token {tokenizer_id} would never emit: {mismatched[:8]}"
+        )
+
+    def test_byte_fallback_tokens_do_not_displace_real_ones(
+        self, tokenizer_id: str
+    ) -> None:
+        tokenizer = _require_tokenizer(tokenizer_id)
+        vocab = tokenizer.get_vocab()
+        fallbacks = {
+            token: token_id
+            for token, token_id in vocab.items()
+            if _is_byte_fallback(token)
+        }
+        if not fallbacks:
+            pytest.skip(f"{tokenizer_id} has no byte-fallback tokens")
+
+        table = _VocabPrefixTable(tokenizer, len(vocab))
+        # One pass over the vocabulary: which real tokens spell each text.
+        real_ids_by_text: dict[str, list[int]] = {}
+        for token, token_id in vocab.items():
+            if _is_byte_fallback(token):
+                continue
+            text = tokenizer.convert_tokens_to_string([token])
+            if text:
+                real_ids_by_text.setdefault(text, []).append(token_id)
+
+        # A byte-fallback token must lose to a real token spelling the same
+        # text -- but the table must not shrink, because a fallback is the only
+        # way to spell a character that has no real token at all.
+        displaced = []
+        fallback_only = 0
+        for token, token_id in fallbacks.items():
+            text = tokenizer.convert_tokens_to_string([token])
+            if not text:
+                continue
+            alternatives = real_ids_by_text.get(text)
+            if not alternatives:
+                fallback_only += 1
+                assert table.longest_prefix(text)[0] == token_id, (
+                    f"{text!r} is spelled only by byte-fallback token {token_id} "
+                    "but the table dropped it, losing coverage"
+                )
+                continue
+            if table.longest_prefix(text)[0] == token_id:
+                displaced.append((text, token_id, alternatives[:2]))
+
+        assert not displaced, (
+            f"byte-fallback tokens won the tiebreak for {len(displaced)} texts "
+            f"that have a real token: {displaced[:8]}"
+        )
+
+
 @_needs_tokenizer
 class TestGrammarProposerProtocol:
     def test_never_needs_target_hidden_states(self) -> None:
@@ -282,6 +394,41 @@ class TestGrammarProposerDrafting:
 
         assert first is not None and second is not None
         assert first.draft_token_ids == second.draft_token_ids
+
+    def test_offline_replay_of_the_golden_accepts_every_draft(self) -> None:
+        """Score the drafter against a real generation, with no model involved.
+
+        ``_TARGET_TEXT`` is the pinned greedy output of Qwen3-0.6B under
+        ``_SCHEMA`` -- its token ids are exactly the ``GREEDY_GOLDEN`` the e2e
+        gate asserts on, minus the trailing EOS. Replaying it position by
+        position and scoring each draft against what the model actually emitted
+        reproduces the benchmark's acceptance number offline, in a second.
+
+        This is the cheap way to make a change to the walk decidable rather than
+        speculative: a strategy that lowers acceptance fails here long before
+        anyone re-runs the benchmark.
+        """
+        proposer = _proposer()
+        golden = _target_ids()
+
+        offered = accepted = 0
+        for position in range(len(golden)):
+            state = _request_state(golden[:position])
+            drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+            if drafts is None:
+                continue
+            draft = drafts.draft_token_ids[0]
+            offered += len(draft)
+            for drafted_id, actual_id in zip(draft, golden[position:], strict=False):
+                if drafted_id != actual_id:
+                    break
+                accepted += 1
+
+        assert offered > 0, "drafted nothing across the whole generation"
+        assert accepted == offered, (
+            f"{offered - accepted} of {offered} drafted tokens did not match "
+            "what the model actually emitted"
+        )
 
     def test_advances_over_newly_committed_output(self) -> None:
         proposer = _proposer()
@@ -426,7 +573,10 @@ class TestGrammarProposerScoring:
         assert proposer.stats.truncated_drafts == 0
         assert proposer.stats.rejected_drafts == 0
 
-    def test_engine_truncating_a_draft_is_flagged(self) -> None:
+    def test_engine_truncating_a_draft_is_counted_but_not_an_invariant(self) -> None:
+        # A shorter draft with its prefix intact is ambiguous: the engine's
+        # grammar may have rejected the tail, or the scheduler may have clipped
+        # it against the token budget. Counted, never asserted on.
         proposer = _proposer()
         state = _request_state([])
         drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
@@ -434,7 +584,6 @@ class TestGrammarProposerScoring:
         draft = drafts.draft_token_ids[0]
         assert len(draft) > 2
 
-        # The engine's own grammar rejected the tail of our proposal.
         kept = tuple(draft[:2])
         state.token_ids.extend(kept)
         proposer.propose(
@@ -445,6 +594,29 @@ class TestGrammarProposerScoring:
         )
 
         assert proposer.stats.truncated_drafts == 1
+        assert proposer.stats.altered_drafts == 0
+
+    def test_engine_altering_a_draft_violates_the_invariant(self) -> None:
+        # Nothing benign rewrites a draft's prefix, so this is the unambiguous
+        # signal that the worker's matcher and the engine's have diverged.
+        proposer = _proposer()
+        state = _request_state([])
+        drafts = proposer.propose(_context(decode_reqs=[("r0", state)]))
+        assert drafts is not None
+        draft = drafts.draft_token_ids[0]
+        assert len(draft) > 2
+
+        altered = (draft[0], draft[1] + 1, *draft[2:])
+        state.token_ids.extend(altered)
+        proposer.propose(
+            _context(
+                decode_reqs=[("r0", state)],
+                decode_segments=[_segment("r0", tuple(altered))],
+            )
+        )
+
+        assert proposer.stats.altered_drafts == 1
+        assert proposer.stats.truncated_drafts == 0
 
     def test_target_rejection_is_counted_but_not_a_truncation(self) -> None:
         proposer = _proposer()

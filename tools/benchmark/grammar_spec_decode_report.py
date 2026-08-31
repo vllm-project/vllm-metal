@@ -485,6 +485,7 @@ def _coverage(record: dict[str, Any]) -> dict[str, Any]:
         # because the steps it does draft on carry several tokens each.
         "token_share": accepted / (accepted + eligible) if eligible else 0.0,
         "truncated": steady.get("truncated_drafts", 0),
+        "altered": steady.get("altered_drafts", 0),
         "rejected": steady.get("rejected_drafts", 0),
     }
 
@@ -589,9 +590,9 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
     add("")
     add(
         "| Batch | Step coverage | Tokens/draft | Tokens from drafts | "
-        "Acceptance | #MAT | Truncated | Rejected |"
+        "Acceptance | #MAT | Altered | Truncated | Rejected |"
     )
-    add("|---|---|---|---|---|---|---|---|")
+    add("|---|---|---|---|---|---|---|---|---|")
     for record in records:
         if record["mode"] != "grammar":
             continue
@@ -599,7 +600,7 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
         if not cov.get("available"):
             add(
                 f"| {record['config']['batch_size']} | n/a | n/a | n/a | n/a "
-                "| n/a | n/a | n/a |"
+                "| n/a | n/a | n/a | n/a |"
             )
             continue
         add(
@@ -608,7 +609,8 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
             f"{cov['steps_eligible']}) | {cov['tokens_per_draft']:.2f} | "
             f"**{cov['token_share'] * 100:.0f}%** | "
             f"{cov['acceptance'] * 100:.1f}% ({cov['accepted']}/{cov['offered']}) | "
-            f"{cov['mat']:.2f} | {cov['truncated']} | {cov['rejected']} |"
+            f"{cov['mat']:.2f} | {cov['altered']} | {cov['truncated']} | "
+            f"{cov['rejected']} |"
         )
     add("")
     add(
@@ -622,20 +624,28 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
     )
     add("")
     add(
-        "**Truncated must be zero.** It counts drafts the engine's own grammar "
-        "rejected, which is the only observable evidence that the worker's "
-        "matcher and the engine's have drifted -- the synchronous draft handoff "
-        "silently truncates rather than raising. **Rejected** is an ordinary "
-        "miss: several tokenizations of a forced string are legal, so a drafted "
-        "token is grammar-legal by construction but only empirically the "
-        "target's argmax."
+        "**Altered must be zero.** It counts drafts that came back with their "
+        "prefix rewritten, which nothing benign does -- it is the unambiguous "
+        "evidence that the worker's matcher and the engine's have drifted, and "
+        "the only one available, because the synchronous draft handoff edits "
+        "drafts silently rather than raising. **Truncated** counts drafts that "
+        "came back shorter with the prefix intact; that has two causes the "
+        "worker cannot tell apart (the engine's grammar rejecting the tail, or "
+        "the scheduler clipping against the token budget / `max_model_len`), so "
+        "it is a diagnostic rather than an invariant. **Rejected** is an "
+        "ordinary miss: several tokenizations of a forced string are legal, so "
+        "a drafted token is grammar-legal by construction but only empirically "
+        "the target's argmax."
     )
     add("")
 
     add("### Cross-check against vLLM's own counters")
     add("")
-    add("| Batch | Probe offered/accepted | Prometheus offered/accepted | Agree |")
-    add("|---|---|---|---|")
+    add(
+        "| Batch | Probe offered/accepted | Prometheus offered/accepted | "
+        "Expected ratio | Observed | Agree |"
+    )
+    add("|---|---|---|---|---|---|")
     for record in records:
         if record["mode"] != "grammar":
             continue
@@ -643,16 +653,33 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
         prom = record["drafter"].get("prometheus", {})
         p_off = prom.get("num_draft_tokens")
         p_acc = prom.get("num_accepted_tokens")
+        config = record["config"]
+        repeats = config.get("repeats") or 0
+        warmup = config.get("warmup") or 0
+        # The probe counts the measured repeats; Prometheus is cumulative over
+        # the whole process, so it also carries the warmup passes. That makes
+        # the relationship exact rather than one-sided: probe/Prometheus should
+        # be repeats/(repeats+warmup) on both totals.
+        expected = repeats / (repeats + warmup) if repeats + warmup else None
+        observed = (cov["offered"] / p_off) if cov.get("available") and p_off else None
         agree = "n/a"
-        if cov.get("available") and p_off is not None:
-            # Prometheus is cumulative over the process (warmup and the TTFT
-            # pass included), so it is the >= side of the comparison.
-            agree = "yes" if p_off >= cov["offered"] else "**NO**"
+        if expected is not None and observed is not None:
+            agree = "yes" if abs(observed - expected) <= 0.02 else "**NO**"
         add(
-            f"| {record['config']['batch_size']} | "
+            f"| {config['batch_size']} | "
             f"{cov.get('offered', '?')}/{cov.get('accepted', '?')} | "
-            f"{p_off}/{p_acc} | {agree} |"
+            f"{p_off}/{p_acc} | "
+            f"{'n/a' if expected is None else f'{expected:.3f}'} | "
+            f"{'n/a' if observed is None else f'{observed:.3f}'} | {agree} |"
         )
+    add("")
+    add(
+        "The probe counts the measured repeats and Prometheus counts the whole "
+        "process, so the two are expected to differ by exactly the warmup "
+        "passes: `repeats / (repeats + warmup)`. Checking that ratio -- rather "
+        "than only that Prometheus is the larger -- is what makes this a real "
+        "cross-check of the proposer's own accounting."
+    )
     add("")
 
     add("## Cost of drafting")

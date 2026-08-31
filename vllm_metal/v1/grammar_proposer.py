@@ -28,11 +28,27 @@ over the vocabulary:
     matcher.accept_token(tok)                # also the legality check
     repeat until S runs out or K is reached
 
-This reproduces canonical BPE, which is what the model emits, because that is
-how its training data was tokenized. On the schema above it drafts 83 tokens
-across a 23-token generation with **zero** mismatches, at 74% coverage and a
-#MAT of 4.6 -- in the same range as ToolSpec (arXiv 2604.13519), without their
-tree attention.
+Greedy longest-match *approximates* the canonical tokenization the model emits;
+it does not reproduce it. BPE merges by rank, not by length, and the two can
+disagree -- ``'celsius'`` walks to ``cel|si|us`` where the tokenizer itself
+produces ``c|elsius``, on both Qwen3's and Gemma-4's vocabularies. It is close
+enough to be worth it: on the schema above it drafts 83 tokens across a 23-token
+generation with **zero** mismatches, at 74% coverage and a #MAT of 4.6 -- in the
+same range as ToolSpec (arXiv 2604.13519), without their tree attention. But it
+is a heuristic, and acceptance is the number that says whether it is holding.
+
+Which token spells the text
+---------------------------
+Several vocabulary entries can decode to the same text, and picking the wrong id
+drafts a token the model will never emit -- legal by construction, rejected in
+practice. SentencePiece vocabularies (Gemma, Llama) are where this bites: they
+carry a byte-fallback token per byte value, spelled ``<0x29>``, next to the real
+``)``. Both decode to ``)``, the fallback has the lower id, and a "lowest id
+wins" tiebreak therefore picks it for *every* ASCII character -- all 73 that a
+JSON skeleton is built from, measured on Gemma-4 E2B. Byte-level BPE
+vocabularies (Qwen3) contain no such tokens, which is why this was invisible
+there and cost Gemma-4 roughly half its acceptance. Real tokens outrank
+byte-fallback ones; see ``_VocabPrefixTable``.
 
 The boundary rule is what makes it safe. A token that consumes *all* of the
 forced string sits on the edge of the free text that follows, and the model may
@@ -84,8 +100,13 @@ them in sync, and one detects it when they do not:
   through ``Scheduler.update_draft_token_ids``, which filters drafts through the
   engine's own ``grammar.validate_tokens()`` and **silently truncates** whatever
   it rejects -- it never sets ``num_invalid_spec_tokens``, so the sentinel guard
-  in ``spec_decode.py`` never fires for us. A truncation is therefore the only
-  evidence that the two matchers have drifted, and it is logged loudly.
+  in ``spec_decode.py`` never fires for us. Comparing what came back is
+  therefore the only evidence of drift available, but it needs splitting: a
+  draft whose *prefix was altered* is unambiguous drift (``altered_drafts``,
+  logged at ERROR), while one merely *truncated* with its prefix intact is not
+  -- the scheduler also clips drafts against the token budget and
+  ``max_model_len``, which is benign and indistinguishable from here
+  (``truncated_drafts``, logged at WARNING).
 
 Requests whose reasoning is gated behind a reasoning parser are not supported at
 all: while reasoning is unfinished the engine sets ``apply_bitmask=False`` and
@@ -98,6 +119,7 @@ and verified next step by ``SpeculativeDecodeController.verify_greedy``.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -135,6 +157,21 @@ _SLOW_COMPILE_S = 0.05
 # partial UTF-8 sequence. Such a token's "text" is meaningless for prefix
 # matching, so they are kept out of the lookup table.
 _REPLACEMENT_CHAR = "�"
+
+# SentencePiece tokenizers (Gemma, Llama) carry a byte-fallback token per byte
+# value, spelled literally `<0x29>`, alongside the real token for the same
+# character. Both decode to `)`, but only the real one is what the model emits;
+# the fallback exists so unknown bytes are still representable. They sit in a
+# low id range, so a naive "lowest id wins" tiebreak picks the wrong one for
+# every ASCII character -- measured on Gemma-4 E2B, that is all 73 characters a
+# JSON skeleton is built from. Byte-level BPE vocabularies (Qwen3) have none of
+# these, which is why the bug was invisible there.
+_BYTE_FALLBACK_RE = re.compile(r"<0x[0-9A-Fa-f]{2}>")
+
+
+def _is_byte_fallback(token: str) -> bool:
+    """Whether ``token`` is a SentencePiece byte-fallback token like ``<0x29>``."""
+    return _BYTE_FALLBACK_RE.fullmatch(token) is not None
 
 
 @dataclass
@@ -174,9 +211,14 @@ class GrammarProposerStats:
     # A drafted token is grammar-legal by construction but only empirically the
     # target's argmax, so this is a statistic, not an invariant.
     rejected_drafts: int = 0
-    # This one IS an invariant: the engine's own grammar refusing a draft our
-    # matcher accepted means the two matchers disagree.
+    # A draft that came back shorter but with its prefix intact. Two causes,
+    # and the worker cannot tell them apart: the engine's own grammar rejecting
+    # the tail (matcher drift), or the scheduler clipping the draft against the
+    # token budget / max_model_len. A diagnostic, therefore, not an invariant.
     truncated_drafts: int = 0
+    # This one IS an invariant: no benign path rewrites the prefix of a draft.
+    # A non-zero count means the worker and engine matchers disagree.
+    altered_drafts: int = 0
     # Requests skipped because they were routed to a non-xgrammar backend.
     skipped_backends: dict[str, int] = field(default_factory=dict)
 
@@ -185,12 +227,21 @@ class _VocabPrefixTable:
     """Longest-token-first lookup of vocabulary text against a forced string.
 
     Built once per process. ``longest_prefix`` answers "what is the longest
-    vocabulary token whose text starts this string", which is the greedy BPE
-    step -- the tokenization the model was trained to emit.
+    vocabulary token whose text starts this string", which is the greedy step
+    approximating the tokenization the model was trained to emit.
+
+    Two tokens can spell the same text, and which id is picked decides whether
+    the draft is the one the model actually emits. See ``_is_byte_fallback``.
     """
 
     def __init__(self, tokenizer: Any, vocab_size: int) -> None:
-        text_to_id: dict[str, int] = {}
+        # text -> (rank, token_id), collapsed to text -> token_id at the end.
+        ranked: dict[str, tuple[tuple[bool, int], int]] = {}
+        # Longest token text *per first character*, so longest_prefix scans
+        # from the longest token that could possibly match rather than from
+        # the vocabulary-wide maximum (128 chars on Qwen3, set by a single
+        # outlier token, against 31 on Gemma-4).
+        bucket_max: dict[str, int] = {}
         max_len = 0
         special = set(getattr(tokenizer, "all_special_ids", ()) or ())
         for token, token_id in tokenizer.get_vocab().items():
@@ -198,16 +249,26 @@ class _VocabPrefixTable:
                 continue
             text = tokenizer.convert_tokens_to_string([token])
             # Partial UTF-8 tokens have no usable text, and an empty decode
-            # would match every string.
+            # would match every string. This does NOT filter out byte-fallback
+            # tokens holding a printable ASCII byte -- those decode to a
+            # perfectly valid single character, which is exactly why the rank
+            # below is needed as well.
             if not text or _REPLACEMENT_CHAR in text:
                 continue
-            # Two tokens can decode to the same text; prefer the lower id so
-            # the choice is deterministic across processes.
-            current = text_to_id.get(text)
-            if current is None or token_id < current:
-                text_to_id[text] = token_id
-            max_len = max(max_len, len(text))
-        self._text_to_id = text_to_id
+            # Rank: real tokens beat byte-fallback tokens for the same text,
+            # then the lower id wins so the choice is deterministic across
+            # processes.
+            rank = (_is_byte_fallback(token), token_id)
+            current = ranked.get(text)
+            if current is None or rank < current[0]:
+                ranked[text] = (rank, token_id)
+            length = len(text)
+            first = text[0]
+            if length > bucket_max.get(first, 0):
+                bucket_max[first] = length
+            max_len = max(max_len, length)
+        self._text_to_id = {text: entry[1] for text, entry in ranked.items()}
+        self._bucket_max = bucket_max
         self._max_len = max_len
 
     def __len__(self) -> int:
@@ -222,7 +283,12 @@ class _VocabPrefixTable:
 
         Returns ``(-1, 0)`` when no vocabulary token matches.
         """
-        for length in range(min(self._max_len, len(text)), 0, -1):
+        if not text:
+            return -1, 0
+        # A token starting with a different character could never match, so
+        # capping the scan at this bucket's longest token is result-identical.
+        start = min(self._bucket_max.get(text[0], 0), len(text))
+        for length in range(start, 0, -1):
             token_id = self._text_to_id.get(text[:length])
             if token_id is not None:
                 return token_id, length
@@ -255,6 +321,9 @@ class GrammarProposer:
                 "the worker cannot observe. Remove --reasoning-parser or use a "
                 "different speculative method."
             )
+
+        # Used when a request's params carry no `_backend` -- see _sync_matcher.
+        self._default_backend = getattr(structured_config, "backend", "") or ""
 
         spec = vllm_config.speculative_config
         assert spec is not None
@@ -294,7 +363,9 @@ class GrammarProposer:
         self._pending: dict[str, tuple[int, tuple[int, ...]]] = {}
         # One-shot log guards: a drift bug would otherwise flood every step.
         self._logged_truncation = False
+        self._logged_altered = False
         self._logged_broken = False
+        self._logged_skipped_backend = False
 
         logger.info(
             "Grammar-forced speculative decoding enabled "
@@ -451,7 +522,13 @@ class GrammarProposer:
         params = getattr(state.sampling_params, "structured_outputs", None)
         if params is None or params.all_constraints_none():
             return None
-        backend = getattr(params, "_backend", None)
+        # `_backend` is stamped onto the engine-side params by
+        # StructuredOutputManager.grammar_init, and the worker sees it only
+        # because Metal's uniproc executor shares the EngineCore process. Fall
+        # back to the configured backend rather than going silently inert if
+        # that ever stops holding (a real executor boundary, or params that
+        # round-trip through serialization).
+        backend = getattr(params, "_backend", None) or self._default_backend
         if backend != "xgrammar":
             # outlines / guidance / lm-format-enforcer requests have no
             # xgrammar matcher to fork from. Counted rather than silently
@@ -460,6 +537,16 @@ class GrammarProposer:
             self.stats.skipped_backends[name] = (
                 self.stats.skipped_backends.get(name, 0) + 1
             )
+            if not self._logged_skipped_backend:
+                self._logged_skipped_backend = True
+                logger.info(
+                    "Grammar-forced drafting is skipping structured-output "
+                    "requests routed to the %r backend; only xgrammar exposes a "
+                    "matcher to fork from. These requests decode normally, just "
+                    "without drafting. Further occurrences are counted in "
+                    "stats.skipped_backends and not logged.",
+                    name,
+                )
             return None
 
         key = get_structured_output_key(params)
@@ -541,18 +628,25 @@ class GrammarProposer:
     def _resolve_pending(self, ctx: ProposeContext) -> None:
         """Score the previous step's proposals against what actually happened.
 
-        Two different things are measured here, and only one of them is an
+        Three different things are measured here, and only one of them is an
         invariant:
 
-        * the scheduler *truncating* a draft is a hard invariant violation.
+        * a draft coming back with its prefix *altered* is a hard invariant
+          violation. Nothing benign rewrites a draft's prefix, so this means the
+          worker's matcher and the engine's disagree.
+        * a draft coming back *truncated* with its prefix intact is ambiguous.
           ``Scheduler.update_draft_token_ids`` filters our proposal through the
           engine's ``validate_tokens()`` and drops the tail it rejects without
-          recording an invalid-token count, so comparing against
-          ``decode_segments[i].draft_token_ids`` -- what was actually scheduled
-          and verified -- is the only way to see the two matchers disagree.
+          recording an invalid-token count -- but the scheduler also clips
+          ``spec_token_ids`` against the token budget and ``max_model_len``, and
+          that looks identical from here. Counted, not asserted on.
         * the target *rejecting* a scheduled draft token is an ordinary miss.
           Several tokenizations of a forced string are legal, so a drafted token
           is grammar-legal by construction but only empirically the argmax.
+
+        Comparing against ``decode_segments[i].draft_token_ids`` -- what was
+        actually scheduled and verified -- is the only way to see any of this,
+        because the handoff truncates silently rather than raising.
 
         Only requests whose draft was really verified this step are scored:
         being in ``decode_reqs`` is not enough, because a request can sit there
@@ -606,20 +700,43 @@ class GrammarProposer:
         *,
         altered: bool,
     ) -> None:
+        if altered:
+            # No benign path rewrites the prefix of a draft, so this is the
+            # unambiguous evidence that the two matchers have drifted.
+            self.stats.altered_drafts += 1
+            if self._logged_altered:
+                return
+            self._logged_altered = True
+            logger.error(
+                "Grammar-forced draft was altered before verification for "
+                "request %s: proposed %s, scheduled %s. Nothing benign rewrites "
+                "a draft's prefix, so the worker and engine matchers have "
+                "diverged -- output is unaffected (the engine's grammar wins) "
+                "but the speedup is not. Further occurrences are counted in "
+                "stats.altered_drafts and not logged.",
+                req_id,
+                list(proposed),
+                list(scheduled),
+            )
+            return
+
         self.stats.truncated_drafts += 1
         if self._logged_truncation:
             return
         self._logged_truncation = True
-        logger.error(
-            "Grammar-forced draft was %s by the engine's own grammar for "
-            "request %s: proposed %s, scheduled %s. The worker and engine "
-            "matchers disagree -- output is unaffected (the engine's grammar "
-            "wins) but the speedup is not. Further occurrences are counted in "
+        logger.warning(
+            "Grammar-forced draft was truncated before verification for "
+            "request %s: proposed %d tokens, %d were scheduled. Either the "
+            "engine's own grammar rejected the tail (the two matchers have "
+            "drifted) or the scheduler clipped the draft against the token "
+            "budget / max_model_len, which is benign and expected near the end "
+            "of a sequence. The worker cannot tell these apart; watch "
+            "stats.altered_drafts for the unambiguous signal. Output is "
+            "unaffected either way. Further occurrences are counted in "
             "stats.truncated_drafts and not logged.",
-            "altered" if altered else "truncated",
             req_id,
-            list(proposed),
-            list(scheduled),
+            len(proposed),
+            len(scheduled),
         )
 
     def _prune_finished(self, finished_req_ids: set[str]) -> None:
