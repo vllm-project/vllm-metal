@@ -104,6 +104,24 @@ Because vLLM already applies the grammar bitmask to **every** verification row
 grammar-legal by construction. It is not *guaranteed* accepted, though — see
 Limitations.
 
+### Why not the in-tree n-gram proposer?
+
+Measured, not argued. On the same structured-output workload, with the same K:
+
+| Model | Batch | baseline TPOT | n-gram | grammar-forced |
+|---|---|---|---|---|
+| Qwen3-0.6B | 1 | 2.82 ms | 2.90 ms (0.97x) | 1.98 ms (**1.42x**) |
+| Qwen3-0.6B | 4 | 6.66 ms | 6.77 ms (0.98x) | 3.68 ms (**1.81x**) |
+| Qwen2.5-0.5B-Instruct | 1 | 1.98 ms | 2.07 ms (0.96x) | 1.16 ms (**1.71x**) |
+| Qwen2.5-0.5B-Instruct | 4 | 4.65 ms | 4.66 ms (1.00x) | 2.34 ms (**1.98x**) |
+
+n-gram offered 8 draft tokens across an entire run and had **zero** accepted: a
+single structured response does not repeat itself, so there is nothing for suffix
+matching to find, and it still pays its match-kernel scan every step. Every arm
+above reproduced the baseline's token ids exactly.
+
+### Latency
+
 Measured on an M4 Pro. Two different workloads, because they exercise two
 different grammars:
 
@@ -197,6 +215,10 @@ Confirm it is active: the server log shows
 - A configured reasoning parser is refused at construction. While reasoning is
   unfinished the engine stops advancing its grammar matcher, which the worker
   cannot observe, so the two would silently desynchronize.
+- **Hybrid GDN models are not supported**, the same as every other Metal
+  speculative method: `SpeculativeDecodeController.validate_supported` raises as
+  soon as any draft is scheduled. Qwen3.5-0.8B is one such model, so it cannot use
+  this (or n-gram, or draft-model) speculative decoding at all.
 
 ## Benchmarking
 
