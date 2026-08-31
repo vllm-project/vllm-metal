@@ -51,6 +51,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
+import random
 import statistics
 from typing import Any
 
@@ -130,6 +132,80 @@ def load_tools(args: argparse.Namespace) -> list[dict[str, Any]]:
     return DEFAULT_TOOLS
 
 
+# BFCL writes its schemas in a Python-flavoured dialect rather than JSON Schema.
+# Only the type names differ; the structure is already schema-shaped.
+_BFCL_TYPES = {"dict": "object", "float": "number", "tuple": "array"}
+
+
+def _normalise_bfcl_schema(node: Any) -> Any:
+    """Rewrite a BFCL parameter schema into JSON Schema xgrammar will compile."""
+    if isinstance(node, list):
+        return [_normalise_bfcl_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "type" and isinstance(value, str):
+            if value == "any":
+                # No JSON Schema equivalent; an absent type means "anything",
+                # which is what BFCL means by it.
+                continue
+            out[key] = _BFCL_TYPES.get(value, value)
+        else:
+            out[key] = _normalise_bfcl_schema(value)
+    # An array must say what it holds or xgrammar cannot build a grammar for it.
+    if out.get("type") == "array" and "items" not in out:
+        out["items"] = {}
+    return out
+
+
+def load_bfcl_items(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Load (prompt, tools) pairs from Berkeley Function-Calling Leaderboard files.
+
+    Each BFCL entry carries its *own* tool set, so unlike the built-in workload
+    every entry compiles to a different grammar. Returned entries are raw; the
+    caller turns each into a structural tag.
+
+    BFCL is not grammar-constrained as distributed -- its tools carry no
+    ``"strict": true`` and it sends ``tool_choice: "auto"`` -- so ``strict`` is
+    forced on here. That is the enforced case this measurement is about, and it
+    is what a deployment would set to get constrained tool calls at all.
+    """
+    items: list[dict[str, Any]] = []
+    for path in args.bfcl_file:
+        for line in pathlib.Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            turns = entry.get("question") or []
+            if not turns or not turns[0]:
+                continue
+            content = turns[0][0].get("content")
+            functions = entry.get("function") or []
+            if not content or not functions:
+                continue
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": fn["name"],
+                        "description": fn.get("description", ""),
+                        # `strict` belongs on the function, not the tool wrapper:
+                        # get_model_structural_tag returns None if it is set one
+                        # level up, and that silently means "no grammar at all".
+                        "strict": True,
+                        "parameters": _normalise_bfcl_schema(
+                            fn.get("parameters") or {"type": "object", "properties": {}}
+                        ),
+                    },
+                }
+                for fn in functions
+            ]
+            items.append({"id": entry.get("id"), "prompt": content, "tools": tools})
+    return items
+
+
 def build_grammar_spec(
     args: argparse.Namespace, raw_tools: list[dict[str, Any]]
 ) -> tuple[str, str]:
@@ -162,9 +238,18 @@ def build_grammar_spec(
 
 
 def generate_traces(
-    args: argparse.Namespace, kind: str, spec: str, raw_tools: list[dict[str, Any]]
+    args: argparse.Namespace,
+    kind: str,
+    spec: str,
+    raw_tools: list[dict[str, Any]],
+    items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Greedy decode with the grammar applied and no speculative decoding."""
+    """Greedy decode with the grammar applied and no speculative decoding.
+
+    ``items`` selects corpus mode: a list of per-entry dicts each carrying its
+    own ``prompt``, ``tools`` and compiled ``spec``. Without it the single
+    shared ``kind``/``spec`` is applied to every prompt.
+    """
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -186,40 +271,59 @@ def generate_traces(
         },
     )
     tokenizer = llm.get_tokenizer()
+
     # The tools must go into the prompt, not just into the grammar. A structural
     # tag permits free text until its trigger fires, so a model that was never
     # told the tools exist simply answers in prose, never triggers the tag, and
     # nothing is ever grammar-determined -- a measurement of the harness rather
     # than of the workload. This mirrors what the OpenAI serving layer does.
-    template_kwargs: dict[str, Any] = {}
-    if args.no_thinking:
-        template_kwargs["enable_thinking"] = False
-    if kind == "structural_tag":
-        template_kwargs["tools"] = raw_tools
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
+    def render(prompt_text: str, tools: list[dict[str, Any]] | None) -> str:
+        template_kwargs: dict[str, Any] = {}
+        if args.no_thinking:
+            template_kwargs["enable_thinking"] = False
+        if tools is not None:
+            template_kwargs["tools"] = tools
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
             tokenize=False,
             add_generation_prompt=True,
             **template_kwargs,
         )
-        for p in (args.prompt or DEFAULT_PROMPTS)[: args.num_prompts]
-    ]
-    structured = (
-        StructuredOutputsParams(json=spec)
-        if kind == "json"
-        else StructuredOutputsParams(structural_tag=spec)
-    )
-    outputs = llm.generate(
-        prompts,
-        SamplingParams(
+
+    def params_for(item_kind: str, item_spec: str) -> SamplingParams:
+        structured = (
+            StructuredOutputsParams(json=item_spec)
+            if item_kind == "json"
+            else StructuredOutputsParams(structural_tag=item_spec)
+        )
+        return SamplingParams(
             temperature=0.0, max_tokens=args.max_tokens, structured_outputs=structured
-        ),
-        use_tqdm=False,
-    )
+        )
+
+    if items is not None:
+        # Corpus mode: every entry carries its own tools, so it compiles to its
+        # own grammar and needs its own SamplingParams. The engine stays loaded
+        # across all of them; only the per-request grammar differs.
+        prompts = [render(it["prompt"], it["tools"]) for it in items]
+        sampling = [params_for("structural_tag", it["spec"]) for it in items]
+        specs = [it["spec"] for it in items]
+    else:
+        prompts = [
+            render(p, raw_tools if kind == "structural_tag" else None)
+            for p in (args.prompt or DEFAULT_PROMPTS)[: args.num_prompts]
+        ]
+        sampling = [params_for(kind, spec)] * len(prompts)
+        specs = [spec] * len(prompts)
+
+    outputs = llm.generate(prompts, sampling, use_tqdm=False)
     traces = [list(o.outputs[0].token_ids) for o in outputs]
     texts = [o.outputs[0].text for o in outputs]
-    return {"traces": traces, "texts": texts, "tokenizer_name": args.model}
+    return {
+        "traces": traces,
+        "texts": texts,
+        "specs": specs,
+        "tokenizer_name": args.model,
+    }
 
 
 def analyse(
@@ -229,6 +333,7 @@ def analyse(
     model: str,
     *,
     disable_any_whitespace: bool,
+    specs: list[str] | None = None,
 ) -> dict:
     """Replay each trace through a fresh matcher, counting determined positions.
 
@@ -244,17 +349,33 @@ def analyse(
     vocab_size = len(tok.get_vocab())
     info = xgr.TokenizerInfo.from_huggingface(tok, vocab_size=vocab_size)
     compiler = xgr.GrammarCompiler(info, cache_enabled=True)
-    ctx = (
-        compiler.compile_json_schema(spec, any_whitespace=not disable_any_whitespace)
-        if kind == "json"
-        else compiler.compile_structural_tag(spec)
-    )
+
+    # In corpus mode every trace was generated under its own grammar, so the
+    # replay grammar has to be per trace. Compiled contexts are cached by spec
+    # because entries frequently repeat a tool set.
+    ctx_cache: dict[str, Any] = {}
+
+    def context_for(trace_spec: str) -> Any:
+        hit = ctx_cache.get(trace_spec)
+        if hit is None:
+            hit = (
+                compiler.compile_json_schema(
+                    trace_spec, any_whitespace=not disable_any_whitespace
+                )
+                if kind == "json"
+                else compiler.compile_structural_tag(trace_spec)
+            )
+            ctx_cache[trace_spec] = hit
+        return hit
+
+    if specs is None:
+        specs = [spec] * len(traces)
 
     total = determined = 0
     runs: list[int] = []
     desynced = 0
-    for trace in traces:
-        matcher = xgr.GrammarMatcher(ctx)
+    for trace, trace_spec in zip(traces, specs, strict=True):
+        matcher = xgr.GrammarMatcher(context_for(trace_spec))
         current = 0
         for token_id in trace:
             # A non-empty jump-forward string means the grammar has already fixed
@@ -308,6 +429,14 @@ def main() -> int:
         "measuring that effect deliberately)",
     )
     parser.set_defaults(disable_any_whitespace=True)
+    parser.add_argument(
+        "--bfcl-file",
+        action="append",
+        default=[],
+        help="Berkeley Function-Calling Leaderboard jsonl file (repeatable). "
+        "Each entry brings its own tools, so each compiles to its own "
+        "grammar -- a real corpus rather than one hand-written schema.",
+    )
     parser.add_argument("--output-json", default=None)
     args = parser.parse_args()
 
@@ -318,15 +447,54 @@ def main() -> int:
         )
 
     raw_tools = load_tools(args)
-    kind, spec = build_grammar_spec(args, raw_tools)
-    generated = generate_traces(args, kind, spec, raw_tools)
+    items: list[dict[str, Any]] | None = None
+    skipped_uncompilable = 0
+
+    if args.bfcl_file:
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+        from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
+
+        entries = load_bfcl_items(args)
+        random.Random(0).shuffle(entries)
+        items = []
+        for entry in entries:
+            if len(items) >= args.num_prompts:
+                break
+            try:
+                tag = get_model_structural_tag(
+                    model=args.structural_tag_model,
+                    tools=[ChatCompletionToolsParam(**t) for t in entry["tools"]],
+                    tool_choice="auto",
+                    reasoning=False,
+                )
+                if tag is None:
+                    raise ValueError("no structural tag produced")
+                entry["spec"] = tag.model_dump_json()
+            except Exception:
+                # A schema this corpus contains but xgrammar/vLLM will not build
+                # a tag for. Counted and reported rather than silently dropped,
+                # since the skip rate is itself a fact about the workload.
+                skipped_uncompilable += 1
+                continue
+            items.append(entry)
+        if not items:
+            raise SystemExit("no BFCL entries produced a usable structural tag")
+        kind, spec = "structural_tag", items[0]["spec"]
+    else:
+        kind, spec = build_grammar_spec(args, raw_tools)
+
+    generated = generate_traces(args, kind, spec, raw_tools, items)
     stats = analyse(
         generated["traces"],
         kind,
         spec,
         args.model,
         disable_any_whitespace=args.disable_any_whitespace,
+        specs=generated["specs"],
     )
+    stats["skipped_uncompilable_entries"] = skipped_uncompilable
     if stats["traces_ending_off_grammar"]:
         # A trace that leaves the grammar makes the share meaningless: the
         # remaining tokens were never counted. Loud, because the usual cause is
