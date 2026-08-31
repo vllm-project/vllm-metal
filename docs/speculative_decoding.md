@@ -160,10 +160,20 @@ structural tag pays it back elsewhere: its `begin` literal is
 `<tool_call>\n{"name": "get_weather", "arguments": ` — 44 characters including
 the tool name, forced in one run.
 
-Reproduce with `./grammar-spec-decode-runs/toolcall/run.sh` (tool calling) and
-`./grammar-spec-decode-runs/run_matrix.sh` (constrained JSON).
+Reproduce with the in-tree report tool, which runs one arm per process and
+renders the comparison from the resulting JSONs:
 
-### Serve
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python -m tools.benchmark.grammar_spec_decode_report \
+  run --model Qwen/Qwen3-0.6B --batch-size 1 --output-json run-grammar-bs1.json --grammar
+python -m tools.benchmark.grammar_spec_decode_report report run-*.json \
+  --output-md grammar-spec-decode-report.md
+```
+
+`--arm` selects baseline, the in-tree n-gram proposer, or this one on identical
+prompts, checking token-id equality rather than assuming it.
+
+### Example
 
 ```bash
 VLLM_METAL_USE_PAGED_ATTENTION=1 \
