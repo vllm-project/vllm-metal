@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sampling-only microbench: torch CPU round-trip vs the native MLX graph.
+"""Sampling-step microbench: the torch production path vs the native graph.
 
-Times one sampling step over a full Qwen-sized vocabulary for both paths at
-decode-like batch sizes. The torch arm replicates the vLLM sampler math the
-Metal runner uses today (``apply_top_k_top_p`` + softmax + exponential +
-argmax on CPU); the native arm times ``mlx_random_tokens`` synchronously —
-in the decode pipeline the same graph defers with the step and overlaps the
+Times one non-greedy sampling step over a full Qwen-sized vocabulary at
+decode-like batch sizes. The torch arm measures the full production cost the
+native path removes: evaluating the MLX logits, bridging them to torch
+(``mlx_to_torch`` after the fp32 cast), then the vLLM sampler math
+(``apply_top_k_top_p`` + softmax + exponential + argmax on CPU). The native
+arm times the ``SamplingBatch`` mask + categorical graph synchronously — in
+the decode pipeline the same graph defers with the step and overlaps the
 next forward, so its effective cost is lower than reported here.
 
 Usage:
@@ -22,7 +24,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.v1.sampling_batch import mlx_random_tokens
+from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.sampling_batch import SamplingBatch
 
 VOCAB_SIZE = 151936
 TOP_K = 20
@@ -31,8 +34,11 @@ WARMUP_ITERS = 5
 TIMED_ITERS = 50
 
 
-def _time_torch(logits: torch.Tensor, batch: int) -> float:
+def _time_torch(logits_mx: mx.array, batch: int) -> float:
     def step() -> torch.Tensor:
+        logits_f32 = logits_mx.astype(mx.float32)
+        mx.eval(logits_f32)
+        logits = mlx_to_torch(logits_f32, device="cpu")
         filtered = apply_top_k_top_p(
             logits.clone(),
             torch.full((batch,), TOP_K),
@@ -55,7 +61,7 @@ def _time_native(logits: mx.array, params: list[SamplingParams]) -> float:
     key = mx.random.key(1)
 
     def step(step_key: mx.array) -> None:
-        tokens = mlx_random_tokens(logits, params, step_key)
+        tokens = SamplingBatch._native_random_tokens(logits, params, step_key)
         mx.eval(tokens)
 
     for _ in range(WARMUP_ITERS):
@@ -73,9 +79,8 @@ def main() -> None:
     for batch in (1, 8):
         logits_mx = mx.random.normal((batch, VOCAB_SIZE), key=mx.random.key(0))
         mx.eval(logits_mx)
-        logits_torch = torch.tensor(logits_mx.tolist())
 
-        torch_ms = _time_torch(logits_torch, batch)
+        torch_ms = _time_torch(logits_mx, batch)
         native_ms = _time_native(logits_mx, [sampling_params] * batch)
         print(
             f"batch={batch} vocab={VOCAB_SIZE}: "
