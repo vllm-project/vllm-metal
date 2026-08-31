@@ -494,6 +494,13 @@ def sdpa_forward(
     if attn_scale is None:
         attn_scale = inner.sm_scale
 
+    # Attention logit softcapping (Gemma 2: ``attn_logit_softcapping``).
+    # mlx_lm applies ``tanh(qk / cap) * cap`` to the pre-softmax scores; the
+    # Metal kernel implements the same clamp and treats any value <= 0 as
+    # disabled, so architectures that do not define the attribute keep the
+    # previous uncapped path unchanged.
+    attn_softcap = float(getattr(inner, "attn_logit_softcapping", None) or 0.0)
+
     # Attention sinks: a learned per-head logit that joins the softmax
     # denominator without contributing a value row (GPT-OSS). Models without
     # sinks leave this None and the kernel keeps its plain-softmax path.
@@ -691,7 +698,7 @@ def sdpa_forward(
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,
@@ -719,7 +726,7 @@ def sdpa_forward(
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,
