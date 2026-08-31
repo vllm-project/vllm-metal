@@ -113,8 +113,6 @@ from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
     _SamplingResult,
-    mlx_greedy_tokens,
-    mlx_random_tokens,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -2833,28 +2831,16 @@ class MetalModelRunner:
         assert logits is not None
         self._draft_token_ids = None
 
-        deferred_params = [state.sampling_params for _, state in decode_reqs]
-        if SamplingBatch.params_allow_native_greedy(deferred_params):
-            tokens = mlx_greedy_tokens(logits[0, : len(decode_reqs), :])
-        elif self._native_sample_key is not None and (
-            SamplingBatch.params_allow_native_random(deferred_params)
-        ):
-            # Unlike argmax, categorical can select a padded lm_head column,
-            # so the random graph samples the vocab-sliced logits.
-            tokens = mlx_random_tokens(
-                logits[0, : len(decode_reqs), : self._vocab_size],
-                deferred_params,
-                self._next_native_sample_key(),
-            )
-        else:
-            key_state = "live" if self._native_sample_key is not None else "absent"
-            raise RuntimeError(
-                "Deferred sampling requires a native-greedy or native-random "
-                f"eligible batch (native sample key {key_state}, "
-                f"random-eligible="
-                f"{SamplingBatch.params_allow_native_random(deferred_params)}) "
-                "— gate desync."
-            )
+        tokens = SamplingBatch.native_decode_tokens(
+            logits[0, : len(decode_reqs), :],
+            [state.sampling_params for _, state in decode_reqs],
+            vocab_size=self._vocab_size,
+            next_key=(
+                self._next_native_sample_key
+                if self._native_sample_key is not None
+                else None
+            ),
+        )
         # Submit now: the token buffer is scheduled right after this step's
         # forward and ahead of the next step's encode, so the deferred
         # resolve is a pure wait on already-queued GPU work.

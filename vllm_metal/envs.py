@@ -80,7 +80,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eligible non-greedy pure-decode steps defer like greedy ones instead
     # of dropping to the synchronous torch path. Requests with seeds,
     # penalties, logprobs, or token constraints keep the torch path
-    # unchanged. Set to "1" to enable.
+    # unchanged. Set to "1" to enable; intended to flip default-on once the
+    # path has serve mileage, with this var remaining as the kill switch.
     "VLLM_METAL_NATIVE_SAMPLING": lambda: (
         os.getenv("VLLM_METAL_NATIVE_SAMPLING", "0") == "1"
     ),

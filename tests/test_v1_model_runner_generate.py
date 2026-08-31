@@ -2510,9 +2510,7 @@ class TestDeferredDecodeSampleThreading:
             generated_tokens=1,
         )
 
-    def test_deferred_random_step_samples_natively_and_backfills(
-        self, monkeypatch
-    ) -> None:
+    def test_deferred_random_step_samples_natively_and_backfills(self) -> None:
         # Arrange — top_k=1 pins the categorical draw to the argmax row, so
         # the backfilled value is deterministic while still exercising the
         # native random graph.
@@ -2525,29 +2523,19 @@ class TestDeferredDecodeSampleThreading:
             mr.PipelineGateDecision(eligible=True, reason="eligible")
         )
         initial_key = runner._native_sample_key
-        random_calls: list = []
-        real_random_tokens = mr.mlx_random_tokens
 
-        def spy_random_tokens(logits_2d, params, key):
-            random_calls.append((logits_2d, params, key))
-            return real_random_tokens(logits_2d, params, key)
-
-        monkeypatch.setattr(mr, "mlx_random_tokens", spy_random_tokens)
-
-        # Act
-        output = runner._submit_deferred_decode_sample()
+        # Act — through the public seam the engine calls.
+        output = runner.sample_tokens(grammar_output=None)
         result = output.get_output()
 
-        # Assert — the native random graph ran with a live step key, the key
-        # chain advanced, and the placeholder resolved to the only candidate
-        # top_k=1 leaves.
-        assert len(random_calls) == 1
-        assert random_calls[0][2] is not None
+        # Assert — the key chain advanced exactly once, the async backfill
+        # resolved the placeholder, and top_k=1 pins the sampled value.
+        assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
         assert runner._native_sample_key.tolist() != initial_key.tolist()
         assert state.token_ids[-1] == 1
         assert result.sampled_token_ids == [[1]]
 
-    def test_deferred_random_step_never_samples_padded_vocab(self, monkeypatch) -> None:
+    def test_deferred_random_step_never_samples_padded_vocab(self) -> None:
         """Columns past the model vocab must be unreachable even when a
         padded column holds the largest logit."""
         runner = make_stub_runner(model_args={"vocab_size": 4})
@@ -2562,7 +2550,7 @@ class TestDeferredDecodeSampleThreading:
             mr.PipelineGateDecision(eligible=True, reason="eligible")
         )
 
-        output = runner._submit_deferred_decode_sample()
+        output = runner.sample_tokens(grammar_output=None)
         result = output.get_output()
 
         assert result.sampled_token_ids == [[1]]
@@ -2581,7 +2569,7 @@ class TestDeferredDecodeSampleThreading:
 
         # Act / Assert
         with pytest.raises(RuntimeError, match="gate desync"):
-            runner._submit_deferred_decode_sample()
+            runner.sample_tokens(grammar_output=None)
 
     def test_submit_advances_bookkeeping_and_returns_async_output(self) -> None:
         # Arrange

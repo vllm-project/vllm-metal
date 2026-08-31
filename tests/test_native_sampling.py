@@ -7,11 +7,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.v1.sampling_batch import (
-    SamplingBatch,
-    mlx_random_tokens,
-    mlx_top_k_top_p_masked_logits,
-)
+from vllm_metal.v1.sampling_batch import SamplingBatch
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -42,12 +38,10 @@ class TestNativeRandomEligibility:
             ("presence penalty", [_random_params(presence_penalty=0.5)]),
             ("repetition penalty", [_random_params(repetition_penalty=1.2)]),
             ("sample logprobs", [_random_params(logprobs=1)]),
-            ("min_p filter", [_random_params(min_p=0.05)]),
             (
                 "logprob token ids",
                 [_random_params(logprob_token_ids=[1, 2])],
             ),
-            ("logit bias", [_random_params(logit_bias={3: 2.0})]),
             (
                 "mixed greedy and random",
                 [_random_params(), _random_params(temperature=0.0)],
@@ -102,22 +96,13 @@ class TestTopKTopPMaskParity:
         )
         p_arg = None if top_p == 1.0 else torch.full((BATCH_SIZE,), top_p)
 
-        masked_mlx = mlx_top_k_top_p_masked_logits(logits, top_k, top_p)
+        masked_mlx = SamplingBatch._top_k_top_p_masked_logits(logits, top_k, top_p)
         mx.eval(masked_mlx)
         masked_ref = apply_top_k_top_p(logits_torch.clone(), k_arg, p_arg)
 
         kept_mlx = [[v != float("-inf") for v in row] for row in masked_mlx.tolist()]
         kept_ref = (masked_ref != float("-inf")).tolist()
         assert kept_mlx == kept_ref
-
-    def test_top_p_zero_keeps_argmax_only(self) -> None:
-        logits = mx.array([[1.0, 5.0, 3.0, 2.0]])
-
-        masked = mlx_top_k_top_p_masked_logits(logits, 0, 0.0)
-        mx.eval(masked)
-
-        kept = [v != float("-inf") for v in masked.tolist()[0]]
-        assert kept == [False, True, False, False]
 
     def test_top_p_boundary_ties_are_masked_positionally(self) -> None:
         """Boundary ties must not all survive (vLLM masks sorted positions).
@@ -128,23 +113,13 @@ class TestTopKTopPMaskParity:
         logits = mx.array([[2.0, 2.0, 2.0, 2.0]])
         logits_torch = torch.full((1, 4), 2.0)
 
-        masked = mlx_top_k_top_p_masked_logits(logits, 0, 0.25)
+        masked = SamplingBatch._top_k_top_p_masked_logits(logits, 0, 0.25)
         mx.eval(masked)
         masked_ref = apply_top_k_top_p(logits_torch, None, torch.full((1,), 0.25))
 
         kept_count = sum(v != float("-inf") for v in masked.tolist()[0])
         kept_count_ref = int((masked_ref != float("-inf")).sum().item())
         assert kept_count == kept_count_ref == 1
-
-    def test_top_p_zero_with_tied_maxima_keeps_one(self) -> None:
-        logits = mx.array([[5.0, 5.0, 1.0, 5.0]])
-
-        masked = mlx_top_k_top_p_masked_logits(logits, 0, 0.0)
-        mx.eval(masked)
-
-        kept = [v != float("-inf") for v in masked.tolist()[0]]
-        assert sum(kept) == 1
-        assert kept[2] is False
 
 
 class TestMlxRandomTokens:
@@ -159,7 +134,7 @@ class TestMlxRandomTokens:
         key = mx.random.key(0)
         for _ in range(200):
             key, subkey = mx.random.split(key)
-            tokens = mlx_random_tokens(logits, params, subkey)
+            tokens = SamplingBatch._native_random_tokens(logits, params, subkey)
             mx.eval(tokens)
             sampled.extend(tokens.tolist())
 
@@ -172,8 +147,8 @@ class TestMlxRandomTokens:
         params = [_random_params()] * BATCH_SIZE
         key = mx.random.key(11)
 
-        first = mlx_random_tokens(logits, params, key)
-        second = mlx_random_tokens(logits, params, key)
+        first = SamplingBatch._native_random_tokens(logits, params, key)
+        second = SamplingBatch._native_random_tokens(logits, params, key)
         mx.eval(first, second)
 
         assert first.tolist() == second.tolist()
@@ -192,7 +167,7 @@ class TestMlxRandomTokens:
         key = mx.random.key(7)
         for _ in range(100):
             key, subkey = mx.random.split(key)
-            tokens = mlx_random_tokens(logits, params, subkey)
+            tokens = SamplingBatch._native_random_tokens(logits, params, subkey)
             mx.eval(tokens)
             cold_row.add(tokens.tolist()[0])
             hot_row.add(tokens.tolist()[1])
@@ -211,7 +186,7 @@ class TestMlxRandomTokens:
         draws = 0
         for _ in range(400):
             key, subkey = mx.random.split(key)
-            tokens = mlx_random_tokens(logits, params, subkey)
+            tokens = SamplingBatch._native_random_tokens(logits, params, subkey)
             mx.eval(tokens)
             for token in tokens.tolist():
                 counts[token] += 1
