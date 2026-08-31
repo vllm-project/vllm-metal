@@ -145,6 +145,14 @@ trigger, then constrained JSON):
 | Qwen3-0.6B | 4 | 1.82x | 49% | 83% |
 | Gemma-4 E2B | 1 | 1.58x | 56% | 82% |
 | Gemma-4 E2B | 4 | 1.77x | 52% | 71% |
+| Gemma-3-4B | 1 | 1.22x | 36% | 67% |
+
+**The gain shrinks as the model grows.** Gemma-3-4B still wins, but at 1.22x
+rather than the ~1.5x the sub-2B models show: a wider verification step costs
+proportionally more when the forward pass is bigger, and acceptance is lower.
+Plan on the smaller end of that range for a model in the multi-billion range.
+4B at bf16 is the largest that fits a 24 GB M4 Pro alongside its KV cache
+(8.60 GB of weights against 15.26 GB usable), so 8B is untested here.
 
 Tool calling shows the smaller speedup of the two because a structural tag leaves
 the model's prose free until the trigger fires, and nothing is drafted there. The
