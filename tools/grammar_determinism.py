@@ -171,6 +171,12 @@ def generate_traces(
     llm = LLM(
         model=args.model,
         max_model_len=args.max_model_len,
+        # Profiling overhead scales with this, and it is what decides whether a
+        # mid-size model fits beside its KV cache on a 24 GB machine: left at
+        # vLLM's default, Gemma-4 E2B reserves 8.8 GB of overhead against a
+        # 19 GB Metal limit and the KV budget goes negative before the run
+        # starts. 512 is what the benchmark harness uses for the same reason.
+        max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.batch_size,
         async_scheduling=False,
         enable_prefix_caching=False,
@@ -291,6 +297,7 @@ def main() -> int:
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--no-thinking", action="store_true", default=True)
     parser.add_argument(
