@@ -115,10 +115,14 @@ Measured, not argued. On the same structured-output workload, with the same K:
 | Qwen2.5-0.5B-Instruct | 1 | 1.98 ms | 2.07 ms (0.96x) | 1.16 ms (**1.71x**) |
 | Qwen2.5-0.5B-Instruct | 4 | 4.65 ms | 4.66 ms (1.00x) | 2.34 ms (**1.98x**) |
 
-n-gram offered 8 draft tokens across an entire run and had **zero** accepted: a
-single structured response does not repeat itself, so there is nothing for suffix
-matching to find, and it still pays its match-kernel scan every step. Every arm
-above reproduced the baseline's token ids exactly.
+n-gram fails here for a structural reason, not just sparse repetition. On one
+batch-1 run of 279 output tokens, `NgramProposer.propose()` returned 3 drafts
+totalling 24 tokens — but only 2 of those tokens were ever verified, and none
+accepted. `Scheduler.update_draft_token_ids` filters drafts through the active
+grammar's `validate_tokens()`, and a grammar-blind drafter's history-derived
+guesses are mostly illegal at that position, so the engine discards them.
+Grammar-forced drafting proposes only tokens the grammar already accepts. Every
+arm above reproduced the baseline's token ids exactly.
 
 ### Latency
 
