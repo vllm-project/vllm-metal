@@ -39,6 +39,19 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 48
 NUM_SPECULATIVE_TOKENS = 8
 
+# Which proposer this gate exercises. Both must satisfy every assertion here:
+# ToolSpecProposer composes GrammarProposer and adds retrieval, and retrieval
+# drafts are verified by the same lossless verify half, so adding it must not
+# change a single emitted token. One engine per process is the rule (see the
+# module docstring), so the two are run as separate pytest invocations rather
+# than parametrised into one:
+#
+#   VLLM_METAL_E2E_PROPOSER=vllm_metal.v1.toolspec_proposer.ToolSpecProposer \
+#     python -m pytest tools/test_grammar_spec_decode_e2e.py
+PROPOSER_PATH = os.environ.get(
+    "VLLM_METAL_E2E_PROPOSER", "vllm_metal.v1.grammar_proposer.GrammarProposer"
+)
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -63,10 +76,16 @@ UNCONSTRAINED_PROMPT = "The capital of France is"
 # check is SD-vs-greedy rather than SD-vs-SD. Regenerate with the same prompt and
 # schema under SamplingParams(temperature=0) and no speculative_config if the
 # model or tokenizer changes.
+#
+# The final token was 151645 (`<|im_end|>`) until vLLM 0.28.0; it is now 151643
+# (`<|endoftext|>`). The 23 content tokens are unchanged. Re-measured against
+# plain greedy with no speculative_config at all, which emits exactly this --
+# so the drift is in which stop token the engine emits, not in drafting. Worth
+# stating because a stale golden here looks precisely like a losslessness bug.
 # fmt: off
 GREEDY_GOLDEN = [
     4913, 606, 788, 330, 455, 69364, 497, 330, 16370, 788, 5212, 2527,
-    788, 330, 59604, 497, 330, 3843, 788, 330, 66, 40247, 30975, 151645,
+    788, 330, 59604, 497, 330, 3843, 788, 330, 66, 40247, 30975, 151643,
 ]
 # fmt: on
 
@@ -100,7 +119,7 @@ def sd_engine():
         },
         speculative_config={
             "method": "custom_class",
-            "model": "vllm_metal.v1.grammar_proposer.GrammarProposer",
+            "model": PROPOSER_PATH,
             "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
         },
     )
@@ -115,10 +134,11 @@ def sd_engine():
     )
 
     runner = llm.llm_engine.model_executor.driver_worker.model_runner
-    from vllm_metal.v1.grammar_proposer import GrammarProposer
+    from vllm.utils.import_utils import resolve_obj_by_qualname
 
-    assert isinstance(runner._drafter, GrammarProposer), (
-        f"expected GrammarProposer drafter, got {type(runner._drafter)!r}"
+    expected = resolve_obj_by_qualname(PROPOSER_PATH)
+    assert isinstance(runner._drafter, expected), (
+        f"expected {expected.__name__} drafter, got {type(runner._drafter)!r}"
     )
     return llm
 
