@@ -16,7 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
 from vllm_metal.config import MetalConfig
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import (
@@ -46,10 +46,15 @@ def _hybrid_runner():
     return make_stub_runner(
         model_args={"full_attention_interval": 4},
         num_layers=NUM_LAYERS,
-        full_attention_interval=4,
-        sdpa_layer_indices=set(SDPA_LAYERS),
-        num_sdpa_layers=len(SDPA_LAYERS),
-        num_linear_layers=NUM_LAYERS - len(SDPA_LAYERS),
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            NUM_LAYERS,
+            SDPA_LAYERS,
+            conv_kernel_dim=4,
+            conv_dim=1024,
+            num_v_heads=16,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
         num_kv_heads=KV_HEADS,
         head_dim=HEAD_DIM,
         kv_cache_dtype=mx.float16,
@@ -60,11 +65,6 @@ def _hybrid_runner():
             mamba_cache_mode="none",
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
-        linear_conv_kernel_dim=4,
-        linear_conv_dim=1024,
-        linear_num_v_heads=16,
-        linear_value_head_dim=64,
-        linear_key_head_dim=64,
     )
 
 
@@ -106,10 +106,15 @@ class TestHybridTurboQuantCachePolicy:
             runner = make_stub_runner(
                 model_args={"full_attention_interval": 4},
                 num_layers=NUM_LAYERS,
-                full_attention_interval=4,
-                sdpa_layer_indices=set(sdpa_layers),
-                num_sdpa_layers=len(sdpa_layers),
-                num_linear_layers=NUM_LAYERS - len(sdpa_layers),
+                hybrid_runtime_plan=make_gdn_hybrid_plan(
+                    NUM_LAYERS,
+                    sdpa_layers,
+                    conv_kernel_dim=4,
+                    conv_dim=1024,
+                    num_v_heads=16,
+                    value_head_dim=64,
+                    key_head_dim=64,
+                ),
                 num_kv_heads=KV_HEADS,
                 head_dim=HEAD_DIM,
                 kv_cache_dtype=mx.float16,
@@ -120,11 +125,6 @@ class TestHybridTurboQuantCachePolicy:
                     mamba_cache_mode="none",
                 ),
                 scheduler_config=SimpleNamespace(max_num_seqs=4),
-                linear_conv_kernel_dim=4,
-                linear_conv_dim=1024,
-                linear_num_v_heads=16,
-                linear_value_head_dim=64,
-                linear_key_head_dim=64,
             )
             with patch(
                 "vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()

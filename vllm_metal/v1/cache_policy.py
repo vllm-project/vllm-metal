@@ -29,9 +29,11 @@ from vllm_metal.attention.caches.turboquant import (
     V_QUANT_PARAMS,
     packed_dim,
 )
-from vllm_metal.attention.runtime.hybrid import (
-    HybridPagedAttentionRuntime,
-    _build_linear_layer_spec,
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.hybrid_plan import (
+    ATTENTION_LAYER,
+    STATE_LAYER,
+    HybridRuntimePlan,
 )
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -65,6 +67,17 @@ def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int
     if num_sdpa_layers > 0 and num_linear_layers % num_sdpa_layers == 0:
         return num_sdpa_layers
     return num_linear_layers
+
+
+def _require_runner_hybrid_plan(runner: MetalModelRunner) -> HybridRuntimePlan:
+    """Return the resolved hybrid plan, failing fast if lifecycle skipped it."""
+    plan = runner.hybrid_runtime_plan
+    if plan is None:
+        raise RuntimeError(
+            "hybrid model has no resolved hybrid_runtime_plan; "
+            "ModelLifecycle.resolve_model_dims must run before cache sizing"
+        )
+    return plan
 
 
 HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
@@ -316,6 +329,9 @@ class ModelCachePolicy:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
+    def _require_hybrid_plan(self) -> HybridRuntimePlan:
+        return _require_runner_hybrid_plan(self._runner)
+
     def _uses_deferred_mha_layout(self) -> bool:
         """Return whether vLLM's grouped MHA config must own allocation."""
         kv_heads = self._runner.kv_heads_per_layer
@@ -365,26 +381,32 @@ class ModelCachePolicy:
             num_spec_layers, _ = self._runner._yoco_cache_mapping
         specs: dict[str, KVCacheSpec] = {}
         use_deferred_mha_layout = self._uses_deferred_mha_layout()
+        hybrid_plan = self._require_hybrid_plan() if self._runner.is_hybrid else None
         for layer_idx in range(num_spec_layers):
             if (
-                self._runner.is_hybrid
-                and layer_idx not in self._runner.sdpa_layer_indices
+                hybrid_plan is not None
+                and hybrid_plan.layers.kind_of(layer_idx) == STATE_LAYER
             ):
                 layer_name = f"layers.{layer_idx}.linear_attn"
                 cache_config = self._runner.cache_config
                 mamba_block_size = cache_config.mamba_block_size
                 # Upstream resolves this during config setup and asserts it here.
                 assert mamba_block_size is not None
-                specs[layer_name] = _build_linear_layer_spec(
-                    conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-                    conv_dim=self._runner.linear_conv_dim,
-                    num_v_heads=self._runner.linear_num_v_heads,
-                    value_head_dim=self._runner.linear_value_head_dim,
-                    key_head_dim=self._runner.linear_key_head_dim,
-                    torch_dtype=torch_dtype,
-                    page_size_padded=cache_config.mamba_page_size_padded,
+                specs[layer_name] = hybrid_plan.state_cache_spec(
+                    conv_dtype=torch_dtype,
                     mamba_block_size=mamba_block_size,
+                    page_size_padded=cache_config.mamba_page_size_padded,
                     mamba_cache_mode=cache_config.mamba_cache_mode,
+                )
+            elif (
+                hybrid_plan is not None
+                and hybrid_plan.layers.kind_of(layer_idx) != ATTENTION_LAYER
+            ):
+                # Unreachable while LayerKind is the closed two-member
+                # Literal; fail-fast for when a future family adds a kind.
+                raise NotImplementedError(
+                    f"hybrid cache sizing has no spec for layer {layer_idx} "
+                    f"of kind {hybrid_plan.layers.kind_of(layer_idx)!r}"
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -606,7 +628,7 @@ class ModelCachePolicy:
             kv_cache_config,
             tuple(
                 f"layers.{layer_idx}.self_attn"
-                for layer_idx in sorted(self._runner.sdpa_layer_indices)
+                for layer_idx in self._require_hybrid_plan().layers.attention_indices
             ),
         )
         if len(group_indices) != 1:
@@ -631,9 +653,7 @@ class ModelCachePolicy:
             cache_idx_by_name = {
                 f"layers.{layer_idx}.linear_attn": cache_idx
                 for cache_idx, layer_idx in enumerate(
-                    layer_idx
-                    for layer_idx in range(self._runner.num_layers)
-                    if layer_idx not in self._runner.sdpa_layer_indices
+                    self._require_hybrid_plan().layers.state_indices
                 )
             }
             mamba_group_ids = [
@@ -687,7 +707,8 @@ class ModelCachePolicy:
                     "layer; cannot derive state pools"
                 )
             budgeted = _align_state_pool_count(
-                len(cache_idx_by_name), len(self._runner.sdpa_layer_indices)
+                len(cache_idx_by_name),
+                self._require_hybrid_plan().layers.num_attention,
             )
             if pools_used > budgeted:
                 raise RuntimeError(
@@ -857,20 +878,18 @@ class ModelCachePolicy:
         """Return bytes for one request's linear-attention state."""
         if not self._runner.is_hybrid:
             raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
+        plan = self._require_hybrid_plan()
+        geometry = plan.geometry
         dtype_size = self._require_kv_cache_dtype().size
-        recurrent_dtype_size = mx.float32.size
-        conv_bytes = (
-            (self._runner.linear_conv_kernel_dim - 1)
-            * self._runner.linear_conv_dim
-            * dtype_size
-        )
+        recurrent_dtype_size = plan.family.recurrent_dtype.itemsize
+        conv_bytes = (geometry.conv_kernel_dim - 1) * geometry.conv_dim * dtype_size
         recurrent_bytes = (
-            self._runner.linear_num_v_heads
-            * self._runner.linear_value_head_dim
-            * self._runner.linear_key_head_dim
+            geometry.num_v_heads
+            * geometry.value_head_dim
+            * geometry.key_head_dim
             * recurrent_dtype_size
         )
-        return self._runner.num_linear_layers * (conv_bytes + recurrent_bytes)
+        return plan.layers.num_state * (conv_bytes + recurrent_bytes)
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -947,22 +966,16 @@ class ModelCachePolicy:
         # this mirror must follow.
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
-            return self._runner.num_linear_layers * padded
+            return self._require_hybrid_plan().layers.num_state * padded
         return self.linear_cache_bytes_per_slot()
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
         return HybridPagedAttentionRuntime(
-            num_layers=self._runner.num_layers,
-            full_attention_interval=self._runner.full_attention_interval,
+            plan=self._require_hybrid_plan(),
             max_num_seqs=self._runner.scheduler_config.max_num_seqs,
             num_kv_heads=self._runner.num_kv_heads,
             head_dim=self._runner.head_dim,
-            linear_num_v_heads=self._runner.linear_num_v_heads,
-            linear_key_head_dim=self._runner.linear_key_head_dim,
-            linear_value_head_dim=self._runner.linear_value_head_dim,
-            linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-            linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
@@ -1064,7 +1077,7 @@ class ModelCachePolicy:
 
     def _num_kv_cache_layers(self) -> int:
         if self._runner.is_hybrid:
-            return self._runner.num_sdpa_layers
+            return self._require_hybrid_plan().layers.num_attention
         return self._runner.num_kv_cache_layers
 
     def _use_turboquant(self, config: MetalConfig) -> bool:
@@ -1292,8 +1305,9 @@ class WorkerCachePlanner:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
-        num_linear = runner.num_layers - len(runner.sdpa_layer_indices)
-        pools = _align_state_pool_count(num_linear, len(runner.sdpa_layer_indices))
+        plan = _require_runner_hybrid_plan(runner)
+        num_linear = plan.layers.num_state
+        pools = _align_state_pool_count(num_linear, plan.layers.num_attention)
         return runner.linear_cache_bytes_per_slot() * pools // num_linear
 
     def _hybrid_align_growth_bytes_per_block(self) -> int:
@@ -1303,7 +1317,7 @@ class WorkerCachePlanner:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
-        num_linear = runner.num_layers - len(runner.sdpa_layer_indices)
+        num_linear = _require_runner_hybrid_plan(runner).layers.num_state
         return runner.linear_cache_bytes_per_slot() // num_linear
 
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:

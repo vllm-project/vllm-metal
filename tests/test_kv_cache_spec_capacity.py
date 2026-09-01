@@ -11,7 +11,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
 
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
@@ -104,9 +104,15 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
             max_model_len=max_model_len,
         ),
         num_layers=2,
-        num_sdpa_layers=1,
-        num_linear_layers=1,
-        sdpa_layer_indices={1},
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            2,
+            [1],
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=1,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,
@@ -116,11 +122,6 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
             mamba_block_size=max_model_len,
             mamba_cache_mode="none",
         ),
-        linear_conv_kernel_dim=4,
-        linear_conv_dim=64,
-        linear_num_v_heads=1,
-        linear_value_head_dim=64,
-        linear_key_head_dim=64,
     )
 
     spec = runner._cache_policy.get_kv_cache_spec()["layers.0.linear_attn"]

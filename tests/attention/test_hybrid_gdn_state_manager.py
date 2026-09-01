@@ -5,6 +5,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from tests.stub_runner import make_gdn_hybrid_plan
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
@@ -228,16 +229,18 @@ class TestHybridGDNStateManager:
 class TestHybridPagedAttentionRuntime:
     def test_initialize_wires_gdn_state_manager_delegation(self) -> None:
         runtime = HybridPagedAttentionRuntime(
-            num_layers=2,
-            full_attention_interval=2,
+            plan=make_gdn_hybrid_plan(
+                2,
+                range(1, 2, 2),
+                conv_kernel_dim=2,
+                conv_dim=4,
+                num_v_heads=1,
+                value_head_dim=4,
+                key_head_dim=32,
+            ),
             max_num_seqs=2,
             num_kv_heads=1,
             head_dim=4,
-            linear_num_v_heads=1,
-            linear_key_head_dim=32,
-            linear_value_head_dim=4,
-            linear_conv_kernel_dim=2,
-            linear_conv_dim=4,
             block_size=4,
             dtype=mx.float32,
         )

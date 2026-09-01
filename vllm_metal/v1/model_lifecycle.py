@@ -14,6 +14,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.compat import apply_compat_patches
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
@@ -190,7 +191,7 @@ class ModelLifecycle:
         self._install_yoco_cache_mapping(args)
         self._install_per_layer_attention_metadata(args, default_head_dim)
         self._reject_pipeline_parallel_with_per_layer_metadata()
-        self._install_hybrid_attention_dims(args)
+        self._install_hybrid_state_plan(args)
 
     def _load_encoder_pooling(self) -> LoadedEncoderBackend | None:
         runner = self._runner
@@ -490,27 +491,11 @@ class ModelLifecycle:
                 "head dims, e.g. Gemma4)."
             )
 
-    def _install_hybrid_attention_dims(self, args: dict[str, Any]) -> None:
-        """Install hybrid linear-attention dimensions for GDN-style models."""
+    def _install_hybrid_state_plan(self, args: dict[str, Any]) -> None:
+        """Resolve the state family that owns this model's hybrid layers."""
         if self._runner.is_hybrid:
-            fai = int(args["full_attention_interval"])
-            self._runner.full_attention_interval = fai
-            self._runner.sdpa_layer_indices = frozenset(
-                i for i in range(self._runner.num_layers) if (i + 1) % fai == 0
-            )
-            self._runner.num_sdpa_layers = len(self._runner.sdpa_layer_indices)
-            self._runner.num_linear_layers = (
-                self._runner.num_layers - self._runner.num_sdpa_layers
-            )
-            self._runner.linear_num_k_heads = int(args["linear_num_key_heads"])
-            self._runner.linear_num_v_heads = int(args["linear_num_value_heads"])
-            self._runner.linear_key_head_dim = int(args["linear_key_head_dim"])
-            self._runner.linear_value_head_dim = int(args["linear_value_head_dim"])
-            self._runner.linear_conv_kernel_dim = int(args["linear_conv_kernel_dim"])
-            # Qwen3.5 GDN packs q/k at key_dim and v at value_dim.
-            self._runner.linear_conv_dim = (
-                self._runner.linear_num_k_heads * self._runner.linear_key_head_dim * 2
-                + self._runner.linear_num_v_heads * self._runner.linear_value_head_dim
+            self._runner.hybrid_runtime_plan = build_gdn_hybrid_plan(
+                args, self._runner.num_layers
             )
 
     def _install_runtime_extensions(

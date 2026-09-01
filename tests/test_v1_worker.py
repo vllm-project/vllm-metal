@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
-from tests.stub_runner import make_stub_runner  # noqa: E402
+from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner  # noqa: E402
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
@@ -140,16 +140,18 @@ class TestOneSequenceKvBytes:
     def test_hybrid_adds_linear_state(self) -> None:
         model_runner = make_stub_runner(
             model_args={"full_attention_interval": 2},
-            num_sdpa_layers=8,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
-            linear_conv_kernel_dim=3,
-            linear_conv_dim=5,
-            linear_num_v_heads=2,
-            linear_value_head_dim=7,
-            linear_key_head_dim=11,
-            num_linear_layers=3,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                11,
+                range(8),
+                conv_kernel_dim=3,
+                conv_dim=5,
+                num_v_heads=2,
+                value_head_dim=7,
+                key_head_dim=11,
+            ),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -175,16 +177,18 @@ class TestOneSequenceKvBytes:
         padded_page = 4096
         model_runner = make_stub_runner(
             model_args={"full_attention_interval": 2},
-            num_sdpa_layers=8,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
-            linear_conv_kernel_dim=3,
-            linear_conv_dim=5,
-            linear_num_v_heads=2,
-            linear_value_head_dim=7,
-            linear_key_head_dim=11,
-            num_linear_layers=3,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                11,
+                range(8),
+                conv_kernel_dim=3,
+                conv_dim=5,
+                num_v_heads=2,
+                value_head_dim=7,
+                key_head_dim=11,
+            ),
             cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
@@ -206,25 +210,19 @@ class TestOneSequenceKvBytes:
         runner._model_adapter = DefaultModelAdapter()
         runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
         runner.kv_cache_dtype = mx.float16
-        runner.linear_conv_kernel_dim = 3
-        runner.linear_conv_dim = 5
-        runner.linear_num_v_heads = 2
-        runner.linear_value_head_dim = 7
-        runner.linear_key_head_dim = 11
-        runner.num_linear_layers = 3
+        runner.hybrid_runtime_plan = make_gdn_hybrid_plan(
+            11,
+            range(8),
+            conv_kernel_dim=3,
+            conv_dim=5,
+            num_v_heads=2,
+            value_head_dim=7,
+            key_head_dim=11,
+        )
 
-        conv_bytes = (
-            (runner.linear_conv_kernel_dim - 1)
-            * runner.linear_conv_dim
-            * mx.float16.size
-        )
-        recurrent_bytes = (
-            runner.linear_num_v_heads
-            * runner.linear_value_head_dim
-            * runner.linear_key_head_dim
-            * mx.float32.size
-        )
-        expected = runner.num_linear_layers * (conv_bytes + recurrent_bytes)
+        # Hand-written from the plan above: conv (3-1)*5 fp16 values = 20 B,
+        # recurrent 2*7*11 fp32 values = 616 B, over 3 state layers.
+        expected = 3 * (20 + 616)
 
         assert runner.linear_cache_bytes_per_slot() == expected
 
@@ -445,7 +443,15 @@ class TestPagedAttentionPlanDiagnostics:
             is_hybrid=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
             num_layers=24,
-            sdpa_layer_indices=list(range(6)),
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                24,
+                range(6),
+                conv_kernel_dim=2,
+                conv_dim=1,
+                num_v_heads=1,
+                value_head_dim=1,
+                key_head_dim=1,
+            ),
             # 18 logical GDN layers at 100 bytes per layer/slot. Striping
             # produces six physical pools: 600 steady bytes per block plus
             # one 100-byte old pool retained during growth.
@@ -530,3 +536,19 @@ class TestPagedAttentionPlanDiagnostics:
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == expected_fraction
+
+
+class TestHybridPlanGuard:
+    def test_hybrid_sizing_without_plan_rejects(self) -> None:
+        # Arrange — is_hybrid derives from model_args; the stub leaves
+        # hybrid_runtime_plan at its None default.
+        runner = make_stub_runner(model_args={"full_attention_interval": 2})
+        expected = (
+            "hybrid model has no resolved hybrid_runtime_plan; "
+            "ModelLifecycle.resolve_model_dims must run before cache sizing"
+        )
+
+        # Act / Assert
+        with pytest.raises(RuntimeError) as excinfo:
+            runner.linear_cache_bytes_per_slot()
+        assert str(excinfo.value) == expected

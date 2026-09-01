@@ -123,6 +123,13 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_lazy", GDNLazyKernels.shared())
         object.__setattr__(self, "_gdn_lazy_policy", _GDNLazyPolicy.from_module(inner))
 
+    def rebind_state_cache(
+        self, state_cache: GDNPagedStateCache, *, cache_idx: int
+    ) -> None:
+        """Refresh pooled state refs in place (cached model reuse)."""
+        object.__setattr__(self, "_gdn_cache_idx", cache_idx)
+        object.__setattr__(self, "_gdn_state_cache", state_cache)
+
     def __call__(
         self,
         x: mx.array,

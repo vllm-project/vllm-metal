@@ -3,12 +3,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.attention.runtime.hybrid_plan import (
+    ATTENTION_LAYER,
+    STATE_LAYER,
+    HybridLayerPlan,
+    HybridRuntimePlan,
+    RecurrentStateGeometry,
+)
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import DecodePipeline
 from vllm_metal.v1.lora import MetalLoRARuntime
@@ -60,6 +69,7 @@ def make_stub_runner(
         "_draft_dims": None,
         "encoder_cache": None,
         "_paged_attention_runtime": None,
+        "hybrid_runtime_plan": None,
         "_paged_block_size": 0,
         "_paged_scheduler_group_indices": (),
         "_paged_group_block_sizes": (),
@@ -201,4 +211,49 @@ def make_gemma4_mixed_mha_runner(
         kv_heads_per_layer=kv_heads_per_layer,
         head_dim_per_layer=head_dim_per_layer,
         sliding_window_per_layer=sliding_windows,
+    )
+
+
+# The production family spec, resolved once through the public builder (the
+# args are a minimal valid sentinel; only the family policy is kept).  Tests
+# reuse it so they cannot drift from the wrapper, detector and dtype policy
+# production installs.
+_GDN_FAMILY_SPEC = build_gdn_hybrid_plan(
+    {
+        "full_attention_interval": 1,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    },
+    1,
+).family
+
+
+def make_gdn_hybrid_plan(
+    num_layers: int,
+    attention_indices: Iterable[int],
+    *,
+    conv_kernel_dim: int,
+    conv_dim: int,
+    num_v_heads: int,
+    value_head_dim: int,
+    key_head_dim: int,
+) -> HybridRuntimePlan:
+    """Build a GDN hybrid plan with explicit topology and geometry."""
+    attention = frozenset(attention_indices)
+    kinds = tuple(
+        ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
+    )
+    return HybridRuntimePlan(
+        layers=HybridLayerPlan.from_kinds(kinds),
+        family=_GDN_FAMILY_SPEC,
+        geometry=RecurrentStateGeometry(
+            conv_kernel_dim=conv_kernel_dim,
+            conv_dim=conv_dim,
+            num_v_heads=num_v_heads,
+            value_head_dim=value_head_dim,
+            key_head_dim=key_head_dim,
+        ),
     )
