@@ -251,8 +251,12 @@ Confirm it is active: the server log shows
 ### Retrieval-augmented drafting (ToolSpec)
 
 The grammar drafts structure and stops at every value, so its ceiling is however
-much of the output the schema fixes — 50% of emitted tokens over the BFCL corpus.
-The other half is argument *content*. `ToolSpecProposer` is the Metal port of
+much of the output the schema fixes, and that is corpus-dependent: **37% of
+emitted tokens over API-Bank, 50% over BFCL** (Qwen3-0.6B, greedy, measured by
+`tools/grammar_determinism.py`, which imports nothing from `vllm_metal` and so
+runs against a checkout with no proposer in it). Plan on the lower end — API-Bank
+is multi-turn and its arguments carry more free text, which is the more realistic
+shape. The rest is argument *content*. `ToolSpecProposer` is the Metal port of
 ToolSpec ([arXiv 2604.13519](https://arxiv.org/abs/2604.13519)), which attacks
 that half: tool-calling traffic repeats itself, so a value some earlier
 invocation produced is a reasonable guess for the one being generated now.

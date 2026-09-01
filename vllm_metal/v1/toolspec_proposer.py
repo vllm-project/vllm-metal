@@ -11,10 +11,11 @@ adds only the second half, and composes the first.
 
 What retrieval is for
 ---------------------
-The grammar drafts structure and stops at every value. Measured over the BFCL
-corpus that is 50% of emitted tokens (``tools/grammar_determinism.py``), and it
-is a *ceiling*: no grammar-aware drafter can do better, because the rest is
-genuinely the model's choice. The rest is argument *content* -- and ToolSpec's
+The grammar drafts structure and stops at every value. Measured by
+``tools/grammar_determinism.py`` that is 37% of emitted tokens over API-Bank and
+50% over BFCL, and it is a *ceiling*: no grammar-aware drafter can do better,
+because the rest is genuinely the model's choice. The rest is argument *content*
+-- and ToolSpec's
 observation is that content repeats across requests, so a value some earlier
 invocation already produced is a decent guess for the one being generated now.
 :class:`~vllm_metal.v1.retrieval_store.RetrievalStore` holds that memory.

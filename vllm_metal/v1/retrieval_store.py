@@ -3,8 +3,9 @@
 
 This is the store half of ToolSpec (arXiv 2604.13519). The grammar proposer
 drafts the text a request's schema has *already* determined and stops at every
-value; measured over the BFCL corpus that covers 50% of emitted tokens, and the
-other 50% is argument *content* it never touches. ToolSpec's observation is that
+value; measured, that covers 37% of emitted tokens over API-Bank and 50% over
+BFCL, and the rest is argument *content* it never touches. ToolSpec's
+observation is that
 this content is not arbitrary either: tool-calling traffic repeats itself across
 requests, so an argument value a past invocation already produced is a good
 guess for the one being generated now.
