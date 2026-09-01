@@ -31,6 +31,10 @@ if TYPE_CHECKING:
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
+    VLLM_METAL_TOOLSPEC_CAPACITY: int = 512
+    VLLM_METAL_TOOLSPEC_TOP_K: int = 4
+    VLLM_METAL_TOOLSPEC_NGRAM_MAX: int = 7
+    VLLM_METAL_TOOLSPEC_NGRAM_MIN: int = 5
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -105,6 +109,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # single-forward behavior.
     "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
         os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    ),
+    # Retrieval-augmented drafting knobs for the ToolSpec proposer
+    # (vllm_metal.v1.toolspec_proposer, method="custom_class"). Ignored by
+    # every other speculative method.
+    #
+    # How many finished invocations the per-worker memory holds before it
+    # starts evicting the oldest. Each entry is one question vector (hidden
+    # width x 4 bytes) plus a truncated token trace, so 512 entries costs a few
+    # MB at typical hidden sizes.
+    "VLLM_METAL_TOOLSPEC_CAPACITY": lambda: int(
+        os.getenv("VLLM_METAL_TOOLSPEC_CAPACITY", "512")
+    ),
+    # How many similar past invocations to n-gram search per drafting step.
+    # Larger values search more traces for a match at proportional CPU cost.
+    "VLLM_METAL_TOOLSPEC_TOP_K": lambda: int(
+        os.getenv("VLLM_METAL_TOOLSPEC_TOP_K", "4")
+    ),
+    # Suffix-match needle window, longest tried first (ToolSpec's 7..5).
+    # Needles below 5 tokens match almost anything in JSON-shaped text and
+    # mostly produce rejected drafts.
+    "VLLM_METAL_TOOLSPEC_NGRAM_MAX": lambda: int(
+        os.getenv("VLLM_METAL_TOOLSPEC_NGRAM_MAX", "7")
+    ),
+    "VLLM_METAL_TOOLSPEC_NGRAM_MIN": lambda: int(
+        os.getenv("VLLM_METAL_TOOLSPEC_NGRAM_MIN", "5")
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
