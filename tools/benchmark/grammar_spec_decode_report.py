@@ -110,12 +110,22 @@ def _timed_pass(
     *,
     repeats: int,
     capture_tokens: bool,
+    sequential: bool = False,
 ) -> dict[str, Any]:
     """Run ``repeats`` identical generate() calls and summarise them.
 
     Only the last repeat's token ids are kept: under greedy sampling with a
     fixed seed every repeat emits the same ids, so keeping one is enough for
     the baseline-vs-grammar equality check and keeps the JSON small.
+
+    ``sequential`` issues each prompt as its own ``generate()`` call instead of
+    one batch. That exists for the ToolSpec arm and is the only setup in which
+    retrieval can be measured honestly: its memory is populated by requests that
+    have *finished*, so inside a single batch it is necessarily empty, and
+    replaying one batch under ``--repeats`` would instead have it retrieve each
+    prompt's own previous output -- memorisation, not generalisation. Timing is
+    the sum over the sequence, so tokens/s stays comparable with the batched
+    arms at the same batch size of 1.
     """
     elapsed: list[float] = []
     output_tokens = 0
@@ -124,7 +134,12 @@ def _timed_pass(
 
     for _ in range(repeats):
         start = time.perf_counter()
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+        if sequential:
+            outputs = []
+            for prompt in prompts:
+                outputs.extend(llm.generate([prompt], sampling_params, use_tqdm=False))
+        else:
+            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
         elapsed.append(time.perf_counter() - start)
         prompt_tokens, output_tokens, samples = summarize_outputs(
             outputs, include_text=False
@@ -176,6 +191,17 @@ def _prom_metrics(llm: Any) -> dict[str, Any]:
 SCHEMA = "vllm-metal.grammar-spec-decode-report/1"
 
 PROPOSER_PATH = "vllm_metal.v1.grammar_proposer.GrammarProposer"
+# The ToolSpec port: the same grammar drafting plus retrieval over past
+# invocations, so the two arms isolate exactly what retrieval adds.
+TOOLSPEC_PROPOSER_PATH = "vllm_metal.v1.toolspec_proposer.ToolSpecProposer"
+
+# Arms compared against baseline in the report. n-gram is the control that
+# matters most: it is already in-tree, so a new proposer has to beat it and
+# not merely the baseline.
+COMPARED_ARMS = ("ngram", "grammar", "toolspec")
+# Arms backed by this repo's own proposers, whose per-step counters the
+# coverage/cost tables read. n-gram keeps different counters.
+PROPOSER_ARMS = ("grammar", "toolspec")
 
 # A tool-call-shaped schema: a fixed skeleton the grammar determines, an enum
 # the model picks from, and a free string it writes itself. The mix is the
@@ -241,11 +267,27 @@ def _drafter_stats(llm: Any) -> dict[str, Any]:
     stats = getattr(drafter, "stats", None)
     if stats is None:
         return {"available": False, "reason": "no drafter with stats in this process"}
-    return {
+    record = {
         "available": True,
         "class": type(drafter).__name__,
         **{key: getattr(stats, key) for key in vars(stats)},
     }
+    # ToolSpecProposer composes a GrammarProposer and a RetrievalStore, each
+    # with its own counters. Nesting them keeps the top level comparable with
+    # the `grammar` arm while still recording which half did the drafting.
+    inner = getattr(drafter, "_grammar", None)
+    if inner is not None and getattr(inner, "stats", None) is not None:
+        record["grammar_half"] = {
+            key: getattr(inner.stats, key) for key in vars(inner.stats)
+        }
+    store = getattr(drafter, "store", None)
+    if store is not None and getattr(store, "stats", None) is not None:
+        record["retrieval_store"] = {
+            "size": len(store),
+            "capacity": store.capacity,
+            **{key: getattr(store.stats, key) for key in vars(store.stats)},
+        }
+    return record
 
 
 def _llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -274,6 +316,14 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["speculative_config"] = {
             "method": "custom_class",
             "model": PROPOSER_PATH,
+            "num_speculative_tokens": args.num_speculative_tokens,
+        }
+    elif args.arm == "toolspec":
+        # Same K and same grammar half as the `grammar` arm, so the difference
+        # between the two is retrieval and nothing else.
+        kwargs["speculative_config"] = {
+            "method": "custom_class",
+            "model": TOOLSPEC_PROPOSER_PATH,
             "num_speculative_tokens": args.num_speculative_tokens,
         }
     elif args.arm == "ngram":
@@ -308,11 +358,30 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     if args.schema_file is not None:
         schema = json.loads(Path(args.schema_file).read_text())
 
-    raw_prompts = select_prompts(
-        batch_size=args.batch_size,
-        prompts=args.prompt or list(DEFAULT_PROMPTS),
-        prompt_file=args.prompt_file,
-    )
+    # In sequential mode the prompts are a *stream* of distinct requests rather
+    # than one batch, so the count comes from --num-prompts and they must not be
+    # cycled: repeating a prompt would let retrieval match a request against its
+    # own earlier output.
+    if args.sequential:
+        raw_prompts = select_prompts(
+            batch_size=args.num_prompts,
+            prompts=args.prompt or list(DEFAULT_PROMPTS),
+            prompt_file=args.prompt_file,
+        )
+        distinct = len(dict.fromkeys(raw_prompts))
+        if distinct < len(raw_prompts):
+            raise SystemExit(
+                f"--sequential needs {len(raw_prompts)} distinct prompts but the "
+                f"source has only {distinct}. Retrieval measured over repeated "
+                "prompts is memorisation, not generalisation -- supply a larger "
+                "--prompt-file or lower --num-prompts."
+            )
+    else:
+        raw_prompts = select_prompts(
+            batch_size=args.batch_size,
+            prompts=args.prompt or list(DEFAULT_PROMPTS),
+            prompt_file=args.prompt_file,
+        )
 
     load_start = time.perf_counter()
     llm = LLM(**_llm_kwargs(args))
@@ -335,13 +404,32 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     schema_json = json.dumps(schema)
 
     def params(max_tokens: int) -> Any:
+        # --no-schema is the unconstrained control: no grammar at all, which is
+        # what ordinary chat traffic looks like. The grammar half must draft
+        # nothing there and the step must stay on Metal's one-row decode fast
+        # path, so this arm's job is to come out at 1.00x rather than fast.
         return SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
             ignore_eos=args.ignore_eos,
-            structured_outputs=StructuredOutputsParams(json=schema_json),
+            structured_outputs=(
+                None
+                if args.no_schema
+                else StructuredOutputsParams(json=schema_json)
+            ),
         )
 
+    if args.sequential and (args.warmup or args.repeats != 1):
+        # Any second pass over the measured prompts leaves each one's own
+        # output in the retrieval memory, and the next pass then "retrieves" it
+        # verbatim. That is a memorisation number, not a generalisation one, so
+        # it is refused rather than footnoted. Run the whole process repeatedly
+        # and compare the JSONs for a noise estimate instead.
+        raise SystemExit(
+            "--sequential requires --warmup 0 --repeats 1: a second pass over "
+            "the measured prompts pre-loads the retrieval memory with their "
+            "own outputs. Re-run the process for repeat measurements."
+        )
     for _ in range(args.warmup):
         llm.generate(prompts, params(args.max_tokens), use_tqdm=False)
 
@@ -349,13 +437,23 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     stats_before = _drafter_stats(llm)
 
     ttft = _timed_pass(
-        llm, prompts, params(1), repeats=args.repeats, capture_tokens=False
+        llm,
+        prompts,
+        params(1),
+        repeats=args.repeats,
+        capture_tokens=False,
+        sequential=args.sequential,
     )
     # Counters are sampled around the full pass only, so warmup and the TTFT
     # pass do not pollute the per-step drafter numbers.
     mid = _drafter_stats(llm)
     full = _timed_pass(
-        llm, prompts, params(args.max_tokens), repeats=args.repeats, capture_tokens=True
+        llm,
+        prompts,
+        params(args.max_tokens),
+        repeats=args.repeats,
+        capture_tokens=True,
+        sequential=args.sequential,
     )
     after = _drafter_stats(llm)
 
@@ -377,10 +475,12 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
     peak_rss = _peak_rss_bytes()
 
     ttft_s = ttft["mean_elapsed_s"]
+    # Batched mode decodes one step for the whole batch at a time, so a pass is
+    # (max_tokens - 1) steps regardless of batch size. Sequential mode runs the
+    # prompts end to end, so a pass is that many steps *per prompt*.
+    decode_steps = (args.max_tokens - 1) * (len(prompts) if args.sequential else 1)
     tpot_s = (
-        (full["mean_elapsed_s"] - ttft_s) / (args.max_tokens - 1)
-        if args.max_tokens > 1
-        else None
+        (full["mean_elapsed_s"] - ttft_s) / decode_steps if decode_steps > 0 else None
     )
 
     # _timed_pass keeps token ids but not text, so decode here rather than
@@ -416,6 +516,10 @@ def run_one(args: argparse.Namespace) -> dict[str, Any]:
             "warmup": args.warmup,
             "repeats": args.repeats,
             "chat_template_applied": bool(args.chat),
+            "sequential": bool(args.sequential),
+            # In sequential mode this is the length of the prompt stream, which
+            # is what a run is actually made of; batch_size stays 1.
+            "num_prompts": len(prompts) if args.sequential else args.batch_size,
         },
         "json_schema": schema,
         "environment": {
@@ -572,9 +676,7 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
             continue
         b_tpot = base["latency"]["tpot_s"]
         add(f"| {batch} | baseline | {_ms(b_tpot)} | 1.00x | — |")
-        # n-gram is the control that matters: it is already in-tree, so a
-        # grammar-forced proposer has to beat it, not just the baseline.
-        for arm in ("ngram", "grammar"):
+        for arm in COMPARED_ARMS:
             spec = by_key.get((arm, batch))
             if not spec or not spec["latency"]["tpot_s"]:
                 continue
@@ -589,22 +691,22 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
     add("## Speculation quality")
     add("")
     add(
-        "| Batch | Step coverage | Tokens/draft | Tokens from drafts | "
+        "| Batch | Arm | Step coverage | Tokens/draft | Tokens from drafts | "
         "Acceptance | #MAT | Altered | Truncated | Rejected |"
     )
-    add("|---|---|---|---|---|---|---|---|---|")
+    add("|---|---|---|---|---|---|---|---|---|---|")
     for record in records:
-        if record["mode"] != "grammar":
+        if record["mode"] not in PROPOSER_ARMS:
             continue
         cov = _coverage(record)
         if not cov.get("available"):
             add(
-                f"| {record['config']['batch_size']} | n/a | n/a | n/a | n/a "
-                "| n/a | n/a | n/a | n/a |"
+                f"| {record['config']['batch_size']} | {record['mode']} | n/a "
+                "| n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
             )
             continue
         add(
-            f"| {record['config']['batch_size']} | "
+            f"| {record['config']['batch_size']} | {record['mode']} | "
             f"{cov['coverage'] * 100:.0f}% ({cov['steps_drafted']}/"
             f"{cov['steps_eligible']}) | {cov['tokens_per_draft']:.2f} | "
             f"**{cov['token_share'] * 100:.0f}%** | "
@@ -614,6 +716,12 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
         )
     add("")
     add(
+        "On the `toolspec` row these counters describe the **retrieval half "
+        "only** -- its grammar half keeps its own, nested under "
+        "`drafter.cumulative.grammar_half` in the JSON. Retrieval acceptance is "
+        "expected to be far lower than the grammar's: a grammar draft is legal "
+        "by construction, a retrieved one is a guess. The arm's speedup is what "
+        "the two produce together.\n\n"
         "*Step coverage* is the share of decode steps that drafted anything; "
         "*tokens from drafts* is the share of emitted tokens that came from a "
         "draft rather than their own forward. The second is the number that "
@@ -647,7 +755,7 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
     )
     add("|---|---|---|---|---|---|")
     for record in records:
-        if record["mode"] != "grammar":
+        if record["mode"] not in PROPOSER_ARMS:
             continue
         cov = _coverage(record)
         prom = record["drafter"].get("prometheus", {})
@@ -687,7 +795,7 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
     add("| Batch | propose() | % of wall | Draft walk | Compiles | Vocab table |")
     add("|---|---|---|---|---|---|")
     for record in records:
-        if record["mode"] != "grammar":
+        if record["mode"] not in PROPOSER_ARMS:
             continue
         cumulative = record["drafter"].get("cumulative", {})
         if not cumulative.get("available"):
@@ -723,7 +831,7 @@ def render_markdown(records: Sequence[dict[str, Any]], notes: Sequence[str]) -> 
         if not base:
             continue
         base_ids = [o["token_ids"] for o in base["latency"]["full_pass"]["outputs"]]
-        for arm in ("ngram", "grammar"):
+        for arm in COMPARED_ARMS:
             spec = by_key.get((arm, batch))
             if not spec:
                 continue
@@ -790,10 +898,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model", required=True)
     run.add_argument(
         "--arm",
-        choices=("baseline", "ngram", "grammar"),
+        choices=("baseline", "ngram", "grammar", "toolspec"),
         default="baseline",
-        help="which drafter to run: none, the in-tree n-gram proposer, or the "
-        "grammar-forced one",
+        help="which drafter to run: none, the in-tree n-gram proposer, the "
+        "grammar-forced one, or the ToolSpec port (grammar + retrieval)",
     )
     run.add_argument(
         "--grammar",
@@ -802,7 +910,28 @@ def build_parser() -> argparse.ArgumentParser:
         const="grammar",
         help="alias for --arm grammar",
     )
+    run.add_argument(
+        "--toolspec",
+        dest="arm",
+        action="store_const",
+        const="toolspec",
+        help="alias for --arm toolspec",
+    )
     run.add_argument("--batch-size", type=_positive_int, default=1)
+    run.add_argument(
+        "--sequential",
+        action="store_true",
+        help="issue --num-prompts distinct prompts one at a time instead of one "
+        "batch. Required to measure the toolspec arm: retrieval draws on "
+        "requests that have already finished, so within a single batch its "
+        "memory is empty by construction.",
+    )
+    run.add_argument(
+        "--num-prompts",
+        type=_positive_int,
+        default=16,
+        help="how many distinct prompts to stream in --sequential mode",
+    )
     run.add_argument("--max-tokens", type=_positive_int, default=64)
     run.add_argument("--max-model-len", type=_positive_int, default=1024)
     run.add_argument("--max-num-batched-tokens", type=_positive_int, default=None)
@@ -812,8 +941,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dtype", default="auto")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--prompt", action="append", default=None)
-    run.add_argument("--prompt-file", default=None)
+    # select_prompts calls .read_text() on this, so it has to arrive as a Path
+    # (gemma4_mtp_benchmark.py, which owns the loader, declares it that way).
+    run.add_argument(
+        "--prompt-file", default=None, type=Path, help="one prompt per line"
+    )
     run.add_argument("--schema-file", default=None, help="JSON schema to constrain to")
+    run.add_argument(
+        "--no-schema",
+        action="store_true",
+        help="send unconstrained requests (no grammar at all). The control arm: "
+        "the proposer must draft nothing and cost nothing on ordinary chat "
+        "traffic, which is what the sonnet run measures.",
+    )
     run.add_argument("--chat", action="store_true", help="apply the chat template")
     run.add_argument(
         "--no-thinking",

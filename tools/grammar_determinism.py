@@ -49,10 +49,12 @@ opt-in; ``--mode tools`` here measures the enforced case.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import pathlib
 import random
+import re
 import statistics
 from typing import Any
 
@@ -203,6 +205,131 @@ def load_bfcl_items(args: argparse.Namespace) -> list[dict[str, Any]]:
                 for fn in functions
             ]
             items.append({"id": entry.get("id"), "prompt": content, "tools": tools})
+    return items
+
+
+# API-Bank as ToolSpec distributes it (`data/API-Bank/level-*-api_processed.json`)
+# does not ship structured tool definitions at all: the tools are prose inside the
+# system prompt, which is why ToolSpec's own schema_fsm.py has to scrape them back
+# out. The corpus uses two layouts, and handling only the labelled one silently
+# drops 131 of 597 entries:
+#
+#     1. Name: QueryHealthData                 1. QueryMeeting: The API for ...
+#     Description: This API queries ...        Parameters: {'user_name': {...}}
+#     Parameters: {'user_id': {...}}
+#
+# The parameter dict is a Python literal on a single line in both. The labelled
+# alternative is tried first, so `1. Name: X` is never mis-read as a tool
+# literally called "Name".
+_APIBANK_TOOL_RE = re.compile(
+    r"\d+\.[ \t]*"
+    r"(?:Name:[ \t]*(?P<name_labelled>[^\n]+)\n"
+    r"Description:[ \t]*(?P<description_labelled>[^\n]*)\n"
+    r"|(?P<name_inline>[A-Za-z_]\w*)[ \t]*:[ \t]*(?P<description_inline>[^\n]*)\n)"
+    r"Parameters:[ \t]*(?P<parameters>\{[^\n]*\})"
+)
+
+# API-Bank spells types as Python builtins rather than JSON Schema names.
+_APIBANK_TYPES = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+    "tuple": "array",
+}
+
+
+def _apibank_parameters(literal: str) -> dict[str, Any] | None:
+    """Turn one API-Bank ``Parameters:`` literal into a JSON Schema object."""
+    try:
+        raw = ast.literal_eval(literal)
+    except (ValueError, SyntaxError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    properties: dict[str, Any] = {}
+    for param, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        declared = str(spec.get("type", "str"))
+        prop: dict[str, Any] = {
+            "type": _APIBANK_TYPES.get(declared, "string"),
+            "description": str(spec.get("description", "")),
+        }
+        if prop["type"] == "array":
+            # xgrammar needs an item type; the corpus does not give one.
+            prop["items"] = {"type": "string"}
+        properties[str(param)] = prop
+    # An empty `Parameters: {}` is a real zero-argument tool, not a parse
+    # failure, and it is the *most* determined case there is -- the whole call
+    # is forced text. Only a literal that would not parse returns None above.
+    return {
+        "type": "object",
+        "properties": properties,
+        # API-Bank's ground truth fills every documented parameter, and a
+        # structural tag over an all-optional object forces almost nothing.
+        "required": sorted(properties),
+    }
+
+
+def load_api_bank_items(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Load (prompt, tools) pairs from ToolSpec's processed API-Bank files.
+
+    API-Bank is the corpus ToolSpec itself evaluates on, and unlike BFCL its
+    entries are *multi-turn*: each carries a dialogue history and the tools
+    recur across entries drawn from the same scenario file. That recurrence is
+    the thing retrieval-augmented drafting exists to exploit, so a BFCL-only
+    measurement understates it.
+
+    Like BFCL, the corpus is not grammar-constrained as distributed, so
+    ``strict`` is forced on to measure the enforced case.
+    """
+    items: list[dict[str, Any]] = []
+    for path in args.api_bank_file:
+        payload = json.loads(pathlib.Path(path).read_text())
+        if isinstance(payload, dict):
+            payload = [payload]
+        for entry in payload:
+            system = entry.get("system") or ""
+            prompt = entry.get("user") or ""
+            if not system or not prompt:
+                continue
+            tools = []
+            for match in _APIBANK_TOOL_RE.finditer(system):
+                parameters = _apibank_parameters(match.group("parameters"))
+                if parameters is None:
+                    continue
+                name = match.group("name_labelled") or match.group("name_inline")
+                description = (
+                    match.group("description_labelled")
+                    if match.group("name_labelled")
+                    else match.group("description_inline")
+                )
+                tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name.strip(),
+                            "description": (description or "").strip(),
+                            # On the function, not the tool wrapper -- see
+                            # load_bfcl_items.
+                            "strict": True,
+                            "parameters": parameters,
+                        },
+                    }
+                )
+            if not tools:
+                continue
+            other = entry.get("other") or {}
+            items.append(
+                {
+                    "id": f"{other.get('file', path)}#{other.get('id', len(items))}",
+                    "prompt": prompt,
+                    "tools": tools,
+                }
+            )
     return items
 
 
@@ -437,6 +564,22 @@ def main() -> int:
         "Each entry brings its own tools, so each compiles to its own "
         "grammar -- a real corpus rather than one hand-written schema.",
     )
+    parser.add_argument(
+        "--api-bank-file",
+        action="append",
+        default=[],
+        help="API-Bank json file in ToolSpec's processed layout (repeatable). "
+        "Multi-turn, and tools recur across entries from the same scenario, "
+        "which is what retrieval-augmented drafting exploits and what BFCL's "
+        "single-turn entries do not show.",
+    )
+    parser.add_argument(
+        "--emit-prompts",
+        default=None,
+        help="write the selected corpus prompts, one per line, to this path and "
+        "exit without generating. Feeds the benchmark harness's --prompt-file "
+        "so the speedup arms run on the same corpus this tool measures.",
+    )
     parser.add_argument("--output-json", default=None)
     args = parser.parse_args()
 
@@ -450,13 +593,13 @@ def main() -> int:
     items: list[dict[str, Any]] | None = None
     skipped_uncompilable = 0
 
-    if args.bfcl_file:
+    if args.bfcl_file or args.api_bank_file:
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionToolsParam,
         )
         from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
 
-        entries = load_bfcl_items(args)
+        entries = load_bfcl_items(args) + load_api_bank_items(args)
         random.Random(0).shuffle(entries)
         items = []
         for entry in entries:
@@ -480,10 +623,23 @@ def main() -> int:
                 continue
             items.append(entry)
         if not items:
-            raise SystemExit("no BFCL entries produced a usable structural tag")
+            raise SystemExit("no corpus entries produced a usable structural tag")
         kind, spec = "structural_tag", items[0]["spec"]
     else:
         kind, spec = build_grammar_spec(args, raw_tools)
+
+    if args.emit_prompts:
+        # The benchmark harness reads one prompt per line, and API-Bank's
+        # dialogue histories are multi-line, so newlines are folded to spaces.
+        source = (
+            [entry["prompt"] for entry in items]
+            if items is not None
+            else list(DEFAULT_PROMPTS)[: args.num_prompts]
+        )
+        lines = [" ".join(prompt.split()) for prompt in source]
+        pathlib.Path(args.emit_prompts).write_text("\n".join(lines) + "\n")
+        print(f"wrote {len(lines)} prompts to {args.emit_prompts}")
+        return 0
 
     generated = generate_traces(args, kind, spec, raw_tools, items)
     stats = analyse(
