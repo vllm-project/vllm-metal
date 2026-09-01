@@ -13,6 +13,10 @@ for method behavior and configuration details.
 | Additional model weights | Assistant checkpoint | Draft model | None | None |
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None | None; one xgrammar matcher per request |
 
+Grammar-forced drafting has a second variant, `ToolSpecProposer`, that adds
+retrieval over past invocations to cover the values the grammar cannot force.
+See [Retrieval-augmented drafting](#retrieval-augmented-drafting-toolspec).
+
 All four methods currently have these Metal-specific constraints:
 
 - Only greedy requests (`temperature=0`) are drafted. Other requests run
@@ -243,6 +247,79 @@ Confirm it is active: the server log shows
   speculative method: `SpeculativeDecodeController.validate_supported` raises as
   soon as any draft is scheduled. Qwen3.5-0.8B is one such model, so it cannot use
   this (or n-gram, or draft-model) speculative decoding at all.
+
+### Retrieval-augmented drafting (ToolSpec)
+
+The grammar drafts structure and stops at every value, so its ceiling is however
+much of the output the schema fixes — 50% of emitted tokens over the BFCL corpus.
+The other half is argument *content*. `ToolSpecProposer` is the Metal port of
+ToolSpec ([arXiv 2604.13519](https://arxiv.org/abs/2604.13519)), which attacks
+that half: tool-calling traffic repeats itself, so a value some earlier
+invocation produced is a reasonable guess for the one being generated now.
+
+It composes the grammar proposer rather than replacing it. Each finished request
+contributes its output to a bounded per-worker memory, keyed by the target's
+hidden state at the last prompt token; a later request retrieves the most
+similar traces by cosine similarity and n-gram suffix-matches its own output
+against them. The grammar drafts first — its draft is legal by construction —
+and retrieval fills only the steps the grammar left empty.
+
+Swap the class; everything else is identical to the grammar arm:
+
+```bash
+VLLM_METAL_USE_PAGED_ATTENTION=1 \
+  vllm serve Qwen/Qwen3-8B \
+    --max-model-len 2048 \
+    --no-async-scheduling \
+    --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+    --speculative-config '{"method":"custom_class","model":"vllm_metal.v1.toolspec_proposer.ToolSpecProposer","num_speculative_tokens":8}'
+```
+
+Tuned with `VLLM_METAL_TOOLSPEC_CAPACITY` (memory size, default 512),
+`_TOP_K` (traces searched per step, 4) and `_NGRAM_MIN`/`_NGRAM_MAX` (suffix
+window, 5–7). See [configuration](configuration.md).
+
+Measured on an M4 Pro, Qwen3-0.6B, 32 sequential requests, greedy, K=8. Every
+arm reproduces plain greedy token-for-token
+(`tools/test_grammar_spec_decode_e2e.py`):
+
+| Workload | baseline TPOT | grammar | +retrieval |
+|---|---|---|---|
+| API-Bank tool calls | 6.6 ms | 5.3 ms (**1.26x**) | 5.1 ms (**1.31x**) |
+| Sonnet under a JSON schema | 7.4 ms | 7.1 ms (1.05x) | 6.7 ms (**1.11x**) |
+| Sonnet, no grammar | 7.1 ms | 7.0 ms (1.01x) | 7.1 ms (1.00x) |
+
+Retrieval helps most where the *content* is free but the request is still
+structured — the schema'd sonnet row nearly doubles the grammar's gain, because
+that workload is mostly free text inside a small envelope. It is measured
+sequentially on purpose: the memory holds requests that have already finished,
+so within a single batch it is empty by construction, and replaying one batch
+would have it retrieve each prompt's own previous output.
+
+The last row is the one to check before enabling this. Unstructured traffic must
+not pay for a feature it cannot use, and it does not: zero drafts, and TPOT
+within noise of baseline.
+
+#### Limitations
+
+- **Linear drafts, not trees.** ToolSpec drafts a *tree* of candidates and
+  verifies it with tree attention. Metal's verify half is linear and shared with
+  the MTP and draft-model proposers, so this port takes the single best
+  candidate. Part of the paper's headline speedup comes from tree breadth, so
+  this does not reproduce it.
+- **Retrieval only pays across requests that resemble each other.** Single-turn,
+  mutually unrelated traffic stores traces nothing later matches. The searching
+  is throttled after a streak of misses (the same back-off
+  `NgramProposer` uses), which is what keeps the no-grammar row at 1.00x —
+  without it, searching and finding nothing cost about 1%.
+- **The memory is shared across requests**: one request's output can seed
+  another's draft. Verification is unchanged, so this changes what is *guessed*,
+  never what is *emitted*. It is a drafting cache, held per worker and never
+  persisted.
+- Retrieval acceptance is much lower than the grammar's (27% against 67% on
+  API-Bank) and that is expected — a grammar draft is legal by construction, a
+  retrieved one is a guess. It still wins because the drafts it does land are
+  long (7.0 tokens against 4.4).
 
 ## Benchmarking
 
