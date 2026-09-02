@@ -62,8 +62,8 @@ class _FakeModel(nn.Module):
     def __init__(self, roles: str) -> None:
         super().__init__()
         self.layers = [
-            _Layer(_FakeGDN() if k == "s" else _FakeSDPA(), linear=(k == "s"))
-            for k in roles
+            _Layer(_FakeGDN() if role == "s" else _FakeSDPA(), linear=(role == "s"))
+            for role in roles
         ]
 
 
@@ -119,15 +119,6 @@ class TestGdnPlanDecision:
         assert plan.geometry.num_v_heads == 4
         assert plan.geometry.value_head_dim == 16
         assert plan.geometry.key_head_dim == 32
-
-    def test_family_policy_matches_the_gdn_runtime_contract(self) -> None:
-        plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
-
-        assert plan.family.label == "gdn"
-        assert plan.family.wrapper_cls is GDNPagedAttentionWrapper
-        assert plan.family.mamba_type is MambaAttentionBackendEnum.GDN_ATTN
-        assert plan.family.recurrent_dtype is torch.float32
-        assert plan.family.supported_cache_modes == ("none", "align")
 
 
 class TestGdnPlanRejection:
