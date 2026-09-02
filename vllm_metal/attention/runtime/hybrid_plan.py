@@ -19,10 +19,10 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 
-LayerKind: TypeAlias = Literal["attention", "state"]
+LayerRole: TypeAlias = Literal["attention", "state"]
 
-ATTENTION_LAYER: LayerKind = "attention"
-STATE_LAYER: LayerKind = "state"
+ATTENTION_LAYER: LayerRole = "attention"
+STATE_LAYER: LayerRole = "state"
 
 
 class PagedStateWrapper(Protocol):
@@ -45,23 +45,27 @@ class PagedStateWrapper(Protocol):
 class HybridLayerPlan:
     """Which model layers own paged attention KV pages and which own state.
 
-    ``kinds`` is the single source of truth; index tuples and counts are
-    derived from it on access.
+    ``layer_roles`` is the single source of truth; index tuples and counts
+    are derived from it on access.
     """
 
-    kinds: tuple[LayerKind, ...]
+    layer_roles: tuple[LayerRole, ...]
 
     def __post_init__(self) -> None:
-        if not self.kinds:
+        if not self.layer_roles:
             raise ValueError("hybrid layer plan requires at least one layer")
 
     @property
     def attention_indices(self) -> tuple[int, ...]:
-        return tuple(i for i, kind in enumerate(self.kinds) if kind == ATTENTION_LAYER)
+        return tuple(
+            i for i, role in enumerate(self.layer_roles) if role == ATTENTION_LAYER
+        )
 
     @property
     def state_indices(self) -> tuple[int, ...]:
-        return tuple(i for i, kind in enumerate(self.kinds) if kind == STATE_LAYER)
+        return tuple(
+            i for i, role in enumerate(self.layer_roles) if role == STATE_LAYER
+        )
 
     @property
     def num_attention(self) -> int:
@@ -71,14 +75,14 @@ class HybridLayerPlan:
     def num_state(self) -> int:
         return len(self.state_indices)
 
-    def layer_kind(self, layer_idx: int) -> LayerKind:
-        """Return the kind owning ``layer_idx``; consumers dispatch on it."""
-        if not 0 <= layer_idx < len(self.kinds):
+    def layer_role(self, layer_idx: int) -> LayerRole:
+        """Return the role owning ``layer_idx``; consumers dispatch on it."""
+        if not 0 <= layer_idx < len(self.layer_roles):
             raise ValueError(
-                f"hybrid layer plan covers layers 0..{len(self.kinds) - 1}, "
+                f"hybrid layer plan covers layers 0..{len(self.layer_roles) - 1}, "
                 f"got layer {layer_idx}"
             )
-        return self.kinds[layer_idx]
+        return self.layer_roles[layer_idx]
 
     def attention_cache_index(self, layer_idx: int) -> int:
         """Return the compact KV cache ordinal owned by an attention layer."""
@@ -89,13 +93,13 @@ class HybridLayerPlan:
         return self._cache_index(self.state_indices, layer_idx, STATE_LAYER)
 
     @staticmethod
-    def _cache_index(indices: tuple[int, ...], layer_idx: int, kind: LayerKind) -> int:
+    def _cache_index(indices: tuple[int, ...], layer_idx: int, role: LayerRole) -> int:
         try:
             return indices.index(layer_idx)
         except ValueError:
             raise ValueError(
-                f"hybrid layer plan has no {kind} cache index for layer "
-                f"{layer_idx}; {kind} layers are {indices}"
+                f"hybrid layer plan has no {role} cache index for layer "
+                f"{layer_idx}; {role} layers are {indices}"
             ) from None
 
 

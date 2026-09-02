@@ -59,11 +59,11 @@ class _Layer(nn.Module):
 
 
 class _FakeModel(nn.Module):
-    def __init__(self, kinds: str) -> None:
+    def __init__(self, roles: str) -> None:
         super().__init__()
         self.layers = [
             _Layer(_FakeGDN() if k == "s" else _FakeSDPA(), linear=(k == "s"))
-            for k in kinds
+            for k in roles
         ]
 
 
@@ -99,7 +99,7 @@ class TestGdnPlanDecision:
         assert plan.layers.state_indices == (0, 1, 2, 4, 5, 6)
         assert plan.layers.num_attention == 2
         assert plan.layers.num_state == 6
-        assert plan.layers.kinds == (
+        assert plan.layers.layer_roles == (
             STATE_LAYER,
             STATE_LAYER,
             STATE_LAYER,
@@ -148,13 +148,13 @@ class TestGdnPlanRejection:
 
 
 class TestLayerPlanDispatch:
-    def test_layer_kind_rejects_out_of_range_layers(self) -> None:
+    def test_layer_role_rejects_out_of_range_layers(self) -> None:
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
 
         with pytest.raises(ValueError, match="got layer 8"):
-            plan.layers.layer_kind(8)
+            plan.layers.layer_role(8)
 
-    def test_cache_index_rejects_the_wrong_kind(self) -> None:
+    def test_cache_index_rejects_the_wrong_role(self) -> None:
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
 
         with pytest.raises(ValueError, match="no attention cache index for layer 0"):

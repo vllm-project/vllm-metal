@@ -19,7 +19,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     STATE_LAYER,
     HybridLayerPlan,
     HybridRuntimePlan,
-    LayerKind,
+    LayerRole,
     RecurrentStateGeometry,
     StateFamilySpec,
 )
@@ -73,27 +73,27 @@ def build_gdn_hybrid_plan(
     model_args: Mapping[str, Any], num_layers: int
 ) -> HybridRuntimePlan:
     """Resolve GDN layer topology and recurrent geometry from model args."""
-    config = GDNHybridConfig.from_model_args(model_args)
+    gdn_config = GDNHybridConfig.from_model_args(model_args)
     if num_layers <= 0:
         raise ValueError(
             f"GDN hybrid requires a positive layer count, got {num_layers}."
         )
-    kinds: tuple[LayerKind, ...] = tuple(
+    layer_roles: tuple[LayerRole, ...] = tuple(
         ATTENTION_LAYER
-        if (i + 1) % config.full_attention_interval == 0
+        if (i + 1) % gdn_config.full_attention_interval == 0
         else STATE_LAYER
         for i in range(num_layers)
     )
     return HybridRuntimePlan(
-        layers=HybridLayerPlan(kinds=kinds),
+        layers=HybridLayerPlan(layer_roles=layer_roles),
         family=_GDN_FAMILY,
         geometry=RecurrentStateGeometry(
-            conv_kernel_dim=config.conv_kernel_dim,
+            conv_kernel_dim=gdn_config.conv_kernel_dim,
             # GDN packs q/k at key_dim and v at value_dim into one conv stream.
-            conv_dim=config.num_key_heads * config.key_head_dim * 2
-            + config.num_value_heads * config.value_head_dim,
-            num_v_heads=config.num_value_heads,
-            value_head_dim=config.value_head_dim,
-            key_head_dim=config.key_head_dim,
+            conv_dim=gdn_config.num_key_heads * gdn_config.key_head_dim * 2
+            + gdn_config.num_value_heads * gdn_config.value_head_dim,
+            num_v_heads=gdn_config.num_value_heads,
+            value_head_dim=gdn_config.value_head_dim,
+            key_head_dim=gdn_config.key_head_dim,
         ),
     )

@@ -243,11 +243,11 @@ def make_gdn_hybrid_plan(
 ) -> HybridRuntimePlan:
     """Build a GDN hybrid plan with explicit topology and geometry."""
     attention = frozenset(attention_indices)
-    kinds = tuple(
+    layer_roles = tuple(
         ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
     )
     return HybridRuntimePlan(
-        layers=HybridLayerPlan(kinds=kinds),
+        layers=HybridLayerPlan(layer_roles=layer_roles),
         family=_GDN_FAMILY_SPEC,
         geometry=RecurrentStateGeometry(
             conv_kernel_dim=conv_kernel_dim,

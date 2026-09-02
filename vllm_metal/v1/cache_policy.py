@@ -379,7 +379,7 @@ class ModelCachePolicy:
         hybrid_plan = self._hybrid_plan() if self._runner.is_hybrid else None
         for layer_idx in range(num_spec_layers):
             layer_role = (
-                hybrid_plan.layers.layer_kind(layer_idx)
+                hybrid_plan.layers.layer_role(layer_idx)
                 if hybrid_plan is not None
                 else None
             )
