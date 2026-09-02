@@ -376,70 +376,99 @@ class ModelCachePolicy:
             num_spec_layers, _ = self._runner._yoco_cache_mapping
         specs: dict[str, KVCacheSpec] = {}
         use_deferred_mha_layout = self._uses_deferred_mha_layout()
-        hybrid_plan = self._hybrid_plan() if self._runner.is_hybrid else None
-        for layer_idx in range(num_spec_layers):
-            layer_role = (
-                hybrid_plan.layers.layer_role(layer_idx)
-                if hybrid_plan is not None
-                else None
+
+        def attention_spec(layer_idx: int) -> KVCacheSpec:
+            return self._attention_layer_spec(
+                layer_idx,
+                block_size=block_size,
+                num_kv_heads=kv_heads[layer_idx],
+                head_dim=head_dims[layer_idx],
+                torch_dtype=torch_dtype,
+                use_turboquant=use_turboquant,
+                config=config,
+                use_deferred_mha_layout=use_deferred_mha_layout,
             )
-            if hybrid_plan is not None and layer_role == STATE_LAYER:
-                layer_name = f"layers.{layer_idx}.linear_attn"
-                cache_config = self._runner.cache_config
-                mamba_block_size = cache_config.mamba_block_size
-                # Upstream resolves this during config setup and asserts it here.
-                assert mamba_block_size is not None
-                specs[layer_name] = hybrid_plan.state_cache_spec(
-                    conv_dtype=torch_dtype,
-                    mamba_block_size=mamba_block_size,
-                    page_size_padded=cache_config.mamba_page_size_padded,
-                    mamba_cache_mode=cache_config.mamba_cache_mode,
-                )
-            elif use_turboquant:
-                layer_name = f"layers.{layer_idx}.self_attn"
-                specs[layer_name] = _build_turboquant_attention_spec(
-                    block_size=block_size,
-                    num_kv_heads=self._runner.num_kv_heads,
-                    head_dim=self._runner.head_dim,
-                    k_quant=config.k_quant,
-                    v_quant=config.v_quant,
-                )
-            else:
-                layer_name = f"layers.{layer_idx}.self_attn"
-                # MLA caches a single latent tensor per layer, not separate K
-                # and V (see ``MLAPagedLatentCache``), which is why
-                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` bakes
-                # the 2x K/V factor into ``page_size_bytes`` (head_size +
-                # head_size_v), so describing MLA with it makes the engine
-                # halve the block count it plans against relative to the pool
-                # actually allocated.
-                if self._runner.is_mla:
-                    specs[layer_name] = MLAAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=kv_heads[layer_idx],
-                        head_size=head_dims[layer_idx],
-                        dtype=torch_dtype,
-                    )
-                elif use_deferred_mha_layout:
-                    specs[layer_name] = self._build_mha_attention_spec(
-                        layer_idx=layer_idx,
-                        block_size=block_size,
-                        num_kv_heads=kv_heads[layer_idx],
-                        head_dim=head_dims[layer_idx],
-                        torch_dtype=torch_dtype,
-                    )
+
+        if self._runner.is_hybrid:
+            hybrid_plan = self._hybrid_plan()
+            state_spec = self._state_layer_spec(hybrid_plan, torch_dtype)
+            for layer_idx in range(num_spec_layers):
+                if hybrid_plan.layers.layer_role(layer_idx) == STATE_LAYER:
+                    specs[f"layers.{layer_idx}.linear_attn"] = state_spec
                 else:
-                    specs[layer_name] = FullAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=kv_heads[layer_idx],
-                        head_size=head_dims[layer_idx],
-                        dtype=torch_dtype,
-                    )
+                    specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+        else:
+            for layer_idx in range(num_spec_layers):
+                specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
 
         specs.update(
             self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
         )
         return specs
+
+    def _state_layer_spec(
+        self, hybrid_plan: HybridRuntimePlan, torch_dtype: torch.dtype
+    ) -> MambaSpec:
+        """Build the scheduler-visible spec shared by every state layer."""
+        cache_config = self._runner.cache_config
+        mamba_block_size = cache_config.mamba_block_size
+        # Upstream resolves this during config setup and asserts it here.
+        assert mamba_block_size is not None
+        return hybrid_plan.state_cache_spec(
+            conv_dtype=torch_dtype,
+            mamba_block_size=mamba_block_size,
+            page_size_padded=cache_config.mamba_page_size_padded,
+            mamba_cache_mode=cache_config.mamba_cache_mode,
+        )
+
+    def _attention_layer_spec(
+        self,
+        layer_idx: int,
+        *,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        torch_dtype: torch.dtype,
+        use_turboquant: bool,
+        config: MetalConfig,
+        use_deferred_mha_layout: bool,
+    ) -> KVCacheSpec:
+        """Build the scheduler-visible spec for one attention layer."""
+        if use_turboquant:
+            return _build_turboquant_attention_spec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                k_quant=config.k_quant,
+                v_quant=config.v_quant,
+            )
+        # MLA caches a single latent tensor per layer, not separate K and V
+        # (see ``MLAPagedLatentCache``), which is why ``_kv_factor`` bills it
+        # at 1.  ``FullAttentionSpec`` bakes the 2x K/V factor into
+        # ``page_size_bytes`` (head_size + head_size_v), so describing MLA with
+        # it makes the engine halve the block count it plans against relative
+        # to the pool actually allocated.
+        if self._runner.is_mla:
+            return MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                dtype=torch_dtype,
+            )
+        if use_deferred_mha_layout:
+            return self._build_mha_attention_spec(
+                layer_idx=layer_idx,
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                torch_dtype=torch_dtype,
+            )
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_dim,
+            dtype=torch_dtype,
+        )
 
     def _draft_layer_specs(
         self, *, block_size: int, torch_dtype: torch.dtype
@@ -611,11 +640,13 @@ class ModelCachePolicy:
                 "hybrid cache config requires HybridPagedAttentionRuntime"
             )
 
+        hybrid_plan = self._hybrid_plan()
+        layer_plan = hybrid_plan.layers
         group_indices = self._scheduler_group_indices_for_layers(
             kv_cache_config,
             tuple(
                 f"layers.{layer_idx}.self_attn"
-                for layer_idx in self._hybrid_plan().layers.attention_indices
+                for layer_idx in layer_plan.attention_indices
             ),
         )
         if len(group_indices) != 1:
@@ -639,9 +670,7 @@ class ModelCachePolicy:
         if self._runner.cache_config.mamba_cache_mode == "align":
             cache_idx_by_name = {
                 f"layers.{layer_idx}.linear_attn": cache_idx
-                for cache_idx, layer_idx in enumerate(
-                    self._hybrid_plan().layers.state_indices
-                )
+                for cache_idx, layer_idx in enumerate(layer_plan.state_indices)
             }
             mamba_group_ids = [
                 index
@@ -694,8 +723,7 @@ class ModelCachePolicy:
                     "layer; cannot derive state pools"
                 )
             budgeted = _align_state_pool_count(
-                len(cache_idx_by_name),
-                self._hybrid_plan().layers.num_attention,
+                len(cache_idx_by_name), layer_plan.num_attention
             )
             if pools_used > budgeted:
                 raise RuntimeError(
