@@ -1203,10 +1203,15 @@ class WorkerCachePlanner:
             logger.info("Encoder pooling: reporting zero KV-cache bytes")
             return 0
 
-        available = self._worker._one_sequence_kv_bytes()
+        request_bytes = self._worker._one_sequence_kv_bytes()
+        # vLLM's BlockPool permanently reserves one null block. Reporting
+        # exactly one request's bytes therefore leaves one fewer free block
+        # than admission requires and the waiting request is skipped forever.
+        reserved_block_bytes = self._worker.get_cache_block_size_bytes()
+        available = request_bytes + reserved_block_bytes
         logger.info(
             "MLX path: reporting %.2f GB for scheduler admission control "
-            "(one max-length sequence, max_model_len=%d)",
+            "(one max-length sequence + reserved null block, max_model_len=%d)",
             available / 1e9,
             self._worker.model_config.max_model_len,
         )

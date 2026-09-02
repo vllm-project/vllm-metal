@@ -88,7 +88,7 @@ class TestWorkerRunnerBoundaryDelegation:
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
-        """Test MLX path returns one max-length sequence estimate (PR #229)."""
+        """MLX path budgets one sequence plus vLLM's reserved null block."""
         model_runner = make_stub_runner(
             num_layers=16,
             num_kv_cache_layers=16,
@@ -100,14 +100,15 @@ class TestWorkerRunnerBoundaryDelegation:
             return_value="single_sequence_estimate"
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
+        model_runner.cache_config.block_size = worker.cache_config.block_size
         worker.model_config = SimpleNamespace(max_model_len=2048)
 
         try:
             available = MetalWorker.determine_available_memory(worker)
 
-            # Should return one max-length sequence KV cache bytes
-            # 2 (K+V) * 16 layers * 2048 tokens * 8 heads * 128 head_dim * 2 bytes
-            expected = 2 * 16 * 2048 * 8 * 128 * 2
+            # Request: 2048 tokens. Reserved null block: 16 tokens.
+            bytes_per_token = 2 * 16 * 8 * 128 * 2
+            expected = bytes_per_token * (2048 + 16)
             assert available == expected
         finally:
             pass
