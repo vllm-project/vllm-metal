@@ -460,10 +460,7 @@ class MetalModelRunner:
         # present: it is consulted on the KV-sizing path, which runs for every
         # model, not only the YOCO ones that install a real mapping.
         self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
-        # Hybrid layer split and state family, resolved once by ModelLifecycle
-        # from the loaded model args.  None for every non-hybrid model; cache
-        # sizing and the hybrid runtime read it instead of re-deriving the
-        # split from full_attention_interval.
+        # Resolved by ModelLifecycle at load; None for non-hybrid models.
         self.hybrid_runtime_plan: HybridRuntimePlan | None = None
 
         # Whether the adapter can run projection-free intermediate forwards
