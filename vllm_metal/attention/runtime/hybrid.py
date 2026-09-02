@@ -43,7 +43,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def __init__(
         self,
         *,
-        plan: HybridRuntimePlan,
+        hybrid_plan: HybridRuntimePlan,
         max_num_seqs: int,
         # SDPA dims
         num_kv_heads: int,
@@ -58,15 +58,16 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         k_quant: str | None = None,
         v_quant: str | None = None,
     ) -> None:
-        self._plan = plan
+        self._hybrid_plan = hybrid_plan
         self._max_num_seqs = max_num_seqs
         self._block_size = block_size
         self._dtype = dtype
-        if mamba_cache_mode not in plan.family.supported_cache_modes:
+        state_family = self._hybrid_plan.family
+        if mamba_cache_mode not in state_family.supported_cache_modes:
             raise NotImplementedError(
                 f"hybrid paged attention does not support mamba_cache_mode="
-                f"{mamba_cache_mode!r} for the {plan.family.label!r} state "
-                f"family (supported: {plan.family.supported_cache_modes})"
+                f"{mamba_cache_mode!r} for the {state_family.label!r} state "
+                f"family (supported: {state_family.supported_cache_modes})"
             )
         self._mamba_cache_mode = mamba_cache_mode
 
@@ -81,8 +82,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         # Layer topology is owned by the plan; alias its index tuples here
         # instead of re-deriving them from config math.
-        self._sdpa_indices = plan.layers.attention_indices
-        self._linear_indices = plan.layers.state_indices
+        self._sdpa_indices = self._hybrid_plan.layers.attention_indices
+        self._linear_indices = self._hybrid_plan.layers.state_indices
 
         self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
@@ -117,15 +118,15 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         # None mode keeps one slab per resident request and grows on demand.
         align = self._mamba_cache_mode == "align"
         state_slots = num_blocks if align else self._max_num_seqs
-        geometry = self._plan.geometry
+        state_geometry = self._hybrid_plan.geometry
         self._state_cache = GDNPagedStateCache(
             num_layers=len(self._linear_indices),
             max_seqs=state_slots,
-            conv_kernel_dim=geometry.conv_kernel_dim,
-            conv_dim=geometry.conv_dim,
-            num_v_heads=geometry.num_v_heads,
-            value_head_dim=geometry.value_head_dim,
-            key_head_dim=geometry.key_head_dim,
+            conv_kernel_dim=state_geometry.conv_kernel_dim,
+            conv_dim=state_geometry.conv_dim,
+            num_v_heads=state_geometry.num_v_heads,
+            value_head_dim=state_geometry.value_head_dim,
+            key_head_dim=state_geometry.key_head_dim,
             initial_seqs=0,
             dtype=self._dtype,
         )
@@ -198,32 +199,32 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         if self._state_cache is None:
             raise RuntimeError("patch_model() called before initialize()")
         state_cache = self._state_cache
-        plan = self._plan
-        family = plan.family
+        layer_plan = self._hybrid_plan.layers
+        state_family = self._hybrid_plan.family
 
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
             if isinstance(attn, SDPAPagedAttentionWrapper):
                 # Already patched (cached model reuse) — refresh cache refs.
-                cache_idx = plan.layers.attention_cache_index(layer_idx)
+                cache_idx = layer_plan.attention_cache_index(layer_idx)
                 attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
                 return attn
-            if isinstance(attn, family.wrapper_cls):
+            if isinstance(attn, state_family.wrapper_cls):
                 # Already patched — refresh state cache ref.
-                cache_idx = plan.layers.state_cache_index(layer_idx)
+                cache_idx = layer_plan.state_cache_index(layer_idx)
                 attn.rebind_state_cache(state_cache, cache_idx=cache_idx)
                 return attn
             if is_sdpa(attn):
-                cache_idx = plan.layers.attention_cache_index(layer_idx)
+                cache_idx = layer_plan.attention_cache_index(layer_idx)
                 return SDPAPagedAttentionWrapper(
                     attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
                 )
-            if family.is_state_module(attn):
-                cache_idx = plan.layers.state_cache_index(layer_idx)
-                return family.wrapper_cls(attn, layer_idx, cache_idx, state_cache)
+            if state_family.is_state_module(attn):
+                cache_idx = layer_plan.state_cache_index(layer_idx)
+                return state_family.wrapper_cls(attn, layer_idx, cache_idx, state_cache)
             raise RuntimeError(
                 f"Hybrid patch_model: layer {layer_idx} attention "
                 f"{type(attn).__name__} is neither SDPA nor "
-                f"{family.label!r} state; refusing to leave it unpatched "
+                f"{state_family.label!r} state; refusing to leave it unpatched "
                 "(it would silently run unpaged)."
             )
 
