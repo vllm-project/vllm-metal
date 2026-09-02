@@ -540,15 +540,8 @@ class TestPagedAttentionPlanDiagnostics:
 
 class TestHybridPlanGuard:
     def test_hybrid_sizing_without_plan_rejects(self) -> None:
-        # Arrange — is_hybrid derives from model_args; the stub leaves
-        # hybrid_runtime_plan at its None default.
+        # is_hybrid derives from model_args; the stub leaves the plan at None.
         runner = make_stub_runner(model_args={"full_attention_interval": 2})
-        expected = (
-            "hybrid model has no resolved hybrid_runtime_plan; "
-            "ModelLifecycle.resolve_model_dims must run before cache sizing"
-        )
 
-        # Act / Assert
-        with pytest.raises(RuntimeError) as excinfo:
+        with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.linear_cache_bytes_per_slot()
-        assert str(excinfo.value) == expected

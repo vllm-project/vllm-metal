@@ -229,7 +229,7 @@ class TestHybridGDNStateManager:
 class TestHybridPagedAttentionRuntime:
     def test_initialize_wires_gdn_state_manager_delegation(self) -> None:
         runtime = HybridPagedAttentionRuntime(
-            plan=make_gdn_hybrid_plan(
+            hybrid_plan=make_gdn_hybrid_plan(
                 2,
                 range(1, 2, 2),
                 conv_kernel_dim=2,

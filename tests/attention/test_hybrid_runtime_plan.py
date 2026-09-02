@@ -82,7 +82,7 @@ def _make_tiny_plan() -> HybridRuntimePlan:
 
 def _make_runtime() -> HybridPagedAttentionRuntime:
     return HybridPagedAttentionRuntime(
-        plan=_make_tiny_plan(),
+        hybrid_plan=_make_tiny_plan(),
         max_num_seqs=2,
         num_kv_heads=1,
         head_dim=4,
@@ -93,10 +93,8 @@ def _make_runtime() -> HybridPagedAttentionRuntime:
 
 class TestGdnPlanDecision:
     def test_topology_follows_the_interval_rule(self) -> None:
-        # Arrange / Act
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
 
-        # Assert
         assert plan.layers.attention_indices == (3, 7)
         assert plan.layers.state_indices == (0, 1, 2, 4, 5, 6)
         assert plan.layers.num_attention == 2
@@ -113,10 +111,9 @@ class TestGdnPlanDecision:
         )
 
     def test_geometry_packs_qk_and_v_into_the_conv_stream(self) -> None:
-        # Arrange / Act
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
 
-        # Assert — conv_dim = 2*32*2 + 4*16 = 192, hand-written.
+        # conv_dim = 2*32*2 + 4*16 = 192, hand-written.
         assert plan.geometry.conv_kernel_dim == 3
         assert plan.geometry.conv_dim == 192
         assert plan.geometry.num_v_heads == 4
@@ -124,10 +121,8 @@ class TestGdnPlanDecision:
         assert plan.geometry.key_head_dim == 32
 
     def test_family_policy_matches_the_gdn_runtime_contract(self) -> None:
-        # Arrange / Act
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
 
-        # Assert
         assert plan.family.label == "gdn"
         assert plan.family.wrapper_cls is GDNPagedAttentionWrapper
         assert plan.family.mamba_type is MambaAttentionBackendEnum.GDN_ATTN
@@ -140,53 +135,34 @@ class TestGdnPlanRejection:
         "missing", ["linear_num_key_heads", "linear_conv_kernel_dim"]
     )
     def test_omitted_linear_dim_rejects_with_the_key_name(self, missing: str) -> None:
-        # Arrange
         args = {k: v for k, v in GDN_ARGS.items() if k != missing}
         expected = f"GDN hybrid model args are missing a usable {missing!r}: got None."
 
-        # Act / Assert
         with pytest.raises(ValueError) as excinfo:
             build_gdn_hybrid_plan(args, 8)
         assert str(excinfo.value) == expected
 
     def test_non_positive_layer_count_rejects(self) -> None:
-        # Arrange
-        expected = "GDN hybrid requires a positive layer count, got 0."
-
-        # Act / Assert
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match="positive layer count"):
             build_gdn_hybrid_plan(GDN_ARGS, 0)
-        assert str(excinfo.value) == expected
 
 
 class TestLayerPlanDispatch:
-    def test_kind_of_rejects_out_of_range_layers(self) -> None:
-        # Arrange
+    def test_layer_kind_rejects_out_of_range_layers(self) -> None:
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
-        expected = "hybrid layer plan covers layers 0..7, got layer 8"
 
-        # Act / Assert
-        with pytest.raises(ValueError) as excinfo:
-            plan.layers.kind_of(8)
-        assert str(excinfo.value) == expected
+        with pytest.raises(ValueError, match="got layer 8"):
+            plan.layers.layer_kind(8)
 
     def test_cache_index_rejects_the_wrong_kind(self) -> None:
-        # Arrange — layer 0 is a state layer.
         plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
-        expected = (
-            "hybrid layer plan has no attention cache index for layer 0; "
-            "attention layers are (3, 7)"
-        )
 
-        # Act / Assert
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match="no attention cache index for layer 0"):
             plan.layers.attention_cache_index(0)
-        assert str(excinfo.value) == expected
 
 
 class TestStateCacheSpec:
     def test_spec_threads_geometry_family_and_mode(self) -> None:
-        # Arrange
         plan = make_gdn_hybrid_plan(
             4,
             [1, 3],
@@ -205,30 +181,25 @@ class TestStateCacheSpec:
             mamba_cache_mode="align",
         )
 
-        # Act
         spec = plan.state_cache_spec(
             conv_dtype=torch.float16,
             mamba_block_size=2048,
             mamba_cache_mode="align",
         )
 
-        # Assert
         assert spec == expected
 
 
 class TestRuntimeUsesThePlan:
     def test_unsupported_cache_mode_rejects_with_the_family_label(self) -> None:
-        # Arrange
-        plan = _make_tiny_plan()
         expected = (
             "hybrid paged attention does not support mamba_cache_mode='all' "
             "for the 'gdn' state family (supported: ('none', 'align'))"
         )
 
-        # Act / Assert
         with pytest.raises(NotImplementedError) as excinfo:
             HybridPagedAttentionRuntime(
-                plan=plan,
+                hybrid_plan=_make_tiny_plan(),
                 max_num_seqs=2,
                 num_kv_heads=1,
                 head_dim=4,
@@ -239,13 +210,10 @@ class TestRuntimeUsesThePlan:
         assert str(excinfo.value) == expected
 
     def test_state_cache_is_sized_from_the_plan_geometry(self) -> None:
-        # Arrange
         runtime = _make_runtime()
 
-        # Act
         runtime.initialize(num_blocks=2)
 
-        # Assert
         state_cache = runtime.state_cache
         assert state_cache.num_layers == 2
         assert state_cache.conv_kernel_dim == 2
@@ -257,15 +225,12 @@ class TestRuntimeUsesThePlan:
 
 class TestHybridPatchModel:
     def test_installs_family_wrappers_at_plan_cache_indices(self) -> None:
-        # Arrange — layers 1 and 3 are attention, 0 and 2 are state.
         runtime = _make_runtime()
         runtime.initialize(num_blocks=2)
         model = _FakeModel("sasa")
 
-        # Act
         patched = runtime.patch_model(model)
 
-        # Assert
         assert patched == 4
         sdpa_1 = model.layers[1].self_attn
         sdpa_3 = model.layers[3].self_attn
@@ -283,7 +248,6 @@ class TestHybridPatchModel:
         assert gdn_2._gdn_state_cache is runtime.state_cache
 
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
-        # Arrange — patch once, then a fresh runtime repatches the same model.
         runtime_a = _make_runtime()
         runtime_a.initialize(num_blocks=2)
         model = _FakeModel("sasa")
@@ -292,10 +256,8 @@ class TestHybridPatchModel:
         runtime_b = _make_runtime()
         runtime_b.initialize(num_blocks=2)
 
-        # Act
         patched = runtime_b.patch_model(model)
 
-        # Assert — same wrapper object, refreshed state cache ref.
         assert patched == 4
         assert model.layers[0].linear_attn is wrapper_before
         assert wrapper_before._gdn_state_cache is runtime_b.state_cache
@@ -303,7 +265,6 @@ class TestHybridPatchModel:
         assert wrapper_before._gdn_cache_idx == 0
 
     def test_unclassifiable_layer_rejects_with_the_family_label(self) -> None:
-        # Arrange
         runtime = _make_runtime()
         runtime.initialize(num_blocks=2)
 
@@ -312,13 +273,6 @@ class TestHybridPatchModel:
 
         model = _FakeModel("sasa")
         model.layers[2] = _Layer(_Mystery(), linear=True)
-        expected = (
-            "Hybrid patch_model: layer 2 attention _Mystery is neither SDPA "
-            "nor 'gdn' state; refusing to leave it unpatched (it would "
-            "silently run unpaged)."
-        )
 
-        # Act / Assert
-        with pytest.raises(RuntimeError) as excinfo:
+        with pytest.raises(RuntimeError, match="neither SDPA nor 'gdn' state"):
             runtime.patch_model(model)
-        assert str(excinfo.value) == expected

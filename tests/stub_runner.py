@@ -247,7 +247,7 @@ def make_gdn_hybrid_plan(
         ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
     )
     return HybridRuntimePlan(
-        layers=HybridLayerPlan.from_kinds(kinds),
+        layers=HybridLayerPlan(kinds=kinds),
         family=_GDN_FAMILY_SPEC,
         geometry=RecurrentStateGeometry(
             conv_kernel_dim=conv_kernel_dim,

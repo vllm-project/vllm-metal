@@ -138,7 +138,7 @@ class TestAlignGDNStateManager:
 class TestHybridAlignRuntime:
     def _make_runtime(self) -> HybridPagedAttentionRuntime:
         return HybridPagedAttentionRuntime(
-            plan=make_gdn_hybrid_plan(
+            hybrid_plan=make_gdn_hybrid_plan(
                 4,
                 range(1, 4, 2),
                 conv_kernel_dim=2,
