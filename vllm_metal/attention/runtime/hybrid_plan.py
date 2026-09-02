@@ -124,8 +124,8 @@ class HybridRuntimePlan:
         *,
         conv_dtype: torch.dtype,
         mamba_block_size: int,
-        page_size_padded: int | None = None,
-        mamba_cache_mode: str = "none",
+        page_size_padded: int | None,
+        mamba_cache_mode: str,
     ) -> MambaSpec:
         """Build the scheduler-visible state spec for one state layer."""
         geometry = self.geometry

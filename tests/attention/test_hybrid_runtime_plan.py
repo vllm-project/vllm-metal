@@ -185,6 +185,7 @@ class TestStateCacheSpec:
         spec = plan.state_cache_spec(
             conv_dtype=torch.float16,
             mamba_block_size=2048,
+            page_size_padded=None,
             mamba_cache_mode="align",
         )
 
