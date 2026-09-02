@@ -261,3 +261,54 @@ class TestHybridCacheMergeExtract:
         kv_cache = contiguous_cache.KVCache()
         with pytest.raises(TypeError, match="Mixed cache types in a single layer"):
             contiguous_cache._merge_kv_caches([[arrays_cache], [kv_cache]])
+
+    def _make_cache_list(
+        self, *, seq_len: int, kv_value: float, v0: float, v1: float
+    ) -> contiguous_cache.CacheList:
+        # Falcon-H1's per-layer shape: CacheList(ArraysCache(size=2), KVCache()).
+        return contiguous_cache.CacheList(
+            self._make_arrays_cache(v0, v1), self._make_kv_cache(seq_len, kv_value)
+        )
+
+    def test_cache_list_merge_extract_roundtrip(self) -> None:
+        """Nested ``CacheList`` layers merge member-wise and extract back.
+
+        mlx_lm gives a layer that owns several stateful modules (Falcon-H1:
+        parallel Mamba-2 mixer + attention) one ``CacheList`` per layer.  Merging
+        must recurse into each member so batched decode sees a batched cache in
+        every slot, and extraction must rebuild the per-request nesting.
+        """
+        req0 = self._make_cache_list(seq_len=2, kv_value=1.0, v0=3.0, v1=33.0)
+        req1 = self._make_cache_list(seq_len=4, kv_value=2.0, v0=4.0, v1=44.0)
+
+        merged = contiguous_cache._merge_kv_caches([[req0], [req1]])
+
+        assert isinstance(merged[0], contiguous_cache.CacheList)
+        assert isinstance(merged[0][0], contiguous_cache.ArraysCache)
+        assert isinstance(merged[0][1], contiguous_cache.BatchKVCache)
+
+        for idx, src in enumerate((req0, req1)):
+            out = contiguous_cache._extract_kv_cache(merged, idx)[0]
+            assert isinstance(out, contiguous_cache.CacheList)
+            arrays_out, kv_out = out.caches
+            assert isinstance(arrays_out, contiguous_cache.ArraysCache)
+            assert isinstance(kv_out, contiguous_cache.KVCache)
+            assert bool(mx.allclose(arrays_out.state[0], src[0].state[0]))
+            assert bool(mx.allclose(arrays_out.state[1], src[0].state[1]))
+            assert kv_out.offset == src[1].offset
+            assert bool(mx.allclose(kv_out.keys, src[1].keys))
+            assert bool(mx.allclose(kv_out.values, src[1].values))
+
+    def test_cache_list_merge_rejects_width_mismatch(self) -> None:
+        req0 = self._make_cache_list(seq_len=2, kv_value=1.0, v0=3.0, v1=33.0)
+        req1 = contiguous_cache.CacheList(self._make_kv_cache(seq_len=2, value=2.0))
+
+        with pytest.raises(TypeError, match="CacheList width mismatch"):
+            contiguous_cache._merge_kv_caches([[req0], [req1]])
+
+    def test_cache_list_merge_rejects_mixed_layer_types(self) -> None:
+        req0 = self._make_cache_list(seq_len=2, kv_value=1.0, v0=3.0, v1=33.0)
+        req1 = self._make_kv_cache(seq_len=2, value=2.0)
+
+        with pytest.raises(TypeError, match="expected CacheList"):
+            contiguous_cache._merge_kv_caches([[req0], [req1]])

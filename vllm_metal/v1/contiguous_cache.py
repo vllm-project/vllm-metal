@@ -8,6 +8,7 @@ from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
+    CacheList,
     KVCache,
     RotatingKVCache,
 )
@@ -15,8 +16,12 @@ from mlx_lm.models.cache import (
 # Minimum requests to use BatchKVCache for batched decode
 _MIN_BATCH_SIZE_FOR_BATCHING = 2
 
-# Per-layer cache types used by non-paged decode.
-AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache
+# Per-layer cache types used by non-paged decode.  ``CacheList`` is mlx_lm's
+# per-layer container for models whose layer owns several stateful modules,
+# e.g. Falcon-H1's parallel Mamba-2 + attention layer, which ``make_cache``
+# shapes as ``CacheList(ArraysCache(size=2), KVCache())``.
+AnyCache: TypeAlias = KVCache | RotatingKVCache | ArraysCache | CacheList
+BatchedCache: TypeAlias = BatchKVCache | BatchRotatingKVCache | ArraysCache | CacheList
 
 
 def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
@@ -57,80 +62,106 @@ def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
     return extracted
 
 
+def _merge_layer_caches(layer_caches: list[AnyCache]) -> BatchedCache:
+    """Merge one layer's per-request caches into a single batched cache."""
+    first = layer_caches[0]
+    if isinstance(first, CacheList):
+        # Recurse member-wise so each nested cache takes its own merge path
+        # (ArraysCache densification, BatchKVCache left padding, ...), then
+        # rebuild the container the model indexes as ``cache[i]``.
+        cache_lists: list[CacheList] = []
+        for cache in layer_caches:
+            if not isinstance(cache, CacheList):
+                raise TypeError(
+                    "Mixed cache types in a single layer: expected CacheList"
+                )
+            cache_lists.append(cache)
+        width = len(first.caches)
+        for cache_list in cache_lists:
+            if len(cache_list.caches) != width:
+                raise TypeError(
+                    "CacheList width mismatch in a single layer: "
+                    f"expected {width}, got {len(cache_list.caches)}"
+                )
+        return CacheList(
+            *(
+                _merge_layer_caches(
+                    [cache_list.caches[i] for cache_list in cache_lists]
+                )
+                for i in range(width)
+            )
+        )
+    if isinstance(first, ArraysCache):
+        arrays_caches: list[ArraysCache] = []
+        for cache in layer_caches:
+            if not isinstance(cache, ArraysCache):
+                raise TypeError(
+                    "Mixed cache types in a single layer: expected ArraysCache"
+                )
+            arrays_caches.append(cache)
+        return _merge_arrays_caches(arrays_caches)
+    if isinstance(first, RotatingKVCache):
+        rotating_caches: list[RotatingKVCache] = []
+        for cache in layer_caches:
+            if not isinstance(cache, RotatingKVCache):
+                raise TypeError(
+                    "Mixed cache types in a single layer: expected RotatingKVCache"
+                )
+            rotating_caches.append(cache)
+        return BatchRotatingKVCache.merge(rotating_caches)
+    if isinstance(first, KVCache):
+        kv_caches: list[KVCache] = []
+        for cache in layer_caches:
+            if not isinstance(cache, KVCache):
+                raise TypeError("Mixed cache types in a single layer: expected KVCache")
+            kv_caches.append(cache)
+        return BatchKVCache.merge(kv_caches)
+    cache_type = type(first).__name__
+    raise TypeError(f"Unsupported cache type for batching: {cache_type}")
+
+
 def _merge_kv_caches(
     caches_list: list[list[AnyCache]],
-) -> list[BatchKVCache | BatchRotatingKVCache | ArraysCache]:
+) -> list[BatchedCache]:
     """Merge per-request layer caches into batched layer caches."""
     if not caches_list:
         return []
 
     num_layers = len(caches_list[0])
-    merged: list[BatchKVCache | BatchRotatingKVCache | ArraysCache] = []
-
-    for layer_idx in range(num_layers):
-        layer_caches = [caches[layer_idx] for caches in caches_list]
-        if isinstance(layer_caches[0], ArraysCache):
-            arrays_caches: list[ArraysCache] = []
-            for cache in layer_caches:
-                if not isinstance(cache, ArraysCache):
-                    raise TypeError(
-                        "Mixed cache types in a single layer: expected ArraysCache"
-                    )
-                arrays_caches.append(cache)
-            batch_cache = _merge_arrays_caches(arrays_caches)
-        elif isinstance(layer_caches[0], RotatingKVCache):
-            rotating_caches: list[RotatingKVCache] = []
-            for cache in layer_caches:
-                if not isinstance(cache, RotatingKVCache):
-                    raise TypeError(
-                        "Mixed cache types in a single layer: expected RotatingKVCache"
-                    )
-                rotating_caches.append(cache)
-            batch_cache = BatchRotatingKVCache.merge(rotating_caches)
-        elif isinstance(layer_caches[0], KVCache):
-            kv_caches: list[KVCache] = []
-            for cache in layer_caches:
-                if not isinstance(cache, KVCache):
-                    raise TypeError(
-                        "Mixed cache types in a single layer: expected KVCache"
-                    )
-                kv_caches.append(cache)
-            batch_cache = BatchKVCache.merge(kv_caches)
-        else:
-            cache_type = type(layer_caches[0]).__name__
-            raise TypeError(f"Unsupported cache type for batching: {cache_type}")
-        merged.append(batch_cache)
-
-    return merged
+    return [
+        _merge_layer_caches([caches[layer_idx] for caches in caches_list])
+        for layer_idx in range(num_layers)
+    ]
 
 
-def _extract_kv_cache(
-    batch_caches: list[BatchKVCache | BatchRotatingKVCache | ArraysCache], idx: int
-) -> list[AnyCache]:
+def _extract_layer_cache(cache: BatchedCache, idx: int) -> AnyCache:
+    """Extract one request's cache for a single layer."""
+    if isinstance(cache, CacheList):
+        return CacheList(*(_extract_layer_cache(sub, idx) for sub in cache.caches))
+    if isinstance(cache, ArraysCache):
+        return _extract_arrays_cache(cache, idx)
+    c = cache.extract(idx)
+    # Pad sliced rotating buffers so later decode can update in place.
+    if (
+        isinstance(c, RotatingKVCache)
+        and c.keys is not None
+        and c.offset > c.max_size
+        and c.keys.shape[2] < c.max_size
+    ):
+        pad = c.max_size - c.keys.shape[2]
+        z_k = mx.zeros(
+            (1, c.keys.shape[1], pad, c.keys.shape[3]),
+            dtype=c.keys.dtype,
+        )
+        z_v = mx.zeros(
+            (1, c.values.shape[1], pad, c.values.shape[3]),
+            dtype=c.values.dtype,
+        )
+        c.keys = mx.concatenate([c.keys, z_k], axis=2)
+        c.values = mx.concatenate([c.values, z_v], axis=2)
+    return c
+
+
+def _extract_kv_cache(batch_caches: list[BatchedCache], idx: int) -> list[AnyCache]:
     """Extract one request's layer caches from batched layer caches."""
-    extracted: list[AnyCache] = []
-    for cache in batch_caches:
-        if isinstance(cache, ArraysCache):
-            extracted.append(_extract_arrays_cache(cache, idx))
-        else:
-            c = cache.extract(idx)
-            # Pad sliced rotating buffers so later decode can update in place.
-            if (
-                isinstance(c, RotatingKVCache)
-                and c.keys is not None
-                and c.offset > c.max_size
-                and c.keys.shape[2] < c.max_size
-            ):
-                pad = c.max_size - c.keys.shape[2]
-                z_k = mx.zeros(
-                    (1, c.keys.shape[1], pad, c.keys.shape[3]),
-                    dtype=c.keys.dtype,
-                )
-                z_v = mx.zeros(
-                    (1, c.values.shape[1], pad, c.values.shape[3]),
-                    dtype=c.values.dtype,
-                )
-                c.keys = mx.concatenate([c.keys, z_k], axis=2)
-                c.values = mx.concatenate([c.values, z_v], axis=2)
-            extracted.append(c)
-    return extracted
+    return [_extract_layer_cache(cache, idx) for cache in batch_caches]
