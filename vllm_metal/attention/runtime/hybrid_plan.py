@@ -43,26 +43,25 @@ class PagedStateWrapper(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class HybridLayerPlan:
-    """Which model layers own paged attention KV pages and which own state."""
+    """Which model layers own paged attention KV pages and which own state.
+
+    ``kinds`` is the single source of truth; index tuples and counts are
+    derived from it on access.
+    """
 
     kinds: tuple[LayerKind, ...]
-    attention_indices: tuple[int, ...]
-    state_indices: tuple[int, ...]
 
-    @classmethod
-    def from_kinds(cls, kinds: tuple[LayerKind, ...]) -> HybridLayerPlan:
-        """Build a plan, deriving the per-kind index tuples once."""
-        if not kinds:
+    def __post_init__(self) -> None:
+        if not self.kinds:
             raise ValueError("hybrid layer plan requires at least one layer")
-        return cls(
-            kinds=kinds,
-            attention_indices=tuple(
-                i for i, kind in enumerate(kinds) if kind == ATTENTION_LAYER
-            ),
-            state_indices=tuple(
-                i for i, kind in enumerate(kinds) if kind == STATE_LAYER
-            ),
-        )
+
+    @property
+    def attention_indices(self) -> tuple[int, ...]:
+        return tuple(i for i, kind in enumerate(self.kinds) if kind == ATTENTION_LAYER)
+
+    @property
+    def state_indices(self) -> tuple[int, ...]:
+        return tuple(i for i, kind in enumerate(self.kinds) if kind == STATE_LAYER)
 
     @property
     def num_attention(self) -> int:
@@ -72,7 +71,7 @@ class HybridLayerPlan:
     def num_state(self) -> int:
         return len(self.state_indices)
 
-    def kind_of(self, layer_idx: int) -> LayerKind:
+    def layer_kind(self, layer_idx: int) -> LayerKind:
         """Return the kind owning ``layer_idx``; consumers dispatch on it."""
         if not 0 <= layer_idx < len(self.kinds):
             raise ValueError(
