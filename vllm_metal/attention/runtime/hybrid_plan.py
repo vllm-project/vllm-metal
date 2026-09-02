@@ -77,11 +77,6 @@ class HybridLayerPlan:
 
     def layer_role(self, layer_idx: int) -> LayerRole:
         """Return the role owning ``layer_idx``; consumers dispatch on it."""
-        if not 0 <= layer_idx < len(self.layer_roles):
-            raise ValueError(
-                f"hybrid layer plan covers layers 0..{len(self.layer_roles) - 1}, "
-                f"got layer {layer_idx}"
-            )
         return self.layer_roles[layer_idx]
 
     def attention_cache_index(self, layer_idx: int) -> int:

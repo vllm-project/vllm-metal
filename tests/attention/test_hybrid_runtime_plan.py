@@ -162,14 +162,6 @@ class TestGdnPlanRejection:
         assert str(excinfo.value) == expected
 
 
-class TestLayerPlanDispatch:
-    def test_layer_role_rejects_out_of_range_layers(self) -> None:
-        plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
-
-        with pytest.raises(ValueError, match="got layer 8"):
-            plan.layers.layer_role(8)
-
-
 class TestStateCacheSpec:
     def test_spec_threads_geometry_family_and_mode(self) -> None:
         plan = make_gdn_hybrid_plan(
