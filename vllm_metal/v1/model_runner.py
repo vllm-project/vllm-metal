@@ -840,6 +840,14 @@ class MetalModelRunner:
         """Bytes for one request's linear attention state across all GDN layers."""
         return self._cache_policy.linear_cache_bytes_per_slot()
 
+    def hybrid_align_state_bytes_per_block(self) -> int:
+        """Per-pool-block linear-state bytes under align-mode prefix caching."""
+        return self._cache_policy.hybrid_align_state_bytes_per_block()
+
+    def hybrid_align_growth_bytes_per_block(self) -> int:
+        """One old physical state pool retained during align-cache growth."""
+        return self._cache_policy.hybrid_align_growth_bytes_per_block()
+
     def draft_scratch_reserve_blocks(self) -> int:
         """Blocks reserved for the draft model's speculative lookahead tail."""
         return self._cache_policy.draft_scratch_reserve_blocks()

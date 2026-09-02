@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner  # noqa: E402
+from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
@@ -442,20 +443,10 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
-            num_layers=24,
-            hybrid_runtime_plan=make_gdn_hybrid_plan(
-                24,
-                range(6),
-                conv_kernel_dim=2,
-                conv_dim=1,
-                num_v_heads=1,
-                value_head_dim=1,
-                key_head_dim=1,
-            ),
-            # 18 logical GDN layers at 100 bytes per layer/slot. Striping
-            # produces six physical pools: 600 steady bytes per block plus
-            # one 100-byte old pool retained during growth.
-            linear_cache_bytes_per_slot=MagicMock(return_value=1_800),
+            # Six striped pools: 600 steady bytes per block plus one 100-byte
+            # old pool retained during growth.
+            hybrid_align_state_bytes_per_block=MagicMock(return_value=600),
+            hybrid_align_growth_bytes_per_block=MagicMock(return_value=100),
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
@@ -536,6 +527,42 @@ class TestPagedAttentionPlanDiagnostics:
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == expected_fraction
+
+
+class TestAlignStateSizing:
+    @staticmethod
+    def _make_align_runner() -> mr.MetalModelRunner:
+        """Qwen-shaped 24-layer GDN plan: 18 state layers striped over 6 SDPA."""
+        return make_stub_runner(
+            model_args={"full_attention_interval": 4},
+            kv_cache_dtype=mx.float16,
+            hybrid_runtime_plan=build_gdn_hybrid_plan(
+                {
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 1,
+                    "linear_num_value_heads": 1,
+                    "linear_key_head_dim": 1,
+                    "linear_value_head_dim": 1,
+                    "linear_conv_kernel_dim": 2,
+                },
+                24,
+            ),
+        )
+
+    def test_align_state_bytes_per_block_stripes_pools(self) -> None:
+        runner = self._make_align_runner()
+        # Hand-written: conv (2-1)*3 fp16 values = 6 B plus 1*1*1 fp32 = 4 B
+        # per layer, one pool per SDPA layer -> 10 B * 6 pools.
+        expected = 60
+
+        assert runner.hybrid_align_state_bytes_per_block() == expected
+
+    def test_align_growth_bytes_retain_one_pool(self) -> None:
+        runner = self._make_align_runner()
+        # Hand-written: one old pool holds one layer's 10 B.
+        expected = 10
+
+        assert runner.hybrid_align_growth_bytes_per_block() == expected
 
 
 class TestHybridPlanGuard:

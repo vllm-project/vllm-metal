@@ -893,18 +893,35 @@ class ModelCachePolicy:
         """Return bytes for one request's linear-attention state."""
         if not self._runner.is_hybrid:
             raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
-        plan = self._hybrid_plan()
-        geometry = plan.geometry
-        dtype_size = self._require_kv_cache_dtype().size
-        recurrent_dtype_size = plan.family.recurrent_dtype.itemsize
-        conv_bytes = (geometry.conv_kernel_dim - 1) * geometry.conv_dim * dtype_size
-        recurrent_bytes = (
-            geometry.num_v_heads
-            * geometry.value_head_dim
-            * geometry.key_head_dim
-            * recurrent_dtype_size
+        hybrid_plan = self._hybrid_plan()
+        return hybrid_plan.layers.num_state * self._state_bytes_per_layer(hybrid_plan)
+
+    def hybrid_align_state_bytes_per_block(self) -> int:
+        """Per-pool-block linear-state bytes under align-mode prefix caching."""
+        hybrid_plan = self._hybrid_plan()
+        layer_plan = hybrid_plan.layers
+        pools = _align_state_pool_count(layer_plan.num_state, layer_plan.num_attention)
+        return self._state_bytes_per_layer(hybrid_plan) * pools
+
+    def hybrid_align_growth_bytes_per_block(self) -> int:
+        """One old physical state pool retained during align-cache growth."""
+        return self._state_bytes_per_layer(self._hybrid_plan())
+
+    def _state_bytes_per_layer(self, hybrid_plan: HybridRuntimePlan) -> int:
+        """Bytes one request holds in one state layer: conv tail plus SSM state."""
+        state_geometry = hybrid_plan.geometry
+        conv_bytes = (
+            (state_geometry.conv_kernel_dim - 1)
+            * state_geometry.conv_dim
+            * self._require_kv_cache_dtype().size
         )
-        return plan.layers.num_state * (conv_bytes + recurrent_bytes)
+        recurrent_bytes = (
+            state_geometry.num_v_heads
+            * state_geometry.value_head_dim
+            * state_geometry.key_head_dim
+            * hybrid_plan.family.recurrent_dtype.itemsize
+        )
+        return conv_bytes + recurrent_bytes
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -1320,14 +1337,7 @@ class WorkerCachePlanner:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
-        # linear_cache_bytes_per_slot routes through ModelCachePolicy, whose
-        # _hybrid_plan() enforces the plan-resolved invariant.
-        bytes_per_slot = runner.linear_cache_bytes_per_slot()
-        plan = runner.hybrid_runtime_plan
-        assert plan is not None
-        num_linear = plan.layers.num_state
-        pools = _align_state_pool_count(num_linear, plan.layers.num_attention)
-        return bytes_per_slot * pools // num_linear
+        return runner.hybrid_align_state_bytes_per_block()
 
     def _hybrid_align_growth_bytes_per_block(self) -> int:
         """One old physical state pool retained during align-cache growth."""
@@ -1336,12 +1346,7 @@ class WorkerCachePlanner:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
-        # linear_cache_bytes_per_slot routes through ModelCachePolicy, whose
-        # _hybrid_plan() enforces the plan-resolved invariant.
-        bytes_per_slot = runner.linear_cache_bytes_per_slot()
-        plan = runner.hybrid_runtime_plan
-        assert plan is not None
-        return bytes_per_slot // plan.layers.num_state
+        return runner.hybrid_align_growth_bytes_per_block()
 
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
         """Return lazy GDN headroom reserved outside the paged KV pool."""
