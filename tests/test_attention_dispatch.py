@@ -257,3 +257,176 @@ def test_qwen35_paged_attention_hybrid():
         outputs = llm.generate(["The capital of France is"], sp)
         assert len(outputs) == 1
         assert len(outputs[0].outputs[0].token_ids) > 0
+
+
+# ---------------------------------------------------------------------------
+# validate_paged_attention_support refuses unmanaged native cache topologies
+# ---------------------------------------------------------------------------
+
+
+def _make_policy_runner(model, *, num_layers: int, model_args=None, **attrs):
+    """Stub runner around a real mlx_lm model for cache-policy validation."""
+    from tests.stub_runner import make_stub_runner
+
+    return make_stub_runner(
+        model_args=dict(model_args or {}),
+        model=model,
+        num_layers=num_layers,
+        num_kv_cache_layers=num_layers,
+        num_kv_heads=2,
+        **attrs,
+    )
+
+
+def test_validate_rejects_falcon_h1_parallel_mamba():
+    """Falcon-H1 runs a Mamba-2 mixer next to self_attn in every layer (#655).
+
+    mlx-lm declares that topology as a ``CacheList`` per layer; the paged
+    runtime manages one KV-style cache per slot, so setup must refuse at
+    validation time rather than crash on the first request.
+    """
+    from mlx_lm.models.falcon_h1 import Model, ModelArgs
+
+    args = ModelArgs(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        mamba_n_heads=4,
+        mamba_d_head=16,
+        mamba_d_ssm=64,
+        mamba_d_state=16,
+        vocab_size=100,
+    )
+    runner = _make_policy_runner(Model(args), num_layers=2)
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        runner.validate_paged_attention_support()
+
+    message = str(excinfo.value)
+    assert "CacheList" in message
+    assert "native cache slot 0" in message
+    assert "VLLM_METAL_USE_PAGED_ATTENTION=0" in message
+
+
+def test_validate_rejects_lfm2_shortconv_layer():
+    """LFM2 conv layers keep ShortConv state, declared as an ArraysCache."""
+    from mlx_lm.models.lfm2 import Model, ModelArgs
+
+    args = ModelArgs(
+        model_type="lfm2",
+        vocab_size=100,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        norm_eps=1e-5,
+        conv_bias=False,
+        conv_L_cache=3,
+        block_dim=64,
+        block_ff_dim=128,
+        block_multiple_of=64,
+        block_ffn_dim_multiplier=1.0,
+        block_auto_adjust_ff_dim=False,
+        layer_types=["conv", "full_attention"],
+    )
+    runner = _make_policy_runner(Model(args), num_layers=2)
+
+    with pytest.raises(
+        NotImplementedError, match=r"ArraysCache at native cache slot 0"
+    ):
+        runner.validate_paged_attention_support()
+
+
+def test_validate_rejects_nemotron_h_mixer_layer():
+    """Nemotron-H Mamba-2 mixer layers declare ArraysCache state slots."""
+    from mlx_lm.models.nemotron_h import Model, ModelArgs
+
+    args = ModelArgs(
+        model_type="nemotron_h",
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        max_position_embeddings=512,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        attention_bias=False,
+        mamba_num_heads=4,
+        mamba_head_dim=16,
+        mamba_proj_bias=False,
+        ssm_state_size=16,
+        conv_kernel=4,
+        n_groups=1,
+        mlp_bias=False,
+        layer_norm_epsilon=1e-5,
+        use_bias=False,
+        use_conv_bias=False,
+        hybrid_override_pattern=["M", "*"],
+    )
+    runner = _make_policy_runner(Model(args), num_layers=2)
+
+    with pytest.raises(
+        NotImplementedError, match=r"ArraysCache at native cache slot 0"
+    ):
+        runner.validate_paged_attention_support()
+
+
+def test_validate_rejects_native_cache_count_mismatch():
+    """A model declaring fewer native slots than KV layers must refuse."""
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import KVCache
+
+    model = SimpleNamespace(make_cache=lambda: [KVCache()])
+    runner = _make_policy_runner(model, num_layers=2)
+
+    with pytest.raises(
+        NotImplementedError, match=r"expected 2 native cache slots.*declares 1"
+    ):
+        runner.validate_paged_attention_support()
+
+
+def test_validate_accepts_dense_and_gdn_hybrid_models():
+    """Qwen3 (all KV slots) and Qwen3.5 (matching GDN plan) both pass."""
+    from mlx_lm.models.qwen3 import Model as Qwen3Model
+    from mlx_lm.models.qwen3 import ModelArgs as Qwen3Args
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    dense = _make_policy_runner(
+        Qwen3Model(Qwen3Args(**_QWEN3_ARGS_KWARGS)), num_layers=2
+    )
+    dense.validate_paged_attention_support()
+
+    hybrid = _make_policy_runner(
+        TextModel(TextModelArgs(**_QWEN35_ARGS_KWARGS)),
+        num_layers=4,
+        model_args={"full_attention_interval": 4},
+        sdpa_layer_indices=frozenset({3}),
+    )
+    hybrid.validate_paged_attention_support()
+
+
+def test_validate_rejects_hybrid_plan_disagreement():
+    """A hybrid whose declared split disagrees with the layer plan refuses.
+
+    With ``full_attention_interval=2`` the plan expects SDPA at slots 1 and
+    3, but the Qwen3.5 model built with interval 4 declares ArraysCache at
+    slot 1 -- state the hybrid runtime would map to a KV-style cache.
+    """
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    runner = _make_policy_runner(
+        TextModel(TextModelArgs(**_QWEN35_ARGS_KWARGS)),
+        num_layers=4,
+        model_args={"full_attention_interval": 2},
+        sdpa_layer_indices=frozenset({1, 3}),
+    )
+
+    with pytest.raises(
+        NotImplementedError, match=r"ArraysCache at native cache slot 1"
+    ):
+        runner.validate_paged_attention_support()

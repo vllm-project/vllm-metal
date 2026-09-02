@@ -57,6 +57,15 @@ models do too; hybrid GDN support remains experimental (`🔵`). These values
 describe default engine behavior, not exhaustive per-model benchmarking on
 Metal.
 
+Model families whose layers keep per-request state the paged runtimes do not
+manage — Mamba/Mamba-2 mixers running next to attention (Falcon-H1, Jamba,
+Nemotron-H, PLaMo-2) and conv-cache layers (LFM2) — are refused at startup
+with a clear error ([#655](https://github.com/vllm-project/vllm-metal/issues/655)).
+Set `VLLM_METAL_USE_PAGED_ATTENTION=0` to serve them on the MLX cache path.
+Supporting such a family on the paged path means managing every cache slot
+mlx-lm declares for it (see `ModelCachePolicy.validate_paged_attention_support`
+and the hybrid GDN runtime for the registered example).
+
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
 uppercase `"GEMM"`) and rejects unsupported variants (`gemv`, `bits != 4`,
