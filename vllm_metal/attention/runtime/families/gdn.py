@@ -36,6 +36,16 @@ _GDN_FAMILY = StateFamilySpec(
 )
 
 
+def _read_positive_int(model_args: Mapping[str, Any], key: str) -> int:
+    """Read one GDN dimension from model args, rejecting anything unusable."""
+    value = model_args.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            f"GDN hybrid model args are missing a usable {key!r}: got {value!r}."
+        )
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class GDNHybridConfig:
     """GDN dims parsed once from the third-party model args boundary."""
@@ -49,24 +59,16 @@ class GDNHybridConfig:
 
     @classmethod
     def from_model_args(cls, model_args: Mapping[str, Any]) -> GDNHybridConfig:
-        require = cls._require_positive_int
         return cls(
-            full_attention_interval=require(model_args, "full_attention_interval"),
-            num_key_heads=require(model_args, "linear_num_key_heads"),
-            num_value_heads=require(model_args, "linear_num_value_heads"),
-            key_head_dim=require(model_args, "linear_key_head_dim"),
-            value_head_dim=require(model_args, "linear_value_head_dim"),
-            conv_kernel_dim=require(model_args, "linear_conv_kernel_dim"),
+            full_attention_interval=_read_positive_int(
+                model_args, "full_attention_interval"
+            ),
+            num_key_heads=_read_positive_int(model_args, "linear_num_key_heads"),
+            num_value_heads=_read_positive_int(model_args, "linear_num_value_heads"),
+            key_head_dim=_read_positive_int(model_args, "linear_key_head_dim"),
+            value_head_dim=_read_positive_int(model_args, "linear_value_head_dim"),
+            conv_kernel_dim=_read_positive_int(model_args, "linear_conv_kernel_dim"),
         )
-
-    @staticmethod
-    def _require_positive_int(model_args: Mapping[str, Any], key: str) -> int:
-        value = model_args.get(key)
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(
-                f"GDN hybrid model args are missing a usable {key!r}: got {value!r}."
-            )
-        return int(value)
 
 
 def build_gdn_hybrid_plan(
