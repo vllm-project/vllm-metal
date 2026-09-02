@@ -651,14 +651,14 @@ class ModelCachePolicy:
         )
         if len(group_indices) != 1:
             raise NotImplementedError(
-                "hybrid paged attention requires all SDPA layers to share one "
-                "scheduler KV group"
+                "hybrid paged attention requires all full-attention layers "
+                "to share one scheduler KV group"
             )
         group_index = group_indices[0]
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
-        # Align mode keys GDN state slabs by scheduler block id.  The engine
+        # Align mode keys recurrent state slabs by scheduler block id. The engine
         # stripes same-spec linear layers across several mamba cache groups
         # (each group hands every request one block-table row), so the runtime
         # needs all those groups plus each linear layer's group ordinal.  None
