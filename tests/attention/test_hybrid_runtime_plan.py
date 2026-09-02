@@ -142,9 +142,24 @@ class TestGdnPlanRejection:
             build_gdn_hybrid_plan(args, 8)
         assert str(excinfo.value) == expected
 
-    def test_non_positive_layer_count_rejects(self) -> None:
-        with pytest.raises(ValueError, match="positive layer count"):
-            build_gdn_hybrid_plan(GDN_ARGS, 0)
+    @pytest.mark.parametrize(
+        ("interval", "num_layers"),
+        [(1, 8), (9, 8)],
+        ids=["no_state_layers", "no_attention_layers"],
+    )
+    def test_interval_dropping_a_layer_role_rejects(
+        self, interval: int, num_layers: int
+    ) -> None:
+        args = {**GDN_ARGS, "full_attention_interval": interval}
+        expected = (
+            "GDN hybrid requires 2 <= full_attention_interval <= num_layers so "
+            "the model keeps both attention and state layers, got "
+            f"full_attention_interval={interval} with num_layers={num_layers}."
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            build_gdn_hybrid_plan(args, num_layers)
+        assert str(excinfo.value) == expected
 
 
 class TestLayerPlanDispatch:

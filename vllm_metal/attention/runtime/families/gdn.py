@@ -76,14 +76,15 @@ def build_gdn_hybrid_plan(
 ) -> HybridRuntimePlan:
     """Resolve GDN layer topology and recurrent geometry from model args."""
     gdn_config = GDNHybridConfig.from_model_args(model_args)
-    if num_layers <= 0:
+    interval = gdn_config.full_attention_interval
+    if not 2 <= interval <= num_layers:
         raise ValueError(
-            f"GDN hybrid requires a positive layer count, got {num_layers}."
+            "GDN hybrid requires 2 <= full_attention_interval <= num_layers so "
+            "the model keeps both attention and state layers, got "
+            f"full_attention_interval={interval} with num_layers={num_layers}."
         )
     layer_roles: tuple[LayerRole, ...] = tuple(
-        ATTENTION_LAYER
-        if (i + 1) % gdn_config.full_attention_interval == 0
-        else STATE_LAYER
+        ATTENTION_LAYER if (i + 1) % interval == 0 else STATE_LAYER
         for i in range(num_layers)
     )
     return HybridRuntimePlan(

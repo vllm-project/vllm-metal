@@ -214,20 +214,18 @@ def make_gemma4_mixed_mha_runner(
     )
 
 
-# The production family spec, resolved once through the public builder (the
-# args are a minimal valid sentinel; only the family policy is kept).  Tests
-# reuse it so they cannot drift from the wrapper, detector and dtype policy
-# production installs.
+# Production family policy, resolved through the public builder from the
+# smallest valid hybrid layout so tests cannot drift from what production installs.
 _GDN_FAMILY_SPEC = build_gdn_hybrid_plan(
     {
-        "full_attention_interval": 1,
+        "full_attention_interval": 2,
         "linear_num_key_heads": 1,
         "linear_num_value_heads": 1,
         "linear_key_head_dim": 1,
         "linear_value_head_dim": 1,
         "linear_conv_kernel_dim": 1,
     },
-    1,
+    2,
 ).family
 
 
