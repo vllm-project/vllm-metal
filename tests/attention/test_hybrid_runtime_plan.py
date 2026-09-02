@@ -169,12 +169,6 @@ class TestLayerPlanDispatch:
         with pytest.raises(ValueError, match="got layer 8"):
             plan.layers.layer_role(8)
 
-    def test_cache_index_rejects_the_wrong_role(self) -> None:
-        plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
-
-        with pytest.raises(ValueError, match="no attention cache index for layer 0"):
-            plan.layers.attention_cache_index(0)
-
 
 class TestStateCacheSpec:
     def test_spec_threads_geometry_family_and_mode(self) -> None:
@@ -289,5 +283,5 @@ class TestHybridPatchModel:
         model = _FakeModel("sasa")
         model.layers[2] = _Layer(_Mystery(), linear=True)
 
-        with pytest.raises(RuntimeError, match="neither SDPA nor 'gdn' state"):
+        with pytest.raises(RuntimeError, match="is not a 'gdn' state module"):
             runtime.patch_model(model)

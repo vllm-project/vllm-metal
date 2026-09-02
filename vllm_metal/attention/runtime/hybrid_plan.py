@@ -86,23 +86,11 @@ class HybridLayerPlan:
 
     def attention_cache_index(self, layer_idx: int) -> int:
         """Return the compact KV cache ordinal owned by an attention layer."""
-        attention_indices = self.attention_indices
-        if layer_idx not in attention_indices:
-            raise ValueError(
-                f"hybrid layer plan has no attention cache index for layer "
-                f"{layer_idx}; attention layers are {attention_indices}"
-            )
-        return attention_indices.index(layer_idx)
+        return self.attention_indices.index(layer_idx)
 
     def state_cache_index(self, layer_idx: int) -> int:
         """Return the compact state ordinal owned by a state layer."""
-        state_indices = self.state_indices
-        if layer_idx not in state_indices:
-            raise ValueError(
-                f"hybrid layer plan has no state cache index for layer "
-                f"{layer_idx}; state layers are {state_indices}"
-            )
-        return state_indices.index(layer_idx)
+        return self.state_indices.index(layer_idx)
 
 
 @dataclass(frozen=True, slots=True)

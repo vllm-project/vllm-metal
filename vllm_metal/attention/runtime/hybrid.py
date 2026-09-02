@@ -27,7 +27,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 )
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
+from vllm_metal.attention.runtime.hybrid_plan import STATE_LAYER, HybridRuntimePlan
 from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
 
 logger = init_logger(__name__)
@@ -196,29 +196,31 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_family = self._hybrid_plan.family
 
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
+            if layer_plan.layer_role(layer_idx) == STATE_LAYER:
+                cache_idx = layer_plan.state_cache_index(layer_idx)
+                if isinstance(attn, state_family.wrapper_cls):
+                    attn.rebind_state_cache(state_cache, cache_idx=cache_idx)
+                    return attn
+                if state_family.is_state_module(attn):
+                    return state_family.wrapper_cls(
+                        attn, layer_idx, cache_idx, state_cache
+                    )
+                raise RuntimeError(
+                    f"Hybrid patch_model: layer {layer_idx} is a state layer in "
+                    f"the hybrid plan but {type(attn).__name__} is not a "
+                    f"{state_family.label!r} state module."
+                )
+            cache_idx = layer_plan.attention_cache_index(layer_idx)
             if isinstance(attn, SDPAPagedAttentionWrapper):
-                # Already patched (cached model reuse) — refresh cache refs.
-                cache_idx = layer_plan.attention_cache_index(layer_idx)
                 attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
                 return attn
-            if isinstance(attn, state_family.wrapper_cls):
-                # Already patched — refresh state cache ref.
-                cache_idx = layer_plan.state_cache_index(layer_idx)
-                attn.rebind_state_cache(state_cache, cache_idx=cache_idx)
-                return attn
             if is_sdpa(attn):
-                cache_idx = layer_plan.attention_cache_index(layer_idx)
                 return SDPAPagedAttentionWrapper(
                     attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
                 )
-            if state_family.is_state_module(attn):
-                cache_idx = layer_plan.state_cache_index(layer_idx)
-                return state_family.wrapper_cls(attn, layer_idx, cache_idx, state_cache)
             raise RuntimeError(
-                f"Hybrid patch_model: layer {layer_idx} attention "
-                f"{type(attn).__name__} is neither SDPA nor "
-                f"{state_family.label!r} state; refusing to leave it unpatched "
-                "(it would silently run unpaged)."
+                f"Hybrid patch_model: layer {layer_idx} is an attention layer in "
+                f"the hybrid plan but {type(attn).__name__} is not SDPA."
             )
 
         return walk_and_wrap(model, wrap_layer)
