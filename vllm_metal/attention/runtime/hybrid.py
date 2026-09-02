@@ -80,11 +80,6 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._k_quant = k_quant
         self._v_quant = v_quant
 
-        # Layer topology is owned by the plan; alias its index tuples here
-        # instead of re-deriving them from config math.
-        self._sdpa_indices = self._hybrid_plan.layers.attention_indices
-        self._linear_indices = self._hybrid_plan.layers.state_indices
-
         self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
         self._gdn_state_manager: HybridGDNStateManager | AlignGDNStateManager | None = (
@@ -95,7 +90,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def initialize(self, num_blocks: int) -> None:
         self._cache = MetalPagedKVCache(
-            num_layers=len(self._sdpa_indices),
+            num_layers=self._hybrid_plan.layers.num_attention,
             num_kv_heads=self._num_kv_heads,
             head_dim=self._head_dim,
             num_blocks=num_blocks,
@@ -120,7 +115,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_slots = num_blocks if align else self._max_num_seqs
         state_geometry = self._hybrid_plan.geometry
         self._state_cache = GDNPagedStateCache(
-            num_layers=len(self._linear_indices),
+            num_layers=self._hybrid_plan.layers.num_state,
             max_seqs=state_slots,
             conv_kernel_dim=state_geometry.conv_kernel_dim,
             conv_dim=state_geometry.conv_dim,
@@ -139,9 +134,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
             "%d linear layers (%d/%d GDN slots allocated, mamba_cache_mode=%s)",
-            len(self._sdpa_indices),
+            self._hybrid_plan.layers.num_attention,
             num_blocks,
-            len(self._linear_indices),
+            self._hybrid_plan.layers.num_state,
             self._state_cache.allocated_seqs,
             self._state_cache.max_seqs,
             self._mamba_cache_mode,
@@ -196,9 +191,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")
-        if self._state_cache is None:
-            raise RuntimeError("patch_model() called before initialize()")
-        state_cache = self._state_cache
+        state_cache = self.state_cache
         layer_plan = self._hybrid_plan.layers
         state_family = self._hybrid_plan.family
 
