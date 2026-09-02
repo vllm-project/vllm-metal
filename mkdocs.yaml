@@ -73,6 +73,7 @@ nav:
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
+    - KV Cache Offloading: kv_offloading.md
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
   - Contributing: CONTRIBUTING.md
