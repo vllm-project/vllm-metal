@@ -11,7 +11,7 @@ Handles models whose attention module exposes:
 - ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
-- Optionally ``q_norm``, ``k_norm``, ``v_norm`` per-head RMSNorms
+- Optionally ``q_norm``, ``k_norm``, ``v_norm`` RMSNorms
 - Optionally ``g_proj`` (+ ``gating=True``) for Laguna-style per-head
   softplus attention-output gating (see :func:`apply_g_proj_gate`)
 
@@ -221,9 +221,9 @@ def _kernel_metadata(
 
 
 def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
-    """Return the first per-head norm present on *module* among *names*.
+    """Return the first Q/K norm present on *module* among *names*.
 
-    mlx_lm spells the per-head Q/K norms differently per architecture:
+    mlx_lm spells the Q/K norms differently per architecture:
     Qwen3/Qwen3.5/Gemma4/OLMo use ``q_norm``/``k_norm``, while Hunyuan
     (``hunyuan_v1_dense``) uses ``query_layernorm``/``key_layernorm``.
     Probing by name keeps the caller from silently skipping the norm on
@@ -322,6 +322,8 @@ def prepare_sdpa_qkv(
     """
     B, L, _ = x.shape  # noqa: N806
     norm_placement = attention_contract.qk_norm_placement
+    q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
+    k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -356,12 +358,16 @@ def prepare_sdpa_qkv(
         q_width = n_heads * head_dim
         kv_width = n_kv_heads * head_dim
         queries, keys, values = mx.split(qkv, [q_width, q_width + kv_width], axis=-1)
+        if norm_placement is QKNormPlacement.BEFORE_HEAD_SPLIT:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
         queries = queries.reshape(B, L, n_heads, head_dim)
         keys = keys.reshape(B, L, n_kv_heads, head_dim)
         values = values.reshape(B, L, n_kv_heads, head_dim)
     else:
         # Projections + reshape.  Qwen3.5 uses gated q_proj (2x head_dim).
         q_proj_out = inner.q_proj(x)
+        if norm_placement is QKNormPlacement.BEFORE_HEAD_SPLIT and q_norm is not None:
+            q_proj_out = q_norm(q_proj_out)
         q_full_head = q_proj_out.shape[-1] // n_heads
         if q_full_head == 2 * head_dim:
             q_reshaped = q_proj_out.reshape(B, L, n_heads, q_full_head)
@@ -380,7 +386,6 @@ def prepare_sdpa_qkv(
             values = keys
         else:
             keys, values = shared_kv
-        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
         if norm_placement is QKNormPlacement.BEFORE_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm)
         queries = queries.transpose(0, 2, 1, 3)
@@ -399,7 +404,13 @@ def prepare_sdpa_qkv(
             queries, keys = _apply_qk_norms(queries, keys, q_norm)
     else:
         if not packed_qkv:
-            keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
+            k_proj_out = inner.k_proj(x)
+            if (
+                norm_placement is QKNormPlacement.BEFORE_HEAD_SPLIT
+                and k_norm is not None
+            ):
+                k_proj_out = k_norm(k_proj_out)
+            keys = k_proj_out.reshape(B, L, n_kv_heads, -1)
             # K-eq-V variant (Gemma4 26B/31B): no v_proj, values = keys.
             if hasattr(inner, "v_proj"):
                 values = inner.v_proj(x).reshape(B, L, n_kv_heads, -1)
@@ -407,8 +418,6 @@ def prepare_sdpa_qkv(
                 values = keys
 
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
-        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
-        k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
         if norm_placement is QKNormPlacement.BEFORE_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
         if hasattr(inner, "v_norm"):
