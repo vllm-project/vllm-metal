@@ -123,6 +123,20 @@ class HybridRuntimePlan:
     family: StateFamilySpec
     geometry: RecurrentStateGeometry
 
+    def state_bytes_per_layer(self, conv_dtype_size: int) -> int:
+        """Bytes one request holds in one recurrent state layer."""
+        geometry = self.geometry
+        conv_bytes = (
+            (geometry.conv_kernel_dim - 1) * geometry.conv_dim * conv_dtype_size
+        )
+        recurrent_bytes = (
+            geometry.num_v_heads
+            * geometry.value_head_dim
+            * geometry.key_head_dim
+            * self.family.recurrent_dtype.itemsize
+        )
+        return conv_bytes + recurrent_bytes
+
     def state_cache_spec(
         self,
         *,

@@ -891,34 +891,25 @@ class ModelCachePolicy:
         if not self._runner.is_hybrid:
             raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
         hybrid_plan = self._hybrid_plan()
-        return hybrid_plan.layers.num_state * self._state_bytes_per_layer(hybrid_plan)
+        return hybrid_plan.layers.num_state * hybrid_plan.state_bytes_per_layer(
+            self._require_kv_cache_dtype().size
+        )
 
     def hybrid_align_state_bytes_per_block(self) -> int:
         """Per-pool-block linear-state bytes under align-mode prefix caching."""
         hybrid_plan = self._hybrid_plan()
         layer_plan = hybrid_plan.layers
         pools = _align_state_pool_count(layer_plan.num_state, layer_plan.num_attention)
-        return self._state_bytes_per_layer(hybrid_plan) * pools
+        return (
+            hybrid_plan.state_bytes_per_layer(self._require_kv_cache_dtype().size)
+            * pools
+        )
 
     def hybrid_align_growth_bytes_per_block(self) -> int:
         """One old physical state pool retained during align-cache growth."""
-        return self._state_bytes_per_layer(self._hybrid_plan())
-
-    def _state_bytes_per_layer(self, hybrid_plan: HybridRuntimePlan) -> int:
-        """Bytes one request holds in one state layer: conv tail plus SSM state."""
-        state_geometry = hybrid_plan.geometry
-        conv_bytes = (
-            (state_geometry.conv_kernel_dim - 1)
-            * state_geometry.conv_dim
-            * self._require_kv_cache_dtype().size
+        return self._hybrid_plan().state_bytes_per_layer(
+            self._require_kv_cache_dtype().size
         )
-        recurrent_bytes = (
-            state_geometry.num_v_heads
-            * state_geometry.value_head_dim
-            * state_geometry.key_head_dim
-            * hybrid_plan.family.recurrent_dtype.itemsize
-        )
-        return conv_bytes + recurrent_bytes
 
     def build_paged_attention_runtime(
         self, *, block_size: int
