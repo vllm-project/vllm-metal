@@ -79,6 +79,10 @@ class HybridLayerPlan:
         """Return the role owning ``layer_idx``; consumers dispatch on it."""
         return self.layer_roles[layer_idx]
 
+    def is_state_layer(self, layer_idx: int) -> bool:
+        """Return whether ``layer_idx`` is owned by the state runtime."""
+        return self.layer_roles[layer_idx] == STATE_LAYER
+
     def attention_cache_index(self, layer_idx: int) -> int:
         """Return the compact KV cache ordinal owned by an attention layer."""
         return self.attention_indices.index(layer_idx)

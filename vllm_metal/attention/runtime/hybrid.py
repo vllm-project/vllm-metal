@@ -27,7 +27,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 )
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-from vllm_metal.attention.runtime.hybrid_plan import STATE_LAYER, HybridRuntimePlan
+from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
 
 logger = init_logger(__name__)
@@ -196,7 +196,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_family = self._hybrid_plan.family
 
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
-            if layer_plan.layer_role(layer_idx) == STATE_LAYER:
+            if layer_plan.is_state_layer(layer_idx):
                 cache_idx = layer_plan.state_cache_index(layer_idx)
                 if isinstance(attn, state_family.wrapper_cls):
                     attn.rebind_state_cache(state_cache, cache_idx=cache_idx)

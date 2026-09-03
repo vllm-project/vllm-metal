@@ -30,10 +30,7 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
 )
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
-from vllm_metal.attention.runtime.hybrid_plan import (
-    STATE_LAYER,
-    HybridRuntimePlan,
-)
+from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
@@ -393,7 +390,7 @@ class ModelCachePolicy:
             hybrid_plan = self._hybrid_plan()
             state_spec = self._state_layer_spec(hybrid_plan, torch_dtype)
             for layer_idx in range(num_spec_layers):
-                if hybrid_plan.layers.layer_role(layer_idx) == STATE_LAYER:
+                if hybrid_plan.layers.is_state_layer(layer_idx):
                     specs[f"layers.{layer_idx}.linear_attn"] = state_spec
                 else:
                     specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
