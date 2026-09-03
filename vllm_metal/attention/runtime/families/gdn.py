@@ -71,6 +71,30 @@ class GDNHybridConfig:
                 f"{', '.join(invalid_fields)}."
             )
 
+    def layer_roles(self, num_layers: int) -> tuple[LayerRole, ...]:
+        interval = self.full_attention_interval
+        if not 2 <= interval <= num_layers:
+            raise ValueError(
+                "GDN hybrid requires 2 <= full_attention_interval <= num_layers so "
+                "the model keeps both attention and state layers, got "
+                f"full_attention_interval={interval} with num_layers={num_layers}."
+            )
+        return tuple(
+            ATTENTION_LAYER if (i + 1) % interval == 0 else STATE_LAYER
+            for i in range(num_layers)
+        )
+
+    def state_geometry(self) -> RecurrentStateGeometry:
+        return RecurrentStateGeometry(
+            conv_kernel_dim=self.conv_kernel_dim,
+            # GDN packs q/k at key_dim and v at value_dim into one conv stream.
+            conv_dim=self.num_key_heads * self.key_head_dim * 2
+            + self.num_value_heads * self.value_head_dim,
+            num_v_heads=self.num_value_heads,
+            value_head_dim=self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+        )
+
 
 _GDN_FAMILY = StateFamilySpec(
     label="gdn",
@@ -89,27 +113,8 @@ def build_gdn_hybrid_plan(
 ) -> HybridRuntimePlan:
     """Resolve GDN layer topology and recurrent geometry from model args."""
     gdn_config = GDNHybridConfig.from_model_args(model_args)
-    interval = gdn_config.full_attention_interval
-    if not 2 <= interval <= num_layers:
-        raise ValueError(
-            "GDN hybrid requires 2 <= full_attention_interval <= num_layers so "
-            "the model keeps both attention and state layers, got "
-            f"full_attention_interval={interval} with num_layers={num_layers}."
-        )
-    layer_roles: tuple[LayerRole, ...] = tuple(
-        ATTENTION_LAYER if (i + 1) % interval == 0 else STATE_LAYER
-        for i in range(num_layers)
-    )
     return HybridRuntimePlan(
-        layers=HybridLayerPlan(layer_roles=layer_roles),
+        layers=HybridLayerPlan(layer_roles=gdn_config.layer_roles(num_layers)),
         family=_GDN_FAMILY,
-        geometry=RecurrentStateGeometry(
-            conv_kernel_dim=gdn_config.conv_kernel_dim,
-            # GDN packs q/k at key_dim and v at value_dim into one conv stream.
-            conv_dim=gdn_config.num_key_heads * gdn_config.key_head_dim * 2
-            + gdn_config.num_value_heads * gdn_config.value_head_dim,
-            num_v_heads=gdn_config.num_value_heads,
-            value_head_dim=gdn_config.value_head_dim,
-            key_head_dim=gdn_config.key_head_dim,
-        ),
+        geometry=gdn_config.state_geometry(),
     )
