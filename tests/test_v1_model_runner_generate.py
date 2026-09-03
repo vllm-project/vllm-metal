@@ -81,6 +81,18 @@ class ForwardOutputRuntimeStub:
         return None
 
 
+class SpeculativeCommitRuntimeStub:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.materialize_calls = 0
+
+    def commit_speculative_state(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+
+    def materialize_pending_state(self) -> None:
+        self.materialize_calls += 1
+
+
 class PoolingForwardBackendStub:
     def __init__(self, hidden_states: mx.array) -> None:
         self.hidden_states = hidden_states
@@ -134,6 +146,74 @@ class TestDrafterReleaseOnLifecycle:
         )
 
         assert released == [{"done", "paused", "back"}]
+
+
+class TestHybridSpeculativeStatePromotion:
+    @staticmethod
+    def _segment(
+        req_id: str,
+        *,
+        start_row: int,
+        cache_start_pos: int,
+        drafts: tuple[int, ...],
+    ) -> PagedDecodeSegment:
+        return PagedDecodeSegment(
+            req_id=req_id,
+            input_token_ids=(9, *drafts),
+            start_row=start_row,
+            num_query_tokens=1 + len(drafts),
+            draft_token_ids=drafts,
+            cache_start_pos=cache_start_pos,
+            block_ids=((2, 3, 6, 7),),
+        )
+
+    def test_commits_only_speculative_requests_with_sampled_lengths(self) -> None:
+        runner = make_stub_runner(tokenizer=object())
+        runner.model_args = {"full_attention_interval": 2}
+        runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+        runtime = SpeculativeCommitRuntimeStub()
+        runner._paged_attention_runtime = runtime
+        runner._state_block_ids_by_req = {
+            "spec": [[2, 3, 6, 7]],
+            "plain": [[8, 9]],
+        }
+        spec_segment = self._segment(
+            "spec", start_row=0, cache_start_pos=5, drafts=(10, 11)
+        )
+        plain_segment = self._segment(
+            "plain", start_row=3, cache_start_pos=12, drafts=()
+        )
+
+        runner._commit_hybrid_speculative_state(
+            decode_reqs=[("spec", object()), ("plain", object())],
+            decode_segments=(spec_segment, plain_segment),
+            decode_token_ids=[[10, 99], [12]],
+        )
+
+        assert runtime.materialize_calls == 1
+        assert runtime.calls == [
+            {
+                "req_ids": ["spec"],
+                "state_block_ids": [[[2, 3, 6, 7]]],
+                "step_positions": [(5, 3)],
+                "num_sampled_tokens": [2],
+            }
+        ]
+
+    def test_rejects_impossible_verifier_output_length(self) -> None:
+        runner = make_stub_runner(tokenizer=object())
+        runner.model_args = {"full_attention_interval": 2}
+        runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+        runner._paged_attention_runtime = SpeculativeCommitRuntimeStub()
+        runner._state_block_ids_by_req = {"spec": [[2, 3, 6, 7]]}
+        segment = self._segment("spec", start_row=0, cache_start_pos=5, drafts=(10, 11))
+
+        with pytest.raises(RuntimeError, match="emitted 0 tokens"):
+            runner._commit_hybrid_speculative_state(
+                decode_reqs=[("spec", object())],
+                decode_segments=(segment,),
+                decode_token_ids=[[]],
+            )
 
 
 class TestV1MetalModelRunnerGenerate:

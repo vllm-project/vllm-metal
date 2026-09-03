@@ -433,6 +433,23 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 hidden_states=None,
             )
 
+        # Hardened mlx-lm Qwen native-MTP models expose an explicit
+        # return_hidden contract: logits have already passed through the final
+        # RMSNorm, while the hidden state is the pre-final-norm value the vendor
+        # MTP head was trained to consume.
+        if bool(getattr(model, "supports_mtp", False)):
+            output = model(input_ids, cache=cache, return_hidden=True)
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise RuntimeError(
+                    "supports_mtp model must return (logits, hidden_states) "
+                    "when return_hidden=True"
+                )
+            logits, hidden_states = output
+            return TargetModelForwardOutput(
+                logits=self.extract_logits(logits),
+                hidden_states=self._flatten_target_hidden_states(hidden_states),
+            )
+
         hidden_states = self._forward_target_hidden_states(
             model,
             input_ids,

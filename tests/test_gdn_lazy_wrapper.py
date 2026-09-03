@@ -110,6 +110,159 @@ def _make_state_cache(
     )
 
 
+class TestGDNSpeculativeStateChains:
+    def test_full_wrapper_writes_conv_and_recurrent_snapshot_per_token(self) -> None:
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            max_seqs=4,
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        context = PagedAttentionContext(
+            slot_mapping=[],
+            cu_seqlens=[0, 3],
+            num_decode_requests=1,
+            gdn_group_slot_mappings=([2],),
+            gdn_group_state_chains=([[0, 0, 1, 2]],),
+        )
+        tokens = mx.stack(
+            [
+                mx.full((inner.conv_dim,), 0.01, dtype=mx.float32),
+                mx.full((inner.conv_dim,), 0.02, dtype=mx.float32),
+                mx.full((inner.conv_dim,), 0.03, dtype=mx.float32),
+            ],
+            axis=0,
+        )[None]
+
+        set_context(context)
+        try:
+            output = wrapper(tokens)
+        finally:
+            clear_context()
+        mx.eval(output, *cache.updated_state_arrays())
+
+        assert output.shape == (1, 3, inner.head_v_dim)
+        conv = np.array(cache.conv_states[0])
+        np.testing.assert_allclose(conv[0], 0.01, atol=1e-6)
+        np.testing.assert_allclose(conv[1], 0.02, atol=1e-6)
+        np.testing.assert_allclose(conv[2], 0.03, atol=1e-6)
+
+        recurrent = np.array(cache.recurrent_states[0])
+        assert np.any(recurrent[0] != 0)
+        assert np.any(recurrent[1] != recurrent[0])
+        assert np.any(recurrent[2] != recurrent[1])
+
+    def test_multi_request_chain_batches_recurrent_but_not_conv(self) -> None:
+        class FakeLazy:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.conv_slots: list[list[int]] = []
+                self.recurrent_slots: list[list[int]] = []
+
+            def try_conv_decode(self, mixed_qkv, _inner, _cache, _cache_idx, slot_ids):
+                self.conv_slots.append(list(slot_ids))
+                return mixed_qkv
+
+            def try_recurrent_decode(self, request):
+                self.recurrent_slots.append(list(request.slot_ids))
+                return mx.zeros(
+                    (
+                        request.total_tokens,
+                        request.num_value_heads,
+                        request.value_head_dim,
+                    ),
+                    dtype=request.output_dtype,
+                )
+
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            max_seqs=4,
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        fake = FakeLazy()
+        object.__setattr__(wrapper, "_gdn_lazy", fake)
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 4, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2, 4],
+            num_requests=2,
+            total_tokens=4,
+            slot_ids=[1, 3],
+            num_decode_requests=2,
+            state_chains=[[0, 0, 1], [2, 2, 3]],
+        )
+
+        conv = wrapper._run_conv_state_chains(state.x, state)
+        assert conv.shape == (1, 4, inner.conv_dim)
+        assert fake.conv_slots == []
+
+        q = mx.zeros((1, 4, 1, 32), dtype=mx.float32)
+        v = mx.zeros((1, 4, 1, 4), dtype=mx.float32)
+        gates = mx.zeros((1, 4, 1), dtype=mx.float32)
+        recurrent = wrapper._run_recurrent_state_chains(q, q, v, gates, gates, state)
+        assert recurrent.shape == (4, 1, 4)
+        assert fake.recurrent_slots == [[0, 2], [1, 3]]
+
+    def test_single_request_one_draft_keeps_conv_fast_path(self) -> None:
+        class FakeLazy:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.conv_slots: list[list[int]] = []
+
+            def try_conv_decode(self, mixed_qkv, _inner, _cache, _cache_idx, slot_ids):
+                self.conv_slots.append(list(slot_ids))
+                return mixed_qkv
+
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            max_seqs=2,
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        fake = FakeLazy()
+        object.__setattr__(wrapper, "_gdn_lazy", fake)
+        state = attention_linear._GDNForwardState(
+            x=mx.stack(
+                [
+                    mx.full((inner.conv_dim,), 0.01, dtype=mx.float32),
+                    mx.full((inner.conv_dim,), 0.02, dtype=mx.float32),
+                ],
+                axis=0,
+            )[None],
+            cu_seqlens=[0, 2],
+            num_requests=1,
+            total_tokens=2,
+            slot_ids=[1],
+            num_decode_requests=1,
+            state_chains=[[0, 0, 1]],
+        )
+
+        conv = wrapper._run_conv_state_chains(state.x, state)
+
+        assert conv.shape == (1, 2, inner.conv_dim)
+        assert fake.conv_slots == [[0], [1]]
+
+
 class TestGDNPagedAttentionWrapperLazyKernels:
     def test_mixed_batch_with_prefill_tries_recurrent_lazy_path(
         self, monkeypatch: pytest.MonkeyPatch

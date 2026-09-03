@@ -120,6 +120,7 @@ class SpeculativeDecodeController:
         is_hybrid: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
+        hybrid_speculative_ready: bool = False,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
         # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
@@ -150,10 +151,14 @@ class SpeculativeDecodeController:
                 "attention so draft-token rows can share scheduler-assigned "
                 "KV slots."
             )
-        if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
+        if (
+            (active_spec_tokens or has_invalid_spec_tokens)
+            and is_hybrid
+            and not hybrid_speculative_ready
+        ):
             raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "GDN models on Metal yet."
+                "Speculative decode verification for hybrid GDN models requires "
+                "the transactional paged Qwen MTP runtime."
             )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}

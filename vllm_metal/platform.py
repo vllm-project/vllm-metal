@@ -540,12 +540,28 @@ class MetalPlatform(Platform):
                 cache_config.enable_prefix_caching
                 and vllm_config.speculative_config is not None
             ):
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "draft-state rollback across mamba state blocks "
-                    "(num_speculative_blocks) is not implemented for "
-                    "speculative decoding",
+                hf_config = model_config.hf_config
+                get_text_config = getattr(hf_config, "get_text_config", None)
+                text_config = (
+                    get_text_config() if callable(get_text_config) else hf_config
                 )
+                speculative_config = vllm_config.speculative_config
+                native_qwen_mtp = (
+                    getattr(speculative_config, "method", None) == "mtp"
+                    and int(
+                        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+                    )
+                    == 1
+                    and int(getattr(text_config, "mtp_num_hidden_layers", 0)) > 0
+                    and cache_config.mamba_cache_mode == "align"
+                    and config.use_paged_attention
+                )
+                if not native_qwen_mtp:
+                    raise NotImplementedError(
+                        "Hybrid prefix caching plus speculative decoding on "
+                        "Metal is supported only for one-token native Qwen MTP "
+                        "with paged attention and mamba_cache_mode='align'."
+                    )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the

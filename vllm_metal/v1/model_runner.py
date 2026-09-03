@@ -108,6 +108,7 @@ from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
     ProposeContext,
+    QwenNativeMTPProposer,
 )
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
@@ -512,6 +513,16 @@ class MetalModelRunner:
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
+        runtime = self._paged_attention_runtime
+        if (
+            self.is_hybrid
+            and runtime is not None
+            and callable(getattr(runtime, "supports_hybrid_speculative_decode", None))
+            and runtime.supports_hybrid_speculative_decode()
+        ):
+            # The phase-2 GDN wrapper requires one segment per request so it
+            # can emit a recurrent/conv checkpoint after every verify token.
+            return True
         return (
             envs.VLLM_METAL_SPEC_VERIFY_WINDOW
             and not self.is_mla
@@ -841,6 +852,10 @@ class MetalModelRunner:
         """
         return self._cache_policy.get_cache_block_size_bytes()
 
+    def qwen_mtp_aux_bytes_per_block(self) -> int:
+        """Return native-Qwen MTP KV and boundary-hidden bytes per block."""
+        return self._cache_policy.qwen_mtp_aux_bytes_per_block()
+
     def linear_cache_bytes_per_slot(self) -> int:
         """Bytes for one request's linear attention state across all GDN layers."""
         return self._cache_policy.linear_cache_bytes_per_slot()
@@ -971,6 +986,8 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "mtp":
+            self._drafter = QwenNativeMTPProposer(self)
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
@@ -1004,7 +1021,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4/Qwen native MTP, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(
@@ -1453,6 +1470,14 @@ class MetalModelRunner:
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
                     del target_output
+
+            if (
+                ctx is not None
+                and runtime is not None
+                and target_hidden_states is not None
+                and bool(getattr(runtime, "qwen_mtp_ready", False))
+            ):
+                runtime.store_qwen_mtp_target_hidden(ctx, target_hidden_states)
         finally:
             clear_context()
 
@@ -1770,6 +1795,16 @@ class MetalModelRunner:
             vocab_size=vocab_size,
         )
 
+        # The target forward has now produced one GDN checkpoint per
+        # verification input token, and the verifier has chosen how many output
+        # tokens to commit. Promote the matching scheduler-owned recurrent state
+        # before request lengths or block ownership advance.
+        self._commit_hybrid_speculative_state(
+            decode_reqs=decode_reqs,
+            decode_segments=decode_segments,
+            decode_token_ids=decode_token_ids,
+        )
+
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
             sampled_ids = decode_token_ids[i]
@@ -1958,6 +1993,81 @@ class MetalModelRunner:
                 decode_reqs.append((req_id, state))
         return tuple(decode_reqs)
 
+    def _commit_hybrid_speculative_state(
+        self,
+        *,
+        decode_reqs: list[tuple[str, RequestState]],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+        decode_token_ids: list[list[int]],
+    ) -> None:
+        """Promote verifier-selected state in an align-mode hybrid runtime.
+
+        ``decode_token_ids[i]`` contains the verifier's emitted sequence for
+        request ``i``. Its length is the universal recurrent-state selector:
+        state snapshot ``len(sampled_ids) - 1``.
+        """
+        runtime = self._paged_attention_runtime
+        if runtime is None or not self.is_hybrid:
+            return
+        if not any(segment.draft_token_ids for segment in decode_segments):
+            return
+        if self.cache_config.mamba_cache_mode != "align":
+            raise RuntimeError(
+                "hybrid speculative state promotion requires mamba_cache_mode='align'"
+            )
+        if not (len(decode_reqs) == len(decode_segments) == len(decode_token_ids)):
+            raise RuntimeError("decode speculation metadata length mismatch")
+
+        req_ids: list[str] = []
+        state_block_ids: list[list[list[int]]] = []
+        step_positions: list[tuple[int, int]] = []
+        num_sampled_tokens: list[int] = []
+        for (req_id, _), segment, sampled_ids in zip(
+            decode_reqs, decode_segments, decode_token_ids, strict=True
+        ):
+            if not segment.draft_token_ids:
+                continue
+            if req_id != segment.req_id:
+                raise RuntimeError(
+                    "hybrid speculative state promotion received mismatched "
+                    f"request metadata: {req_id!r} != {segment.req_id!r}"
+                )
+            sampled = len(sampled_ids)
+            if sampled < 1 or sampled > segment.num_query_tokens:
+                raise RuntimeError(
+                    f"request {req_id!r} emitted {sampled} tokens for a "
+                    f"{segment.num_query_tokens}-token verification window"
+                )
+            try:
+                request_state_blocks = self._state_block_ids_by_req[req_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"no scheduler-owned GDN block table for {req_id!r}"
+                ) from exc
+
+            req_ids.append(req_id)
+            state_block_ids.append(request_state_blocks)
+            step_positions.append((segment.cache_start_pos, segment.num_query_tokens))
+            num_sampled_tokens.append(sampled)
+
+        if not req_ids:
+            return
+
+        commit = getattr(runtime, "commit_speculative_state", None)
+        if commit is None:
+            raise RuntimeError(
+                "hybrid runtime does not implement speculative GDN state promotion"
+            )
+        commit(
+            req_ids=req_ids,
+            state_block_ids=state_block_ids,
+            step_positions=step_positions,
+            num_sampled_tokens=num_sampled_tokens,
+        )
+        # The promotion copy is a lazy MLX state mutation. Materialize it before
+        # the scheduler can reuse, evict, preempt, or copy those blocks.
+        runtime.materialize_pending_state()
+
     def _validate_spec_decode_supported(
         self,
         scheduler_output: SchedulerOutput,
@@ -1969,6 +2079,17 @@ class MetalModelRunner:
             is_hybrid=self.is_hybrid,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
+            hybrid_speculative_ready=(
+                self._paged_attention_runtime is not None
+                and callable(
+                    getattr(
+                        self._paged_attention_runtime,
+                        "supports_hybrid_speculative_decode",
+                        None,
+                    )
+                )
+                and self._paged_attention_runtime.supports_hybrid_speculative_decode()
+            ),
         )
 
     def _run_vision_encoders(
