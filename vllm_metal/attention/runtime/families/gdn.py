@@ -24,27 +24,6 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     StateFamilySpec,
 )
 
-_GDN_FAMILY = StateFamilySpec(
-    label="gdn",
-    wrapper_cls=GDNPagedAttentionWrapper,
-    is_state_module=is_linear_attention,
-    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-    # Match the fp32 recurrent pool used for kernel accumulation.
-    recurrent_dtype=torch.float32,
-    # Scheduler-side mamba caching strategies the GDN state path implements.
-    supported_cache_modes=("none", "align"),
-)
-
-
-def _read_positive_int(model_args: Mapping[str, Any], key: str) -> int:
-    """Read one GDN dimension from model args, rejecting anything unusable."""
-    value = model_args.get(key)
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(
-            f"GDN hybrid model args are missing a usable {key!r}: got {value!r}."
-        )
-    return value
-
 
 @dataclass(frozen=True, slots=True)
 class GDNHybridConfig:
@@ -59,16 +38,50 @@ class GDNHybridConfig:
 
     @classmethod
     def from_model_args(cls, model_args: Mapping[str, Any]) -> GDNHybridConfig:
-        return cls(
-            full_attention_interval=_read_positive_int(
-                model_args, "full_attention_interval"
-            ),
-            num_key_heads=_read_positive_int(model_args, "linear_num_key_heads"),
-            num_value_heads=_read_positive_int(model_args, "linear_num_value_heads"),
-            key_head_dim=_read_positive_int(model_args, "linear_key_head_dim"),
-            value_head_dim=_read_positive_int(model_args, "linear_value_head_dim"),
-            conv_kernel_dim=_read_positive_int(model_args, "linear_conv_kernel_dim"),
-        )
+        try:
+            return cls(
+                full_attention_interval=model_args["full_attention_interval"],
+                num_key_heads=model_args["linear_num_key_heads"],
+                num_value_heads=model_args["linear_num_value_heads"],
+                key_head_dim=model_args["linear_key_head_dim"],
+                value_head_dim=model_args["linear_value_head_dim"],
+                conv_kernel_dim=model_args["linear_conv_kernel_dim"],
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"GDN hybrid model args are missing required {exc.args[0]!r}."
+            ) from exc
+
+    def __post_init__(self) -> None:
+        invalid_fields = [
+            f"{name}={value!r}"
+            for name, value in (
+                ("full_attention_interval", self.full_attention_interval),
+                ("linear_num_key_heads", self.num_key_heads),
+                ("linear_num_value_heads", self.num_value_heads),
+                ("linear_key_head_dim", self.key_head_dim),
+                ("linear_value_head_dim", self.value_head_dim),
+                ("linear_conv_kernel_dim", self.conv_kernel_dim),
+            )
+            if type(value) is not int or value <= 0
+        ]
+        if invalid_fields:
+            raise ValueError(
+                "GDN hybrid model args must be positive integers; invalid "
+                f"{', '.join(invalid_fields)}."
+            )
+
+
+_GDN_FAMILY = StateFamilySpec(
+    label="gdn",
+    wrapper_cls=GDNPagedAttentionWrapper,
+    is_state_module=is_linear_attention,
+    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    # Match the fp32 recurrent pool used for kernel accumulation.
+    recurrent_dtype=torch.float32,
+    # Scheduler-side mamba caching strategies the GDN state path implements.
+    supported_cache_modes=("none", "align"),
+)
 
 
 def build_gdn_hybrid_plan(

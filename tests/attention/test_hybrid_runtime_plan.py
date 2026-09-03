@@ -127,7 +127,7 @@ class TestGdnPlanRejection:
     )
     def test_omitted_linear_dim_rejects_with_the_key_name(self, missing: str) -> None:
         args = {k: v for k, v in GDN_ARGS.items() if k != missing}
-        expected = f"GDN hybrid model args are missing a usable {missing!r}: got None."
+        expected = f"GDN hybrid model args are missing required {missing!r}."
 
         with pytest.raises(ValueError) as excinfo:
             build_gdn_hybrid_plan(args, 8)
