@@ -774,6 +774,39 @@ class TestModelLifecycle:
         assert runner.model_args["model_type"] == "gemma4"
         assert runner.model_args["vocab_size"] == _TEXT_MODEL_ARGS["vocab_size"]
 
+    def test_load_reads_omitted_text_keys_off_the_built_language_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A re-saved Qwen3.5 config omits full_attention_interval; mlx-lm
+        resolves it to 4 on the built text model, and routing must see that."""
+        text_config = dict(_TEXT_MODEL_ARGS) | {
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 3,
+        }
+        args = SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+        fake_model = SimpleNamespace(
+            args=args,
+            language_model=SimpleNamespace(
+                args=SimpleNamespace(**text_config, full_attention_interval=4)
+            ),
+        )
+        _stub_generation_model(monkeypatch, config=None, model=fake_model)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["full_attention_interval"] == 4
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
+        assert runner.hybrid_runtime_plan.layers.num_attention == (
+            _TEXT_MODEL_ARGS["num_hidden_layers"] // 4
+        )
+
     def test_load_stt_model_loads_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = SimpleNamespace(
             create_runtime_adapter=lambda model_name: (object(), model_name)

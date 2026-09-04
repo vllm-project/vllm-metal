@@ -543,6 +543,13 @@ class ModelLifecycle:
 
         merged_values = dict(model_values)
         text_values = self._config_to_mapping(text_config)
+        # mlx-lm builds the text sub-model from this raw dict and resolves the
+        # omitted keys on its args, so read those off the built module.
+        language_model = getattr(model, "language_model", None)
+        resolved_text_args = getattr(language_model, "args", None)
+        if resolved_text_args is not None:
+            for key, value in self._config_to_mapping(resolved_text_args).items():
+                text_values.setdefault(key, value)
         for key, value in text_values.items():
             merged_values.setdefault(key, value)
         return merged_values
