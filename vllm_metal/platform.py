@@ -517,7 +517,7 @@ class MetalPlatform(Platform):
                 cache_config.mamba_ssm_cache_dtype = "float32"
             elif cache_config.mamba_ssm_cache_dtype != "float32":
                 raise NotImplementedError(
-                    "Hybrid GDN models on Metal require "
+                    "Hybrid models on Metal require "
                     "--mamba-ssm-cache-dtype float32 because recurrent state is "
                     "stored in fp32."
                 )
@@ -525,7 +525,7 @@ class MetalPlatform(Platform):
                 # Before the downgrades below, which overwrite the mode: an
                 # explicit --mamba-cache-mode all must fail fast on every path.
                 raise NotImplementedError(
-                    "mamba_cache_mode='all' is not supported for hybrid GDN "
+                    "mamba_cache_mode='all' is not supported for hybrid "
                     "models on Metal (nor upstream, which falls back to "
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
@@ -841,7 +841,7 @@ class MetalPlatform(Platform):
 
     @staticmethod
     def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
-        """Downgrade default-on prefix caching for a hybrid GDN model.
+        """Downgrade default-on prefix caching for a hybrid model.
 
         vLLM 0.28.0 enables prefix caching by default for hybrid models
         (vllm#50991) and resolves ``mamba_cache_mode``/``mamba_block_size``
@@ -858,13 +858,13 @@ class MetalPlatform(Platform):
             # user's two explicit choices conflict; fail with the Metal
             # constraint before upstream's misleading error fires.
             raise NotImplementedError(
-                "Prefix caching for hybrid GDN models on Metal cannot serve "
+                "Prefix caching for hybrid models on Metal cannot serve "
                 f"this configuration ({reason}), and --mamba-block-size "
                 "requires prefix caching. Drop --mamba-block-size or the "
                 "conflicting option."
             )
         logger.warning(
-            "Disabling prefix caching for this hybrid GDN model: %s. "
+            "Disabling prefix caching for this hybrid model: %s. "
             "(vLLM enables prefix caching by default for hybrid models; "
             "pass --no-enable-prefix-caching to make this explicit.)",
             reason,
@@ -878,7 +878,7 @@ class MetalPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        """Metal supports hybrid KV cache for models like Qwen3.5 (SDPA + GDN)."""
+        """Metal supports the hybrid KV cache manager for hybrid models."""
         return True
 
     @classmethod
@@ -981,7 +981,7 @@ class MetalPlatform(Platform):
         # the kernel sees more, smaller blocks.
         if model_config.is_hybrid and metal_config.use_paged_attention:
             logger.warning(
-                "Hybrid model (e.g., Qwen3.5) with paged attention enabled. "
+                "Hybrid model with paged attention enabled. "
                 "Using block-size translation (PR #235) to convert vLLM's large "
                 "block_size to a Metal kernel-compatible size.\n"
                 "  Mechanism: Each vLLM block is split into multiple kernel blocks.\n"

@@ -153,7 +153,7 @@ class SpeculativeDecodeController:
         if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
             raise NotImplementedError(
                 "Speculative decode verification is not supported for hybrid "
-                "GDN models on Metal yet."
+                "models on Metal yet."
             )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}

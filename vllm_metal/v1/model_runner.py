@@ -700,7 +700,7 @@ class MetalModelRunner:
             raise NotImplementedError(
                 "Pipeline parallelism on Metal is validated only for uniform-"
                 "attention generation on the paged path (e.g. Qwen3 with "
-                "VLLM_METAL_USE_PAGED_ATTENTION=1); YOCO / hybrid (GDN) / MLA / "
+                "VLLM_METAL_USE_PAGED_ATTENTION=1); YOCO / hybrid / MLA / "
                 "pooling / VLM (multimodal) / non-paged configs are not "
                 "supported under PP yet."
             )

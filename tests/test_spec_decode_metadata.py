@@ -209,7 +209,7 @@ class TestSpecDecodePolicy:
             )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
-        with pytest.raises(NotImplementedError, match="hybrid GDN"):
+        with pytest.raises(NotImplementedError, match="hybrid models"):
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
