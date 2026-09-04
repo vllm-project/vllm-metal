@@ -32,13 +32,15 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 def make_stub_runner(
     *,
     model_args: dict[str, Any] | None = None,
+    is_hybrid: bool = False,
     **attrs: Any,
 ) -> mr.MetalModelRunner:
     """Create a ``MetalModelRunner`` stub without running ``__init__``.
 
     Sets sensible defaults for all internal attributes.  ``_vocab_size``
     is derived from ``model_args["vocab_size"]`` automatically — never
-    set it separately.  Pass keyword arguments to override any attribute.
+    set it separately.  ``is_hybrid`` lands on the default ``model_config``.
+    Pass keyword arguments to override any attribute.
     """
     runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
 
@@ -58,7 +60,10 @@ def make_stub_runner(
             mamba_cache_mode="none",
         ),
         "model_config": SimpleNamespace(
-            runner_type="generate", get_head_size=lambda: 128, max_model_len=2048
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=is_hybrid,
         ),
         "model": object(),
         "tokenizer": None,

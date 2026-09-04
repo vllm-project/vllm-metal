@@ -219,10 +219,10 @@ class TestCachePolicyPerLayerBytes:
         head_dim: int,
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
-        model_args: dict | None = None,
+        is_hybrid: bool = False,
     ) -> object:
         return make_stub_runner(
-            model_args=model_args,
+            is_hybrid=is_hybrid,
             num_layers=num_layers,
             num_kv_cache_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -288,7 +288,7 @@ class TestCachePolicyPerLayerBytes:
             head_dim=256,
             kv_heads_per_layer=[4, 4, 4, 4],
             head_dim_per_layer=[256, 256, 256, 256],
-            model_args={"full_attention_interval": 2},
+            is_hybrid=True,
         )
 
         with pytest.raises(

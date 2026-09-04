@@ -655,7 +655,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         backend = HybridRuntimeStub(state_cache)
         runner = make_stub_runner(
             tokenizer=object(),
-            model_args={"full_attention_interval": 2},
+            is_hybrid=True,
             _paged_attention_runtime=backend,
         )
         runner.num_layers = 0
@@ -2375,14 +2375,14 @@ class TestMergeVerifyWindows:
 
     def test_false_for_hybrid_even_when_opted_in(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
-        runner = make_stub_runner(model_args={"full_attention_interval": 4})
+        runner = make_stub_runner(is_hybrid=True)
         assert runner.merge_verify_windows is False
 
     def test_false_past_window_head_bound_even_when_opted_in(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
         runner = make_stub_runner(
             model_config=SimpleNamespace(
-                runner_type="generate", get_head_size=lambda: 512
+                runner_type="generate", get_head_size=lambda: 512, is_hybrid=False
             )
         )
         assert runner.merge_verify_windows is False

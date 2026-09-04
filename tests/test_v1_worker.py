@@ -141,7 +141,7 @@ class TestOneSequenceKvBytes:
 
     def test_hybrid_adds_linear_state(self) -> None:
         model_runner = make_stub_runner(
-            model_args={"full_attention_interval": 2},
+            is_hybrid=True,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
@@ -178,7 +178,7 @@ class TestOneSequenceKvBytes:
         # sequence falls short by the padding on every linear layer.
         padded_page = 4096
         model_runner = make_stub_runner(
-            model_args={"full_attention_interval": 2},
+            is_hybrid=True,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
@@ -208,7 +208,7 @@ class TestOneSequenceKvBytes:
 
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner.model_args = {"full_attention_interval": 2}
+        runner.model_config = SimpleNamespace(is_hybrid=True)
         runner._model_adapter = DefaultModelAdapter()
         runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
         runner.kv_cache_dtype = mx.float16
@@ -535,7 +535,7 @@ class TestAlignStateSizing:
     def _make_align_runner() -> mr.MetalModelRunner:
         """Qwen-shaped 24-layer GDN plan: 18 state layers striped over 6 SDPA."""
         return make_stub_runner(
-            model_args={"full_attention_interval": 4},
+            is_hybrid=True,
             kv_cache_dtype=mx.float16,
             hybrid_runtime_plan=build_gdn_hybrid_plan(
                 {
@@ -568,8 +568,8 @@ class TestAlignStateSizing:
 
 class TestHybridPlanGuard:
     def test_hybrid_sizing_without_plan_rejects(self) -> None:
-        # is_hybrid derives from model_args; the stub leaves the plan at None.
-        runner = make_stub_runner(model_args={"full_attention_interval": 2})
+        # The typed config says hybrid; the stub leaves the plan at None.
+        runner = make_stub_runner(is_hybrid=True)
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.linear_cache_bytes_per_slot()

@@ -213,6 +213,7 @@ def _pooling_model_config(**overrides):
         "tokenizer": "stub-pooling-model",
         "tokenizer_revision": None,
         "get_head_size": lambda: 128,
+        "is_hybrid": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

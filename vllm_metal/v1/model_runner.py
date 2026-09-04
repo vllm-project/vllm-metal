@@ -487,13 +487,8 @@ class MetalModelRunner:
 
     @property
     def is_hybrid(self) -> bool:
-        """Whether the model mixes SDPA and linear attention layers.
-
-        Hybrid models (Qwen3.5) have ``full_attention_interval`` in their
-        config: every N-th layer uses SDPA, the rest use GDN linear attention.
-        """
-        fai = self.model_args.get("full_attention_interval", 0)
-        return isinstance(fai, int) and fai > 0
+        """Whether the model mixes attention layers with recurrent state layers."""
+        return self.model_config.is_hybrid
 
     @property
     def merge_verify_windows(self) -> bool:

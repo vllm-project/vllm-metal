@@ -55,9 +55,32 @@ def _runner_model_config(**overrides: object) -> object:
         "revision": None,
         "tokenizer": None,
         "tokenizer_revision": None,
+        "is_hybrid": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+_GDN_HYBRID_ARGS = {
+    "num_hidden_layers": 8,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "hidden_size": 1024,
+    "full_attention_interval": 4,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 3,
+}
+
+_NEMOTRON_H_ARGS = {
+    "model_type": "nemotron_h",
+    "num_hidden_layers": 52,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "hidden_size": 4096,
+}
 
 
 def _text_config(**overrides: object) -> SimpleNamespace:
@@ -1090,10 +1113,33 @@ class TestModelLifecycle:
 
 
 class TestResolveModelDims:
-    def _resolve(self, args: dict[str, object]) -> object:
-        lifecycle, runner = _make_lifecycle(model_args=args)
+    def _resolve(self, args: dict[str, object], *, is_hybrid: bool = False) -> object:
+        lifecycle, runner = _make_lifecycle(
+            model_args=args, model_config=_runner_model_config(is_hybrid=is_hybrid)
+        )
         lifecycle.resolve_model_dims()
         return runner
+
+    def test_hybrid_model_installs_its_family_plan(self) -> None:
+        runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=True)
+
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
+        assert runner.hybrid_runtime_plan.layers.attention_indices == (3, 7)
+
+    def test_routing_follows_the_typed_field_not_the_args(self) -> None:
+        runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)
+
+        assert runner.hybrid_runtime_plan is None
+
+    def test_hybrid_model_without_a_family_rejects_before_any_plan(self) -> None:
+        lifecycle, runner = _make_lifecycle(
+            model_args=_NEMOTRON_H_ARGS,
+            model_config=_runner_model_config(is_hybrid=True),
+        )
+
+        with pytest.raises(NotImplementedError, match="model_type='nemotron_h'"):
+            lifecycle.resolve_model_dims()
+        assert runner.hybrid_runtime_plan is None
 
     def test_standard_mha(self) -> None:
         runner = self._resolve(

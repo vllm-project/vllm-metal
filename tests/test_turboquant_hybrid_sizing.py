@@ -44,7 +44,7 @@ TQ_PAGE = turboquant_page_size_bytes(
 
 def _hybrid_runner():
     return make_stub_runner(
-        model_args={"full_attention_interval": 4},
+        is_hybrid=True,
         num_layers=NUM_LAYERS,
         hybrid_runtime_plan=make_gdn_hybrid_plan(
             NUM_LAYERS,
@@ -104,7 +104,7 @@ class TestHybridTurboQuantCachePolicy:
 
         for sdpa_layers in ([3, 7], [0, 4]):
             runner = make_stub_runner(
-                model_args={"full_attention_interval": 4},
+                is_hybrid=True,
                 num_layers=NUM_LAYERS,
                 hybrid_runtime_plan=make_gdn_hybrid_plan(
                     NUM_LAYERS,
