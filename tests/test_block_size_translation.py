@@ -134,7 +134,7 @@ class TestKernelMetadataMemo:
         assert meta.slot_mapping.tolist() == ctx.slot_mapping
         assert meta.seq_lens.tolist() == ctx.context_lens
         assert meta.cu_seqlens_q.tolist() == ctx.cu_seqlens
-        assert meta.max_seq_len == max(ctx.context_lens, default=0)
+        assert meta.max_seq_len == max(ctx.context_lens)
 
     def test_new_context_is_not_served_stale_arrays(self):
         ctx1 = self._fresh_ctx([0, 1, 2], 40, 4)

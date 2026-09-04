@@ -212,7 +212,7 @@ def _kernel_metadata(
             cu_seqlens_q=mx.array(ctx.cu_seqlens, dtype=mx.int32),
             block_tables=block_tables,
             block_size=kernel_block_size,
-            max_seq_len=max(ctx.context_lens, default=0),
+            max_seq_len=max(ctx.context_lens),
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
