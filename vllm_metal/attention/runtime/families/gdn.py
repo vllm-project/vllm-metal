@@ -108,6 +108,11 @@ _GDN_FAMILY = StateFamilySpec(
 )
 
 
+def supports_gdn_hybrid(model_args: Mapping[str, Any]) -> bool:
+    """Whether these model args describe a GDN linear-attention hybrid."""
+    return "full_attention_interval" in model_args
+
+
 def build_gdn_hybrid_plan(
     model_args: Mapping[str, Any], num_layers: int
 ) -> HybridRuntimePlan:

@@ -14,7 +14,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import apply_compat_patches
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
@@ -494,7 +494,7 @@ class ModelLifecycle:
     def _install_hybrid_state_plan(self, args: dict[str, Any]) -> None:
         """Resolve the state family that owns this model's hybrid layers."""
         if self._runner.is_hybrid:
-            self._runner.hybrid_runtime_plan = build_gdn_hybrid_plan(
+            self._runner.hybrid_runtime_plan = build_hybrid_runtime_plan(
                 args, self._runner.num_layers
             )
 

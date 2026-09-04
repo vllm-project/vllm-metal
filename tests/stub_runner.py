@@ -10,7 +10,7 @@ from typing import Any
 import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
-from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -218,9 +218,9 @@ def make_gemma4_mixed_mha_runner(
     )
 
 
-# Production family policy, resolved through the public builder from the
+# Production family policy, resolved through the family table from the
 # smallest valid hybrid layout so tests cannot drift from what production installs.
-_GDN_FAMILY_SPEC = build_gdn_hybrid_plan(
+_GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
     {
         "full_attention_interval": 2,
         "linear_num_key_heads": 1,

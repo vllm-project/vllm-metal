@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract tests for the hybrid runtime plan and its GDN family owner."""
+"""Contract tests for the hybrid runtime plan, its GDN family owner and the
+state-family factory."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from tests.stub_runner import make_gdn_hybrid_plan
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
+from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import (
@@ -151,6 +153,30 @@ class TestGdnPlanRejection:
         with pytest.raises(ValueError) as excinfo:
             build_gdn_hybrid_plan(args, num_layers)
         assert str(excinfo.value) == expected
+
+
+class TestStateFamilyFactory:
+    def test_routes_gdn_args_to_the_gdn_family(self) -> None:
+        plan = build_hybrid_runtime_plan(GDN_ARGS, 8)
+
+        assert plan.family.label == "gdn"
+        assert plan.layers.attention_indices == (3, 7)
+
+    def test_rejects_args_without_a_state_family(self) -> None:
+        args = {"model_type": "nemotron_h", "num_hidden_layers": 52}
+        expected = (
+            "Metal hybrid runtime has no state family for model_type='nemotron_h'."
+        )
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            build_hybrid_runtime_plan(args, 52)
+        assert str(excinfo.value) == expected
+
+    def test_malformed_interval_is_a_gdn_error_not_a_miss(self) -> None:
+        args = {**GDN_ARGS, "full_attention_interval": "4"}
+
+        with pytest.raises(ValueError, match="must be positive integers"):
+            build_hybrid_runtime_plan(args, 8)
 
 
 class TestStateCacheSpec:
