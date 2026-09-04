@@ -309,6 +309,32 @@ class TestPrepareSDPAQKV:
         assert gate is None
         assert kv_for_sharing == (keys, values)
 
+    def test_default_qk_norm_layout_remains_per_head(self) -> None:
+        # Qwen-style norms have one learned weight per head dimension and
+        # therefore must run after Q/K projections are split into heads.
+        inner = _make_inner(with_v_proj=True)
+        inner.q_norm = nn.RMSNorm(_HEAD_DIM)
+        inner.k_norm = nn.RMSNorm(_HEAD_DIM)
+        inner.q_norm.weight = mx.array([0.5, 0.75, 1.25, 1.5])
+        inner.k_norm.weight = mx.array([1.5, 1.25, 0.75, 0.5])
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.linspace(-1.0, 1.0, _BATCH * _SEQ_LEN * _HIDDEN).reshape(
+            _BATCH, _SEQ_LEN, _HIDDEN
+        )
+
+        raw_q = inner.q_proj(x).reshape(_BATCH, _SEQ_LEN, _N_HEADS, _HEAD_DIM)
+        raw_k = inner.k_proj(x).reshape(_BATCH, _SEQ_LEN, _N_KV_HEADS, _HEAD_DIM)
+        expected_q = inner.q_norm(raw_q).transpose(0, 2, 1, 3)
+        expected_k = inner.k_norm(raw_k).transpose(0, 2, 1, 3)
+
+        queries, keys, _, _, _ = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+        mx.eval(queries, keys, expected_q, expected_k)
+
+        assert mx.array_equal(queries, expected_q).item()
+        assert mx.array_equal(keys, expected_k).item()
+
     def test_resolves_head_dim_from_out_features_for_weightless_projection(
         self,
     ) -> None:
