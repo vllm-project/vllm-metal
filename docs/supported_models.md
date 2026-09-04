@@ -84,6 +84,17 @@ end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
+Qwen2.5-Coder-1.5B-Instruct (`mlx-community/Qwen2.5-Coder-1.5B-Instruct-bf16`,
+plus 8-bit and 4-bit MLX quantizations converted from it) verified on an
+M5 Pro (15-core CPU / 16-core GPU, 24GB unified memory): 135 real inference
+requests across concurrency 1-16 and three prompt lengths (~128 to ~6k
+tokens), zero failures. Throughput scales with both quantization and
+concurrency as expected — e.g. at concurrency 8 on ~1.4k-token prompts:
+148.9 tok/s (bf16), 330.6 tok/s (8-bit), 459.8 tok/s (4-bit). Not tested:
+vllm-metal's native GGUF path (our GGUF artifact uses Q4_K_M, a K-quant,
+which this doc's own GGUF section notes is out of scope for that path — it
+was served through Ollama instead, not vllm-metal). See #289.
+
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
