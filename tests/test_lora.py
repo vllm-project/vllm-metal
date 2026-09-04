@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
@@ -119,7 +120,7 @@ def test_punica_handles_fragmented_routing() -> None:
 
 def test_punica_output_dtype_matches_base_for_all_routing_paths() -> None:
     routing_cases = (
-        ((11, 22, 11, 22), False, np.float16),
+        ((11, 22, 11, 22), False, np.float32),
         ((11, 11, 11, 11), True, np.float32),
         (tuple(11 if i % 2 == 0 else 22 for i in range(80)), True, np.float32),
     )
@@ -571,6 +572,7 @@ def _lora_config_stub(
     max_lora_rank: int,
     max_cpu_loras: int | None = None,
     target_modules: list[str] | None = None,
+    lora_dtype: torch.dtype = torch.float32,
 ) -> SimpleNamespace:
     """Stand-in for ``vllm.config.lora.LoRAConfig`` — only the fields the manager reads."""
     return SimpleNamespace(
@@ -578,6 +580,7 @@ def _lora_config_stub(
         max_lora_rank=max_lora_rank,
         max_cpu_loras=max_cpu_loras,
         target_modules=target_modules,
+        lora_dtype=lora_dtype,
     )
 
 
@@ -1082,7 +1085,6 @@ def _runtime_setup_kwargs(**overrides: object) -> dict:
         "speculative_decode_enabled": False,
         "max_num_seqs": 1,
         "max_num_batched_tokens": 8,
-        "dtype": mx.float16,
         "max_position_embeddings": None,
     }
     kwargs.update(overrides)
@@ -1107,6 +1109,25 @@ def test_runtime_stt_disables_lora_without_raising() -> None:
     rt = runtime_mod.MetalLoRARuntime()
     rt.setup(**_runtime_setup_kwargs(is_stt=True))
     assert rt.enabled is False
+
+
+def test_runtime_uses_configured_lora_dtype() -> None:
+    model = _TwoLinearModel()
+    rt = runtime_mod.MetalLoRARuntime()
+
+    rt.setup(
+        **_runtime_setup_kwargs(
+            model=model,
+            lora_config=_lora_config_stub(
+                max_loras=1,
+                max_lora_rank=1,
+                lora_dtype=torch.bfloat16,
+                target_modules=["fc1"],
+            ),
+        )
+    )
+
+    assert model.fc1.lora_a_stacked.dtype == mx.bfloat16
 
 
 def test_prepare_step_raises_for_unknown_lora_id() -> None:
