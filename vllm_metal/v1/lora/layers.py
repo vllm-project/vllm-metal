@@ -164,21 +164,21 @@ class MLXLinearWithLoRA(_LoRALinearBase):
             return y
 
         # Punica expects (n_tokens, dim); collapse leading dims if needed.
-        shape = y.shape
-        x2, y2 = (
-            (x.reshape(-1, x.shape[-1]), y.reshape(-1, y.shape[-1]))
-            if x.ndim > 2
-            else (x, y)
-        )
-        out = self.punica_wrapper.add_lora_linear(
-            y2,
-            x2,
+        output_shape = y.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, x.shape[-1])
+            y = y.reshape(-1, y.shape[-1])
+        if x.dtype != self.lora_a_stacked.dtype:
+            x = x.astype(self.lora_a_stacked.dtype)
+        output = self.punica_wrapper.add_lora_linear(
+            y,
+            x,
             self.lora_a_stacked,
             self.lora_b_stacked,
             scale=1.0,
             lora_ranks=self._lora_ranks,
         )
-        return out if out is y else out.reshape(shape)
+        return output if output.shape == output_shape else output.reshape(output_shape)
 
 
 class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
@@ -215,19 +215,18 @@ class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
         if self.punica_wrapper is None or self.punica_wrapper.no_lora:
             return y
 
-        # Run the LoRA delta in the adapter dtype regardless of the quantized
-        # base output dtype, then cast back so downstream layers are unaffected.
-        lora_dtype = self.lora_a_stacked.dtype
-        shape = y.shape
-        x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        y_flat = y.reshape(-1, y.shape[-1]) if y.ndim > 2 else y
-        out = self.punica_wrapper.add_lora_linear(
-            y_flat.astype(lora_dtype),
-            x_flat.astype(lora_dtype),
+        output_shape = y.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, x.shape[-1])
+            y = y.reshape(-1, y.shape[-1])
+        if x.dtype != self.lora_a_stacked.dtype:
+            x = x.astype(self.lora_a_stacked.dtype)
+        output = self.punica_wrapper.add_lora_linear(
+            y,
+            x,
             self.lora_a_stacked,
             self.lora_b_stacked,
             scale=1.0,
             lora_ranks=self._lora_ranks,
         )
-        out = out.astype(y.dtype)
-        return out if out.shape == shape else out.reshape(shape)
+        return output if output.shape == output_shape else output.reshape(output_shape)

@@ -7,8 +7,9 @@ import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-import mlx.core as mx
 from vllm.lora.layers import LoRAMapping
+
+from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 from .worker_manager import MetalWorkerLoRAManager
 
@@ -64,7 +65,6 @@ class MetalLoRARuntime:
         speculative_decode_enabled: bool,
         max_num_seqs: int,
         max_num_batched_tokens: int,
-        dtype: mx.Dtype,
         max_position_embeddings: int | None,
     ) -> None:
         if lora_config is None:
@@ -95,7 +95,7 @@ class MetalLoRARuntime:
             lora_config=lora_config,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
-            dtype=dtype,
+            dtype=TORCH_TO_MLX_DTYPE[lora_config.lora_dtype],
             max_position_embeddings=max_position_embeddings,
         )
 

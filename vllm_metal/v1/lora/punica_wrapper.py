@@ -107,11 +107,12 @@ class PunicaWrapperMLX:
         if self._expanded_slot_indices is not None:
             lora_a = mx.take(lora_a_stacked, self._expanded_slot_indices, axis=0)
             lora_b = mx.take(lora_b_stacked, self._expanded_slot_indices, axis=0)
-            return (
-                y
-                + mx.matmul(lora_b, mx.matmul(lora_a, x[:, :, None])).squeeze(-1)
-                * scale
-            )
+            delta = mx.matmul(lora_b, mx.matmul(lora_a, x[:, :, None])).squeeze(-1)
+            if scale != 1.0:
+                delta = delta * scale
+            if delta.dtype != y.dtype:
+                delta = delta.astype(y.dtype)
+            return y + delta
 
         max_rank = int(lora_a_stacked.shape[1])
         ranks = lora_ranks if lora_ranks is not None else [max_rank] * self.max_loras

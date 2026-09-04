@@ -629,13 +629,12 @@ class MetalModelRunner:
             max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
         self._lora.setup(
             model=self._forward_model,
-            lora_config=getattr(self.vllm_config, "lora_config", None),
+            lora_config=self.vllm_config.lora_config,
             is_stt=False,
             paged_attention_enabled=self.metal_config.use_paged_attention,
             speculative_decode_enabled=self.vllm_config.speculative_config is not None,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            dtype=self.kv_cache_dtype or mx.float16,
             max_position_embeddings=max_position_embeddings,
         )
         # Probed here because it runs a cacheless one-token forward, which is
