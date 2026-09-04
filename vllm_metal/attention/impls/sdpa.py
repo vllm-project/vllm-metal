@@ -181,6 +181,7 @@ class _KernelMetadata:
     cu_seqlens_q: mx.array
     block_tables: mx.array
     block_size: int
+    max_seq_len: int
 
 
 def _kernel_metadata(
@@ -211,6 +212,7 @@ def _kernel_metadata(
             cu_seqlens_q=mx.array(ctx.cu_seqlens, dtype=mx.int32),
             block_tables=block_tables,
             block_size=kernel_block_size,
+            max_seq_len=max(ctx.context_lens, default=0),
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
@@ -624,7 +626,7 @@ def sdpa_forward(
     seq_lens = meta.seq_lens
     cu_seqlens_q = meta.cu_seqlens_q
     block_tables, kernel_block_size = meta.block_tables, meta.block_size
-    max_seq_len = max(ctx.context_lens)
+    max_seq_len = meta.max_seq_len
 
     if shared_kv is not None or read_existing_kv:
         # YOCO shared layer / MTP read-existing layer: the authoritative K/V
