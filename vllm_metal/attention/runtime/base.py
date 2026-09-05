@@ -25,7 +25,7 @@ class PagedAttentionRuntimeBase:
 
     Subclasses allocate their primary paged cache onto ``self._cache`` in
     ``initialize()``.  The primary cache must expose ``num_blocks``.  Secondary
-    caches (e.g. the hybrid GDN state cache) remain the subclass's concern.
+    caches (e.g. the hybrid state cache) remain the subclass's concern.
     """
 
     # Primary paged cache; ``None`` until ``initialize()`` runs.  Subclasses set

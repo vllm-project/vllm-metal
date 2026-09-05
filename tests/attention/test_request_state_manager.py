@@ -9,7 +9,7 @@ from tests.stub_runner import make_gdn_hybrid_plan
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
-from vllm_metal.attention.state import HybridGDNStateManager
+from vllm_metal.attention.state import RequestStateManager
 
 
 def _make_cache(*, num_layers: int = 2, max_seqs: int = 2) -> GDNPagedStateCache:
@@ -30,10 +30,10 @@ def _make_context() -> PagedAttentionContext:
     return PagedAttentionContext(slot_mapping=[])
 
 
-class TestHybridGDNStateManager:
+class TestRequestStateManager:
     def test_assign_step_slots_grows_state_cache_once(self) -> None:
         cache = _make_cache(max_seqs=3)
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
 
         slots = manager.assign_step_slots(["req-A", "req-B"])
 
@@ -44,7 +44,7 @@ class TestHybridGDNStateManager:
 
     def test_assign_step_slots_is_atomic_on_grow_failure(self) -> None:
         cache = _make_cache(max_seqs=1)
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
 
         with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
             manager.assign_step_slots(["req-A", "req-B"])
@@ -53,14 +53,14 @@ class TestHybridGDNStateManager:
         assert manager.request_slots == {}
         assert manager.free_slots == ()
 
-    def test_populate_step_context_sets_gdn_slot_mapping(self) -> None:
+    def test_populate_step_context_sets_state_slot_mapping(self) -> None:
         cache = _make_cache()
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         ctx = _make_context()
 
         manager.populate_step_context(req_ids=["req-A", "req-B"], ctx=ctx)
 
-        assert ctx.gdn_slot_mapping == [0, 1]
+        assert ctx.state_slot_mapping == [0, 1]
         assert manager.request_slots == {"req-A": 0, "req-B": 1}
 
     def test_extend_forward_eval_outputs_uses_pending_compact_state(self) -> None:
@@ -75,7 +75,7 @@ class TestHybridGDNStateManager:
             initial_seqs=0,
             dtype=mx.float32,
         )
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         manager.assign_step_slots(["req-A", "req-B"])
         cache.set_pending_conv_state(0, [1], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
@@ -106,7 +106,7 @@ class TestHybridGDNStateManager:
             initial_seqs=0,
             dtype=mx.float32,
         )
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         manager.assign_step_slots(["done"])
         slot = manager.request_slots["done"]
 
@@ -129,7 +129,7 @@ class TestHybridGDNStateManager:
 
     def test_materialize_pending_state_clears_flag_once(self) -> None:
         cache = _make_cache(max_seqs=2)
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         manager.assign_step_slots(["req-A", "req-B"])
 
         manager.release_requests({"req-A", "req-B"})
@@ -154,7 +154,7 @@ class TestHybridGDNStateManager:
             initial_seqs=0,
             dtype=mx.float32,
         )
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         released_slot = manager.assign_step_slots(["done"])[0]
 
         manager.release_requests({"done"})
@@ -180,7 +180,7 @@ class TestHybridGDNStateManager:
 
     def test_reused_slot_is_zeroed_before_new_request_uses_it(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=2)
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         slot = manager.assign_step_slots(["req-A"])[0]
 
         conv = cache.conv_states[0]
@@ -201,7 +201,7 @@ class TestHybridGDNStateManager:
 
     def test_reused_slot_does_not_touch_other_live_slot(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=2)
-        manager = HybridGDNStateManager(cache)
+        manager = RequestStateManager(cache)
         slot_a, slot_b = manager.assign_step_slots(["req-A", "req-B"])
 
         conv_states = cache.conv_states[0]
@@ -227,7 +227,7 @@ class TestHybridGDNStateManager:
 
 
 class TestHybridPagedAttentionRuntime:
-    def test_initialize_wires_gdn_state_manager_delegation(self) -> None:
+    def test_initialize_wires_state_manager_delegation(self) -> None:
         runtime = HybridPagedAttentionRuntime(
             hybrid_plan=make_gdn_hybrid_plan(
                 2,
@@ -249,10 +249,10 @@ class TestHybridPagedAttentionRuntime:
         ctx = _make_context()
         runtime.populate_step_context(req_ids=["req-A"], ctx=ctx)
 
-        assert ctx.gdn_slot_mapping == [0]
+        assert ctx.state_slot_mapping == [0]
 
         cache = runtime.state_cache
-        slot = ctx.gdn_slot_mapping[0]
+        slot = ctx.state_slot_mapping[0]
         cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
             0,
@@ -265,4 +265,4 @@ class TestHybridPagedAttentionRuntime:
 
         assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
-        assert runtime.gdn_state_manager.needs_materialize is False
+        assert runtime.state_manager.needs_materialize is False

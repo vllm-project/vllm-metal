@@ -24,7 +24,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
-from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
+from vllm_metal.attention.state import AlignStateManager, RequestStateManager
 
 logger = init_logger(__name__)
 
@@ -74,9 +74,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         self._cache = None
         self._state_cache: PagedStateCache | None = None
-        self._gdn_state_manager: HybridGDNStateManager | AlignGDNStateManager | None = (
-            None
-        )
+        self._state_manager: RequestStateManager | AlignStateManager | None = None
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
 
@@ -112,10 +110,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             initial_seqs=0,
             dtype=self._dtype,
         )
-        self._gdn_state_manager = (
-            AlignGDNStateManager(self._state_cache, self._block_size)
+        self._state_manager = (
+            AlignStateManager(self._state_cache, self._block_size)
             if align
-            else HybridGDNStateManager(self._state_cache)
+            else RequestStateManager(self._state_cache)
         )
 
         logger.info(
@@ -143,9 +141,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         ``group_index`` is the group owning SDPA KV blocks (kernel block
         tables); ``state_group_indices`` are the mamba cache groups whose
-        block ids key the GDN recurrent state slabs;
+        block ids key the operator state slabs;
         ``layer_group_ordinals[cache_idx]`` records which of those groups
-        each linear layer belongs to (the engine stripes same-spec layers
+        each state layer belongs to (the engine stripes same-spec layers
         across several groups) and ``layer_pool_ordinals[cache_idx]`` which
         physical state pool it shares (one pool per within-group position,
         following ``kv_cache_tensors.shared_by``).
@@ -224,16 +222,16 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._state_cache
 
     @property
-    def gdn_state_manager(self) -> HybridGDNStateManager | AlignGDNStateManager:
-        if self._gdn_state_manager is None:
-            raise RuntimeError("gdn_state_manager accessed before initialize()")
-        return self._gdn_state_manager
+    def state_manager(self) -> RequestStateManager | AlignStateManager:
+        if self._state_manager is None:
+            raise RuntimeError("state_manager accessed before initialize()")
+        return self._state_manager
 
     def needs_step_context(self) -> bool:
         return True
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler CoW copies to SDPA KV and align-mode GDN state."""
+        """Apply scheduler CoW copies to SDPA KV and align-mode state."""
         self.kv_cache.copy_blocks(block_copies)
         if self._mamba_cache_mode == "align":
             self.state_cache.copy_blocks(block_copies)
@@ -246,7 +244,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
-        self.gdn_state_manager.populate_step_context(
+        self.state_manager.populate_step_context(
             req_ids=req_ids,
             ctx=ctx,
             state_block_ids=state_block_ids,
@@ -254,10 +252,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        self.gdn_state_manager.extend_forward_eval_outputs(outputs)
+        self.state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:
-        self.gdn_state_manager.release_requests(req_ids)
+        self.state_manager.release_requests(req_ids)
 
     def materialize_pending_state(self) -> None:
-        self.gdn_state_manager.materialize_pending_state()
+        self.state_manager.materialize_pending_state()

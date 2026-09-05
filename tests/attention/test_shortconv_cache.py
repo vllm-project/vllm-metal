@@ -8,7 +8,7 @@ import numpy as np
 
 from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
 from vllm_metal.attention.context import PagedAttentionContext
-from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
+from vllm_metal.attention.state import AlignStateManager, RequestStateManager
 
 
 def _cache(
@@ -71,7 +71,7 @@ def test_scheduler_copies_each_physical_pool_once_and_grows_for_destination() ->
 def test_partial_prefix_cow_preserves_producer_and_consumer_checkpoint() -> None:
     cache = _cache(num_layers=1)
     _write(cache, 0, 2, 5)  # state after six tokens, inside scheduler block 1
-    manager = AlignGDNStateManager(cache, block_size=4)
+    manager = AlignStateManager(cache, block_size=4)
 
     # A producer keeps its append-only running table; scheduler moves the
     # partial cache entry to block 5 before another token overwrites block 2.
@@ -83,7 +83,7 @@ def test_partial_prefix_cow_preserves_producer_and_consumer_checkpoint() -> None
     # because both computed and scheduled positions are in that same block.
     cache.copy_blocks([(5, 6)])
     ctx = _populate(manager, ["consumer"], [[[0, 6]]], [(6, 2)])
-    assert ctx.gdn_group_slot_mappings == ([6],)
+    assert ctx.state_group_slot_mappings == ([6],)
     values = _values(cache)
     np.testing.assert_array_equal(values[2], 7)
     np.testing.assert_array_equal(values[5], 5)
@@ -97,7 +97,7 @@ def test_partial_prefix_cow_preserves_producer_and_consumer_checkpoint() -> None
 
 def test_none_mode_recycled_request_slot_is_reset_in_every_layer() -> None:
     cache = _cache(initial_seqs=0)
-    manager = HybridGDNStateManager(cache)
+    manager = RequestStateManager(cache)
     assert manager.assign_step_slots(["a", "b"]) == [0, 1]
     for layer in range(cache.num_layers):
         _write(cache, layer, 0, 5 + layer)

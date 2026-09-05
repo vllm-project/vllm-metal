@@ -60,11 +60,11 @@ class ShortConvPagedWrapper(nn.Module):
 
         cache_idx = self._cache_idx
         state_cache = self._state_cache
-        if ctx.gdn_group_slot_mappings is not None:
+        if ctx.state_group_slot_mappings is not None:
             ordinal = state_cache.layer_group_ordinal(cache_idx)
-            slots = ctx.gdn_group_slot_mappings[ordinal]
+            slots = ctx.state_group_slot_mappings[ordinal]
         else:
-            slots = ctx.gdn_slot_mapping
+            slots = ctx.state_slot_mapping
         boundaries = ctx.cu_seqlens
         if slots is None or len(slots) != len(boundaries) - 1:
             raise RuntimeError("ShortConv requires one state slot per packed request")

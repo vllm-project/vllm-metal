@@ -101,8 +101,8 @@ def _set_packed_context(
         PagedAttentionContext(
             slot_mapping=[],
             cu_seqlens=cu_seqlens,
-            gdn_slot_mapping=None if grouped else list(slot_ids),
-            gdn_group_slot_mappings=(list(slot_ids),) if grouped else None,
+            state_slot_mapping=None if grouped else list(slot_ids),
+            state_group_slot_mappings=(list(slot_ids),) if grouped else None,
             num_decode_requests=num_decode,
         )
     )
