@@ -433,6 +433,63 @@ static void dispatch_paged_attention_tiled(
       MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
+// ---------------------------------------------------------------------------
+// Shared pass-2 for the split-KV decode paths: merge per-partition partials
+// into `out` (log-sum-exp combine).  Partials must follow the ps512 contract:
+// log2-space (max, exp-sum) stats plus epsilon-normalised partial outputs in
+// tmp_out[token, head, partition, :].
+static void dispatch_paged_attention_v2_reduce(
+    metal::Device& d, metal::CommandEncoder& enc, array& out,
+    const array& exp_sums, const array& max_logits, const array& tmp_out,
+    const array& seq_lens, const array& cu_seqlens_q, int num_seqs,
+    int total_q_tokens, int num_heads, int head_size, int max_num_partitions,
+    const std::string& dt, bool use_sinks, const array* sinks,
+    bool use_tq_fc) {
+  std::string rname =
+      "paged_attention_v2_reduce_" + dt + "_hs" + std::to_string(head_size) +
+      "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
+  // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
+  // other function constants are inert for it.  TurboQuant batches take this
+  // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
+  // and sinks are folded here rather than in the partitioned kernel so the
+  // sink logit is counted once globally.  The cache key MUST encode every
+  // constant the pipeline is specialized on — otherwise the first compile
+  // wins and a later caller with different constants silently reuses the
+  // wrong pipeline.
+  std::string rhash = rname + "_v2reduce"
+      + "_tq" + (use_tq_fc ? "1" : "0")
+      + "_sk" + (use_sinks ? "1" : "0");
+  auto* lib = d.get_library("paged_attention_v2_kern");
+  auto* rkernel = d.get_kernel(
+      rname, lib, rhash,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+  enc.set_compute_pipeline_state(rkernel);
+  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
+  // (odd partition counts would yield 8 mod 16 and trip the API-validation
+  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
+  // is never touched.
+  size_t reduce_shmem =
+      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(seq_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 6);
+  }
+  enc.set_input_array(cu_seqlens_q, 7);
+  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+  enc.set_bytes(num_seqs_i, 8);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(256, 1, 1));
+}
+
 static void dispatch_paged_attention_v2_online(
     array& out, const array& query,
     const array& key_cache, const array& value_cache,
@@ -596,6 +653,19 @@ static void dispatch_paged_attention_v2_online(
 
   auto& enc = metal::get_command_encoder(s);
 
+  // Split-KV scratch factory shared by the split paths below: partial output
+  // + softmax (max, exp-sum) stats.  Tiny (~64 KB tmp_out @ conc=1/8K).
+  // add_temporary keeps them alive until the command buffer completes; MLX
+  // auto-inserts a barrier between the two dispatches via input/output
+  // dependency tracking (set_output here -> set_input in the reduce),
+  // mirroring MLX's own sdpa_vector_2pass.
+  auto make_temp = [&](Shape shape, Dtype dtype) {
+    array a(std::move(shape), dtype, nullptr, {});
+    a.set_data(allocator::malloc(a.nbytes()));
+    enc.add_temporary(a);
+    return a;
+  };
+
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
     if (!use_turboquant) return;
@@ -616,6 +686,96 @@ static void dispatch_paged_attention_v2_online(
     enc.set_input_array(*sinks, 18);
   };
 
+  // ----- GQA-shared flash-decode pass -------------------------------------
+  // Pure-decode batches without TurboQuant/FP8/sinks/softcap/sliding-window
+  // take a dedicated split-KV kernel whose threadgroups share every KV row
+  // load across the whole GQA group (the per-token kernel re-reads each row
+  // once per query head from separate threadgroups) and keep the online
+  // softmax in registers — no threadgroup-memory score staging, no barriers.
+  // This lifts long-context single-sequence decode from ~40GB/s to ~190GB/s
+  // effective KV-scan bandwidth on M5 Pro.  Partials follow the ps512
+  // contract and merge through the standard v2 reduce.  Instantiated for
+  // head sizes {64,96,128,256}, GQA groups <= 8 (one simdgroup per q head),
+  // and same-dtype half/bfloat16 Q/K/V; anything else falls through to the
+  // per-token kernel below.  Engages only once the KV volume makes the split
+  // pay (below ~16K context the serial per-partition loop is latency-bound
+  // against the wider base grid — measured on M5 Pro).  Restricted to
+  // single-sequence batches: a multi-sequence decode batch is
+  // indistinguishable from an expanded spec-decode verify window, and those
+  // must stay bitwise identical to the windowed dispatch
+  // (tests/test_spec_window_parity.py), which a different kernel family
+  // breaks.
+  const int gqa_group = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+  const bool gqa_decode =
+      pure_decode && num_seqs == 1
+      && dtype_ok && query.dtype() == value_cache.dtype()
+      && !use_turboquant && softcap <= 0.f && sinks == nullptr
+      && sliding_window < 0 && num_kv_heads > 0
+      && num_heads % num_kv_heads == 0 && gqa_group >= 1 && gqa_group <= 8
+      && (head_size == 64 || head_size == 96 || head_size == 128 ||
+          head_size == 256)
+      && max_num_partitions >= 2 && max_seq_len >= 16384;
+  if (gqa_decode) {
+    std::string gname =
+        "paged_attention_gqa_decode_" + dt + "_hs" + std::to_string(head_size) +
+        "_bs" + std::to_string(block_size) + "_ps" +
+        std::to_string(kPartitionSize);
+    // The kernel only exists in freshly built shader libraries; a stale
+    // prebuilt .metallib (or an older wheel's) does not carry it — fall
+    // through to the per-token kernel instead of failing the dispatch.
+    MTL::ComputePipelineState* gkernel = nullptr;
+    try {
+      gkernel = d.get_kernel(gname, lib, gname, {});
+    } catch (const std::exception&) {
+    }
+    if (gkernel != nullptr) {
+
+    array g_tmp_out = make_temp(
+        Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
+        query.dtype());
+    array g_exp_sums =
+        make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+    array g_max_logits =
+        make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+
+    // Binds mirror paged_attention_gqa_decode's signature exactly (the
+    // kernel declares only these slots; no shared-mem carve).
+    enc.set_compute_pipeline_state(gkernel);
+    enc.set_output_array(g_exp_sums, 0);
+    enc.set_output_array(g_max_logits, 1);
+    enc.set_output_array(g_tmp_out, 2);
+    enc.set_input_array(query, 3);
+    enc.set_input_array(key_cache, 4);
+    enc.set_input_array(value_cache, 5);
+    int32_t g_nkv = static_cast<int32_t>(num_kv_heads);
+    enc.set_bytes(g_nkv, 8);
+    enc.set_bytes(scale, 9);
+    enc.set_input_array(block_tables, 11);
+    enc.set_input_array(seq_lens, 12);
+    int32_t g_max_blocks = static_cast<int32_t>(block_tables.shape(1));
+    enc.set_bytes(g_max_blocks, 13);
+    int32_t g_q_stride = static_cast<int32_t>(num_heads * head_size);
+    int32_t g_kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
+    int32_t g_kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
+    enc.set_bytes(g_q_stride, 15);
+    enc.set_bytes(g_kv_block_stride, 16);
+    enc.set_bytes(g_kv_head_stride, 17);
+    // One threadgroup per (partition, kv head, sequence); each simdgroup
+    // owns one query head of the GQA group.
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(max_num_partitions, num_kv_heads, num_seqs),
+        MTL::Size::Make(32 * gqa_group, 1, 1));
+
+    dispatch_paged_attention_v2_reduce(
+        d, enc, out, g_exp_sums, g_max_logits, g_tmp_out, seq_lens,
+        cu_seqlens_q, num_seqs, total_q_tokens, num_heads, head_size,
+        max_num_partitions, dt, /*use_sinks=*/false, nullptr,
+        /*use_tq_fc=*/false);
+    return;
+    }
+    // Kernel unavailable in the loaded shader library: fall through.
+  }
+
   if (!partition) {
     // Single-pass path (grid.z = 1): the original decode/per-token kernel.
     enc.set_compute_pipeline_state(kernel);
@@ -633,17 +793,6 @@ static void dispatch_paged_attention_v2_online(
   }
 
   // ----- Split-KV path: paged_attention(_ps512) -> paged_attention_v2_reduce.
-  // Per-partition scratch: partial output + softmax (max, exp-sum) stats.
-  // Tiny (~64 KB tmp_out @ conc=1/8K).  add_temporary keeps them alive until
-  // the command buffer completes; MLX auto-inserts a barrier between the two
-  // dispatches via input/output dependency tracking (set_output here ->
-  // set_input below), mirroring MLX's own sdpa_vector_2pass.
-  auto make_temp = [&](Shape shape, Dtype dtype) {
-    array a(std::move(shape), dtype, nullptr, {});
-    a.set_data(allocator::malloc(a.nbytes()));
-    enc.add_temporary(a);
-    return a;
-  };
   array tmp_out = make_temp(
       Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
       query.dtype());
@@ -671,48 +820,10 @@ static void dispatch_paged_attention_v2_online(
       MTL::Size::Make(NUM_THREADS, 1, 1));
 
   // Pass 2: reduce per-partition partials -> out (log-sum-exp combine).
-  std::string rname =
-      "paged_attention_v2_reduce_" + dt + "_hs" + std::to_string(head_size) +
-      "_nt256_nsl32_ps" + std::to_string(kPartitionSize);
-  // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
-  // other function constants are inert for it.  TurboQuant batches take this
-  // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
-  // and sinks are folded here rather than in the partitioned kernel so the
-  // sink logit is counted once globally.  The cache key MUST encode every
-  // constant the pipeline is specialized on — otherwise the first compile
-  // wins and a later caller with different constants silently reuses the
-  // wrong pipeline.
-  std::string rhash = rname + "_v2reduce"
-      + "_tq" + (use_tq_fc ? "1" : "0")
-      + "_sk" + (use_sinks ? "1" : "0");
-  auto* rkernel = d.get_kernel(
-      rname, lib, rhash,
-      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&use_tq_fc, MTL::DataType::DataTypeBool, NS::UInteger(50)}});
-  enc.set_compute_pipeline_state(rkernel);
-  // Metal requires setThreadgroupMemoryLength to be a multiple of 16 bytes
-  // (odd partition counts would yield 8 mod 16 and trip the API-validation
-  // layer).  The kernel reads exactly 2*num_partitions floats; the padding
-  // is never touched.
-  size_t reduce_shmem =
-      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
-  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
-  enc.set_output_array(out, 0);
-  enc.set_input_array(exp_sums, 1);
-  enc.set_input_array(max_logits, 2);
-  enc.set_input_array(tmp_out, 3);
-  enc.set_input_array(seq_lens, 4);
-  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
-  enc.set_bytes(max_num_partitions_i, 5);
-  if (use_sinks) {
-    enc.set_input_array(*sinks, 6);
-  }
-  enc.set_input_array(cu_seqlens_q, 7);
-  int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
-  enc.set_bytes(num_seqs_i, 8);
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, total_q_tokens, 1),
-      MTL::Size::Make(NUM_THREADS, 1, 1));
+  dispatch_paged_attention_v2_reduce(
+      d, enc, out, exp_sums, max_logits, tmp_out, seq_lens, cu_seqlens_q,
+      num_seqs, total_q_tokens, num_heads, head_size, max_num_partitions, dt,
+      use_sinks, sinks, use_tq_fc);
 }
 
 // ---------------------------------------------------------------------------
