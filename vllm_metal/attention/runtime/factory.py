@@ -11,6 +11,10 @@ from vllm_metal.attention.runtime.families.gdn import (
     build_gdn_hybrid_plan,
     supports_gdn_hybrid,
 )
+from vllm_metal.attention.runtime.families.shortconv import (
+    build_shortconv_hybrid_plan,
+    supports_shortconv_hybrid,
+)
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 
 
@@ -26,6 +30,10 @@ _STATE_FAMILY_PLAN_BUILDERS = (
     StateFamilyPlanBuilder(
         supports=supports_gdn_hybrid,
         build=build_gdn_hybrid_plan,
+    ),
+    StateFamilyPlanBuilder(
+        supports=supports_shortconv_hybrid,
+        build=build_shortconv_hybrid_plan,
     ),
 )
 

@@ -7,9 +7,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import mlx.core as mx
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.impls.linear import (
     GDNPagedAttentionWrapper,
     is_linear_attention,
@@ -22,6 +24,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     LayerRole,
     RecurrentStateGeometry,
     StateFamilySpec,
+    StateGeometry,
 )
 
 
@@ -96,15 +99,40 @@ class GDNHybridConfig:
         )
 
 
+def _create_gdn_state_cache(
+    *,
+    geometry: StateGeometry,
+    num_layers: int,
+    max_seqs: int,
+    initial_seqs: int,
+    dtype: mx.Dtype,
+) -> GDNPagedStateCache:
+    if not isinstance(geometry, RecurrentStateGeometry):
+        raise TypeError("GDN state cache requires recurrent state geometry")
+    return GDNPagedStateCache(
+        num_layers=num_layers,
+        max_seqs=max_seqs,
+        conv_kernel_dim=geometry.conv_kernel_dim,
+        conv_dim=geometry.conv_dim,
+        num_v_heads=geometry.num_v_heads,
+        value_head_dim=geometry.value_head_dim,
+        key_head_dim=geometry.key_head_dim,
+        initial_seqs=initial_seqs,
+        dtype=dtype,
+    )
+
+
 _GDN_FAMILY = StateFamilySpec(
     label="gdn",
     wrapper_cls=GDNPagedAttentionWrapper,
     is_state_module=is_linear_attention,
     mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     # Match the fp32 recurrent pool used for kernel accumulation.
-    recurrent_dtype=torch.float32,
+    state_dtypes=(None, torch.float32),
     # Scheduler-side mamba caching strategies the GDN state path implements.
     supported_cache_modes=("none", "align"),
+    layer_name="linear_attn",
+    create_state_cache=_create_gdn_state_cache,
 )
 
 

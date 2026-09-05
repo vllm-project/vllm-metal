@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Align-mode GDN state lifecycle (hybrid prefix caching).
+"""Align-mode state lifecycle (hybrid prefix caching).
 
 With ``mamba_cache_mode="align"`` the scheduler's mamba cache groups carry a
 position-indexed block table per request, exactly like upstream: the state
@@ -33,16 +33,16 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
 
 
-class AlignGDNStateManager:
-    """Drive block-indexed GDN state for align-mode prefix caching."""
+class AlignStateManager:
+    """Drive block-indexed state for align-mode prefix caching."""
 
-    def __init__(self, state_cache: GDNPagedStateCache, block_size: int) -> None:
+    def __init__(self, state_cache: PagedStateCache, block_size: int) -> None:
         self._state_cache = state_cache
         self._block_size = block_size
         self._needs_materialize = False
@@ -69,12 +69,12 @@ class AlignGDNStateManager:
         """
         if state_block_ids is None or step_positions is None:
             raise RuntimeError(
-                "align-mode GDN state requires per-request mamba block ids "
+                "align-mode state requires per-request mamba block ids "
                 "and (num_computed, num_scheduled) step positions"
             )
         if not (len(state_block_ids) == len(step_positions) == len(req_ids)):
             raise RuntimeError(
-                "align GDN state manager requires block ids and step positions "
+                "align state manager requires block ids and step positions "
                 f"for every request (got {len(state_block_ids)} tables / "
                 f"{len(step_positions)} positions for {len(req_ids)} requests)"
             )
@@ -110,13 +110,13 @@ class AlignGDNStateManager:
                 row = state_block_ids[req_idx][group]
                 if num_scheduled <= 0:
                     raise RuntimeError(
-                        f"align GDN state manager: request "
+                        f"align state manager: request "
                         f"{req_ids[req_idx]!r} scheduled {num_scheduled} tokens"
                     )
                 dst_idx = (num_computed + num_scheduled - 1) // self._block_size
                 if dst_idx >= len(row):
                     raise RuntimeError(
-                        f"align GDN state manager: request "
+                        f"align state manager: request "
                         f"{req_ids[req_idx]!r} needs state block index "
                         f"{dst_idx} but its mamba block table has {len(row)} "
                         "entries"
@@ -137,11 +137,11 @@ class AlignGDNStateManager:
             self._state_cache.copy_slots(copy_src, copy_dst, layer_indices)
             group_mappings.append(dst_ids)
 
-        ctx.gdn_group_slot_mappings = tuple(group_mappings)
+        ctx.state_group_slot_mappings = tuple(group_mappings)
         self._needs_materialize = True
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        """Append authoritative GDN state arrays that the forward mutates."""
+        """Append authoritative state arrays that the forward mutates."""
         outputs.extend(self._state_cache.updated_state_arrays())
 
     def release_requests(self, req_ids: set[str]) -> None:
@@ -154,7 +154,7 @@ class AlignGDNStateManager:
         del req_ids
 
     def materialize_pending_state(self) -> None:
-        """Force stable GDN arrays out of the lazy graph between steps."""
+        """Force stable state arrays out of the lazy graph between steps."""
         if not self._needs_materialize:
             return
         self._state_cache.apply_pending_states()

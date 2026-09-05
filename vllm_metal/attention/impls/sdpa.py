@@ -6,8 +6,8 @@ between ``n_heads`` (queries) and ``n_kv_heads`` (keys/values) is handled
 transparently by the Metal paged attention kernel.
 
 Handles models whose attention module exposes:
-- ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
-  see K-eq-V variant below)
+- ``q_proj``, ``k_proj``, ``o_proj`` / ``out_proj`` linear projections
+  (``v_proj`` optional — see K-eq-V variant below)
 - ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
@@ -90,7 +90,8 @@ def is_sdpa(module: nn.Module) -> bool:
 
     Accepts two contracts:
 
-    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / ``o_proj``, plus
+    - Split-projection SDPA: ``q_proj`` / ``k_proj`` and ``o_proj`` or
+      ``out_proj`` (LFM2), plus
       EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
       The latter admits Gemma4 26B / 31B full-attention layers which
       share the K projection for values and never define ``v_proj``
@@ -110,7 +111,7 @@ def is_sdpa(module: nn.Module) -> bool:
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "o_proj")
+        and (hasattr(module, "o_proj") or hasattr(module, "out_proj"))
         and (hasattr(module, "v_proj") or getattr(module, "use_k_eq_v", False))
     )
 
@@ -813,7 +814,8 @@ def sdpa_forward(
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
-    return inner.o_proj(out), kv_for_sharing
+    out_proj = inner.o_proj if hasattr(inner, "o_proj") else inner.out_proj
+    return out_proj(out), kv_for_sharing
 
 
 def apply_g_proj_gate(

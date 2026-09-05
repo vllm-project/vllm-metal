@@ -391,7 +391,9 @@ class ModelCachePolicy:
             state_spec = self._state_layer_spec(hybrid_plan, torch_dtype)
             for layer_idx in range(num_spec_layers):
                 if hybrid_plan.layers.is_state_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.linear_attn"] = state_spec
+                    specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
+                        state_spec
+                    )
                 else:
                     specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
         else:
@@ -666,7 +668,7 @@ class ModelCachePolicy:
         layer_pool_ordinals: list[int] | None = None
         if self._runner.cache_config.mamba_cache_mode == "align":
             cache_idx_by_name = {
-                f"layers.{layer_idx}.linear_attn": cache_idx
+                f"layers.{layer_idx}.{hybrid_plan.family.layer_name}": cache_idx
                 for cache_idx, layer_idx in enumerate(layer_plan.state_indices)
             }
             mamba_group_ids = [

@@ -24,7 +24,7 @@ import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
-from vllm_metal.attention.state import HybridGDNStateManager
+from vllm_metal.attention.state import RequestStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
@@ -34,29 +34,29 @@ from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
-        self._gdn_state_manager = HybridGDNStateManager(state_cache)
+        self._state_manager = RequestStateManager(state_cache)
 
     def needs_step_context(self) -> bool:
         return True
 
     @property
-    def gdn_state_manager(self) -> HybridGDNStateManager:
-        return self._gdn_state_manager
+    def state_manager(self) -> RequestStateManager:
+        return self._state_manager
 
     def populate_step_context(
         self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
     ) -> None:
         del state_block_ids, step_positions
-        self._gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+        self._state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        self._gdn_state_manager.extend_forward_eval_outputs(outputs)
+        self._state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:
-        self._gdn_state_manager.release_requests(req_ids)
+        self._state_manager.release_requests(req_ids)
 
     def materialize_pending_state(self) -> None:
-        self._gdn_state_manager.materialize_pending_state()
+        self._state_manager.materialize_pending_state()
 
 
 class ForwardOutputRuntimeStub:
@@ -696,7 +696,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             )
 
         assert mr.get_context() is None
-        assert backend.gdn_state_manager.request_slots == {}
+        assert backend.state_manager.request_slots == {}
 
     def test_start_paged_forward_collects_hidden_states_for_gemma4_mtp(
         self, monkeypatch
@@ -1548,7 +1548,7 @@ class TestV1MetalModelRunnerExecuteModel:
             generator=None,
             generated_tokens=0,
         )
-        slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        slot = runtime.state_manager.assign_step_slots(["done"])[0]
         cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
             0,
@@ -1569,7 +1569,7 @@ class TestV1MetalModelRunnerExecuteModel:
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
         np.testing.assert_array_equal(np.array(cache.conv_states[0][slot]), 7)
         np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
-        assert runtime.gdn_state_manager.needs_materialize is False
+        assert runtime.state_manager.needs_materialize is False
 
     def test_non_paged_spec_decode_fails_after_cleanup_before_new_state(self) -> None:
         runner = self._make_runner()
@@ -1830,9 +1830,9 @@ class TestV1MetalModelRunnerGDNSubmit:
         )
         runner._paged_request_seq_lens["done"] = 1
 
-        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        released_slot = runtime.state_manager.assign_step_slots(["done"])[0]
         runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
-        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        reused_slot = runtime.state_manager.assign_step_slots(["next"])[0]
         assert reused_slot == released_slot
 
         cache.set_pending_conv_state(
@@ -1856,7 +1856,7 @@ class TestV1MetalModelRunnerGDNSubmit:
             np.array(cache.recurrent_states[0][reused_slot]),
             9,
         )
-        assert runtime.gdn_state_manager.needs_materialize is False
+        assert runtime.state_manager.needs_materialize is False
 
 
 class TestV1MetalModelRunnerGDNLifecycle:
@@ -1932,7 +1932,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
         runner._request_states[req_id] = state
         runner._paged_request_seq_lens[req_id] = 2
-        slot = runtime.gdn_state_manager.assign_step_slots([req_id])[0]
+        slot = runtime.state_manager.assign_step_slots([req_id])[0]
 
         cache.set_pending_conv_state(
             0,
@@ -1954,9 +1954,9 @@ class TestV1MetalModelRunnerGDNLifecycle:
 
         assert runner._request_states[req_id] is state
         assert runner._paged_request_seq_lens[req_id] == 2
-        assert runtime.gdn_state_manager.request_slots == {}
-        assert runtime.gdn_state_manager.free_slots == (slot,)
-        assert runtime.gdn_state_manager.needs_materialize is False
+        assert runtime.state_manager.request_slots == {}
+        assert runtime.state_manager.free_slots == (slot,)
+        assert runtime.state_manager.needs_materialize is False
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
         np.testing.assert_array_equal(np.array(cache.conv_states[0][slot]), 7)
         np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
@@ -1992,7 +1992,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
             ctx = mr.get_context()
             assert ctx is not None
             captured["input_ids"] = input_ids.tolist()
-            captured["gdn_slot_mapping"] = list(ctx.gdn_slot_mapping or [])
+            captured["state_slot_mapping"] = list(ctx.state_slot_mapping or [])
             return mr.TargetModelForwardOutput(logits=mx.zeros((1, 2, 16)))
 
         monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
@@ -2026,8 +2026,8 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
 
         assert captured["input_ids"] == [[6, 9]]
-        assert captured["gdn_slot_mapping"] == [0, 1]
-        assert runtime.gdn_state_manager.request_slots == {
+        assert captured["state_slot_mapping"] == [0, 1]
+        assert runtime.state_manager.request_slots == {
             "decode-0": 0,
             "prefill-0": 1,
         }
@@ -2057,9 +2057,9 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
         runner._paged_request_seq_lens["done"] = 1
 
-        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        released_slot = runtime.state_manager.assign_step_slots(["done"])[0]
         runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
-        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        reused_slot = runtime.state_manager.assign_step_slots(["next"])[0]
         assert reused_slot == released_slot
 
         cache.set_pending_conv_state(
@@ -2091,7 +2091,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
             np.array(cache.recurrent_states[0][reused_slot]),
             9,
         )
-        assert runtime.gdn_state_manager.needs_materialize is False
+        assert runtime.state_manager.needs_materialize is False
 
 
 class TestRunnerMlaProperties:

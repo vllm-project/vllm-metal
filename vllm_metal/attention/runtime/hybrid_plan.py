@@ -10,14 +10,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import prod
 from typing import Any, Literal, Protocol, TypeAlias
 
+import mlx.core as mx
 import mlx.nn as nn
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 
 LayerRole: TypeAlias = Literal["attention", "state"]
 
@@ -33,11 +35,11 @@ class PagedStateWrapper(Protocol):
         inner: nn.Module,
         layer_idx: int,
         cache_idx: int,
-        state_cache: GDNPagedStateCache,
+        state_cache: PagedStateCache,
     ) -> None: ...
 
     def rebind_state_cache(
-        self, state_cache: GDNPagedStateCache, *, cache_idx: int
+        self, state_cache: PagedStateCache, *, cache_idx: int
     ) -> None: ...
 
 
@@ -102,6 +104,42 @@ class RecurrentStateGeometry:
     value_head_dim: int
     key_head_dim: int
 
+    @property
+    def state_shapes(self) -> tuple[tuple[int, ...], ...]:
+        return (
+            (self.conv_kernel_dim - 1, self.conv_dim),
+            (self.num_v_heads, self.value_head_dim, self.key_head_dim),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ConvStateGeometry:
+    """Convolution tail dimensions for a family with no recurrent SSM pool."""
+
+    conv_kernel_dim: int
+    conv_dim: int
+
+    @property
+    def state_shapes(self) -> tuple[tuple[int, ...], ...]:
+        return ((self.conv_kernel_dim - 1, self.conv_dim),)
+
+
+StateGeometry: TypeAlias = RecurrentStateGeometry | ConvStateGeometry
+
+
+class StateCacheFactory(Protocol):
+    """Allocate a family's state pools using its resolved geometry."""
+
+    def __call__(
+        self,
+        *,
+        geometry: StateGeometry,
+        num_layers: int,
+        max_seqs: int,
+        initial_seqs: int,
+        dtype: mx.Dtype,
+    ) -> PagedStateCache: ...
+
 
 @dataclass(frozen=True, slots=True)
 class StateFamilySpec:
@@ -111,8 +149,12 @@ class StateFamilySpec:
     wrapper_cls: type[PagedStateWrapper]
     is_state_module: Callable[[Any], bool]
     mamba_type: MambaAttentionBackendEnum
-    recurrent_dtype: torch.dtype
+    # None follows the runtime's convolution dtype; fixed dtypes describe
+    # accumulation state such as GDN's fp32 recurrent matrix.
+    state_dtypes: tuple[torch.dtype | None, ...]
     supported_cache_modes: tuple[str, ...]
+    layer_name: str
+    create_state_cache: StateCacheFactory
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,21 +163,16 @@ class HybridRuntimePlan:
 
     layers: HybridLayerPlan
     family: StateFamilySpec
-    geometry: RecurrentStateGeometry
+    geometry: StateGeometry
 
     def state_bytes_per_layer(self, conv_dtype_size: int) -> int:
         """Bytes one request holds in one recurrent state layer."""
-        geometry = self.geometry
-        conv_bytes = (
-            (geometry.conv_kernel_dim - 1) * geometry.conv_dim * conv_dtype_size
+        return sum(
+            prod(shape) * (conv_dtype_size if dtype is None else dtype.itemsize)
+            for shape, dtype in zip(
+                self.geometry.state_shapes, self.family.state_dtypes, strict=True
+            )
         )
-        recurrent_bytes = (
-            geometry.num_v_heads
-            * geometry.value_head_dim
-            * geometry.key_head_dim
-            * self.family.recurrent_dtype.itemsize
-        )
-        return conv_bytes + recurrent_bytes
 
     def state_cache_spec(
         self,
@@ -146,17 +183,12 @@ class HybridRuntimePlan:
         mamba_cache_mode: str,
     ) -> MambaSpec:
         """Build the scheduler-visible state spec for one state layer."""
-        geometry = self.geometry
         return MambaSpec(
-            shapes=(
-                (geometry.conv_kernel_dim - 1, geometry.conv_dim),
-                (
-                    geometry.num_v_heads,
-                    geometry.value_head_dim,
-                    geometry.key_head_dim,
-                ),
+            shapes=self.geometry.state_shapes,
+            dtypes=tuple(
+                conv_dtype if dtype is None else dtype
+                for dtype in self.family.state_dtypes
             ),
-            dtypes=(conv_dtype, self.family.recurrent_dtype),
             block_size=mamba_block_size,
             page_size_padded=page_size_padded,
             mamba_type=self.family.mamba_type,
