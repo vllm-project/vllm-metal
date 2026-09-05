@@ -72,12 +72,11 @@ def test_matmul_matches_dense_oracle_f32(tmp_path, qtype):
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
-    expected = x @ mx.array(oracle).T
+    # M5 GPU matmul may use TF32; keep the reference at full FP32 precision on CPU.
+    expected = mx.matmul(x, mx.array(oracle).T, stream=mx.cpu)
     mx.eval(out, expected)
 
-    # f32 path has no f16 accumulation noise, so hold it tight: the only error
-    # is quantization rounding shared with the oracle. Measured headroom is
-    # ~4e-7 relative, so 4e-6 catches a quant-math regression with ~10x margin.
+    # Allow FP32 accumulation-order differences from the CPU reference.
     ref_max = float(mx.max(mx.abs(expected)))
     np.testing.assert_allclose(
         np.array(out), np.array(expected), rtol=0, atol=ref_max * 4e-6
@@ -145,7 +144,7 @@ def test_embedding_as_linear_matches_matmul(tmp_path, qtype):
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
-    expected = x @ mx.array(oracle).T
+    expected = mx.matmul(x, mx.array(oracle).T, stream=mx.cpu)
     mx.eval(out, expected)
 
     ref_max = float(mx.max(mx.abs(expected)))
@@ -332,7 +331,7 @@ def test_real_file_linear_parity_vs_oracle(path):
 
     x = mx.random.normal((4, qt.in_features)).astype(mx.float32)
     out = qt.matmul(x)
-    expected = x @ mx.array(oracle).T
+    expected = mx.matmul(x, mx.array(oracle).T, stream=mx.cpu)
     mx.eval(out, expected)
 
     ref_max = float(mx.max(mx.abs(expected)))
@@ -509,7 +508,7 @@ def test_permute_rows_matches_dequant_then_gather(tmp_path, qtype):
     assert permuted.logical_shape == qt.logical_shape
     x = mx.array(np.random.default_rng(2).standard_normal((3, 128)), dtype=mx.float32)
     got = permuted.matmul(x)
-    want = x @ mx.array(oracle)[index].T
+    want = mx.matmul(x, mx.array(oracle)[index].T, stream=mx.cpu)
     assert bool(mx.allclose(got, want, atol=1e-3).item())
 
 
