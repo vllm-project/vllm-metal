@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from tests.stub_runner import make_stub_runner
@@ -45,8 +46,13 @@ class TestValidatePagedAttentionSupport:
                 calls.append((args, num_kv_heads))
 
         model_args = {"num_global_key_value_heads": 8}
+        # Two plain layers: mlx-lm declares one KV-style cache per layer,
+        # which passes the native-cache topology validation.
+        model = SimpleNamespace(layers=[object(), object()])
         runner = make_stub_runner(
             model_args=model_args,
+            model=model,
+            num_kv_cache_layers=2,
             num_kv_heads=8,
             _model_adapter=RecordingAdapter(),
         )

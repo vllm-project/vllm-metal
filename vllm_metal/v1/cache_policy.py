@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import mlx.core as mx
 import torch
+from mlx_lm.models.cache import make_prompt_cache
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
@@ -66,6 +68,26 @@ def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int
 
 
 HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
+
+
+def _native_cache_classes(name: str) -> tuple[type, ...]:
+    """Resolve the cache class *name* across mlx-lm and mlx-vlm.
+
+    Model loading goes through either package (mlx-vlm serves VLM-capable
+    families such as Qwen3.5), and each declares its own parallel cache
+    class hierarchy, so ``isinstance`` checks against native caches must
+    accept both packages' classes.
+    """
+    classes: list[type] = []
+    for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:  # pragma: no cover - both ship with vllm-metal
+            continue
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            classes.append(cls)
+    return tuple(classes)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -279,6 +301,7 @@ class ModelCachePolicy:
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
+        self._require_managed_native_caches()
         # ``require_uniform_kv_heads`` is the fail-fast for configs whose
         # ``num_global_key_value_heads`` differs from ``num_key_value_heads``
         # and which would silently fall back to the scalar uniform cache
@@ -292,6 +315,91 @@ class ModelCachePolicy:
                 self._runner.model_args,
                 self._runner.num_kv_heads,
             )
+
+    def _require_managed_native_caches(self) -> None:
+        """Refuse cache topologies the selected paged runtime does not manage.
+
+        ``make_prompt_cache`` is mlx-lm's declaration of the per-request
+        state each layer keeps.  The paged runtimes replace exactly one
+        KV-style cache per native slot (plus, for registered hybrids, the
+        GDN state their layer plan covers); a layer whose declared state is
+        a Mamba/conv ``ArraysCache`` or a ``CacheList`` stacking several
+        caches (Falcon-H1, LFM2, Nemotron-H, ...) would be left running
+        against state nothing manages -- crashing on the first request or
+        silently losing state between decode steps (#655).  Fail loud at
+        setup instead.
+        """
+        runner = self._runner
+        native_caches = make_prompt_cache(runner._forward_model)
+
+        # Registered hybrid runtimes validate against their own layer plan.
+        if runner.is_hybrid:
+            self._validate_hybrid_native_caches(native_caches)
+            return
+
+        expected = runner.num_kv_cache_layers
+        if len(native_caches) != expected:
+            raise NotImplementedError(
+                f"Paged attention expected {expected} native cache slots, "
+                f"but mlx-lm declares {len(native_caches)}. This model uses "
+                "a cache topology the selected paged runtime does not "
+                "manage; set VLLM_METAL_USE_PAGED_ATTENTION=0."
+            )
+
+        unmanaged_classes = _native_cache_classes(
+            "ArraysCache"
+        ) + _native_cache_classes("CacheList")
+        for slot, cache in enumerate(native_caches):
+            if isinstance(cache, unmanaged_classes):
+                raise NotImplementedError(
+                    f"Paged attention cannot serve this model: mlx-lm "
+                    f"declares {type(cache).__name__} at native cache slot "
+                    f"{slot}, but the selected runtime manages only one "
+                    "KV-style cache per slot. Set "
+                    "VLLM_METAL_USE_PAGED_ATTENTION=0."
+                )
+
+    def _validate_hybrid_native_caches(self, native_caches: list[Any]) -> None:
+        """Check mlx-lm's declared cache layout against the hybrid layer plan.
+
+        The hybrid (GDN) runtime manages one KV-style cache per SDPA layer
+        and the conv/recurrent state of every linear layer; mlx-lm declares
+        that same split as KV-style vs ``ArraysCache`` slots.  Any other
+        layout (a ``CacheList`` stacking several states on one layer, or a
+        split that disagrees with ``sdpa_layer_indices``) carries state the
+        runtime would not manage.
+        """
+        runner = self._runner
+        expected = runner.num_layers
+        if len(native_caches) != expected:
+            raise NotImplementedError(
+                f"Hybrid paged attention expected {expected} native cache "
+                f"slots (one per layer), but mlx-lm declares "
+                f"{len(native_caches)}. This model uses a cache topology the "
+                "hybrid runtime does not manage; set "
+                "VLLM_METAL_USE_PAGED_ATTENTION=0."
+            )
+        state_classes = _native_cache_classes("ArraysCache")
+        unmanaged_classes = state_classes + _native_cache_classes("CacheList")
+        for slot, cache in enumerate(native_caches):
+            if slot in runner.sdpa_layer_indices:
+                if isinstance(cache, unmanaged_classes):
+                    raise NotImplementedError(
+                        f"Hybrid paged attention cannot serve this model: "
+                        f"mlx-lm declares {type(cache).__name__} at native "
+                        f"cache slot {slot}, which the layer plan maps to "
+                        "SDPA, but the hybrid runtime manages only one "
+                        "KV-style cache there. Set "
+                        "VLLM_METAL_USE_PAGED_ATTENTION=0."
+                    )
+            elif not isinstance(cache, state_classes):
+                raise NotImplementedError(
+                    f"Hybrid paged attention cannot serve this model: mlx-lm "
+                    f"declares {type(cache).__name__} at native cache slot "
+                    f"{slot}, which the layer plan maps to linear attention, "
+                    "but the hybrid runtime manages only GDN ArraysCache "
+                    "state there. Set VLLM_METAL_USE_PAGED_ATTENTION=0."
+                )
 
     def scheduler_memory_reporting_mode(
         self, *, paged_attention_enabled: bool
