@@ -1,26 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness gates for the single-sequence decode fast path.
+"""Correctness gates for the contiguous native-SDPA decode fast path.
 
-``_native_sdpa_decode_fast_path`` routes decode attention either to MLX's
-native SDPA over zero-copy strided views (contiguous block runs) or to a
-block-table-driven flash-decode kernel (non-contiguous runs, e.g. hybrid
-GDN interleave). Both paths are compared against a float32 einsum reference
-here — the flash-decode launch config is in threads, not threadgroups, a
-mistake these tests catch immediately (it computes only tile 0 / kv head 0).
+``_native_sdpa_decode_fast_path`` routes *contiguous* single-sequence decode
+to MLX native SDPA over zero-copy strided views. Non-contiguous runs return
+``None`` so ``sdpa_forward`` falls through to ``paged_attention_primitive``
+(GQA-shared flash-decode at long context, split-KV otherwise) — those
+shapes are covered by ``tests/test_gqa_paged_decode.py``.
 """
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
-from vllm_metal.attention.impls.sdpa import (
-    _GQA_TILE,
-    _native_sdpa_decode_fast_path,
-)
+import vllm_metal.attention.impls.sdpa as sdpa_mod
+from vllm_metal.attention.impls.sdpa import _native_sdpa_decode_fast_path
 
 
 def _ref_sdpa(q: mx.array, k: mx.array, v: mx.array, scale: float) -> mx.array:
@@ -37,16 +35,6 @@ def _ref_sdpa(q: mx.array, k: mx.array, v: mx.array, scale: float) -> mx.array:
 
 def _make_ctx(seq: int):
     return SimpleNamespace(context_lens=[seq], kernel_metadata_cache={})
-
-
-def _interleaved_table(n_blocks: int) -> list[int]:
-    """Run-of-2, skip-1 pattern produced by hybrid GDN block interleave."""
-    table: list[int] = []
-    b = 3
-    while len(table) < n_blocks:
-        table += [b, b + 1]
-        b += 3
-    return table[:n_blocks]
 
 
 def _run_fast_path(
@@ -67,7 +55,11 @@ def _run_fast_path(
     if contig:
         table = list(range(7, 7 + n_blocks))
     else:
-        table = _interleaved_table(n_blocks)
+        table = (
+            [3, 4, 6, 7][:n_blocks]
+            if n_blocks <= 4
+            else ([3, 4] + list(range(6, 6 + n_blocks - 2)))
+        )
     q = mx.random.normal((1, n_kv_heads * group, dim)).astype(dtype)
     scale = 1.0 / math.sqrt(dim)
     ctx = _make_ctx(seq)
@@ -86,51 +78,36 @@ def _run_fast_path(
         None,
         None,
     )
-    assert out is not None, "fast path did not fire"
-    rows = [table[t // block] * block + t % block for t in range(seq)]
-    kg = kc.reshape(-1, n_kv_heads, dim)[mx.array(rows)]
-    vg = vc.reshape(-1, n_kv_heads, dim)[mx.array(rows)]
-    ref = _ref_sdpa(q[0], kg, vg, scale)
-    diff = mx.max(mx.abs(out.reshape(-1, dim).astype(mx.float32) - ref)).item()
-    return diff, ctx
+    return out, q, kc, vc, table, scale, ctx
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize(
-    "n_kv_heads,group,dim,block,seq",
-    [
-        (8, 4, 128, 16, 1),  # single token
-        (8, 4, 128, 16, 4096),
-        (8, 4, 128, 16, 4097),  # seq % block != 0
-        (4, 8, 128, 32, 5000),
-        (1, 8, 64, 16, 3333),  # MQA, head_dim 64
-        (2, 2, 256, 8, 2000),  # head_dim 256
-        (8, 4, 96, 16, 1000),  # head_dim 96
-        (8, 4, 128, 16, _GQA_TILE - 1),
-        (8, 4, 128, 16, _GQA_TILE),  # exactly one tile
-        (8, 4, 128, 16, _GQA_TILE + 1),
-        (8, 1, 128, 16, 2000),  # no GQA grouping
-        (8, 4, 128, 544, 30000),  # hybrid align block size
-    ],
-)
-def test_kernel_path_matches_reference(n_kv_heads, group, dim, block, seq, dtype):
-    diff, _ = _run_fast_path(n_kv_heads, group, dim, block, seq, dtype, contig=False)
-    assert diff < 0.01, f"max abs diff {diff}"
-
-
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("seq", [1, 100, 4096, 30000])
+@pytest.mark.parametrize("seq", [1, 100, 4096, 4097, 16384])
 def test_contiguous_path_matches_reference(seq, dtype):
-    diff, _ = _run_fast_path(8, 4, 128, 16, seq, dtype, contig=True)
+    out, q, kc, vc, table, scale, _ = _run_fast_path(
+        8, 4, 128, 16, seq, dtype, contig=True
+    )
+    assert out is not None, "contiguous native-SDPA path did not fire"
+    block = 16
+    rows = [table[t // block] * block + t % block for t in range(seq)]
+    kg = kc.reshape(-1, 8, 128)[mx.array(rows)]
+    vg = vc.reshape(-1, 8, 128)[mx.array(rows)]
+    ref = _ref_sdpa(q[0], kg, vg, scale)
+    diff = mx.max(mx.abs(out.reshape(-1, 128).astype(mx.float32) - ref)).item()
     assert diff < 0.01, f"max abs diff {diff}"
+
+
+def test_non_contiguous_defers_to_paged_kernel():
+    out, *_ = _run_fast_path(8, 4, 128, 16, 4096, mx.bfloat16, contig=False)
+    assert out is None
 
 
 def test_plan_memoized_per_forward_step():
     """Second layer on the same ctx must reuse the plan, not rescan."""
-    _, ctx = _run_fast_path(8, 4, 128, 16, 4096, mx.bfloat16, contig=False)
+    _, _, _, _, _, _, ctx = _run_fast_path(
+        8, 4, 128, 16, 4096, mx.bfloat16, contig=True
+    )
     assert len(ctx.kernel_metadata_cache) == 1
-    # Repeat with a different table object under the same ctx: the memoized
-    # plan (not the new list) drives the dispatch.
     mx.random.seed(1)
     n_kv_heads, group, dim, block, seq = 8, 4, 128, 16, 4096
     n_blocks = (seq + block - 1) // block
@@ -144,7 +121,7 @@ def test_plan_memoized_per_forward_step():
         kc,
         ctx,
         None,
-        [list(range(5, 5 + n_blocks))],  # contiguous, but memoized plan wins
+        [list(range(20, 20 + n_blocks))],  # different table; memoized plan wins
         block,
         n_kv_heads,
         1.0 / math.sqrt(dim),
@@ -157,14 +134,15 @@ def test_plan_memoized_per_forward_step():
     assert len(ctx.kernel_metadata_cache) == 1
 
 
-def _gating_kwargs():
+def _gating_kwargs(*, contig: bool = False):
+    table = [3, 4, 5, 6] if contig else [3, 4, 6, 7]
     return {
         "q_3d": mx.zeros((1, 32, 128), dtype=mx.bfloat16),
         "k_cache": mx.zeros((64, 16, 8, 128), dtype=mx.bfloat16),
         "v_cache": mx.zeros((64, 16, 8, 128), dtype=mx.bfloat16),
         "ctx": _make_ctx(60),
         "group_index": None,
-        "raw_block_tables": [[3, 4, 6, 7]],
+        "raw_block_tables": [table],
         "cache_block_size": 16,
         "cache_kv_heads": 8,
         "attn_scale": 0.088,
@@ -194,8 +172,10 @@ def _fast_path_named(**kw):
 
 
 def test_gating_fallbacks():
-    kw = _gating_kwargs()
-    assert _fast_path_named(**kw) is not None  # baseline fires
+    kw = _gating_kwargs(contig=True)
+    assert _fast_path_named(**kw) is not None  # contiguous fires native SDPA
+
+    assert _fast_path_named(**_gating_kwargs(contig=False)) is None
 
     bad = dict(kw, attn_softcap=50.0)
     assert _fast_path_named(**bad) is None, "softcap must fall back"
@@ -227,4 +207,13 @@ def test_gating_fallbacks():
 
 def test_env_disable(monkeypatch):
     monkeypatch.setenv("VLLM_METAL_NATIVE_SDPA_DECODE", "0")
-    assert _fast_path_named(**_gating_kwargs()) is None
+    assert _fast_path_named(**_gating_kwargs(contig=True)) is None
+
+
+def test_no_python_jit_gqa_kernels():
+    """Shipped decode must not construct mx.fast.metal_kernel GQA pass1/merge."""
+    assert not hasattr(sdpa_mod, "_gqa_decode_kernels")
+    assert not hasattr(sdpa_mod, "_GQA_DECODE_PASS1_TEMPLATE")
+    src = inspect.getsource(sdpa_mod._native_sdpa_decode_fast_path)
+    assert "metal_kernel" not in src
+    assert "_gqa_decode_kernels" not in src

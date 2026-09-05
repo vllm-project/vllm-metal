@@ -36,6 +36,11 @@ using namespace mlx::core;
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
+// Below this context length the GQA-shared decode pass loses to the
+// established per-token / split-KV kernel (measured on M5 Pro).  Kept as
+// a named constant so the dispatch gate and the Python test surface cannot
+// drift.
+constexpr int kGqaDecodeMinSeqLen = 16384;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -714,21 +719,17 @@ static void dispatch_paged_attention_v2_online(
       && num_heads % num_kv_heads == 0 && gqa_group >= 1 && gqa_group <= 8
       && (head_size == 64 || head_size == 96 || head_size == 128 ||
           head_size == 256)
-      && max_num_partitions >= 2 && max_seq_len >= 16384;
+      && max_num_partitions >= 2 && max_seq_len >= kGqaDecodeMinSeqLen;
   if (gqa_decode) {
     std::string gname =
         "paged_attention_gqa_decode_" + dt + "_hs" + std::to_string(head_size) +
         "_bs" + std::to_string(block_size) + "_ps" +
         std::to_string(kPartitionSize);
-    // The kernel only exists in freshly built shader libraries; a stale
-    // prebuilt .metallib (or an older wheel's) does not carry it — fall
-    // through to the per-token kernel instead of failing the dispatch.
-    MTL::ComputePipelineState* gkernel = nullptr;
-    try {
-      gkernel = d.get_kernel(gname, lib, gname, {});
-    } catch (const std::exception&) {
-    }
-    if (gkernel != nullptr) {
+    // Instantiated in pagedattention.metal and shipped in the v2 metallib.
+    // A missing specialization is a build/packaging bug: fail loudly
+    // rather than silently drop eligible long decode back to the slower
+    // per-token kernel.
+    auto* gkernel = d.get_kernel(gname, lib, gname, {});
 
     array g_tmp_out = make_temp(
         Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
@@ -772,8 +773,6 @@ static void dispatch_paged_attention_v2_online(
         max_num_partitions, dt, /*use_sinks=*/false, nullptr,
         /*use_tq_fc=*/false);
     return;
-    }
-    // Kernel unavailable in the loaded shader library: fall through.
   }
 
   if (!partition) {
@@ -1728,9 +1727,26 @@ void gdn_linear_attention_impl(
 
 NB_MODULE(_paged_ops, m) {
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
+  m.attr("GQA_DECODE_MIN_SEQ_LEN") = nb::int_(kGqaDecodeMinSeqLen);
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
         "engages on this machine.");
+  m.def(
+      "has_gqa_decode_kernel",
+      []() {
+        try {
+          auto& d = metal::device(Device::gpu);
+          auto* lib = d.get_library("paged_attention_v2_kern");
+          auto* k = d.get_kernel(
+              "paged_attention_gqa_decode_half_hs128_bs16_ps512", lib,
+              "paged_attention_gqa_decode_half_hs128_bs16_ps512", {});
+          return k != nullptr;
+        } catch (const std::exception&) {
+          return false;
+        }
+      },
+      "True when the loaded v2 shader library contains the GQA-shared "
+      "flash-decode pass (the default prebuilt metallib on this branch).");
 
   m.def("init_v2_library", &init_v2_library,
         nb::arg("v2_src"),
