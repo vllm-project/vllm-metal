@@ -39,6 +39,7 @@ from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
     LogprobsLists,
+    LogprobsTensors,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
@@ -104,6 +105,10 @@ from vllm_metal.v1.pooling.contract import (
     ExecutablePoolingBackend,
 )
 from vllm_metal.v1.pooling.validation import validate_pooling_request
+from vllm_metal.v1.prompt_logprobs import (
+    PromptLogprobsTracker,
+    full_prompt_logprobs,
+)
 from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
@@ -232,6 +237,9 @@ class _ExecutionBatch:
     paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
     paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
     valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
+    # Completed prompt-logprobs tensors, delivered on the step that finishes
+    # each requesting prompt (the vLLM v1 ``prompt_logprobs_dict`` contract).
+    prompt_logprobs_dict: dict[str, LogprobsTensors] = field(default_factory=dict)
 
     def add_output(
         self,
@@ -453,6 +461,10 @@ class MetalModelRunner:
 
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
+
+        # Per-request prompt-logprobs accumulation across prefill chunks
+        # (populated only for requests whose SamplingParams ask for it).
+        self._prompt_logprobs_tracker = PromptLogprobsTracker()
 
         # One-step-ahead decode pipelining (owner: decode_pipeline.py).
         # Gate-eligible pure-decode greedy steps defer the sampling sync one
@@ -1057,7 +1069,7 @@ class MetalModelRunner:
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
-    ) -> tuple[int, list[KVCache], LogprobsLists | None]:
+    ) -> tuple[int, list[KVCache], LogprobsLists | None, LogprobsTensors | None]:
         """Process a single prefill request.
 
         Args:
@@ -1065,7 +1077,7 @@ class MetalModelRunner:
             sampling_params: Sampling parameters for this request
 
         Returns:
-            Tuple of (next_token, cache)
+            Tuple of (next_token, cache, sample logprobs, prompt logprobs)
         """
         cache: list[KVCache] = make_prompt_cache(self._forward_model)
 
@@ -1073,6 +1085,17 @@ class MetalModelRunner:
         model_output = self._forward_model(input_ids, cache=cache)
 
         logits = self._extract_logits(model_output)
+
+        # The non-paged path forwards the whole prompt in one chunk, so the
+        # packed rows cover every prompt position and one gather fulfills the
+        # engine's prompt-logprobs contract.
+        prompt_logprobs: LogprobsTensors | None = None
+        if sampling_params.prompt_logprobs is not None:
+            prompt_logprobs = full_prompt_logprobs(
+                logits[0],
+                token_ids,
+                sampling_params.prompt_logprobs,
+            )
 
         # Extract last token logits
         last_logits = logits[:, -1, :]
@@ -1090,7 +1113,7 @@ class MetalModelRunner:
         [next_token] = result.token_ids
         mx.eval(*[c.state for c in cache])
 
-        return next_token, cache, result.logprobs
+        return next_token, cache, result.logprobs, prompt_logprobs
 
     def _batched_decode(
         self, decode_reqs: list[tuple[str, RequestState]]
@@ -1433,17 +1456,30 @@ class MetalModelRunner:
                     and all(pr.prompt_len is None for pr in prefill_reqs)
                     and self._drafter is None
                 )
-                if intermediate_only and self._intermediate_forward_supported:
+                # Prompt-logprobs requests need a logits row for every prompt
+                # position, so their steps skip both head-pruning paths: the
+                # projection-free intermediate forward (no logits at all) and
+                # the selective layout (last prefill row only).
+                needs_prompt_logprob_rows = any(
+                    PromptLogprobsTracker.wants(pr.sampling_params)
+                    for pr in prefill_reqs
+                )
+                if (
+                    intermediate_only
+                    and self._intermediate_forward_supported
+                    and not needs_prompt_logprob_rows
+                ):
                     intermediate_hidden = self._model_adapter.intermediate_forward(
                         self._forward_model, input_ids, cache=offset_caches
                     ).hidden_states
                     logits = None
                     target_hidden_states = None
                 else:
-                    logits_layout = self._paged_logits_layout(
-                        cu_seqlens,
-                        num_decode_segments=len(decode_segments),
-                    )
+                    if not needs_prompt_logprob_rows:
+                        logits_layout = self._paged_logits_layout(
+                            cu_seqlens,
+                            num_decode_segments=len(decode_segments),
+                        )
                     target_output = self._target_forward(
                         input_ids,
                         cache=offset_caches,
@@ -1652,6 +1688,13 @@ class MetalModelRunner:
                     "Intermediate-only step has rows that must sample — "
                     "routing desynced."
                 )
+            self._gather_prefill_prompt_logprobs(
+                batch,
+                prefill_reqs,
+                logits,
+                logits_cu_seqlens,
+                num_decode_segments,
+            )
             for pr in prefill_reqs:
                 self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
                     pr.token_ids
@@ -1784,6 +1827,15 @@ class MetalModelRunner:
         for pr in prefill_reqs:
             self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(pr.token_ids)
 
+        # ---- prompt logprobs for requests that asked for them ----
+        self._gather_prefill_prompt_logprobs(
+            batch,
+            prefill_reqs,
+            logits,
+            logits_cu_seqlens,
+            num_decode_segments,
+        )
+
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
             next_token = prefill_result.token_ids[i]
@@ -1861,6 +1913,57 @@ class MetalModelRunner:
         )
 
         return batch, scheduler_output
+
+    def _gather_prefill_prompt_logprobs(
+        self,
+        batch: _ExecutionBatch,
+        prefill_reqs: list[PrefillRequest],
+        logits: mx.array | None,
+        logits_cu_seqlens: list[int],
+        num_decode_segments: int,
+    ) -> None:
+        """Score this step's prefill chunks for prompt-logprobs requests.
+
+        Feeds each requesting chunk's logits rows to the tracker; a request's
+        completed tensors land in ``batch.prompt_logprobs_dict`` on the chunk
+        that finishes its prompt, which is the step the engine expects them
+        (``ModelRunnerOutput.prompt_logprobs_dict``).
+        """
+        for i, prefill in enumerate(prefill_reqs):
+            if not PromptLogprobsTracker.wants(prefill.sampling_params):
+                continue
+            num_logprobs = prefill.sampling_params.prompt_logprobs
+            assert num_logprobs is not None
+            if logits is None:
+                raise RuntimeError(
+                    "Prompt logprobs requested but the forward produced no "
+                    "logits — the intermediate-forward gate desynced."
+                )
+            full_prompt = prefill.full_prompt_token_ids
+            if full_prompt is None:
+                raise RuntimeError(
+                    f"Prompt logprobs requested for {prefill.req_id!r} but "
+                    "the prefill pack carries no full prompt — "
+                    "_build_prefill_pack gating desynced."
+                )
+            seg_start = logits_cu_seqlens[num_decode_segments + i]
+            seg_end = logits_cu_seqlens[num_decode_segments + i + 1]
+            if seg_end - seg_start != len(prefill.token_ids):
+                raise RuntimeError(
+                    "Prompt logprobs requested but the head projected only "
+                    f"{seg_end - seg_start} of {len(prefill.token_ids)} chunk "
+                    "rows — the selective-logits gate desynced."
+                )
+            tensors = self._prompt_logprobs_tracker.observe_chunk(
+                prefill.req_id,
+                prompt_token_ids=full_prompt,
+                start_pos=prefill.start_pos,
+                num_tokens=len(prefill.token_ids),
+                chunk_logits=logits[0, seg_start:seg_end, :],
+                num_logprobs=num_logprobs,
+            )
+            if tensors is not None:
+                batch.prompt_logprobs_dict[prefill.req_id] = tensors
 
     def _register_new_request_mm_features(
         self, req_id: str, new_req: NewRequestData
@@ -2329,12 +2432,14 @@ class MetalModelRunner:
                     )
                 continue
 
-            next_token, cache, logprobs = self._prefill_single(
+            next_token, cache, logprobs, prompt_logprobs = self._prefill_single(
                 token_ids,
                 sampling_params,
                 generator=generator,
             )
             batch.add_output(req_id, [next_token], logprobs)
+            if prompt_logprobs is not None:
+                batch.prompt_logprobs_dict[req_id] = prompt_logprobs
             self._request_states[req_id] = RequestState(
                 token_ids=list(token_ids) + [next_token],
                 prompt_len=len(token_ids),
@@ -2496,17 +2601,22 @@ class MetalModelRunner:
         Multimodal requests need it at every chunk including the first —
         ``adapter.get_mrope_input_positions`` must see the whole prompt
         to compute correct M-RoPE positions for image placeholders, then
-        a later commit slices the chunk-relevant range.  Both conditions
-        share the same two-source resolution (RequestState first, new_req
-        fallback) and the same contract-bug raises.
+        a later commit slices the chunk-relevant range.  Prompt-logprobs
+        requests need it at every chunk too: each chunk's last row scores
+        the first token of the *next* chunk, so the targets always reach
+        one past this chunk's own tokens.  All conditions share the same
+        two-source resolution (RequestState first, new_req fallback) and
+        the same contract-bug raises.
         """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
             prefill = entry.prefill
             full_prompt = None
 
-            needs_full_prompt = prefill.start_pos > 0 or self._is_mm_request(
-                prefill.req_id
+            needs_full_prompt = (
+                prefill.start_pos > 0
+                or self._is_mm_request(prefill.req_id)
+                or PromptLogprobsTracker.wants(prefill.sampling_params)
             )
             if needs_full_prompt:
                 state = self._request_states.get(prefill.req_id)
@@ -2557,7 +2667,7 @@ class MetalModelRunner:
             req_id_to_index=batch.req_id_to_index,
             sampled_token_ids=batch.sampled_tokens,
             logprobs=batch.merged_logprobs(),
-            prompt_logprobs_dict={},
+            prompt_logprobs_dict=dict(batch.prompt_logprobs_dict),
             pooler_output=batch.pooler_outputs,
         )
 
@@ -2670,6 +2780,11 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
             self._state_block_ids_by_req.pop(req_id, None)
+
+        # In-progress prompt-logprobs state survives preemption (a resumed
+        # request re-runs its prompt chunks over the same positions) and is
+        # dropped only when the engine finishes the request.
+        self._prompt_logprobs_tracker.discard(evicted_req_ids)
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
