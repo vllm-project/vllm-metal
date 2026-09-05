@@ -16,6 +16,7 @@ from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
+from vllm_metal.v1 import worker as worker_mod  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
     ModelCachePolicy,
     WorkerCachePlanner,
@@ -573,3 +574,66 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.linear_cache_bytes_per_slot()
+
+
+class TestShutdownClosesConnectorStep:
+    """The connector step must end before the transfer group is torn down."""
+
+    def test_step_closes_before_kv_transfer_shutdown(self, monkeypatch) -> None:
+        order: list[str] = []
+        model_runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: order.append("close"),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: order.append("shutdown")
+        )
+
+        MetalWorker.shutdown(worker)
+
+        assert order == ["close", "shutdown"]
+
+    def test_shutdown_survives_a_runner_without_the_hook(self, monkeypatch) -> None:
+        """STT runners have no connector step; shutdown must not care."""
+        calls: list[str] = []
+        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == ["shutdown"]
+
+
+class TestOffloadGuardsGateOnAConnector:
+    """validate_metal_support rejects shapes the offload path cannot serve.
+    It must run only when a connector is configured: a transfer config with
+    no connector is inert upstream, and hybrid models never asked for
+    offloading."""
+
+    def _run(self, monkeypatch, kv_transfer_config) -> list[str]:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "vllm_metal.v1.kv_offload.spec.validate_metal_support",
+            lambda _cfg: calls.append("validate"),
+        )
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_initialized", lambda *_: None
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+        runner = SimpleNamespace(initialize_kv_cache=lambda _cfg: calls.append("init"))
+        worker = _make_worker(runner, use_paged_attention=True)
+        worker.vllm_config.kv_transfer_config = kv_transfer_config
+        MetalWorker.initialize_from_config(worker, SimpleNamespace())
+        return calls
+
+    def test_inert_transfer_config_skips_the_guard(self, monkeypatch) -> None:
+        inert = SimpleNamespace(kv_connector=None)
+        assert self._run(monkeypatch, inert) == ["init"]
+
+    def test_connector_runs_the_guard_first(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        assert self._run(monkeypatch, configured) == ["validate", "init"]

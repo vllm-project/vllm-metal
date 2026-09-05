@@ -53,6 +53,171 @@ def _pick_mb_buffer_default(
     return None
 
 
+def _configure_kv_events(vllm_config: "VllmConfig", extra: dict) -> None:
+    """Line up the two switches that gate KV cache events.
+
+    A KV-aware router consumes the BlockStored events an offload
+    tier emits. A tier only emits them when ``enable_kv_events`` is set on
+    the tier config AND ``kv_events_config.enable_kv_cache_events`` is set
+    globally. Set one without the other and the tier logs a warning
+    mid-startup and then silently publishes nothing, which looks exactly
+    like a routing bug.
+
+    So: turn the tier switch on for the user when events are enabled
+    globally, and refuse the reverse combination at config time rather than
+    letting it degrade quietly.
+    """
+    events_config = vllm_config.kv_events_config
+    globally_on = bool(events_config and events_config.enable_kv_cache_events)
+    tiers = extra.get("secondary_tiers") or []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        if globally_on:
+            tier.setdefault("enable_kv_events", True)
+        elif tier.get("enable_kv_events"):
+            raise NotImplementedError(
+                "Secondary KV tier has enable_kv_events set, but KV cache "
+                "events are disabled globally, so the tier would publish "
+                "nothing. Pass --kv-events-config with "
+                "'{\"enable_kv_cache_events\": true}' (plus a publisher) or "
+                "drop enable_kv_events from the tier."
+            )
+
+
+def _configure_kv_offloading(vllm_config: "VllmConfig") -> None:
+    """Translate --kv-offloading-size and validate the KV connector."""
+    config = get_config()
+    parallel_config = vllm_config.parallel_config
+    # KV offloading / KV connectors. vLLM's own translation of
+    # --kv-offloading-size N into kv_transfer_config runs AFTER this hook
+    # (_post_init_kv_transfer_config, vllm/config/vllm.py) and would
+    # force-set a connector name this platform cannot serve. So the
+    # translation is performed here instead — kv_offloading_size is
+    # cleared afterwards, which disarms the upstream translation (it
+    # returns early when the size is unset) — and the connector is routed
+    # to the Metal subclass via kv_connector_module_path. A
+    # kv_transfer_config with no connector and no offloading request is
+    # inert upstream and passes through untouched.
+    # Typed access, not getattr: vllm-metal #604 removed the defensive
+    # fallbacks here in favour of trusting vLLM's config DTOs, and a
+    # getattr with a default would silently pass a guard after an upstream
+    # rename rather than failing loudly.
+    cache_config = vllm_config.cache_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    kv_offloading_size = cache_config.kv_offloading_size
+    explicit_connector = (
+        kv_transfer_config.kv_connector if kv_transfer_config is not None else None
+    )
+    if explicit_connector not in (
+        None,
+        "OffloadingConnector",
+        "MetalOffloadingConnector",
+    ):
+        raise NotImplementedError(
+            f"KV connector '{explicit_connector}' is not supported on "
+            "Metal; only the KV offloading connector "
+            "(--kv-offloading-size N) is available."
+        )
+    if kv_offloading_size is not None or explicit_connector is not None:
+        kv_offloading_backend = cache_config.kv_offloading_backend
+        if kv_offloading_size is not None and kv_offloading_backend != "native":
+            raise NotImplementedError(
+                "Metal supports only --kv-offloading-backend native; "
+                f"'{kv_offloading_backend}' is not supported."
+            )
+        import vllm.envs as vllm_envs
+
+        if vllm_envs.VLLM_USE_SIMPLE_KV_OFFLOAD:
+            raise NotImplementedError(
+                "VLLM_USE_SIMPLE_KV_OFFLOAD is not supported on Metal; "
+                "unset it to use the native KV offloading connector."
+            )
+        if not config.use_paged_attention:
+            raise NotImplementedError(
+                "KV offloading on Metal requires paged attention "
+                "(VLLM_METAL_USE_PAGED_ATTENTION=1)."
+            )
+        if parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "KV offloading on Metal does not support pipeline "
+                "parallelism yet; run with pipeline_parallel_size=1."
+            )
+        if kv_transfer_config is None:
+            from vllm.config import KVTransferConfig
+
+            kv_transfer_config = KVTransferConfig()
+            vllm_config.kv_transfer_config = kv_transfer_config
+        kv_transfer_config.kv_connector = "MetalOffloadingConnector"
+        kv_transfer_config.kv_connector_module_path = (
+            "vllm_metal.v1.kv_offload.connector"
+        )
+        # Force-normalize like upstream _post_init_kv_transfer_config
+        # (vllm/config/vllm.py): offloading always runs kv_both. A
+        # passed-through kv_producer would silently disable the
+        # scheduler's defer_block_free protection (freed-block race).
+        if kv_transfer_config.kv_role not in (None, "kv_both"):
+            logger.warning(
+                "KV offloading on Metal overrides kv_role=%r to 'kv_both'.",
+                kv_transfer_config.kv_role,
+            )
+        kv_transfer_config.kv_role = "kv_both"
+        extra = kv_transfer_config.kv_connector_extra_config
+        if kv_offloading_size is not None:
+            # A non-None kv_offloading_size implies cache_config exists
+            # (it was read off cache_config above).
+            assert cache_config is not None
+            # Mirrors upstream _post_init_kv_transfer_config (GiB).
+            extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
+            cache_config.kv_offloading_size = None
+        elif "cpu_bytes_to_use" not in extra:
+            raise NotImplementedError(
+                "KV offloading on Metal needs a host pool size: pass "
+                "--kv-offloading-size N (GiB) alongside the connector."
+            )
+        # Secondary tier types are gated here: the upstream "obj" tier
+        # needs NIXL, which has no macOS build — without this guard it
+        # crashes ungracefully deep inside engine start.
+        # MetalFileSystemTierManager is what MetalTieringOffloadingSpec
+        # rewrites "fs" to, so accept it here: this hook runs again in the
+        # engine core process, on a config the spec has already rewritten.
+        for tier in extra.get("secondary_tiers") or []:
+            tier_type = tier.get("type") if isinstance(tier, dict) else None
+            if tier_type not in ("fs", "MetalFileSystemTierManager"):
+                raise NotImplementedError(
+                    f"Secondary KV tier type '{tier_type}' is not "
+                    "supported on Metal; only 'fs' (filesystem) is "
+                    "available (the 'obj' tier requires NIXL, which has "
+                    "no macOS build)."
+                )
+        _configure_kv_events(vllm_config, extra)
+        # Remap upstream spec names to the one Metal spec, which serves both
+        # the plain host pool and secondary tiers. Unknown names fail here
+        # rather than resolving to a CUDA-bound spec deep inside engine start.
+        spec_name = extra.get("spec_name")
+        if spec_name not in (
+            None,
+            "CPUOffloadingSpec",
+            "TieringOffloadingSpec",
+            "MetalTieringOffloadingSpec",
+        ):
+            raise NotImplementedError(
+                f"Offloading spec '{spec_name}' is not supported on Metal."
+            )
+        extra["spec_name"] = "MetalTieringOffloadingSpec"
+        extra["spec_module_path"] = "vllm_metal.v1.kv_offload.spec"
+        # The host pool is anonymous RAM shared between the scheduler and the
+        # worker within one process (macOS has no tmpfs; a file-backed region
+        # would write KV churn back to SSD). That requires the single-process
+        # executor.
+        if parallel_config.distributed_executor_backend != "uni":
+            raise NotImplementedError(
+                "KV offloading on Metal requires the single-process executor "
+                "(--distributed-executor-backend uni); got "
+                f"'{parallel_config.distributed_executor_backend}'."
+            )
+
+
 class MetalPlatform(Platform):
     """Platform implementation for Apple Silicon Metal/MLX.
 
@@ -660,6 +825,8 @@ class MetalPlatform(Platform):
             # NB: the Ray job-level hook is registered only AFTER the remaining DP
             # rejections (multimodal, STT) further below, so an unsupported DP
             # config fails fast before any ray.init side effect.
+
+        _configure_kv_offloading(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
 

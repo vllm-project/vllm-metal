@@ -13,6 +13,16 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -72,7 +82,7 @@ class MetalWorker(WorkerBase):
     # Override model_runner type from base class. Typed as MetalModelRunner
     # because its worker-facing method set is a superset of STTModelRunner's;
     # STT models are assigned an STTModelRunner at runtime (see init_device).
-    model_runner: MetalModelRunner  # type: ignore[assignment]
+    model_runner: MetalModelRunner
 
     def __init__(
         self,
@@ -246,7 +256,61 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # Offloading specs no longer receive the KVCacheConfig, so the checks
+        # that need it run here instead, while it is still in scope. Gated on
+        # a connector being configured: these reject model shapes the offload
+        # path cannot serve, not shapes Metal cannot serve, and a transfer
+        # config with no connector is inert upstream and must stay so.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is not None and kv_transfer_config.kv_connector:
+            from vllm_metal.v1.kv_offload.spec import validate_metal_support
+
+            validate_metal_support(kv_cache_config)
+
+        # Create the worker-side KV connector before KV cache initialization,
+        # mirroring vllm.v1.worker.gpu_worker.Worker.initialize_from_config.
+        # No-op unless kv_transfer_config is set (e.g. --kv-offloading-size).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if has_kv_transfer_group():
+            if not hasattr(self.model_runner, "register_kv_connector_caches"):
+                raise NotImplementedError(
+                    "KV offloading is not supported for STT models on Metal."
+                )
+            # The MLX paged cache already exists (allocated during
+            # determine_available_memory -> setup_paged_attention), so the
+            # connector can be handed the live cache immediately.
+            self.model_runner.register_kv_connector_caches()
+
+            # Needs both the built spec and the KVCacheConfig, so it runs
+            # here rather than in the spec constructor. Only without a disk
+            # tier: behind one, a small pool is the expected shape.
+            from vllm_metal.v1.kv_offload.spec import warn_if_pool_undersized
+
+            spec = get_kv_transfer_group().connector_worker.spec
+            if not spec.secondary_tier_configs:
+                warn_if_pool_undersized(spec, kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Get KV connector handshake metadata, keyed by (pp_rank, tp_rank).
+
+        Called by the engine core via ``collective_rpc`` whenever a KV
+        connector is configured. Copied from
+        ``vllm.v1.worker.gpu_worker.Worker`` (device-agnostic); the offloading
+        connector needs no handshake and yields ``None``.
+        """
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
@@ -391,6 +455,23 @@ class MetalWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        # Close any open connector step before the connector goes away. If
+        # execute_model opened a step and sample_tokens never ran, the context
+        # is still open, and ensure_kv_transfer_shutdown drops the transfer
+        # group its exit path needs.
+        finish_step = getattr(self.model_runner, "finish_kv_connector_step", None)
+        if finish_step is not None:
+            try:
+                finish_step()
+            except Exception:
+                logger.exception("Closing the KV connector step failed; continuing")
+
+        try:
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            # Never let connector teardown block profiler/model cleanup.
+            logger.exception("KV transfer shutdown failed; continuing")
+
         if self._metal_profiler is not None:
             self._metal_profiler.shutdown()
             self._metal_profiler = None

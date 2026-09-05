@@ -38,6 +38,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import KVConnectorOutput
 
     from vllm_metal.v1.model_runner import RequestState, _ExecutionBatch
     from vllm_metal.v1.spec_decode import PagedDecodeSegment
@@ -174,6 +175,10 @@ class PendingSampleStep:
     entries: tuple[PendingBackfillEntry, ...]
     batch: _ExecutionBatch
     scheduler_output: SchedulerOutput
+    # Collected at submit, because the connector step must close before the
+    # next step runs (see _submit_deferred_decode_sample). None when no KV
+    # connector is configured.
+    kv_connector_output: KVConnectorOutput | None
 
 
 class MetalAsyncModelRunnerOutput(AsyncModelRunnerOutput):
@@ -373,4 +378,7 @@ class DecodePipeline:
             pending.batch.set_output(entry.output_idx, [value])
 
         self._validate(pending.batch, pending.scheduler_output)
-        self._resolved = (self._pending_serial, self._build_output(pending.batch))
+        output = self._build_output(pending.batch)
+        if pending.kv_connector_output is not None:
+            output.kv_connector_output = pending.kv_connector_output
+        self._resolved = (self._pending_serial, output)

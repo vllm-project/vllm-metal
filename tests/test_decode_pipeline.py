@@ -161,6 +161,7 @@ def _submit_step(
             entries=tuple(entries),
             batch=batch,
             scheduler_output=_make_scheduler_output(req_ids),
+            kv_connector_output=None,
         )
     )
     return handle, states, batch
