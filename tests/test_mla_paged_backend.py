@@ -547,6 +547,63 @@ class TestMLAPagedAttentionWrapperPagedPath:
 
         assert bool(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
 
+    def test_bailing_prefill_and_decode_match_mlx_lm(self) -> None:
+        from mlx_lm.models.bailing_moe_v3 import BailingMLA, ModelArgs
+        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.models.cache import KVCache
+
+        mx.random.seed(29)
+        args = ModelArgs(
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=4,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            max_position_embeddings=32,
+        )
+        inner = BailingMLA(args)
+        reference_cache = KVCache()
+        paged_cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=args.kv_lora_rank + args.qk_rope_head_dim,
+            num_blocks=2,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner, 0, paged_cache)
+
+        def run_paged(tokens: mx.array, *, offset: int, context_len: int) -> mx.array:
+            num_tokens = tokens.shape[1]
+            pac.set_context(
+                pac.PagedAttentionContext(
+                    slot_mapping=list(range(offset, offset + num_tokens)),
+                    block_tables=[[0]],
+                    context_lens=[context_len],
+                    offsets=[offset],
+                    cu_seqlens=[0, num_tokens],
+                )
+            )
+            return wrapper(tokens)
+
+        prefill = mx.random.normal((1, 3, args.hidden_size)).astype(mx.float32)
+        expected_prefill = inner(
+            prefill,
+            mask=create_causal_mask(prefill.shape[1]),
+            cache=reference_cache,
+        )
+        actual_prefill = run_paged(prefill, offset=0, context_len=3)
+
+        decode = mx.random.normal((1, 1, args.hidden_size)).astype(mx.float32)
+        expected_decode = inner(decode, cache=reference_cache)
+        actual_decode = run_paged(decode, offset=3, context_len=4)
+        mx.eval(actual_prefill, expected_prefill, actual_decode, expected_decode)
+
+        assert bool(mx.allclose(actual_prefill, expected_prefill, rtol=1e-5, atol=1e-5))
+        assert bool(mx.allclose(actual_decode, expected_decode, rtol=1e-5, atol=1e-5))
+
 
 # Single-pass kernel dimensions (matches mla.metal instantiation).
 _KERNEL_KV_RANK = 512

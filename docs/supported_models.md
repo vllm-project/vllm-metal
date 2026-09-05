@@ -84,6 +84,18 @@ end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
+Ling-3.0 requires
+[vLLM 0.28.0](https://github.com/vllm-project/vllm/releases/tag/v0.28.0) or
+later, which includes its
+[Bailing V3 model support](https://github.com/vllm-project/vllm/pull/51045).
+Its MLX-LM implementation landed in
+[mlx-lm#1711](https://github.com/ml-explore/mlx-lm/pull/1711). Supported weight
+formats are BF16 and MLX-native MXFP8 converted from the BF16 checkpoint. The
+official serialized block-FP8 checkpoint is not loaded directly. Ling-3.0 Tiny
+has been validated end to end. Due to resource constraints, Flash has only
+been validated at the configuration and direct-Q model-structure level; its
+full checkpoint weights were not loaded.
+
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -96,6 +108,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
 | StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| Ling-3.0 Tiny | 🔵 | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |

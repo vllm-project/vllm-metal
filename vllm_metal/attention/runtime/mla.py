@@ -51,8 +51,7 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def _patch_model(self, model: Any, latent_cache: MLAPagedLatentCache) -> int:
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
             if isinstance(attn, MLAPagedAttentionWrapper):
-                # Already patched — refresh cache reference in place.
-                object.__setattr__(attn, "_mla_latent_cache", latent_cache)
+                attn.rebind_cache(latent_cache, cache_idx=layer_idx)
                 return attn
             return MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
 

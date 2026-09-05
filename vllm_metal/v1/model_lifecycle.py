@@ -14,6 +14,7 @@ from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.families.bailing import build_bailing_hybrid_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.compat import apply_compat_patches
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
@@ -224,10 +225,17 @@ class ModelLifecycle:
             gguf_source=request.gguf_source,
             lazy_weights=request.lazy_weights,
         )
+        model_args = self._extract_model_args(model, request.is_vlm)
+        if request.hf_config is not None:
+            architectures = self._config_to_mapping(request.hf_config).get(
+                "architectures"
+            )
+            if architectures is not None:
+                model_args.setdefault("architectures", architectures)
         return LoadedGenerationModel(
             model=model,
             tokenizer=tokenizer,
-            model_args=self._extract_model_args(model, request.is_vlm),
+            model_args=model_args,
         )
 
     def _install_encoder_pooling_model(
@@ -494,9 +502,12 @@ class ModelLifecycle:
     def _install_hybrid_state_plan(self, args: dict[str, Any]) -> None:
         """Resolve the state family that owns this model's hybrid layers."""
         if self._runner.is_hybrid:
-            self._runner.hybrid_runtime_plan = build_gdn_hybrid_plan(
-                args, self._runner.num_layers
+            build_plan = (
+                build_bailing_hybrid_plan
+                if self._runner.is_bailing_v3
+                else build_gdn_hybrid_plan
             )
+            self._runner.hybrid_runtime_plan = build_plan(args, self._runner.num_layers)
 
     def _install_runtime_extensions(
         self,

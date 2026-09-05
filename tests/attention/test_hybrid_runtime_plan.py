@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract tests for the hybrid runtime plan and its GDN family owner."""
+"""Contract tests for the hybrid runtime plan and its state-family owners."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from tests.stub_runner import make_gdn_hybrid_plan
+from tests.stub_runner import make_bailing_hybrid_plan, make_gdn_hybrid_plan
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
@@ -151,6 +151,28 @@ class TestGdnPlanRejection:
         with pytest.raises(ValueError) as excinfo:
             build_gdn_hybrid_plan(args, num_layers)
         assert str(excinfo.value) == expected
+
+
+class TestBailingPlan:
+    def test_incomplete_tail_uses_mla(self) -> None:
+        plan = make_bailing_hybrid_plan(5)
+
+        assert plan.layers.attention_indices == (1, 3, 4)
+        assert plan.layers.state_indices == (0, 2)
+
+    @pytest.mark.parametrize(
+        ("name", "value", "error"),
+        [
+            ("short_conv_kernel_size", None, ValueError),
+            ("no_kda_lora", False, NotImplementedError),
+            ("kda_safe_gate", False, NotImplementedError),
+        ],
+    )
+    def test_unsupported_config_rejects_at_the_family_boundary(
+        self, name: str, value: object, error: type[Exception]
+    ) -> None:
+        with pytest.raises(error, match=name):
+            make_bailing_hybrid_plan(4, **{name: value})
 
 
 class TestStateCacheSpec:

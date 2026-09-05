@@ -64,6 +64,27 @@ def _text_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**(_TEXT_MODEL_ARGS | overrides))
 
 
+def _bailing_v3_args(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "model_type": "bailing_hybrid",
+        "architectures": ["BailingMoeV3ForCausalLM"],
+        "vocab_size": 157184,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 16,
+        "hidden_size": 1536,
+        "head_dim": 128,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_group_size": 4,
+        "short_conv_kernel_size": 4,
+        "no_kda_lora": True,
+        "kda_safe_gate": True,
+    }
+    values.update(overrides)
+    return values
+
+
 class _Qwen35LanguageModelStub:
     """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
 
@@ -580,6 +601,33 @@ class TestModelLifecycle:
         assert runner.model_args["vocab_size"] == 32000
         assert runner.hidden_size == 4096
         assert runner.kv_cache_dtype is not None
+
+    def test_load_preserves_hf_architectures_for_bailing_v3_detection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        args = _bailing_v3_args()
+        args.pop("architectures")
+        fake_model = SimpleNamespace(args=SimpleNamespace(**args))
+        _stub_generation_model(
+            monkeypatch,
+            config=SimpleNamespace(**args),
+            model=fake_model,
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="bailing_hybrid",
+                    architectures=["BailingMoeV3ForCausalLM"],
+                )
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["architectures"] == ["BailingMoeV3ForCausalLM"]
+        assert runner.is_bailing_v3
+        assert runner.is_hybrid
 
     def test_load_wires_gemma4_mtp_assistant_after_target_dims(
         self,
@@ -1111,6 +1159,31 @@ class TestResolveModelDims:
         assert runner.num_kv_heads == 1
         assert runner.head_dim == expected_head_dim
         assert runner.mla_latent_dim == expected_head_dim
+
+    def test_bailing_v3_sets_mla_and_kda_cache_dims(self) -> None:
+        runner = self._resolve(_bailing_v3_args())
+
+        assert runner.is_bailing_v3
+        assert runner.is_hybrid
+        assert runner.is_mla
+        assert runner.num_kv_heads == 1
+        assert runner.head_dim == 576
+        plan = runner.hybrid_runtime_plan
+        assert plan is not None
+        assert plan.family.label == "kda"
+        assert plan.layers.attention_indices == (3, 7, 11, 15, 19, 23)
+        assert plan.layers.num_state == 18
+        assert plan.geometry.num_v_heads == 16
+        assert plan.geometry.key_head_dim == 128
+        assert plan.geometry.value_head_dim == 128
+        assert plan.geometry.conv_kernel_dim == 4
+        assert plan.geometry.conv_dim == 3 * 16 * 128
+
+    def test_other_bailing_architecture_is_not_classified_as_v3(self) -> None:
+        _, runner = _make_lifecycle(
+            model_args=_bailing_v3_args(architectures=["BailingMoeV2_5ForCausalLM"])
+        )
+        assert not runner.is_bailing_v3
 
     def test_missing_dims_raise(self) -> None:
         lifecycle, _ = _make_lifecycle(model_args={"num_hidden_layers": 32})

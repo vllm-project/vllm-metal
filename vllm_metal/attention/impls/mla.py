@@ -64,12 +64,47 @@ class MLAPagedAttentionWrapper(nn.Module):
                 self, "_apply_mla_attention", self._apply_kv_b_proj_attention
             )
 
+    def rebind_cache(
+        self, latent_cache: MLAPagedLatentCache, *, cache_idx: int
+    ) -> None:
+        """Refresh the latent cache and compact layer index for model reuse."""
+        object.__setattr__(self, "_mla_layer_idx", cache_idx)
+        object.__setattr__(self, "_mla_latent_cache", latent_cache)
+
     def _attention_scale(self) -> float:
         inner = self._inner
         scale = getattr(inner, "scale", None)
         if scale is None:
             scale = inner.softmax_scale
         return scale
+
+    def _q_head_dim(self) -> int:
+        inner = self._inner
+        q_head_dim = getattr(inner, "q_head_dim", None)
+        if q_head_dim is None:
+            q_head_dim = inner.qk_head_dim
+        return int(q_head_dim)
+
+    def _project_output(self, x: mx.array, output: mx.array) -> mx.array:
+        """Apply the model-specific MLA gate and output projection."""
+        inner = self._inner
+        if hasattr(inner, "o_proj"):
+            return inner.o_proj(output)
+        if not hasattr(inner, "dense") or not hasattr(inner, "g_proj"):
+            raise RuntimeError(
+                f"Unsupported MLA output projection for {type(inner).__name__}"
+            )
+
+        batch, length, _ = output.shape
+        output = output.reshape(batch, length, inner.num_heads, inner.v_head_dim)
+        gate = mx.sigmoid(inner.g_proj(x).astype(mx.float32)).astype(output.dtype)
+        if gate.shape[-1] != inner.num_heads:
+            raise RuntimeError(
+                f"Unsupported MLA gate width {gate.shape[-1]} for "
+                f"{type(inner).__name__}; expected {inner.num_heads}"
+            )
+        output = output * gate[..., None]
+        return inner.dense(output.reshape(batch, length, -1))
 
     @staticmethod
     def _causal_valid_mask(
@@ -355,7 +390,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             q = inner.q_proj(x)
         else:
             q = inner.q_b_proj(inner.q_a_layernorm(inner.q_a_proj(x)))
-        q = q.reshape(1, seq_len, inner.num_heads, inner.q_head_dim).transpose(
+        q = q.reshape(1, seq_len, inner.num_heads, self._q_head_dim()).transpose(
             0, 2, 1, 3
         )
         q_nope, q_pe = mx.split(q, [inner.qk_nope_head_dim], axis=-1)
@@ -412,7 +447,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             # and the live graph across all-prefill steps). Schedule it now so it
             # lands during prefill, overlapped with the rest of the forward.
             mx.async_eval(latent_cache.latent_caches[layer_idx])
-            return inner.o_proj(final)
+            return self._project_output(x, final)
 
         # Env-gated single-pass Metal kernel fast path. Falls through
         # to the per-request MLX SDPA loop below when the gate rejects
@@ -422,7 +457,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             final = self._kernel_fast_path_single_pass(
                 inner, latent_cache, layer_idx, q_nope, q_pe, ctx, seq_len
             )
-            return inner.o_proj(final)
+            return self._project_output(x, final)
 
         # Pre-convert block tables once to avoid a new mx.array allocation per request
         block_tables_mx = [mx.array(bt, dtype=mx.int32) for bt in ctx.block_tables]
@@ -465,4 +500,4 @@ class MLAPagedAttentionWrapper(nn.Module):
             outputs.append(out)
 
         final = mx.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
-        return inner.o_proj(final)
+        return self._project_output(x, final)
