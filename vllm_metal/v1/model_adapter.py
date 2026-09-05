@@ -721,7 +721,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 types surface loudly here instead of silently falling back
                 to full-attention shapes.
         """
-        layer_types = args.get("layer_types", [])
+        layer_types = args.get("layer_types") or []
         global_head_dim = args.get("global_head_dim")
         if len(layer_types) != num_layers or not global_head_dim:
             return None

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 class HybridGDNStateManager:
     """Own request-to-slot lifecycle for one hybrid runtime."""
 
-    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+    def __init__(self, state_cache: PagedStateCache) -> None:
         self._state_cache = state_cache
         self._req_to_slot: dict[str, int] = {}
         self._free_slots: list[int] = []

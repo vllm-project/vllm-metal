@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 class AlignGDNStateManager:
     """Drive block-indexed GDN state for align-mode prefix caching."""
 
-    def __init__(self, state_cache: GDNPagedStateCache, block_size: int) -> None:
+    def __init__(self, state_cache: PagedStateCache, block_size: int) -> None:
         self._state_cache = state_cache
         self._block_size = block_size
         self._needs_materialize = False

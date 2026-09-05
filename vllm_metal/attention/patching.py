@@ -37,8 +37,9 @@ def find_layers(model: Any) -> list[Any]:
         )
 
 
-# Attribute names to probe on each layer, in priority order.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention")
+# Attribute names to probe on each layer, in priority order. LFM2 uses
+# ``conv`` for its ShortConv layers, which have no attention submodule.
+_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv")
 
 
 def find_attn_attr(layer: Any) -> str | None:

@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention runtime for hybrid models (SDPA + linear attention).
+"""Paged SDPA and state-family execution for hybrid models.
 
-Handles models like Qwen3.5 where some layers use standard dot-product
-attention (paged KV cache) and others use GDN linear attention (fixed-size
-recurrent state).
-
-SDPA layers use the native Metal SDPA kernel (same as ``MHAPagedAttentionRuntime``).
-GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
+The family plan supplies layer roles, state geometry, allocation and wrappers.
+The runtime pairs its state cache with paged KV and the none/align lifecycle.
 """
 
 from __future__ import annotations
@@ -18,8 +14,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import (
@@ -34,11 +30,7 @@ logger = init_logger(__name__)
 
 
 class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention runtime for hybrid SDPA + linear attention models.
-
-    SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
-    GDN layers: MLX-native state management (via GDNPagedAttentionWrapper)
-    """
+    """Execute attention and state layers through their registered wrappers."""
 
     def __init__(
         self,
@@ -81,7 +73,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._v_quant = v_quant
 
         self._cache = None
-        self._state_cache: GDNPagedStateCache | None = None
+        self._state_cache: PagedStateCache | None = None
         self._gdn_state_manager: HybridGDNStateManager | AlignGDNStateManager | None = (
             None
         )
@@ -113,15 +105,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         # None mode keeps one slab per resident request and grows on demand.
         align = self._mamba_cache_mode == "align"
         state_slots = num_blocks if align else self._max_num_seqs
-        state_geometry = self._hybrid_plan.geometry
-        self._state_cache = GDNPagedStateCache(
+        self._state_cache = self._hybrid_plan.family.create_state_cache(
+            geometry=self._hybrid_plan.geometry,
             num_layers=self._hybrid_plan.layers.num_state,
             max_seqs=state_slots,
-            conv_kernel_dim=state_geometry.conv_kernel_dim,
-            conv_dim=state_geometry.conv_dim,
-            num_v_heads=state_geometry.num_v_heads,
-            value_head_dim=state_geometry.value_head_dim,
-            key_head_dim=state_geometry.key_head_dim,
             initial_seqs=0,
             dtype=self._dtype,
         )
@@ -133,10 +120,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d linear layers (%d/%d GDN slots allocated, mamba_cache_mode=%s)",
+            "%d %s layers (%d/%d state slots allocated, mamba_cache_mode=%s)",
             self._hybrid_plan.layers.num_attention,
             num_blocks,
             self._hybrid_plan.layers.num_state,
+            self._hybrid_plan.family.label,
             self._state_cache.allocated_seqs,
             self._state_cache.max_seqs,
             self._mamba_cache_mode,
@@ -230,7 +218,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._require_initialized("kv_cache")
 
     @property
-    def state_cache(self) -> GDNPagedStateCache:
+    def state_cache(self) -> PagedStateCache:
         if self._state_cache is None:
             raise RuntimeError("state_cache accessed before initialize()")
         return self._state_cache
