@@ -11,9 +11,6 @@ import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
-from vllm_metal.attention.runtime.families.nemotron_h import (
-    build_nemotron_h_hybrid_plan,
-)
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -296,7 +293,7 @@ def make_gdn_hybrid_plan(
 
 
 def make_nemotron_hybrid_plan(pattern: str) -> HybridRuntimePlan:
-    """Build a Nemotron-H plan for ``pattern`` at the tiny test geometry."""
-    return build_nemotron_h_hybrid_plan(
+    """Build a Nemotron-H plan for ``pattern`` through the family table."""
+    return build_hybrid_runtime_plan(
         {**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": pattern}, len(pattern)
     )
