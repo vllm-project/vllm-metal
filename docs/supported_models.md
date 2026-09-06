@@ -55,8 +55,11 @@ Native multimodal support currently targets image-only vision-language requests 
 models reuse shared prefixes by default. As of vLLM 0.28.0, hybrid/Mamba
 models do too; hybrid GDN support remains experimental (`🔵`). Nemotron-H keeps
 one private Mamba-2 state slot per request, so prefix caching is downgraded to
-off for it. These values describe default engine behavior, not exhaustive
-per-model benchmarking on Metal.
+off for it and the decode pipeline stays off; only the mlx-community Nemotron
+3.5 Lightning MLX checkpoints load, since mlx-lm does not read
+`attention_head_dim` from the `nvidia/Nemotron-H-*` configs yet. These values
+describe default engine behavior, not exhaustive per-model benchmarking on
+Metal.
 
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
