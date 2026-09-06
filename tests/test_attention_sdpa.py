@@ -618,8 +618,9 @@ class _PagedRoutingOpsSpy:
         _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
+        **_kwargs,
     ) -> None:
-        del window_seqlen_q, sinks
+        del window_seqlen_q, sinks, _kwargs
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
 

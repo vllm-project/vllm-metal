@@ -91,11 +91,10 @@ class PagedAttentionContext:
     # legacy single-group path.
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
     # Kernel-format metadata memo, keyed by (KV group index, cache block
-    # size) — or ("native_decode", group, block size) for the decode
-    # fast-path dispatch plan.  The context lives for exactly one forward
-    # pass, so entries never go stale; every layer of a group reuses the
-    # first layer's conversion instead of re-serializing the Python lists
-    # above (see ``impls.sdpa._kernel_metadata``).
+    # size).  The context lives for exactly one forward pass, so entries
+    # never go stale; every layer of a group reuses the first layer's
+    # conversion instead of re-serializing the Python lists above (see
+    # ``impls.sdpa._kernel_metadata``).
     kernel_metadata_cache: dict[tuple, Any] = field(default_factory=dict)
 
 

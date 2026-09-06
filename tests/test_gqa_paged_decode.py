@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """GQA-shared flash-decode pass inside ``paged_attention_primitive``.
 
-Eligible long single-sequence decode (no TQ/sinks/softcap/window, head size
-in {64,96,128,256}, GQA group <= 8, context >= ``GQA_DECODE_MIN_SEQ_LEN``)
-is dispatched to ``paged_attention_gqa_decode`` and merged by the existing
-``paged_attention_v2_reduce``.  Shorter contexts, multi-sequence batches,
-and spec-decode verify windows stay on the established per-token / split-KV
-family — a different kernel family would break
-``tests/test_spec_window_parity.py`` bitwise identity.
+Eligible pure-decode batches (no TQ/sinks/softcap/window, head size in
+{64,96,128,256}, GQA group <= 8, ``window_seqlen_q <= 1``, aggregate KV
+``num_seqs * max_seq_len >= GQA_DECODE_MIN_SEQ_LEN``) dispatch to
+``paged_attention_gqa_decode`` and merge through ``paged_attention_v2_reduce``.
+Spec-decode verify windows pass ``window_seqlen_q = K+1`` and stay on the
+established family so ``tests/test_spec_window_parity.py`` stays bitwise.
 
 These tests drive the shipped primitive (not a reimplementation) against
 ``ref_paged_attn``.
@@ -61,6 +60,7 @@ def _run_primitive(
     seed: int,
     window_seqlen_q: int = 1,
     query_lens: list[int] | None = None,
+    num_decode_requests: int = -1,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -72,11 +72,13 @@ def _run_primitive(
     n_blocks_needed = (max_kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     tables = []
     max_blk = 0
-    for _ in range(num_seqs):
+    # Offset each sequence's pages so multi-seq batches do not alias.
+    page_stride = n_blocks_needed * 3
+    for s in range(num_seqs):
         if interleaved:
-            table = _interleaved_table(n_blocks_needed)
+            table = [b + s * page_stride for b in _interleaved_table(n_blocks_needed)]
         else:
-            table = list(range(n_blocks_needed))
+            table = list(range(s * n_blocks_needed, (s + 1) * n_blocks_needed))
         tables.append(table)
         max_blk = max(max_blk, max(table))
     num_cache_blocks = max_blk + 4
@@ -114,6 +116,7 @@ def _run_primitive(
         -1,
         out,
         window_seqlen_q=window_seqlen_q,
+        num_decode_requests=num_decode_requests,
     )
     mx.eval(out)
     ref = ref_paged_attn(
@@ -160,10 +163,7 @@ def test_gqa_decode_matches_reference(
 
 
 def test_below_crossover_stays_on_split_kv() -> None:
-    """Contexts under GQA_DECODE_MIN_SEQ_LEN must not take the new pass.
-
-    They still match the reference via the established split-KV kernel.
-    """
+    """A single sequence under GQA_DECODE_MIN_SEQ_LEN stays on split-KV."""
     ops = get_ops()
     kv_len = ops.GQA_DECODE_MIN_SEQ_LEN - 1
     assert kv_len > ops.PARTITION_SIZE
@@ -172,21 +172,35 @@ def test_below_crossover_stays_on_split_kv() -> None:
     _assert_close(out, ref, mx.float16)
 
 
-def test_multi_seq_does_not_switch_kernel_family() -> None:
-    """Two long sequences stay on split-KV (GQA-decode is single-seq only).
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_multi_seq_gqa_decode_matches_reference(dtype: mx.Dtype) -> None:
+    """True multi-seq decode (window_seqlen_q=1) takes GQA-decode.
 
-    A multi-sequence decode batch is indistinguishable from an expanded
-    spec-decode verify window; switching family would break bitwise parity.
+    Aggregate KV ``num_seqs * max_seq_len`` meets the 16k budget with two
+    8k+ sequences, which a single 8k sequence would miss.
     """
     ops = get_ops()
-    kv_lens = [ops.GQA_DECODE_MIN_SEQ_LEN, ops.GQA_DECODE_MIN_SEQ_LEN + 64]
+    half = ops.GQA_DECODE_MIN_SEQ_LEN // 2
+    kv_lens = [half, half + 64]
+    assert len(kv_lens) * max(kv_lens) >= ops.GQA_DECODE_MIN_SEQ_LEN
     assert NUM_QUERY_HEADS * len(kv_lens) < ops.min_decode_grid()
-    out, ref = _run_primitive(kv_lens, mx.float16, interleaved=True, seed=2)
-    _assert_close(out, ref, mx.float16)
+    out, ref = _run_primitive(
+        kv_lens,
+        dtype,
+        interleaved=True,
+        seed=2,
+        num_decode_requests=len(kv_lens),
+    )
+    _assert_close(out, ref, dtype)
 
 
 def test_spec_window_does_not_switch_kernel_family() -> None:
-    """A K+1 verify window on a long context stays on the window/split path."""
+    """A K+1 verify window on a long context stays on the window/split path.
+
+    Production expanded verify windows pass window_seqlen_q=K+1 even when
+    packed as length-1 segments; this keeps them off GQA-decode so they
+    stay bitwise with the windowed dispatch.
+    """
     ops = get_ops()
     ctx = ops.GQA_DECODE_MIN_SEQ_LEN
     window = 4

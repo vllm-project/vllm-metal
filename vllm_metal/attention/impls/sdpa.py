@@ -778,46 +778,27 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
+            num_decode_requests=ctx.num_decode_requests,
         )
     else:
-        try:
-            fast_out = _native_sdpa_decode_fast_path(
-                q_3d,
-                kernel_k_cache,
-                kernel_v_cache,
-                ctx,
-                None if ctx.kv_groups is None else group_index,
-                raw_block_tables,
-                cache_block_size,
-                cache_kv_heads,
-                attn_scale,
-                attn_softcap,
-                layer_sliding_window,
-                sinks,
-                getattr(ctx, "verify_window_q", None),
-            )
-        except Exception:  # noqa: BLE001 - fall back to the paged kernel
-            fast_out = None
-        if fast_out is not None:
-            out = fast_out
-        else:
-            ops.paged_attention_primitive(
-                q_3d,
-                kernel_k_cache,
-                kernel_v_cache,
-                cache_kv_heads,
-                attn_scale,
-                attn_softcap,
-                block_tables,
-                seq_lens,
-                cu_seqlens_q,
-                kernel_block_size,
-                max_seq_len,
-                layer_sliding_window,
-                out,
-                window_seqlen_q=ctx.verify_window_q,
-                sinks=sinks,
-            )
+        ops.paged_attention_primitive(
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            cache_kv_heads,
+            attn_scale,
+            attn_softcap,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            kernel_block_size,
+            max_seq_len,
+            layer_sliding_window,
+            out,
+            window_seqlen_q=ctx.verify_window_q,
+            sinks=sinks,
+            num_decode_requests=ctx.num_decode_requests,
+        )
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
@@ -825,150 +806,6 @@ def sdpa_forward(
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
     return inner.o_proj(out), kv_for_sharing
-
-
-# ---------------------------------------------------------------------------
-# Native-SDPA decode fast path (contiguous single-sequence runs only)
-# ---------------------------------------------------------------------------
-
-_NATIVE_FP_STATS = {"hit": 0, "miss": {}}
-
-
-def _native_fp_miss(reason: str) -> None:
-    _NATIVE_FP_STATS["miss"][reason] = _NATIVE_FP_STATS["miss"].get(reason, 0) + 1
-
-
-@dataclass(frozen=True, eq=False)
-class _NativeDecodePlan:
-    """Per-forward dispatch decision for the native decode fast path.
-
-    The block table and context length only change between forward steps, so
-    the contiguity scan runs once per step (on the first attention layer)
-    and is memoized on the paged context — the per-layer hot path is a dict
-    lookup instead of an O(blocks) list compare. ``eq=False``: identity
-    comparison only (the default ``__eq__`` would compare mx arrays, which
-    raises on ``bool()``).
-    """
-
-    seq: int  # context length of the single sequence (includes current token)
-    n_blocks: int  # blocks covered by the sequence's run
-    contig_first: int  # first physical block when the run is contiguous, else -1
-
-
-def _native_decode_plan(
-    ctx: PagedAttentionContext,
-    group_index: int | None,
-    raw_block_tables: list[list[int]],
-    cache_block_size: int,
-) -> _NativeDecodePlan:
-    key = ("native_decode", group_index, cache_block_size)
-    plan = ctx.kernel_metadata_cache.get(key)
-    if plan is None:
-        seq = ctx.context_lens[0]
-        table = raw_block_tables[0]
-        n_blocks = (seq + cache_block_size - 1) // cache_block_size
-        contig_first = -1
-        if n_blocks <= len(table):
-            first = table[0]
-            if table[:n_blocks] == list(range(first, first + n_blocks)):
-                contig_first = first
-        plan = _NativeDecodePlan(seq, n_blocks, contig_first)
-        ctx.kernel_metadata_cache[key] = plan
-    return plan
-
-
-def _native_sdpa_decode_fast_path(
-    q_3d,
-    k_cache,
-    v_cache,
-    ctx: PagedAttentionContext,
-    group_index: int | None,
-    raw_block_tables,
-    cache_block_size,
-    cache_kv_heads,
-    attn_scale,
-    attn_softcap,
-    layer_sliding_window,
-    sinks,
-    verify_window_q,
-):
-    """Zero-copy MLX-native SDPA path for single-sequence decode steps.
-
-    When one sequence's vLLM blocks are physically contiguous in the paged
-    cache (the common single-request decode case), its KV is a dense slice of
-    the flattened cache, so ``mx.fast.scaled_dot_product_attention`` can read
-    it through strided views with no gather/copy. The native kernel's KV-scan
-    bandwidth (~200 GB/s on M5 Pro) is several times the paged Metal
-    kernel's at long contexts, which dominates single-stream decode.
-
-    Non-contiguous runs (hybrid GDN interleave, prefix-cache restores) and
-    every ineligible shape return ``None`` so ``sdpa_forward`` falls through
-    to ``paged_attention_primitive``.  Eligible long single-sequence decode
-    is handled there by the precompiled GQA-shared flash-decode pass; shorter
-    contexts and multi-sequence / windowed batches keep the established
-    per-token and split-KV kernels.
-
-    The contiguity scan is memoized per forward step on the paged context
-    (see :func:`_native_decode_plan`), so the hot path adds no GPU
-    synchronisation and no per-layer Python rescans.
-
-    Returns the attention output ``(L, heads, cache_head_dim)`` or ``None``
-    when the fast path does not apply (falls back to the paged kernel).
-    """
-    from vllm_metal import envs
-
-    if not envs.VLLM_METAL_NATIVE_SDPA_DECODE:
-        return None
-    if (
-        q_3d.shape[0] != 1  # decode single token
-        or len(ctx.context_lens) != 1  # single sequence in the batch
-        or attn_softcap  # softcap unsupported on the native path
-        or sinks is not None
-        # No-window layers use the sentinel -1 (see kv_cache.py); only a real
-        # positive window disqualifies the native path.
-        or (layer_sliding_window or 0) > 0  # windows unsupported
-        # verify_window_q defaults to 1 (one query token per step); values > 1
-        # mean an expanded spec-decode verify window, unsupported here.
-        or (verify_window_q or 1) > 1
-        or q_3d.dtype not in (mx.float16, mx.bfloat16)
-        or q_3d.shape[2] not in (64, 96, 128, 256)  # native kernel widths
-    ):
-        _native_fp_miss("conditions")
-        return None
-
-    heads = q_3d.shape[1]
-    if heads % cache_kv_heads:
-        _native_fp_miss("gqa")
-        return None
-    group = heads // cache_kv_heads
-    dim = q_3d.shape[2]
-
-    plan = _native_decode_plan(ctx, group_index, raw_block_tables, cache_block_size)
-    seq = plan.seq
-
-    if plan.contig_first >= 0:
-        # Contiguous run: zero-copy strided views straight into native SDPA.
-        flat_k = k_cache.reshape(-1, cache_kv_heads, k_cache.shape[-1])
-        flat_v = v_cache.reshape(-1, cache_kv_heads, v_cache.shape[-1])
-        row0 = plan.contig_first * cache_block_size
-        k_view = flat_k[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
-        v_view = flat_v[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
-        q_sdpa = q_3d.reshape(cache_kv_heads, group, 1, dim)
-        out = mx.fast.scaled_dot_product_attention(
-            q_sdpa, k_view, v_view, scale=attn_scale
-        )
-        _NATIVE_FP_STATS["hit_contig"] = _NATIVE_FP_STATS.get("hit_contig", 0) + 1
-        return out.reshape(1, heads, dim)
-
-    # Non-contiguous (or a short table): the precompiled paged kernel owns
-    # this shape.  Eligible long single-seq decode takes the GQA-shared
-    # flash-decode pass inside the primitive; everything else stays on the
-    # established per-token / split-KV path.
-    if plan.n_blocks > len(raw_block_tables[0]):
-        _native_fp_miss("table_short")
-    else:
-        _native_fp_miss("non_contig")
-    return None
 
 
 def apply_g_proj_gate(
