@@ -48,6 +48,7 @@ class _FakeGDN(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.in_proj_qkv = nn.Linear(4, 4)
         self.conv1d = nn.Conv1d(4, 4, 2)
 
 

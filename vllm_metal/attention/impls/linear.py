@@ -29,12 +29,14 @@ _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV = 8
 
 
 def is_linear_attention(module: nn.Module) -> bool:
-    """Return True if *module* is a linear attention layer (e.g. GatedDeltaNet).
+    """Return True for an mlx_lm GatedDeltaNet module (Qwen3.5 family, Qwen3-Next).
 
-    Checks for ``conv1d`` (present in all known GatedDeltaNet variants) and
-    the absence of ``q_proj`` (which would indicate SDPA).
+    Matches the projection layout the wrapper dispatches on, so Mamba-2 mixers
+    (``in_proj`` + ``conv1d``) are not mistaken for GDN.
     """
-    return hasattr(module, "conv1d") and not hasattr(module, "q_proj")
+    return hasattr(module, "conv1d") and (
+        hasattr(module, "in_proj_qkv") or hasattr(module, "in_proj_qkvz")
+    )
 
 
 @dataclass(frozen=True)
