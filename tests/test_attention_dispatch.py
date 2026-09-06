@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from vllm_metal.attention.impls.linear import is_linear_attention
+from vllm_metal.attention.impls.mamba2 import is_mamba2_mixer
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.patching import find_attn_attr, find_layers
 
@@ -90,6 +91,7 @@ def test_qwen35_linear_layer_detected():
 
     assert find_attn_attr(layer) == "linear_attn"
     assert is_linear_attention(layer.linear_attn)
+    assert not is_mamba2_mixer(layer.linear_attn)
     assert not is_sdpa(layer.linear_attn)
 
 
@@ -123,6 +125,7 @@ def test_nemotron_h_mamba2_mixer_is_not_gdn():
 
     mixer = NemotronHMamba2Mixer(ModelArgs(**_NEMOTRON_H_ARGS_KWARGS))
 
+    assert is_mamba2_mixer(mixer)
     assert not is_linear_attention(mixer)
     assert not is_sdpa(mixer)
 
