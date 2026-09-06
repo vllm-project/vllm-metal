@@ -12,9 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from mlx_lm.models.nemotron_h import Model as NemotronHModel
+from mlx_lm.models.nemotron_h import ModelArgs as NemotronHModelArgs
 
 import vllm_metal.envs as envs
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.distributed.pipeline import PipelineGroup
@@ -1184,6 +1186,34 @@ class TestResolveModelDims:
         with pytest.raises(NotImplementedError, match="model_type='jamba'"):
             lifecycle.resolve_model_dims()
         assert runner.hybrid_runtime_plan is None
+
+    def test_nemotron_pattern_resolves_from_layers_block_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The published checkpoint config carries layers_block_type only;
+        # mlx-lm resolves hybrid_override_pattern on the built args.
+        raw_args = {
+            k: v
+            for k, v in NEMOTRON_H_TINY_ARGS.items()
+            if k != "hybrid_override_pattern"
+        }
+        raw_args["layers_block_type"] = ["mamba", "mlp", "attention", "mamba"]
+        raw_args["num_hidden_layers"] = 4
+        model = NemotronHModel(NemotronHModelArgs(**raw_args))
+        _stub_generation_model(monkeypatch, config=None, model=model)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.hybrid_runtime_plan.family.label == "nemotron_h"
+        assert runner.hybrid_runtime_plan.layers.layer_roles == (
+            "state",
+            "stateless",
+            "attention",
+            "state",
+        )
 
     def test_nemotron_model_installs_its_family_plan(self) -> None:
         runner = self._resolve(_NEMOTRON_H_ARGS, is_hybrid=True)
