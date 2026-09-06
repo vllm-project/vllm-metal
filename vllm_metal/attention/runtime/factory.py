@@ -26,9 +26,6 @@ class StateFamilyPlanBuilder:
     family: StateFamilySpec
     build: Callable[[Mapping[str, Any], int], HybridRuntimePlan]
 
-    def supports(self, model_args: Mapping[str, Any]) -> bool:
-        return model_args.get("model_type") in self.model_types
-
 
 _STATE_FAMILY_PLAN_BUILDERS = (
     # ``ModelConfig.is_hybrid`` only says a model mixes attention and state
@@ -46,14 +43,22 @@ _STATE_FAMILY_PLAN_BUILDERS = (
 )
 
 
+def _builder_for_model_type(model_type: object) -> StateFamilyPlanBuilder:
+    for builder in _STATE_FAMILY_PLAN_BUILDERS:
+        if model_type in builder.model_types:
+            return builder
+    raise NotImplementedError(
+        f"Metal hybrid runtime has no state family for model_type={model_type!r}."
+    )
+
+
+def state_family_for_model_type(model_type: str) -> StateFamilySpec:
+    """Return the family owning ``model_type`` before any model is built."""
+    return _builder_for_model_type(model_type).family
+
+
 def build_hybrid_runtime_plan(
     model_args: Mapping[str, Any], num_layers: int
 ) -> HybridRuntimePlan:
-    for builder in _STATE_FAMILY_PLAN_BUILDERS:
-        if builder.supports(model_args):
-            return builder.build(model_args, num_layers)
-
-    raise NotImplementedError(
-        f"Metal hybrid runtime has no state family for "
-        f"model_type={model_args.get('model_type')!r}."
-    )
+    builder = _builder_for_model_type(model_args["model_type"])
+    return builder.build(model_args, num_layers)
