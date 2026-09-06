@@ -18,6 +18,7 @@ class AttentionContract:
 
     qk_norm_placement: QKNormPlacement = QKNormPlacement.BEFORE_ROPE
     derive_scale_from_query: bool = False
+    use_rope: bool = True
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
@@ -26,6 +27,8 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
     "mlx_lm.models.stablelm": AttentionContract(derive_scale_from_query=True),
+    # Nemotron-H attention is position-free: no rotary module, none expected.
+    "mlx_lm.models.nemotron_h": AttentionContract(use_rope=False),
 }
 
 

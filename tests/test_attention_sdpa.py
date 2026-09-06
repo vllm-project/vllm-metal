@@ -21,7 +21,10 @@ import mlx.nn as nn
 import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
-from vllm_metal.attention.attention_contracts import attention_contract_for
+from vllm_metal.attention.attention_contracts import (
+    AttentionContract,
+    attention_contract_for,
+)
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.mha_layout import (
     MHAKVCacheLayout,
@@ -548,6 +551,48 @@ class TestPrepareSDPAQKV:
                 _N_KV_HEADS,
                 shared_kv=(shared_k, shared_v),
             )
+
+    def test_contract_without_rope_keeps_projections_unrotated(self) -> None:
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+        expected_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+
+        queries, keys, _, _, _ = prepare_sdpa_qkv(
+            inner,
+            x,
+            ctx,
+            _N_HEADS,
+            _N_KV_HEADS,
+            attention_contract=AttentionContract(use_rope=False),
+        )
+
+        assert mx.array_equal(queries, expected_q)
+        assert mx.array_equal(keys, expected_k)
+
+    def test_contract_without_rope_covers_the_shared_kv_path(self) -> None:
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        shared_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+        shared_v = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+
+        queries, keys, _, _, _ = prepare_sdpa_qkv(
+            inner,
+            x,
+            ctx,
+            _N_HEADS,
+            _N_KV_HEADS,
+            shared_kv=(shared_k, shared_v),
+            attention_contract=AttentionContract(use_rope=False),
+        )
+
+        assert mx.array_equal(queries, expected_q)
+        assert mx.array_equal(keys, shared_k)
 
     def test_precomputed_rope_path_does_not_require_rope_attribute(self) -> None:
         # Arrange — some VLMs precompute ``(cos, sin)`` at the model level

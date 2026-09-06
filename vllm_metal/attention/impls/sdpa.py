@@ -376,6 +376,7 @@ def prepare_sdpa_qkv(
             apply_keys=False,
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
+            use_rope=attention_contract.use_rope,
         )
         if norm_placement is QKNormPlacement.AFTER_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm)
@@ -409,6 +410,7 @@ def prepare_sdpa_qkv(
             offsets=ctx.offsets if ctx.offsets else None,
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
+            use_rope=attention_contract.use_rope,
         )
         if norm_placement is QKNormPlacement.AFTER_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
