@@ -283,6 +283,27 @@ class TestHybridPatchModel:
         assert wrapper_before._gdn_state_cache is not runtime_a.state_cache
         assert wrapper_before._gdn_cache_idx == 0
 
+    def test_state_pool_dtype_mismatch_rejects_at_patch_time(self) -> None:
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=_make_tiny_plan(),
+            max_num_seqs=2,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.bfloat16,
+        )
+        runtime.initialize(num_blocks=2)
+        model = _FakeModel("sasa")
+        expected = (
+            "state pool dtype mlx.core.bfloat16 does not match the layer 0 mixer "
+            "dtype mlx.core.float32; pass --dtype matching the checkpoint so "
+            "state and activations keep one dtype."
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            runtime.patch_model(model)
+        assert str(excinfo.value) == expected
+
     def test_unclassifiable_layer_rejects_with_the_family_label(self) -> None:
         runtime = _make_runtime()
         runtime.initialize(num_blocks=2)

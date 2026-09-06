@@ -189,6 +189,15 @@ class GDNPagedStateCache:
 
         self.allocated_seqs = num_seqs
 
+    def require_mixer_dtype(self, mixer_dtype: mx.Dtype, *, layer_idx: int) -> None:
+        """Reject a conv pool whose dtype differs from the mixer feeding it."""
+        if mixer_dtype != self.dtype:
+            raise ValueError(
+                f"state pool dtype {self.dtype} does not match the layer "
+                f"{layer_idx} mixer dtype {mixer_dtype}; pass --dtype matching "
+                "the checkpoint so state and activations keep one dtype."
+            )
+
     def step_slot_ids(
         self, ctx: PagedAttentionContext, cache_idx: int, num_requests: int
     ) -> list[int]:

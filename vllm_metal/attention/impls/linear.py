@@ -116,6 +116,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         state_cache: GDNPagedStateCache,
     ) -> None:
         super().__init__()
+        state_cache.require_mixer_dtype(inner.conv1d.weight.dtype, layer_idx=layer_idx)
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
