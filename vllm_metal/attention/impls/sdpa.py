@@ -90,7 +90,8 @@ def is_sdpa(module: nn.Module) -> bool:
 
     Accepts two contracts:
 
-    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / ``o_proj``, plus
+    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / output projection
+      (``o_proj``, or ``dense`` as in ``mlx_lm.models.phi``), plus
       EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
       The latter admits Gemma4 26B / 31B full-attention layers which
       share the K projection for values and never define ``v_proj``
@@ -110,7 +111,7 @@ def is_sdpa(module: nn.Module) -> bool:
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "o_proj")
+        and _output_projection(module) is not None
         and (hasattr(module, "v_proj") or getattr(module, "use_k_eq_v", False))
     )
 
@@ -233,6 +234,21 @@ def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
         norm = getattr(module, name, None)
         if norm is not None:
             return norm
+    return None
+
+
+def _output_projection(module: nn.Module) -> nn.Module | None:
+    """Return the attention-output projection on *module*.
+
+    Nearly every mlx_lm SDPA architecture calls it ``o_proj``; Phi-1/1.5
+    (``mlx_lm.models.phi``) spell theirs ``dense``.  Probing by name keeps
+    ``is_sdpa`` and the forward path aligned on the same alias set instead
+    of the forward breaking on architectures that already pass dispatch.
+    """
+    for name in ("o_proj", "dense"):
+        proj = getattr(module, name, None)
+        if proj is not None:
+            return proj
     return None
 
 
@@ -815,7 +831,7 @@ def sdpa_forward(
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
-    return inner.o_proj(out), kv_for_sharing
+    return _output_projection(inner)(out), kv_for_sharing
 
 
 def apply_g_proj_gate(

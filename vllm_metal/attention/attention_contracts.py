@@ -27,6 +27,9 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
     "mlx_lm.models.stablelm": AttentionContract(derive_scale_from_query=True),
+    # Phi computes the standard scale inline in its forward and exposes no
+    # scale attribute, exactly like StableLM.
+    "mlx_lm.models.phi": AttentionContract(derive_scale_from_query=True),
     # Nemotron-H attention is position-free: no rotary module, none expected.
     "mlx_lm.models.nemotron_h": AttentionContract(use_rope=False),
 }

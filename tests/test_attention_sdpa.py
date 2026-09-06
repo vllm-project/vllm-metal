@@ -1219,3 +1219,89 @@ class TestApplyGProjGate:
 
         assert result.shape == out.shape
         assert mx.allclose(result, expected, atol=1e-6).item()
+
+
+class TestPhiAttention:
+    """Phi-1/1.5 (``mlx_lm.models.phi``) reaches the paged kernel.
+
+    The real class spells its output projection ``dense`` (not ``o_proj``)
+    and computes the standard softmax scale inline, so it needs both the
+    dispatch alias and the query-derived-scale contract to serve on the
+    paged path.
+    """
+
+    def test_phi_dispatch_and_derived_scale_reach_kernel(self) -> None:
+        """is_sdpa accepts ``dense`` and the kernel sees head_dim**-0.5."""
+        from mlx_lm.models.phi import ModelArgs, PhiAttention
+
+        n_heads, n_kv_heads, head_dim = 4, 2, 16
+        hidden = n_heads * head_dim
+        inner = PhiAttention(
+            ModelArgs(
+                model_type="phi",
+                vocab_size=32,
+                hidden_size=hidden,
+                num_attention_heads=n_heads,
+                num_hidden_layers=1,
+                num_key_value_heads=n_kv_heads,
+                partial_rotary_factor=0.5,
+                intermediate_size=16,
+            )
+        )
+
+        assert sdpa_mod.is_sdpa(inner)
+
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, hidden))
+
+        queries = mx.ones((_BATCH, n_heads, _SEQ_LEN, head_dim))
+        keys = mx.ones((_BATCH, n_kv_heads, _SEQ_LEN, head_dim))
+        values = mx.ones((_BATCH, n_kv_heads, _SEQ_LEN, head_dim))
+        kv_for_sharing = (keys, values)
+
+        captured: dict[str, float] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self, _key, _value, key_cache, value_cache, _slot_mapping
+            ):
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self, _query, _key_cache, _value_cache, _num_kv_heads, scale, *_a, **_k
+            ):
+                captured["scale"] = scale
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, kv_for_sharing),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, hidden)),
+            ),
+        ):
+            out = sdpa_forward(
+                inner,
+                x,
+                ctx,
+                cache,
+                layer_idx=0,
+                attention_contract=attention_contract_for(inner),
+            )
+
+        assert captured["scale"] == pytest.approx(head_dim**-0.5)
+        # The output ran through PhiAttention.dense, not a missing o_proj.
+        assert out is not None
