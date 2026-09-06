@@ -53,17 +53,17 @@ llm.start_profile(profile_prefix="my_run")  # → start_capture
 out = llm.generate(["Hello"], SamplingParams(max_tokens=8))
 llm.stop_profile()  # → stop_capture
 
-# Trace lands at /tmp/metal-trace/my_run_dp0_pp0_tp0.gputrace
+# The log reports the full path under /tmp/metal-trace/my_run_*.gputrace.
 ```
 
-The trace filename is `<prefix>_dp<X>_pp<Y>_tp<Z>.gputrace` (data-, pipeline-, tensor-parallel ranks). On a single Apple Silicon device this resolves to `<prefix>_dp0_pp0_tp0.gputrace`.
+The trace filename includes the optional prefix, vLLM's worker-rank suffix, and a unique capture ID: `<prefix>_<worker-ranks>_<capture-id>.gputrace`. Each start/stop cycle writes a separate bundle, including when a worker is restarted with the same prefix and output directory. The full path is logged when capture starts.
 
 ## Opening and Reading the Trace
 
 The `.gputrace` is an Apple bundle (a folder, not a single file). To inspect:
 
 ```bash
-open /tmp/metal-trace/my_run_dp0_pp0_tp0.gputrace
+open /tmp/metal-trace/my_run_*.gputrace
 ```
 
 This launches Xcode and loads the **GPU Frame Debugger**. Useful views (in the left sidebar):

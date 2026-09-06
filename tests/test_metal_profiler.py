@@ -62,13 +62,23 @@ def test_raises_when_trace_dir_missing(
         MetalProfilerWrapper(cfg, trace_name="run")
 
 
-def test_start_passes_trace_path_to_mlx(
+@pytest.mark.parametrize("new_wrapper", [False, True])
+def test_captures_use_distinct_trace_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    new_wrapper: bool,
 ) -> None:
     monkeypatch.setenv("MTL_CAPTURE_ENABLED", "1")
-    mock_start = MagicMock()
-    monkeypatch.setattr("mlx.core.metal.start_capture", mock_start)
+    captures: list[Path] = []
+
+    def start_capture(path: str) -> None:
+        trace_path = Path(path)
+        # Like Metal, refuse to overwrite an earlier capture.
+        trace_path.mkdir()
+        captures.append(trace_path)
+
+    monkeypatch.setattr("mlx.core.metal.start_capture", start_capture)
+    monkeypatch.setattr("mlx.core.metal.stop_capture", MagicMock())
 
     cfg = ProfilerConfig(
         profiler="torch",
@@ -76,9 +86,20 @@ def test_start_passes_trace_path_to_mlx(
     )
     wrapper = MetalProfilerWrapper(cfg, trace_name="run42")
     wrapper.start()
+    assert wrapper.is_running
+    wrapper.stop()
 
-    expected = str(Path(cfg.torch_profiler_dir) / "run42.gputrace")
-    mock_start.assert_called_once_with(expected)
+    if new_wrapper:
+        wrapper = MetalProfilerWrapper(cfg, trace_name="run42")
+    wrapper.start()
+    assert wrapper.is_running
+    wrapper.stop()
+
+    assert len(captures) == 2
+    for path in captures:
+        assert path.parent == Path(cfg.torch_profiler_dir)
+        assert path.name.startswith("run42_")
+        assert path.suffix == ".gputrace"
 
 
 def test_stop_calls_mlx_stop_capture(

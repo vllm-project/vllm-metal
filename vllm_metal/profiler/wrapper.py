@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import override
+from uuid import uuid4
 
 import mlx.core as mx
 from vllm.config import ProfilerConfig
@@ -37,7 +38,7 @@ logger = init_logger(__name__)
 class MetalProfilerWrapper(WorkerProfiler):
     """Metal frame-capture flavor of vLLM's WorkerProfiler.
 
-    Trace output: ``<profiler_config.torch_profiler_dir>/<trace_name>.gputrace``
+    Trace output: ``<torch_profiler_dir>/<trace_name>_<capture_id>.gputrace``
     """
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
@@ -71,17 +72,17 @@ class MetalProfilerWrapper(WorkerProfiler):
             )
 
         Path(trace_dir).mkdir(parents=True, exist_ok=True)
-        self._trace_path = str(Path(trace_dir) / f"{trace_name}.gputrace")
-
-        logger.info_once(
-            "Metal frame capture enabled. Trace will be saved to %s",
-            self._trace_path,
-            scope="local",
-        )
+        self._trace_prefix = Path(trace_dir) / f"{trace_name}_"
 
     @override
     def _start(self) -> None:
-        mx.metal.start_capture(self._trace_path)
+        # Metal refuses to capture to an existing bundle, including one left
+        # by an earlier start/stop cycle or a previous worker instance.
+        trace_path = f"{self._trace_prefix}{uuid4().hex}.gputrace"
+        mx.metal.start_capture(trace_path)
+        logger.info(
+            "Metal frame capture started. Trace will be saved to %s", trace_path
+        )
 
     @override
     def _stop(self) -> None:
