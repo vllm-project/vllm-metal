@@ -11,7 +11,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
-from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
+from tests.stub_runner import (
+    make_gdn_hybrid_plan,
+    make_nemotron_hybrid_plan,
+    make_stub_runner,
+)
 
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
@@ -102,16 +106,7 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
             is_hybrid=True,
         ),
         num_layers=4,
-        hybrid_runtime_plan=make_gdn_hybrid_plan(
-            4,
-            [2],
-            conv_kernel_dim=4,
-            conv_dim=64,
-            num_v_heads=1,
-            value_head_dim=64,
-            key_head_dim=64,
-            stateless_indices=[1],
-        ),
+        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M"),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,

@@ -8,20 +8,46 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx_lm.models.nemotron_h import (
+    Model,
+    ModelArgs,
+    NemotronHMamba2Mixer,
+    NemotronHMLP,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from tests.stub_runner import make_gdn_hybrid_plan
+from tests.stub_runner import (
+    NEMOTRON_H_TINY_ARGS,
+    make_gdn_hybrid_plan,
+    make_nemotron_hybrid_plan,
+)
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
+from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.attention.runtime.families.nemotron_h import (
+    build_nemotron_h_hybrid_plan,
+)
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
+    STATELESS_LAYER,
     HybridRuntimePlan,
 )
+
+NEMOTRON_H_ARGS = {
+    "model_type": "nemotron_h",
+    "hybrid_override_pattern": ["M", "E", "M", "*", "-", "M"],
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 8,
+    "ssm_state_size": 32,
+    "n_groups": 2,
+    "conv_kernel": 4,
+}
 
 GDN_ARGS = {
     "model_type": "qwen3_5",
@@ -53,12 +79,6 @@ class _FakeGDN(nn.Module):
         self.conv1d = nn.Conv1d(4, 4, 2)
 
 
-class _FakeMLP(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.up_proj = nn.Linear(4, 4)
-
-
 class _Layer(nn.Module):
     def __init__(self, attn: nn.Module, linear: bool) -> None:
         super().__init__()
@@ -87,6 +107,18 @@ def _make_tiny_plan() -> HybridRuntimePlan:
         num_v_heads=1,
         value_head_dim=4,
         key_head_dim=32,
+    )
+
+
+def _make_nemotron_runtime() -> HybridPagedAttentionRuntime:
+    """Four real Nemotron-H blocks (M-*M) on an fp32 pool sized for the tiny args."""
+    return HybridPagedAttentionRuntime(
+        hybrid_plan=make_nemotron_hybrid_plan("M-*M"),
+        max_num_seqs=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=4,
+        dtype=mx.float32,
     )
 
 
@@ -184,21 +216,145 @@ class TestStateFamilyFactory:
             build_hybrid_runtime_plan(args, 8)
         assert str(excinfo.value) == expected
 
-    def test_rejects_args_without_a_state_family(self) -> None:
-        args = {"model_type": "nemotron_h", "num_hidden_layers": 52}
-        expected = (
-            "Metal hybrid runtime has no state family for model_type='nemotron_h'."
-        )
+    def test_routes_nemotron_args_to_the_nemotron_family(self) -> None:
+        plan = build_hybrid_runtime_plan(NEMOTRON_H_ARGS, 6)
 
-        with pytest.raises(NotImplementedError) as excinfo:
-            build_hybrid_runtime_plan(args, 52)
-        assert str(excinfo.value) == expected
+        assert plan.family.label == "nemotron_h"
+        assert plan.layers.layer_roles == (
+            STATE_LAYER,
+            STATELESS_LAYER,
+            STATE_LAYER,
+            ATTENTION_LAYER,
+            STATELESS_LAYER,
+            STATE_LAYER,
+        )
 
     def test_malformed_interval_is_a_gdn_error_not_a_miss(self) -> None:
         args = {**GDN_ARGS, "full_attention_interval": "4"}
 
         with pytest.raises(ValueError, match="must be positive integers"):
             build_hybrid_runtime_plan(args, 8)
+
+
+class TestNemotronHPlanDecision:
+    def test_geometry_packs_x_b_and_c_into_the_conv_stream(self) -> None:
+        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
+
+        # conv_dim = 4*8 + 2*2*32 = 160, hand-written.
+        assert plan.geometry.conv_kernel_dim == 4
+        assert plan.geometry.conv_dim == 160
+        assert plan.geometry.num_v_heads == 4
+        assert plan.geometry.value_head_dim == 8
+        assert plan.geometry.key_head_dim == 32
+
+    def test_string_pattern_reads_as_characters(self) -> None:
+        plan = build_nemotron_h_hybrid_plan(
+            {**NEMOTRON_H_ARGS, "hybrid_override_pattern": "M*E"}, 3
+        )
+
+        assert plan.layers.layer_roles == (
+            STATE_LAYER,
+            ATTENTION_LAYER,
+            STATELESS_LAYER,
+        )
+
+    def test_spec_is_mamba2_typed_with_fp32_state(self) -> None:
+        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
+        expected = MambaSpec(
+            shapes=((3, 160), (4, 8, 32)),
+            dtypes=(torch.bfloat16, torch.float32),
+            block_size=2048,
+            page_size_padded=None,
+            mamba_type=MambaAttentionBackendEnum.MAMBA2,
+            mamba_cache_mode="none",
+        )
+
+        spec = plan.state_cache_spec(
+            conv_dtype=torch.bfloat16,
+            mamba_block_size=2048,
+            page_size_padded=None,
+            mamba_cache_mode="none",
+        )
+
+        assert spec == expected
+
+    def test_geometry_matches_the_built_mixer(self) -> None:
+        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_TINY_ARGS, 2)
+        mixer = NemotronHMamba2Mixer(ModelArgs(**NEMOTRON_H_TINY_ARGS))
+
+        geometry = plan.geometry
+
+        assert geometry.conv_kernel_dim == mixer.conv_kernel_size
+        assert geometry.conv_dim == mixer.conv_dim
+        assert geometry.num_v_heads == mixer.num_heads
+        assert geometry.value_head_dim == mixer.head_dim
+        assert geometry.key_head_dim == mixer.ssm_state_size
+
+    def test_spec_shapes_match_vllm_mamba2_calculator(self) -> None:
+        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
+        expected = MambaStateShapeCalculator.mamba2_state_shape(
+            tp_world_size=1,
+            intermediate_size=32,
+            n_groups=2,
+            num_heads=4,
+            head_dim=8,
+            state_size=32,
+            conv_kernel=4,
+        )
+
+        spec = plan.state_cache_spec(
+            conv_dtype=torch.bfloat16,
+            mamba_block_size=2048,
+            page_size_padded=None,
+            mamba_cache_mode="none",
+        )
+
+        assert spec.shapes == expected
+
+
+class TestNemotronHPlanRejection:
+    @pytest.mark.parametrize("missing", ["hybrid_override_pattern", "n_groups"])
+    def test_omitted_key_rejects_with_the_key_name(self, missing: str) -> None:
+        args = {k: v for k, v in NEMOTRON_H_ARGS.items() if k != missing}
+        expected = f"Nemotron-H hybrid model args are missing required {missing!r}."
+
+        with pytest.raises(ValueError) as excinfo:
+            build_nemotron_h_hybrid_plan(args, 6)
+        assert str(excinfo.value) == expected
+
+    @pytest.mark.parametrize(("value", "shown"), [(0, "0"), ("32", "'32'")])
+    def test_non_positive_or_non_int_dim_rejects(self, value, shown: str) -> None:
+        args = {**NEMOTRON_H_ARGS, "ssm_state_size": value}
+        expected = (
+            "Nemotron-H hybrid model args must be positive integers; invalid "
+            f"ssm_state_size={shown}."
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            build_nemotron_h_hybrid_plan(args, 6)
+        assert str(excinfo.value) == expected
+
+    def test_unknown_block_token_rejects(self) -> None:
+        args = {**NEMOTRON_H_ARGS, "hybrid_override_pattern": "M*Z"}
+        expected = "Nemotron-H hybrid_override_pattern must use M, *, - or E; got 'Z'."
+
+        with pytest.raises(ValueError) as excinfo:
+            build_nemotron_h_hybrid_plan(args, 3)
+        assert str(excinfo.value) == expected
+
+    @pytest.mark.parametrize(
+        "pattern", ["MEME", "*E*"], ids=["no_attention", "no_state"]
+    )
+    def test_pattern_missing_a_role_rejects(self, pattern: str) -> None:
+        args = {**NEMOTRON_H_ARGS, "hybrid_override_pattern": pattern}
+        expected = (
+            "Nemotron-H hybrid requires both Mamba-2 ('M') and attention ('*') "
+            f"blocks, got hybrid_override_pattern={pattern!r}."
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            build_nemotron_h_hybrid_plan(args, len(pattern))
+        assert str(excinfo.value) == expected
 
 
 class TestStateCacheSpec:
@@ -288,37 +444,6 @@ class TestHybridPatchModel:
         assert gdn_0._gdn_state_cache is runtime.state_cache
         assert gdn_2._gdn_state_cache is runtime.state_cache
 
-    def test_stateless_layers_are_never_probed(self) -> None:
-        runtime = HybridPagedAttentionRuntime(
-            hybrid_plan=make_gdn_hybrid_plan(
-                4,
-                [2],
-                conv_kernel_dim=2,
-                conv_dim=4,
-                num_v_heads=1,
-                value_head_dim=4,
-                key_head_dim=32,
-                stateless_indices=[1],
-            ),
-            max_num_seqs=2,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=4,
-            dtype=mx.float32,
-        )
-        runtime.initialize(num_blocks=2)
-        model = _FakeModel("ssas")
-        mlp = _FakeMLP()
-        model.layers[1] = mlp
-
-        patched = runtime.patch_model(model)
-
-        assert patched == 3
-        assert model.layers[1] is mlp
-        assert isinstance(model.layers[2].self_attn, SDPAPagedAttentionWrapper)
-        assert isinstance(model.layers[3].linear_attn, GDNPagedAttentionWrapper)
-        assert model.layers[3].linear_attn._gdn_cache_idx == 1
-
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
         runtime_a = _make_runtime()
         runtime_a.initialize(num_blocks=2)
@@ -335,6 +460,42 @@ class TestHybridPatchModel:
         assert wrapper_before._gdn_state_cache is runtime_b.state_cache
         assert wrapper_before._gdn_state_cache is not runtime_a.state_cache
         assert wrapper_before._gdn_cache_idx == 0
+
+    def test_nemotron_layout_wraps_only_attention_and_mixers(self) -> None:
+        model = Model(
+            ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
+        )
+        runtime = _make_nemotron_runtime()
+        runtime.initialize(num_blocks=2)
+
+        patched = runtime.patch_model(model)
+
+        assert patched == 3
+        assert isinstance(model.layers[0].mixer, Mamba2PagedStateWrapper)
+        assert isinstance(model.layers[1].mixer, NemotronHMLP)
+        assert isinstance(model.layers[2].mixer, SDPAPagedAttentionWrapper)
+        assert isinstance(model.layers[3].mixer, Mamba2PagedStateWrapper)
+        assert model.layers[0].mixer._mamba2_cache_idx == 0
+        assert model.layers[3].mixer._mamba2_cache_idx == 1
+        assert model.layers[3].mixer._mamba2_state_cache is runtime.state_cache
+
+    def test_nemotron_repatch_rebinds_the_mixer_wrappers(self) -> None:
+        model = Model(
+            ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
+        )
+        runtime_a = _make_nemotron_runtime()
+        runtime_a.initialize(num_blocks=2)
+        runtime_a.patch_model(model)
+        wrapper_before = model.layers[3].mixer
+        runtime_b = _make_nemotron_runtime()
+        runtime_b.initialize(num_blocks=2)
+
+        patched = runtime_b.patch_model(model)
+
+        assert patched == 3
+        assert model.layers[3].mixer is wrapper_before
+        assert wrapper_before._mamba2_state_cache is runtime_b.state_cache
+        assert wrapper_before._mamba2_cache_idx == 1
 
     def test_state_pool_dtype_mismatch_rejects_at_patch_time(self) -> None:
         runtime = HybridPagedAttentionRuntime(

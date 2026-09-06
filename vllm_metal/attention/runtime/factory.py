@@ -12,6 +12,11 @@ from vllm_metal.attention.runtime.families.gdn import (
     GDN_MODEL_TYPES,
     build_gdn_hybrid_plan,
 )
+from vllm_metal.attention.runtime.families.nemotron_h import (
+    NEMOTRON_H_FAMILY,
+    NEMOTRON_H_MODEL_TYPES,
+    build_nemotron_h_hybrid_plan,
+)
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan, StateFamilySpec
 
 
@@ -32,6 +37,11 @@ _STATE_FAMILY_PLAN_BUILDERS = (
         model_types=GDN_MODEL_TYPES,
         family=GDN_FAMILY,
         build=build_gdn_hybrid_plan,
+    ),
+    StateFamilyPlanBuilder(
+        model_types=NEMOTRON_H_MODEL_TYPES,
+        family=NEMOTRON_H_FAMILY,
+        build=build_nemotron_h_hybrid_plan,
     ),
 )
 

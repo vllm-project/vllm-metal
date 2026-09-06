@@ -11,10 +11,12 @@ import mlx.core as mx
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
+from vllm_metal.attention.runtime.families.nemotron_h import (
+    build_nemotron_h_hybrid_plan,
+)
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
-    STATELESS_LAYER,
     HybridLayerPlan,
     HybridRuntimePlan,
     RecurrentStateGeometry,
@@ -224,6 +226,31 @@ def make_gemma4_mixed_mha_runner(
     )
 
 
+# Tiny mlx-lm Nemotron-H ModelArgs shared by the real-module tests.
+NEMOTRON_H_TINY_ARGS: dict[str, Any] = {
+    "model_type": "nemotron_h",
+    "vocab_size": 100,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "max_position_embeddings": 512,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "attention_bias": False,
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 8,
+    "mamba_proj_bias": False,
+    "ssm_state_size": 32,
+    "conv_kernel": 4,
+    "n_groups": 2,
+    "mlp_bias": False,
+    "layer_norm_epsilon": 1e-5,
+    "use_bias": False,
+    "use_conv_bias": True,
+    "hybrid_override_pattern": "M*",
+}
+
+
 # Production family policy, resolved through the family table from the
 # smallest valid hybrid layout so tests cannot drift from what production installs.
 _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
@@ -249,18 +276,11 @@ def make_gdn_hybrid_plan(
     num_v_heads: int,
     value_head_dim: int,
     key_head_dim: int,
-    stateless_indices: Iterable[int] = (),
 ) -> HybridRuntimePlan:
     """Build a GDN hybrid plan with explicit topology and geometry."""
     attention = frozenset(attention_indices)
-    stateless = frozenset(stateless_indices)
     layer_roles = tuple(
-        ATTENTION_LAYER
-        if i in attention
-        else STATELESS_LAYER
-        if i in stateless
-        else STATE_LAYER
-        for i in range(num_layers)
+        ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
     )
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=layer_roles),
@@ -272,4 +292,11 @@ def make_gdn_hybrid_plan(
             value_head_dim=value_head_dim,
             key_head_dim=key_head_dim,
         ),
+    )
+
+
+def make_nemotron_hybrid_plan(pattern: str) -> HybridRuntimePlan:
+    """Build a Nemotron-H plan for ``pattern`` at the tiny test geometry."""
+    return build_nemotron_h_hybrid_plan(
+        {**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": pattern}, len(pattern)
     )

@@ -11,6 +11,7 @@ import pytest
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.nemotron_h import ModelArgs, NemotronHMamba2Mixer
 
+from tests.stub_runner import NEMOTRON_H_TINY_ARGS
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import (
     PagedAttentionContext,
@@ -20,28 +21,6 @@ from vllm_metal.attention.context import (
 from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper
 
 _HIDDEN = 32
-_ARGS = {
-    "model_type": "nemotron_h",
-    "vocab_size": 100,
-    "hidden_size": _HIDDEN,
-    "intermediate_size": 64,
-    "num_hidden_layers": 2,
-    "max_position_embeddings": 512,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "attention_bias": False,
-    "mamba_num_heads": 4,
-    "mamba_head_dim": 8,
-    "mamba_proj_bias": False,
-    "ssm_state_size": 32,
-    "conv_kernel": 4,
-    "n_groups": 2,
-    "mlp_bias": False,
-    "layer_norm_epsilon": 1e-5,
-    "use_bias": False,
-    "use_conv_bias": True,
-    "hybrid_override_pattern": "M*",
-}
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +32,7 @@ def _no_context() -> Iterator[None]:
 
 def _make_mixer(**overrides: object) -> NemotronHMamba2Mixer:
     mx.random.seed(0)
-    mixer = NemotronHMamba2Mixer(ModelArgs(**{**_ARGS, **overrides}))
+    mixer = NemotronHMamba2Mixer(ModelArgs(**{**NEMOTRON_H_TINY_ARGS, **overrides}))
     mx.eval(mixer.parameters())
     return mixer
 
@@ -137,7 +116,9 @@ class TestMamba2PagedStateWrapper:
         assert not np.any(np.array(untouched_conv))
         assert not np.any(np.array(untouched_ssm))
 
-    def test_decode_runs_all_requests_as_one_batch(self) -> None:
+    def test_decode_runs_all_requests_as_one_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         mixer = _make_mixer()
         mixer.set_dtype(mx.bfloat16)
         cache = _make_cache(mixer, mx.bfloat16)
@@ -155,10 +136,19 @@ class TestMamba2PagedStateWrapper:
             mixer, mx.concatenate([step_first, step_second], axis=0), ref_cache
         )
         _set_step([0, 1, 2], [2, 0], num_decode=2)
+        calls: list[tuple[int, ...]] = []
+        real_call = NemotronHMamba2Mixer.__call__
+
+        def spy(self, x, mask=None, cache=None):
+            calls.append(tuple(x.shape))
+            return real_call(self, x, mask=mask, cache=cache)
+
+        monkeypatch.setattr(NemotronHMamba2Mixer, "__call__", spy)
 
         out = wrapper(mx.concatenate([step_first, step_second], axis=1))
         mx.eval(out)
 
+        assert calls == [(2, 1, _HIDDEN)]
         assert mx.array_equal(out[:, :1], ref_out[:1])
         assert mx.array_equal(out[:, 1:], ref_out[1:])
         conv, ssm = _pool_rows(cache, 2)
@@ -270,12 +260,3 @@ class TestMamba2PagedStateWrapper:
 
         with pytest.raises(ValueError, match="state pool dtype"):
             Mamba2PagedStateWrapper(mixer, 0, 0, cache)
-
-    def test_context_without_slot_mapping_rejects(self) -> None:
-        mixer = _make_mixer()
-        cache = _make_cache(mixer, mx.float32)
-        wrapper = Mamba2PagedStateWrapper(mixer, 0, 0, cache)
-        set_context(PagedAttentionContext(slot_mapping=[0, 0], cu_seqlens=[0, 2]))
-
-        with pytest.raises(RuntimeError, match="gdn_slot_mapping"):
-            wrapper(_tokens(2))

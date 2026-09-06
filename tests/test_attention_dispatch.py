@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.stub_runner import NEMOTRON_H_TINY_ARGS
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.impls.linear import is_linear_attention
 from vllm_metal.attention.impls.mamba2 import is_mamba2_mixer
 from vllm_metal.attention.impls.sdpa import is_sdpa
@@ -95,35 +97,11 @@ def test_qwen35_linear_layer_detected():
     assert not is_sdpa(layer.linear_attn)
 
 
-_NEMOTRON_H_ARGS_KWARGS = {
-    "model_type": "nemotron_h",
-    "vocab_size": 100,
-    "hidden_size": 32,
-    "intermediate_size": 64,
-    "num_hidden_layers": 2,
-    "max_position_embeddings": 512,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "attention_bias": False,
-    "mamba_num_heads": 4,
-    "mamba_head_dim": 8,
-    "mamba_proj_bias": False,
-    "ssm_state_size": 32,
-    "conv_kernel": 4,
-    "n_groups": 2,
-    "mlp_bias": False,
-    "layer_norm_epsilon": 1e-5,
-    "use_bias": False,
-    "use_conv_bias": True,
-    "hybrid_override_pattern": "M*",
-}
-
-
 def test_nemotron_h_mamba2_mixer_is_not_gdn():
     """Mamba-2 mixers carry conv1d too; the GDN predicate keys on its projections."""
     from mlx_lm.models.nemotron_h import ModelArgs, NemotronHMamba2Mixer
 
-    mixer = NemotronHMamba2Mixer(ModelArgs(**_NEMOTRON_H_ARGS_KWARGS))
+    mixer = NemotronHMamba2Mixer(ModelArgs(**NEMOTRON_H_TINY_ARGS))
 
     assert is_mamba2_mixer(mixer)
     assert not is_linear_attention(mixer)
@@ -133,10 +111,11 @@ def test_nemotron_h_mamba2_mixer_is_not_gdn():
 def test_nemotron_h_attention_detected_as_sdpa():
     from mlx_lm.models.nemotron_h import ModelArgs, NemotronHAttention
 
-    attn = NemotronHAttention(ModelArgs(**_NEMOTRON_H_ARGS_KWARGS))
+    attn = NemotronHAttention(ModelArgs(**NEMOTRON_H_TINY_ARGS))
 
     assert is_sdpa(attn)
     assert not is_linear_attention(attn)
+    assert attention_contract_for(attn).use_rope is False
 
 
 def test_gemma4_attention_contract_detected_as_sdpa():

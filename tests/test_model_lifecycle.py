@@ -75,12 +75,29 @@ _GDN_HYBRID_ARGS = {
     "linear_conv_kernel_dim": 3,
 }
 
+_JAMBA_ARGS = {
+    "model_type": "jamba",
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "hidden_size": 4096,
+}
+
 _NEMOTRON_H_ARGS = {
     "model_type": "nemotron_h",
     "num_hidden_layers": 52,
     "num_attention_heads": 32,
-    "num_key_value_heads": 8,
-    "hidden_size": 4096,
+    "num_key_value_heads": 2,
+    "hidden_size": 2688,
+    "head_dim": 128,
+    "hybrid_override_pattern": list(
+        "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    ),
+    "mamba_num_heads": 64,
+    "mamba_head_dim": 64,
+    "ssm_state_size": 128,
+    "n_groups": 8,
+    "conv_kernel": 4,
 }
 
 
@@ -1160,13 +1177,35 @@ class TestResolveModelDims:
 
     def test_hybrid_model_without_a_family_rejects_before_any_plan(self) -> None:
         lifecycle, runner = _make_lifecycle(
-            model_args=_NEMOTRON_H_ARGS,
+            model_args=_JAMBA_ARGS,
             model_config=_runner_model_config(is_hybrid=True),
         )
 
-        with pytest.raises(NotImplementedError, match="model_type='nemotron_h'"):
+        with pytest.raises(NotImplementedError, match="model_type='jamba'"):
             lifecycle.resolve_model_dims()
         assert runner.hybrid_runtime_plan is None
+
+    def test_nemotron_model_installs_its_family_plan(self) -> None:
+        runner = self._resolve(_NEMOTRON_H_ARGS, is_hybrid=True)
+
+        assert runner.hybrid_runtime_plan.family.label == "nemotron_h"
+        assert runner.hybrid_runtime_plan.layers.attention_indices == (
+            5,
+            12,
+            19,
+            26,
+            33,
+            42,
+        )
+        assert runner.hybrid_runtime_plan.layers.num_state == 23
+        assert runner.head_dim == 128
+
+    def test_nemotron_head_dim_resolves_like_mlx_lm_when_omitted(self) -> None:
+        args = {k: v for k, v in _NEMOTRON_H_ARGS.items() if k != "head_dim"}
+
+        runner = self._resolve(args, is_hybrid=True)
+
+        assert runner.head_dim == 2688 // 32
 
     def test_standard_mha(self) -> None:
         runner = self._resolve(
