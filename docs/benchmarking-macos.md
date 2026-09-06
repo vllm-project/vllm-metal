@@ -2,7 +2,7 @@
 
 Three measurement hazards documented in [#713] can silently distort
 performance numbers on Apple Silicon. All three were hit while
-validating the decode work in #693 on an M5 Pro; each cost hours of
+validating the decode work in [#715](https://github.com/vllm-project/vllm-metal/pull/715) (successor of #693) on an M5 Pro; each cost hours of
 misattribution before being isolated.
 
 ## 1. Absolute numbers: use the server topology

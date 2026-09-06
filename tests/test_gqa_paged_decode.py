@@ -235,3 +235,11 @@ def test_gqa_disable_env_forces_established_kernels(monkeypatch) -> None:
 
     monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
     assert envs.VLLM_METAL_DISABLE_GQA_DECODE is True
+    out_env, _ = _run_primitive(
+        [kv_len],
+        mx.bfloat16,
+        interleaved=True,
+        seed=7,
+        gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
+    )
+    _assert_close(out_env, ref, mx.bfloat16)

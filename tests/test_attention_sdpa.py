@@ -701,6 +701,53 @@ class TestSDPAForward:
         assert captured["num_kv_heads"] == 2
         assert captured["scale"] == 0.5
 
+    def test_gqa_disable_env_reaches_primitive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``sdpa_forward`` must pass ``VLLM_METAL_DISABLE_GQA_DECODE`` through."""
+        captured: dict[str, bool | None] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _keys,
+                _values,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
+            def paged_attention_primitive(self, *_args, **kwargs) -> None:
+                captured["gqa_disabled"] = kwargs.get("gqa_disabled")
+
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        zeros = mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM), dtype=mx.float16)
+
+        def _run() -> None:
+            with (
+                patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+                patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+            ):
+                sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        _run()
+        assert captured.get("gqa_disabled") is False
+
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
+        _run()
+        assert captured.get("gqa_disabled") is True
+
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
         layout = MHAKVCacheLayout(

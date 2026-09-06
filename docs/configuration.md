@@ -8,6 +8,7 @@
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Force-close the GQA flash-decode dispatch gate ([#713](https://github.com/vllm-project/vllm-metal/issues/713) / [#714](https://github.com/vllm-project/vllm-metal/pull/714)). Set to `1` so long-context decode stays on the established per-token / split-KV kernels — the server-topology A/B hatch (mirrors `VLLM_METAL_DISABLE_NAX`). Off by default. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist; `multimodal-native` disables overrides |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
