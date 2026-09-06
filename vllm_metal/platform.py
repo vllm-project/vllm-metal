@@ -544,9 +544,9 @@ class MetalPlatform(Platform):
                 ):
                     cls._disable_hybrid_prefix_caching(
                         vllm_config,
-                        f"the {state_family.label!r} state family keeps one private "
-                        "state slot per request and has no block-keyed state to "
-                        "restore from",
+                        f"the {state_family.label!r} state family supports "
+                        f"mamba_cache_mode {state_family.supported_cache_modes}, "
+                        f"not {cache_config.mamba_cache_mode!r}",
                     )
             if cache_config.enable_prefix_caching and not config.use_paged_attention:
                 cls._disable_hybrid_prefix_caching(
