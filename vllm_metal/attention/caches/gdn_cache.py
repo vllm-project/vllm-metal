@@ -28,8 +28,12 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
+
+if TYPE_CHECKING:
+    from vllm_metal.attention.context import PagedAttentionContext
 
 
 @functools.cache
@@ -185,13 +189,30 @@ class GDNPagedStateCache:
 
         self.allocated_seqs = num_seqs
 
+    def step_slot_ids(
+        self, ctx: PagedAttentionContext, cache_idx: int, num_requests: int
+    ) -> list[int]:
+        """Return this step's state slot per request for ``cache_idx``."""
+        if ctx.gdn_group_slot_mappings is not None:
+            slot_ids = ctx.gdn_group_slot_mappings[self.layer_group_ordinal(cache_idx)]
+        elif ctx.gdn_slot_mapping is not None:
+            slot_ids = ctx.gdn_slot_mapping
+        else:
+            raise RuntimeError("state cache requires gdn_slot_mapping in context")
+        if len(slot_ids) != num_requests:
+            raise RuntimeError("state cache requires one slot per request")
+        if len(set(slot_ids)) != len(slot_ids):
+            raise RuntimeError("state cache requires unique slots per request")
+        self.require_allocated_slots(slot_ids)
+        return slot_ids
+
     def require_allocated_slots(self, slot_ids: list[int]) -> None:
         """Validate slots against both the scheduler cap and allocated rows."""
         if any(slot < 0 or slot >= self.max_seqs for slot in slot_ids):
-            raise RuntimeError("GDN wrapper received out-of-range slot mapping")
+            raise RuntimeError("state cache received out-of-range slot mapping")
         if any(slot >= self.allocated_seqs for slot in slot_ids):
             raise RuntimeError(
-                "GDN wrapper received slot mapping beyond allocated state cache"
+                "state cache received slot mapping beyond allocated state cache"
             )
 
     def reset_slot(self, slot: int) -> None:

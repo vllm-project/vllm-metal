@@ -159,18 +159,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        if ctx.gdn_group_slot_mappings is not None:
-            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
-            slot_ids = ctx.gdn_group_slot_mappings[ordinal]
-        elif ctx.gdn_slot_mapping is not None:
-            slot_ids = ctx.gdn_slot_mapping
-        else:
-            raise RuntimeError("GDN wrapper requires gdn_slot_mapping in context")
-        if len(slot_ids) != num_requests:
-            raise RuntimeError("GDN wrapper requires one slot per request")
-        if len(set(slot_ids)) != len(slot_ids):
-            raise RuntimeError("GDN wrapper requires unique slots per request")
-        self._gdn_state_cache.require_allocated_slots(slot_ids)
+        slot_ids = self._gdn_state_cache.step_slot_ids(
+            ctx, self._gdn_cache_idx, num_requests
+        )
 
         return _GDNForwardState(
             x=x,
