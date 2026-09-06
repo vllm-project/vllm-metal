@@ -96,7 +96,13 @@ class GDNHybridConfig:
         )
 
 
-_GDN_FAMILY = StateFamilySpec(
+# mlx-lm names the text-only loads by the outer config; mlx-vlm flattens the
+# nested text config, so the same family also arrives as the ``_text`` types.
+GDN_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"}
+)
+
+GDN_FAMILY = StateFamilySpec(
     label="gdn",
     wrapper_cls=GDNPagedAttentionWrapper,
     is_state_module=is_linear_attention,
@@ -108,11 +114,6 @@ _GDN_FAMILY = StateFamilySpec(
 )
 
 
-def supports_gdn_hybrid(model_args: Mapping[str, Any]) -> bool:
-    """Whether these model args describe a GDN linear-attention hybrid."""
-    return "full_attention_interval" in model_args
-
-
 def build_gdn_hybrid_plan(
     model_args: Mapping[str, Any], num_layers: int
 ) -> HybridRuntimePlan:
@@ -120,6 +121,6 @@ def build_gdn_hybrid_plan(
     gdn_config = GDNHybridConfig.from_model_args(model_args)
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=gdn_config.layer_roles(num_layers)),
-        family=_GDN_FAMILY,
+        family=GDN_FAMILY,
         geometry=gdn_config.state_geometry(),
     )

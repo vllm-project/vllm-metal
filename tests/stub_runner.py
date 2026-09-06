@@ -227,6 +227,7 @@ def make_gemma4_mixed_mha_runner(
 # smallest valid hybrid layout so tests cannot drift from what production installs.
 _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
     {
+        "model_type": "qwen3_5",
         "full_attention_interval": 2,
         "linear_num_key_heads": 1,
         "linear_num_value_heads": 1,

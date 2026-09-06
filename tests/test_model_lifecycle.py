@@ -62,6 +62,7 @@ def _runner_model_config(**overrides: object) -> object:
 
 
 _GDN_HYBRID_ARGS = {
+    "model_type": "qwen3_5",
     "num_hidden_layers": 8,
     "num_attention_heads": 16,
     "num_key_value_heads": 4,
@@ -829,6 +830,32 @@ class TestModelLifecycle:
         assert runner.hybrid_runtime_plan.layers.num_attention == (
             _TEXT_MODEL_ARGS["num_hidden_layers"] // 4
         )
+
+    def test_load_routes_the_mlx_vlm_text_model_type_to_the_gdn_family(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mlx-vlm flattens text_config, whose model_type is the ``_text`` name."""
+        text_config = _text_config(
+            model_type="qwen3_5_text",
+            full_attention_interval=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=3,
+        )
+        _stub_generation_model(
+            monkeypatch, config=SimpleNamespace(text_config=text_config), is_vlm=True
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True, is_multimodal_model=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["model_type"] == "qwen3_5_text"
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
 
     def test_load_stt_model_loads_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = SimpleNamespace(

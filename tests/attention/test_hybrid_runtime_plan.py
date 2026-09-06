@@ -24,6 +24,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
 )
 
 GDN_ARGS = {
+    "model_type": "qwen3_5",
     "full_attention_interval": 4,
     "linear_num_key_heads": 2,
     "linear_num_value_heads": 4,
@@ -157,11 +158,25 @@ class TestGdnPlanRejection:
 
 
 class TestStateFamilyFactory:
-    def test_routes_gdn_args_to_the_gdn_family(self) -> None:
-        plan = build_hybrid_runtime_plan(GDN_ARGS, 8)
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"],
+    )
+    def test_routes_gdn_model_types_to_the_gdn_family(self, model_type: str) -> None:
+        plan = build_hybrid_runtime_plan({**GDN_ARGS, "model_type": model_type}, 8)
 
         assert plan.family.label == "gdn"
         assert plan.layers.attention_indices == (3, 7)
+
+    def test_overlapping_fields_of_an_unsupported_hybrid_still_reject(self) -> None:
+        args = {**GDN_ARGS, "model_type": "falcon_h1", "mamba_num_heads": 8}
+        expected = (
+            "Metal hybrid runtime has no state family for model_type='falcon_h1'."
+        )
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            build_hybrid_runtime_plan(args, 8)
+        assert str(excinfo.value) == expected
 
     def test_rejects_args_without_a_state_family(self) -> None:
         args = {"model_type": "nemotron_h", "num_hidden_layers": 52}
