@@ -46,16 +46,14 @@ dependencies = [
     # import tvm-ffi; this bounds the resolver only.
     # TODO: remove once xgrammar bounds its own apache-tvm-ffi range.
     "apache-tvm-ffi>=0.1.9,<0.1.13; platform_system == 'Darwin' and platform_machine == 'arm64'",
-    # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
-    "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # mlx-vlm 0.6.8 drives MLX-quantized Qwen3.5/3.6 wrappers with correct
+    # mRoPE state; 0.6.4 leaves it unset and garbles their output (#685).
+    # Capped below 0.6.16, which drops `target_verify` from
+    # Qwen3_5MLP.__call__ and trips the CompiledMLPBlocks wrapper guard.
+    "mlx-vlm>=0.6.8,<0.6.16; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
     # Keep aligned with vLLM 0.28.0's Transformers lower bound.
-    # Temporary cap: transformers 5.13.0 (released 2026-07-03) breaks MLX Metal
-    # availability inside the vLLM process on GitHub's macOS runner VMs, so
-    # platform resolution falls back to CPU. Verified A/B on the same runner:
-    # 5.13.0 -> CpuPlatform, 5.12.1 -> MetalPlatform.
-    # TODO: remove once the interaction is understood/fixed upstream.
-    "transformers>=5.5.3,<5.13",
+    "transformers>=5.5.3",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
     # Imported directly (model download/cache paths); keep aligned with vLLM
