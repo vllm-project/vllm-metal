@@ -58,7 +58,7 @@ scripts/lint.sh
 
 ## Run CI locally
 
-Mirrors the `test` job in CI — serving smoke tests plus the non-slow pytest suite:
+Mirrors the `test` job in CI: wheel validation, Metal platform checks, and the non-slow pytest suite. Model parity runs separately in the [daily and requested workflow](tools.md#scheduled-and-requested-ci):
 
 ```bash
 scripts/test.sh

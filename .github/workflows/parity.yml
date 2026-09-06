@@ -1,0 +1,159 @@
+name: Parity
+
+on:
+  schedule:
+    - cron: '17 7 * * *' # Daily at 07:17 UTC.
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  resolve:
+    if: >-
+      github.repository == 'vllm-project/vllm-metal' &&
+      (github.event_name == 'schedule' ||
+       (github.event.issue.pull_request && github.event.comment.body == '/ci parity'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    outputs:
+      run: ${{ steps.target.outputs.run }}
+      sha: ${{ steps.target.outputs.sha }}
+      repository: ${{ steps.target.outputs.repository }}
+      key: ${{ steps.target.outputs.key }}
+      check_id: ${{ steps.target.outputs.check_id }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }} # Trusted default-branch code, not the PR checkout.
+          persist-credentials: false
+      - name: Resolve parity target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/parity.py resolve
+
+  parity:
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
+    name: Parity (${{ matrix.os }}, ${{ matrix.model.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    concurrency:
+      group: parity-${{ needs.resolve.outputs.key }}-${{ matrix.os }}-${{ matrix.model.name }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        model:
+          - name: qwen3-0.6b
+            id: Qwen/Qwen3-0.6B
+            revision: c1899de289a04d12100db370d81485cdf75e47ca
+          - name: qwen35-0.8b
+            id: Qwen/Qwen3.5-0.8B
+            revision: 2fc06364715b967f1860aea9cf38778875588b17
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # Leave headroom for the CPU runtime on hosted Mac runners.
+      VLLM_METAL_MEMORY_FRACTION: '0.65'
+      GLOO_SOCKET_IFNAME: lo0
+      MODEL_ID: ${{ matrix.model.id }}
+      MODEL_REVISION: ${{ matrix.model.revision }}
+      TESTED_SHA: ${{ needs.resolve.outputs.sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ needs.resolve.outputs.repository }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        id: models
+        with:
+          path: ~/.cache/huggingface/hub
+          key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}
+      - name: Install the tested checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          mkdir -p "$RUNNER_TEMP/parity"
+          printf 'commit=%s\nmodel=%s\nrevision=%s\n' "$TESTED_SHA" "$MODEL_ID" "$MODEL_REVISION" > "$RUNNER_TEMP/parity/environment.txt"
+          ./install.sh
+      - name: Prepare checkpoint
+        run: |
+          source .venv-vllm-metal/bin/activate
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import os
+          import platform
+          import sys
+          from huggingface_hub import snapshot_download
+          from vllm.platforms import current_platform
+          assert type(current_platform).__name__ == "MetalPlatform", current_platform
+          with open(os.environ["RUNNER_TEMP"] + "/parity/environment.txt", "a") as f:
+              print(platform.platform(), file=f)
+              print(sys.version, file=f)
+              for package in ("vllm-metal", "vllm", "mlx", "mlx-lm"):
+                  print(package, metadata.version(package), file=f)
+          model = snapshot_download(os.environ["MODEL_ID"], revision=os.environ["MODEL_REVISION"])
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              print(f"MODEL_PATH={model}", file=f)
+          PY
+      - uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        if: success() && github.event_name == 'schedule' && steps.models.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/huggingface/hub
+          key: ${{ steps.models.outputs.cache-primary-key }}
+      - name: Compare all batch sizes
+        run: |
+          source .venv-vllm-metal/bin/activate
+          printf '### %s\n\nCommit: %s\n\n| Batch | EXACT | TOP_K_MATCH | FAIL | Exit |\n|---|---:|---:|---:|---:|\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for batch in 1 2; do
+            log="$RUNNER_TEMP/parity/batch-${batch}.log"
+            if python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 --batch-size "$batch" 2>&1 | tee "$log"; then
+              code=0
+            else
+              code=$?
+              failed=1
+            fi
+            exact=$(awk '/^EXACT / {n++} END {print n+0}' "$log")
+            topk=$(awk '/^TOP_K_MATCH / {n++} END {print n+0}' "$log")
+            mismatches=$(awk '/^FAIL / {n++} END {print n+0}' "$log")
+            printf '| %s | %s | %s | %s | %s |\n' "$batch" "$exact" "$topk" "$mismatches" "$code" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$failed"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: parity-${{ matrix.os }}-${{ matrix.model.name }}-${{ needs.resolve.outputs.sha }}
+          path: ${{ runner.temp }}/parity
+          retention-days: 14
+
+  report:
+    needs: [resolve, parity]
+    if: always() && needs.resolve.outputs.check_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Report parity result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARITY_CHECK_ID: ${{ needs.resolve.outputs.check_id }}
+          PARITY_RESULT: ${{ needs.parity.result }}
+        run: python3 .github/scripts/parity.py report

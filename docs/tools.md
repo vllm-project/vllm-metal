@@ -16,3 +16,9 @@ Both backends use the same checkpoint and input token IDs in separate processes.
 - `FAIL`: a mismatch fails the comparison, or generation is incomplete.
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
+
+## Scheduled and requested CI
+
+Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
+
+Both triggers test Qwen3-0.6B and Qwen3.5-0.8B on macOS 15 and 26 with Xcode 26.3: 40 shared prompts, 20 output tokens, top-K 5, and batch sizes 1/2. The `Parity` check links to job summaries and logs retained for 14 days. Regular PR CI runs fast tests without starting model servers.
