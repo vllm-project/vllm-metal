@@ -104,7 +104,6 @@ cache. Its benefit depends on repeated token spans in the request history.
 ### Example
 
 ```bash
-VLLM_METAL_USE_PAGED_ATTENTION=1 \
   vllm serve Qwen/Qwen3-8B \
     --max-model-len 2048 \
     --no-async-scheduling \

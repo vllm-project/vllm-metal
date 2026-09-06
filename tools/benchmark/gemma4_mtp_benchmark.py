@@ -105,7 +105,6 @@ def environment_metadata() -> dict[str, Any]:
             name: os.environ.get(name)
             for name in (
                 "VLLM_METAL_MEMORY_FRACTION",
-                "VLLM_METAL_USE_PAGED_ATTENTION",
                 "VLLM_ENABLE_V1_MULTIPROCESSING",
             )
             if os.environ.get(name) is not None

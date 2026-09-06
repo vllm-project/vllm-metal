@@ -112,7 +112,6 @@ class TestBuildPrefillPackMmFullPrompt:
         runner._request_states["req-0"] = RequestState(
             token_ids=[1, 99, 99, 2, 3, 4],  # 4 prompt + 2 generated
             prompt_len=4,
-            cache=[],
             sampling_params=SamplingParams(),
         )
         entry = _make_prefill_entry(
@@ -161,7 +160,6 @@ class TestBuildPrefillPackMmFullPrompt:
         runner._request_states["req-0"] = RequestState(
             token_ids=[1, 2, 3, 4, 5, 6, 7],
             prompt_len=5,
-            cache=[],
             sampling_params=SamplingParams(),
         )
         entry = _make_prefill_entry(

@@ -61,7 +61,6 @@ class MetalLoRARuntime:
         model: nn.Module,
         lora_config: LoRAConfig | None,
         is_stt: bool,
-        paged_attention_enabled: bool,
         speculative_decode_enabled: bool,
         max_num_seqs: int,
         max_num_batched_tokens: int,
@@ -74,14 +73,6 @@ class MetalLoRARuntime:
                 "LoRA is not supported for STT models; ignoring --enable-lora"
             )
             return
-        if not paged_attention_enabled:
-            raise NotImplementedError(
-                "LoRA on Metal requires paged attention. The non-paged "
-                "(legacy MLX KV cache) path runs multiple separate forwards "
-                "per step, which the step-level Punica routing cannot align. "
-                "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
-                "or drop --enable-lora."
-            )
         if speculative_decode_enabled:
             raise NotImplementedError(
                 "LoRA combined with speculative decode is not supported on "

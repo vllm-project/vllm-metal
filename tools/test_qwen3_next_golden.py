@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
 os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.55")
 
 from vllm import LLM, SamplingParams

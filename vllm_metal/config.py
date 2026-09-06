@@ -36,22 +36,13 @@ class MetalConfig:
 
     memory_fraction: float  # -1.0 selects the active backend's auto policy
     mlx_device: Literal["gpu", "cpu"]
-    use_paged_attention: bool = True
     multimodal_mode: MultimodalMode = "auto"
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
     v_quant: str = "q3_0"  # Value quantization type: q2_0, q3_0, q4_0, q5_0 (Lloyd-Max)
 
     def __post_init__(self) -> None:
-        if not self.use_paged_attention and not self.is_auto_memory:
-            raise ValueError(
-                f"VLLM_METAL_MEMORY_FRACTION={self.memory_fraction} is only "
-                "supported with paged attention (the default). "
-                "The MLX KV cache path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
-                "requires VLLM_METAL_MEMORY_FRACTION=auto."
-            )
-
-        if self.use_paged_attention and not self.is_auto_memory:
+        if not self.is_auto_memory:
             if not (0 < self.memory_fraction <= 1):
                 raise ValueError(
                     f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
@@ -70,11 +61,6 @@ class MetalConfig:
     def _validate_turboquant(self) -> None:
         """Validate TurboQuant configuration."""
         if self.turboquant:
-            if not self.use_paged_attention:
-                raise ValueError(
-                    "turboquant requires paged attention. "
-                    "TurboQuant KV cache compression only works with paged attention."
-                )
             if self.k_quant not in TURBOQUANT_VALID_K_QUANTS:
                 available = ", ".join(sorted(TURBOQUANT_VALID_K_QUANTS))
                 raise ValueError(
@@ -125,7 +111,6 @@ class MetalConfig:
         return cls(
             memory_fraction=memory_fraction,
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
-            use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
         )
 

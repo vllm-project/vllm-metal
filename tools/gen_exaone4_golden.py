@@ -46,7 +46,6 @@ def _mlx_tokens(model: str, max_tokens: int) -> dict[str, list[int]]:
 
 def _paged_tokens(model: str, max_tokens: int) -> dict[str, list[int]]:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
     os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
     from vllm import LLM, SamplingParams
 

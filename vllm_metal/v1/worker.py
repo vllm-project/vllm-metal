@@ -202,26 +202,10 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-    def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of cache state.
-
-        Uses block-aligned token count so the estimate matches the upstream
-        ``_check_enough_kv_cache_memory`` calculation, which rounds
-        ``max_model_len`` up to the nearest ``block_size`` boundary via
-        ``cdiv(max_model_len, block_size) * page_size_bytes``.
-        """
-        block_size = self.vllm_config.cache_config.block_size
-        return self.model_runner.estimate_one_sequence_kv_bytes(
-            max_model_len=self.model_config.max_model_len,
-            block_size=block_size,
-        )
-
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path: reports one max-length sequence of KV cache
-        so the scheduler budgets for one concurrent sequence.
 
         Returns:
             Available memory in bytes

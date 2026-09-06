@@ -37,7 +37,6 @@ def _child_env(enabled: bool) -> None:
     os.environ["VLLM_METAL_COMPILED_MLP"] = "1" if enabled else "0"
     for key, val in (
         ("VLLM_ENABLE_V1_MULTIPROCESSING", "0"),
-        ("VLLM_METAL_USE_PAGED_ATTENTION", "1"),
         ("VLLM_METAL_MEMORY_FRACTION", "0.5"),
     ):
         os.environ.setdefault(key, val)

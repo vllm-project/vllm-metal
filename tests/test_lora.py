@@ -1117,7 +1117,6 @@ def _runtime_setup_kwargs(**overrides: object) -> dict:
         "model": object(),
         "lora_config": _lora_config_stub(max_loras=1, max_lora_rank=8),
         "is_stt": False,
-        "paged_attention_enabled": True,
         "speculative_decode_enabled": False,
         "max_num_seqs": 1,
         "max_num_batched_tokens": 8,
@@ -1125,13 +1124,6 @@ def _runtime_setup_kwargs(**overrides: object) -> dict:
     }
     kwargs.update(overrides)
     return kwargs
-
-
-def test_runtime_rejects_lora_without_paged_attention() -> None:
-    rt = runtime_mod.MetalLoRARuntime()
-    with pytest.raises(NotImplementedError, match="requires paged attention"):
-        rt.setup(**_runtime_setup_kwargs(paged_attention_enabled=False))
-    assert rt.enabled is False
 
 
 def test_runtime_rejects_lora_with_speculative_decode() -> None:

@@ -162,7 +162,6 @@ def validate_pooling_request(
     new_req: NewRequestData,
     model_config: Any,
     pooling_backend: PoolingBackend | None,
-    paged_attention_enabled: bool,
 ) -> None:
     pooling_params = new_req.pooling_params
     if pooling_params is None:
@@ -191,14 +190,6 @@ def validate_pooling_request(
     if new_req.prompt_embeds is not None:
         raise NotImplementedError(
             "Prompt-embedding pooling inputs are not supported on Metal yet."
-        )
-    if (
-        pooling_backend.capabilities.requires_paged_attention
-        and not paged_attention_enabled
-    ):
-        raise NotImplementedError(
-            "Metal pooling currently requires paged attention; "
-            "set VLLM_METAL_USE_PAGED_ATTENTION=1."
         )
     if not (new_req.prompt_token_ids or []):
         raise ValueError(

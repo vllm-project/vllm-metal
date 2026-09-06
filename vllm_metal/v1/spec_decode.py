@@ -116,7 +116,6 @@ class SpeculativeDecodeController:
         scheduler_output: SchedulerOutput,
         decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
         *,
-        paged_attention_enabled: bool,
         is_hybrid: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
@@ -142,14 +141,6 @@ class SpeculativeDecodeController:
         }
         has_invalid_spec_tokens = any(count > 0 for count in invalid_counts.values())
 
-        if (
-            active_spec_tokens or has_invalid_spec_tokens
-        ) and not paged_attention_enabled:
-            raise NotImplementedError(
-                "Speculative decode verification on Metal requires paged "
-                "attention so draft-token rows can share scheduler-assigned "
-                "KV slots."
-            )
         if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
             raise NotImplementedError(
                 "Speculative decode verification is not supported for hybrid "

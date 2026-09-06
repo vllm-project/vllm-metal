@@ -4,14 +4,12 @@
 
 Usage:
     VLLM_METAL_MEMORY_FRACTION=0.1 \
-    VLLM_METAL_USE_PAGED_ATTENTION=1 \
     python tools/repro_block_exhaustion.py
 """
 
 import os
 
 os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.12")
-os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
 

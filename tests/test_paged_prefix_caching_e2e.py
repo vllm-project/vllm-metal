@@ -37,7 +37,6 @@ import pytest
 
 from tests.test_paged_deterministic import (
     DEFAULT_PAGED_MEMORY_FRACTION,
-    DEFAULT_USE_PAGED_ATTENTION,
     MODEL_NAME,
 )
 
@@ -65,11 +64,7 @@ def _setenv_default(key: str, default: str) -> None:
 def _run_prefix_cache_correctness() -> None:
     """Body of the e2e test — runs in a spawned child process."""
     _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_USE_PAGED_ATTENTION", DEFAULT_USE_PAGED_ATTENTION)
     _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
-
-    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") != "1":
-        return  # non-paged path: nothing to test
 
     from vllm import LLM, SamplingParams
 

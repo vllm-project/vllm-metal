@@ -95,7 +95,7 @@ VLLM_HOST_IP=10.0.0.2 ray start --address=10.0.0.1:6379 \
 **Mac A** — serve across both stages:
 
 ```bash
-RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_USE_PAGED_ATTENTION=1 \
+RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 \
   vllm serve Qwen/Qwen3-0.6B \
     --distributed-executor-backend ray \
     --pipeline-parallel-size 2 \
@@ -162,7 +162,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 - **Co-located stages oversubscribe the KV budget.** Each stage applies `VLLM_METAL_MEMORY_FRACTION` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
-- **Model support.** YOCO / hybrid / MLA / pooling / VLM / non-paged / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
+- **Model support.** YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
 
 ## Data parallelism
 

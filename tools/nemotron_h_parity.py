@@ -20,7 +20,6 @@ Not in CI, requires local weights.
 Usage:
     python tools/nemotron_h_parity.py
     python tools/nemotron_h_parity.py --model /path/to/checkpoint --max-tokens 16
-    python tools/nemotron_h_parity.py --arm nonpaged
 """
 
 from __future__ import annotations
@@ -63,11 +62,9 @@ def _to_numpy(array) -> np.ndarray:
     return np.array(array.astype(mx.float32))
 
 
-def _child_env(paged: bool) -> None:
+def _child_env() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1" if paged else "0"
-    # The non-paged MLX cache path only accepts the auto memory fraction.
-    os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5" if paged else "auto"
+    os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5"
 
 
 def _divergence(m, tokenizer, prompt: str, mlx_tokens, other_tokens) -> dict | None:
@@ -144,12 +141,11 @@ def run_mlx_child(
 def run_vllm_child(
     model: str,
     max_tokens: int,
-    paged: bool,
     check_state: bool,
     max_num_seqs: int,
     queue,
 ) -> None:
-    _child_env(paged)
+    _child_env()
     from vllm import LLM, SamplingParams
 
     reach = {
@@ -160,31 +156,30 @@ def run_vllm_child(
         "slot": None,
     }
     captured = {}
-    if paged:
-        from vllm_metal.attention.impls import mamba2
-        from vllm_metal.attention.runtime import hybrid
+    from vllm_metal.attention.impls import mamba2
+    from vllm_metal.attention.runtime import hybrid
 
-        real_call = mamba2.Mamba2PagedStateWrapper.__call__
-        real_patch = hybrid.HybridPagedAttentionRuntime.patch_model
+    real_call = mamba2.Mamba2PagedStateWrapper.__call__
+    real_patch = hybrid.HybridPagedAttentionRuntime.patch_model
 
-        def spy_call(self, x, mask=None, cache=None):
-            reach["wrapper_calls"] += 1
-            if self._mamba2_cache_idx == 0:
-                ctx = mamba2.get_context()
-                if ctx is not None and ctx.state_slot_mapping is not None:
-                    reach["slot"] = ctx.state_slot_mapping[-1]
-            return real_call(self, x, mask=mask, cache=cache)
+    def spy_call(self, x, mask=None, cache=None):
+        reach["wrapper_calls"] += 1
+        if self._mamba2_cache_idx == 0:
+            ctx = mamba2.get_context()
+            if ctx is not None and ctx.state_slot_mapping is not None:
+                reach["slot"] = ctx.state_slot_mapping[-1]
+        return real_call(self, x, mask=mask, cache=cache)
 
-        def spy_patch(self, model_obj):
-            layers = self._hybrid_plan.layers
-            reach["expected"] = layers.num_attention + layers.num_state
-            reach["num_state"] = layers.num_state
-            reach["patched"] = real_patch(self, model_obj)
-            captured["runtime"] = self
-            return reach["patched"]
+    def spy_patch(self, model_obj):
+        layers = self._hybrid_plan.layers
+        reach["expected"] = layers.num_attention + layers.num_state
+        reach["num_state"] = layers.num_state
+        reach["patched"] = real_patch(self, model_obj)
+        captured["runtime"] = self
+        return reach["patched"]
 
-        mamba2.Mamba2PagedStateWrapper.__call__ = spy_call
-        hybrid.HybridPagedAttentionRuntime.patch_model = spy_patch
+    mamba2.Mamba2PagedStateWrapper.__call__ = spy_call
+    hybrid.HybridPagedAttentionRuntime.patch_model = spy_patch
 
     llm = LLM(
         model=model,
@@ -197,7 +192,7 @@ def run_vllm_child(
     sp = SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True)
     tokens = {o.prompt: list(o.outputs[0].token_ids) for o in llm.generate(PROMPTS, sp)}
     state = None
-    if paged and check_state:
+    if check_state:
         llm.generate([PROMPTS[0]], sp)
         cache = captured["runtime"].state_cache
         slot = reach["slot"]
@@ -232,18 +227,15 @@ def main() -> int:
     )
     parser.add_argument("--model", default=MODEL_DEFAULT)
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--arm", choices=("paged", "nonpaged"), default="paged")
     parser.add_argument("--check-state", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=4)
     args = parser.parse_args()
-    paged = args.arm == "paged"
-    check_state = args.check_state and paged
+    check_state = args.check_state
 
     vllm_arm = _run(
         run_vllm_child,
         args.model,
         args.max_tokens,
-        paged,
         check_state,
         args.max_num_seqs,
     )
@@ -262,22 +254,21 @@ def main() -> int:
             ok = False
         print(f"[{verdict}] {prompt!r}")
         print(f"    mlx_lm: {mlx['tokens'][prompt]}")
-        print(f"    {args.arm}: {vllm_arm['tokens'][prompt]}")
+        print(f"    paged: {vllm_arm['tokens'][prompt]}")
         if report is not None:
             token, logit, rank = report["other"]
             print(
                 f"    diverges at {report['index']}: mlx_lm top3={report['top3']}, "
-                f"{args.arm} token {token} logit {logit} (rank {rank}, "
+                f"paged token {token} logit {logit} (rank {rank}, "
                 f"{report['margin_ulps']} bf16 ULPs behind)"
             )
-    if paged:
-        reach = vllm_arm["reach"]
-        print(
-            f"reach: patched={reach['patched']} expected={reach['expected']} "
-            f"wrapper_calls={reach['wrapper_calls']}"
-        )
-        ok &= reach["patched"] == reach["expected"]
-        ok &= reach["wrapper_calls"] >= len(PROMPTS) * reach["num_state"]
+    reach = vllm_arm["reach"]
+    print(
+        f"reach: patched={reach['patched']} expected={reach['expected']} "
+        f"wrapper_calls={reach['wrapper_calls']}"
+    )
+    ok &= reach["patched"] == reach["expected"]
+    ok &= reach["wrapper_calls"] >= len(PROMPTS) * reach["num_state"]
     if check_state:
         ref_conv, ref_ssm = mlx["state"]
         conv, ssm = vllm_arm["state"]

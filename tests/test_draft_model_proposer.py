@@ -126,7 +126,6 @@ def _request_state(
     return RequestState(
         token_ids=list(token_ids),
         prompt_len=len(token_ids),
-        cache=[],
         sampling_params=sampling_params or SamplingParams(temperature=0.0),
         block_ids=[list(committed_block_ids)],
         num_computed_tokens=num_computed_tokens,

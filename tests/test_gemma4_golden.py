@@ -49,7 +49,7 @@ Regenerate goldens with:
     # mlx_lm reference (no env vars required)
     python tools/gen_gemma4_golden.py <model-path>
     # paged-path reference (engine must run)
-    VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_METAL_USE_PAGED_ATTENTION=1 \\
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 \\
         python tools/gen_gemma4_golden.py --paged <model-path>
 
 Run tests:
@@ -306,7 +306,6 @@ def _paged_env_for_golden_class():
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         yield
 
 

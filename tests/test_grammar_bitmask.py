@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.v1.model_runner as mr
@@ -728,43 +727,6 @@ class TestApplyGrammarBitmaskPaged:
 
 
 # ---------------------------------------------------------------------------
-# execute_model — non-paged path raises early for structured output
-# ---------------------------------------------------------------------------
-
-
-class TestSampleTokensGrammarNonPagedPath:
-    def _make_runner(self) -> mr.MetalModelRunner:
-        return make_stub_runner()
-
-    def test_non_paged_path_raises_early_in_execute_model(self) -> None:
-        """Non-paged path must raise NotImplementedError in execute_model before
-        any forward pass runs, when structured output is requested."""
-        runner = self._make_runner()
-        scheduler_output = _make_scheduler_output(
-            [], has_structured_output_requests=True
-        )
-
-        with pytest.raises(NotImplementedError, match="non-paged"):
-            runner.execute_model(scheduler_output)
-
-    def test_non_paged_path_no_raise_without_grammar(self) -> None:
-        """Non-paged path with grammar_output=None must return output normally."""
-        runner = self._make_runner()
-        pending = ModelRunnerOutput(
-            req_ids=["r0"],
-            req_id_to_index={"r0": 0},
-            sampled_token_ids=[[5]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[None],
-        )
-        runner._pending_output = pending
-
-        out = runner.sample_tokens(grammar_output=None)
-        assert out is pending
-
-
-# ---------------------------------------------------------------------------
 # sample_tokens — paged path applies grammar bitmask before sampling
 # ---------------------------------------------------------------------------
 
@@ -791,7 +753,6 @@ class TestSampleTokensGrammarPagedPath:
         req_state = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=0,

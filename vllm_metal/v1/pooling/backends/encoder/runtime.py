@@ -161,7 +161,6 @@ class MetalEncoderPoolingBackend:
                 new_req,
                 model_config,
                 pooling_backend=self,
-                paged_attention_enabled=False,
             )
             if new_req.pooling_params is None:
                 raise RuntimeError(

@@ -1016,7 +1016,7 @@ class TestRequireUniformKvHeads:
         args = {"num_global_key_value_heads": 2}
         num_kv_heads = 8
         adapter = DefaultModelAdapter()
-        with pytest.raises(ValueError, match="VLLM_METAL_USE_PAGED_ATTENTION=0"):
+        with pytest.raises(ValueError, match="without per-layer shape support"):
             adapter.require_uniform_kv_heads(args, num_kv_heads)
 
 

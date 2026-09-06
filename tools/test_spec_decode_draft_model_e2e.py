@@ -100,7 +100,6 @@ def _set_env():
     """Force the paged path (spec-decode verify requires it) with headroom."""
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         if os.environ.get("VLLM_METAL_MEMORY_FRACTION") is None:
             mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
         yield

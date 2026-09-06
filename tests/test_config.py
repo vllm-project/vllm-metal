@@ -31,14 +31,12 @@ class TestMetalConfig:
         assert config.memory_fraction == AUTO_MEMORY_FRACTION
         assert config.is_auto_memory is True
         assert config.mlx_device == "gpu"
-        assert config.use_paged_attention is True
         assert config.multimodal_mode == "auto"
 
     def test_custom_config_from_env(self, monkeypatch) -> None:
         """Test configuration from environment variables."""
         monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", "0.75")
         monkeypatch.setenv("VLLM_MLX_DEVICE", "cpu")
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
 
         config = MetalConfig.from_env()
@@ -46,13 +44,6 @@ class TestMetalConfig:
         assert config.memory_fraction == 0.75
         assert config.mlx_device == "cpu"
         assert config.multimodal_mode == "multimodal-native"
-
-    def test_paged_attention_can_be_disabled(self, monkeypatch) -> None:
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-
-        config = MetalConfig.from_env()
-
-        assert config.use_paged_attention is False
 
     def test_get_config_singleton(self) -> None:
         """Test that get_config returns a singleton."""
@@ -100,21 +91,11 @@ class TestMetalConfig:
         assert config.memory_fraction == 0.5
         assert config.is_auto_memory is False
 
-    def test_explicit_fraction_requires_paged_attention(self) -> None:
-        """Test that explicit memory fraction without paged attention is rejected."""
-        with pytest.raises(ValueError, match="only supported with paged attention"):
-            MetalConfig(
-                memory_fraction=0.7,
-                mlx_device="gpu",
-                use_paged_attention=False,
-            )
-
     def test_fraction_above_one_rejected(self) -> None:
         with pytest.raises(ValueError, match="Invalid VLLM_METAL_MEMORY_FRACTION"):
             MetalConfig(
                 memory_fraction=1.5,
                 mlx_device="gpu",
-                use_paged_attention=True,
             )
 
     def test_fraction_zero_or_negative_rejected(self) -> None:
@@ -123,7 +104,6 @@ class TestMetalConfig:
                 MetalConfig(
                     memory_fraction=fraction,
                     mlx_device="gpu",
-                    use_paged_attention=True,
                 )
 
     def test_turboquant_defaults(self) -> None:
@@ -139,19 +119,7 @@ class TestMetalConfig:
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
-                use_paged_attention=True,
                 multimodal_mode=mode,  # type: ignore[arg-type]
-            )
-
-    def test_turboquant_requires_paged_attention(self) -> None:
-        """Test that turboquant=True without paged attention is rejected."""
-        with pytest.raises(ValueError, match="turboquant requires paged attention"):
-            MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
-                mlx_device="gpu",
-                use_paged_attention=False,
-                turboquant=True,
-                k_quant="uint8",
             )
 
     def test_turboquant_invalid_k_quant_rejected(self) -> None:
@@ -160,7 +128,6 @@ class TestMetalConfig:
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
-                use_paged_attention=True,
                 turboquant=True,
                 k_quant="fp16",
             )
@@ -171,7 +138,6 @@ class TestMetalConfig:
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
-                use_paged_attention=True,
                 turboquant=True,
                 k_quant="q8_0",
                 v_quant="fp16",

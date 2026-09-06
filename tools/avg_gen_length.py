@@ -8,15 +8,15 @@ Usage:
         --repo-type dataset --local-dir . ShareGPT_V3_unfiltered_cleaned_split.json
 
     # Batch size 1 (sequential):
-    VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
+    VLLM_METAL_MEMORY_FRACTION=0.7 \
         python tools/avg_gen_length.py --max-num-seqs 1
 
     # Batch size 8:
-    VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
+    VLLM_METAL_MEMORY_FRACTION=0.7 \
         python tools/avg_gen_length.py --max-num-seqs 8
 
     # Compare both in one run (reloads model for each):
-    VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
+    VLLM_METAL_MEMORY_FRACTION=0.7 \
         python tools/avg_gen_length.py --max-num-seqs 1 8
 """
 

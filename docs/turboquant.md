@@ -5,13 +5,13 @@ vllm-metal supports TurboQuant-based KV cache compression: a Walsh–Hadamard ro
 ## Quick Start
 
 ```bash
-VLLM_METAL_USE_PAGED_ATTENTION=1 vllm serve meta-llama/Llama-3.2-1B-Instruct \
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
   --dtype bfloat16 \
   --max-model-len 32768 \
   --additional-config '{"turboquant": true, "k_quant": "q8_0", "v_quant": "q3_0"}'
 ```
 
-TurboQuant is controlled via vLLM's `--additional-config` JSON, not a separate environment variable. Paged attention (`VLLM_METAL_USE_PAGED_ATTENTION=1`) is required.
+TurboQuant is controlled via vLLM's `--additional-config` JSON, not a separate environment variable.
 
 ## Configuration
 
@@ -59,7 +59,6 @@ At `max_model_len=32768` on Llama-3.2-1B, the default `q8_0/q3_0` configuration 
 
 ## Requirements and Caveats
 
-- **Paged attention is required** (`VLLM_METAL_USE_PAGED_ATTENTION=1`). TurboQuant cannot run on the MLX KV cache path.
 - **MHA and hybrid (SDPA + GDN linear attention) models are supported.** In hybrid models, only the SDPA layers are compressed; GDN recurrent state stays at fp16 (it has no paged KV cache to quantize).
 - **MLA models are not supported.** Enabling `turboquant` on an MLA model raises `NotImplementedError` at startup rather than silently falling back.
 - **Head dim must be 64, 128, or 256** — sizes supported by the FWHT Metal kernel. Models outside this set are not supported yet.
@@ -86,7 +85,7 @@ Observed behavior:
 For production use with minimal quality impact:
 
 ```bash
-VLLM_METAL_USE_PAGED_ATTENTION=1 vllm serve meta-llama/Llama-3.2-1B-Instruct \
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
   --dtype bfloat16 \
   --max-model-len 65536 \
   --additional-config '{"turboquant": true, "k_quant": "q8_0", "v_quant": "q3_0"}'
@@ -97,7 +96,7 @@ VLLM_METAL_USE_PAGED_ATTENTION=1 vllm serve meta-llama/Llama-3.2-1B-Instruct \
 For memory-bound workloads where some quality loss is acceptable:
 
 ```bash
-VLLM_METAL_USE_PAGED_ATTENTION=1 vllm serve meta-llama/Llama-3.2-1B-Instruct \
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
   --dtype bfloat16 \
   --max-model-len 65536 \
   --additional-config '{"turboquant": true, "k_quant": "q4_0", "v_quant": "q3_0"}'

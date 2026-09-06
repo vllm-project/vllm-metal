@@ -129,7 +129,6 @@ def test_awq_e2e_paged_runner_smoke():
     try:
         with monkeypatch_ctx as mp:
             mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-            mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
             mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
             llm = LLM(

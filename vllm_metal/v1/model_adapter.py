@@ -375,9 +375,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 f"Paged attention does not support variable KV head count "
                 f"without per-layer shape support: "
                 f"num_key_value_heads={num_kv_heads}, "
-                f"num_global_key_value_heads={global_kv_heads}. "
-                f"Use VLLM_METAL_USE_PAGED_ATTENTION=0 to fall back to the "
-                f"non-paged path."
+                f"num_global_key_value_heads={global_kv_heads}."
             )
 
     def text_model(self, model: Any) -> Any:

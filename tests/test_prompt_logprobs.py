@@ -313,43 +313,6 @@ class TestRunnerWiring:
 
         assert output.prompt_logprobs_dict == {"req-0": tensors}
 
-    def test_prefill_single_populates_prompt_logprobs(self) -> None:
-        from types import SimpleNamespace
-
-        from vllm.sampling_params import SamplingParams
-
-        vocab = 32
-        prompt = [4, 7, 1, 9]
-        rows = mx.arange(len(prompt) * vocab, dtype=mx.float32).reshape(
-            1, len(prompt), vocab
-        ) * mx.array([0.01])
-
-        class _TinyModel(SimpleNamespace):
-            def make_cache(self):
-                return []
-
-            def __call__(self, input_ids, cache=None):
-                return rows
-
-        runner = self._runner()
-        runner.model = _TinyModel()
-
-        next_token, _cache, _logprobs, prompt_logprobs = runner._prefill_single(
-            prompt,
-            SamplingParams(temperature=0, prompt_logprobs=1),
-        )
-
-        assert isinstance(next_token, int)
-        assert prompt_logprobs is not None
-        assert prompt_logprobs.logprob_token_ids.shape == (len(prompt) - 1, 2)
-        assert prompt_logprobs.logprob_token_ids[:, 0].tolist() == prompt[1:]
-
-        # Without the flag the extra work is skipped entirely.
-        _, _, _, none_logprobs = runner._prefill_single(
-            prompt, SamplingParams(temperature=0)
-        )
-        assert none_logprobs is None
-
     def test_paged_gather_delivers_on_completing_chunk(self) -> None:
         from vllm.sampling_params import SamplingParams
 
@@ -463,7 +426,6 @@ def test_prompt_logprobs_end_to_end_paged():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
         llm = LLM(

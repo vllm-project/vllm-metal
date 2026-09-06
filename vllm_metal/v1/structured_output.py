@@ -31,7 +31,7 @@ class MetalStructuredOutputApplier:
 
     Instantiate once on MetalModelRunner and call apply_paged() from
     _sample_paged_batch(). The class boundary keeps future extensions
-    (e.g. non-paged path, xgrammar allocator caching) out of model_runner.py.
+    (e.g. xgrammar allocator caching) out of model_runner.py.
     """
 
     def apply_paged(

@@ -26,9 +26,9 @@ from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import RequestStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
-from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
+from vllm_metal.v1.sampling_batch import _SamplingResult
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 
@@ -179,76 +179,6 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
 
-    def test_accumulates_streamed_segments(self, monkeypatch) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_stream_generate(model, tokenizer, prompt, max_tokens=256, **kwargs):
-            captured["model"] = model
-            captured["prompt"] = prompt
-            captured["max_tokens"] = max_tokens
-            captured["kwargs"] = kwargs
-            yield SimpleNamespace(text="hello")
-            yield SimpleNamespace(text=" ")
-            yield SimpleNamespace(text="world")
-
-        monkeypatch.setattr(mr, "stream_generate", fake_stream_generate)
-
-        runner = self._make_runner()
-        out = runner.generate("p", max_tokens=3, temperature=0.0)
-
-        assert out == "hello world"
-        assert captured["model"] is runner.model
-        assert captured["prompt"] == "p"
-        assert captured["max_tokens"] == 3
-        kwargs = captured.get("kwargs")
-        assert isinstance(kwargs, dict)
-        # mlx_lm 0.29+ uses sampler parameter instead of temp
-        assert "sampler" in kwargs
-        assert callable(kwargs["sampler"])
-
-    def test_passes_sampler_for_temperature_sampling(self, monkeypatch) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_stream_generate(model, tokenizer, prompt, max_tokens=256, **kwargs):
-            captured["kwargs"] = kwargs
-            assert "sampler" in kwargs
-            assert callable(kwargs["sampler"])
-            yield SimpleNamespace(text="a")
-            yield SimpleNamespace(text="b")
-
-        monkeypatch.setattr(mr, "stream_generate", fake_stream_generate)
-
-        runner = self._make_runner()
-        out = runner.generate("p", max_tokens=2, temperature=0.5)
-
-        assert out == "ab"
-        kwargs = captured.get("kwargs")
-        assert isinstance(kwargs, dict)
-        assert "sampler" in kwargs
-
-    def test_uses_forward_model_for_vlm_composite(self, monkeypatch) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_stream_generate(model, tokenizer, prompt, max_tokens=256, **kwargs):
-            captured["model"] = model
-            yield SimpleNamespace(text="ok")
-
-        monkeypatch.setattr(mr, "stream_generate", fake_stream_generate)
-
-        language_model = object()
-        runner = self._make_runner()
-        runner.model = SimpleNamespace(language_model=object())
-        runner._multimodal_adapter = Qwen3VLMultimodalAdapter(
-            spatial_merge_size=2,
-            language_model=language_model,
-        )
-        runner._is_vlm = True
-
-        out = runner.generate("p", max_tokens=1)
-
-        assert out == "ok"
-        assert captured["model"] is language_model
-
 
 class TestV1MetalModelRunnerSampleTokens:
     """Tests for `MetalModelRunner.sample_tokens`.
@@ -261,23 +191,6 @@ class TestV1MetalModelRunnerSampleTokens:
 
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner()
-
-    def test_returns_pending_output_and_clears_state(self) -> None:
-        runner = self._make_runner()
-        pending = ModelRunnerOutput(
-            req_ids=["req-0"],
-            req_id_to_index={"req-0": 0},
-            sampled_token_ids=[[123]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[None],
-        )
-        runner._pending_output = pending
-
-        out = runner.sample_tokens(grammar_output=None)
-
-        assert out is pending
-        assert runner._pending_output is None
 
     def test_take_draft_token_ids_returns_and_clears_state(self) -> None:
         runner = self._make_runner()
@@ -328,7 +241,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         return mr.RequestState(
             token_ids=token_ids,
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=temperature),
             generator=None,
             generated_tokens=len(token_ids) - 1,
@@ -1252,7 +1164,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             del sampler
             sampled_rows.append(logits_2d.tolist())
             assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]
-            return mr._SamplingResult([4])
+            return _SamplingResult([4])
 
         monkeypatch.setattr(mr, "sample_from_logits", fake_sample_from_logits)
 
@@ -1481,15 +1393,7 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.req_ids == []
         assert out.req_id_to_index == {}
         assert out.sampled_token_ids == []
-        assert runner._pending_output is None
-
-    def test_non_paged_cached_request_without_state_raises(self) -> None:
-        runner = self._make_runner()
-
-        with pytest.raises(RuntimeError, match="req-0"):
-            runner.execute_model(self._make_scheduler_output(["req-0"]))
-
-        assert runner._pending_output is None
+        assert runner._execute_model_state is None
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
@@ -1504,13 +1408,13 @@ class TestV1MetalModelRunnerExecuteModel:
         with pytest.raises(RuntimeError, match="req-0"):
             runner.execute_model(self._make_scheduler_output(["req-0"]))
 
-        assert runner._pending_output is None
+        assert runner._execute_model_state is None
 
     def test_missing_cached_request_fails_before_new_prefill(self, monkeypatch) -> None:
         runner = self._make_runner()
         monkeypatch.setattr(
             runner,
-            "_prefill_single",
+            "_start_paged_forward",
             lambda *args, **kwargs: pytest.fail("prefill should not run"),
         )
         new_req = self._make_new_request()
@@ -1524,7 +1428,7 @@ class TestV1MetalModelRunnerExecuteModel:
             )
 
         assert "new" not in runner._request_states
-        assert runner._pending_output is None
+        assert runner._execute_model_state is None
 
     def test_missing_cached_request_materializes_released_gdn_state(self) -> None:
         cache = GDNPagedStateCache(
@@ -1543,7 +1447,6 @@ class TestV1MetalModelRunnerExecuteModel:
         runner._request_states["done"] = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=0,
@@ -1571,28 +1474,6 @@ class TestV1MetalModelRunnerExecuteModel:
         np.testing.assert_array_equal(np.array(cache.recurrent_states[0][slot]), 9)
         assert runtime.state_manager.needs_materialize is False
 
-    def test_non_paged_spec_decode_fails_after_cleanup_before_new_state(self) -> None:
-        runner = self._make_runner()
-        runner._request_states["done"] = mr.RequestState(
-            token_ids=[1],
-            prompt_len=1,
-            cache=[],
-            sampling_params=SamplingParams(),
-            generator=None,
-            generated_tokens=0,
-        )
-        scheduler_output = self._make_scheduler_output(
-            finished_req_ids={"done"},
-            scheduled_spec_decode_tokens={"req-0": [7]},
-            scheduled_new_reqs=[self._make_new_request()],
-        )
-
-        with pytest.raises(NotImplementedError, match="requires paged attention"):
-            runner.execute_model(scheduler_output)
-
-        assert "done" not in runner._request_states
-        assert "new" not in runner._request_states
-
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
         runner._paged_attention_runtime = MHAPagedAttentionRuntime(
@@ -1605,7 +1486,6 @@ class TestV1MetalModelRunnerExecuteModel:
         req_state = mr.RequestState(
             token_ids=[1, 6],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=1,
@@ -1823,7 +1703,6 @@ class TestV1MetalModelRunnerGDNSubmit:
         runner._request_states["done"] = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=0,
@@ -1925,7 +1804,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
         state = mr.RequestState(
             token_ids=[1, 2],
             prompt_len=2,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=0,
@@ -2000,7 +1878,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
         decode_state = mr.RequestState(
             token_ids=[5, 6],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=1,
@@ -2050,7 +1927,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
         runner._request_states["done"] = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             generator=None,
             generated_tokens=0,
@@ -2348,7 +2224,6 @@ class TestStartPagedForwardSelectiveLogits:
         return mr.RequestState(
             token_ids=token_ids,
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=len(token_ids) - 1,
@@ -2407,7 +2282,7 @@ class TestLoadModelPipelineSplitOrdering:
         runner = make_stub_runner(
             pp=PipelineGroup(_FakeGroup()),
             model_config=SimpleNamespace(runner_type="generate", hf_config=None),
-            metal_config=SimpleNamespace(use_paged_attention=True),
+            metal_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
@@ -2430,7 +2305,7 @@ class TestSelectiveLogitsLoRAGate:
     def _load(self, *, lora_enabled: bool) -> mr.MetalModelRunner:
         runner = make_stub_runner(
             model_config=SimpleNamespace(runner_type="generate", hf_config=None),
-            metal_config=SimpleNamespace(use_paged_attention=True),
+            metal_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
@@ -2634,7 +2509,6 @@ class TestPipelineGateSpecDecodeDerivation:
             "r0": mr.RequestState(
                 token_ids=[1, 7],
                 prompt_len=1,
-                cache=[],
                 sampling_params=SamplingParams(temperature=0.7, top_k=20, top_p=0.95),
                 generator=None,
                 generated_tokens=1,
@@ -2753,7 +2627,6 @@ class TestDeferredDecodeSampleThreading:
         return mr.RequestState(
             token_ids=[3, 9],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=1,
@@ -2796,7 +2669,6 @@ class TestDeferredDecodeSampleThreading:
         return mr.RequestState(
             token_ids=[3, 9],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.7, top_k=1, top_p=1.0),
             generator=None,
             generated_tokens=1,
@@ -3330,7 +3202,6 @@ class TestIntermediateBodyOnlyForward:
             state = mr.RequestState(
                 token_ids=[3, 9],
                 prompt_len=1,
-                cache=[],
                 sampling_params=SamplingParams(temperature=0.0),
                 generator=None,
                 generated_tokens=1,
@@ -3421,7 +3292,7 @@ class TestIntermediateBodyOnlyForward:
         runner = make_stub_runner(
             model=SimpleNamespace(model=_body_stub),
             model_config=SimpleNamespace(runner_type="generate", hf_config=None),
-            metal_config=SimpleNamespace(use_paged_attention=True),
+            metal_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
@@ -3613,7 +3484,6 @@ class TestIntermediateBodyOnlyForward:
         state = mr.RequestState(
             token_ids=[3, 9],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=1,
@@ -3673,7 +3543,6 @@ class TestStateBlockIdLifecycle:
         runner._request_states["r"] = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             block_ids=[[40]],
         )
@@ -3699,7 +3568,6 @@ class TestStateBlockIdLifecycle:
         runner._request_states["r"] = mr.RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=SamplingParams(),
             block_ids=[[40]],
         )

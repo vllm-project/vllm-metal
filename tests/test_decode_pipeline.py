@@ -179,7 +179,7 @@ class TestGate:
         [
             ("pipeline_enabled", False, "pipeline disabled"),
             ("use_async_scheduling", False, "async scheduling off"),
-            ("paged_runtime_active", False, "non-paged path"),
+            ("paged_runtime_active", False, "paged runtime not initialized"),
             ("is_pooling", True, "pooling model"),
             ("pp_active", True, "pipeline parallelism"),
             (

@@ -53,7 +53,6 @@ SUFFIXES = (
 def _child_env() -> None:
     for key, val in (
         ("VLLM_ENABLE_V1_MULTIPROCESSING", "0"),
-        ("VLLM_METAL_USE_PAGED_ATTENTION", "1"),
         ("VLLM_METAL_MEMORY_FRACTION", "0.5"),
     ):
         os.environ.setdefault(key, val)

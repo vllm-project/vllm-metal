@@ -45,7 +45,6 @@ The Metal runner rejects these cases with diagnostic errors:
   `STEP`)
 - generic token-level pooling outside the BGE-M3 `token_classify` path
 - chunked long-input embedding aggregation (`enable_chunked_processing`)
-- non-paged decoder pooling execution
 - multimodal embeddings and scheduled encoder inputs
 - prompt embeddings
 - unsafe dimension requests
@@ -58,8 +57,7 @@ is validated end to end.
 
 ## Usage
 
-Set `VLLM_METAL_USE_PAGED_ATTENTION=1` for decoder pooling models. Encoder
-pooling models such as BGE-M3 do not use decoder KV cache or paged attention.
+Encoder pooling models such as BGE-M3 do not use decoder KV cache or paged attention.
 
 ### Offline Embeddings
 
@@ -79,7 +77,6 @@ print(len(outputs), len(outputs[0].outputs.embedding))
 
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-VLLM_METAL_USE_PAGED_ATTENTION=1 \
 VLLM_METAL_MEMORY_FRACTION=auto \
 vllm serve mlx-community/Qwen3-Embedding-0.6B-8bit \
   --runner pooling \
@@ -155,7 +152,6 @@ print(outputs[0].outputs.score)
 
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-VLLM_METAL_USE_PAGED_ATTENTION=1 \
 VLLM_METAL_MEMORY_FRACTION=auto \
 vllm serve mku64/Qwen3-Reranker-0.6B-mlx-8Bit \
   --revision ba80418a47fa1c4368a6c2287b0e449904063576 \

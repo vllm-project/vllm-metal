@@ -92,7 +92,6 @@ def main() -> int:
 
     env = os.environ.copy()
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
-    env.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
     env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.8")
 
     failures: list[tuple[str, int]] = []

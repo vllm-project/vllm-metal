@@ -127,39 +127,6 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
     }
 
 
-def test_hybrid_one_sequence_estimate_charges_vllm_group_padding() -> None:
-    """vLLM pads 5 state layers to 6 groups of 2 attention layers; charge them."""
-    plan = make_nemotron_hybrid_plan("MMMMM**")
-    runner = make_stub_runner(
-        model_config=SimpleNamespace(
-            runner_type="generate",
-            get_head_size=lambda: 128,
-            max_model_len=2048,
-            is_hybrid=True,
-        ),
-        num_layers=7,
-        hybrid_runtime_plan=plan,
-        num_kv_heads=1,
-        head_dim=128,
-        kv_cache_dtype=mx.float16,
-        cache_config=SimpleNamespace(
-            block_size=544,
-            mamba_page_size_padded=None,
-            mamba_block_size=2048,
-            mamba_cache_mode="none",
-        ),
-    )
-    attention_layer_bytes = 2 * cdiv(2048, 544) * 544 * 2 * 1 * 128
-    state_layer_bytes = plan.state_bytes_per_layer()
-    expected = 2 * attention_layer_bytes + 6 * state_layer_bytes
-
-    estimate = runner._cache_policy.estimate_one_sequence_kv_bytes(
-        max_model_len=2048, block_size=544
-    )
-
-    assert estimate == expected
-
-
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     attention_block_size = 544
     max_model_len = 2048

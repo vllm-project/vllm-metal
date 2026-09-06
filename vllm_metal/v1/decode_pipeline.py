@@ -68,7 +68,7 @@ class RunnerCapabilities:
         blockers = (
             (not self.pipeline_enabled, "pipeline disabled"),
             (not self.use_async_scheduling, "async scheduling off"),
-            (not self.paged_runtime_active, "non-paged path"),
+            (not self.paged_runtime_active, "paged runtime not initialized"),
             (self.is_pooling, "pooling model"),
             (self.pp_active, "pipeline parallelism"),
             (

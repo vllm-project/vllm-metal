@@ -184,7 +184,6 @@ class TestSpecDecodePolicy:
         SpeculativeDecodeController().validate_supported(
             _scheduler_output(scheduled_spec_decode_tokens={}),
             (),
-            paged_attention_enabled=False,
             is_hybrid=True,
         )
 
@@ -193,19 +192,9 @@ class TestSpecDecodePolicy:
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={}),
                 (),
-                paged_attention_enabled=True,
                 is_hybrid=False,
                 use_async_scheduling=True,
                 speculative_config=_gemma4_mtp_speculative_config(),
-            )
-
-    def test_non_paged_scheduled_tokens_are_rejected(self) -> None:
-        with pytest.raises(NotImplementedError, match="requires paged attention"):
-            SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
-                [("r0", _request_state())],
-                paged_attention_enabled=False,
-                is_hybrid=False,
             )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
@@ -213,7 +202,6 @@ class TestSpecDecodePolicy:
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=True,
             )
 
@@ -222,7 +210,6 @@ class TestSpecDecodePolicy:
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=False,
             )
 
@@ -234,7 +221,6 @@ class TestSpecDecodePolicy:
                     num_invalid_spec_tokens={"r0": 1},
                 ),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=False,
             )
 
@@ -243,7 +229,6 @@ class TestSpecDecodePolicy:
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"missing": [1]}),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=False,
             )
 
@@ -252,7 +237,6 @@ class TestSpecDecodePolicy:
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"missing": []}),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=False,
             )
 
@@ -264,7 +248,6 @@ class TestSpecDecodePolicy:
                     num_scheduled_tokens={"r0": 2},
                 ),
                 [("r0", _request_state())],
-                paged_attention_enabled=True,
                 is_hybrid=False,
             )
 
@@ -474,7 +457,6 @@ class TestSchedulerPaddedDrafts:
         SpeculativeDecodeController().validate_supported(
             scheduler_output,
             [],
-            paged_attention_enabled=True,
             is_hybrid=False,
         )
 

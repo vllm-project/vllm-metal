@@ -313,7 +313,6 @@ class TestTextOnlyRoutingForExplicitPositionsAdapter:
         state = RequestState(
             token_ids=[1, 2, 3, 4, 5, 6],
             prompt_len=5,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=None,
         )
@@ -383,7 +382,6 @@ class TestMmDecodeSegmentPositions:
         state = RequestState(
             token_ids=[1, 2, 3, 4, 5, 6],
             prompt_len=5,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=-3,
         )
@@ -427,7 +425,6 @@ class TestMmDecodeSegmentPositions:
         state = RequestState(
             token_ids=[1, 2, 3, 4, 5, 6],
             prompt_len=5,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=-3,
         )
@@ -471,7 +468,6 @@ class TestMmDecodeSegmentPositions:
         text_state = RequestState(
             token_ids=[1, 2, 3, 4, 5],
             prompt_len=4,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=None,
         )
@@ -721,7 +717,6 @@ class TestMmPrefillDeltaRoundTrip:
         runner._request_states["req-0"] = RequestState(
             token_ids=[99, 11],  # prompt only (no sampled token yet)
             prompt_len=2,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             mrope_position_delta=None,
         )

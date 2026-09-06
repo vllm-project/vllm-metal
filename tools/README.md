@@ -77,7 +77,7 @@ cache-on by toggling `--enable-prefix-caching` / `--no-enable-prefix-caching`.
 
 ```bash
 # Adjust MEMORY_FRACTION based on available RAM (lower if OOM).
-VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.7 \
+VLLM_METAL_MEMORY_FRACTION=0.7 \
   vllm serve Qwen/Qwen3-0.6B \
     --port 8000 --max-model-len 2048 --max-num-seqs 8 \
     --enable-prefix-caching

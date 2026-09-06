@@ -81,7 +81,6 @@ def _ordinary_paged_cache(monkeypatch):
         lambda: MetalConfig(
             memory_fraction=-1.0,
             mlx_device="gpu",
-            use_paged_attention=True,
             turboquant=False,
         ),
     )

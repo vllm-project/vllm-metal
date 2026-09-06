@@ -18,12 +18,6 @@ not a kernel bug. We keep a paged-specific fallback for that one prompt.
 Run (paged KV path, the default):
     python -m pytest tests/test_paged_deterministic.py -v -s -m slow
 
-To test the MLX inline cache path instead, pass env vars explicitly:
-    VLLM_METAL_USE_PAGED_ATTENTION=0 VLLM_METAL_MEMORY_FRACTION=auto \
-        python -m pytest tests/test_paged_deterministic.py -v -s -m slow
-
-Note: MLX requires VLLM_METAL_MEMORY_FRACTION=auto (numeric fractions are
-only valid for the paged attention path).
 """
 
 from __future__ import annotations
@@ -35,9 +29,7 @@ from vllm import LLM, SamplingParams
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
-DEFAULT_USE_PAGED_ATTENTION = "1"
 DEFAULT_PAGED_MEMORY_FRACTION = "0.2"
-DEFAULT_MLX_MEMORY_FRACTION = "auto"
 
 PROMPTS = [
     "The capital of France is",
@@ -92,28 +84,11 @@ def _set_env():
 
     Uses MonkeyPatch.context() so env changes are automatically reverted
     after the module, avoiding side effects on other tests.
-
-    Defaults to the paged KV cache path to ensure the test actually exercises
-    the paged attention kernel, but respects any env vars already set by the
-    user (e.g. to run the MLX path).
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-        # Default to paged attention, but allow explicit caller override.
-        use_paged = _setenv_default(
-            mp,
-            "VLLM_METAL_USE_PAGED_ATTENTION",
-            DEFAULT_USE_PAGED_ATTENTION,
-        )
-
-        # Choose a path-specific memory default, while preserving caller override.
-        memory_default = (
-            DEFAULT_PAGED_MEMORY_FRACTION
-            if use_paged == "1"
-            else DEFAULT_MLX_MEMORY_FRACTION
-        )
-        _setenv_default(mp, "VLLM_METAL_MEMORY_FRACTION", memory_default)
+        _setenv_default(mp, "VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
         yield
 
 
@@ -132,17 +107,16 @@ def vllm_outputs():
         enable_prefix_caching=False,
     )
 
-    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") == "1":
-        runner = llm.llm_engine.model_executor.driver_worker.model_runner
-        assert runner._paged_attention_runtime is not None, (
-            "Paged attention backend not initialised"
-        )
-        from vllm_metal.attention.impls.sdpa_wrapper import (
-            SDPAPagedAttentionWrapper,
-        )
+    runner = llm.llm_engine.model_executor.driver_worker.model_runner
+    assert runner._paged_attention_runtime is not None, (
+        "Paged attention backend not initialised"
+    )
+    from vllm_metal.attention.impls.sdpa_wrapper import (
+        SDPAPagedAttentionWrapper,
+    )
 
-        attn = runner.model.model.layers[0].self_attn
-        assert isinstance(attn, SDPAPagedAttentionWrapper)
+    attn = runner.model.model.layers[0].self_attn
+    assert isinstance(attn, SDPAPagedAttentionWrapper)
 
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
     outputs = llm.generate(PROMPTS, sp)
@@ -160,9 +134,6 @@ class TestPagedDeterministic:
         mlx_expected = GOLDEN_MLX[prompt]
         fallback = GOLDEN_PAGED_FALLBACK.get(prompt)
 
-        print(
-            f"VLLM_METAL_USE_PAGED_ATTENTION: {os.environ.get('VLLM_METAL_USE_PAGED_ATTENTION')}"
-        )
         print(f"\n  prompt: {prompt!r}")
         print(f"  output: {text!r}")
         print(f"  ids:    {token_ids}")

@@ -95,9 +95,7 @@ class STTModelRunner:
         """No-op: STT does not run on the paged-attention path."""
         return None
 
-    def scheduler_memory_reporting_mode(
-        self, *, paged_attention_enabled: bool
-    ) -> Literal["stt_nominal"]:
+    def scheduler_memory_reporting_mode(self) -> Literal["stt_nominal"]:
         """STT allocates no KV cache, so report nominal scheduler memory."""
         return "stt_nominal"
 

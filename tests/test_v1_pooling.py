@@ -556,7 +556,7 @@ class TestMetalPoolingCapabilities:
 
         assert runner.supported_worker_tasks() == ()
 
-    def test_supported_worker_tasks_rejects_non_paged_pooling(self) -> None:
+    def test_supported_worker_tasks_requires_initialized_pooling_runtime(self) -> None:
         runner = _make_runner(paged=False)
 
         assert runner.supported_worker_tasks() == ()
@@ -601,9 +601,7 @@ class TestMetalPoolingCapabilities:
             _EncoderModel(),
         )
 
-        assert runner.scheduler_memory_reporting_mode(
-            paged_attention_enabled=False
-        ) == ("pooling_no_kv")
+        assert runner.scheduler_memory_reporting_mode() == ("pooling_no_kv")
         assert runner.get_kv_cache_spec() == {}
         runner.initialize_kv_cache(
             KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
@@ -615,7 +613,7 @@ class TestMetalPoolingCapabilities:
         runner._pooling_backend = None
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
         runner._model_lifecycle = lifecycle
-        runner.metal_config = SimpleNamespace(use_paged_attention=True)
+        runner.metal_config = SimpleNamespace()
         runner.scheduler_config = SimpleNamespace(
             max_num_seqs=1,
             max_num_batched_tokens=1,
@@ -1131,13 +1129,6 @@ class TestMetalPoolingFailFast:
         req = _new_req("req-0", [1, 2], task="embed")
 
         with pytest.raises(NotImplementedError, match="task='embed'"):
-            runner.execute_model(_scheduler_output(new_reqs=[req]))
-
-    def test_pooling_requires_paged_attention(self) -> None:
-        runner = _make_runner(paged=False)
-        req = _new_req("req-0", [1, 2], task="embed")
-
-        with pytest.raises(NotImplementedError, match="paged attention"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
     def test_encoder_pooling_rejects_chunked_requests(self) -> None:

@@ -23,17 +23,15 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     SlidingWindowSpec,
 )
 
-from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner  # noqa: E402
+from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
-    ModelCachePolicy,
     WorkerCachePlanner,
 )
-from vllm_metal.v1.model_adapter import DefaultModelAdapter  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
 
@@ -56,7 +54,7 @@ class TestKVCacheLayoutRpcs:
     def test_engine_resolves_metal_page_order_without_backend_probe(
         self, monkeypatch
     ) -> None:
-        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        worker = _make_worker(SimpleNamespace())
         monkeypatch.setattr(
             worker_base, "get_current_attn_backends", _refuse_backend_probe
         )
@@ -72,7 +70,7 @@ class TestKVCacheLayoutRpcs:
         assert vllm_config.cache_config.kv_cache_layout == KV_CACHE_LAYOUT
 
     def test_explicit_block_outermost_layout_fails_loud(self, monkeypatch) -> None:
-        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        worker = _make_worker(SimpleNamespace())
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "BLHNC")
 
         with pytest.raises(
@@ -90,7 +88,7 @@ class TestKVCacheLayoutRpcs:
 
     def test_initialize_from_config_records_resolved_layout(self) -> None:
         runner = SimpleNamespace(initialize_kv_cache=MagicMock())
-        worker = _make_worker(runner, use_paged_attention=True)
+        worker = _make_worker(runner)
         worker.cache_config = CacheConfig()
         kv_cache_config = KVCacheConfig(
             num_blocks=1,
@@ -109,13 +107,12 @@ def _refuse_backend_probe(vllm_config: object) -> None:
     raise AssertionError("worker answered the layout RPC via the backend probe")
 
 
-def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWorker:
+def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(
         memory_fraction=AUTO_MEMORY_FRACTION,
         mlx_device="gpu",
-        use_paged_attention=use_paged_attention,
     )
     worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
@@ -130,7 +127,7 @@ class TestWorkerRunnerBoundaryDelegation:
         from vllm_metal.v1 import worker as worker_module
         from vllm_metal.v1.stt_model_runner import STTModelRunner
 
-        worker = _make_worker(None, use_paged_attention=False)
+        worker = _make_worker(None)
         worker.model_config = SimpleNamespace(
             model="org/model", revision=revision, seed=0
         )
@@ -158,14 +155,12 @@ class TestWorkerRunnerBoundaryDelegation:
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(return_value="stt_nominal"),
         )
-        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker = _make_worker(model_runner)
 
         available = MetalWorker.determine_available_memory(worker)
 
         assert available == STT_SCHED_AVAILABLE_BYTES
-        model_runner.scheduler_memory_reporting_mode.assert_called_once_with(
-            paged_attention_enabled=True
-        )
+        model_runner.scheduler_memory_reporting_mode.assert_called_once_with()
 
     def test_determine_available_memory_paged_capacity_mode(
         self, monkeypatch: pytest.MonkeyPatch
@@ -180,7 +175,7 @@ class TestWorkerRunnerBoundaryDelegation:
             profile_run=MagicMock(return_value=measured_overhead),
             paged_attention_runtime=None,
         )
-        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker = _make_worker(model_runner)
         worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
 
         def _fake_setup(*, overhead: int) -> None:
@@ -202,223 +197,6 @@ class TestWorkerRunnerBoundaryDelegation:
         setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
-    def test_determine_available_memory_single_sequence_mode(self) -> None:
-        """MLX path budgets one sequence plus vLLM's reserved null block."""
-        model_runner = make_stub_runner(
-            num_layers=16,
-            num_kv_cache_layers=16,
-            num_kv_heads=8,
-            head_dim=128,
-            kv_cache_dtype=mx.float16,
-        )
-        model_runner.scheduler_memory_reporting_mode = MagicMock(
-            return_value="single_sequence_estimate"
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        model_runner.cache_config.block_size = worker.cache_config.block_size
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-
-        try:
-            available = MetalWorker.determine_available_memory(worker)
-
-            # Request: 2048 tokens. Reserved null block: 16 tokens.
-            bytes_per_token = 2 * 16 * 8 * 128 * 2
-            expected = bytes_per_token * (2048 + 16)
-            assert available == expected
-        finally:
-            pass
-
-
-class TestOneSequenceKvBytes:
-    """_one_sequence_kv_bytes must account for hybrid linear state and block alignment."""
-
-    def test_non_hybrid_counts_all_layers(self) -> None:
-        model_runner = make_stub_runner(
-            num_layers=16,
-            num_kv_cache_layers=16,
-            num_kv_heads=8,
-            head_dim=64,
-            kv_cache_dtype=mx.float16,
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        # block_size=16 divides 2048 evenly, so no padding
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16)
-        )
-
-        # Act
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        # Assert — 2 * 16 * 2048 * 8 * 64 * 2
-        assert result == 2 * 16 * 2048 * 8 * 64 * 2
-
-    def test_hybrid_adds_linear_state(self) -> None:
-        model_runner = make_stub_runner(
-            is_hybrid=True,
-            num_kv_heads=4,
-            head_dim=256,
-            kv_cache_dtype=mx.float16,
-            hybrid_runtime_plan=make_gdn_hybrid_plan(
-                12,
-                [0, 4, 8],
-                conv_kernel_dim=3,
-                conv_dim=5,
-                num_v_heads=2,
-                value_head_dim=7,
-                key_head_dim=11,
-            ),
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16)
-        )
-
-        # Act
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        # Assert — SDPA bytes + linear state
-        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
-        conv_bytes = (3 - 1) * 5 * mx.float16.size
-        recurrent_bytes = 2 * 7 * 11 * mx.float32.size
-        linear_bytes = 9 * (conv_bytes + recurrent_bytes)
-        assert result == sdpa_bytes + linear_bytes
-
-    def test_hybrid_uses_padded_mamba_page_size_when_set(self) -> None:
-        # vLLM checks admission against the reported MambaSpec, whose page
-        # size is padded to align with attention pages. The one-sequence
-        # estimate must count the padded pages, or admission of a max-length
-        # sequence falls short by the padding on every linear layer.
-        padded_page = 4096
-        model_runner = make_stub_runner(
-            is_hybrid=True,
-            num_kv_heads=4,
-            head_dim=256,
-            kv_cache_dtype=mx.float16,
-            hybrid_runtime_plan=make_gdn_hybrid_plan(
-                12,
-                [0, 4, 8],
-                conv_kernel_dim=3,
-                conv_dim=5,
-                num_v_heads=2,
-                value_head_dim=7,
-                key_head_dim=11,
-            ),
-            cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16)
-        )
-
-        # Act
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        # Assert — SDPA bytes + padded linear pages (not raw state bytes)
-        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
-        assert result == sdpa_bytes + 9 * padded_page
-
-    def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
-        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner.model_config = SimpleNamespace(is_hybrid=True)
-        runner._model_adapter = DefaultModelAdapter()
-        runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
-        runner.kv_cache_dtype = mx.float16
-        runner.hybrid_runtime_plan = make_gdn_hybrid_plan(
-            11,
-            range(8),
-            conv_kernel_dim=3,
-            conv_dim=5,
-            num_v_heads=2,
-            value_head_dim=7,
-            key_head_dim=11,
-        )
-
-        # Hand-written from the plan above: conv (3-1)*5 fp16 values = 20 B,
-        # recurrent 2*7*11 fp32 values = 616 B, over 3 state layers.
-        expected = 3 * (20 + 616)
-
-        assert runner.linear_cache_bytes_per_slot() == expected
-
-    def test_block_alignment_rounds_up_token_count(self) -> None:
-        """When block_size doesn't divide max_model_len evenly, the token
-        count must be rounded up to the next block boundary so that the
-        reported bytes match the scheduler's block-aligned accounting.
-
-        This reproduces the KV cache startup failure seen with Mamba-hybrid
-        models (e.g. Granite 4.0-H) where the attention block_size is padded
-        to 400 to match the mamba page size.
-        """
-        model_runner = make_stub_runner(
-            num_layers=4,
-            num_kv_cache_layers=4,
-            num_kv_heads=4,
-            head_dim=64,
-            kv_cache_dtype=mx.float16,
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        # block_size=400 (Mamba-hybrid): ceil(2048/400)=6, 6*400=2400 tokens
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=400)
-        )
-
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        # Should use 2400 tokens (block-aligned), not 2048
-        aligned_tokens = 2400  # ceil(2048/400) * 400
-        expected = 2 * 4 * aligned_tokens * 4 * 64 * 2
-        assert result == expected
-        # Verify this is strictly more than the unaligned calculation
-        unaligned = 2 * 4 * 2048 * 4 * 64 * 2
-        assert result > unaligned
-
-    def test_mla_uses_latent_only(self) -> None:
-        """MLA cache stores one latent vector per token, not K+V.
-
-        head_dim=576 represents kv_lora_rank + qk_rope_head_dim (e.g. GLM-4).
-        The 2x K/V factor must NOT be applied — kv_factor=1.
-        """
-        model_runner = make_stub_runner(
-            model_args={"kv_lora_rank": 512},
-            num_layers=4,
-            num_kv_cache_layers=4,
-            num_kv_heads=1,
-            head_dim=576,
-            kv_cache_dtype=mx.float16,
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16)
-        )
-
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        expected = 1 * 4 * 2048 * 1 * 576 * 2
-        assert result == expected
-
-    def test_yoco_uses_unique_cache_layers(self) -> None:
-        model_runner = make_stub_runner(
-            num_layers=28,
-            num_kv_cache_layers=24,
-            num_kv_heads=4,
-            head_dim=256,
-            kv_cache_dtype=mx.float16,
-        )
-        worker = _make_worker(model_runner, use_paged_attention=False)
-        worker.model_config = SimpleNamespace(max_model_len=2048)
-        worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16)
-        )
-
-        result = MetalWorker._one_sequence_kv_bytes(worker)
-
-        expected = 2 * 24 * 2048 * 4 * 256 * 2
-        assert result == expected
-
 
 class TestPagedAttentionPlanDiagnostics:
     def _make_planner(
@@ -429,7 +207,7 @@ class TestPagedAttentionPlanDiagnostics:
         block_size: int = 16,
         per_block_bytes: int = 1,
     ) -> WorkerCachePlanner:
-        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker = _make_worker(model_runner)
         worker.cache_config.block_size = block_size
         worker.metal_config.memory_fraction = memory_fraction
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
@@ -448,7 +226,7 @@ class TestPagedAttentionPlanDiagnostics:
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
-        worker = _make_worker(runner, use_paged_attention=True)
+        worker = _make_worker(runner)
         worker.metal_config.memory_fraction = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1)
         monkeypatch.setattr(
@@ -474,9 +252,7 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget=-0.09GB" in message
         assert "lower --max-num-seqs" in message
         assert "increase VLLM_METAL_MEMORY_FRACTION" in message
-        runner.scheduler_memory_reporting_mode.assert_called_once_with(
-            paged_attention_enabled=True
-        )
+        runner.scheduler_memory_reporting_mode.assert_called_once_with()
         runner.profile_run.assert_called_once_with()
         runner.validate_paged_attention_support.assert_called_once_with()
 
@@ -631,9 +407,7 @@ class TestPagedAttentionPlanDiagnostics:
         gpu_mem_util: float,
         expected_fraction: float,
     ) -> None:
-        worker = _make_worker(
-            SimpleNamespace(is_hybrid=False), use_paged_attention=True
-        )
+        worker = _make_worker(SimpleNamespace(is_hybrid=False))
         worker.metal_config.memory_fraction = (
             AUTO_MEMORY_FRACTION if is_auto else memory_fraction
         )

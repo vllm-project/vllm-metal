@@ -533,7 +533,7 @@ class MetalPlatform(Platform):
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
-            if cache_config.enable_prefix_caching and config.use_paged_attention:
+            if cache_config.enable_prefix_caching:
                 from vllm_metal.attention.runtime.factory import (
                     state_family_for_model_type,
                 )
@@ -551,12 +551,6 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-            if cache_config.enable_prefix_caching and not config.use_paged_attention:
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "the non-paged MLX path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
-                    "has no block-indexed state to restore from",
-                )
             if (
                 cache_config.enable_prefix_caching
                 and vllm_config.speculative_config is not None
@@ -732,42 +726,14 @@ class MetalPlatform(Platform):
             )
 
         if scheduler_config.enable_chunked_prefill:
-            if config.use_paged_attention:
-                # The paged path uses a unified varlen Metal kernel that
-                # handles mixed prefill + decode in a single forward pass,
-                # so chunked prefill works correctly.
-                logger.info(
-                    "Metal: chunked prefill enabled (paged attention), "
-                    "max_num_batched_tokens=%d",
-                    scheduler_config.max_num_batched_tokens,
-                )
-            else:
-                # The non-paged MLX path does not honor chunked-prefill
-                # scheduler boundaries.  Disable so the scheduler only
-                # requests full prefills.
-                scheduler_config.enable_chunked_prefill = False
-
-                # Without chunked prefill, the scheduler must fit the
-                # entire prompt in a single step.  Ensure
-                # max_num_batched_tokens (and max_num_scheduled_tokens)
-                # are at least max_model_len; otherwise the scheduler
-                # silently refuses to schedule any prompt that exceeds
-                # the budget.
-                if model_config is not None:
-                    model_max = model_config.max_model_len
-                    if scheduler_config.max_num_batched_tokens < model_max:
-                        scheduler_config.max_num_batched_tokens = model_max
-                    if (
-                        scheduler_config.max_num_scheduled_tokens is not None
-                        and scheduler_config.max_num_scheduled_tokens < model_max
-                    ):
-                        scheduler_config.max_num_scheduled_tokens = model_max
-
-                logger.info(
-                    "Metal: disabled chunked prefill (non-paged path), "
-                    "max_num_batched_tokens=%d",
-                    scheduler_config.max_num_batched_tokens,
-                )
+            # The paged path uses a unified varlen Metal kernel that
+            # handles mixed prefill + decode in a single forward pass,
+            # so chunked prefill works correctly.
+            logger.info(
+                "Metal: chunked prefill enabled (paged attention), "
+                "max_num_batched_tokens=%d",
+                scheduler_config.max_num_batched_tokens,
+            )
 
         # Disable cascade attention (not supported), then let the adapter
         # apply any model-specific normalisations (e.g. clearing
@@ -967,9 +933,6 @@ class MetalPlatform(Platform):
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
         """
-        from vllm_metal.config import get_config
-
-        metal_config = get_config()
         model_config = vllm_config.model_config
 
         if not model_config:
@@ -996,7 +959,7 @@ class MetalPlatform(Platform):
         #
         # This is a logical transformation only — the computation is identical, just
         # the kernel sees more, smaller blocks.
-        if model_config.is_hybrid and metal_config.use_paged_attention:
+        if model_config.is_hybrid:
             logger.warning(
                 "Hybrid model with paged attention enabled. "
                 "Using block-size translation (PR #235) to convert vLLM's large "
@@ -1044,12 +1007,7 @@ class MetalPlatform(Platform):
         k_quant = metal_config.k_quant
         v_quant = metal_config.v_quant
 
-        if (
-            not turboquant
-            or not metal_config.use_paged_attention
-            or not model_config
-            or not model_config.is_hybrid
-        ):
+        if not turboquant or not model_config or not model_config.is_hybrid:
             return
 
         from math import lcm

@@ -139,7 +139,6 @@ def test_preempted_requests_keep_runner_resume_state() -> None:
     state = RequestState(
         token_ids=[1, 2],
         prompt_len=1,
-        cache=[],
         sampling_params=SamplingParams(),
     )
     runner._request_states["req-0"] = state
@@ -206,7 +205,6 @@ def test_execute_model_cleans_finished_requests_before_encoder_fail_fast() -> No
     runner._request_states["done"] = RequestState(
         token_ids=[1, 2],
         prompt_len=1,
-        cache=[],
         sampling_params=SamplingParams(),
     )
 
@@ -330,20 +328,15 @@ def test_reject_scheduled_encoder_inputs_dispatches_when_adapter_is_forward_read
     assert "image-0" in runner.encoder_cache.encoder_outputs
 
 
-def test_reject_scheduled_encoder_inputs_raises_on_non_paged_backend() -> None:
-    """forward_ready=True but no paged backend must fail fast.
-
-    The non-paged legacy path never splices encoded image embeddings, so
-    running the encoder and falling through to _prefill_single would silently
-    drop image conditioning (or feed raw placeholder IDs to the LM).
-    """
+def test_reject_scheduled_encoder_inputs_requires_initialized_runtime() -> None:
+    """Encoder dispatch requires cache initialization."""
     runner = _runner_with_encoder_cache()  # _paged_attention_runtime is None
     adapter = _RecordingAdapter()  # forward_ready = True
     runner._multimodal_adapter = adapter
     assert runner.encoder_cache is not None
     runner.encoder_cache.add_request("req-0", [_feature("image-0")])
 
-    with pytest.raises(NotImplementedError, match="paged attention backend"):
+    with pytest.raises(RuntimeError, match="runtime is not initialized"):
         runner._reject_scheduled_encoder_inputs({"req-0": [0]})
 
     # The encoder must not run when the request is going to be rejected.

@@ -54,10 +54,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# vLLM widens the KV group size to the larger layer count when the types are
-# this close, to avoid padding; see kv_cache_utils._get_kv_cache_groups_uniform_page_size.
-UNIFORM_GROUP_PADDING_RATIO = 1.5
-
 
 def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int:
     """Physical GDN state pools under align mode, as the memory plan sees it.
@@ -300,12 +296,11 @@ class ModelCachePolicy:
             )
 
     def scheduler_memory_reporting_mode(
-        self, *, paged_attention_enabled: bool
+        self,
     ) -> Literal[
         "paged_attention_capacity",
         "paged_attention_mha_layout_budget",
         "pooling_no_kv",
-        "single_sequence_estimate",
     ]:
         """Return which scheduler memory-reporting mode worker should use."""
         pooling_backend = self._runner._pooling_backend
@@ -314,11 +309,9 @@ class ModelCachePolicy:
             and not pooling_backend.capabilities.uses_kv_cache
         ):
             return "pooling_no_kv"
-        if paged_attention_enabled:
-            if self._uses_deferred_mha_layout():
-                return "paged_attention_mha_layout_budget"
-            return "paged_attention_capacity"
-        return "single_sequence_estimate"
+        if self._uses_deferred_mha_layout():
+            return "paged_attention_mha_layout_budget"
+        return "paged_attention_capacity"
 
     def _hybrid_plan(self) -> HybridRuntimePlan:
         """Return the resolved hybrid plan, failing fast if lifecycle skipped it."""
@@ -940,74 +933,6 @@ class ModelCachePolicy:
             group_block_sizes=backend.kv_group_block_sizes(),
         )
 
-    def estimate_one_sequence_kv_bytes(
-        self, *, max_model_len: int, block_size: int
-    ) -> int:
-        """Estimate bytes for one max-length sequence of cache state."""
-        self._require_supported_per_layer_shapes()
-        dtype_size = self._require_kv_cache_dtype().size
-        aligned_tokens = -(-max_model_len // block_size) * block_size
-        num_kv_layers = self._num_kv_cache_layers()
-
-        # TurboQuant uses quantized KV cache with different byte layout
-        config = get_config()
-        if self._use_turboquant(config):
-            return num_kv_layers * turboquant_page_size_bytes(
-                block_size=aligned_tokens,
-                num_kv_heads=self._runner.num_kv_heads,
-                head_dim=self._runner.head_dim,
-                k_quant=config.k_quant,
-                v_quant=config.v_quant,
-            )
-
-        if self._runner.is_hybrid:
-            num_attention, num_state = self._padded_hybrid_layer_counts()
-            attention_bytes = (
-                self._kv_factor()
-                * aligned_tokens
-                * dtype_size
-                * self._runner.num_kv_heads
-                * self._runner.head_dim
-            )
-            return (
-                num_attention * attention_bytes
-                + num_state * self._state_layer_bytes_as_charged()
-            )
-        return (
-            self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
-        )
-
-    def _padded_hybrid_layer_counts(self) -> tuple[int, int]:
-        """Attention and state layer counts after vLLM pads its KV groups.
-
-        vLLM splits a hybrid model into equal-size groups and pads the last
-        group of each layer type (``_get_kv_cache_groups_uniform_page_size``),
-        so admission charges the padding layers and the estimate must too.
-        """
-        layers = self._hybrid_plan().layers
-        counts = (layers.num_attention, layers.num_state)
-        group_size = min(counts)
-        if max(counts) < group_size * UNIFORM_GROUP_PADDING_RATIO:
-            group_size = max(counts)
-        num_attention, num_state = (
-            cdiv(count, group_size) * group_size for count in counts
-        )
-        return num_attention, num_state
-
-    def _state_layer_bytes_as_charged(self) -> int:
-        """Per-layer state bytes as the reported MambaSpec charges them.
-
-        The MambaSpec carries ``mamba_page_size_padded`` when set; an
-        unpadded estimate falls short of admission by the padding margin.
-        """
-        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
-        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
-        # this mirror must follow.
-        padded = self._runner.cache_config.mamba_page_size_padded
-        if padded is not None:
-            return padded
-        return self._hybrid_plan().state_bytes_per_layer()
-
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
         return HybridPagedAttentionRuntime(
@@ -1210,9 +1135,7 @@ class WorkerCachePlanner:
 
     def determine_available_memory(self) -> int:
         """Return scheduler-visible available cache memory."""
-        mode = self._worker.model_runner.scheduler_memory_reporting_mode(
-            paged_attention_enabled=self._worker.metal_config.use_paged_attention
-        )
+        mode = self._worker.model_runner.scheduler_memory_reporting_mode()
 
         if mode == "stt_nominal":
             logger.info("STT model: reporting nominal memory for scheduler")
@@ -1255,19 +1178,7 @@ class WorkerCachePlanner:
             logger.info("Encoder pooling: reporting zero KV-cache bytes")
             return 0
 
-        request_bytes = self._worker._one_sequence_kv_bytes()
-        # vLLM's BlockPool permanently reserves one null block. Reporting
-        # exactly one request's bytes therefore leaves one fewer free block
-        # than admission requires and the waiting request is skipped forever.
-        reserved_block_bytes = self._worker.get_cache_block_size_bytes()
-        available = request_bytes + reserved_block_bytes
-        logger.info(
-            "MLX path: reporting %.2f GB for scheduler admission control "
-            "(one max-length sequence + reserved null block, max_model_len=%d)",
-            available / 1e9,
-            self._worker.model_config.max_model_len,
-        )
-        return available
+        raise AssertionError(f"Unknown scheduler memory reporting mode: {mode}")
 
     @staticmethod
     def base_kv_budget_bytes(

@@ -3,12 +3,12 @@
 """Qwen3.5 golden token deterministic test: paged vs mlx_lm ground truth.
 
 Verifies that the hybrid paged attention path (SDPA + GDN) produces the
-same tokens as the MLX inline cache path for Qwen3.5.
+same tokens as native mlx-lm for Qwen3.5.
 
 Not in CI — requires local model weights.
 
 Usage:
-    # Generate golden tokens (MLX inline cache, greedy):
+    # Generate golden tokens (paged serving, greedy):
     VLLM_ENABLE_V1_MULTIPROCESSING=0 python tools/test_qwen35_golden.py --gen-golden
 
     # Run deterministic test (paged path vs golden):
@@ -26,8 +26,6 @@ import sys
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from vllm import LLM, SamplingParams  # noqa: E402
-
-import vllm_metal.envs as envs  # noqa: E402
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-4B")
 MAX_TOKENS = 20
@@ -64,21 +62,26 @@ def _run_in_subprocess(
     model: str, max_tokens: int, paged: bool
 ) -> dict[str, list[int]]:
     """Run generation in a subprocess to avoid memory interference."""
+    if not paged:
+        if __package__:
+            from .check_parity import run_backend
+        else:
+            from check_parity import run_backend
+
+        rows = run_backend("mlx", model, PROMPTS, max_tokens)
+        return {row["prompt"]: row["tokens"] for row in rows}
+
     import json
     import subprocess
 
     env = os.environ.copy()
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    if paged:
-        env["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
-        env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
+    env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
 
     script = f"""
 import os, json
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-if {paged!r}:
-    os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
-    os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
+os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
 from vllm import LLM, SamplingParams
 llm = LLM(model={model!r}, max_model_len=512, max_num_seqs=1)
 sp = SamplingParams(temperature=0, max_tokens={max_tokens})
@@ -105,8 +108,8 @@ print("GOLDEN_JSON:" + json.dumps(result))
 
 
 def run_test(model: str, max_tokens: int) -> bool:
-    """Compare paged path output against MLX inline cache path."""
-    print("=== Step 1: MLX inline cache (ground truth) ===")
+    """Compare paged path output against native mlx-lm."""
+    print("=== Step 1: native mlx-lm (ground truth) ===")
     mlx_results = _run_in_subprocess(model, max_tokens, paged=False)
 
     print("=== Step 2: Paged attention path ===")
@@ -154,10 +157,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.gen_golden:
-        paged = envs.VLLM_METAL_USE_PAGED_ATTENTION
-        label = "PAGED" if paged else "MLX"
+        label = "PAGED"
         print(f"Generating golden tokens ({label} path, {args.model})")
-        results = _run_in_subprocess(args.model, args.max_tokens, paged=paged)
+        results = _run_in_subprocess(args.model, args.max_tokens, paged=True)
         print_golden(results, label)
     else:
         ok = run_test(args.model, args.max_tokens)

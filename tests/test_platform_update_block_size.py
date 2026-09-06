@@ -119,7 +119,6 @@ class TestUpdateBlockSizeForBackend:
 
         with patch("vllm_metal.config.get_config") as mock_get_config:
             mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
             mock_get_config.return_value = mock_metal_config
 
             MetalPlatform.update_block_size_for_backend(vllm_config)
@@ -141,7 +140,6 @@ class TestUpdateBlockSizeForBackend:
 
         with patch("vllm_metal.config.get_config") as mock_get_config:
             mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
             mock_get_config.return_value = mock_metal_config
 
             with caplog.at_level(logging.WARNING, logger="vllm_metal.platform"):
@@ -184,7 +182,6 @@ class TestUpdateBlockSizeForBackend:
 
         with patch("vllm_metal.config.get_config") as mock_get_config:
             mock_metal_config = MagicMock()
-            mock_metal_config.use_paged_attention = True
             mock_get_config.return_value = mock_metal_config
 
             with caplog.at_level(logging.WARNING, logger="vllm_metal.platform"):

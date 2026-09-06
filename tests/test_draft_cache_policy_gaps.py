@@ -39,7 +39,6 @@ from tests.test_draft_model_proposer import (
 )
 from tests.test_paged_deterministic import (
     DEFAULT_PAGED_MEMORY_FRACTION,
-    DEFAULT_USE_PAGED_ATTENTION,
     MODEL_NAME,
 )
 
@@ -97,11 +96,7 @@ def _install_plan_logger(dmp, plans: list) -> None:
 def _run_policy_e2e() -> None:
     """Body of the e2e test -- runs in a spawned child process."""
     _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_USE_PAGED_ATTENTION", DEFAULT_USE_PAGED_ATTENTION)
     _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
-
-    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") != "1":
-        return  # non-paged path: nothing to test
 
     from vllm import LLM, SamplingParams
 
@@ -206,11 +201,7 @@ def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
     multiple forwards while a chunk of 0 keeps the single-forward behavior.
     """
     _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_USE_PAGED_ATTENTION", DEFAULT_USE_PAGED_ATTENTION)
     _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
-    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") != "1":
-        result_q.put(("skipped", -1, []))
-        return
     os.environ["VLLM_METAL_SPEC_INGEST_CHUNK"] = chunk
 
     from vllm import LLM, SamplingParams
@@ -262,7 +253,7 @@ def test_chunked_cold_ingest_token_identity_e2e() -> None:
     chunked, control = (result_q.get(), result_q.get())
     for label, (status, ingest, _) in (("chunked", chunked), ("control", control)):
         if status != "ok":
-            raise AssertionError(f"{label} child skipped (non-paged attention?)")
+            raise AssertionError(f"{label} child skipped")
         if ingest <= 16:
             raise AssertionError(
                 f"{label} first plan ingested {ingest} tokens -- expected a "
@@ -297,7 +288,6 @@ def test_scratch_reserve_covers_max_concurrency() -> None:
         return RequestState(
             token_ids=list(range(16)),
             prompt_len=16,
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             block_ids=[[0]],
             num_computed_tokens=0,

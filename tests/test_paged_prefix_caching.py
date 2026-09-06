@@ -322,7 +322,6 @@ class TestCachedRequestBlockUpdates:
         runner._request_states["req-1"] = mr.RequestState(
             token_ids=[10, 20, 30, 40, 50],
             prompt_len=4,
-            cache=[],
             sampling_params=_greedy_sp(),
             generator=None,
             generated_tokens=1,
@@ -357,7 +356,6 @@ class TestMixedDecodeAndPrefixHitPrefill:
         runner._request_states["req-A"] = mr.RequestState(
             token_ids=prompt_a + [99],
             prompt_len=len(prompt_a),
-            cache=[],
             sampling_params=_greedy_sp(),
             generator=None,
             generated_tokens=1,
@@ -437,7 +435,6 @@ class TestCachedRequestContinuation:
         runner._request_states["req-1"] = mr.RequestState(
             token_ids=list(prompt),
             prompt_len=len(prompt),
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=0,
@@ -490,7 +487,6 @@ class TestCachedRequestContinuation:
         runner._request_states["req-1"] = mr.RequestState(
             token_ids=list(prompt),
             prompt_len=len(prompt),
-            cache=[],
             sampling_params=SamplingParams(temperature=0.0),
             generator=None,
             generated_tokens=0,

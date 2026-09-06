@@ -52,7 +52,6 @@ def _run_real_gemma4_paged_path(
     env.update(
         {
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-            "VLLM_METAL_USE_PAGED_ATTENTION": "1",
             "VLLM_METAL_MEMORY_FRACTION": memory_fraction,
         }
     )

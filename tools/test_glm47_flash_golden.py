@@ -122,14 +122,11 @@ def run_paged() -> dict[str, list[int]]:
     # the Metal MLA kernel against standalone mlx_lm. A caller with
     # VLLM_METAL_MLA_KERNEL=0 exported would silently fall back to MLX
     # SDPA, which matches all goldens and produces a false pass.
-    os.environ["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
     os.environ["VLLM_METAL_MLA_KERNEL"] = "1"
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.75")
     print(
-        f"  effective env: VLLM_METAL_USE_PAGED_ATTENTION="
-        f"{os.environ['VLLM_METAL_USE_PAGED_ATTENTION']} "
-        f"VLLM_METAL_MLA_KERNEL={os.environ['VLLM_METAL_MLA_KERNEL']}"
+        f"  effective env: VLLM_METAL_MLA_KERNEL={os.environ['VLLM_METAL_MLA_KERNEL']}"
     )
 
     from transformers import AutoTokenizer
