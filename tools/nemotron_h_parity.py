@@ -42,6 +42,11 @@ MODEL_DEFAULT = os.environ.get(
 # when the other arm picked mlx_lm's second choice inside this margin.
 NEAR_TIE_ULPS = 4
 BF16_MANTISSA_BITS = 7
+# Relative tolerance on the layer-0 pool rows against mlx-lm's own cache; the
+# bf16 activations feeding them differ by rounding, not by state content.
+STATE_REL_TOLERANCE = 1e-2
+MAX_MODEL_LEN = 2048
+CHILD_POLL_SECONDS = 5
 PROMPTS = [
     "The capital of France is",
     "One plus one equals",
@@ -183,7 +188,7 @@ def run_vllm_child(
 
     llm = LLM(
         model=model,
-        max_model_len=2048,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=max_num_seqs,
         enable_prefix_caching=False,
         max_num_batched_tokens=CHUNK_MNBT,
@@ -210,7 +215,7 @@ def _run(target, *args) -> dict:
     proc.start()
     while True:
         try:
-            result = queue.get(timeout=5)
+            result = queue.get(timeout=CHILD_POLL_SECONDS)
             break
         except Empty:
             if not proc.is_alive():
@@ -284,7 +289,7 @@ def main() -> int:
             f"state layer 0 (replayed tokens): conv max rel diff={conv_rel:.3e} "
             f"of {conv_scale:.3g}, ssm max rel diff={ssm_rel:.3e} of {ssm_scale:.3g}"
         )
-        ok &= conv_rel <= 1e-2 and ssm_rel <= 1e-2
+        ok &= conv_rel <= STATE_REL_TOLERANCE and ssm_rel <= STATE_REL_TOLERANCE
     print("\nPARITY OK" if ok else "\nPARITY FAILED")
     return 0 if ok else 1
 
