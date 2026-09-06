@@ -41,7 +41,12 @@ class _Mamba2Step:
 
 
 class _SlotArraysCache:
-    """The ``ArraysCache`` surface the mixer reads, backed by state pool rows."""
+    """The ``ArraysCache`` surface the mixer reads, backed by state pool rows.
+
+    The four members (``[0]``, ``[1]``, ``lengths``, ``advance``) mirror the
+    pinned mlx-lm mixer; the wrapper tests drive that mixer against its own
+    ``ArraysCache`` so a pin bump that changes the surface fails there.
+    """
 
     __slots__ = ("_state_cache", "_cache_idx", "_slot_ids")
     # Slices arrive unpadded, so the mixer's right-padding gather stays off.
