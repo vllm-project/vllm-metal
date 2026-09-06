@@ -43,7 +43,7 @@ _STATE_FAMILY_PLAN_BUILDERS = (
 )
 
 
-def _builder_for_model_type(model_type: object) -> StateFamilyPlanBuilder:
+def _builder_for_model_type(model_type: str) -> StateFamilyPlanBuilder:
     for builder in _STATE_FAMILY_PLAN_BUILDERS:
         if model_type in builder.model_types:
             return builder

@@ -127,11 +127,7 @@ NEMOTRON_H_FAMILY = StateFamilySpec(
 def build_nemotron_h_hybrid_plan(
     model_args: Mapping[str, Any], num_layers: int
 ) -> HybridRuntimePlan:
-    """Resolve Nemotron-H block roles and Mamba-2 geometry from model args.
-
-    ``num_layers`` is the table contract; mlx-lm already sets the layer count
-    from the block pattern, so the pattern alone fixes the roles.
-    """
+    """Resolve Nemotron-H block roles and Mamba-2 geometry from model args."""
     nemotron_config = NemotronHHybridConfig.from_model_args(model_args)
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=nemotron_config.layer_roles()),

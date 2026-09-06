@@ -164,7 +164,6 @@ class Mamba2PagedStateWrapper(nn.Module):
         if inner.ssm_state_size % _SSM_KERNEL_STATE_COLUMNS != 0:
             raise NotImplementedError(
                 f"Mamba-2 paged decode at layer {layer_idx} requires ssm_state_size "
-                f"to be a multiple of {_SSM_KERNEL_STATE_COLUMNS} (mlx_lm's "
-                f"single-token ssm kernel covers {_SSM_KERNEL_STATE_COLUMNS} state "
-                f"columns per thread), got ssm_state_size={inner.ssm_state_size}."
+                f"to be a multiple of {_SSM_KERNEL_STATE_COLUMNS}, got "
+                f"ssm_state_size={inner.ssm_state_size}."
             )

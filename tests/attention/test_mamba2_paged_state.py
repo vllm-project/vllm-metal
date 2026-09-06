@@ -246,8 +246,7 @@ class TestMamba2PagedStateWrapper:
         cache = _make_cache(mixer, mx.float32)
         expected = (
             "Mamba-2 paged decode at layer 3 requires ssm_state_size to be a "
-            "multiple of 32 (mlx_lm's single-token ssm kernel covers 32 state "
-            "columns per thread), got ssm_state_size=48."
+            "multiple of 32, got ssm_state_size=48."
         )
 
         with pytest.raises(NotImplementedError) as excinfo:
