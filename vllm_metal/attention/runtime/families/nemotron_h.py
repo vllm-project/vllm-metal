@@ -119,6 +119,8 @@ NEMOTRON_H_FAMILY = StateFamilySpec(
     recurrent_dtype=torch.float32,
     # One private slot per resident request; state is not block-keyed.
     supported_cache_modes=("none",),
+    # Full-step path only; not validated on the decode pipeline.
+    supports_decode_pipeline=False,
 )
 
 

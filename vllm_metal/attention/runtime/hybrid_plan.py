@@ -118,6 +118,7 @@ class StateFamilySpec:
     mamba_type: MambaAttentionBackendEnum
     recurrent_dtype: torch.dtype
     supported_cache_modes: tuple[str, ...]
+    supports_decode_pipeline: bool
 
 
 @dataclass(frozen=True, slots=True)

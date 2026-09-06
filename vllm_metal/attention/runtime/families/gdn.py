@@ -111,6 +111,7 @@ GDN_FAMILY = StateFamilySpec(
     recurrent_dtype=torch.float32,
     # Scheduler-side mamba caching strategies the GDN state path implements.
     supported_cache_modes=("none", "align"),
+    supports_decode_pipeline=True,
 )
 
 

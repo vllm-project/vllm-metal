@@ -21,7 +21,7 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_nemotron_hybrid_plan, make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.state import HybridGDNStateManager
@@ -2650,6 +2650,27 @@ class TestPipelineGateSpecDecodeDerivation:
         # Assert
         assert decision.eligible is False
         assert decision.reason == "prompt logprobs requested"
+
+    def test_state_family_without_pipeline_support_disables_pipeline(self) -> None:
+        runner = self._runner(drafter=None)
+        runner.model_config.is_hybrid = True
+        runner.hybrid_runtime_plan = make_nemotron_hybrid_plan("M*")
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=[1, 7],
+                prompt_len=1,
+                cache=[],
+                sampling_params=SamplingParams(temperature=0.0),
+                generator=None,
+                generated_tokens=1,
+            )
+        }
+        scheduler_output = self._cached_decode_output("r0")
+
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        assert decision.eligible is False
+        assert decision.reason == "state family without decode pipeline support"
 
     def _native_random_decode_setup(self, runner) -> SchedulerOutput:
         runner._request_states = {

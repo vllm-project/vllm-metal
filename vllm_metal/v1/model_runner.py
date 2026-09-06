@@ -1540,6 +1540,10 @@ class MetalModelRunner:
             hybrid_without_lazy_gdn=(
                 self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
+            state_family_pipelined=(
+                self.hybrid_runtime_plan is None
+                or self.hybrid_runtime_plan.family.supports_decode_pipeline
+            ),
             spec_decode_configured=(
                 self.vllm_config.speculative_config is not None
                 or self._drafter is not None
