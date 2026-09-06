@@ -19,10 +19,11 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 
-LayerRole: TypeAlias = Literal["attention", "state"]
+LayerRole: TypeAlias = Literal["attention", "state", "stateless"]
 
 ATTENTION_LAYER: LayerRole = "attention"
 STATE_LAYER: LayerRole = "state"
+STATELESS_LAYER: LayerRole = "stateless"
 
 
 class PagedStateWrapper(Protocol):
@@ -43,7 +44,7 @@ class PagedStateWrapper(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class HybridLayerPlan:
-    """Which model layers own paged attention KV pages and which own state.
+    """Which model layers own paged KV pages, which own state, and which own neither.
 
     ``layer_roles`` is the single source of truth; index tuples and counts
     are derived from it on access.
@@ -82,6 +83,10 @@ class HybridLayerPlan:
     def is_state_layer(self, layer_idx: int) -> bool:
         """Return whether ``layer_idx`` is owned by the state runtime."""
         return self.layer_roles[layer_idx] == STATE_LAYER
+
+    def is_attention_layer(self, layer_idx: int) -> bool:
+        """Return whether ``layer_idx`` owns paged attention KV pages."""
+        return self.layer_roles[layer_idx] == ATTENTION_LAYER
 
     def attention_cache_index(self, layer_idx: int) -> int:
         """Return the compact KV cache ordinal owned by an attention layer."""

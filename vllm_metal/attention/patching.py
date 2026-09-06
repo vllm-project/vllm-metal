@@ -37,8 +37,9 @@ def find_layers(model: Any) -> list[Any]:
         )
 
 
-# Attribute names to probe on each layer, in priority order.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention")
+# Attribute names to probe on each layer, in priority order; Nemotron-H names
+# every block's module ``mixer``.
+_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "mixer")
 
 
 def find_attn_attr(layer: Any) -> str | None:
@@ -76,7 +77,7 @@ def walk_and_wrap(
     Args:
         wrap_layer: callable ``(layer_idx, attn) -> wrapper``.
         only_layers: if given, only patch these layer indices; others are left
-            untouched (used by KV-sharing models that patch a subset).
+            untouched (KV-sharing subsets and hybrid plans that own a subset).
 
     Returns the number of patched layers.
     """

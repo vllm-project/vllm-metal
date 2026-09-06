@@ -93,6 +93,45 @@ def test_plain_attention_spec_is_unchanged() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
+def test_hybrid_spec_omits_stateless_layers() -> None:
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=True,
+        ),
+        num_layers=4,
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            4,
+            [2],
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=1,
+            value_head_dim=64,
+            key_head_dim=64,
+            stateless_indices=[1],
+        ),
+        num_kv_heads=1,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=544,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+
+    assert set(specs) == {
+        "layers.0.linear_attn",
+        "layers.2.self_attn",
+        "layers.3.linear_attn",
+    }
+
+
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     attention_block_size = 544
     max_model_len = 2048

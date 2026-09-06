@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged attention runtime for hybrid models (SDPA + linear attention).
+"""Paged attention runtime for hybrid models (SDPA + recurrent state).
 
-Handles models like Qwen3.5 where some layers use standard dot-product
-attention (paged KV cache) and others use GDN linear attention (fixed-size
-recurrent state).
+Handles models like Qwen3.5 and Nemotron-H where some layers use standard
+dot-product attention (paged KV cache) and others keep fixed-size recurrent
+state owned by a state family.
 
 SDPA layers use the native Metal SDPA kernel (same as ``MHAPagedAttentionRuntime``).
-GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
+State layers run behind the family's wrapper on ``GDNPagedStateCache`` slots.
 """
 
 from __future__ import annotations
@@ -34,10 +34,10 @@ logger = init_logger(__name__)
 
 
 class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention runtime for hybrid SDPA + linear attention models.
+    """Paged attention runtime for hybrid SDPA + recurrent state models.
 
     SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
-    GDN layers: MLX-native state management (via GDNPagedAttentionWrapper)
+    State layers: the family's wrapper over per-request state slots
     """
 
     def __init__(
@@ -133,7 +133,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d linear layers (%d/%d GDN slots allocated, mamba_cache_mode=%s)",
+            "%d state layers (%d/%d state slots allocated, mamba_cache_mode=%s)",
             self._hybrid_plan.layers.num_attention,
             num_blocks,
             self._hybrid_plan.layers.num_state,
@@ -223,7 +223,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 f"the hybrid plan but {type(attn).__name__} is not SDPA."
             )
 
-        return walk_and_wrap(model, wrap_layer)
+        # Stateless layers keep their module; only plan-owned layers are probed.
+        return walk_and_wrap(
+            model,
+            wrap_layer,
+            only_layers=[*layer_plan.attention_indices, *layer_plan.state_indices],
+        )
 
     @property
     def kv_cache(self) -> MetalPagedKVCache:

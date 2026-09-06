@@ -14,6 +14,7 @@ from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
+    STATELESS_LAYER,
     HybridLayerPlan,
     HybridRuntimePlan,
     RecurrentStateGeometry,
@@ -248,11 +249,18 @@ def make_gdn_hybrid_plan(
     num_v_heads: int,
     value_head_dim: int,
     key_head_dim: int,
+    stateless_indices: Iterable[int] = (),
 ) -> HybridRuntimePlan:
     """Build a GDN hybrid plan with explicit topology and geometry."""
     attention = frozenset(attention_indices)
+    stateless = frozenset(stateless_indices)
     layer_roles = tuple(
-        ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
+        ATTENTION_LAYER
+        if i in attention
+        else STATELESS_LAYER
+        if i in stateless
+        else STATE_LAYER
+        for i in range(num_layers)
     )
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=layer_roles),

@@ -392,7 +392,7 @@ class ModelCachePolicy:
             for layer_idx in range(num_spec_layers):
                 if hybrid_plan.layers.is_state_layer(layer_idx):
                     specs[f"layers.{layer_idx}.linear_attn"] = state_spec
-                else:
+                elif hybrid_plan.layers.is_attention_layer(layer_idx):
                     specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
         else:
             for layer_idx in range(num_spec_layers):

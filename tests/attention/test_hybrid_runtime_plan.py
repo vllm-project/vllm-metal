@@ -53,6 +53,12 @@ class _FakeGDN(nn.Module):
         self.conv1d = nn.Conv1d(4, 4, 2)
 
 
+class _FakeMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.up_proj = nn.Linear(4, 4)
+
+
 class _Layer(nn.Module):
     def __init__(self, attn: nn.Module, linear: bool) -> None:
         super().__init__()
@@ -281,6 +287,37 @@ class TestHybridPatchModel:
         assert gdn_2._gdn_cache_idx == 1
         assert gdn_0._gdn_state_cache is runtime.state_cache
         assert gdn_2._gdn_state_cache is runtime.state_cache
+
+    def test_stateless_layers_are_never_probed(self) -> None:
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=make_gdn_hybrid_plan(
+                4,
+                [2],
+                conv_kernel_dim=2,
+                conv_dim=4,
+                num_v_heads=1,
+                value_head_dim=4,
+                key_head_dim=32,
+                stateless_indices=[1],
+            ),
+            max_num_seqs=2,
+            num_kv_heads=1,
+            head_dim=4,
+            block_size=4,
+            dtype=mx.float32,
+        )
+        runtime.initialize(num_blocks=2)
+        model = _FakeModel("ssas")
+        mlp = _FakeMLP()
+        model.layers[1] = mlp
+
+        patched = runtime.patch_model(model)
+
+        assert patched == 3
+        assert model.layers[1] is mlp
+        assert isinstance(model.layers[2].self_attn, SDPAPagedAttentionWrapper)
+        assert isinstance(model.layers[3].linear_attn, GDNPagedAttentionWrapper)
+        assert model.layers[3].linear_attn._gdn_cache_idx == 1
 
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
         runtime_a = _make_runtime()
