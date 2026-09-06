@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# vLLM widens the KV group size to the larger layer count when the types are
+# this close, to avoid padding; see kv_cache_utils._get_kv_cache_groups_uniform_page_size.
+UNIFORM_GROUP_PADDING_RATIO = 1.5
+
 
 def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int:
     """Physical GDN state pools under align mode, as the memory plan sees it.
@@ -967,27 +971,55 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        sdpa_kv_bytes = (
+        if self._runner.is_hybrid:
+            num_attention, num_state = self._padded_hybrid_layer_counts()
+            attention_bytes = (
+                self._kv_factor()
+                * aligned_tokens
+                * dtype_size
+                * self._runner.num_kv_heads
+                * self._runner.head_dim
+            )
+            return (
+                num_attention * attention_bytes
+                + num_state * self._state_layer_bytes_as_charged()
+            )
+        return (
             self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
-        if self._runner.is_hybrid:
-            return sdpa_kv_bytes + self._linear_spec_bytes_per_slot()
-        return sdpa_kv_bytes
 
-    def _linear_spec_bytes_per_slot(self) -> int:
-        """Per-slot linear-state bytes as the reported MambaSpec charges them.
+    def _padded_hybrid_layer_counts(self) -> tuple[int, int]:
+        """Attention and state layer counts after vLLM pads its KV groups.
 
-        vLLM admits against the specs this worker reports, and the linear
-        MambaSpec carries ``mamba_page_size_padded`` — an unpadded estimate
-        falls short of that requirement by the padding margin.
+        vLLM splits a hybrid model into equal-size groups and pads the last
+        group of each layer type (``_get_kv_cache_groups_uniform_page_size``),
+        so admission charges the padding layers and the estimate must too.
+        """
+        layers = self._hybrid_plan().layers
+        counts = (layers.num_attention, layers.num_state)
+        group_size = min(counts)
+        if max(counts) < group_size * UNIFORM_GROUP_PADDING_RATIO:
+            group_size = max(counts)
+        num_attention, num_state = (
+            cdiv(count, group_size) * group_size for count in counts
+        )
+        return num_attention, num_state
+
+    def _state_layer_bytes_as_charged(self) -> int:
+        """Per-layer state bytes as the reported MambaSpec charges them.
+
+        The MambaSpec carries ``mamba_page_size_padded`` when set; an
+        unpadded estimate falls short of admission by the padding margin.
         """
         # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
         # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
         # this mirror must follow.
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
-            return self._hybrid_plan().layers.num_state * padded
-        return self.linear_cache_bytes_per_slot()
+            return padded
+        return self._hybrid_plan().state_bytes_per_layer(
+            self._require_kv_cache_dtype().size
+        )
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()

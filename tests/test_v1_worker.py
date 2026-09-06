@@ -146,8 +146,8 @@ class TestOneSequenceKvBytes:
             head_dim=256,
             kv_cache_dtype=mx.float16,
             hybrid_runtime_plan=make_gdn_hybrid_plan(
-                11,
-                range(8),
+                12,
+                [0, 4, 8],
                 conv_kernel_dim=3,
                 conv_dim=5,
                 num_v_heads=2,
@@ -165,10 +165,10 @@ class TestOneSequenceKvBytes:
         result = MetalWorker._one_sequence_kv_bytes(worker)
 
         # Assert — SDPA bytes + linear state
-        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
         conv_bytes = (3 - 1) * 5 * mx.float16.size
         recurrent_bytes = 2 * 7 * 11 * mx.float32.size
-        linear_bytes = 3 * (conv_bytes + recurrent_bytes)
+        linear_bytes = 9 * (conv_bytes + recurrent_bytes)
         assert result == sdpa_bytes + linear_bytes
 
     def test_hybrid_uses_padded_mamba_page_size_when_set(self) -> None:
@@ -183,8 +183,8 @@ class TestOneSequenceKvBytes:
             head_dim=256,
             kv_cache_dtype=mx.float16,
             hybrid_runtime_plan=make_gdn_hybrid_plan(
-                11,
-                range(8),
+                12,
+                [0, 4, 8],
                 conv_kernel_dim=3,
                 conv_dim=5,
                 num_v_heads=2,
@@ -203,8 +203,8 @@ class TestOneSequenceKvBytes:
         result = MetalWorker._one_sequence_kv_bytes(worker)
 
         # Assert — SDPA bytes + padded linear pages (not raw state bytes)
-        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
-        assert result == sdpa_bytes + 3 * padded_page
+        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
+        assert result == sdpa_bytes + 9 * padded_page
 
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
