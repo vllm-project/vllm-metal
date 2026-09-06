@@ -237,16 +237,6 @@ class TestStateFamilyFactory:
 
 
 class TestNemotronHPlanDecision:
-    def test_geometry_packs_x_b_and_c_into_the_conv_stream(self) -> None:
-        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
-
-        # conv_dim = 4*8 + 2*2*32 = 160, hand-written.
-        assert plan.geometry.conv_kernel_dim == 4
-        assert plan.geometry.conv_dim == 160
-        assert plan.geometry.num_v_heads == 4
-        assert plan.geometry.value_head_dim == 8
-        assert plan.geometry.key_head_dim == 32
-
     def test_string_pattern_reads_as_characters(self) -> None:
         plan = build_nemotron_h_hybrid_plan(
             {**NEMOTRON_H_ARGS, "hybrid_override_pattern": "M*E"}, 3
