@@ -251,13 +251,12 @@ class DefaultModelAdapter(ModelAdapter):
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
-        marked multimodal even when served text-only, and both quantized
-        families diverge under mlx_vlm.load() — FP8 fails on
-        `*_weight_scale_inv` tensors, while MLX affine checkpoints load but,
-        unless the config exposes a real VL shape, run the bare language model
-        with unset mrope state and generate garbled output.  Both route through
-        the mlx_lm text loader instead; MLX-quant wrappers with a native VL
-        config keep the multimodal path.
+        marked multimodal even when served text-only, and the FP8 family fails
+        under mlx_vlm.load() on `*_weight_scale_inv` tensors, so it routes
+        through the mlx_lm text loader instead.  MLX affine checkpoints used to
+        need the same treatment because mlx_vlm left their mRoPE state unset;
+        the pinned mlx-vlm floor (>=0.6.8) drives them correctly, so they keep
+        the native multimodal path.
         """
         if hf_config is None:
             return False
@@ -277,25 +276,13 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        # MLX affine Qwen3.5/Qwen3.6 text wrappers may still carry a
-        # vision_config, but mlx_vlm drives those text-only checkpoints with
-        # unset mRoPE state and produces garbled output.  Real Qwen3-VL uses
-        # Qwen3VLForConditionalGeneration, which is not in the text-wrapper
-        # architecture set above and therefore keeps the native path.
-        return self._has_mlx_quantized_weights(hf_config)
+        return False
 
     def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
         quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
         if isinstance(quantization_config_from_hf, dict):
             return quantization_config_from_hf.get("quant_method") == "fp8"
         return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
-
-    def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
-        mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
-        return (
-            isinstance(mlx_quantization_from_hf, dict)
-            and "bits" in mlx_quantization_from_hf
-        )
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.

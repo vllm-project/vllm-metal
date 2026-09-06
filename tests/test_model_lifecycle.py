@@ -372,11 +372,25 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is False
 
-    def test_load_uses_adapter_override_for_qwen35_mlx_quant_dense_wrapper(
+    def test_load_keeps_qwen35_mlx_quant_dense_wrapper_as_vlm(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _stub_generation_model(monkeypatch, config=_text_config())
+        # The auto-mode override used to route MLX-quantized wrappers to the
+        # text backbone; the pinned mlx-vlm floor serves them natively, so auto
+        # mode now keeps the multimodal path.
+        vision_tower = object()
+        language_model = _Qwen35LanguageModelStub()
+        fake_model = _qwen35_vlm_model(
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
+        _stub_generation_model(
+            monkeypatch,
+            config=fake_model.config,
+            is_vlm=True,
+            model=fake_model,
+        )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
@@ -392,8 +406,8 @@ class TestModelLifecycle:
 
         lifecycle.load()
 
-        assert runner._is_vlm is False
-        assert runner._multimodal_adapter is None
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
 
     def test_load_multimodal_native_mode_keeps_qwen35_fp8_as_vlm(
         self,
