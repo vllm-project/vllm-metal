@@ -1,5 +1,9 @@
 # Tools
 
+## Greedy Parity
+
+See the [Tools guide](../docs/tools.md) for live comparison against native `mlx-lm`.
+
 ## Attention Benchmark
 
 The repository includes a local benchmark utility for comparing Metal attention backends:

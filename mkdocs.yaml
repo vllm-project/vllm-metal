@@ -75,4 +75,5 @@ nav:
     - Turboquant: turboquant.md
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
+  - Tools: tools.md
   - Contributing: CONTRIBUTING.md
