@@ -280,8 +280,6 @@ class DraftModelProposer:
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
-        if num_speculative_tokens <= 0:
-            return None
         if self._committed_group_index is None:
             raise RuntimeError(
                 "DraftModelProposer.propose() called before "
@@ -302,6 +300,12 @@ class DraftModelProposer:
         # row that ingested this step, drafting or not.
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
+
+        # A scheduler step can have no speculative-token budget while still
+        # advancing committed prefill tokens. Keep the draft KV cache in sync,
+        # but do not generate any draft tokens for that step.
+        if num_speculative_tokens <= 0:
+            return None
 
         drafting_plans = [plan for plan in plans if plan.is_drafting]
         if not drafting_plans:
