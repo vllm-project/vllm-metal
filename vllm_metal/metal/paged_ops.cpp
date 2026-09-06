@@ -502,7 +502,8 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    int window_seqlen_q, int num_decode_requests, Stream s,
+    int window_seqlen_q, int num_decode_requests, bool gqa_disabled,
+    Stream s,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -720,7 +721,8 @@ static void dispatch_paged_attention_v2_online(
       (num_decode_requests < 0) ? (num_seqs == 1)
                                 : (num_decode_requests == num_seqs);
   const bool gqa_decode =
-      pure_decode && window_seqlen_q <= 1 && gqa_real_decode_batch
+      !gqa_disabled
+      && pure_decode && window_seqlen_q <= 1 && gqa_real_decode_batch
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && num_kv_heads > 0
@@ -849,14 +851,15 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
       int window_seqlen_q = 1, bool use_sinks = false,
-      int num_decode_requests = -1)
+      int num_decode_requests = -1, bool gqa_disabled = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
         use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
         window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks),
-        num_decode_requests_(num_decode_requests) {}
+        num_decode_requests_(num_decode_requests),
+        gqa_disabled_(gqa_disabled) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -882,7 +885,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_kv_heads_, scale_, softcap_,
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
-        num_decode_requests_,
+        num_decode_requests_, gqa_disabled_,
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk);
   }
@@ -901,7 +904,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->v_bits_ == v_bits_
         && rhs->window_seqlen_q_ == window_seqlen_q_
         && rhs->use_sinks_ == use_sinks_
-        && rhs->num_decode_requests_ == num_decode_requests_;
+        && rhs->num_decode_requests_ == num_decode_requests_
+        && rhs->gqa_disabled_ == gqa_disabled_;
   }
 
  private:
@@ -917,6 +921,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int window_seqlen_q_;
   bool use_sinks_;
   int num_decode_requests_;
+  bool gqa_disabled_;
 };
 
 static array paged_attention_primitive_fn(
@@ -932,7 +937,8 @@ static array paged_attention_primitive_fn(
     const array* key_zero_cache = nullptr,
     const array* v_centroids = nullptr,
     int v_bits = 3, int window_seqlen_q = 1,
-    const array* sinks = nullptr, int num_decode_requests = -1) {
+    const array* sinks = nullptr, int num_decode_requests = -1,
+    bool gqa_disabled = false) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -1027,7 +1033,7 @@ static array paged_attention_primitive_fn(
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
-      num_decode_requests);
+      num_decode_requests, gqa_disabled);
   if (use_turboquant) {
     return array(
         query.shape(), query.dtype(), std::move(prim),
@@ -1946,7 +1952,8 @@ NB_MODULE(_paged_ops, m) {
            int v_bits,
            int window_seqlen_q,
            nb::object sinks_h,
-           int num_decode_requests) {
+           int num_decode_requests,
+           bool gqa_disabled) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* ks = use_turboquant
@@ -1967,7 +1974,7 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk, num_decode_requests);
+              window_seqlen_q, sk, num_decode_requests, gqa_disabled);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1988,6 +1995,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("window_seqlen_q") = 1,
         nb::arg("sinks") = nb::none(),
         nb::arg("num_decode_requests") = -1,
+        nb::arg("gqa_disabled") = false,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "

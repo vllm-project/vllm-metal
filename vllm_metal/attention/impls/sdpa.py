@@ -36,6 +36,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal import envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -805,6 +806,7 @@ def sdpa_forward(
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
             num_decode_requests=ctx.num_decode_requests,
+            gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
         )
     else:
         ops.paged_attention_primitive(
@@ -824,6 +826,7 @@ def sdpa_forward(
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
             num_decode_requests=ctx.num_decode_requests,
+            gqa_disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE,
         )
 
     # Reshape + strip padding back to actual head_dim before o_proj.

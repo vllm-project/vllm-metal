@@ -61,6 +61,7 @@ def _run_primitive(
     window_seqlen_q: int = 1,
     query_lens: list[int] | None = None,
     num_decode_requests: int = -1,
+    gqa_disabled: bool = False,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -117,6 +118,7 @@ def _run_primitive(
         out,
         window_seqlen_q=window_seqlen_q,
         num_decode_requests=num_decode_requests,
+        gqa_disabled=gqa_disabled,
     )
     mx.eval(out)
     ref = ref_paged_attn(
@@ -214,3 +216,22 @@ def test_spec_window_does_not_switch_kernel_family() -> None:
         query_lens=[window],
     )
     _assert_close(out, ref, mx.float16)
+
+
+def test_gqa_disable_env_forces_established_kernels(monkeypatch) -> None:
+    """VLLM_METAL_DISABLE_GQA_DECODE=1 keeps eligible batches off the GQA
+    kernel without changing results (issue #713 benchmarking escape hatch)."""
+    from vllm_metal import envs
+
+    ops = get_ops()
+    assert envs.VLLM_METAL_DISABLE_GQA_DECODE is False  # default off
+    kv_len = 2 * ops.GQA_DECODE_MIN_SEQ_LEN
+    out_on, ref = _run_primitive([kv_len], mx.bfloat16, interleaved=True, seed=7)
+    out_off, _ = _run_primitive(
+        [kv_len], mx.bfloat16, interleaved=True, seed=7, gqa_disabled=True
+    )
+    _assert_close(out_on, ref, mx.bfloat16)
+    _assert_close(out_off, ref, mx.bfloat16)  # numerics identical either way
+
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
+    assert envs.VLLM_METAL_DISABLE_GQA_DECODE is True
