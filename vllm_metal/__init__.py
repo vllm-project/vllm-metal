@@ -126,7 +126,6 @@ def _register() -> str | None:
     """
     _configure_logging()
     _apply_macos_defaults()
-    _apply_mlx_buffer_defaults()
 
     # Register our env vars with vLLM's registry so validate_environ()
     # does not warn about unknown VLLM_METAL_* / VLLM_MLX_* variables.
@@ -135,6 +134,15 @@ def _register() -> str | None:
     from vllm_metal.envs import environment_variables as metal_env_vars
 
     vllm.envs.environment_variables.update(metal_env_vars)
+
+    from vllm_metal import envs
+
+    if envs.VLLM_METAL_MODEL_BACKEND != "mlx":
+        # vLLM swallows exceptions during platform probing. Validate explicit
+        # selections when the platform is instantiated, outside that probe.
+        return "vllm_metal.pytorch_backend.platform.TorchPlatform"
+
+    _apply_mlx_buffer_defaults()
 
     from vllm_metal.compat import apply_compat_patches
 

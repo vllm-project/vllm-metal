@@ -68,6 +68,7 @@ nav:
   - Models:
     - Supported Models: supported_models.md
   - Features:
+    - Experimental PyTorch Backend: pytorch_backend.md
     - GGUF: gguf.md
     - Speculative Decoding: speculative_decoding.md
     - Text Pooling: text_embedding_pooling.md

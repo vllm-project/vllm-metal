@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    VLLM_METAL_MODEL_BACKEND: str = "mlx"
     VLLM_METAL_MEMORY_FRACTION: str = "auto"
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt in to upstream vLLM model implementations on PyTorch MPS.
+    "VLLM_METAL_MODEL_BACKEND": lambda: os.getenv("VLLM_METAL_MODEL_BACKEND", "mlx"),
     # Fraction of unified memory to use.  "auto" (the default) means the
     # plugin calculates the minimal amount needed at startup.
     # Returns the raw string; config.py handles "auto" → sentinel conversion.
