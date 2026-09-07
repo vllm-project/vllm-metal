@@ -75,6 +75,26 @@ VLLM_METAL_MEMORY_FRACTION=0.55 \
     --speculative-config '{"method":"draft_model","model":"Qwen/Qwen3-0.6B","num_speculative_tokens":3}'
 ```
 
+### Dynamic speculative decoding
+
+See the upstream [dynamic speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/dynamic_speculative_decoding/)
+for configuration details. This example sets `K=3` for one scheduled request
+and `K=0` for two:
+
+```bash
+VLLM_METAL_MEMORY_FRACTION=0.55 \
+  vllm serve Qwen/Qwen3-8B \
+    --max-model-len 2048 \
+    --max-num-seqs 2 \
+    --no-async-scheduling \
+    --speculative-config '{
+      "method": "draft_model",
+      "model": "Qwen/Qwen3-0.6B",
+      "num_speculative_tokens": 3,
+      "num_speculative_tokens_per_batch_size": [[1, 1, 3], [2, 2, 0]]
+    }'
+```
+
 ## N-gram
 
 Follow the upstream [N-gram guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/n_gram/)
