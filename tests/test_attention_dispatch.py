@@ -15,7 +15,11 @@ from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.impls.linear import is_linear_attention
 from vllm_metal.attention.impls.mamba2 import is_mamba2_mixer
 from vllm_metal.attention.impls.sdpa import is_sdpa
-from vllm_metal.attention.patching import find_attn_attr, find_layers
+from vllm_metal.attention.patching import (
+    DEFAULT_ATTN_ATTR_NAMES,
+    find_attn_attr,
+    find_layers,
+)
 
 # ---------------------------------------------------------------------------
 # Minimal ModelArgs for real mlx_lm module instantiation (no weights needed)
@@ -282,3 +286,12 @@ def test_qwen35_paged_attention_hybrid():
         outputs = llm.generate(["The capital of France is"], sp)
         assert len(outputs) == 1
         assert len(outputs[0].outputs[0].token_ids) > 0
+
+
+def test_mixer_is_probed_only_when_a_family_opts_in() -> None:
+    from mlx_lm.models.nemotron_h import ModelArgs, NemotronHBlock
+
+    block = NemotronHBlock(ModelArgs(**NEMOTRON_H_TINY_ARGS), "M")
+
+    assert find_attn_attr(block) is None
+    assert find_attn_attr(block, (*DEFAULT_ATTN_ATTR_NAMES, "mixer")) == "mixer"

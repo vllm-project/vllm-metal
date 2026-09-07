@@ -39,12 +39,14 @@ def find_layers(model: Any) -> list[Any]:
 
 # Attribute names to probe on each layer, in priority order. LFM2 uses
 # ``conv`` for its ShortConv layers, which have no attention submodule.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv", "mixer")
+DEFAULT_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv")
 
 
-def find_attn_attr(layer: Any) -> str | None:
+def find_attn_attr(
+    layer: Any, attr_names: tuple[str, ...] = DEFAULT_ATTN_ATTR_NAMES
+) -> str | None:
     """Return the attention attribute name for a single layer, or None."""
-    for name in _ATTN_ATTR_NAMES:
+    for name in attr_names:
         if hasattr(layer, name):
             return name
     return None
@@ -60,6 +62,7 @@ def walk_and_wrap(
     wrap_layer: Any,
     *,
     only_layers: list[int] | None = None,
+    attr_names: tuple[str, ...] = DEFAULT_ATTN_ATTR_NAMES,
 ) -> int:
     """Walk a model's attention layers and install paged-attention wrappers.
 
@@ -78,6 +81,8 @@ def walk_and_wrap(
         wrap_layer: callable ``(layer_idx, attn) -> wrapper``.
         only_layers: if given, only patch these layer indices; others are left
             untouched (KV-sharing subsets and hybrid plans that own a subset).
+        attr_names: attribute names probed on each layer; a family whose
+            modules sit behind another name (Nemotron-H ``mixer``) opts in.
 
     Returns the number of patched layers.
     """
@@ -86,7 +91,7 @@ def walk_and_wrap(
     for layer_idx, layer in enumerate(find_layers(model)):
         if only_set is not None and layer_idx not in only_set:
             continue
-        attn_attr = find_attn_attr(layer)
+        attn_attr = find_attn_attr(layer, attr_names)
         if attn_attr is None:
             continue
         attn = getattr(layer, attn_attr)
