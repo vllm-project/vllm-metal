@@ -83,11 +83,6 @@ V_QUANT_PARAMS = {
     "q8_0": {"signed": False, "bits": 8, "dtype": mx.uint8, "block_size": 32},
 }
 
-
-def searchsorted(boundaries, x):
-    return (x[..., None] > boundaries).sum(axis=-1)
-
-
 FWHT_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
 
 
@@ -141,7 +136,7 @@ def _compute_lloyd_max_normal(bits: int) -> tuple[mx.array, mx.array]:
     for _ in range(500):
         boundaries = (centroids[:-1] + centroids[1:]) * 0.5
         # assign[i] = cluster index for sample[i] (in [0, n))
-        assign = searchsorted(boundaries, samples).astype(mx.int32)
+        assign = mx.searchsorted(boundaries, samples).astype(mx.int32)
         # one_hot: (N, n)
         one_hot = (assign[:, None] == cluster_ids[None, :]).astype(mx.float32)
         counts = one_hot.sum(axis=0)  # (n,)
@@ -212,7 +207,7 @@ def lm_quant(x: mx.array, bits: int = 3) -> tuple[mx.array, mx.array]:
     x = x.reshape(*shape[:-1], -1, BLOCK_SIZE)
     scale = mx.sqrt(mx.mean(x**2, axis=-1, keepdims=True))
     x_norm = x / (scale + 1e-8)
-    indices = searchsorted(boundaries, x_norm).reshape(shape)
+    indices = mx.searchsorted(boundaries, x_norm).reshape(shape)
     return indices.astype(mx.uint8), scale.squeeze(-1).astype(mx.float16)
 
 
