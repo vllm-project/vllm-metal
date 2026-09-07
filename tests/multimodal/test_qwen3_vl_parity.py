@@ -2,7 +2,7 @@
 """End-to-end parity: ``adapter.call_lm`` vs ``mlx_vlm.Model.__call__``.
 
 Marked ``slow`` — opt in with ``pytest -m slow`` (matches the existing
-real-model convention in ``tests/test_qwen35_smoke.py``).  Skips when
+real-model convention in the shared parity tool).  Skips when
 the model is not pre-pulled into the HF cache; pre-pull locally with::
 
     hf download mlx-community/Qwen3-VL-4B-Instruct-4bit

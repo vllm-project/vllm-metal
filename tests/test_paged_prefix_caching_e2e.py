@@ -23,9 +23,8 @@ the ``spawn`` start method) so Metal device init happens in a fresh
 interpreter.  Required on Metal because:
   - ``fork`` inherits the parent's Metal context and segfaults
     (Metal is not fork-safe).
-  - Running in the parent pytest process alongside the cache-off
-    baseline fixture in ``test_paged_deterministic`` causes
-    ``kv_budget=0`` — MLX wired buffers aren't released by Python gc.
+  - Other engines in the parent pytest process can retain MLX wired
+    buffers and leave no room for this test's KV cache.
 """
 
 from __future__ import annotations
@@ -35,10 +34,8 @@ import os
 
 import pytest
 
-from tests.test_paged_deterministic import (
-    DEFAULT_PAGED_MEMORY_FRACTION,
-    MODEL_NAME,
-)
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+DEFAULT_PAGED_MEMORY_FRACTION = "0.2"
 
 # Long shared prefix (~30 tokens — comfortably more than the 16-token
 # Metal block size, so the upstream scheduler hashes at least one block

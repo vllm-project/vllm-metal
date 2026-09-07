@@ -155,7 +155,7 @@ def kernel_dispatch_log() -> list[_KernelDispatch]:
         pytest.skip(f"{MODEL_ENV}={model_path} is not a directory")
 
     with pytest.MonkeyPatch.context() as mp:
-        # Single-process mode for determinism (mirrors test_gemma4_golden.py).
+        # Single-process mode for deterministic local inference.
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
         # Install the spy BEFORE importing vllm or creating the LLM --
