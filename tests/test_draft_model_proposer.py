@@ -160,7 +160,7 @@ def _prefills_context(
         decode_segments=[],
         decode_token_ids=[],
         prefill_reqs=prefill_reqs,
-        prefill_token_ids=[],
+        prefill_token_ids=[42] * len(prefill_reqs),
         prefill_result_modes=["final"] * len(prefill_reqs),
         request_states={
             req_id: _request_state(committed_block_ids=[0]) for req_id, _ in prefills
@@ -536,29 +536,29 @@ def test_chunked_ingest_forwards_per_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A >16-token cold ingest runs one forward per chunk: a 20-token prompt
-    with a 16-token chunk runs 16 then 4, and the predicted token comes from
-    the final ingested row (position 19), not a chunk boundary."""
+    plus the sampled token runs 16 then 5, and the predicted token comes from
+    the sampled token's row (position 20), not a chunk boundary."""
     monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
     model = _PositionEncodingDraftModel()
     proposer = _proposer(model)
 
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
-    assert model.input_lens == [16, 4]
+    assert model.input_lens == [16, 5]
     assert drafts is not None
-    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_ingest_chunk_exact_multiple_two_equal_rounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 32-token ingest with a 16-token chunk splits 16 / 16; the final
+    """A 31-token prompt plus its sampled token splits 16 / 16; the final
     row of the second round (position 31) predicts."""
     monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
     model = _PositionEncodingDraftModel()
     proposer = _proposer(model)
 
-    drafts = proposer.propose(_prefills_context([("r1", list(range(32)))]))
+    drafts = proposer.propose(_prefills_context([("r1", list(range(31)))]))
 
     assert model.input_lens == [16, 16]
     assert drafts is not None
@@ -575,9 +575,9 @@ def test_ingest_chunk_larger_than_prompt_single_forward(
 
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
-    assert model.input_lens == [20]
+    assert model.input_lens == [21]
     assert drafts is not None
-    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_ingest_chunk_size_zero_single_forward(
@@ -590,9 +590,9 @@ def test_ingest_chunk_size_zero_single_forward(
 
     drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
 
-    assert model.input_lens == [20]
+    assert model.input_lens == [21]
     assert drafts is not None
-    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -602,7 +602,7 @@ def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> Non
     model = _PositionEncodingDraftModel()
     proposer = _proposer(model)
 
-    drafts = proposer.propose(_prefills_context([("r1", list(range(16)))]))
+    drafts = proposer.propose(_prefills_context([("r1", list(range(15)))]))
 
     assert model.input_lens == [16]
     assert drafts is not None
@@ -610,9 +610,9 @@ def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """20- and 25-token ingests with a 16-token chunk: round 0 carries both
+    """21- and 26-token ingests with a 16-token chunk: round 0 carries both
     plans' first 16 tokens, round 1 the two tails; each plan predicts from
-    its own final row (positions 19 and 24)."""
+    its own sampled-token row (positions 20 and 25)."""
     monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
     model = _PositionEncodingDraftModel()
     proposer = _proposer(model)
@@ -621,10 +621,10 @@ def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> No
         _prefills_context([("r1", list(range(20))), ("r2", list(range(25)))])
     )
 
-    assert model.input_lens == [32, 13]
+    assert model.input_lens == [32, 15]
     assert drafts is not None
     assert drafts.req_ids == ["r1", "r2"]
-    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE], [24 % VOCAB_SIZE]]
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
 
 
 # -- Sliding-window / hybrid draft rejection ---------------------------------
