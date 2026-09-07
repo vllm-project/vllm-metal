@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import torch
@@ -57,7 +57,4 @@ def load_encoder_weight_file(weight_file: Path) -> dict[str, mx.array]:
             for name, value in state_dict.items()
             if isinstance(value, torch.Tensor)
         }
-    weights = mx.load(str(weight_file))
-    if not isinstance(weights, dict):
-        raise ValueError(f"Expected named tensors in {weight_file}")
-    return weights
+    return cast(dict[str, mx.array], mx.load(str(weight_file)))

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 from vllm.lora.peft_helper import PEFTHelper
@@ -56,12 +56,7 @@ def load_peft_adapter(
     helper = PEFTHelper.from_local_dir(str(adapter_path), max_position_embeddings)
     if lora_config is not None:
         helper.validate_legal(lora_config)
-    raw = mx.load(str(safetensors_path))
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"Expected safetensors weights in {safetensors_path}, got "
-            f"{type(raw).__name__}"
-        )
+    raw = cast(dict[str, mx.array], mx.load(str(safetensors_path)))
     # Preserve eager loading: later in-place adapter updates must not change
     # tensors already returned to the adapter manager.
     mx.eval(raw)
