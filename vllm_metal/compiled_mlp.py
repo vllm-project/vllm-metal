@@ -106,19 +106,8 @@ class CompiledMLPBlocks:
         return len(replacements)
 
     @classmethod
-    def _target_policies(cls) -> dict[type, type]:
-        """Target block type -> wrapper class (one per calling convention).
-
-        The Qwen3-Next family blocks (Qwen3.5/3.6/3.8 share them via the
-        qwen3_5 arch) take a plain activations-only call; mlx_vlm's dense
-        and MoE variants add a default-off ``target_verify`` flag, whose
-        signatures are validated here so an mlx-vlm bump that changes them
-        fails fast instead of silently mis-routing. All targets are
-        stateless by construction — extending this table requires the same
-        property.
-        """
-        import inspect
-
+    def _target_policies(cls) -> dict[type[nn.Module], type[CompiledMLPBlock]]:
+        """Target block type -> wrapper class."""
         from mlx_lm.models.qwen3_next import Qwen3NextMLP, Qwen3NextSparseMoeBlock
         from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
         from mlx_vlm.models.qwen3_5_moe.language import (
@@ -126,21 +115,35 @@ class CompiledMLPBlocks:
             Qwen3_5MoeSparseMoeBlock,
         )
 
-        for target in (Qwen3_5MLP, Qwen3_5MoeMLP, Qwen3_5MoeSparseMoeBlock):
-            params = list(inspect.signature(target.__call__).parameters)
-            if params != ["self", "x", "target_verify"]:
-                raise RuntimeError(
-                    f"mlx_vlm {target.__name__}.__call__ signature changed "
-                    f"({params}); update CompiledMLPBlocks' wrapper policy "
-                    "before wrapping it."
-                )
-        return {
+        policies: dict[type[nn.Module], type[CompiledMLPBlock]] = {
             Qwen3NextSparseMoeBlock: CompiledMLPBlock,
             Qwen3NextMLP: CompiledMLPBlock,
-            Qwen3_5MLP: CompiledTargetVerifyMLPBlock,
-            Qwen3_5MoeMLP: CompiledTargetVerifyMLPBlock,
-            Qwen3_5MoeSparseMoeBlock: CompiledTargetVerifyMLPBlock,
         }
+        for target in (Qwen3_5MLP, Qwen3_5MoeMLP, Qwen3_5MoeSparseMoeBlock):
+            policies[target] = cls.wrapper_for_target(target)
+        return policies
+
+    @staticmethod
+    def wrapper_for_target(target: type[nn.Module]) -> type[CompiledMLPBlock]:
+        """Select a wrapper for a released mlx-vlm MLP call contract."""
+        import inspect
+
+        signature = inspect.signature(target.__call__)
+        parameters = list(signature.parameters.values())
+        names = [parameter.name for parameter in parameters]
+        if names == ["self", "x"]:
+            return CompiledMLPBlock
+        if (
+            names == ["self", "x", "target_verify"]
+            and parameters[2].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameters[2].default is False
+        ):
+            return CompiledTargetVerifyMLPBlock
+        raise RuntimeError(
+            f"mlx_vlm {target.__name__}.__call__ signature changed "
+            f"{signature}; update CompiledMLPBlocks' wrapper policy "
+            "before wrapping it."
+        )
 
 
 class CompiledMLPBlock(nn.Module):

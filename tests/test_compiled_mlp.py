@@ -111,6 +111,11 @@ def _spy_compiled(wrapper: CompiledMLPBlock) -> dict[str, int]:
     return calls
 
 
+class _TargetVerifyMLPContract(nn.Module):
+    def __call__(self, x: mx.array, target_verify: bool = False) -> mx.array:
+        return x
+
+
 class TestInstall:
     def test_flag_defaults_off(self):
         # Assert — opt-in while the dispatch gathers serve mileage.
@@ -191,9 +196,6 @@ class TestInstall:
         assert not isinstance(wrapper.inner.shared_expert, CompiledMLPBlock)
 
     def test_vlm_moe_family_is_registered(self, monkeypatch):
-        # Arrange — the qwen3_5_moe package's blocks use the target_verify
-        # convention; the dense variant is cheap to construct, the sparse
-        # block's registration and wrapper class are pinned via the policy.
         _require_metal()
         from mlx_vlm.models.qwen3_5_moe.language import (
             Qwen3_5MoeMLP,
@@ -201,7 +203,9 @@ class TestInstall:
         )
 
         policies = CompiledMLPBlocks._target_policies()
-        assert policies[Qwen3_5MoeSparseMoeBlock] is CompiledTargetVerifyMLPBlock
+        assert policies[
+            Qwen3_5MoeSparseMoeBlock
+        ] is CompiledMLPBlocks.wrapper_for_target(Qwen3_5MoeSparseMoeBlock)
         mx.random.seed(15)
         inner = Qwen3_5MoeMLP(DIM, HIDDEN)
         inner.eval()
@@ -210,16 +214,13 @@ class TestInstall:
         x = mx.random.normal((1, 2, DIM)).astype(mx.float16)
         reference = inner(x)
 
-        # Act
         assert _install(monkeypatch, host) == 1
         calls = _spy_compiled(host.mlp)
         out = host.mlp(x)
-        out_verify = host.mlp(x, True)
 
-        # Assert
-        assert isinstance(host.mlp, CompiledTargetVerifyMLPBlock)
-        assert calls["n"] == 1  # plain engaged; target_verify=True eager
-        mx.eval(reference, out, out_verify)
+        assert isinstance(host.mlp, CompiledMLPBlocks.wrapper_for_target(Qwen3_5MoeMLP))
+        assert calls["n"] == 1
+        mx.eval(reference, out)
         np.testing.assert_array_equal(
             np.array(reference.astype(mx.float32)),
             np.array(out.astype(mx.float32)),
@@ -300,9 +301,25 @@ class TestDispatch:
         assert engaged_at_cap == 1
         assert calls["n"] == 1  # over-cap call stayed eager
 
-    def test_vlm_mlp_wraps_and_extra_args_stay_eager(self, monkeypatch):
-        # Arrange — mlx_vlm's dense MLP takes a target_verify kwarg; the
-        # plain call compiles, the kwarg-carrying call stays eager.
+    def test_target_verify_wrapper_keeps_verify_eager(self):
+        _require_metal()
+        inner = _TargetVerifyMLPContract()
+        inner.eval()
+        wrapper_cls = CompiledMLPBlocks.wrapper_for_target(_TargetVerifyMLPContract)
+        assert wrapper_cls is CompiledTargetVerifyMLPBlock
+        wrapper = wrapper_cls(inner)
+        calls = _spy_compiled(wrapper)
+        x = mx.random.normal((1, 2, DIM)).astype(mx.float16)
+
+        wrapper(x)
+        wrapper(x, target_verify=False)
+        wrapper(x, True)
+        with pytest.raises(TypeError):
+            wrapper(x, False, target_verify=False)
+
+        assert calls["n"] == 2
+
+    def test_vlm_mlp_uses_signature_matched_wrapper(self, monkeypatch):
         _require_metal()
         mx.random.seed(13)
         inner = Qwen3_5MLP(DIM, HIDDEN)
@@ -314,19 +331,11 @@ class TestDispatch:
         assert _install(monkeypatch, host) == 1
         calls = _spy_compiled(host.mlp)
 
-        # Act — default-off target_verify (positional or named) is the
-        # plain call and engages; a truthy flag stays eager, and an invalid
-        # duplicate raises at the wrapper exactly like the unwrapped module.
-        assert isinstance(host.mlp, CompiledTargetVerifyMLPBlock)
+        expected_wrapper = CompiledMLPBlocks.wrapper_for_target(Qwen3_5MLP)
+        assert isinstance(host.mlp, expected_wrapper)
         out_plain = host.mlp(x)
-        out_default = host.mlp(x, target_verify=False)
-        out_verify = host.mlp(x, True)
-        with pytest.raises(TypeError):
-            host.mlp(x, False, target_verify=False)
-
-        # Assert
-        assert calls["n"] == 2  # plain + default-off engaged; others eager
-        mx.eval(reference, out_plain, out_default, out_verify)
+        assert calls["n"] == 1
+        mx.eval(reference, out_plain)
         np.testing.assert_array_equal(
             np.array(reference.astype(mx.float32)),
             np.array(out_plain.astype(mx.float32)),
