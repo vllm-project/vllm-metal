@@ -181,6 +181,12 @@ def _gguf_module_histogram(model: nn.Module) -> dict[str, int]:
     return counts
 
 
+def _assert_dense_wrapper_histogram(model: nn.Module) -> None:
+    hist = _gguf_module_histogram(model)
+    assert hist.get("GGUFEmbedding") == 1
+    assert hist.get("GGUFLinear") == 2 * 7
+
+
 def _assert_forward_vocab_shape(model: nn.Module) -> None:
     out = model(mx.array([[1, 2, 3]]))
     mx.eval(out)
@@ -205,9 +211,7 @@ def test_loads_dense_model_installs_wrappers(
         config_dir=cfg_dir,
         target_dtype=mx.float32,
     ).load()
-    hist = _gguf_module_histogram(model)
-    assert hist.get("GGUFEmbedding") == 1
-    assert hist.get("GGUFLinear") == 2 * 7
+    _assert_dense_wrapper_histogram(model)
     _assert_forward_vocab_shape(model)
 
 
@@ -850,9 +854,7 @@ def test_direct_loader_keeps_quantized_wrappers(tmp_path):
     loader = GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32)
     assert isinstance(loader, GGUFModelLoader)
     model, _ = loader.load()
-    hist = _gguf_module_histogram(model)
-    assert hist.get("GGUFEmbedding") == 1
-    assert hist.get("GGUFLinear") == 2 * 7
+    _assert_dense_wrapper_histogram(model)
 
 
 def test_direct_loader_rejects_remote_reference(tmp_path):
@@ -867,3 +869,40 @@ def test_direct_loader_rejects_missing_config_dir(tmp_path):
     gguf_path, _ = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
     with pytest.raises(GGUFLoadError, match="No config.json"):
         GGUFModelLoader(gguf_path, config_dir=gguf_path, target_dtype=mx.float32).load()
+
+
+@pytest.mark.parametrize(
+    "shard_name",
+    [
+        "qwen3-Q8_0-00001-of-00002.gguf",
+        "qwen3-Q8_0-00002-of-00002.gguf",
+        "qwen3-Q8_0-1-of-2.gguf",
+    ],
+)
+def test_rejects_local_sharded_gguf_before_reading(tmp_path, shard_name):
+    # A dummy payload proves the guard fires on the name, before GGUFReader.
+    shard_path = tmp_path / shard_name
+    shard_path.write_bytes(b"not a gguf payload")
+    expected = (
+        f"Sharded GGUF files are not supported yet: {str(shard_path)!r}; "
+        "pass a single-file .gguf or merge the shards."
+    )
+
+    with pytest.raises(GGUFLoadError) as excinfo:
+        GGUFModelLoader(
+            str(shard_path), config_dir=str(tmp_path), target_dtype=mx.float32
+        ).load()
+
+    assert str(excinfo.value) == expected
+
+
+def test_loads_single_file_set_named_like_one_shard(tmp_path):
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    single = tmp_path / "qwen3-Q8_0-00001-of-00001.gguf"
+    Path(gguf_path).rename(single)
+
+    model, _ = GGUFModelLoader(
+        str(single), config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    _assert_dense_wrapper_histogram(model)

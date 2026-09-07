@@ -477,15 +477,24 @@ def test_remote_load_source_downloads_one_matching_gguf(tmp_path, monkeypatch) -
     [
         (
             [],
-            "No 'Q8_0' GGUF file",
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
         (
             ["model-a-Q8_0.gguf", "model-b-Q8_0.gguf"],
-            "matched multiple files",
+            "Remote GGUF reference 'Qwen/Qwen3-0.6B-GGUF:Q8_0' matched "
+            "multiple files: model-a-Q8_0.gguf, model-b-Q8_0.gguf.",
         ),
         (
             ["model-Q8_0-00001-of-00002.gguf"],
-            "Remote sharded GGUF files",
+            "Remote sharded GGUF files are not supported yet: "
+            "'Qwen/Qwen3-0.6B-GGUF:Q8_0'.",
+        ),
+        # Remote selection stays N-agnostic: a lone -00001-of-00001 match is
+        # still rejected here; only the local loader guard admits N==1 sets.
+        (
+            ["model-Q8_0-00001-of-00001.gguf"],
+            "Remote sharded GGUF files are not supported yet: "
+            "'Qwen/Qwen3-0.6B-GGUF:Q8_0'.",
         ),
     ],
 )
@@ -502,8 +511,10 @@ def test_remote_load_source_rejects_unsupported_remote_matches(
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", fail_snapshot_download)
 
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError) as excinfo:
         gguf_source.GGUFLoadSource.from_model_config(_remote_gguf_model_config())
+
+    assert str(excinfo.value) == error
 
 
 def test_remote_load_source_rejects_unsupported_qtype_before_download(

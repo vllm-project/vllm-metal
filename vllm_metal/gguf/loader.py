@@ -148,6 +148,12 @@ class GGUFModelLoader:
             or not self._gguf_path.is_file()
         ):
             raise GGUFLoadError(f"Not a local .gguf file: {str(self._gguf_path)!r}")
+        if GGUFLoadSource.is_sharded_weights_path(self._gguf_path.name):
+            raise GGUFLoadError(
+                "Sharded GGUF files are not supported yet: "
+                f"{str(self._gguf_path)!r}; pass a single-file .gguf or merge "
+                "the shards."
+            )
         if not (self._config_dir / "config.json").is_file():
             raise GGUFLoadError(
                 f"No config.json in config_dir {str(self._config_dir)!r}"

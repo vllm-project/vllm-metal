@@ -22,7 +22,7 @@ _QUANT_TAG_RE = re.compile(
 )
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
-_REMOTE_SHARD_RE = re.compile(r"-\d+-of-\d+\.gguf$")
+_SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
 _SUPPORTED_REMOTE_QTYPES = frozenset({"Q8_0", "Q4_0", "Q4_1"})
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 _TOKENIZER_ALLOW_PATTERNS = (
@@ -110,7 +110,7 @@ class RemoteGGUFReference:
                 f"No {self.quant_type!r} GGUF file found in remote repository "
                 f"{self.repo_id!r}."
             )
-        if any(_REMOTE_SHARD_RE.search(filename) for filename in filenames):
+        if any(_SHARD_NAME_RE.search(filename) for filename in filenames):
             raise ValueError(
                 f"Remote sharded GGUF files are not supported yet: {self.value!r}."
             )
@@ -181,6 +181,12 @@ class GGUFLoadSource:
     @staticmethod
     def is_weights_path(value: str) -> bool:
         return value.endswith(_GGUF_SUFFIX)
+
+    @staticmethod
+    def is_sharded_weights_path(value: str) -> bool:
+        # A -00001-of-00001.gguf set is one complete file and loads as such.
+        match = _SHARD_NAME_RE.search(value)
+        return match is not None and int(match.group(1)) > 1
 
     @staticmethod
     def _resolve_companion_source(
