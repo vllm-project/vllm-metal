@@ -47,9 +47,7 @@ dependencies = [
     "apache-tvm-ffi>=0.1.9,<0.1.13; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # mlx-vlm 0.6.8 drives MLX-quantized Qwen3.5/3.6 wrappers with correct
     # mRoPE state; 0.6.4 leaves it unset and garbles their output (#685).
-    # Capped below 0.6.16, which drops `target_verify` from
-    # Qwen3_5MLP.__call__ and trips the CompiledMLPBlocks wrapper guard.
-    "mlx-vlm>=0.6.8,<0.6.16; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.6.8,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
     # Keep aligned with vLLM 0.28.0's Transformers lower bound.
     "transformers>=5.5.3",
