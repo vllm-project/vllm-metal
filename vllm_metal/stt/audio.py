@@ -14,6 +14,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 import numpy as np
+from transformers.audio_utils import mel_filter_bank
 
 # ===========================================================================
 # Whisper audio constants (matches OpenAI spec)
@@ -198,7 +199,15 @@ def _stft(
         Complex spectrogram of shape ``(n_fft // 2 + 1, num_frames)``.
     """
     pad_amount = n_fft // 2
-    audio = mx.pad(audio, [(pad_amount, pad_amount)])
+    if audio.shape[0] <= pad_amount:
+        raise ValueError(
+            f"STFT input must contain more than {pad_amount} samples for "
+            "reflect padding; pad the waveform before computing features."
+        )
+    # Match torch.stft's centered reflect padding, excluding the endpoints.
+    audio = mx.concatenate(
+        [audio[1 : pad_amount + 1][::-1], audio, audio[-pad_amount - 1 : -1][::-1]]
+    )
 
     num_frames = (audio.shape[0] - n_fft) // hop_length + 1
 
@@ -226,29 +235,19 @@ def _mel_filters(sample_rate: int, n_fft: int, n_mels: int) -> mx.array:
         Filter-bank of shape ``(n_mels, n_fft // 2 + 1)``.
     """
 
-    def hz_to_mel(hz: float) -> float:
-        return 2595.0 * math.log10(1.0 + hz / 700.0)
-
-    def mel_to_hz(mel: float) -> float:
-        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
-
-    mel_points = mx.linspace(hz_to_mel(0), hz_to_mel(sample_rate / 2), n_mels + 2)
-    hz_points = mx.array([mel_to_hz(m.item()) for m in mel_points])
-    bin_points = mx.floor((n_fft + 1) * hz_points / sample_rate).astype(mx.int32)
-
-    filters = mx.zeros((n_mels, n_fft // 2 + 1))
-    for i in range(n_mels):
-        left, center, right = (bin_points[j].item() for j in (i, i + 1, i + 2))
-        for j in range(left, center):
-            if center != left:
-                filters[i, j] = (j - left) / (center - left)
-        for j in range(center, right):
-            if right != center:
-                filters[i, j] = (right - j) / (right - center)
-
-    # Slaney normalisation
-    enorm = 2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels])
-    return filters * enorm[:, None]
+    # Whisper uses the Slaney frequency scale as well as Slaney area
+    # normalization. Evaluate triangles at FFT frequencies without rounding
+    # their vertices to bins (which can erase narrow low-frequency filters).
+    filters = mel_filter_bank(
+        num_frequency_bins=n_fft // 2 + 1,
+        num_mel_filters=n_mels,
+        min_frequency=0.0,
+        max_frequency=sample_rate / 2,
+        sampling_rate=sample_rate,
+        norm="slaney",
+        mel_scale="slaney",
+    )
+    return mx.array(filters.T, dtype=mx.float32)
 
 
 def log_mel_spectrogram(
@@ -270,7 +269,8 @@ def log_mel_spectrogram(
         audio = mx.array(audio, mx.float32)
 
     window = _hanning(N_FFT)
-    freqs = _stft(audio, window, N_FFT, HOP_LENGTH)
+    # Whisper drops the final centered STFT frame before Mel projection.
+    freqs = _stft(audio, window, N_FFT, HOP_LENGTH)[:, :-1]
     magnitudes = (freqs * mx.conj(freqs)).real
 
     filters = _mel_filters(SAMPLE_RATE, N_FFT, n_mels)

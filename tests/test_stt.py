@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 import pytest
+from transformers import WhisperFeatureExtractor
 from transformers.models.whisper.tokenization_whisper import LANGUAGES
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 
@@ -69,6 +70,25 @@ class TestValidateLanguage:
 
 class TestAudioPipeline:
     """Tests for core audio processing functions."""
+
+    @pytest.mark.parametrize("n_mels", [80, 128])
+    def test_log_mel_spectrogram_matches_whisper(self, n_mels: int) -> None:
+        # Non-silent boundaries expose STFT padding differences; the partial
+        # final hop also checks Whisper's trailing-frame convention.
+        audio = (
+            np.random.default_rng(0).normal(0, 0.1, SAMPLE_RATE + 57).astype(np.float32)
+        )
+        expected = WhisperFeatureExtractor(feature_size=n_mels)(
+            audio,
+            sampling_rate=SAMPLE_RATE,
+            padding="do_not_pad",
+            truncation=False,
+            return_tensors="np",
+        ).input_features[0]
+
+        actual = log_mel_spectrogram(audio, n_mels=n_mels)
+
+        np.testing.assert_allclose(np.array(actual), expected, atol=2e-4, rtol=1e-5)
 
     def test_log_mel_spectrogram_shape(self) -> None:
         """Log-mel spectrogram should have expected shape."""

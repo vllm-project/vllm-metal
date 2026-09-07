@@ -15,7 +15,6 @@ from vllm.config import SpeechToTextConfig
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 
 from vllm_metal.stt.audio import (
-    N_FRAMES,
     N_SAMPLES,
     SAMPLE_RATE,
     audio_duration,
@@ -384,8 +383,10 @@ class WhisperTranscriber:
         return segments
 
     def _encode_chunk(self, audio_chunk: mx.array) -> mx.array:
+        # Pad silence in waveform space: zero-valued log-Mel features are
+        # not the spectrogram of silence, and padding affects normalization.
+        audio_chunk = pad_or_trim(audio_chunk, N_SAMPLES)
         mel = log_mel_spectrogram(audio_chunk, n_mels=self.model.config.n_mels)
-        mel = pad_or_trim(mel, N_FRAMES, axis=-1)
         if mel.ndim == 2:
             mel = mel[None, ...]
         mel = mel.transpose(0, 2, 1)

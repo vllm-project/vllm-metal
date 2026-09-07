@@ -9,11 +9,12 @@ from types import SimpleNamespace
 from typing import cast
 
 import mlx.core as mx
+import numpy as np
 import pytest
-from transformers import WhisperTokenizer
+from transformers import WhisperFeatureExtractor, WhisperTokenizer
 from vllm.config import SpeechToTextConfig
 
-from vllm_metal.stt.audio import SAMPLE_RATE
+from vllm_metal.stt.audio import N_SAMPLES, SAMPLE_RATE
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel, WhisperTranscriber
 from vllm_metal.stt.whisper.transcriber import (
@@ -407,6 +408,26 @@ class TestGreedyDecode:
 
 
 class TestEncodeChunk:
+    @pytest.mark.parametrize("n_mels", [80, 128])
+    @pytest.mark.parametrize("num_samples", [SAMPLE_RATE, N_SAMPLES])
+    def test_encoder_input_matches_whisper(self, n_mels: int, num_samples: int) -> None:
+        audio = np.random.default_rng(1).normal(0, 0.1, num_samples).astype(np.float32)
+        # Return the encoder input so the assertion covers the real chunk
+        # preprocessing, including padding and the time/mel transpose.
+        model = cast(
+            WhisperModel,
+            SimpleNamespace(
+                config=SimpleNamespace(n_mels=n_mels), encode=lambda mel: mel
+            ),
+        )
+        expected = WhisperFeatureExtractor(feature_size=n_mels)(
+            audio, sampling_rate=SAMPLE_RATE, return_tensors="np"
+        ).input_features.transpose(0, 2, 1)
+
+        actual = WhisperTranscriber(model)._encode_chunk(mx.array(audio))
+
+        np.testing.assert_allclose(np.array(actual), expected, atol=2e-4, rtol=1e-5)
+
     def test_encode_chunk_output_shape(self) -> None:
         transcriber = WhisperTranscriber(
             model=_make_tiny_whisper_model(n_audio_ctx=1500)
