@@ -111,6 +111,11 @@ def _spy_compiled(wrapper: CompiledMLPBlock) -> dict[str, int]:
     return calls
 
 
+class _UnaryMLPContract(nn.Module):
+    def __call__(self, x: mx.array) -> mx.array:
+        return x
+
+
 class _TargetVerifyMLPContract(nn.Module):
     def __call__(self, x: mx.array, target_verify: bool = False) -> mx.array:
         return x
@@ -177,6 +182,20 @@ class TestInstall:
         assert all(isinstance(h.mlp, CompiledMLPBlock) for h in deep.layers)
         assert isinstance(deep.head.mlp, CompiledMLPBlock)
 
+    @pytest.mark.parametrize(
+        ("target", "expected_wrapper"),
+        [
+            (_UnaryMLPContract, CompiledMLPBlock),
+            (_TargetVerifyMLPContract, CompiledTargetVerifyMLPBlock),
+        ],
+    )
+    def test_wrapper_matches_released_vlm_call_contract(
+        self,
+        target: type[nn.Module],
+        expected_wrapper: type[CompiledMLPBlock],
+    ):
+        assert CompiledMLPBlocks.wrapper_for_target(target) is expected_wrapper
+
     def test_install_is_idempotent(self, monkeypatch):
         # Arrange — the MoE block nests another target (its shared-expert
         # MLP); a re-install must not wrap anything beneath the existing
@@ -218,7 +237,7 @@ class TestInstall:
         calls = _spy_compiled(host.mlp)
         out = host.mlp(x)
 
-        assert isinstance(host.mlp, CompiledMLPBlocks.wrapper_for_target(Qwen3_5MoeMLP))
+        assert type(host.mlp) is CompiledMLPBlocks.wrapper_for_target(Qwen3_5MoeMLP)
         assert calls["n"] == 1
         mx.eval(reference, out)
         np.testing.assert_array_equal(
@@ -332,7 +351,7 @@ class TestDispatch:
         calls = _spy_compiled(host.mlp)
 
         expected_wrapper = CompiledMLPBlocks.wrapper_for_target(Qwen3_5MLP)
-        assert isinstance(host.mlp, expected_wrapper)
+        assert type(host.mlp) is expected_wrapper
         out_plain = host.mlp(x)
         assert calls["n"] == 1
         mx.eval(reference, out_plain)

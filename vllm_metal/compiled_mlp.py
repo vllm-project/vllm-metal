@@ -190,11 +190,10 @@ class CompiledMLPBlock(nn.Module):
 
 
 class CompiledTargetVerifyMLPBlock(CompiledMLPBlock):
-    """Wrapper for blocks called as ``__call__(x, target_verify=False)``.
+    """Wrapper for older blocks called as ``__call__(x, target_verify=False)``.
 
-    mlx_vlm's decoder layers pass the flag on every call; its default-off
-    form is the plain call, while a truthy flag (spec-decode verify)
-    delegates to the eager inner block unchanged.
+    The default-off form is the plain call; a truthy spec-decode verify
+    call delegates to the eager inner block unchanged.
     """
 
     def __call__(self, x: mx.array, target_verify: bool = False) -> mx.array:
