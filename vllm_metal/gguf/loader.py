@@ -234,6 +234,8 @@ class GGUFModelLoader:
     ) -> _PartitionedTensors:
         """Route each GGUF tensor to quant-install / plain-load / bias-side-map."""
         arrays = mx.load(str(self._gguf_path))
+        if not isinstance(arrays, dict):
+            raise ValueError(f"Expected named tensors in {self._gguf_path}")
         if tied:
             skipped_output = arrays.pop("output.weight", None)
             if skipped_output is not None:

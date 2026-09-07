@@ -6,6 +6,8 @@ including key/value quantization metadata, bit packing helpers, and the FWHT
 rotation/sign tables used by the Metal dequantization kernels.
 """
 
+from typing import cast
+
 import mlx.core as mx
 from vllm.logger import init_logger
 
@@ -146,7 +148,7 @@ def _compute_lloyd_max_normal(bits: int) -> tuple[mx.array, mx.array]:
         sums = (one_hot * samples[:, None]).sum(axis=0)  # (n,)
         # Empty clusters keep their old centroid to avoid divide-by-zero.
         new_centroids = mx.where(counts > 0, sums / mx.maximum(counts, 1.0), centroids)
-        diff = mx.abs(new_centroids - centroids).max().item()
+        diff = cast(float, mx.abs(new_centroids - centroids).max().item())
         if diff < threshold:
             centroids = new_centroids
             converged = True

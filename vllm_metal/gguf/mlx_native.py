@@ -20,14 +20,12 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 try:
-    import gguf
+    from gguf import GGMLQuantizationType
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "GGUF support requires the optional 'gguf' dependency. "
         "Install it with: pip install 'vllm-metal[gguf]'"
     ) from exc
-
-GGMLQuantizationType = gguf.GGMLQuantizationType
 
 # qtypes MLX repacks into its affine representation.
 _BITS: dict[GGMLQuantizationType, int] = {

@@ -57,6 +57,11 @@ def load_peft_adapter(
     if lora_config is not None:
         helper.validate_legal(lora_config)
     raw = mx.load(str(safetensors_path))
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Expected safetensors weights in {safetensors_path}, got "
+            f"{type(raw).__name__}"
+        )
     # Preserve eager loading: later in-place adapter updates must not change
     # tensors already returned to the adapter manager.
     mx.eval(raw)

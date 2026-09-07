@@ -75,7 +75,7 @@ class XLMRobertaEmbeddings(nn.Module):
         )
 
     def _position_ids(self, input_ids: mx.array) -> mx.array:
-        mask = (input_ids != self.padding_idx).astype(mx.int32)
+        mask = mx.array(input_ids != self.padding_idx, dtype=mx.int32)
         return mx.cumsum(mask, axis=1) * mask + self.padding_idx
 
 

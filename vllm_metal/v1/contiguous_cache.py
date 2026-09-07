@@ -24,12 +24,12 @@ def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
     if not caches:
         raise ValueError("caches must be non-empty")
 
-    num_entries = len(caches[0].state)
+    num_entries = len(caches[0].cache)
     batch_size = len(caches)
 
     merged = ArraysCache(num_entries)
     for entry_idx in range(num_entries):
-        values = [cache.state[entry_idx] for cache in caches]
+        values = [cache.cache[entry_idx] for cache in caches]
         template = next((value for value in values if value is not None), None)
         if template is None:
             continue
@@ -49,9 +49,9 @@ def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
 
 def _extract_arrays_cache(batch_cache: ArraysCache, idx: int) -> ArraysCache:
     """Extract one request's ArraysCache, preserving all-``None`` entries."""
-    state = batch_cache.state
+    state = batch_cache.cache
     extracted = ArraysCache(len(state))
-    extracted.state = [
+    extracted.cache = [
         None if value is None else value[idx : idx + 1] for value in state
     ]
     return extracted

@@ -74,10 +74,10 @@ class TestHybridCacheMergeExtract:
         assert isinstance(merged[0], contiguous_cache.ArraysCache)
         assert isinstance(extracted_req0, contiguous_cache.ArraysCache)
         assert isinstance(extracted_req1, contiguous_cache.ArraysCache)
-        assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
-        assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
-        assert bool(mx.allclose(extracted_req1.state[0], arrays_cache_req1.state[0]))
-        assert bool(mx.allclose(extracted_req1.state[1], arrays_cache_req1.state[1]))
+        assert bool(mx.allclose(extracted_req0.cache[0], arrays_cache_req0.cache[0]))
+        assert bool(mx.allclose(extracted_req0.cache[1], arrays_cache_req0.cache[1]))
+        assert bool(mx.allclose(extracted_req1.cache[0], arrays_cache_req1.cache[0]))
+        assert bool(mx.allclose(extracted_req1.cache[1], arrays_cache_req1.cache[1]))
 
     def test_arrays_cache_merge_extract_handles_missing_entries(self) -> None:
         """Missing per-request entries become zeros after merging.
@@ -99,11 +99,11 @@ class TestHybridCacheMergeExtract:
         assert isinstance(extracted_req0, contiguous_cache.ArraysCache)
         assert isinstance(extracted_req1, contiguous_cache.ArraysCache)
 
-        assert bool(mx.allclose(extracted_req0.state[0], arrays_cache_req0.state[0]))
-        assert bool(mx.allclose(extracted_req0.state[1], arrays_cache_req0.state[1]))
-        assert bool(mx.allclose(extracted_req1.state[0], arrays_cache_req1.state[0]))
+        assert bool(mx.allclose(extracted_req0.cache[0], arrays_cache_req0.cache[0]))
+        assert bool(mx.allclose(extracted_req0.cache[1], arrays_cache_req0.cache[1]))
+        assert bool(mx.allclose(extracted_req1.cache[0], arrays_cache_req1.cache[0]))
 
-        missing = extracted_req1.state[1]
+        missing = extracted_req1.cache[1]
         assert missing is not None
         assert missing.shape == (1, self._ARRAYS_CACHE_FEATURES)
         assert bool(mx.allclose(missing, mx.zeros_like(missing)))
@@ -139,10 +139,10 @@ class TestHybridCacheMergeExtract:
         assert bool(mx.allclose(kv_req1_out.keys, kv_cache_req1.keys))
         assert bool(mx.allclose(kv_req1_out.values, kv_cache_req1.values))
 
-        assert bool(mx.allclose(arrays_req0_out.state[0], arrays_cache_req0.state[0]))
-        assert bool(mx.allclose(arrays_req0_out.state[1], arrays_cache_req0.state[1]))
-        assert bool(mx.allclose(arrays_req1_out.state[0], arrays_cache_req1.state[0]))
-        assert bool(mx.allclose(arrays_req1_out.state[1], arrays_cache_req1.state[1]))
+        assert bool(mx.allclose(arrays_req0_out.cache[0], arrays_cache_req0.cache[0]))
+        assert bool(mx.allclose(arrays_req0_out.cache[1], arrays_cache_req0.cache[1]))
+        assert bool(mx.allclose(arrays_req1_out.cache[0], arrays_cache_req1.cache[0]))
+        assert bool(mx.allclose(arrays_req1_out.cache[1], arrays_cache_req1.cache[1]))
 
     def test_rotating_kvcache_merge_extract_preserves_offsets(self) -> None:
         cache_req0 = self._make_rotating_kv_cache(

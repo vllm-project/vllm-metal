@@ -57,4 +57,7 @@ def load_encoder_weight_file(weight_file: Path) -> dict[str, mx.array]:
             for name, value in state_dict.items()
             if isinstance(value, torch.Tensor)
         }
-    return mx.load(str(weight_file))
+    weights = mx.load(str(weight_file))
+    if not isinstance(weights, dict):
+        raise ValueError(f"Expected named tensors in {weight_file}")
+    return weights
