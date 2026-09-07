@@ -1099,6 +1099,7 @@ class TestMetalPlatform:
         cache_config: SimpleNamespace,
         speculative_config: SimpleNamespace | None = None,
         model_type: str = "qwen3_5",
+        text_model_type: str | None = None,
     ) -> VllmConfig:
         return self._platform_config(
             speculative_config=speculative_config,
@@ -1118,6 +1119,9 @@ class TestMetalPlatform:
                 max_model_len=32768,
                 multimodal_config=None,
                 hf_config=SimpleNamespace(model_type=model_type),
+                hf_text_config=SimpleNamespace(
+                    model_type=text_model_type or model_type
+                ),
                 is_hybrid=True,
             ),
             scheduler_config=SimpleNamespace(
@@ -1309,6 +1313,32 @@ class TestMetalPlatform:
             reset_config()
 
         assert vllm_config.cache_config.enable_prefix_caching is False
+
+    def test_hybrid_family_lookup_uses_the_text_model_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+                text_model_type="nemotron_h",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is False
+        assert vllm_config.cache_config.mamba_cache_mode == "none"
 
     def test_check_and_update_config_rejects_paged_hybrid_without_a_family(
         self, monkeypatch: pytest.MonkeyPatch

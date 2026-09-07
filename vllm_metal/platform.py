@@ -553,7 +553,7 @@ class MetalPlatform(Platform):
                 )
 
                 state_family = state_family_for_model_type(
-                    model_config.hf_config.model_type
+                    model_config.hf_text_config.model_type
                 )
                 if (
                     cache_config.mamba_cache_mode
