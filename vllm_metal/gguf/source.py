@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import constants as hf_constants
 from huggingface_hub.utils import filter_repo_objects
 
 _GGUF_SUFFIX = ".gguf"
@@ -79,11 +80,30 @@ class RemoteGGUFReference:
                 f"Remote GGUF qtype {self.quant_type!r} is not supported by "
                 f"vllm-metal; supported qtypes: {supported}."
             )
-        repo_files = HfApi().list_repo_files(
-            repo_id=self.repo_id,
-            revision=revision,
-            token=token,
-        )
+        snapshot_dir = None
+        if hf_constants.HF_HUB_OFFLINE:
+            snapshot_dir = Path(
+                snapshot_download(
+                    repo_id=self.repo_id,
+                    cache_dir=cache_dir,
+                    allow_patterns=list(self.allow_patterns),
+                    ignore_patterns=ignore_patterns,
+                    revision=revision,
+                    token=token,
+                    local_files_only=True,
+                )
+            )
+            repo_files = [
+                path.relative_to(snapshot_dir).as_posix()
+                for path in snapshot_dir.rglob("*")
+                if path.is_file()
+            ]
+        else:
+            repo_files = HfApi().list_repo_files(
+                repo_id=self.repo_id,
+                revision=revision,
+                token=token,
+            )
         filename = self._select_single_filename(
             sorted(
                 filter_repo_objects(
@@ -93,15 +113,16 @@ class RemoteGGUFReference:
                 )
             )
         )
-        snapshot_dir = Path(
-            snapshot_download(
-                repo_id=self.repo_id,
-                cache_dir=cache_dir,
-                allow_patterns=[filename],
-                revision=revision,
-                token=token,
+        if snapshot_dir is None:
+            snapshot_dir = Path(
+                snapshot_download(
+                    repo_id=self.repo_id,
+                    cache_dir=cache_dir,
+                    allow_patterns=[filename],
+                    revision=revision,
+                    token=token,
+                )
             )
-        )
         return str(snapshot_dir / filename)
 
     def _select_single_filename(self, filenames: list[str]) -> str:

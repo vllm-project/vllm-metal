@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from huggingface_hub import constants as hf_constants
 
 gguf = pytest.importorskip("gguf")
 
@@ -23,6 +25,7 @@ import vllm_metal.gguf.loader as gguf_loader  # noqa: E402
 from vllm_metal.gguf.adapter import GGUFModelAdapter  # noqa: E402
 from vllm_metal.gguf.loader import GGUFLoadError, GGUFModelLoader  # noqa: E402
 from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor  # noqa: E402
+from vllm_metal.gguf.source import GGUFLoadSource  # noqa: E402
 from vllm_metal.gguf.wrappers import GGUFLinear  # noqa: E402
 
 QT = gguf.GGMLQuantizationType
@@ -213,6 +216,44 @@ def test_loads_dense_model_installs_wrappers(
     ).load()
     _assert_dense_wrapper_histogram(model)
     _assert_forward_vocab_shape(model)
+
+
+def test_loads_cached_remote_model_offline(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "hub"
+    repository = cache_dir / "models--org--tiny-GGUF"
+    revision = "a" * 40
+    snapshot = repository / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (repository / "refs").mkdir()
+    (repository / "refs" / "weights-revision").write_text(revision)
+    gguf_path, config_dir = _build_dense_fixture(snapshot, "qwen3", has_qk_norm=True)
+    weights_path = snapshot / "tiny-Q8_0.gguf"
+    Path(gguf_path).rename(weights_path)
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    source = GGUFLoadSource.from_model_config(
+        SimpleNamespace(
+            quantization="gguf",
+            model_weights="org/tiny-GGUF:Q8_0",
+            model=config_dir,
+            tokenizer=config_dir,
+            revision="weights-revision",
+            tokenizer_revision=None,
+            hf_token=None,
+        ),
+        SimpleNamespace(download_dir=str(cache_dir), ignore_patterns=None),
+    )
+    assert source is not None
+    model, _ = GGUFModelLoader(
+        source.weights_path,
+        config_dir=source.config_dir,
+        tokenizer_dir=source.tokenizer_dir,
+        target_dtype=mx.float32,
+    ).load()
+    reference, _ = GGUFModelLoader(
+        weights_path, config_dir=config_dir, target_dtype=mx.float32
+    ).load()
+    tokens = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(np.array(model(tokens)), np.array(reference(tokens)))
 
 
 def test_skips_tie_redundant_output(tmp_path, monkeypatch, caplog):

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import vllm.engine.arg_utils as arg_utils_module
+from huggingface_hub import constants as hf_constants
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_metal.gguf import source as gguf_source
@@ -210,7 +211,11 @@ def test_non_gguf_model_is_untouched(config_dir) -> None:
     assert model_config.model_weights == ""
 
 
-def test_create_model_config_routes_remote_gguf_reference(config_dir) -> None:
+@pytest.mark.parametrize("offline", [False, True])
+def test_create_model_config_routes_remote_gguf_reference(
+    config_dir, monkeypatch, offline
+) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     reference = "Qwen/Qwen3-0.6B-GGUF:Q8_0"
 
     model_config = _engine_args(
@@ -235,11 +240,13 @@ def test_remote_gguf_reference_defaults_config_to_weights_repo() -> None:
 def test_register_is_idempotent() -> None:
     before_config = EngineArgs.create_model_config
     before_probe = arg_utils_module.maybe_override_with_speculators
+    before_model_path = arg_utils_module.get_model_path
     vllm_integration.register()
     vllm_integration.register()
 
     assert EngineArgs.create_model_config is before_config
     assert arg_utils_module.maybe_override_with_speculators is before_probe
+    assert arg_utils_module.get_model_path is before_model_path
 
 
 def test_integration_imports_without_gguf_package(monkeypatch) -> None:
@@ -321,12 +328,13 @@ def test_broken_official_plugin_does_not_disable_integration(
     assert arg_utils_module.maybe_override_with_speculators is not sentinel
 
 
+@pytest.mark.parametrize("offline_remote", [False, True])
 def test_entry_point_mounts_without_manual_register(
-    gguf_file, config_dir, tmp_path
+    gguf_file, config_dir, tmp_path, offline_remote
 ) -> None:
     """The regression boundary #463 actually crossed: a fresh process where
     vLLM itself discovers and loads the ``vllm.general_plugins`` entry point —
-    no manual import or register() — must route a local .gguf. Uses a
+    no manual import or register() — must route local and offline remote GGUFs. Uses a
     dist-info scaffold because a PYTHONPATH checkout carries no entry-point
     metadata.
     """
@@ -342,6 +350,9 @@ def test_entry_point_mounts_without_manual_register(
     repo_root = Path(vllm_integration.__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{tmp_path}"
+    if offline_remote:
+        gguf_file = "Qwen/Qwen3-0.6B-GGUF:Q8_0"
+        env["HF_HUB_OFFLINE"] = "1"
     script = (
         "from vllm.engine.arg_utils import EngineArgs\n"
         f"mc = EngineArgs(model={gguf_file!r}, tokenizer={config_dir!r})"

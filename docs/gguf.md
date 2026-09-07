@@ -34,6 +34,11 @@ The source priority is:
 vllm-metal downloads exactly one matching `.gguf` file from the remote
 repository. Missing, ambiguous, or sharded matches fail before model load.
 
+With `HF_HUB_OFFLINE=1`, remote references select from the requested revision
+in the local Hugging Face cache. Cache the matching GGUF file and companion
+config/tokenizer first; missing, ambiguous, or sharded cached matches also fail
+before model load.
+
 ## Current scope
 
 - Supported model families: Qwen2, Qwen3, Llama, and Mistral.

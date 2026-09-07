@@ -6,9 +6,10 @@ vLLM 0.24 migrated in-tree GGUF support to the CUDA/ROCm-only
 sets ``quantization="gguf"`` for a ``.gguf`` model anymore and vllm-metal's
 GGUF routing went dead. This module restores the engine-facing layer with the
 same semantics as the official plugin for the fields the Metal path consumes:
-a marker quantization config so ``quantization="gguf"`` validates, and two
-narrow wraps that detect a local GGUF file, carry it in
-``model_config.model_weights``, and point ``model`` at the config source.
+a marker quantization config so ``quantization="gguf"`` validates, and narrow
+wraps that preserve GGUF references through online/offline initialization,
+carry them in ``model_config.model_weights``, and point ``model`` at the config
+source.
 
 Mounted through the ``vllm.general_plugins`` entry point (the official
 plugin's own mechanism), which vLLM loads in ``EngineArgs.__post_init__`` and
@@ -187,11 +188,21 @@ class GGUFEngineIntegration:
 
     @classmethod
     def _patch_engine_args(cls) -> None:
+        import vllm.engine.arg_utils as arg_utils_module
         from vllm.engine.arg_utils import EngineArgs
 
         if getattr(EngineArgs, "_metal_gguf_patched", False):
             return
         original = EngineArgs.create_model_config
+        original_get_model_path = arg_utils_module.get_model_path
+
+        @wraps(original_get_model_path)
+        def get_model_path(model, *args, **kwargs):
+            # __post_init__ resolves offline Hub paths before create_model_config.
+            # Preserve the quant selector until the GGUF owner routes the weights.
+            if isinstance(model, str) and cls.is_remote_gguf_reference(model):
+                return model
+            return original_get_model_path(model, *args, **kwargs)
 
         @wraps(original)
         def create_model_config(self, *args, **kwargs):
@@ -229,6 +240,7 @@ class GGUFEngineIntegration:
             return original(self, *args, **kwargs)
 
         EngineArgs.create_model_config = create_model_config
+        arg_utils_module.get_model_path = get_model_path
         EngineArgs._metal_gguf_patched = True
 
     @classmethod
