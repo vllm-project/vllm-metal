@@ -766,8 +766,12 @@ def _load_draft_model(
     # Its own instance (patched to its own draft KV cache, so it must not alias
     # the target). AWQ / variable-head-dim drafts aren't handled here yet
     # (canonical loader: ModelLifecycle._load_generation_model).
-    model_path = get_model_download_path(draft_model_config.model)
+    model_path = get_model_download_path(
+        draft_model_config.model, revision=draft_model_config.revision
+    )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
-        model, _ = mlx_lm_load(str(compatible_path))
+        model, _ = mlx_lm_load(
+            str(compatible_path), revision=draft_model_config.revision
+        )
 
     return model, dims

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -46,6 +47,24 @@ def _write_config(tmp_path: Path, config: dict) -> Path:
 
 class TestConfigDetection:
     """``AWQQuantLoader.for_model``: detection, accept, decline, reject."""
+
+    @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
+    def test_revision_reaches_config_and_weight_loaders(
+        self, monkeypatch, tmp_path, revision
+    ):
+        config_dir = _write_config(tmp_path, {"quantization_config": _AWQ_INNER})
+        download = Mock(return_value=str(config_dir / "config.json"))
+        load = Mock(return_value=(nn.Module(), None))
+        monkeypatch.setattr("vllm_metal.quant.awq_loader.hf_hub_download", download)
+        monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_load", load)
+
+        loader = AWQQuantLoader.for_model("org/model", revision=revision)
+        assert loader is not None
+        loader.load("org/model", target_dtype=mx.float16, revision=revision)
+
+        download.assert_called_once_with("org/model", "config.json", revision=revision)
+        load.assert_called_once()
+        assert load.call_args.kwargs["revision"] == revision
 
     def test_returns_none_for_non_awq(self, tmp_path):
         """Non-AWQ checkpoints get None back, no exception."""

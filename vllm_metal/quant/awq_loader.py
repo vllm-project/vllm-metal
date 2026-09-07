@@ -62,7 +62,9 @@ class AWQQuantLoader:
         }
 
     @classmethod
-    def for_model(cls, model_name: str) -> AWQQuantLoader | None:
+    def for_model(
+        cls, model_name: str, *, revision: str | None = None
+    ) -> AWQQuantLoader | None:
         """Detect AWQ in ``model_name``'s ``config.json`` (local dir or HF
         Hub) and return a configured loader. Returns ``None`` when the
         checkpoint has no quantization config or uses a quant method
@@ -78,7 +80,7 @@ class AWQQuantLoader:
             UnsupportedQuantizationConfigError: AWQ but outside v1 scope,
                 or GPTQ (not yet validated for vllm-metal).
         """
-        raw_qc = cls._read_raw_quantization_config(model_name)
+        raw_qc = cls._read_raw_quantization_config(model_name, revision=revision)
         if raw_qc is None:
             return None
         quant_method = raw_qc.get("quant_method")
@@ -98,6 +100,7 @@ class AWQQuantLoader:
         *,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any] | None = None,
+        revision: str | None = None,
     ) -> tuple[Any, Any]:
         """Run ``mlx_lm.load`` with the normalized quant config, then align
         non-quantized floating params to ``target_dtype``.
@@ -110,6 +113,7 @@ class AWQQuantLoader:
             model_path,
             tokenizer_config=dict(tokenizer_config) if tokenizer_config else None,
             model_config=self._mlx_lm_model_config,
+            revision=revision,
         )
         n_cast = self._align_non_quantized_dtypes(model, target_dtype)
         logger.info(
@@ -122,7 +126,9 @@ class AWQQuantLoader:
     # -- private helpers (owned by the loader, not module-level) -----------
 
     @staticmethod
-    def _read_raw_quantization_config(model_name: str) -> Mapping[str, Any] | None:
+    def _read_raw_quantization_config(
+        model_name: str, *, revision: str | None = None
+    ) -> Mapping[str, Any] | None:
         """Read ``quantization_config`` from the model's ``config.json``
         without invoking ``mlx_lm.load``. Returns ``None`` if the field is
         absent (the checkpoint genuinely is not quantized) or the local
@@ -148,7 +154,9 @@ class AWQQuantLoader:
             if not config_path.is_file():
                 return None
         else:
-            config_path = Path(hf_hub_download(model_name, "config.json"))
+            config_path = Path(
+                hf_hub_download(model_name, "config.json", revision=revision)
+            )
         with open(config_path, encoding="utf-8") as fid:
             config = json.load(fid)
         qc = config.get("quantization_config")

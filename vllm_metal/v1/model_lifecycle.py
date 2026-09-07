@@ -112,7 +112,9 @@ class GenerationLoadRequest:
             model_name=(
                 gguf_source.weights_path
                 if gguf_source is not None
-                else get_model_download_path(model_config.model)
+                else get_model_download_path(
+                    model_config.model, revision=model_config.revision
+                )
             ),
             model_config=model_config,
             hf_config=hf_config,
@@ -276,7 +278,12 @@ class ModelLifecycle:
                 self._runner.vllm_config.load_config,
             )
         is_gguf = gguf_source is not None
-        awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
+        revision = model_config.revision
+        awq_loader = (
+            None
+            if is_gguf or is_vlm
+            else AWQQuantLoader.for_model(model_name, revision=revision)
+        )
 
         if is_gguf:
             load_label = "GGUF model"
@@ -288,7 +295,9 @@ class ModelLifecycle:
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(model_name, lazy=lazy_weights)
+            model, tokenizer = mlx_vlm_load(
+                model_name, lazy=lazy_weights, revision=revision
+            )
 
         elif awq_loader is not None:
             load_label = "AWQ model"
@@ -297,6 +306,7 @@ class ModelLifecycle:
                 awq_loader,
                 target_dtype,
                 tokenizer_config,
+                revision=revision,
             )
 
         else:
@@ -305,6 +315,7 @@ class ModelLifecycle:
                 model_name,
                 tokenizer_config,
                 lazy=lazy_weights,
+                revision=revision,
             )
 
         loaded_from = (
@@ -342,12 +353,15 @@ class ModelLifecycle:
         awq_loader: AWQQuantLoader,
         target_dtype: Any,
         tokenizer_config: Mapping[str, Any],
+        *,
+        revision: str | None = None,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             return awq_loader.load(
                 str(compatible_model_name),
                 target_dtype=target_dtype,
                 tokenizer_config=tokenizer_config,
+                revision=revision,
             )
 
     def _load_mlx_lm_text_model(
@@ -356,12 +370,14 @@ class ModelLifecycle:
         tokenizer_config: Mapping[str, Any],
         *,
         lazy: bool = False,
+        revision: str | None = None,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model, tokenizer = mlx_lm_load(
                 str(compatible_model_name),
                 tokenizer_config=tokenizer_config,
                 lazy=lazy,
+                revision=revision,
             )
         return model, tokenizer
 

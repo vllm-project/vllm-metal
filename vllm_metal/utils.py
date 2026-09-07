@@ -7,7 +7,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def get_model_download_path(model_repo_name: str) -> str:
+def get_model_download_path(
+    model_repo_name: str, *, revision: str | None = None
+) -> str:
     """
     Get the path to the model, downloading from ModelScope if configured, otherwise will pass the model_repo_name.
 
@@ -16,6 +18,7 @@ def get_model_download_path(model_repo_name: str) -> str:
 
     Args:
         model_repo_name: Model repo name from HuggingFace or ModelScope
+        revision: Requested ModelScope revision; HuggingFace loaders receive it separately.
 
     Returns:
         Local folder path (string) of repo snapshot
@@ -42,7 +45,11 @@ def get_model_download_path(model_repo_name: str) -> str:
             model_cache_dir = envs.VLLM_METAL_MODELSCOPE_CACHE
 
             logger.info(f"Downloading model {model_repo_name} from ModelScope...")
-            model_path = snapshot_download(model_repo_name, cache_dir=model_cache_dir)
+            model_path = snapshot_download(
+                model_repo_name,
+                cache_dir=model_cache_dir,
+                **({"revision": revision} if revision is not None else {}),
+            )
             logger.info(f"Model downloaded to {model_path}")
             return str(model_path)
         except ImportError:

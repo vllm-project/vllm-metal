@@ -12,11 +12,15 @@ real scheduler.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import mlx.core as mx
 import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_metal.attention.context import OffsetCache, get_context
+from vllm_metal.v1 import draft_model_proposer
 from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.proposer import ProposeContext
@@ -28,6 +32,23 @@ COMMITTED_NUM_BLOCKS = 2
 SCRATCH_RESERVE_BLOCKS = 2
 VOCAB_SIZE = 64
 PROMPT_LEN = 20
+
+
+@pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
+def test_draft_load_preserves_revision(monkeypatch, revision):
+    dims, model = object(), object()
+    config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(model="org/draft", revision=revision)
+    )
+    monkeypatch.setattr(draft_model_proposer, "resolve_draft_dims", lambda *_: dims)
+    resolve_path = Mock(return_value="org/draft")
+    load = Mock(return_value=(model, None))
+    monkeypatch.setattr(draft_model_proposer, "get_model_download_path", resolve_path)
+    monkeypatch.setattr(draft_model_proposer, "mlx_lm_load", load)
+
+    assert draft_model_proposer._load_draft_model(config, None) == (model, dims)
+    resolve_path.assert_called_once_with("org/draft", revision=revision)
+    load.assert_called_once_with("org/draft", revision=revision)
 
 
 class _StubDraftModel:

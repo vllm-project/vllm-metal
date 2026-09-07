@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -169,6 +170,46 @@ def _make_lifecycle(
 
 
 class TestModelLifecycle:
+    @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
+    @pytest.mark.parametrize("backend", ["text", "vlm", "awq"])
+    def test_generation_load_preserves_revision(
+        self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
+    ) -> None:
+        model, tokenizer = object(), object()
+        loader = Mock(return_value=(model, tokenizer))
+        awq_loader = SimpleNamespace(load=loader) if backend == "awq" else None
+        detect_awq = Mock(return_value=awq_loader)
+        monkeypatch.setattr(model_lifecycle.AWQQuantLoader, "for_model", detect_awq)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", loader)
+        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load", loader)
+        resolve_path = Mock(return_value="org/model")
+        monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                model="org/model",
+                revision=revision,
+                is_multimodal_model=backend == "vlm",
+            )
+        )
+        request = GenerationLoadRequest.from_runner(
+            runner, SimpleNamespace(should_force_text_backbone=lambda _: False)
+        )
+
+        result = lifecycle._load_generation_model(
+            request.model_name,
+            request.is_vlm,
+            model_config=request.model_config,
+            target_dtype=request.target_dtype,
+        )
+
+        assert result == (model, tokenizer)
+        resolve_path.assert_called_once_with("org/model", revision=revision)
+        loader.assert_called_once()
+        assert loader.call_args.args == ("org/model",)
+        assert loader.call_args.kwargs["revision"] == revision
+        if backend != "vlm":
+            detect_awq.assert_called_once_with("org/model", revision=revision)
+
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
     ) -> None:
@@ -313,7 +354,7 @@ class TestModelLifecycle:
         captured: dict[str, object] = {}
 
         def _fake_load(
-            path: str, *, tokenizer_config: object, lazy: bool
+            path: str, *, tokenizer_config: object, lazy: bool, revision: str | None
         ) -> tuple[object, object]:
             captured["lazy"] = lazy
             return object(), object()
@@ -490,7 +531,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str) -> None:
+            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
                 return None
 
         def _load_text(
@@ -498,6 +539,7 @@ class TestModelLifecycle:
             *,
             tokenizer_config: object,
             lazy: bool,
+            revision: str | None,
         ) -> tuple[object, object]:
             return text_model, text_tokenizer
 
@@ -524,7 +566,9 @@ class TestModelLifecycle:
         vlm_tokenizer = object()
         vlm_lazy: list[bool] = []
 
-        def _load_vlm(_model_name: str, *, lazy: bool) -> tuple[object, object]:
+        def _load_vlm(
+            _model_name: str, *, lazy: bool, revision: str | None
+        ) -> tuple[object, object]:
             vlm_lazy.append(lazy)
             return vlm_model, vlm_tokenizer
 
@@ -877,7 +921,9 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str) -> _StubAWQLoader | None:
+            def for_model(
+                cls, _model_name: str, *, revision: str | None
+            ) -> _StubAWQLoader | None:
                 return cls() if is_awq else None
 
             def load(
@@ -886,6 +932,7 @@ class TestModelLifecycle:
                 *,
                 target_dtype: object,
                 tokenizer_config: dict[str, object] | None,
+                revision: str | None,
             ) -> tuple[object, object]:
                 awq_load_calls.append(
                     {
@@ -1040,7 +1087,7 @@ class TestModelLifecycle:
 
         class _StubAWQLoader:
             @classmethod
-            def for_model(cls, _model_name: str) -> None:
+            def for_model(cls, _model_name: str, *, revision: str | None) -> None:
                 return None
 
         monkeypatch.setitem(sys.modules, "gguf", None)
