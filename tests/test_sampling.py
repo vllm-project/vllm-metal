@@ -26,6 +26,8 @@ from vllm_metal.v1.model_runner import (
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     sample_decode_tokens,
+    _apply_min_p_mlx,
+    _apply_min_p_torch,
     sample_from_logits,
 )
 
@@ -1101,3 +1103,107 @@ class TestV1PenaltyTokenAccounting:
         output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token
+
+
+class TestMinP:
+    """Tests for min_p sampling support."""
+
+    def _make_logits_mlx(self) -> mx.array:
+        """Logits where token 0 dominates, tokens 1-3 are small, rest tiny.
+
+        softmax ≈ [0.73, 0.09, 0.09, 0.09, ~0, ...]
+        """
+        logits = mx.full((1, VOCAB_SIZE), -10.0)
+        logits = logits.at[0, 0].add(12.0)  # ~0.73
+        logits = logits.at[0, 1].add(10.0)  # ~0.09
+        logits = logits.at[0, 2].add(10.0)  # ~0.09
+        logits = logits.at[0, 3].add(10.0)  # ~0.09
+        mx.eval(logits)
+        return logits
+
+    def test_min_p_mlx_masks_low_prob_tokens(self) -> None:
+        """Tokens below min_p * max_prob should be masked to -inf."""
+        logits = self._make_logits_mlx()
+        # min_p=0.2 → threshold = 0.2 * 0.73 ≈ 0.146
+        # tokens 1-3 have prob ~0.09 < 0.146, so they should be masked
+        sp = SamplingParams(temperature=1.0, min_p=0.2)
+        result = _apply_min_p_mlx(logits, [sp])
+        mx.eval(result)
+        # Token 0 should survive, tokens 1-3 should be -inf
+        assert result[0, 0].item() > -1e9
+        assert result[0, 1].item() == float("-inf")
+        assert result[0, 2].item() == float("-inf")
+        assert result[0, 3].item() == float("-inf")
+
+    def test_min_p_mlx_zero_is_noop(self) -> None:
+        """min_p=0 should not change logits."""
+        logits = self._make_logits_mlx()
+        sp = SamplingParams(temperature=1.0, min_p=0.0)
+        result = _apply_min_p_mlx(logits, [sp])
+        mx.eval(result)
+        assert mx.allclose(result, logits).item()
+
+    def test_min_p_mlx_keeps_top_token(self) -> None:
+        """Even with high min_p, the top token should always survive."""
+        logits = self._make_logits_mlx()
+        sp = SamplingParams(temperature=1.0, min_p=0.99)
+        result = _apply_min_p_mlx(logits, [sp])
+        mx.eval(result)
+        assert result[0, 0].item() > -1e9
+
+    def test_min_p_mlx_per_row(self) -> None:
+        """Different min_p values per row in a batch."""
+        logits = mx.concatenate([self._make_logits_mlx()] * 2, axis=0)
+        mx.eval(logits)
+        sp0 = SamplingParams(temperature=1.0, min_p=0.0)  # no filtering
+        sp1 = SamplingParams(temperature=1.0, min_p=0.2)  # filters tokens 1-3
+        result = _apply_min_p_mlx(logits, [sp0, sp1])
+        mx.eval(result)
+        # Row 0: no filtering, token 1 survives
+        assert result[0, 1].item() > -1e9
+        # Row 1: filtered, token 1 masked
+        assert result[1, 1].item() == float("-inf")
+
+    def test_min_p_torch_masks_low_prob_tokens(self) -> None:
+        """Torch path: tokens below threshold should be masked."""
+        logits = mlx_to_torch(self._make_logits_mlx(), device="cpu")
+        sp = SamplingParams(temperature=1.0, min_p=0.2)
+        result = _apply_min_p_torch(logits, [sp])
+        assert result[0, 0].item() > -1e9
+        assert result[0, 1].item() == float("-inf")
+
+    def test_min_p_torch_zero_is_noop(self) -> None:
+        """Torch path: min_p=0 should not change logits."""
+        logits = mlx_to_torch(self._make_logits_mlx(), device="cpu")
+        sp = SamplingParams(temperature=1.0, min_p=0.0)
+        result = _apply_min_p_torch(logits, [sp])
+        assert torch.equal(result, logits)
+
+    def test_min_p_native_random_sampling(self) -> None:
+        """End-to-end: native random path with min_p should not error."""
+        logits = self._make_logits_mlx()
+        sp = SamplingParams(temperature=1.0, min_p=0.2)
+        batch = SamplingBatch(
+            [sp],
+            [[0, 1, 2]],
+            [[3]],
+            vocab_size=VOCAB_SIZE,
+        )
+        sampler = Sampler()
+        result = sample_from_logits(logits, batch, sampler)
+        assert len(result.token_ids) == 1
+
+    def test_min_p_torch_fallback_sampling(self) -> None:
+        """End-to-end: torch fallback path with min_p (seeded) should work."""
+        logits = self._make_logits_mlx()
+        sp = SamplingParams(temperature=1.0, min_p=0.2, seed=42)
+        batch = SamplingBatch(
+            [sp],
+            [[0, 1, 2]],
+            [[3]],
+            vocab_size=VOCAB_SIZE,
+            generators={0: torch.Generator(device="cpu").manual_seed(42)},
+        )
+        sampler = Sampler()
+        result = sample_from_logits(logits, batch, sampler)
+        assert len(result.token_ids) == 1

@@ -144,11 +144,10 @@ class TestMetalPlatform:
     @pytest.mark.parametrize(
         ("sampling_params", "control"),
         [
-            (SamplingParams(min_p=0.1), "min_p"),
             (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
             (SamplingParams(min_tokens=2), "min_tokens"),
         ],
-        ids=["min-p", "logit-bias", "min-tokens"],
+        ids=["logit-bias", "min-tokens"],
     )
     def test_validate_request_rejects_logits_processor_controls(
         self,
@@ -158,6 +157,9 @@ class TestMetalPlatform:
         with pytest.raises(VLLMValidationError, match=control) as exc_info:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
+
+    def test_validate_request_accepts_min_p(self) -> None:
+        MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,

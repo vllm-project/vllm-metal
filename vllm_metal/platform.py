@@ -255,7 +255,6 @@ class MetalPlatform(Platform):
         unsupported_controls = [
             name
             for name, enabled in (
-                ("min_p", params.min_p > 0.0),
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
             )

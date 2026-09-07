@@ -202,12 +202,11 @@ class SamplingBatch:
         """Whether MLX categorical sampling matches *sampling_params_list*.
 
         Mirror of :meth:`params_allow_native_greedy` for the non-greedy case:
-        every request must use plain temperature/top-k/top-p sampling, with
-        one shared ``(top_k, top_p)`` across the batch so a single mask graph
-        covers every row. Seeded requests keep the torch path, whose
-        per-request ``torch.Generator`` contract MLX keys do not reproduce.
-        Options the platform rejects outright (``min_p``, ``logit_bias``)
-        are not re-checked here.
+        every request must use plain temperature/top-k/top-p/min-p sampling,
+        with one shared ``(top_k, top_p)`` across the batch so a single mask
+        graph covers every row.  Per-row ``min_p`` is handled natively.
+        Seeded requests keep the torch path, whose per-request
+        ``torch.Generator`` contract MLX keys do not reproduce.
         """
         if not sampling_params_list:
             return False
@@ -309,7 +308,7 @@ class SamplingBatch:
         sampling_params_list: Sequence[SamplingParams],
         key: mx.array,
     ) -> mx.array:
-        """Lazy temperature/top-k/top-p token ids, one per row.
+        """Lazy temperature/top-k/top-p/min-p token ids, one per row.
 
         Only valid for batches that pass :meth:`params_allow_native_random`:
         per-row temperature with one shared ``(top_k, top_p)``.
@@ -318,6 +317,7 @@ class SamplingBatch:
             [sp.temperature for sp in sampling_params_list], dtype=mx.float32
         )
         scaled = logits_2d.astype(mx.float32) / temperatures[:, None]
+        scaled = _apply_min_p_mlx(scaled, sampling_params_list)
         masked = cls._top_k_top_p_masked_logits(
             scaled,
             sampling_params_list[0].top_k,
@@ -520,6 +520,46 @@ class SamplingBatch:
 
 
 # ---------------------------------------------------------------------------
+# min_p helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_min_p_mlx(
+    logits: mx.array, sampling_params_list: Sequence[SamplingParams]
+) -> mx.array:
+    """Mask logits below the per-row min_p threshold (MLX path).
+
+    Tokens whose probability is less than ``min_p * max_prob`` for that row
+    are set to ``-inf``.  Matches upstream vLLM's ``MinPLogitsProcessor``
+    order: applied after temperature, before top-k/top-p.
+    """
+    min_p_vals = [sp.min_p for sp in sampling_params_list]
+    if not any(v > 0.0 for v in min_p_vals):
+        return logits
+    probs = mx.softmax(logits, axis=-1)
+    max_prob = mx.max(probs, axis=-1, keepdims=True)
+    threshold = mx.array(min_p_vals, dtype=mx.float32)[:, None] * max_prob
+    return mx.where(probs < threshold, -mx.inf, logits)
+
+
+def _apply_min_p_torch(
+    logits: torch.Tensor, sampling_params_list: Sequence[SamplingParams]
+) -> torch.Tensor:
+    """Mask logits below the per-row min_p threshold (torch path)."""
+    min_p_vals = [sp.min_p for sp in sampling_params_list]
+    if not any(v > 0.0 for v in min_p_vals):
+        return logits
+    probs = torch.softmax(logits, dim=-1)
+    max_prob = probs.max(dim=-1, keepdim=True).values
+    threshold = (
+        torch.tensor(min_p_vals, dtype=torch.float32, device=logits.device)
+        .unsqueeze(-1)
+        .mul_(max_prob)
+    )
+    return logits.masked_fill(probs < threshold, float("-inf"))
+
+
+# ---------------------------------------------------------------------------
 # Pure sampling functions
 # ---------------------------------------------------------------------------
 
@@ -557,6 +597,8 @@ def sample_from_logits(
     logits_torch = mlx_to_torch(
         logits_2d.astype(mx.float32), device=SamplingBatch.SAMPLER_DEVICE
     )
+    # min_p: applied before the vLLM sampler since logitsprocs are not wired up.
+    logits_torch = _apply_min_p_torch(logits_torch, batch.sampling_params_list)
     metadata = batch.make_sampling_metadata(logits_torch)
     output = sampler.forward(logits_torch, metadata)
     logprobs = (
