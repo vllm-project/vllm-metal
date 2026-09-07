@@ -1200,7 +1200,7 @@ class TestResolveModelDims:
         )
 
     def test_hybrid_state_dtypes_come_from_the_configured_registry(self) -> None:
-        state_dtypes = (torch.float32, torch.float16)
+        state_dtypes = (torch.float32, torch.float32)
         model_cls = SimpleNamespace(
             get_mamba_state_dtype_from_config=lambda _: state_dtypes
         )
@@ -1215,6 +1215,36 @@ class TestResolveModelDims:
         lifecycle.resolve_model_dims()
 
         assert runner.hybrid_runtime_plan.state_dtypes == state_dtypes
+
+    @pytest.mark.parametrize(
+        ("model_dtype", "conv_dtype", "ssm_dtype", "supported"),
+        [
+            (torch.bfloat16, "auto", "auto", True),
+            (torch.bfloat16, "auto", "float32", True),
+            (torch.float16, "auto", "auto", True),
+            (torch.float32, "auto", "auto", True),
+            (torch.bfloat16, "auto", "float16", False),
+            (torch.bfloat16, "float32", "bfloat16", False),
+            (torch.float32, "float16", "float16", False),
+        ],
+    )
+    def test_gdn_dtype_support_is_checked_at_initialization(
+        self, model_dtype, conv_dtype, ssm_dtype, supported
+    ) -> None:
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(is_hybrid=True, dtype=model_dtype),
+        )
+        runner.cache_config.mamba_cache_dtype = conv_dtype
+        runner.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+
+        if supported:
+            lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan is not None
+        else:
+            with pytest.raises(ValueError, match="--mamba-ssm-cache-dtype float32"):
+                lifecycle.resolve_model_dims()
+            assert runner.hybrid_runtime_plan is None
 
     def test_routing_follows_the_typed_field_not_the_args(self) -> None:
         runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)

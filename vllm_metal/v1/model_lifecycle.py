@@ -498,11 +498,19 @@ class ModelLifecycle:
             model_cls, _ = model_config.registry.resolve_model_cls(
                 model_config.architecture, model_config=model_config
             )
-            self._runner.hybrid_runtime_plan = build_hybrid_runtime_plan(
+            plan = build_hybrid_runtime_plan(
                 args,
                 self._runner.num_layers,
                 model_cls.get_mamba_state_dtype_from_config(self._runner.vllm_config),
             )
+            if plan.family.label == "gdn":
+                conv, ssm = plan.state_dtypes
+                if ssm != torch.float32 and not (model_config.dtype == conv == ssm):
+                    raise ValueError(
+                        "GDN requires matching model/cache dtypes or "
+                        "--mamba-ssm-cache-dtype float32."
+                    )
+            self._runner.hybrid_runtime_plan = plan
 
     def _install_runtime_extensions(
         self,
