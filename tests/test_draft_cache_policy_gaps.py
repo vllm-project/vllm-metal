@@ -37,10 +37,9 @@ from tests.test_draft_model_proposer import (
     _proposer,
     _StubDraftModel,
 )
-from tests.test_paged_deterministic import (
-    DEFAULT_PAGED_MEMORY_FRACTION,
-    MODEL_NAME,
-)
+
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+DEFAULT_PAGED_MEMORY_FRACTION = "0.2"
 
 K = 3
 GEN = 8

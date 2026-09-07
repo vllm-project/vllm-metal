@@ -78,7 +78,7 @@ scripts/test.sh
 
 Two conditional checks apply depending on what your PR touches:
 
-**If your PR adds or modifies a model**, include a deterministic test that asserts the generated tokens match the `mlx_lm` reference under greedy sampling (`temperature=0`). See `tools/gen_golden_token_ids_for_deterministics.py` for how to generate golden token IDs for a new model.
+**If your PR adds or modifies a model**, run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
 
 **If your PR claims a performance improvement**, attach before/after benchmark results. For example, using `vllm bench serve` with the sonnet dataset:
 
