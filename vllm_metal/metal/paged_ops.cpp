@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,18 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 // a named constant so the dispatch gate and the Python test surface cannot
 // drift.
 constexpr int kGqaDecodeMinSeqLen = 16384;
+
+// Last dispatch family chosen by dispatch_paged_attention_v2_online
+// ("gqa_decode" / "per_token_ps0" / "per_token_ps512" / "window_ps0" /
+// "window_ps512" / "nax_prefill" / "tiled_prefill").  Diagnostic surface
+// for the routing tests: the gate lives below the Python boundary, so the
+// family name is the only faithful record of which kernel ran.
+static std::mutex g_last_dispatch_mu;
+static std::string g_last_dispatch;
+inline void record_paged_dispatch(const std::string& name) {
+  std::lock_guard<std::mutex> lk(g_last_dispatch_mu);
+  g_last_dispatch = name;
+}
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -502,7 +515,8 @@ static void dispatch_paged_attention_v2_online(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    int window_seqlen_q, int num_decode_requests, Stream s,
+    int window_seqlen_q, int num_decode_requests, bool gqa_disabled,
+    Stream s,
     // TurboQuant (optional, all nullptr when disabled):
     const array* key_scale_cache = nullptr,
     const array* value_scale_cache = nullptr,
@@ -542,6 +556,7 @@ static void dispatch_paged_attention_v2_online(
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
     if (nax_eligible(query.dtype(), head_size, block_size)) {
+      record_paged_dispatch("nax_prefill");
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -550,6 +565,7 @@ static void dispatch_paged_attention_v2_online(
       return;
     }
     if (auto cfg = select_tile_config(head_size)) {
+      record_paged_dispatch("tiled_prefill");
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -704,23 +720,26 @@ static void dispatch_paged_attention_v2_online(
   // same-dtype half/bfloat16 Q/K/V; anything else falls through to the
   // per-token kernel below.
   //
-  // Spec-decode expanded windows pack as many length-1 segments (same
-  // shape as multi-seq decode) with window_seqlen_q == 1.  Production
-  // passes num_decode_requests = scheduler request count, which is 1 for
-  // a single expanded window and N for N real decode requests.  Callers
-  // that omit it (num_decode_requests < 0) keep the conservative
-  // single-seq gate so tests/test_spec_window_parity.py stays bitwise.
-  // Windowed verify windows have has_prefill and never reach this pass.
+  // Scoped to the single-request, long-context case that was measured and
+  // parity-tested (review on #715): num_seqs == 1 and the scheduler
+  // confirms a real decode request (num_decode_requests == 1; callers that
+  // omit it default to -1, which keeps the conservative single-seq gate so
+  // tests/test_spec_window_parity.py stays bitwise).  Multi-request decode
+  // batches stay on the established per-token/split-KV family until the
+  // batched GQA kernel carries its own measurements and tests.
+  // VLLM_METAL_DISABLE_GQA_DECODE forces eligible batches back to the
+  // established kernels (A/B escape hatch for the benchmarking pitfalls
+  // documented in issue #713).
   //
   // Occupancy: a single short sequence underfills the GPU (measured
-  // crossover ~16k tokens on M5 Pro).  Multi-seq scales the same KV
-  // budget across the batch, so 4 seqs at 4k is treated like 1 seq at 16k.
+  // crossover ~16k tokens on M5 Pro).  num_seqs is 1 here, so this is
+  // just max_seq_len >= kGqaDecodeMinSeqLen.
   const int gqa_group = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
-  const bool gqa_real_decode_batch =
-      (num_decode_requests < 0) ? (num_seqs == 1)
-                                : (num_decode_requests == num_seqs);
+  const bool gqa_single_request =
+      num_seqs == 1 && (num_decode_requests < 0 || num_decode_requests == 1);
   const bool gqa_decode =
-      pure_decode && window_seqlen_q <= 1 && gqa_real_decode_batch
+      !gqa_disabled
+      && pure_decode && window_seqlen_q <= 1 && gqa_single_request
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
       && sliding_window < 0 && num_kv_heads > 0
@@ -728,8 +747,9 @@ static void dispatch_paged_attention_v2_online(
       && (head_size == 64 || head_size == 96 || head_size == 128 ||
           head_size == 256)
       && max_num_partitions >= 2
-      && (int64_t)num_seqs * (int64_t)max_seq_len >= kGqaDecodeMinSeqLen;
+      && max_seq_len >= kGqaDecodeMinSeqLen;
   if (gqa_decode) {
+    record_paged_dispatch("gqa_decode");
     std::string gname =
         "paged_attention_gqa_decode_" + dt + "_hs" + std::to_string(head_size) +
         "_bs" + std::to_string(block_size) + "_ps" +
@@ -786,6 +806,8 @@ static void dispatch_paged_attention_v2_online(
 
   if (!partition) {
     // Single-pass path (grid.z = 1): the original decode/per-token kernel.
+    record_paged_dispatch(
+        window_batch ? "window_ps0" : "per_token_ps0");
     enc.set_compute_pipeline_state(kernel);
     enc.set_threadgroup_memory_length(shmem, 0);
     bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
@@ -801,6 +823,8 @@ static void dispatch_paged_attention_v2_online(
   }
 
   // ----- Split-KV path: paged_attention(_ps512) -> paged_attention_v2_reduce.
+  record_paged_dispatch(
+      window_batch ? "window_ps512" : "per_token_ps512");
   array tmp_out = make_temp(
       Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
       query.dtype());
@@ -849,14 +873,15 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
       int window_seqlen_q = 1, bool use_sinks = false,
-      int num_decode_requests = -1)
+      int num_decode_requests = -1, bool gqa_disabled = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
         use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
         window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks),
-        num_decode_requests_(num_decode_requests) {}
+        num_decode_requests_(num_decode_requests),
+        gqa_disabled_(gqa_disabled) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -882,7 +907,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_kv_heads_, scale_, softcap_,
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
-        num_decode_requests_,
+        num_decode_requests_, gqa_disabled_,
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk);
   }
@@ -901,7 +926,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->v_bits_ == v_bits_
         && rhs->window_seqlen_q_ == window_seqlen_q_
         && rhs->use_sinks_ == use_sinks_
-        && rhs->num_decode_requests_ == num_decode_requests_;
+        && rhs->num_decode_requests_ == num_decode_requests_
+        && rhs->gqa_disabled_ == gqa_disabled_;
   }
 
  private:
@@ -917,6 +943,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int window_seqlen_q_;
   bool use_sinks_;
   int num_decode_requests_;
+  bool gqa_disabled_;
 };
 
 static array paged_attention_primitive_fn(
@@ -932,7 +959,8 @@ static array paged_attention_primitive_fn(
     const array* key_zero_cache = nullptr,
     const array* v_centroids = nullptr,
     int v_bits = 3, int window_seqlen_q = 1,
-    const array* sinks = nullptr, int num_decode_requests = -1) {
+    const array* sinks = nullptr, int num_decode_requests = -1,
+    bool gqa_disabled = false) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -1027,7 +1055,7 @@ static array paged_attention_primitive_fn(
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
-      num_decode_requests);
+      num_decode_requests, gqa_disabled);
   if (use_turboquant) {
     return array(
         query.shape(), query.dtype(), std::move(prim),
@@ -1946,7 +1974,8 @@ NB_MODULE(_paged_ops, m) {
            int v_bits,
            int window_seqlen_q,
            nb::object sinks_h,
-           int num_decode_requests) {
+           int num_decode_requests,
+           bool gqa_disabled) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* ks = use_turboquant
@@ -1967,7 +1996,7 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk, num_decode_requests);
+              window_seqlen_q, sk, num_decode_requests, gqa_disabled);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1988,6 +2017,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("window_seqlen_q") = 1,
         nb::arg("sinks") = nb::none(),
         nb::arg("num_decode_requests") = -1,
+        nb::arg("gqa_disabled") = false,
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
@@ -1995,7 +2025,21 @@ NB_MODULE(_paged_ops, m) {
         "the per-token kernel's window mode.  sinks is an optional float32 "
         "array of one learned logit per query head (GPT-OSS style attention "
         "sinks); it joins the softmax denominator without contributing a "
-        "value row, and is rejected together with TurboQuant.");
+        "value row, and is rejected together with TurboQuant.  "
+        "gqa_disabled mirrors VLLM_METAL_DISABLE_GQA_DECODE and keeps "
+        "eligible batches off the GQA-shared decode kernel.");
+
+  m.def(
+      "last_paged_dispatch",
+      []() {
+        std::lock_guard<std::mutex> lk(g_last_dispatch_mu);
+        return g_last_dispatch;
+      },
+      "Dispatch family chosen by the most recent paged_attention_primitive "
+      "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
+      "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
+      "\"tiled_prefill\").  Diagnostic surface for routing tests; empty "
+      "before the first eval.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),
