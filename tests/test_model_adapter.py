@@ -59,10 +59,8 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            # Dense and MoE MLX 4-bit wrappers from issues #580 and #571.
+            # Only the dense Qwen3.5 wrapper has a native multimodal adapter.
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
     def test_mlx_quant_conditional_generation_keeps_native_path(
@@ -78,6 +76,28 @@ class TestShouldForceTextBackbone:
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+            ("qwen3_6_moe", "Qwen3_6MoeForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_wrapper_without_adapter_keeps_text_backbone(
+        self, model_type: str, architecture: str
+    ) -> None:
+        # `build_multimodal_adapter` has no adapter for these, and an image
+        # request against a missing adapter raises in the runner.
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
     @pytest.mark.parametrize(
         ("model_type", "architecture", "vision_config"),
@@ -557,8 +577,6 @@ class TestNormalizeModelConfig:
         ("model_type", "architecture"),
         [
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
     def test_preserves_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(

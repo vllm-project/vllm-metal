@@ -276,7 +276,28 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        return False
+        # MLX affine wrappers only keep the native path when
+        # `build_multimodal_adapter` actually has an adapter for them. The MoE
+        # and Qwen3.6 wrappers do not, and an image request against a missing
+        # adapter raises in the runner, so they stay on the text backbone.
+        return self._has_mlx_quantized_weights(
+            hf_config
+        ) and not self._is_qwen3_vl_family(hf_config)
+
+    def _is_qwen3_vl_family(self, hf_config: Any) -> bool:
+        """Whether ``build_multimodal_adapter`` has a native adapter for this."""
+        model_type = getattr(hf_config, "model_type", "")
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        return model_type in _QWEN3_VL_MODEL_TYPES or any(
+            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
+        )
+
+    def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
+        mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
+        return (
+            isinstance(mlx_quantization_from_hf, dict)
+            and "bits" in mlx_quantization_from_hf
+        )
 
     def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
         quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
@@ -600,9 +621,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type in _QWEN3_VL_MODEL_TYPES or any(
-            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        ):
+        if self._is_qwen3_vl_family(hf_config):
             from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
             return cast(
