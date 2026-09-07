@@ -59,15 +59,15 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            # Dense and MoE MLX 4-bit wrappers from issues #580 and #571.
+            # Only the dense Qwen3.5 wrapper has a native multimodal adapter.
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
-    def test_mlx_quant_conditional_generation_uses_auto_override(
+    def test_mlx_quant_conditional_generation_keeps_native_path(
         self, model_type: str, architecture: str, bits: int
     ) -> None:
+        # mlx-vlm >=0.6.8 drives these wrappers with correct mRoPE state, so
+        # the auto-mode override no longer routes them to the text backbone.
         hf_config = SimpleNamespace(
             model_type=model_type,
             architectures=[architecture],
@@ -75,7 +75,29 @@ class TestShouldForceTextBackbone:
         )
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
+        assert result is False
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+            ("qwen3_6_moe", "Qwen3_6MoeForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_wrapper_without_adapter_keeps_text_backbone(
+        self, model_type: str, architecture: str
+    ) -> None:
+        # `build_multimodal_adapter` has no adapter for these, and an image
+        # request against a missing adapter raises in the runner.
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
     @pytest.mark.parametrize(
         ("model_type", "architecture", "vision_config"),
@@ -105,7 +127,7 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
 
-    def test_mlx_quant_qwen35_wrapper_uses_auto_override_with_vision_config(
+    def test_mlx_quant_qwen35_wrapper_keeps_native_path_with_vision_config(
         self,
     ) -> None:
         hf_config = SimpleNamespace(
@@ -117,7 +139,7 @@ class TestShouldForceTextBackbone:
         )
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
+        assert result is False
 
     def test_multimodal_native_mode_disables_mlx_quant_override(
         self, monkeypatch
@@ -555,15 +577,16 @@ class TestNormalizeModelConfig:
         ("model_type", "architecture"),
         [
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
-    def test_clears_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(
+    def test_preserves_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(
         self, model_type: str, architecture: str
     ) -> None:
+        # These wrappers serve correctly on the multimodal path with the
+        # pinned mlx-vlm floor, so auto mode must leave their config alone.
+        sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
-            multimodal_config=SimpleNamespace(language_model_only=False),
+            multimodal_config=sentinel,
             hf_config=SimpleNamespace(
                 model_type=model_type,
                 architectures=[architecture],
@@ -573,7 +596,7 @@ class TestNormalizeModelConfig:
 
         DefaultModelAdapter().normalize_model_config(model_config)
 
-        assert model_config.multimodal_config is None
+        assert model_config.multimodal_config is sentinel
 
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)

@@ -202,12 +202,14 @@ class GDNPagedStateCache:
         self, ctx: PagedAttentionContext, cache_idx: int, num_requests: int
     ) -> list[int]:
         """Return this step's state slot per request for ``cache_idx``."""
-        if ctx.gdn_group_slot_mappings is not None:
-            slot_ids = ctx.gdn_group_slot_mappings[self.layer_group_ordinal(cache_idx)]
-        elif ctx.gdn_slot_mapping is not None:
-            slot_ids = ctx.gdn_slot_mapping
+        if ctx.state_group_slot_mappings is not None:
+            slot_ids = ctx.state_group_slot_mappings[
+                self.layer_group_ordinal(cache_idx)
+            ]
+        elif ctx.state_slot_mapping is not None:
+            slot_ids = ctx.state_slot_mapping
         else:
-            raise RuntimeError("state cache requires gdn_slot_mapping in context")
+            raise RuntimeError("state cache requires state_slot_mapping in context")
         if len(slot_ids) != num_requests:
             raise RuntimeError("state cache requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):

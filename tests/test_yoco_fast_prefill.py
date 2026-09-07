@@ -359,7 +359,7 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
                     "tokens": h.shape[1],
                     "cu_seqlens": tuple(ctx.cu_seqlens),
                     "offsets": tuple(ctx.offsets),
-                    "gdn_slot_mapping": ctx.gdn_slot_mapping,
+                    "state_slot_mapping": ctx.state_slot_mapping,
                     "kv_groups": (
                         tuple(
                             (
@@ -429,7 +429,7 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
         context_lens=[5],
         offsets=[0],
         cu_seqlens=[0, 5],
-        gdn_slot_mapping=[17],
+        state_slot_mapping=[17],
         kv_groups=(
             PagedKVGroupContext(
                 slot_mapping=[0, 1, 2, 3, 4],
@@ -458,9 +458,9 @@ def test_try_enable_gemma4_yoco_fast_prefill_reduces_shared_layer_queries() -> N
         ((4,), ((0, 1),), 4),
         ((14,), ((8, 9),), 16),
     )
-    assert text_model.layers[0].calls[0]["gdn_slot_mapping"] == [17]
-    assert text_model.layers[2].calls[0]["gdn_slot_mapping"] is None
-    assert text_model.layers[3].calls[0]["gdn_slot_mapping"] is None
+    assert text_model.layers[0].calls[0]["state_slot_mapping"] == [17]
+    assert text_model.layers[2].calls[0]["state_slot_mapping"] is None
+    assert text_model.layers[3].calls[0]["state_slot_mapping"] is None
     assert out[0, 0, 0].item() == 3
     assert out[0, 4, 0].item() == 10
 

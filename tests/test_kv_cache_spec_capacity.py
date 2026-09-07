@@ -121,9 +121,9 @@ def test_hybrid_spec_omits_stateless_layers() -> None:
     specs = runner._cache_policy.get_kv_cache_spec()
 
     assert set(specs) == {
-        "layers.0.linear_attn",
+        "layers.0.mixer",
         "layers.2.self_attn",
-        "layers.3.linear_attn",
+        "layers.3.mixer",
     }
 
 

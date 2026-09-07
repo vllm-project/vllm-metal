@@ -6,8 +6,8 @@ between ``n_heads`` (queries) and ``n_kv_heads`` (keys/values) is handled
 transparently by the Metal paged attention kernel.
 
 Handles models whose attention module exposes:
-- ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
-  see K-eq-V variant below)
+- ``q_proj``, ``k_proj``, ``o_proj`` / ``out_proj`` linear projections
+  (``v_proj`` optional — see K-eq-V variant below)
 - ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
@@ -91,7 +91,7 @@ def is_sdpa(module: nn.Module) -> bool:
     Accepts two contracts:
 
     - Split-projection SDPA: ``q_proj`` / ``k_proj`` / output projection
-      (``o_proj``, or ``dense`` as in ``mlx_lm.models.phi``), plus
+      (``o_proj``, ``dense`` in Phi, or ``out_proj`` in LFM2), plus
       EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
       The latter admits Gemma4 26B / 31B full-attention layers which
       share the K projection for values and never define ``v_proj``
@@ -241,11 +241,12 @@ def _output_projection(module: nn.Module) -> nn.Module | None:
     """Return the attention-output projection on *module*.
 
     Nearly every mlx_lm SDPA architecture calls it ``o_proj``; Phi-1/1.5
-    (``mlx_lm.models.phi``) spell theirs ``dense``.  Probing by name keeps
-    ``is_sdpa`` and the forward path aligned on the same alias set instead
+    (``mlx_lm.models.phi``) spell theirs ``dense`` and LFM2 uses ``out_proj``.
+    Probing by name keeps ``is_sdpa`` and the forward path aligned on the
+    same alias set instead
     of the forward breaking on architectures that already pass dispatch.
     """
-    for name in ("o_proj", "dense"):
+    for name in ("o_proj", "dense", "out_proj"):
         proj = getattr(module, name, None)
         if proj is not None:
             return proj

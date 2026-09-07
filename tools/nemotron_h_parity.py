@@ -171,8 +171,8 @@ def run_vllm_child(
             reach["wrapper_calls"] += 1
             if self._mamba2_cache_idx == 0:
                 ctx = mamba2.get_context()
-                if ctx is not None and ctx.gdn_slot_mapping is not None:
-                    reach["slot"] = ctx.gdn_slot_mapping[-1]
+                if ctx is not None and ctx.state_slot_mapping is not None:
+                    reach["slot"] = ctx.state_slot_mapping[-1]
             return real_call(self, x, mask=mask, cache=cache)
 
         def spy_patch(self, model_obj):

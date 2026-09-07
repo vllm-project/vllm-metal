@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from vllm_metal.attention.state.align import AlignGDNStateManager
-from vllm_metal.attention.state.gdn import HybridGDNStateManager
+from vllm_metal.attention.state.align import AlignStateManager
+from vllm_metal.attention.state.request import RequestStateManager
 
-__all__ = ["AlignGDNStateManager", "HybridGDNStateManager"]
+__all__ = ["AlignStateManager", "RequestStateManager"]

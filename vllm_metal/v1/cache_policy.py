@@ -395,7 +395,9 @@ class ModelCachePolicy:
             state_spec = self._state_layer_spec(hybrid_plan, torch_dtype)
             for layer_idx in range(num_spec_layers):
                 if hybrid_plan.layers.is_state_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.linear_attn"] = state_spec
+                    specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
+                        state_spec
+                    )
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
                     specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
         else:
@@ -659,10 +661,10 @@ class ModelCachePolicy:
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
-        # Align mode keys GDN state slabs by scheduler block id.  The engine
-        # stripes same-spec linear layers across several mamba cache groups
+        # Align mode keys hybrid state slabs by scheduler block id.  The engine
+        # stripes same-spec state layers across several mamba cache groups
         # (each group hands every request one block-table row), so the runtime
-        # needs all those groups plus each linear layer's group ordinal.  None
+        # needs all those groups plus each state layer's group ordinal.  None
         # mode keeps a private per-request slot pool and ignores the
         # scheduler's mamba groups.
         state_group_indices: tuple[int, ...] = ()
@@ -670,7 +672,7 @@ class ModelCachePolicy:
         layer_pool_ordinals: list[int] | None = None
         if self._runner.cache_config.mamba_cache_mode == "align":
             cache_idx_by_name = {
-                f"layers.{layer_idx}.linear_attn": cache_idx
+                f"layers.{layer_idx}.{hybrid_plan.family.layer_name}": cache_idx
                 for cache_idx, layer_idx in enumerate(layer_plan.state_indices)
             }
             mamba_group_ids = [
@@ -688,17 +690,16 @@ class ModelCachePolicy:
                         raise RuntimeError(
                             f"mamba cache group {mamba_group_id} holds "
                             f"{layer_name!r}, which is not one of the "
-                            "runner's linear-attention layers"
+                            "runner's hybrid state layers"
                         )
                     layer_group_ordinals[cache_idx] = ordinal
             if -1 in layer_group_ordinals:
                 raise RuntimeError(
-                    "scheduler mamba cache groups do not cover every "
-                    "linear-attention layer"
+                    "scheduler mamba cache groups do not cover every hybrid state layer"
                 )
             # Physical pools follow the engine's tensor sharing: each
             # kv_cache_tensor is shared by one layer from each cache group, so
-            # linear layers sharing a tensor share one state pool (their
+            # state layers sharing a tensor share one state pool (their
             # groups own disjoint block ids and never collide).
             layer_pool_ordinals = [-1] * len(cache_idx_by_name)
             pools_used = 0
@@ -713,14 +714,14 @@ class ModelCachePolicy:
                 for cache_idx in members:
                     if layer_pool_ordinals[cache_idx] != -1:
                         raise RuntimeError(
-                            "a linear-attention layer appears in two "
+                            "a hybrid state layer appears in two "
                             "kv_cache_tensors; cannot derive state pools"
                         )
                     layer_pool_ordinals[cache_idx] = pools_used
                 pools_used += 1
             if -1 in layer_pool_ordinals:
                 raise RuntimeError(
-                    "kv_cache_tensors do not cover every linear-attention "
+                    "kv_cache_tensors do not cover every hybrid state "
                     "layer; cannot derive state pools"
                 )
             budgeted = _align_state_pool_count(
@@ -728,7 +729,7 @@ class ModelCachePolicy:
             )
             if pools_used > budgeted:
                 raise RuntimeError(
-                    f"engine layout needs {pools_used} GDN state pools but "
+                    f"engine layout needs {pools_used} hybrid state pools but "
                     f"the memory plan budgeted {budgeted}; refusing to "
                     "exceed the paged memory budget"
                 )

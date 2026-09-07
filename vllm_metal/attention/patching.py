@@ -37,9 +37,9 @@ def find_layers(model: Any) -> list[Any]:
         )
 
 
-# Attribute names to probe on each layer, in priority order; Nemotron-H names
-# every block's module ``mixer``.
-_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "mixer")
+# Attribute names to probe on each layer, in priority order. LFM2 uses
+# ``conv`` for its ShortConv layers, which have no attention submodule.
+_ATTN_ATTR_NAMES = ("self_attn", "linear_attn", "attention", "conv", "mixer")
 
 
 def find_attn_attr(layer: Any) -> str | None:

@@ -978,7 +978,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             PagedAttentionContext(
                 slot_mapping=[0, 1],
                 cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[1, 1],
+                state_slot_mapping=[1, 1],
             )
         )
 
@@ -989,7 +989,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         finally:
             clear_context()
 
-    def test_requires_gdn_slot_mapping_in_paged_context(self) -> None:
+    def test_requires_state_slot_mapping_in_paged_context(self) -> None:
         # Arrange
         inner = _TinyGDNInner()
         cache = _make_state_cache(
@@ -1011,7 +1011,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
 
         # Act / Assert
         try:
-            with pytest.raises(RuntimeError, match="gdn_slot_mapping"):
+            with pytest.raises(RuntimeError, match="state_slot_mapping"):
                 wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
         finally:
             clear_context()
@@ -1033,7 +1033,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             PagedAttentionContext(
                 slot_mapping=[0, 1],
                 cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[0, cache.max_seqs],
+                state_slot_mapping=[0, cache.max_seqs],
             )
         )
 
@@ -1063,7 +1063,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             PagedAttentionContext(
                 slot_mapping=[0, 1],
                 cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[0, 1],
+                state_slot_mapping=[0, 1],
             )
         )
 
@@ -1119,7 +1119,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             PagedAttentionContext(
                 slot_mapping=[0, 1],
                 cu_seqlens=[0, 1, 2],
-                gdn_slot_mapping=[0, 1],
+                state_slot_mapping=[0, 1],
             )
         )
 

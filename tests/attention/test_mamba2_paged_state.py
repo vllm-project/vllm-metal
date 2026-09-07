@@ -79,7 +79,7 @@ def _set_step(cu_seqlens: list[int], slots: list[int], num_decode: int) -> None:
         PagedAttentionContext(
             slot_mapping=[0] * cu_seqlens[-1],
             cu_seqlens=cu_seqlens,
-            gdn_slot_mapping=slots,
+            state_slot_mapping=slots,
             num_decode_requests=num_decode,
         )
     )

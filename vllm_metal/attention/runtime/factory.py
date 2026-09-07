@@ -17,6 +17,11 @@ from vllm_metal.attention.runtime.families.nemotron_h import (
     NEMOTRON_H_MODEL_TYPES,
     build_nemotron_h_hybrid_plan,
 )
+from vllm_metal.attention.runtime.families.shortconv import (
+    SHORTCONV_FAMILY,
+    SHORTCONV_MODEL_TYPES,
+    build_shortconv_hybrid_plan,
+)
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan, StateFamilySpec
 
 
@@ -39,6 +44,11 @@ _STATE_FAMILY_PLAN_BUILDERS = (
         model_types=NEMOTRON_H_MODEL_TYPES,
         family=NEMOTRON_H_FAMILY,
         build=build_nemotron_h_hybrid_plan,
+    ),
+    StateFamilyPlanBuilder(
+        model_types=SHORTCONV_MODEL_TYPES,
+        family=SHORTCONV_FAMILY,
+        build=build_shortconv_hybrid_plan,
     ),
 )
 

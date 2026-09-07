@@ -513,14 +513,31 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_ssm_cache_dtype == "auto":
-                cache_config.mamba_ssm_cache_dtype = "float32"
-            elif cache_config.mamba_ssm_cache_dtype != "float32":
+            is_shortconv = getattr(model_config.hf_config, "model_type", None) in (
+                "lfm2",
+                "lfm2_moe",
+            )
+            if (
+                is_shortconv
+                and cache_config.mamba_cache_dtype != "auto"
+                and cache_config.mamba_cache_dtype
+                != str(model_config.dtype).removeprefix("torch.")
+            ):
                 raise NotImplementedError(
-                    "Hybrid models on Metal require "
-                    "--mamba-ssm-cache-dtype float32 because recurrent state is "
-                    "stored in fp32."
+                    "ShortConv state on Metal uses the model dtype; "
+                    "--mamba-cache-dtype must be auto or match --dtype."
                 )
+            # ShortConv has only a model-dtype convolution tail. The fp32
+            # requirement belongs to families with recurrent SSM state.
+            if not is_shortconv:
+                if cache_config.mamba_ssm_cache_dtype == "auto":
+                    cache_config.mamba_ssm_cache_dtype = "float32"
+                elif cache_config.mamba_ssm_cache_dtype != "float32":
+                    raise NotImplementedError(
+                        "Hybrid models on Metal require "
+                        "--mamba-ssm-cache-dtype float32 because recurrent state is "
+                        "stored in fp32."
+                    )
             if cache_config.mamba_cache_mode == "all":
                 # Before the downgrades below, which overwrite the mode: an
                 # explicit --mamba-cache-mode all must fail fast on every path.

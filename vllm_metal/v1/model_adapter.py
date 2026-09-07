@@ -251,13 +251,12 @@ class DefaultModelAdapter(ModelAdapter):
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
-        marked multimodal even when served text-only, and both quantized
-        families diverge under mlx_vlm.load() — FP8 fails on
-        `*_weight_scale_inv` tensors, while MLX affine checkpoints load but,
-        unless the config exposes a real VL shape, run the bare language model
-        with unset mrope state and generate garbled output.  Both route through
-        the mlx_lm text loader instead; MLX-quant wrappers with a native VL
-        config keep the multimodal path.
+        marked multimodal even when served text-only, and the FP8 family fails
+        under mlx_vlm.load() on `*_weight_scale_inv` tensors, so it routes
+        through the mlx_lm text loader instead.  MLX affine checkpoints used to
+        need the same treatment because mlx_vlm left their mRoPE state unset;
+        the pinned mlx-vlm floor (>=0.6.8) drives them correctly, so they keep
+        the native multimodal path.
         """
         if hf_config is None:
             return False
@@ -277,18 +276,21 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        # MLX affine Qwen3.5/Qwen3.6 text wrappers may still carry a
-        # vision_config, but mlx_vlm drives those text-only checkpoints with
-        # unset mRoPE state and produces garbled output.  Real Qwen3-VL uses
-        # Qwen3VLForConditionalGeneration, which is not in the text-wrapper
-        # architecture set above and therefore keeps the native path.
-        return self._has_mlx_quantized_weights(hf_config)
+        # MLX affine wrappers only keep the native path when
+        # `build_multimodal_adapter` actually has an adapter for them. The MoE
+        # and Qwen3.6 wrappers do not, and an image request against a missing
+        # adapter raises in the runner, so they stay on the text backbone.
+        return self._has_mlx_quantized_weights(
+            hf_config
+        ) and not self._is_qwen3_vl_family(hf_config)
 
-    def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
-        quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
-        if isinstance(quantization_config_from_hf, dict):
-            return quantization_config_from_hf.get("quant_method") == "fp8"
-        return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
+    def _is_qwen3_vl_family(self, hf_config: Any) -> bool:
+        """Whether ``build_multimodal_adapter`` has a native adapter for this."""
+        model_type = getattr(hf_config, "model_type", "")
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        return model_type in _QWEN3_VL_MODEL_TYPES or any(
+            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
+        )
 
     def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
         mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
@@ -296,6 +298,12 @@ class DefaultModelAdapter(ModelAdapter):
             isinstance(mlx_quantization_from_hf, dict)
             and "bits" in mlx_quantization_from_hf
         )
+
+    def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
+        quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
+        if isinstance(quantization_config_from_hf, dict):
+            return quantization_config_from_hf.get("quant_method") == "fp8"
+        return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
@@ -613,9 +621,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type in _QWEN3_VL_MODEL_TYPES or any(
-            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        ):
+        if self._is_qwen3_vl_family(hf_config):
             from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
             return cast(
@@ -721,7 +727,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 types surface loudly here instead of silently falling back
                 to full-attention shapes.
         """
-        layer_types = args.get("layer_types", [])
+        layer_types = args.get("layer_types") or []
         global_head_dim = args.get("global_head_dim")
         if len(layer_types) != num_layers or not global_head_dim:
             return None

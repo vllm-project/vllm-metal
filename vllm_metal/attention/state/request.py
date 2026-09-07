@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hybrid GDN request-state lifecycle.
+"""Hybrid request-state lifecycle.
 
 The hybrid paged runtime owns two different state systems:
 
 - SDPA KV cache, indexed by scheduler block tables
-- GDN recurrent state, indexed by one stable slot per resident request
+- Operator state, indexed by one stable slot per resident request
 
-`HybridGDNStateManager` owns the second one. It keeps request-to-slot
-assignment stable across request reordering, grows the recurrent cache when new
+`RequestStateManager` owns the second one. It keeps request-to-slot
+assignment stable across request reordering, grows the state cache when new
 requests arrive, resets reused slots before they are handed to a new request,
-and tracks when stable GDN arrays must be materialized out of the lazy graph.
+and tracks when stable state arrays must be materialized out of the lazy graph.
 """
 
 from __future__ import annotations
@@ -18,16 +18,16 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.protocol import PagedStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
 
 
-class HybridGDNStateManager:
+class RequestStateManager:
     """Own request-to-slot lifecycle for one hybrid runtime."""
 
-    def __init__(self, state_cache: GDNPagedStateCache) -> None:
+    def __init__(self, state_cache: PagedStateCache) -> None:
         self._state_cache = state_cache
         self._req_to_slot: dict[str, int] = {}
         self._free_slots: list[int] = []
@@ -56,15 +56,15 @@ class HybridGDNStateManager:
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
-        """Attach stable GDN slot ids to one forward-pass context.
+        """Attach stable state slot ids to one forward-pass context.
 
         Scheduler block ids and step positions drive align-mode state motion
-        (see ``AlignGDNStateManager``); this manager keeps one private slot
+        (see ``AlignStateManager``); this manager keeps one private slot
         per request for its whole lifetime, so it ignores them.  Accepting
         them keeps both managers on one signature.
         """
         del state_block_ids, step_positions
-        ctx.gdn_slot_mapping = self.assign_step_slots(req_ids)
+        ctx.state_slot_mapping = self.assign_step_slots(req_ids)
 
     def assign_step_slots(self, req_ids: list[str]) -> list[int]:
         """Plan one scheduler step's stable request-to-slot mapping atomically."""
@@ -116,11 +116,11 @@ class HybridGDNStateManager:
         return step_slot_ids
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        """Append authoritative GDN state arrays that the forward mutates."""
+        """Append authoritative state arrays that the forward mutates."""
         outputs.extend(self._state_cache.updated_state_arrays())
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release slots for requests whose recurrent state is no longer valid."""
+        """Release slots for requests whose state is no longer valid."""
         freed_slots: list[int] = []
         for req_id in req_ids:
             slot = self._req_to_slot.pop(req_id, None)
@@ -135,7 +135,7 @@ class HybridGDNStateManager:
         self._free_slots.extend(freed_slots)
 
     def materialize_pending_state(self) -> None:
-        """Force stable GDN arrays after a slot release updated them lazily."""
+        """Force stable state arrays after a slot release updated them lazily."""
         if not self._needs_materialize:
             return
 
