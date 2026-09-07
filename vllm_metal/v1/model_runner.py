@@ -1624,7 +1624,6 @@ class MetalModelRunner:
                 and not states_missing
                 and SamplingBatch.params_allow_native_random(decode_params)
             ),
-            has_prompt_logprobs=self._prompt_logprobs_tracker.wants_any(decode_req_ids),
         )
         return self._decode_pipeline.evaluate_gate(capabilities, step, sampling)
 

@@ -52,7 +52,6 @@ _CLEAN_STEP_KWARGS = {
 _GREEDY_SAMPLING_KWARGS = {
     "native_greedy": True,
     "native_random": False,
-    "has_prompt_logprobs": False,
 }
 
 
@@ -227,7 +226,6 @@ class TestGate:
         ("flag", "value", "reason"),
         [
             ("native_greedy", False, "non-native sampling"),
-            ("has_prompt_logprobs", True, "prompt logprobs requested"),
         ],
     )
     def test_each_sampling_blocker_rejects_with_its_reason(self, flag, value, reason):

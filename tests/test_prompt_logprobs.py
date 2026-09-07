@@ -162,7 +162,6 @@ class TestPromptLogprobsTracker:
         # Delivery clears all lifecycle state so decode preemption cannot
         # re-emit prompt logprobs for the same request.
         assert not tracker.wants("req-a")
-        assert not tracker.wants_any(["req-a"])
 
     def test_single_chunk_prompt_completes_immediately(self) -> None:
         tracker = PromptLogprobsTracker()

@@ -2629,30 +2629,6 @@ class TestPipelineGateSpecDecodeDerivation:
             num_spec_tokens_to_schedule=0,
         )
 
-    def test_prompt_logprobs_request_disables_pipeline(self) -> None:
-        # Arrange — an active prompt-logprobs request must keep the synchronous
-        # sample path until the prompt scores are delivered.
-        runner = self._runner(drafter=None)
-        runner._prompt_logprobs_tracker.register("r0", 5)
-        runner._request_states = {
-            "r0": mr.RequestState(
-                token_ids=[1, 7],
-                prompt_len=1,
-                cache=[],
-                sampling_params=SamplingParams(temperature=0.0, prompt_logprobs=5),
-                generator=None,
-                generated_tokens=1,
-            )
-        }
-        scheduler_output = self._cached_decode_output("r0")
-
-        # Act
-        decision = runner._evaluate_pipeline_gate(scheduler_output)
-
-        # Assert
-        assert decision.eligible is False
-        assert decision.reason == "prompt logprobs requested"
-
     def test_state_family_without_pipeline_support_disables_pipeline(self) -> None:
         runner = self._runner(drafter=None)
         runner.model_config.is_hybrid = True
