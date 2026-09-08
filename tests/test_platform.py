@@ -61,6 +61,7 @@ class TestMetalPlatform:
     ) -> VllmConfig:
         """Build the upstream DTOs without re-entering the platform hook."""
         model_fields = vars(model_config) if model_config is not None else {}
+        model_fields.setdefault("revision", None)
         max_model_len = int(model_fields.get("max_model_len", 2048))
         cache = (
             cache_config
@@ -102,14 +103,21 @@ class TestMetalPlatform:
         self,
         monkeypatch: pytest.MonkeyPatch,
         is_stt: bool,
+        expected_revision: str | None = None,
     ) -> None:
+        def resolve(model, *, revision):
+            assert revision == expected_revision
+            return model
+
+        def detect(_model, *, revision):
+            assert revision == expected_revision
+            return is_stt
+
         monkeypatch.setattr(
             "vllm_metal.utils.get_model_download_path",
-            lambda model: model,
+            resolve,
         )
-        monkeypatch.setattr(
-            "vllm_metal.stt.detection.is_stt_model", lambda _model: is_stt
-        )
+        monkeypatch.setattr("vllm_metal.stt.detection.is_stt_model", detect)
 
     def test_device_name(self) -> None:
         """Test device name retrieval."""
@@ -343,15 +351,16 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="speculative decoding"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     def test_check_and_update_config_rejects_pipeline_with_stt(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, revision: str | None
     ) -> None:
         """PP>1 with an STT model is rejected at config time.
 
         STT checkpoints use a dedicated runner with no pipeline-split path, so
         reject before any worker spawns rather than fail after startup.
         """
-        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        self._patch_stt_resolution(monkeypatch, is_stt=True, expected_revision=revision)
         vllm_config = self._platform_config(
             cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
             parallel_config=SimpleNamespace(
@@ -363,6 +372,7 @@ class TestMetalPlatform:
             ),
             model_config=SimpleNamespace(
                 model="openai/whisper-tiny",
+                revision=revision,
                 disable_cascade_attn=False,
                 tokenizer=None,
                 multimodal_config=None,

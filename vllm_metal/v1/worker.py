@@ -177,7 +177,11 @@ class MetalWorker(WorkerBase):
         from vllm_metal.stt.detection import is_stt_model
         from vllm_metal.utils import get_model_download_path
 
-        if is_stt_model(get_model_download_path(self.model_config.model)):
+        revision = self.model_config.revision
+        if is_stt_model(
+            get_model_download_path(self.model_config.model, revision=revision),
+            revision=revision,
+        ):
             from vllm_metal.v1.stt_model_runner import STTModelRunner
 
             self.model_runner = STTModelRunner(

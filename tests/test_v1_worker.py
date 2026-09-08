@@ -40,6 +40,35 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should honor model runner memory-reporting modes."""
 
+    @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
+    def test_init_device_preserves_stt_revision(self, monkeypatch, revision) -> None:
+        from vllm_metal.v1 import worker as worker_module
+        from vllm_metal.v1.stt_model_runner import STTModelRunner
+
+        worker = _make_worker(None, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(
+            model="org/model", revision=revision, seed=0
+        )
+        worker.vllm_config.model_config = worker.model_config
+        worker.vllm_config.scheduler_config = SimpleNamespace()
+        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        worker.rank = worker.local_rank = 0
+        worker.distributed_init_method = "unused"
+        monkeypatch.setattr(worker_module, "set_wired_limit", lambda: None)
+        monkeypatch.setattr(
+            worker_module, "init_worker_distributed_environment", lambda *_: None
+        )
+        resolve = MagicMock(return_value="org/model")
+        detect = MagicMock(return_value=True)
+        monkeypatch.setattr("vllm_metal.utils.get_model_download_path", resolve)
+        monkeypatch.setattr("vllm_metal.stt.detection.is_stt_model", detect)
+
+        worker.init_device()
+
+        assert isinstance(worker.model_runner, STTModelRunner)
+        resolve.assert_called_once_with("org/model", revision=revision)
+        detect.assert_called_once_with("org/model", revision=revision)
+
     def test_determine_available_memory_stt_nominal_mode(self) -> None:
         model_runner = SimpleNamespace(
             scheduler_memory_reporting_mode=MagicMock(return_value="stt_nominal"),

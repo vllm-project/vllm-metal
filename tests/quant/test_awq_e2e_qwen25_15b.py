@@ -42,6 +42,7 @@ _AWQ_REPO = "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
 def _runner_model_config(*, dtype):
     return SimpleNamespace(
         model=_AWQ_REPO,
+        revision=None,
         hf_config=None,
         is_multimodal_model=False,
         trust_remote_code=False,

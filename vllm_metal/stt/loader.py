@@ -11,6 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from vllm_metal.stt.registry import get_stt_model_constructor
+from vllm_metal.utils import get_model_download_path
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,12 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_LOAD_DTYPES = frozenset({mx.float16, mx.float32, mx.bfloat16})
 
 
-def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
+def load_model(
+    model_path: str | Path,
+    dtype: mx.Dtype = mx.float16,
+    *,
+    revision: str | None = None,
+):
     """Load an STT model from a local directory or HuggingFace repo."""
     if isinstance(model_path, str) and not model_path.strip():
         raise ValueError(
@@ -26,7 +32,7 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
         )
     _validate_load_dtype(dtype)
 
-    resolved_model_path = _resolve_model_path(model_path)
+    resolved_model_path = resolve_model_path(model_path, revision=revision)
     config_dict = _read_config(resolved_model_path)
     model_type = config_dict.get("model_type", "").lower()
 
@@ -67,9 +73,9 @@ def _load_weights(model_path: Path) -> dict[str, mx.array]:
     return weights
 
 
-def _resolve_model_path(model_path: str | Path) -> Path:
-    """Resolve model path, downloading from HF if needed."""
-    model_path = Path(model_path)
+def resolve_model_path(model_path: str | Path, *, revision: str | None = None) -> Path:
+    """Resolve a local snapshot for STT weights and tokenizer assets."""
+    model_path = Path(get_model_download_path(str(model_path), revision=revision))
     if model_path.exists():
         return model_path
 
@@ -81,7 +87,7 @@ def _resolve_model_path(model_path: str | Path) -> Path:
         ) from e
 
     try:
-        return Path(snapshot_download(repo_id=str(model_path)))
+        return Path(snapshot_download(repo_id=str(model_path), revision=revision))
     except OSError as e:
         raise ValueError(f"Could not download model: {model_path}") from e
 

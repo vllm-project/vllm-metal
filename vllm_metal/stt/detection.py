@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 _STT_MODEL_TYPES = frozenset({"whisper", "qwen3_asr"})
 
 
-def _resolve_config_file(model_path: str) -> Path | None:
+def _resolve_config_file(
+    model_path: str, *, revision: str | None = None
+) -> Path | None:
     """Return local or downloaded config.json path for *model_path*."""
     p = Path(model_path)
     if p.is_dir():
@@ -35,7 +37,11 @@ def _resolve_config_file(model_path: str) -> Path | None:
         return None
 
     try:
-        return Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+        return Path(
+            hf_hub_download(
+                repo_id=model_path, filename="config.json", revision=revision
+            )
+        )
     except (OSError, ValueError) as exc:
         logger.debug("Failed to download config.json for %s: %s", model_path, exc)
         return None
@@ -57,13 +63,13 @@ def _read_model_type(config_file: Path) -> str | None:
     return model_type.lower()
 
 
-def is_stt_model(model_path: str) -> bool:
+def is_stt_model(model_path: str, *, revision: str | None = None) -> bool:
     """Return True when *model_path* resolves to a known STT model type.
 
     Detection is based on ``model_type`` in the model's ``config.json``.
     Falls back to ``False`` if the config cannot be read.
     """
-    config_file = _resolve_config_file(model_path)
+    config_file = _resolve_config_file(model_path, revision=revision)
     if config_file is None:
         return False
     model_type = _read_model_type(config_file)

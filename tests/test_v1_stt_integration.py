@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -393,18 +395,39 @@ class TestSTTRunnerWorkerContract:
         bound = STTModelRunner.supported_worker_tasks.__get__(runner)
         assert bound() == ("transcription",)
 
+    @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
+    @pytest.mark.parametrize("source", ["huggingface", "modelscope", "local"])
     def test_load_model_wires_model_and_adapter(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, revision, source
     ) -> None:
+        import vllm_metal.stt.loader as loader
         import vllm_metal.v1.stt_model_runner as smr
+        from vllm_metal.stt.detection import is_stt_model
 
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "whisper"}))
+        model_name = str(tmp_path) if source == "local" else "org/model"
+        download = MagicMock(return_value=str(tmp_path))
+        config_download = MagicMock(return_value=str(tmp_path / "config.json"))
+        monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+        monkeypatch.setattr("vllm_metal.stt.detection.hf_hub_download", config_download)
+        monkeypatch.setattr("vllm.envs.VLLM_USE_MODELSCOPE", source == "modelscope")
+        monkeypatch.setenv("VLLM_METAL_MODELSCOPE_CACHE", "/model-cache")
+        monkeypatch.setitem(
+            sys.modules,
+            "modelscope.hub.snapshot_download",
+            SimpleNamespace(snapshot_download=download),
+        )
         adapter = object()
-        fake_model = SimpleNamespace(create_runtime_adapter=lambda _name: adapter)
-        monkeypatch.setattr(smr, "load_stt_model", lambda _name: fake_model)
-        monkeypatch.setattr(smr, "get_model_download_path", lambda _m: "resolved-path")
+        fake_model = SimpleNamespace(
+            create_runtime_adapter=MagicMock(return_value=adapter)
+        )
+        constructor = MagicMock(return_value=fake_model)
+        monkeypatch.setattr(loader, "get_stt_model_constructor", lambda _: constructor)
+        load_weights = MagicMock(return_value=fake_model)
+        monkeypatch.setattr(loader, "_load_and_init_model", load_weights)
 
         vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(model="some-model"),
+            model_config=SimpleNamespace(model=model_name, revision=revision),
             cache_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(),
         )
@@ -414,6 +437,28 @@ class TestSTTRunnerWorkerContract:
         assert runner.model is fake_model
         assert runner.tokenizer is None
         assert runner._stt_runtime_adapter is adapter
+        fake_model.create_runtime_adapter.assert_called_once_with(str(tmp_path))
+        load_weights.assert_called_once_with(
+            fake_model, tmp_path, {"model_type": "whisper"}
+        )
+        if source == "huggingface":
+            download.assert_called_once_with(repo_id=model_name, revision=revision)
+        elif source == "modelscope":
+            kwargs = {"revision": revision} if revision is not None else {}
+            download.assert_called_once_with(
+                model_name, cache_dir="/model-cache", **kwargs
+            )
+        else:
+            download.assert_not_called()
+
+        detection_path = model_name if source == "huggingface" else str(tmp_path)
+        assert is_stt_model(detection_path, revision=revision)
+        if source == "huggingface":
+            config_download.assert_called_once_with(
+                repo_id=model_name, filename="config.json", revision=revision
+            )
+        else:
+            config_download.assert_not_called()
 
 
 class TestWhisperRuntimeAdapterTranscriberCaching:

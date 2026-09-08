@@ -70,6 +70,7 @@ _DENSE_AWQ_MATRIX = [
 def _runner_model_config(repo: str, *, dtype):
     return SimpleNamespace(
         model=repo,
+        revision=None,
         hf_config=None,
         is_multimodal_model=False,
         trust_remote_code=False,

@@ -779,11 +779,13 @@ class MetalPlatform(Platform):
         from vllm_metal.utils import get_model_download_path
 
         resolved_model = (
-            get_model_download_path(model_config.model)
+            get_model_download_path(model_config.model, revision=model_config.revision)
             if model_config is not None
             else None
         )
-        if resolved_model is not None and is_stt_model(resolved_model):
+        if resolved_model is not None and is_stt_model(
+            resolved_model, revision=model_config.revision
+        ):
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
             # before any worker spawns.

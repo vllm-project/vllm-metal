@@ -30,10 +30,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
+from vllm_metal.stt.loader import resolve_model_path
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
-from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.model_lifecycle import load_stt_model
 
 logger = init_logger(__name__)
@@ -63,7 +63,11 @@ class STTModelRunner:
 
     def load_model(self) -> None:
         """Load the STT model and build its per-model runtime adapter."""
-        model_name = get_model_download_path(self.model_config.model)
+        model_name = str(
+            resolve_model_path(
+                self.model_config.model, revision=self.model_config.revision
+            )
+        )
         model = load_stt_model(model_name)
         self.model = model
         self.tokenizer = None
