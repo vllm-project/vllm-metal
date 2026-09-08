@@ -32,7 +32,9 @@ position in ``[draft_seq_len, committed_len)`` *before* the block can be
 hashed: the scheduler only content-hashes a block once it is fully filled,
 and by that point a future ingest step will have overwritten the speculative
 slots with the correct committed KV.  No stale draft KV can leak into a
-prefix-cache match.
+prefix-cache match. K=0 remains eager when prefix caching is enabled.
+Deferred unwritten KV is allowed only when prefix caching is disabled, so it
+cannot be exposed as a cross-request prefix-cache hit.
 
 **Why every active row ingests, not just drafting-eligible ones.** The
 scheduler advances a request's ``num_computed_tokens`` and marks the
@@ -150,11 +152,16 @@ class DraftModelProposer:
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
         merge_ingest_windows: bool = False,
+        enable_prefix_caching: bool = True,
     ) -> None:
         self._model = model
         self._block_size = block_size
         self._controller = controller
         self._extract_logits = extract_logits
+        # Deferring K=0 ingest is safe only when prefix caching is disabled.
+        # Otherwise the scheduler may publish a full draft-group block as a
+        # cache hit even though its physical KV has not been materialized.
+        self._defer_zero_k_ingest = not enable_prefix_caching
         # Structural half of the ingest window gate (see `build`); the
         # operator half (VLLM_METAL_SPEC_VERIFY_WINDOW) is read per call
         # like the runner's `merge_verify_windows` property.  The same
@@ -215,6 +222,7 @@ class DraftModelProposer:
         scratch_reserve_blocks: int,
         block_size: int,
         dtype: mx.Dtype,
+        enable_prefix_caching: bool,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config, parallel_config)
         total_blocks = committed_num_blocks + scratch_reserve_blocks
@@ -254,6 +262,7 @@ class DraftModelProposer:
             # vacuous, and `_load_draft_model` resolves one uniform
             # head_dim.  Only the decode kernel's head bound remains.
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
+            enable_prefix_caching=enable_prefix_caching,
         )
 
     def adopt_committed_group(self, group_index: int) -> None:
@@ -288,6 +297,10 @@ class DraftModelProposer:
             )
 
         self._prune_finished(ctx.request_states)
+        if num_speculative_tokens <= 0 and self._defer_zero_k_ingest:
+            self._record_deferred_ingest_boundaries(ctx)
+            return None
+
         plans = self._collect_draft_plans(ctx, num_speculative_tokens)
         if not plans:
             return None
@@ -301,9 +314,9 @@ class DraftModelProposer:
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
 
-        # A scheduler step can have no speculative-token budget while still
-        # advancing committed prefill tokens. Keep the draft KV cache in sync,
-        # but do not generate any draft tokens for that step.
+        # If K=0 reaches this point, lazy ingest is disabled (currently because
+        # prefix caching is enabled). Keep physical draft KV synchronized with the
+        # scheduler, but do not return draft tokens.
         if num_speculative_tokens <= 0:
             return None
 
@@ -364,6 +377,25 @@ class DraftModelProposer:
             self._spec_kv_writes.pop(req_id, None)
 
     # -- internals -----------------------------------------------------------
+
+    def _record_deferred_ingest_boundaries(self, ctx: ProposeContext) -> None:
+        """Remember where lazy K=0 catch-up must start without running MLX."""
+        boundaries = [
+            (req_id, state.num_computed_tokens) for req_id, state in ctx.decode_reqs
+        ]
+        boundaries.extend(
+            (prefill.req_id, prefill.start_pos) for prefill in ctx.prefill_reqs
+        )
+        for req_id, boundary in boundaries:
+            self._draft_seq_lens.setdefault(req_id, boundary)
+
+            # No speculative lookahead is needed while K=0. Returning its
+            # private tail avoids pinning scratch capacity during a long
+            # zero-budget interval. The speculative-write ledger is retained;
+            # entries are block/token validated before any later reuse.
+            blocks = self._scratch_req_blocks.pop(req_id, None)
+            if blocks is not None:
+                self._scratch_free_blocks.extend(blocks)
 
     def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
         for req_id in list(self._scratch_req_blocks.keys()):
@@ -487,6 +519,44 @@ class DraftModelProposer:
             return None
         req_id = prefill.req_id
         committed_len = prefill.start_pos + len(prefill.token_ids)
+        draft_seq_len = self._draft_seq_lens.setdefault(req_id, prefill.start_pos)
+        if draft_seq_len >= committed_len:
+            return None
+
+        if draft_seq_len < prefill.start_pos:
+            # K may have been zero for earlier prefill chunks. The packed continuation
+            # carries the full original prompt, allowing reconstruction before this
+            # chunk. Slice only through committed_len because the full prompt may also
+            # contain future, unscheduled prompt tokens.
+            full_prompt_token_ids = prefill.full_prompt_token_ids
+            if full_prompt_token_ids is None:
+                raise RuntimeError(
+                    "Cannot catch up deferred draft KV for request "
+                    f"{req_id!r}: valid boundary {draft_seq_len} precedes "
+                    f"prefill start {prefill.start_pos}, but "
+                    "full_prompt_token_ids is missing"
+                )
+            catch_up_token_ids = list(full_prompt_token_ids)
+            if committed_len > len(catch_up_token_ids):
+                # A final prefill plan includes the target's just-sampled
+                # output token after the prompt chunk (#721). Preserve it when
+                # rebuilding an ingest range that starts in an older chunk.
+                current_chunk_offset = len(catch_up_token_ids) - prefill.start_pos
+                catch_up_token_ids.extend(prefill.token_ids[current_chunk_offset:])
+            ingest_tokens = catch_up_token_ids[draft_seq_len:committed_len]
+        else:
+            chunk_offset = draft_seq_len - prefill.start_pos
+            ingest_tokens = list(prefill.token_ids[chunk_offset:])
+
+        expected_ingest_len = committed_len - draft_seq_len
+        if len(ingest_tokens) != expected_ingest_len:
+            raise RuntimeError(
+                "Cannot catch up deferred draft KV for request "
+                f"{req_id!r}: expected {expected_ingest_len} tokens from "
+                f"position {draft_seq_len} through {committed_len}, got "
+                f"{len(ingest_tokens)}"
+            )
+
         is_drafting = result_mode != "intermediate" and req_id in drafting_req_ids
         assert self._committed_group_index is not None
         # The ingest includes the target's sampled token. Producing K drafts
@@ -501,8 +571,8 @@ class DraftModelProposer:
             req_id=req_id,
             block_ids=block_ids,
             committed_len=committed_len,
-            draft_seq_len=prefill.start_pos,
-            ingest_tokens=list(prefill.token_ids),
+            draft_seq_len=draft_seq_len,
+            ingest_tokens=ingest_tokens,
             is_drafting=is_drafting,
         )
         return plan

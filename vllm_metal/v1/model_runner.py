@@ -1019,6 +1019,7 @@ class MetalModelRunner:
                 scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
+                enable_prefix_caching=self.vllm_config.cache_config.enable_prefix_caching,
             )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
@@ -2626,6 +2627,10 @@ class MetalModelRunner:
         one past this chunk's own tokens.  All conditions share the same
         two-source resolution (RequestState first, new_req fallback) and
         the same contract-bug raises.
+
+        Continuation chunks also expose the full original prompt so consumers such
+        as DraftModelProposer can reconstruct a deferred KV range that begins before
+        the current chunk.
         """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
