@@ -1000,6 +1000,10 @@ class MetalModelRunner:
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif spec.uses_draft_model():
+            defer_zero_k_ingest = (
+                not self.vllm_config.cache_config.enable_prefix_caching
+            )
+
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
             # `num_blocks` is the scheduler-visible committed-KV capacity for
@@ -1019,7 +1023,7 @@ class MetalModelRunner:
                 scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
-                enable_prefix_caching=self.vllm_config.cache_config.enable_prefix_caching,
+                defer_zero_k_ingest=defer_zero_k_ingest,
             )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer

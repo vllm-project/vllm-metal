@@ -79,7 +79,7 @@ def _proposer(
     *,
     committed_num_blocks: int = COMMITTED_NUM_BLOCKS,
     scratch_reserve_blocks: int = SCRATCH_RESERVE_BLOCKS,
-    enable_prefix_caching: bool = True,
+    defer_zero_k_ingest: bool = False,
 ) -> DraftModelProposer:
     proposer = DraftModelProposer(
         model=model,
@@ -89,7 +89,7 @@ def _proposer(
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
-        enable_prefix_caching=enable_prefix_caching,
+        defer_zero_k_ingest=defer_zero_k_ingest,
     )
     proposer.adopt_committed_group(COMMITTED_GROUP_INDEX)
     return proposer
@@ -347,7 +347,7 @@ def test_zero_k_eagerly_ingests_when_prefix_caching_is_enabled() -> None:
 def test_first_seen_at_zero_k_catches_up_from_initial_prefill_boundary() -> None:
     """A deferred first chunk must not be forgotten by the next prefill."""
     model = _PositionEncodingDraftModel()
-    proposer = _proposer(model, enable_prefix_caching=False)
+    proposer = _proposer(model, defer_zero_k_ingest=True)
     prompt = list(range(PROMPT_LEN))
 
     assert (
@@ -388,7 +388,7 @@ def test_first_seen_at_zero_k_catches_up_from_initial_prefill_boundary() -> None
 def test_consecutive_zero_k_prefills_catch_up_on_first_decode() -> None:
     """Repeated K=0 prefills catch up once when decode resumes drafting."""
     model = _PositionEncodingDraftModel()
-    proposer = _proposer(model, enable_prefix_caching=False)
+    proposer = _proposer(model, defer_zero_k_ingest=True)
     prompt = list(range(PROMPT_LEN))
 
     assert (
@@ -451,7 +451,7 @@ def test_consecutive_zero_k_prefills_catch_up_on_first_decode() -> None:
 def test_zero_k_preserves_existing_boundary_until_decode_catch_up() -> None:
     """Scheduler progress during K=0 must not claim unwritten KV is valid."""
     model = _StubDraftModel()
-    proposer = _proposer(model, enable_prefix_caching=False)
+    proposer = _proposer(model, defer_zero_k_ingest=True)
 
     initial_state = _request_state(
         committed_block_ids=[0, 1],
