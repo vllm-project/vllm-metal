@@ -136,9 +136,11 @@ def _compute_lloyd_max_normal(bits: int) -> tuple[mx.array, mx.array]:
     for _ in range(500):
         boundaries = (centroids[:-1] + centroids[1:]) * 0.5
         # assign[i] = cluster index for sample[i] (in [0, n))
-        assign = mx.searchsorted(boundaries, samples).astype(mx.int32)
+        assign = cast(mx.array, mx.searchsorted(boundaries, samples)).astype(mx.int32)
         # one_hot: (N, n)
-        one_hot = (assign[:, None] == cluster_ids[None, :]).astype(mx.float32)
+        one_hot = cast(mx.array, assign[:, None] == cluster_ids[None, :]).astype(
+            mx.float32
+        )
         counts = one_hot.sum(axis=0)  # (n,)
         sums = (one_hot * samples[:, None]).sum(axis=0)  # (n,)
         # Empty clusters keep their old centroid to avoid divide-by-zero.
