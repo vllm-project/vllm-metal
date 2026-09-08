@@ -384,16 +384,18 @@ def _scheduler_output(
     )
 
 
-def _expected_embedding(token_id: int) -> torch.Tensor:
-    vector = torch.tensor([float(token_id), float(token_id + 1), 1.0])
+def _expected_embedding(token_id: int, dimensions: int | None = None) -> torch.Tensor:
+    vector = torch.tensor([float(token_id), float(token_id + 1), 1.0])[:dimensions]
     return vector / vector.norm()
 
 
-def _assert_embedding(tensor: torch.Tensor | None, token_id: int) -> None:
+def _assert_embedding(
+    tensor: torch.Tensor | None, token_id: int, dimensions: int | None = None
+) -> None:
     assert tensor is not None
     assert tensor.device.type == "cpu"
-    assert tensor.shape == (3,)
-    assert torch.allclose(tensor, _expected_embedding(token_id), atol=1e-6)
+    assert tensor.shape == (3 if dimensions is None else dimensions,)
+    assert torch.allclose(tensor, _expected_embedding(token_id, dimensions), atol=1e-6)
 
 
 def _expected_score(token_id: int, *, activated: bool = True) -> torch.Tensor:
@@ -682,9 +684,11 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
+    @pytest.mark.parametrize("dimensions", [None, 4])
     def test_xlm_roberta_checkpoint_matches_transformers(
         self,
         tmp_path,
+        dimensions,
     ) -> None:
         torch.manual_seed(0)
         torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(tmp_path)
@@ -695,6 +699,10 @@ class TestMetalPoolingCapabilities:
             tokenizer_revision="tokenizer-revision",
             hf_config=torch_config,
             dtype=torch.float32,
+            pooler_config=_pooler_config(seq_pooling_type="CLS", dimensions=dimensions),
+            is_matryoshka=True,
+            matryoshka_dimensions=None,
+            embedding_size=torch_config.hidden_size,
         )
 
         with patch(
@@ -735,12 +743,14 @@ class TestMetalPoolingCapabilities:
             rtol=1e-5,
         )
 
-        request = _new_req("req-0", [0, 5, 6, 2], task="embed")
+        pooling_params = _pooling_params(task="embed")
+        pooling_params.verify(model_config)
+        request = _new_req("req-0", [0, 5, 6, 2], pooling_params=pooling_params)
         outputs = loaded_backend.pooling_backend.pool_scheduler_output(
             _scheduler_output(new_reqs=[request]),
             model_config,
         )
-        expected_cls = normalize(expected_hidden[0, 0].float(), dim=0)
+        expected_cls = normalize(expected_hidden[0, 0, :dimensions].float(), dim=0)
 
         assert len(outputs) == 1
         assert torch.allclose(
@@ -873,9 +883,12 @@ class TestMetalPoolingCapabilities:
 
 
 class TestMetalPoolingRunnerOutput:
-    def test_paged_embed_preserves_request_order(self) -> None:
+    @pytest.mark.parametrize("dimensions", [None, 2])
+    def test_paged_embed_preserves_request_order(self, dimensions) -> None:
         runner = _make_runner()
-        req_b = _new_req("req-b", [4, 5])
+        req_b = _new_req(
+            "req-b", [4, 5], pooling_params=_pooling_params(dimensions=dimensions)
+        )
         req_a = _new_req("req-a", [7, 8, 9])
         sched = _scheduler_output(new_reqs=[req_b, req_a])
 
@@ -888,11 +901,13 @@ class TestMetalPoolingRunnerOutput:
         assert out.req_ids == ["req-b", "req-a"]
         assert out.sampled_token_ids == [[], []]
         assert out.pooler_output is not None
-        _assert_embedding(out.pooler_output[0], 5)
+        _assert_embedding(out.pooler_output[0], 5, dimensions)
         _assert_embedding(out.pooler_output[1], 9)
 
+    @pytest.mark.parametrize("dimensions", [None, 2])
     def test_encoder_embed_preserves_request_order_without_paged_attention(
         self,
+        dimensions,
     ) -> None:
         runner = _make_runner(
             paged=False,
@@ -902,7 +917,9 @@ class TestMetalPoolingRunnerOutput:
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
         )
-        req_b = _new_req("req-b", [4, 5])
+        req_b = _new_req(
+            "req-b", [4, 5], pooling_params=_pooling_params(dimensions=dimensions)
+        )
         req_a = _new_req("req-a", [7, 8, 9])
 
         with patch("vllm_metal.v1.model_runner.prepare_grouped") as prepare:
@@ -912,12 +929,17 @@ class TestMetalPoolingRunnerOutput:
         assert out.req_ids == ["req-b", "req-a"]
         assert out.sampled_token_ids == [[], []]
         assert out.pooler_output is not None
-        _assert_embedding(out.pooler_output[0], 4)
+        _assert_embedding(out.pooler_output[0], 4, dimensions)
         _assert_embedding(out.pooler_output[1], 7)
 
-    def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(self) -> None:
+    @pytest.mark.parametrize("dimensions", [None, 2])
+    def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(
+        self, dimensions
+    ) -> None:
         runner = _make_runner()
-        req = _new_req("req-0", [1, 2, 3, 4])
+        req = _new_req(
+            "req-0", [1, 2, 3, 4], pooling_params=_pooling_params(dimensions=dimensions)
+        )
         first = _scheduler_output(
             new_reqs=[req],
             num_scheduled_tokens={"req-0": 2},
@@ -946,7 +968,7 @@ class TestMetalPoolingRunnerOutput:
 
         assert final.sampled_token_ids == [[]]
         assert final.pooler_output is not None
-        _assert_embedding(final.pooler_output[0], 4)
+        _assert_embedding(final.pooler_output[0], 4, dimensions)
 
     def test_paged_classify_returns_qwen3_reranker_scores(self) -> None:
         runner = _make_runner(
@@ -1239,7 +1261,6 @@ class TestMetalPoolingFailFast:
             (_pooling_params(returned_token_ids=[1]), "returned_token_ids"),
             (_pooling_params(extra_kwargs={"foo": True}), "extra pooling kwargs"),
             (_pooling_params(use_activation=False), "use_activation=False"),
-            (_pooling_params(dimensions=2), "dimension"),
             (
                 _pooling_params(requires_token_ids=True, dimensions=2),
                 "token-level ALL",

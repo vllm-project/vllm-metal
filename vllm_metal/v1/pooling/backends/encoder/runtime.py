@@ -61,7 +61,8 @@ class EncoderEmbeddingPooler:
             if self.config.sequence_pooling_type != "LAST"
             else len(request.token_ids) - 1
         )
-        vector = hidden_states[0, token_index, :].astype(mx.float32)
+        dimensions = request.pooling_params.dimensions
+        vector = hidden_states[0, token_index, :dimensions].astype(mx.float32)
         norm = mx.sqrt(mx.sum(vector * vector))
         norm = mx.maximum(norm, mx.array(_MIN_NORM, dtype=mx.float32))
         tensor = mlx_to_torch(mx.contiguous(vector / norm), device="cpu")

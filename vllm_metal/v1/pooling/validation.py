@@ -107,10 +107,6 @@ class PoolingConfigView:
         return bool(self.pooler_config.enable_chunked_processing)
 
     @property
-    def has_embedding_dimension_override(self) -> bool:
-        return self.pooler_config.dimensions is not None
-
-    @property
     def supports_decoder_embed_config(self) -> bool:
         return (
             self.is_text_only
@@ -159,11 +155,6 @@ class PoolingConfigView:
             and pooling_params.use_activation is False
         ):
             return "use_activation=False"
-        if (
-            pooling_params.dimensions is not None
-            or self.has_embedding_dimension_override
-        ):
-            return "embedding-dimension truncation"
         return None
 
 
