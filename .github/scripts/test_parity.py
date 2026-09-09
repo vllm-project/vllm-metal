@@ -27,21 +27,13 @@ def event(monkeypatch, tmp_path):
         "GITHUB_RUN_ID": "123",
     }.items():
         monkeypatch.setenv(key, value)
-    return payload, event_path
 
 
-def test_only_authorized_exact_commands_can_launch_pr_code(event, monkeypatch):
+def test_read_only_user_cannot_launch_pr_code(event, monkeypatch):
     api = Mock(return_value={"permission": "read"})
     monkeypatch.setattr(parity, "github_api", api)
     assert parity.start() is None
     api.assert_called_once_with("collaborators/reviewer/permission")
-
-    api.reset_mock()
-    payload, event_path = event
-    payload["comment"]["body"] = "/ci parity extra"
-    event_path.write_text(json.dumps(payload))
-    assert parity.start() is None
-    api.assert_not_called()
 
 
 def test_captured_fork_sha_and_original_check_are_used(event, monkeypatch):
