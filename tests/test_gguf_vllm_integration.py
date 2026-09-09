@@ -544,9 +544,38 @@ def test_remote_load_source_rejects_unsupported_qtype_before_download(
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", fail_snapshot_download)
 
-    with pytest.raises(ValueError, match="Remote GGUF qtype 'Q4_K_M'"):
+    with pytest.raises(ValueError) as excinfo:
         gguf_source.GGUFLoadSource.from_model_config(
             _remote_gguf_model_config(
                 model_weights="Qwen/Qwen3-0.6B-GGUF:Q4_K_M",
             )
         )
+
+    assert str(excinfo.value) == (
+        "Remote GGUF qtype 'Q4_K_M' is not supported by vllm-metal; "
+        "supported qtypes: BF16, F16, F32, Q4_0, Q4_1, Q8_0."
+    )
+
+
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
+def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
+    snapshot = tmp_path / "weights"
+    snapshot.mkdir()
+    gguf_name = f"model-{tag}.gguf"
+    (snapshot / gguf_name).write_text("dummy")
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(list_repo_files=lambda **_: ["README.md", gguf_name]),
+    )
+    monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
+    reference = gguf_source.RemoteGGUFReference.parse(f"org/model:{tag}")
+    assert reference is not None
+
+    resolved = reference.resolve(
+        cache_dir=None, revision=None, ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / gguf_name)

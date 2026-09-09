@@ -947,3 +947,20 @@ def test_loads_single_file_set_named_like_one_shard(tmp_path):
     ).load()
 
     _assert_dense_wrapper_histogram(model)
+
+
+@pytest.mark.parametrize("plain_type", [QT.F16, QT.F32, QT.BF16])
+def test_loads_plain_typed_checkpoint_without_wrappers(tmp_path, plain_type):
+    # llama.cpp plain exports keep norms F32; matrix weights carry the type.
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, "qwen3", has_qk_norm=True, quant_type=plain_type
+    )
+
+    model, _ = GGUFModelLoader(
+        gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
+    ).load()
+
+    hist = _gguf_module_histogram(model)
+    assert "GGUFEmbedding" not in hist
+    assert "GGUFLinear" not in hist
+    _assert_forward_vocab_shape(model)

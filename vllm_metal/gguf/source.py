@@ -24,7 +24,7 @@ _QUANT_TAG_RE = re.compile(
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
-_SUPPORTED_REMOTE_QTYPES = frozenset({"Q8_0", "Q4_0", "Q4_1"})
+_SUPPORTED_REMOTE_QTYPES = frozenset({"Q8_0", "Q4_0", "Q4_1", "F16", "F32", "BF16"})
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 _TOKENIZER_ALLOW_PATTERNS = (
     "*.json",
