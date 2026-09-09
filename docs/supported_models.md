@@ -37,6 +37,7 @@ validation guidance. The reranker requires Qwen3 sequence-classification
 | Qwen3-Embedding | 🔵 | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
 | Qwen3-Reranker | 🔵 | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
 | BGE-M3 | 🔵 | `pooling` / `embed`, `token_classify` (encoder) | `BAAI/bge-m3` |
+| Multilingual E5 Base | 🔵 | `pooling` / `embed` (encoder) | `intfloat/multilingual-e5-base` |
 
 ## Multimodal Language Models
 

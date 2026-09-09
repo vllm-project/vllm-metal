@@ -31,6 +31,8 @@ Current scope is intentionally narrow:
   using `lm_head` for untied checkpoints or `embed_tokens.as_linear` when word
   embeddings are tied
 - BGE-M3 dense embeddings from the CLS hidden state, L2-normalized
+- unquantized XLM-R/RoBERTa encoder embeddings with CLS, LAST, or MEAN
+  pooling and L2 normalization, including `intfloat/multilingual-e5-base`
 - BGE-M3 sparse lexical weights through `/pooling` with
   `pooler_config.task="token_classify"`
 
@@ -170,6 +172,28 @@ vllm serve mku64/Qwen3-Reranker-0.6B-mlx-8Bit \
 curl http://localhost:8000/score \
   -H "Content-Type: application/json" \
   -d '{"text_1":["What is the capital of China?"],"text_2":["The capital of China is Beijing."]}'
+```
+
+### Multilingual E5 Embeddings
+
+[`intfloat/multilingual-e5-base`](https://huggingface.co/intfloat/multilingual-e5-base)
+uses the XLM-R encoder with MEAN pooling and returns 768-dimensional,
+L2-normalized embeddings. vLLM reads the pooling strategy from the checkpoint's
+Sentence Transformers configuration.
+
+```bash
+vllm serve intfloat/multilingual-e5-base \
+  --runner pooling \
+  --max-model-len 512
+```
+
+For retrieval, prefix queries with `query: ` and documents with `passage: `,
+including non-English inputs, as specified in the model card.
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"intfloat/multilingual-e5-base","input":["query: what is semantic search?","passage: Semantic search retrieves documents by meaning."]}'
 ```
 
 ### BGE-M3 Dense Embeddings

@@ -29,7 +29,7 @@ from vllm_metal.v1.pooling.validation import (
 )
 
 _MIN_NORM = 1e-12
-_ENCODER_POOLING_TYPES = (None, "CLS", "LAST")
+_ENCODER_POOLING_TYPES = (None, "CLS", "LAST", "MEAN")
 
 
 class EncoderEmbeddingPooler:
@@ -53,16 +53,23 @@ class EncoderEmbeddingPooler:
         hidden_states: mx.array,
         request: EncoderPoolingRequest,
     ) -> torch.Tensor:
-        """Return one normalized CLS or LAST embedding for an encoder request."""
+        """Return one normalized CLS, LAST, or MEAN encoder embedding."""
         if not request.token_ids:
             raise ValueError("Metal encoder pooling requires at least one token.")
-        token_index = (
-            0
-            if self.config.sequence_pooling_type != "LAST"
-            else len(request.token_ids) - 1
-        )
         dimensions = request.pooling_params.dimensions
-        vector = hidden_states[0, token_index, :dimensions].astype(mx.float32)
+        if self.config.sequence_pooling_type == "MEAN":
+            vector = (
+                hidden_states[0, : len(request.token_ids), :dimensions]
+                .astype(mx.float32)
+                .mean(axis=0)
+            )
+        else:
+            token_index = (
+                len(request.token_ids) - 1
+                if self.config.sequence_pooling_type == "LAST"
+                else 0
+            )
+            vector = hidden_states[0, token_index, :dimensions].astype(mx.float32)
         norm = mx.sqrt(mx.sum(vector * vector))
         norm = mx.maximum(norm, mx.array(_MIN_NORM, dtype=mx.float32))
         tensor = mlx_to_torch(mx.contiguous(vector / norm), device="cpu")
