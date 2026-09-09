@@ -846,3 +846,55 @@ class TestMmIdentifierFlowsEncoderToCallLm:
         # Placeholder rows at offsets 1, 2 carry the encoder output rows.
         assert mx.allclose(embeds[0, 1], sentinel[0]).item()
         assert mx.allclose(embeds[0, 2], sentinel[1]).item()
+
+
+class _SequentialPositionsAdapter(_MmAdapter):
+    """Adapter whose language model derives RoPE from ``ctx.offsets``."""
+
+    supplies_segment_positions = False
+
+
+class TestSegmentPositionsOptOut:
+    def _captured_segment_positions(self, adapter: _MmAdapter) -> Any:
+        runner = _runner(adapter)
+        runner.encoder_cache.add_request(
+            "req-0", [_feature("img-0", offset=1, length=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+        captured: dict[str, Any] = {}
+        original_call_lm = adapter.call_lm
+
+        def _call_lm(*args: Any, **kwargs: Any) -> Any:
+            ctx = get_context()
+            captured["segment_positions"] = (
+                None if ctx is None else ctx.segment_positions
+            )
+            return original_call_lm(*args, **kwargs)
+
+        adapter.call_lm = _call_lm  # type: ignore[method-assign]
+        prefill = _mm_prefill(
+            "req-0",
+            token_ids=[10, 99, 99, 11],
+            prompt_len=4,
+            full_prompt=[10, 99, 99, 11],
+        )
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+        assert "segment_positions" in captured
+        return captured["segment_positions"]
+
+    def test_opt_out_leaves_context_positions_none(self) -> None:
+        assert self._captured_segment_positions(_SequentialPositionsAdapter()) is None
+
+    def test_default_adapter_still_supplies_positions(self) -> None:
+        positions = self._captured_segment_positions(_MmAdapter())
+        assert isinstance(positions, list)
+        assert len(positions) == 1
+        assert positions[0].shape == (3, 1, 4)

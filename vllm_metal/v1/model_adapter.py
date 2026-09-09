@@ -62,6 +62,18 @@ class MultimodalRuntimeAdapter(Protocol):
     explicit on every batch.
     """
 
+    supplies_segment_positions: bool
+    """Whether the runner hands this adapter's per-segment positions to the
+    paged attention context (``ctx.segment_positions``).
+
+    True for M-RoPE models whose attention reads caller-supplied positions
+    (the runner assumes True when the attribute is absent).  False for
+    models with plain 1-D RoPE driven by ``ctx.offsets``: their mlx_lm
+    ``rope(x, offset=)`` modules reject caller-supplied positions, and
+    keeping the context field ``None`` preserves the batched decode RoPE
+    path.  ``call_lm`` still receives ``position_ids`` either way.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 

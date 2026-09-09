@@ -2108,11 +2108,18 @@ class MetalModelRunner:
 
         position_ids = mx.concatenate(position_ids_parts, axis=2)
 
-        # Hand per-segment positions to ``apply_packed_rope`` via the
-        # paged context, overriding the sequential-arange policy.
+        # Hand per-segment positions to ``apply_packed_rope`` via the paged
+        # context, unless the adapter's LM derives positions from
+        # ``ctx.offsets`` (mlx_lm ``rope(x, offset=)`` rejects explicit
+        # positions, and a list of ``None`` would also defeat the batched
+        # decode RoPE path).
         ctx = get_context()
         if ctx is not None:
-            ctx.segment_positions = ctx_segment_positions
+            ctx.segment_positions = (
+                ctx_segment_positions
+                if getattr(adapter, "supplies_segment_positions", True)
+                else None
+            )
 
         mm_prefill_deltas = {
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
