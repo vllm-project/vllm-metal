@@ -99,8 +99,17 @@ Without a configured default or request override, embeddings keep their full siz
 
 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
 supports dimensions from 32 to 1024. The MLX conversion used above omits the
-Matryoshka metadata, so add `--hf-overrides '{"is_matryoshka":true}'` to that
-server command, then request a shorter vector:
+Matryoshka metadata. Setting `is_matryoshka=true` alone lets vLLM accept any
+dimension from 1 to 1024, including values below Qwen's published minimum.
+Add an explicit allowlist to the server command, for example:
+
+```bash
+--hf-overrides '{"is_matryoshka":true,"matryoshka_dimensions":[32,64,128,256,512,1024]}'
+```
+
+This example permits only the listed dimensions. Add other values within
+Qwen's published 32–1024 range to `matryoshka_dimensions` as needed.
+Then request a shorter vector:
 
 ```bash
 curl http://localhost:8000/v1/embeddings \
