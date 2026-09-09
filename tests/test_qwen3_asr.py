@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import numpy as np
@@ -466,6 +467,28 @@ class TestQwen3ASRModel:
         logits2, cache2 = tiny_model.decode_step(next_tok, cache)
         mx.eval(logits2)
         assert logits2.shape == (1, 1, 100)
+
+
+class TestGreedyDecodeStopping:
+    @pytest.mark.parametrize("stop_token", [2, 3], ids=["model-eos", "tokenizer-eos"])
+    @pytest.mark.parametrize("prefix", [[], [7]], ids=["prefill", "decode"])
+    def test_stops_before_forwarding_eos(self, stop_token, prefix) -> None:
+        model = MagicMock()
+        model.config.eos_token_id = 2
+        # A continuation after EOS must never be decoded.
+        logits = [
+            mx.eye(10)[None, token : token + 1] for token in [*prefix, stop_token, 9, 2]
+        ]
+        model.prefill.return_value = (logits[0], None)
+        model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        transcriber = Qwen3ASRTranscriber(
+            model, tokenizer=SimpleNamespace(eos_token_id=3)
+        )
+
+        tokens = transcriber.greedy_decode_tokens(mx.zeros((1, 4)), [1])
+
+        assert tokens == prefix
+        assert model.decode_step.call_count == len(prefix)
 
 
 class TestPostProcessOutput:

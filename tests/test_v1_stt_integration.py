@@ -25,6 +25,7 @@ from vllm_metal.stt.audio import (
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
+from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 from vllm_metal.v1.stt_model_runner import STTModelRunner
@@ -645,6 +646,26 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         adapter = _make_qwen3_runtime_adapter()
         with pytest.raises(ValueError, match="prompt_token_ids"):
             adapter.decode_tokens(mx.ones((50, 1024)), [])
+
+    def test_runner_ignores_transcript_after_tokenizer_eos(self) -> None:
+        adapter = _make_qwen3_runtime_adapter()
+        tokenizer = adapter.transcriber.tokenizer
+        tokenizer.eos_token_id = 151645
+        # A second ASR span after <|im_end|> must not replace the transcript.
+        token_stream = [151674, 200, 151645, 151674, 300, 151643]
+        logits = [
+            mx.where(mx.arange(151675) == token, 1.0, 0.0)[None, None, :]
+            for token in token_stream
+        ]
+        adapter.model.prefill.return_value = (logits[0], None)
+        adapter.model.decode_step.side_effect = [(row, None) for row in logits[1:]]
+        adapter._transcriber = Qwen3ASRTranscriber(adapter.model, tokenizer=tokenizer)
+        runner = _StubRunner(adapter)
+        request = _make_new_req(mm_features=_make_valid_mm_features())
+
+        runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
+
+        assert runner._pending_output.sampled_token_ids == [[200, 151643]]
 
 
 class TestQwen3ASRUpstreamContract:

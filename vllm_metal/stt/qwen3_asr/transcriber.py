@@ -48,7 +48,8 @@ class Qwen3ASRTranscriber:
         if not prompt_token_ids:
             raise ValueError("Qwen3-ASR decode requires non-empty prompt_token_ids.")
 
-        eos_token = self.model.config.eos_token_id
+        # Qwen3-ASR also ends assistant turns with the tokenizer's <|im_end|>.
+        eos_tokens = (self.model.config.eos_token_id, self.tokenizer.eos_token_id)
         tokens = mx.array([prompt_token_ids], dtype=mx.int32)
 
         logits, cache = self.model.prefill(tokens, audio_features)
@@ -56,7 +57,7 @@ class Qwen3ASRTranscriber:
 
         output_tokens: list[int] = []
         next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-        if next_token == eos_token:
+        if next_token in eos_tokens:
             return output_tokens
         output_tokens.append(next_token)
 
@@ -65,7 +66,7 @@ class Qwen3ASRTranscriber:
             logits, cache = self.model.decode_step(token_input, cache)
             mx.eval(logits)
             next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-            if next_token == eos_token:
+            if next_token in eos_tokens:
                 break
             output_tokens.append(next_token)
 
