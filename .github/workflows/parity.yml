@@ -61,7 +61,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: '15.0'
-      # Leave headroom for the CPU runtime on hosted Mac runners.
+      # Use 0.65 on small GHA runners; 0.8 makes parity tests extremely slow.
       VLLM_METAL_MEMORY_FRACTION: '0.65'
       GLOO_SOCKET_IFNAME: lo0
       MODEL_ID: ${{ matrix.model.id }}
