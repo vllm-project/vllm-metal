@@ -38,6 +38,9 @@ def mlx_generate(
     from mlx_lm.generate import generate_step
     from mlx_lm.sample_utils import make_sampler
 
+    from vllm_metal.compat import _patch_transformers_exaone4_config
+
+    _patch_transformers_exaone4_config()
     model, tokenizer = load(model_path)
     results = []
     for prompt in prompts:
