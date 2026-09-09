@@ -84,7 +84,7 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.5")
 from vllm import LLM, SamplingParams
 llm = LLM(model={model!r}, max_model_len=512, max_num_seqs=1)
-sp = SamplingParams(temperature=0, max_tokens={max_tokens})
+sp = SamplingParams(temperature=0, max_tokens={max_tokens}, ignore_eos=True)
 prompts = {PROMPTS!r}
 outputs = llm.generate(prompts, sp)
 result = {{o.prompt: list(o.outputs[0].token_ids) for o in outputs}}
