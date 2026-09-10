@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+import urllib.error
 from unittest.mock import Mock
 
 import parity
@@ -25,6 +26,8 @@ def event(monkeypatch, tmp_path):
         "GITHUB_SHA": "main-sha",
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_RUN_ID": "123",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+        "PARITY_TESTED_SHA": "pr-sha",
     }.items():
         monkeypatch.setenv(key, value)
 
@@ -41,7 +44,7 @@ def test_captured_fork_sha_and_original_check_are_used(event, monkeypatch):
         "state": "open",
         "head": {"sha": "pr-sha", "repo": {"full_name": "contributor/fork"}},
     }
-    api = Mock(side_effect=[{"permission": "maintain"}, pr, {"id": 99}, {}])
+    api = Mock(side_effect=[{"permission": "maintain"}, pr, {"id": 99}, pr, {}])
     monkeypatch.setattr(parity, "github_api", api)
     target = parity.start()
     assert target["repository"] == "contributor/fork"
@@ -52,6 +55,46 @@ def test_captured_fork_sha_and_original_check_are_used(event, monkeypatch):
     parity.finish(target["check_id"], "failure")
     assert api.call_args.args == ("check-runs/99",)
     assert api.call_args.kwargs["data"]["conclusion"] == "failure"
+
+
+@pytest.mark.parametrize(
+    ("head", "expected"),
+    [
+        ({"head": {"sha": "a" * 40}}, "Up to date at report time."),
+        ({"head": {"sha": "b" * 40}}, "Outdated"),
+        (urllib.error.URLError("unavailable"), "Freshness unknown"),
+    ],
+)
+def test_report_preserves_result_and_shows_freshness(
+    event, monkeypatch, tmp_path, head, expected
+):
+    monkeypatch.setenv("PARITY_TESTED_SHA", "a" * 40)
+    api = Mock(side_effect=[head, {}])
+    monkeypatch.setattr(parity, "github_api", api)
+    parity.finish("99", "success")
+    assert api.call_args_list[0].args == ("pulls/42",)
+    assert api.call_args.args == ("check-runs/99",)
+    data = api.call_args.kwargs["data"]
+    assert data["conclusion"] == "success"
+    summary = data["output"]["summary"]
+    assert f"Tested commit: `{'a' * 40}`" in summary
+    assert expected in summary
+    if isinstance(head, dict):
+        assert f"Current PR head: `{head['head']['sha']}`" in summary
+    assert summary in (tmp_path / "summary.md").read_text()
+
+
+def test_nightly_report_does_not_fetch_pr_head(event, monkeypatch):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("PARITY_TESTED_SHA", "main-sha")
+    api = Mock()
+    monkeypatch.setattr(parity, "github_api", api)
+    parity.finish("99", "success")
+    assert api.call_count == 1
+    assert api.call_args.args == ("check-runs/99",)
+    assert (
+        "Tested commit: `main-sha`" in api.call_args.kwargs["data"]["output"]["summary"]
+    )
 
 
 def test_nightly_uses_event_sha_and_does_not_run_in_forks(event, monkeypatch):

@@ -96,6 +96,28 @@ def start() -> dict | None:
 
 def finish(check_id: str, result: str) -> None:
     conclusion = result if result in {"success", "cancelled"} else "failure"
+    tested_sha = os.environ["PARITY_TESTED_SHA"]
+    summary = f"Tested commit: `{tested_sha}`.\n\n"
+    if os.environ["GITHUB_EVENT_NAME"] == "issue_comment":
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        number = int(event["issue"]["number"])
+        try:
+            head_sha = github_api(f"pulls/{number}")["head"]["sha"]
+            freshness = (
+                "Up to date at report time."
+                if head_sha == tested_sha
+                else "Outdated — the current PR head was not tested by this run. "
+                "Comment `/ci parity` to test the current head."
+            )
+            summary += f"Current PR head: `{head_sha}`.\n\n{freshness}\n\n"
+        except (OSError, ValueError, KeyError) as error:
+            print(f"::warning::Could not read current PR head: {error}")
+            summary += "Freshness unknown: could not read the current PR head.\n\n"
+    summary += (
+        f"[View workflow run]({workflow_url()}) for per-model "
+        "summaries of EXACT, TOP_K_MATCH, and FAIL. Download the parity "
+        "artifacts for per-batch logs and environment versions."
+    )
     github_api(
         f"check-runs/{int(check_id)}",
         method="PATCH",
@@ -104,12 +126,12 @@ def finish(check_id: str, result: str) -> None:
             "conclusion": conclusion,
             "output": {
                 "title": f"Parity matrix: {conclusion}",
-                "summary": f"[View workflow run]({workflow_url()}) for per-model "
-                "summaries of EXACT, TOP_K_MATCH, and FAIL. Download the parity "
-                "artifacts for per-batch logs and environment versions.",
+                "summary": summary,
             },
         },
     )
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+        print(f"### Parity matrix: {conclusion}\n\n{summary}", file=output)
 
 
 def main() -> None:
