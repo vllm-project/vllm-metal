@@ -24,9 +24,9 @@ TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
     {"q2_0", "q3_0", "q4_0", "q5_0", "q8_0"}
 )
 
-MultimodalMode = Literal["auto", "multimodal-native"]
+MultimodalMode = Literal["auto", "multimodal-native", "text-only"]
 VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
-    {"auto", "multimodal-native"}
+    {"auto", "multimodal-native", "text-only"}
 )
 
 

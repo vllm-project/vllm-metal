@@ -142,3 +142,11 @@ class TestMetalConfig:
                 k_quant="q8_0",
                 v_quant="fp16",
             )
+
+    def test_text_only_multimodal_mode_is_accepted(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only")
+        reset_config()
+        try:
+            assert get_config().multimodal_mode == "text-only"
+        finally:
+            reset_config()

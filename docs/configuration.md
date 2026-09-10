@@ -7,7 +7,7 @@
 | `VLLM_METAL_MEMORY_FRACTION` | `auto` | Metal memory budget mode; see [KV Cache Memory Settings](#kv-cache-memory-settings) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
-| `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist; `multimodal-native` disables overrides |
+| `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
@@ -38,8 +38,9 @@ wins. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 
-- `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.
+- `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers. Gemma 4 checkpoints with vision weights, a loadable HF processor, no per-layer inputs and no speculative decoding serve images through the vision sidecar on the mlx_lm text backbone (see [Supported Models](supported_models.md)); otherwise they stay text-only with a logged reason.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
+- `text-only`: force the text-only backbone for every multimodal checkpoint, including Gemma 4 (the pre-sidecar behaviour).
 
 ## Speculative Decoding
 

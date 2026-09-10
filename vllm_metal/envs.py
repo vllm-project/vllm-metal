@@ -46,8 +46,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
-    #   text-only compatibility path.
+    #   text-only compatibility path; Gemma 4 serves images through the
+    #   vision sidecar on the mlx_lm text backbone when the checkpoint allows.
     # - "multimodal-native": keep native multimodal loading enabled.
+    # - "text-only": force the text-only path for every multimodal checkpoint.
     "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
         "VLLM_METAL_MULTIMODAL_MODE", "auto"
     ),
