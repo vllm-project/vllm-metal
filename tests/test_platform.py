@@ -4,6 +4,7 @@
 import importlib
 import os
 import platform
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -412,6 +413,22 @@ class TestMetalPlatform:
         )
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_explicit_v2_model_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit V2 request fails with the Metal constraint, not Triton's."""
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+        with pytest.raises(
+            NotImplementedError,
+            match=re.escape(
+                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: MetalWorker "
+                "implements the V1 model runner contract. Unset it (vllm-metal "
+                "defaults it to 0)."
+            ),
+        ):
+            MetalPlatform.check_and_update_config(self._platform_config())
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
