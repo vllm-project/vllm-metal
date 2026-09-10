@@ -5,10 +5,11 @@ Times one non-greedy sampling step over a full Qwen-sized vocabulary at
 decode-like batch sizes. The torch arm measures the full production cost the
 native path removes: evaluating the MLX logits, bridging them to torch
 (``mlx_to_torch`` after the fp32 cast), then the vLLM sampler math
-(``apply_top_k_top_p`` + softmax + exponential + argmax on CPU). The native
-arm times the ``SamplingBatch`` mask + categorical graph synchronously — in
-the decode pipeline the same graph defers with the step and overlaps the
-next forward, so its effective cost is lower than reported here.
+(``BatchMinPLogitsProcessor`` + ``apply_top_k_top_p`` + softmax + exponential
++ argmax on CPU), in the order ``Sampler`` applies them. The native arm times
+the ``SamplingBatch`` mask + categorical graph synchronously — in the decode
+pipeline the same graph defers with the step and overlaps the next forward, so
+its effective cost is lower than reported here.
 
 Usage:
 
@@ -25,22 +26,26 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 from vllm_metal.v1.sampling_batch import SamplingBatch
 
 VOCAB_SIZE = 151936
 TOP_K = 20
 TOP_P = 0.95
+MIN_P = 0.05
 WARMUP_ITERS = 5
 TIMED_ITERS = 50
 
 
 def _time_torch(logits_mx: mx.array, batch: int) -> float:
+    min_p_proc = BatchMinPLogitsProcessor(torch.full((batch,), MIN_P))
+
     def step() -> torch.Tensor:
         logits_f32 = logits_mx.astype(mx.float32)
         mx.eval(logits_f32)
-        logits = mlx_to_torch(logits_f32, device="cpu")
+        logits = mlx_to_torch(logits_f32, device="cpu").clone()
         filtered = apply_top_k_top_p(
-            logits.clone(),
+            min_p_proc.apply(logits),
             torch.full((batch,), TOP_K),
             torch.full((batch,), TOP_P),
         )
@@ -75,7 +80,9 @@ def _time_native(logits: mx.array, params: list[SamplingParams]) -> float:
 
 
 def main() -> None:
-    sampling_params = SamplingParams(temperature=0.7, top_k=TOP_K, top_p=TOP_P)
+    sampling_params = SamplingParams(
+        temperature=0.7, top_k=TOP_K, top_p=TOP_P, min_p=MIN_P
+    )
     for batch in (1, 8):
         logits_mx = mx.random.normal((batch, VOCAB_SIZE), key=mx.random.key(0))
         mx.eval(logits_mx)

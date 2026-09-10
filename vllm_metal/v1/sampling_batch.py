@@ -19,6 +19,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
@@ -203,8 +204,8 @@ class SamplingBatch:
 
         Mirror of :meth:`params_allow_native_greedy` for the non-greedy case:
         every request must use plain temperature/top-k/top-p/min-p sampling,
-        with one shared ``(top_k, top_p)`` across the batch so a single mask
-        graph covers every row.  Per-row ``min_p`` is handled natively.
+        with one shared ``(top_k, top_p, min_p)`` across the batch so a single mask
+        graph covers every row.
         Seeded requests keep the torch path, whose per-request
         ``torch.Generator`` contract MLX keys do not reproduce.
         """
@@ -212,9 +213,11 @@ class SamplingBatch:
             return False
         shared_top_k = len({sp.top_k for sp in sampling_params_list}) == 1
         shared_top_p = len({sp.top_p for sp in sampling_params_list}) == 1
+        shared_min_p = len({sp.min_p for sp in sampling_params_list}) == 1
         return (
             shared_top_k
             and shared_top_p
+            and shared_min_p
             and all(
                 sp.temperature >= GREEDY_TEMPERATURE_EPS
                 and sp.seed is None
@@ -264,19 +267,22 @@ class SamplingBatch:
         )
 
     @staticmethod
-    def _top_k_top_p_masked_logits(
+    def _top_k_top_p_min_p_masked_logits(
         scaled_logits: mx.array,
         top_k: int,
         top_p: float,
+        min_p: float,
     ) -> mx.array:
-        """Mask temperature-scaled logits to the top-k/top-p candidate set.
+        """Mask temperature-scaled logits to the top-k/top-p/min-p candidate set.
 
-        Mask semantics match vLLM's ``apply_top_k_top_p``: ties at the top-k
-        threshold survive, while top-p masks sorted positions individually
-        (boundary ties do NOT all survive; which tied token survives follows
-        sort order). The leading sorted position carries zero leading mass,
-        so every valid ``top_p > 0`` keeps at least one candidate.
-        Non-candidates become ``-inf``.
+        Mask semantics match vLLM's ``MinPLogitsProcessor`` followed by
+        ``apply_top_k_top_p``, in that order: ties at the top-k threshold
+        survive, while top-p masks sorted positions individually (boundary
+        ties do NOT all survive; which tied token survives follows sort
+        order). The leading sorted position carries zero leading mass, so
+        every valid ``top_p > 0`` keeps at least one candidate, and min-p
+        compares against that same leading position's probability so it
+        keeps at least one too. Non-candidates become ``-inf``.
         """
         vocab_size = int(scaled_logits.shape[-1])
         if 0 < top_k < vocab_size:
@@ -286,17 +292,21 @@ class SamplingBatch:
             scaled_logits = mx.where(
                 scaled_logits < kth_largest, -mx.inf, scaled_logits
             )
-        if top_p < 1.0:
+        if top_p < 1.0 or min_p > 0.0:
             order_desc = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
             sorted_desc = mx.take_along_axis(scaled_logits, order_desc, axis=-1)
-            sorted_probs = mx.softmax(sorted_desc, axis=-1)
-            leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
-            keep = leading_mass < top_p
-            masked_sorted = mx.where(keep, sorted_desc, -mx.inf)
+            if min_p > 0.0:
+                sorted_probs = mx.softmax(sorted_desc, axis=-1)
+                keep = sorted_probs >= min_p * sorted_probs[..., :1]
+                sorted_desc = mx.where(keep, sorted_desc, -mx.inf)
+            if top_p < 1.0:
+                sorted_probs = mx.softmax(sorted_desc, axis=-1)
+                leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
+                sorted_desc = mx.where(leading_mass < top_p, sorted_desc, -mx.inf)
             scaled_logits = mx.put_along_axis(
                 mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
                 order_desc,
-                masked_sorted,
+                sorted_desc,
                 axis=-1,
             )
         return scaled_logits
@@ -311,17 +321,17 @@ class SamplingBatch:
         """Lazy temperature/top-k/top-p/min-p token ids, one per row.
 
         Only valid for batches that pass :meth:`params_allow_native_random`:
-        per-row temperature with one shared ``(top_k, top_p)``.
+        per-row temperature with one shared ``(top_k, top_p, min_p)``.
         """
         temperatures = mx.array(
             [sp.temperature for sp in sampling_params_list], dtype=mx.float32
         )
         scaled = logits_2d.astype(mx.float32) / temperatures[:, None]
-        scaled = _apply_min_p_mlx(scaled, sampling_params_list)
-        masked = cls._top_k_top_p_masked_logits(
+        masked = cls._top_k_top_p_min_p_masked_logits(
             scaled,
             sampling_params_list[0].top_k,
             sampling_params_list[0].top_p,
+            sampling_params_list[0].min_p,
         )
         return mx.random.categorical(masked, axis=-1, key=key)
 
@@ -487,6 +497,22 @@ class SamplingBatch:
                 token_ids_by_row[i] = []
         return None, token_ids_by_row
 
+    def _make_logitsprocs(self) -> LogitsProcessors:
+        min_p_vals = [sp.min_p for sp in self.sampling_params_list]
+        if not any(min_p > 0.0 for min_p in min_p_vals):
+            return _EMPTY_LOGITSPROCS
+        return LogitsProcessors(
+            [
+                BatchMinPLogitsProcessor(
+                    torch.tensor(
+                        min_p_vals,
+                        dtype=torch.float32,
+                        device=self.SAMPLER_DEVICE,
+                    )
+                )
+            ]
+        )
+
     def make_sampling_metadata(
         self, logits: torch.Tensor | None = None
     ) -> SamplingMetadata:
@@ -514,49 +540,9 @@ class SamplingBatch:
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=self._make_allowed_token_ids_mask(),
             bad_words_token_ids=self._make_bad_words_token_ids(),
-            logitsprocs=_EMPTY_LOGITSPROCS,
+            logitsprocs=self._make_logitsprocs(),
             logprob_token_ids=logprob_token_ids,
         )
-
-
-# ---------------------------------------------------------------------------
-# min_p helpers
-# ---------------------------------------------------------------------------
-
-
-def _apply_min_p_mlx(
-    logits: mx.array, sampling_params_list: Sequence[SamplingParams]
-) -> mx.array:
-    """Mask logits below the per-row min_p threshold (MLX path).
-
-    Tokens whose probability is less than ``min_p * max_prob`` for that row
-    are set to ``-inf``.  Matches upstream vLLM's ``MinPLogitsProcessor``
-    order: applied after temperature, before top-k/top-p.
-    """
-    min_p_vals = [sp.min_p for sp in sampling_params_list]
-    if not any(v > 0.0 for v in min_p_vals):
-        return logits
-    probs = mx.softmax(logits, axis=-1)
-    max_prob = mx.max(probs, axis=-1, keepdims=True)
-    threshold = mx.array(min_p_vals, dtype=mx.float32)[:, None] * max_prob
-    return mx.where(probs < threshold, -mx.inf, logits)
-
-
-def _apply_min_p_torch(
-    logits: torch.Tensor, sampling_params_list: Sequence[SamplingParams]
-) -> torch.Tensor:
-    """Mask logits below the per-row min_p threshold (torch path)."""
-    min_p_vals = [sp.min_p for sp in sampling_params_list]
-    if not any(v > 0.0 for v in min_p_vals):
-        return logits
-    probs = torch.softmax(logits, dim=-1)
-    max_prob = probs.max(dim=-1, keepdim=True).values
-    threshold = (
-        torch.tensor(min_p_vals, dtype=torch.float32, device=logits.device)
-        .unsqueeze(-1)
-        .mul_(max_prob)
-    )
-    return logits.masked_fill(probs < threshold, float("-inf"))
 
 
 # ---------------------------------------------------------------------------
@@ -597,8 +583,6 @@ def sample_from_logits(
     logits_torch = mlx_to_torch(
         logits_2d.astype(mx.float32), device=SamplingBatch.SAMPLER_DEVICE
     )
-    # min_p: applied before the vLLM sampler since logitsprocs are not wired up.
-    logits_torch = _apply_min_p_torch(logits_torch, batch.sampling_params_list)
     metadata = batch.make_sampling_metadata(logits_torch)
     output = sampler.forward(logits_torch, metadata)
     logprobs = (

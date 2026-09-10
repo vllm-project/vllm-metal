@@ -26,8 +26,6 @@ from vllm_metal.v1.model_runner import (
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
     sample_decode_tokens,
-    _apply_min_p_mlx,
-    _apply_min_p_torch,
     sample_from_logits,
 )
 
@@ -536,6 +534,72 @@ class TestV1SamplingBatch:
         assert result.token_ids[0] == VOCAB_SIZE - 1
         # Top-k row stays inside the top-64 candidates (values 960..1023).
         assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
+
+    def test_min_p_narrows_candidates_before_top_p(self) -> None:
+        """min_p must be applied before top_p on the native MLX path.
+
+        probs are [0.5, 0.4, 0.1]. min_p=0.25 masks token 2, and the softmax
+        over the survivors then reaches top_p=0.55 inside token 0 alone, so
+        token 0 is the only candidate. Measuring top_p first — or skipping
+        min_p — leaves the un-renormalized mass below 0.55 at token 1 and
+        wrongly admits it. Mirrors vLLM's order: MinPLogitsProcessor, then
+        apply_top_k_top_p.
+        """
+        probs = [0.5, 0.4, 0.1]
+        logits = mx.array([[float(np.log(p)) for p in probs]], dtype=mx.float32)
+        params = [SamplingParams(temperature=1.0, top_p=0.55, min_p=0.25)]
+        # Shared (top_k, top_p, min_p) keeps the batch on the native path.
+        assert SamplingBatch.params_allow_native_random(params)
+
+        keys = iter([mx.random.key(seed) for seed in range(64)])
+        sampled = {
+            int(
+                SamplingBatch.native_decode_tokens(
+                    logits,
+                    params,
+                    vocab_size=len(probs),
+                    next_key=lambda: next(keys),
+                ).item()
+            )
+            for _ in range(64)
+        }
+        # min_p then top_p leaves one candidate; either error admits token 1.
+        assert sampled == {0}
+
+    def test_min_p_masks_after_temperature_on_torch_path(self) -> None:
+        """Seeded requests must get min_p from the sampler, after temperature.
+
+        At temperature 2.0 the scaled probs are [0.64, 0.24, 0.09, 0.03], so
+        min_p=0.3 keeps tokens 0 and 1. Thresholding the raw logits instead —
+        as masking before Sampler.forward() does — sees [0.87, 0.12, ...] and
+        keeps only token 0, while an empty LogitsProcessors drops min_p and
+        admits tokens 2 and 3. Exercises the real Sampler.forward() path via
+        sample_from_logits (seeded requests are excluded from the native
+        path).
+        """
+        sampler = Sampler()
+        sampled = set()
+        for seed in range(40):
+            # Fresh logits per call: mlx_to_torch hands the sampler a
+            # zero-copy view and apply_temperature scales it in place.
+            logits = mx.array([[4.0, 2.0, 0.0, -2.0]], dtype=mx.float32)
+            sp = SamplingParams(temperature=2.0, min_p=0.3, seed=seed)
+            assert not SamplingBatch.params_allow_native_random([sp])
+            batch = SamplingBatch(
+                [sp],
+                [[1]],
+                [[]],
+                vocab_size=4,
+                generators={0: torch.Generator().manual_seed(seed)},
+            )
+            # min_p must ride the argmax-invariant slot, which the sampler
+            # applies after temperature and before top-k/top-p.
+            metadata = batch.make_sampling_metadata(torch.zeros(1, 4))
+            assert len(list(metadata.logitsprocs.argmax_invariant)) == 1
+
+            sampled.add(sample_from_logits(logits, batch, sampler).token_ids[0])
+        # Tokens 2 and 3 fall under min_p * max_prob on the scaled logits.
+        assert sampled == {0, 1}
 
     def test_bad_words_blocks_greedy_token(self) -> None:
         """Greedy + bad_words_token_ids must fall back and block the banned token."""
@@ -1103,107 +1167,3 @@ class TestV1PenaltyTokenAccounting:
         output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token
-
-
-class TestMinP:
-    """Tests for min_p sampling support."""
-
-    def _make_logits_mlx(self) -> mx.array:
-        """Logits where token 0 dominates, tokens 1-3 are small, rest tiny.
-
-        softmax ≈ [0.73, 0.09, 0.09, 0.09, ~0, ...]
-        """
-        logits = mx.full((1, VOCAB_SIZE), -10.0)
-        logits = logits.at[0, 0].add(12.0)  # ~0.73
-        logits = logits.at[0, 1].add(10.0)  # ~0.09
-        logits = logits.at[0, 2].add(10.0)  # ~0.09
-        logits = logits.at[0, 3].add(10.0)  # ~0.09
-        mx.eval(logits)
-        return logits
-
-    def test_min_p_mlx_masks_low_prob_tokens(self) -> None:
-        """Tokens below min_p * max_prob should be masked to -inf."""
-        logits = self._make_logits_mlx()
-        # min_p=0.2 → threshold = 0.2 * 0.73 ≈ 0.146
-        # tokens 1-3 have prob ~0.09 < 0.146, so they should be masked
-        sp = SamplingParams(temperature=1.0, min_p=0.2)
-        result = _apply_min_p_mlx(logits, [sp])
-        mx.eval(result)
-        # Token 0 should survive, tokens 1-3 should be -inf
-        assert result[0, 0].item() > -1e9
-        assert result[0, 1].item() == float("-inf")
-        assert result[0, 2].item() == float("-inf")
-        assert result[0, 3].item() == float("-inf")
-
-    def test_min_p_mlx_zero_is_noop(self) -> None:
-        """min_p=0 should not change logits."""
-        logits = self._make_logits_mlx()
-        sp = SamplingParams(temperature=1.0, min_p=0.0)
-        result = _apply_min_p_mlx(logits, [sp])
-        mx.eval(result)
-        assert mx.allclose(result, logits).item()
-
-    def test_min_p_mlx_keeps_top_token(self) -> None:
-        """Even with high min_p, the top token should always survive."""
-        logits = self._make_logits_mlx()
-        sp = SamplingParams(temperature=1.0, min_p=0.99)
-        result = _apply_min_p_mlx(logits, [sp])
-        mx.eval(result)
-        assert result[0, 0].item() > -1e9
-
-    def test_min_p_mlx_per_row(self) -> None:
-        """Different min_p values per row in a batch."""
-        logits = mx.concatenate([self._make_logits_mlx()] * 2, axis=0)
-        mx.eval(logits)
-        sp0 = SamplingParams(temperature=1.0, min_p=0.0)  # no filtering
-        sp1 = SamplingParams(temperature=1.0, min_p=0.2)  # filters tokens 1-3
-        result = _apply_min_p_mlx(logits, [sp0, sp1])
-        mx.eval(result)
-        # Row 0: no filtering, token 1 survives
-        assert result[0, 1].item() > -1e9
-        # Row 1: filtered, token 1 masked
-        assert result[1, 1].item() == float("-inf")
-
-    def test_min_p_torch_masks_low_prob_tokens(self) -> None:
-        """Torch path: tokens below threshold should be masked."""
-        logits = mlx_to_torch(self._make_logits_mlx(), device="cpu")
-        sp = SamplingParams(temperature=1.0, min_p=0.2)
-        result = _apply_min_p_torch(logits, [sp])
-        assert result[0, 0].item() > -1e9
-        assert result[0, 1].item() == float("-inf")
-
-    def test_min_p_torch_zero_is_noop(self) -> None:
-        """Torch path: min_p=0 should not change logits."""
-        logits = mlx_to_torch(self._make_logits_mlx(), device="cpu")
-        sp = SamplingParams(temperature=1.0, min_p=0.0)
-        result = _apply_min_p_torch(logits, [sp])
-        assert torch.equal(result, logits)
-
-    def test_min_p_native_random_sampling(self) -> None:
-        """End-to-end: native random path with min_p should not error."""
-        logits = self._make_logits_mlx()
-        sp = SamplingParams(temperature=1.0, min_p=0.2)
-        batch = SamplingBatch(
-            [sp],
-            [[0, 1, 2]],
-            [[3]],
-            vocab_size=VOCAB_SIZE,
-        )
-        sampler = Sampler()
-        result = sample_from_logits(logits, batch, sampler)
-        assert len(result.token_ids) == 1
-
-    def test_min_p_torch_fallback_sampling(self) -> None:
-        """End-to-end: torch fallback path with min_p (seeded) should work."""
-        logits = self._make_logits_mlx()
-        sp = SamplingParams(temperature=1.0, min_p=0.2, seed=42)
-        batch = SamplingBatch(
-            [sp],
-            [[0, 1, 2]],
-            [[3]],
-            vocab_size=VOCAB_SIZE,
-            generators={0: torch.Generator(device="cpu").manual_seed(42)},
-        )
-        sampler = Sampler()
-        result = sample_from_logits(logits, batch, sampler)
-        assert len(result.token_ids) == 1
