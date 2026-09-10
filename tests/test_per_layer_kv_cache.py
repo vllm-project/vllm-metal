@@ -541,7 +541,9 @@ class TestMHAKVCacheLayout:
             "vllm_metal.v1.cache_policy.get_config",
             lambda: metal_config,
         )
-        reported_dense_blocks = 2
+        # vLLM 0.29.0 reserves the null block before its capacity check, so two
+        # dense blocks no longer serve one max_model_len request.
+        reported_dense_blocks = 3
         dense_block_bytes = runner.get_cache_block_size_bytes()
         worker = SimpleNamespace(
             model_runner=runner,

@@ -1905,24 +1905,16 @@ class TestKvBudgetBytes:
 
 
 class TestAutoFitMaxModelLenChain:
-    """The -1 sentinel drives the Metal null-block auto-fit contract.
+    """The -1 sentinel drives the null-block auto-fit contract on Metal shapes.
 
     Builds the gemma-4-31B mixed-MHA KV shape and runs vLLM's
-    ``get_kv_cache_configs`` against fixed synthetic memory budgets. These
-    tests do not re-test upstream's fitting algorithm; they check Metal's
-    null-block reservation, too-small-pool failure, and current mixed-layout
-    budget shape for issue #505.
+    ``get_kv_cache_configs`` against fixed synthetic memory budgets: the
+    fitted length leaves the null block free, a too-small pool fails, and
+    the mixed layout keeps its budget shape (issue #505).
     """
 
     _NUM_LAYERS = 60
     _MAX_BATCH_TOKENS = 2048
-
-    @pytest.fixture(autouse=True)
-    def _ensure_compat_patches(self) -> None:
-        """The null-block auto-fit patch (compat.py) is part of the contract
-        under test; ensure it directly because plugin activation can skip it
-        while vLLM is partially imported."""
-        compat.ensure_vllm_auto_fit_null_block_patch()
 
     # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
     # equals the packed per-block bytes the Metal pool reports.
