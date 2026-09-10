@@ -250,6 +250,10 @@ class MetalWorker(WorkerBase):
         """Report Metal's own page order instead of the CPU backend's LBHNC."""
         return [KV_CACHE_LAYOUT]
 
+    def synchronize_device(self) -> None:
+        """Wait for in-flight MLX work; Metal is outside ``torch.accelerator``."""
+        mx.synchronize()
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize from KV cache configuration.
 
