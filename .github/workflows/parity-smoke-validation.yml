@@ -1,4 +1,5 @@
 name: PR 706 HTTP parity matrix validation
+run-name: Full parity matrix for PR 706 at 199bd29
 'on':
   push:
     branches:
@@ -35,7 +36,7 @@ jobs:
       GLOO_SOCKET_IFNAME: lo0
       MODEL_ID: ${{ matrix.model.id }}
       MODEL_REVISION: ${{ matrix.model.revision }}
-      TESTED_SHA: c72682f260dbbd6c9f86397de1777cc8fbd662af
+      TESTED_SHA: 199bd29a1c27dfc774c68c7a5208ff6f0c792830
     defaults:
       run:
         shell: bash
@@ -43,7 +44,7 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
         repository: vllm-project/vllm-metal
-        ref: c72682f260dbbd6c9f86397de1777cc8fbd662af
+        ref: 199bd29a1c27dfc774c68c7a5208ff6f0c792830
         submodules: recursive
         persist-credentials: false
     - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
@@ -52,25 +53,51 @@ jobs:
         path: ~/.cache/huggingface/hub
         key: parity-hf-${{ runner.os }}-${{ matrix.model.name }}-${{ matrix.model.revision }}
     - name: Install the tested checkout
-      run: 'test "$(git rev-parse HEAD)" = "$TESTED_SHA"
-
+      run: |
+        test "$(git rev-parse HEAD)" = "$TESTED_SHA"
         mkdir -p "$RUNNER_TEMP/parity"
-
-        printf ''commit=%s\nmodel=%s\nrevision=%s\n'' "$TESTED_SHA" "$MODEL_ID" "$MODEL_REVISION" > "$RUNNER_TEMP/parity/environment.txt"
-
+        printf 'commit=%s\nmodel=%s\nrevision=%s\n' "$TESTED_SHA" "$MODEL_ID" "$MODEL_REVISION" > "$RUNNER_TEMP/parity/environment.txt"
         ./install.sh
-
-        '
     - name: Prepare checkpoint
-      run: "source .venv-vllm-metal/bin/activate\npython - <<'PY'\nimport importlib.metadata as metadata\nimport os\nimport platform\nimport sys\nfrom huggingface_hub import snapshot_download\nfrom vllm.platforms import current_platform\nassert type(current_platform).__name__ == \"MetalPlatform\", current_platform\nwith open(os.environ[\"RUNNER_TEMP\"] + \"/parity/environment.txt\", \"a\") as f:\n    print(platform.platform(), file=f)\n    print(sys.version, file=f)\n    for package in (\"vllm-metal\", \"vllm\", \"mlx\", \"mlx-lm\"):\n        print(package, metadata.version(package), file=f)\nmodel = snapshot_download(os.environ[\"MODEL_ID\"], revision=os.environ[\"MODEL_REVISION\"])\nwith open(os.environ[\"GITHUB_ENV\"], \"a\") as f:\n    print(f\"MODEL_PATH={model}\", file=f)\nPY\n"
-    - name: Generate native MLX reference once
-      run: "source .venv-vllm-metal/bin/activate\npython - <<'PYREF' 2>&1 | tee \"$RUNNER_TEMP/parity/reference.log\"\nimport json\nimport os\nfrom pathlib import Path\nfrom tools.check_parity import mlx_generate\nfrom tools.parity_prompts import PROMPTS\n\nmodel = os.environ[\"MODEL_PATH\"]\nresults = mlx_generate(model, PROMPTS, max_tokens=20, top_k=5)\nreference = {\"model\": model, \"max_tokens\": 20, \"top_k\": 5, \"results\": results}\nPath(os.environ[\"RUNNER_TEMP\"], \"parity\", \"reference.json\").write_text(json.dumps(reference))\nwith open(os.environ[\"GITHUB_ENV\"], \"a\") as output:\n    print(f\"PARITY_MAX_MODEL_LEN={max(len(row['input_ids']) for row in results) + 20}\", file=output)\nPYREF\n"
-    - name: Serve once and compare concurrency levels
-      run: "source .venv-vllm-metal/bin/activate\n# Give the server and its workers a process group for cleanup.\nset -m\nvllm serve \"$MODEL_PATH\" --host 127.0.0.1 --port 8000 \\\n  --max-model-len \"$PARITY_MAX_MODEL_LEN\" --max-num-seqs 2 \\\n  --no-enable-prefix-caching --generation-config vllm \\\n  > \"$RUNNER_TEMP/parity/serve.log\" 2>&1 &\nserver_pid=$!\ncleanup() {\n  kill -- -\"$server_pid\" 2>/dev/null || true\n  sleep 2\n  kill -KILL -- -\"$server_pid\" 2>/dev/null || true\n  wait \"$server_pid\" 2>/dev/null || true\n}\ntrap cleanup EXIT\nfor ((attempt=0; attempt<60; attempt++)); do\n  kill -0 \"$server_pid\" 2>/dev/null || { cat \"$RUNNER_TEMP/parity/serve.log\"; exit 1; }\n  if curl -fsS --max-time 2 http://127.0.0.1:8000/health > /dev/null 2>&1; then\n    break\n  fi\n  sleep 2\ndone\ncurl -fsS --max-time 5 http://127.0.0.1:8000/health > /dev/null\nprintf '### %s\\n\\nCommit: %s\\n\\n| Concurrency | EXACT | TOP_K_MATCH | FAIL | Exit |\\n|---|---:|---:|---:|---:|\\n' \"$MODEL_ID\"\
-        \ \"$TESTED_SHA\" >> \"$GITHUB_STEP_SUMMARY\"\nfailed=0\nfor concurrency in 1 2; do\n  log=\"$RUNNER_TEMP/parity/concurrency-${concurrency}.log\"\n  if python tools/check_parity.py --base-url http://127.0.0.1:8000/v1 --reference \"$RUNNER_TEMP/parity/reference.json\" --concurrency \"$concurrency\" 2>&1 | tee \"$log\"; then\n    code=0\n  else\n    code=$?\n    failed=1\n  fi\n  exact=$(awk '/^EXACT / {n++} END {print n+0}' \"$log\")\n  topk=$(awk '/^TOP_K_MATCH / {n++} END {print n+0}' \"$log\")\n  mismatches=$(awk '/^FAIL / {n++} END {print n+0}' \"$log\")\n  printf '| %s | %s | %s | %s | %s |\\n' \"$concurrency\" \"$exact\" \"$topk\" \"$mismatches\" \"$code\" >> \"$GITHUB_STEP_SUMMARY\"\ndone\nexit \"$failed\"\n"
+      run: |
+        source .venv-vllm-metal/bin/activate
+        python - <<'PY'
+        import importlib.metadata as metadata
+        import os
+        import platform
+        import sys
+        from huggingface_hub import snapshot_download
+        from vllm.platforms import current_platform
+        assert type(current_platform).__name__ == "MetalPlatform", current_platform
+        with open(os.environ["RUNNER_TEMP"] + "/parity/environment.txt", "a") as f:
+            print(platform.platform(), file=f)
+            print(sys.version, file=f)
+            for package in ("vllm-metal", "vllm", "mlx", "mlx-lm"):
+                print(package, metadata.version(package), file=f)
+        model = snapshot_download(os.environ["MODEL_ID"], revision=os.environ["MODEL_REVISION"])
+        with open(os.environ["GITHUB_ENV"], "a") as f:
+            print(f"MODEL_PATH={model}", file=f)
+        PY
+    - uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+      if: success() && github.event_name == 'schedule' && steps.models.outputs.cache-hit != 'true'
+      with:
+        path: ~/.cache/huggingface/hub
+        key: ${{ steps.models.outputs.cache-primary-key }}
+    - name: Compare parity through HTTP serving
+      run: |
+        source .venv-vllm-metal/bin/activate
+        python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
+          --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity"
+    - name: Summarize parity
+      if: always()
+      run: |
+        printf '### %s\n\nCommit: %s\n\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$RUNNER_TEMP/parity/summary.md" ]; then
+          cat "$RUNNER_TEMP/parity/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: always()
       with:
-        name: http-parity-${{ matrix.os }}-${{ matrix.model.name }}-c72682f260dbbd6c9f86397de1777cc8fbd662af
+        name: http-parity-${{ matrix.os }}-${{ matrix.model.name }}-199bd29a1c27dfc774c68c7a5208ff6f0c792830
         path: ${{ runner.temp }}/parity
         retention-days: 14
