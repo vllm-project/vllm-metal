@@ -152,6 +152,24 @@ class TestEncodePrompt:
         assert len(result) <= MAX_PROMPT_TOKENS + 1
 
 
+class TestTokenizerFallback:
+    @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
+    @pytest.mark.parametrize("with_model_path", [False, True])
+    def test_fallback_matches_model_vocabulary(
+        self, tmp_path: Path, n_vocab: int, with_model_path: bool
+    ) -> None:
+        # MLX-format Whisper snapshots can contain only config and weights.
+        (tmp_path / "config.json").write_text(json.dumps({"n_vocab": n_vocab}))
+        model = cast(
+            WhisperModel, SimpleNamespace(config=WhisperConfig(n_vocab=n_vocab))
+        )
+        transcriber = WhisperTranscriber(
+            model, model_path=str(tmp_path) if with_model_path else None
+        )
+
+        assert len(transcriber.tokenizer) == n_vocab
+
+
 class TestLoadModel:
     def test_missing_config_json(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError, match="config.json not found"):

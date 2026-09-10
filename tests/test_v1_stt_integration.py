@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +28,7 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.whisper import WhisperConfig
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
 from vllm_metal.v1.stt_model_runner import STTModelRunner
 
@@ -143,6 +145,35 @@ class TestWhisperRuntimeAdapterDecode:
         )
 
         assert result[-1] == 50257
+
+    @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
+    def test_runner_uses_fallback_eot_for_tokenizer_free_snapshot(
+        self, tmp_path: Path, n_vocab: int
+    ) -> None:
+        (tmp_path / "config.json").write_text(json.dumps({"n_vocab": n_vocab}))
+        eot = 50256 if n_vocab == 51864 else 50257
+        logits = []
+        for token in (200, eot):
+            step = mx.full((1, 1, n_vocab), -float("inf"))
+            step[:, :, token] = 0
+            logits.append((step, None))
+        model = SimpleNamespace(
+            config=WhisperConfig(n_vocab=n_vocab),
+            encode=lambda _: mx.zeros((1, 1, 1)),
+            decode=MagicMock(
+                side_effect=[*logits, AssertionError("Decoded past the model EOT")]
+            ),
+        )
+        runner = _StubRunner(WhisperRuntimeAdapter(model, str(tmp_path)))
+        request = _make_new_req(
+            prompt_token_ids=[eot + 1], mm_features=_make_valid_mm_features()
+        )
+
+        runner._execute_stt(
+            _make_scheduler_output(new_reqs=[request], cached_req_ids=["cached"])
+        )
+
+        assert runner._pending_output.sampled_token_ids == [[200, eot], [eot]]
 
 
 class TestExtractAudioFeatures:

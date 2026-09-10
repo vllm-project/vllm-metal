@@ -78,24 +78,34 @@ class WhisperTranscriber:
         self._tokenizer = tokenizer
 
     @staticmethod
-    def load_tokenizer(model_path: str | None) -> WhisperTokenizer:
+    def load_tokenizer(
+        model_path: str | None, *, n_vocab: int = 51865
+    ) -> WhisperTokenizer:
         if model_path:
             try:
-                return WhisperTokenizer.from_pretrained(model_path)
+                tokenizer = WhisperTokenizer.from_pretrained(model_path)
+                # Transformers can construct an empty tokenizer for an MLX
+                # snapshot that contains config and weights but no vocabulary.
+                if tokenizer.vocab_size:
+                    return tokenizer
             except (OSError, ValueError) as e:
                 logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
 
+        fallback = {
+            51864: "openai/whisper-small.en",
+            51866: "openai/whisper-large-v3",
+        }.get(n_vocab, "openai/whisper-small")
         try:
-            return WhisperTokenizer.from_pretrained("openai/whisper-small")
+            return WhisperTokenizer.from_pretrained(fallback)
         except OSError:
-            return WhisperTokenizer.from_pretrained(
-                "openai/whisper-small", local_files_only=True
-            )
+            return WhisperTokenizer.from_pretrained(fallback, local_files_only=True)
 
     @property
     def tokenizer(self) -> WhisperTokenizer:
         if self._tokenizer is None:
-            self._tokenizer = self.load_tokenizer(self._model_path)
+            self._tokenizer = self.load_tokenizer(
+                self._model_path, n_vocab=self.model.config.n_vocab
+            )
         return self._tokenizer
 
     @tokenizer.setter
