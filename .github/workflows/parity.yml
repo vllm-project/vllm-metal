@@ -113,25 +113,18 @@ jobs:
         with:
           path: ~/.cache/huggingface/hub
           key: ${{ steps.models.outputs.cache-primary-key }}
-      - name: Compare all batch sizes
+      - name: Compare parity through HTTP serving
         run: |
           source .venv-vllm-metal/bin/activate
-          printf '### %s\n\nCommit: %s\n\n| Batch | EXACT | TOP_K_MATCH | FAIL | Exit |\n|---|---:|---:|---:|---:|\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
-          failed=0
-          for batch in 1 2; do
-            log="$RUNNER_TEMP/parity/batch-${batch}.log"
-            if python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 --batch-size "$batch" 2>&1 | tee "$log"; then
-              code=0
-            else
-              code=$?
-              failed=1
-            fi
-            exact=$(awk '/^EXACT / {n++} END {print n+0}' "$log")
-            topk=$(awk '/^TOP_K_MATCH / {n++} END {print n+0}' "$log")
-            mismatches=$(awk '/^FAIL / {n++} END {print n+0}' "$log")
-            printf '| %s | %s | %s | %s | %s |\n' "$batch" "$exact" "$topk" "$mismatches" "$code" >> "$GITHUB_STEP_SUMMARY"
-          done
-          exit "$failed"
+          python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
+            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity"
+      - name: Summarize parity
+        if: always()
+        run: |
+          printf '### %s\n\nCommit: %s\n\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/parity/summary.md" ]; then
+            cat "$RUNNER_TEMP/parity/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
