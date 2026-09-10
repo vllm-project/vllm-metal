@@ -135,7 +135,6 @@ def _register() -> str | None:
     _configure_logging()
     _apply_macos_defaults()
     _apply_mlx_buffer_defaults()
-    _apply_model_runner_default()
 
     # Register our env vars with vLLM's registry so validate_environ()
     # does not warn about unknown VLLM_METAL_* / VLLM_MLX_* variables.
@@ -152,5 +151,6 @@ def _register() -> str | None:
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():
+        _apply_model_runner_default()
         return "vllm_metal.platform.MetalPlatform"
     return None
