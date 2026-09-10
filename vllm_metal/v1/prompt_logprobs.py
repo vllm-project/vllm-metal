@@ -156,9 +156,8 @@ def full_prompt_logprobs(
 ) -> LogprobsTensors:
     """One-shot prompt logprobs when the whole prompt ran in one forward.
 
-    ``logits_rows`` holds one row per prompt position (the non-paged path
-    forwards the full prompt in a single chunk); rows past the scored
-    positions — the last row predicts the first sampled token — are ignored.
+    ``logits_rows`` holds one row per prompt position. Rows past the scored
+    positions are ignored; the last row predicts the first sampled token.
     """
     prompt_len = len(prompt_token_ids)
     window = prompt_logprobs_window(
