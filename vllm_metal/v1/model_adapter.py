@@ -42,7 +42,14 @@ class MultimodalEncodeResult(Protocol):
 
 
 class MultimodalRuntimeAdapter(Protocol):
-    """Model-owned behavior needed for native multimodal execution."""
+    """Model-owned behavior needed for native multimodal execution.
+
+    Adapters may additionally implement ``profile_features() ->
+    list[MultiModalFeatureSpec]`` returning one feature of the largest
+    encoder input; ``MetalModelRunner.profile_run`` encodes it so the
+    measured allocator overhead covers the vision tower.  Absent method
+    means no encoder profiling (Qwen3-VL, PaddleOCR-VL today).
+    """
 
     forward_ready: bool
     """Whether scheduled multimodal encoder inputs may be executed.

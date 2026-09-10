@@ -884,9 +884,27 @@ class MetalModelRunner:
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
         mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        # The vision encoder runs outside the text forward; profile it too so
+        # the buffer-cache cap covers one encoder pass (the runner encodes
+        # features one adapter call per step, so one maximal feature is the
+        # peak).
+        mx.eval(*self._dummy_encoder_outputs())
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
+
+    def _dummy_encoder_outputs(self) -> list[mx.array]:
+        """Encoder outputs for one profiling feature, when the adapter offers one."""
+        adapter = self._multimodal_adapter
+        if adapter is None or not adapter.forward_ready:
+            return []
+        profile_features = getattr(adapter, "profile_features", None)
+        if profile_features is None:
+            return []
+        features = profile_features()
+        if not features:
+            return []
+        return [result.hidden_states for result in adapter.encode_multimodal(features)]
 
     def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
         if self._is_pooling:
