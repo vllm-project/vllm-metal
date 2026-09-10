@@ -252,6 +252,18 @@ class MetalWorker(WorkerBase):
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], Any] | None:
+        """Report PD handshake metadata if a worker KV connector is active.
+
+        The file-based MetalFileConnector exchanges nothing out of band
+        (both sides rendezvous through the shared directory), so this is
+        always None; the method exists so EngineCore startup can collect
+        handshake metadata like it does for CUDA workers.
+        """
+        return None
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
         # Reset seed for reproducibility

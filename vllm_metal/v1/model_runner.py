@@ -358,7 +358,13 @@ class MetalModelRunner:
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
     Uses true batched decode with BatchKVCache for efficient parallel processing.
+
+    Class-level defaults keep stub-built runners (``__new__`` without
+    ``__init__``, as in tests) functional on the PD-disaggregation guards.
     """
+
+    _kv_connector_worker: Any = None
+    _pd_step_has_meta: bool = False
 
     def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
@@ -377,6 +383,11 @@ class MetalModelRunner:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
+        # Prefill/decode disaggregation: worker-role KV connector, created
+        # lazily in initialize_kv_cache when --kv-transfer-config names
+        # vllm_metal.kv_connector.MetalFileConnector.
+        self._kv_connector_worker: Any = None
+        self._pd_step_has_meta: bool = False
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
         # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
@@ -842,6 +853,83 @@ class MetalModelRunner:
         This method exists to satisfy the engine's initialization protocol.
         """
         self._cache_policy.initialize_kv_cache(kv_cache_config)
+        self._maybe_init_kv_connector(kv_cache_config)
+
+    def _maybe_init_kv_connector(self, kv_cache_config: KVCacheConfig) -> None:
+        """Create the worker-role KV connector for PD disaggregation.
+
+        The scheduler-role connector is created by vLLM core's Scheduler;
+        here we build the worker counterpart and hand it the per-layer
+        Metal paged KV pools so it can move blocks in and out.
+        """
+        # getattr: stub runners in tests build partial vllm_config objects.
+        if getattr(self.vllm_config, "kv_transfer_config", None) is None:
+            return
+        runtime = self._paged_attention_runtime
+        if runtime is None:
+            logger.warning(
+                "kv-transfer-config set but paged attention runtime is "
+                "absent; PD disaggregation requires the paged path."
+            )
+            return
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+        from vllm_metal.kv_connector import MetalKVBlockRegistry
+
+        if len(self._paged_group_block_sizes) != 1 or self._paged_state_group_indices:
+            raise NotImplementedError(
+                "PD disaggregation currently supports single-KV-group "
+                "models only (dense MHA/GQA); hybrid linear-attention "
+                "state transfer is not implemented."
+            )
+        # PagedAttentionRuntimeBase keeps its primary paged cache on
+        # ``_cache`` (no public accessor); same package, direct access.
+        cache = runtime._cache
+        if cache is None:
+            raise RuntimeError(
+                "paged attention runtime has no primary cache; PD "
+                "disaggregation cannot attach."
+            )
+        connector = KVConnectorFactory.create_connector(
+            self.vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+        connector.set_block_registry(
+            MetalKVBlockRegistry(
+                key_caches=list(cache.key_caches),
+                value_caches=list(cache.value_caches),
+                block_size=cache.block_size_for_layer(0)
+                if callable(getattr(cache, "block_size_for_layer", None))
+                else self._paged_group_block_sizes[0],
+                num_blocks=cache.num_blocks,
+            )
+        )
+        self._kv_connector_worker = connector
+        logger.info(
+            "PD disaggregation enabled: %d KV layers, block_size=%d, num_blocks=%d",
+            len(cache.key_caches),
+            self._paged_group_block_sizes[0],
+            cache.num_blocks,
+        )
+
+    def _pd_load_before_forward(self, scheduler_output: SchedulerOutput) -> None:
+        """Bind this step's transfer plan and load external KV blocks."""
+        metadata = scheduler_output.kv_connector_metadata
+        if metadata is None:
+            return
+        self._kv_connector_worker.bind_connector_metadata(metadata)
+        self._kv_connector_worker.start_load_kv(None)
+        self._pd_step_has_meta = True
+
+    def _pd_save_after_forward(self) -> None:
+        """Dump store-planned KV blocks once the forward is materialized."""
+        if not self._pd_step_has_meta:
+            return
+        self._kv_connector_worker.save_finished_requests()
+        self._kv_connector_worker.clear_connector_metadata()
+        self._pd_step_has_meta = False
 
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
@@ -2825,7 +2913,15 @@ class MetalModelRunner:
         # Gate the decode pipeline for this step BEFORE any state mutation:
         # an ineligible step must resolve the pending deferred sample first so
         # the synchronous path never observes a pending token placeholder.
-        self._decode_pipeline.begin_step(self._evaluate_pipeline_gate(scheduler_output))
+        # PD disaggregation keeps every step on the synchronous sample path —
+        # the deferred path skips _sample_paged_batch, which is where store
+        # plans are materialized after the forward completes.
+        gate_decision = self._evaluate_pipeline_gate(scheduler_output)
+        if self._kv_connector_worker is not None:
+            gate_decision = PipelineGateDecision(
+                eligible=False, reason="pd disagg: keep steps synchronous"
+            )
+        self._decode_pipeline.begin_step(gate_decision)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
@@ -2907,6 +3003,8 @@ class MetalModelRunner:
             self._lora.prepare_step(
                 self._paged_lora_routing(batch.paged_decode_reqs, prefill_pack)
             )
+            if self._kv_connector_worker is not None:
+                self._pd_load_before_forward(scheduler_output)
             self._start_paged_forward(
                 batch,
                 prefill_pack,
@@ -2985,6 +3083,8 @@ class MetalModelRunner:
                     )
                 return self._submit_deferred_decode_sample()
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
+            if self._kv_connector_worker is not None:
+                self._pd_save_after_forward()
             runtime = self._paged_attention_runtime
             if runtime is not None:
                 runtime.materialize_pending_state()
