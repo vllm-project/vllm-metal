@@ -20,7 +20,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.caches.mha_layout import (
+    MHAKVCacheLayout,
+    layer_addresses,
+)
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -79,10 +82,9 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
     Publishes the packed per-(head, token) byte count through the base
     spec's ``state_content_bytes`` field so vLLM's scheduler budgets
     blocks from the true compressed page size — without lying about
-    ``head_size``. vLLM 0.28.0 computes ``page_size_bytes`` as
-    ``num_heads * storage_block_size * state_content_size_bytes`` and
-    demoted ``real_page_size_bytes`` to an alias, so overriding the
-    latter no longer reaches the scheduler; publishing the field is the
+    ``head_size``. Since vLLM 0.28.0 the scheduler derives ``page_size_bytes``
+    from that field and ``real_page_size_bytes`` is only an alias, so
+    overriding the latter would not reach it; publishing the field is the
     same mechanism upstream's ``TurboQuantAttentionBackend.customize_spec``
     uses for its packed layout.
     """
@@ -694,28 +696,24 @@ class ModelCachePolicy:
                 raise RuntimeError(
                     "scheduler mamba cache groups do not cover every hybrid state layer"
                 )
-            # Physical pools follow the engine's tensor sharing: each
-            # kv_cache_tensor is shared by one layer from each cache group, so
-            # state layers sharing a tensor share one state pool (their
-            # groups own disjoint block ids and never collide).
+            # State layers whose regions share a KV address share one pool
+            # (see ``layer_addresses``).
             layer_pool_ordinals = [-1] * len(cache_idx_by_name)
-            pools_used = 0
+            pool_by_address: dict[int, int] = {}
             for tensor in kv_cache_config.kv_cache_tensors:
-                members = [
-                    cache_idx_by_name[name]
-                    for name in tensor.shared_by
-                    if name in cache_idx_by_name
-                ]
-                if not members:
-                    continue
-                for cache_idx in members:
+                for name, address in layer_addresses(tensor):
+                    cache_idx = cache_idx_by_name.get(name)
+                    if cache_idx is None:
+                        continue
                     if layer_pool_ordinals[cache_idx] != -1:
                         raise RuntimeError(
                             "a hybrid state layer appears in two "
                             "kv_cache_tensors; cannot derive state pools"
                         )
-                    layer_pool_ordinals[cache_idx] = pools_used
-                pools_used += 1
+                    layer_pool_ordinals[cache_idx] = pool_by_address.setdefault(
+                        address, len(pool_by_address)
+                    )
+            pools_used = len(pool_by_address)
             if -1 in layer_pool_ordinals:
                 raise RuntimeError(
                     "kv_cache_tensors do not cover every hybrid state "

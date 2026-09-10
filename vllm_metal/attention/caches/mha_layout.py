@@ -25,6 +25,19 @@ KV_CACHE_LAYOUT = KVCacheLayout.LBNHC.name
 StandardMHASpec: TypeAlias = FullAttentionSpec | SlidingWindowSpec
 
 
+def layer_addresses(tensor: KVCacheTensor) -> list[tuple[str, int]]:
+    """Return each layer's region start in the KV allocation.
+
+    vLLM overlays every cache group on one allocation and places layer ``l``
+    of a tensor at ``offset + l * layer_stride``; layers whose regions start at
+    the same address alias the same bytes (their groups own disjoint block ids).
+    """
+    return [
+        (layer_name, tensor.offset + position * tensor.layer_stride)
+        for position, layer_name in enumerate(tensor.layers)
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class MHAGroupLayout:
     """vLLM cache-group specs and layer-to-group mapping."""
@@ -35,7 +48,7 @@ class MHAGroupLayout:
 
 @dataclass(frozen=True, slots=True)
 class MHATensorLayout:
-    """vLLM physical tensor slots and layer-to-slot mapping."""
+    """vLLM physical slots (distinct region addresses) and layer-to-slot mapping."""
 
     layer_indices: dict[str, int]
     slot_layers: tuple[tuple[int, ...], ...]
@@ -62,15 +75,15 @@ class MHAKVCacheLayout:
     """Immutable standard-MHA cache layout derived from vLLM's DTOs."""
 
     num_blocks: int
-    tensor_sizes: tuple[int, ...]
+    allocation_bytes: int
     layers: tuple[MHALayerKVLayout, ...]
     group_block_sizes: tuple[int, ...]
     slot_layers: tuple[tuple[int, ...], ...]
 
     @property
     def total_bytes(self) -> int:
-        """Return the aggregate storage vLLM allocated for KV tensors."""
-        return sum(self.tensor_sizes)
+        """Return the backing allocation vLLM planned for the KV tensors."""
+        return self.allocation_bytes
 
     @classmethod
     def from_config(
@@ -101,7 +114,7 @@ class MHAKVCacheLayoutTranslator:
 
         return MHAKVCacheLayout(
             num_blocks=self.config.num_blocks,
-            tensor_sizes=tuple(tensor.size for tensor in self.config.kv_cache_tensors),
+            allocation_bytes=self.config.kv_cache_tensors[0].size,
             layers=self._layer_layouts(group_layout, tensor_layout),
             group_block_sizes=tuple(spec.block_size for spec in group_layout.specs),
             slot_layers=tensor_layout.slot_layers,
@@ -133,28 +146,23 @@ class MHAKVCacheLayoutTranslator:
 
     def _tensor_layout(self, group_layout: MHAGroupLayout) -> MHATensorLayout:
         layer_indices: dict[str, int] = {}
-        slot_layers: list[tuple[int, ...]] = []
+        slot_layers: list[list[int]] = []
+        slot_by_address: dict[int, int] = {}
         model_layer_indices = self._model_layer_indices
 
         for tensor_index, tensor in enumerate(self.config.kv_cache_tensors):
-            if tensor.offset != 0 or tensor.block_stride != 0:
-                raise NotImplementedError(
-                    "standard MHA layout does not support KV tensors with "
-                    "offset and block_stride"
-                )
-
-            tensor_layer_indices: list[int] = []
-            for layer_name in tensor.shared_by:
-                group_index = group_layout.layer_indices[layer_name]
-                group_spec = group_layout.specs[group_index]
-                self._require_tensor_size(tensor, tensor_index, group_spec, layer_name)
-                layer_indices[layer_name] = tensor_index
-                tensor_layer_indices.append(model_layer_indices[layer_name])
-            slot_layers.append(tuple(tensor_layer_indices))
+            spec = group_layout.specs[group_layout.layer_indices[tensor.layers[0]]]
+            self._require_layer_outermost(tensor, tensor_index, spec)
+            for layer_name, address in layer_addresses(tensor):
+                slot = slot_by_address.setdefault(address, len(slot_layers))
+                if slot == len(slot_layers):
+                    slot_layers.append([])
+                layer_indices[layer_name] = slot
+                slot_layers[slot].append(model_layer_indices[layer_name])
 
         return MHATensorLayout(
             layer_indices=layer_indices,
-            slot_layers=tuple(slot_layers),
+            slot_layers=tuple(tuple(layers) for layers in slot_layers),
         )
 
     def _layer_layouts(
@@ -195,17 +203,17 @@ class MHAKVCacheLayoutTranslator:
                 "model_layer_names"
             )
 
-    def _require_tensor_size(
-        self,
-        tensor: KVCacheTensor,
-        tensor_index: int,
-        group_spec: StandardMHASpec,
-        layer_name: str,
+    def _require_layer_outermost(
+        self, tensor: KVCacheTensor, tensor_index: int, spec: StandardMHASpec
     ) -> None:
-        expected_size = self.config.num_blocks * group_spec.page_size_bytes
-        if tensor.size != expected_size:
-            raise ValueError(
-                f"KV cache tensor {tensor_index} size {tensor.size} does not "
-                f"match {self.config.num_blocks} blocks of "
-                f"{group_spec.page_size_bytes} bytes for layer {layer_name!r}"
+        region_bytes = self.config.num_blocks * spec.page_size_bytes
+        if (
+            tensor.block_stride != spec.page_size_bytes
+            or tensor.layer_stride != region_bytes
+        ):
+            raise NotImplementedError(
+                "standard MHA layout requires layer-outermost KV tensors "
+                f"(block_stride {spec.page_size_bytes}, layer_stride "
+                f"{region_bytes}); tensor {tensor_index} has block_stride "
+                f"{tensor.block_stride}, layer_stride {tensor.layer_stride}"
             )

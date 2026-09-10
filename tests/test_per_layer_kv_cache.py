@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     SlidingWindowSpec,
 )
 
@@ -46,7 +47,9 @@ def vllm_config_for_kv_grouping() -> VllmConfig:
 
 
 def config_from_vllm_groups(
-    groups: list[KVCacheGroupSpec], num_blocks: int
+    groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+    vllm_config: VllmConfig | None = None,
 ) -> KVCacheConfig:
     if len(groups) == 1:
         available = groups[0].kv_cache_spec.page_size_bytes * num_blocks
@@ -54,7 +57,7 @@ def config_from_vllm_groups(
         group_size = max(len(group.layer_names) for group in groups)
         available = groups[0].kv_cache_spec.page_size_bytes * num_blocks * group_size
     return get_kv_cache_config_from_groups(
-        vllm_config_for_kv_grouping(), groups, available
+        vllm_config or vllm_config_for_kv_grouping(), groups, available
     )
 
 
@@ -358,7 +361,9 @@ class TestMHAKVCacheLayout:
             num_gpu_blocks_override=num_gpu_blocks_override,
         )
 
-    def _mixed_mha_config(self) -> tuple[KVCacheConfig, tuple[str, ...]]:
+    def _mixed_mha_config(
+        self, vllm_config: VllmConfig | None = None
+    ) -> tuple[KVCacheConfig, tuple[str, ...]]:
         names = tuple(f"layers.{index}.self_attn" for index in range(4))
         specs = {
             names[0]: FullAttentionSpec(
@@ -388,9 +393,10 @@ class TestMHAKVCacheLayout:
                 sliding_window=1024,
             ),
         }
-        groups = get_kv_cache_groups(vllm_config_for_kv_grouping(), specs)
+        vllm_config = vllm_config or vllm_config_for_kv_grouping()
+        groups = get_kv_cache_groups(vllm_config, specs)
         assert len(groups) == 2
-        return config_from_vllm_groups(groups, 3), names
+        return config_from_vllm_groups(groups, 3, vllm_config), names
 
     def test_translates_upstream_slots_and_groups(self) -> None:
         config, names = self._mixed_mha_config()
@@ -402,9 +408,8 @@ class TestMHAKVCacheLayout:
         assert [layer.tensor_index for layer in layout.layers] == [0, 0, 1, 1]
         assert [layer.group_index for layer in layout.layers] == [0, 1, 0, 1]
         assert [layer.sliding_window for layer in layout.layers] == [-1, 1024, -1, 1024]
-        assert layout.total_bytes == sum(
-            tensor.size for tensor in config.kv_cache_tensors
-        )
+        # Every tensor describes the same backing allocation the slots partition.
+        assert layout.total_bytes == config.kv_cache_tensors[0].size
 
     def test_allocates_shared_slots_from_layout(self) -> None:
         config, names = self._mixed_mha_config()
@@ -509,10 +514,10 @@ class TestMHAKVCacheLayout:
         assert runner._paged_group_block_sizes == (16,)
 
     @pytest.mark.parametrize(
-        ("num_layers", "sliding_kv_heads", "full_kv_heads", "expected_slots"),
+        ("num_layers", "sliding_kv_heads", "full_kv_heads"),
         (
-            (60, 16, 4, 10),
-            (30, 8, 2, 5),
+            (60, 16, 4),
+            (30, 8, 2),
         ),
     )
     def test_cache_policy_initializes_gemma4_grouped_layout_from_budget(
@@ -521,7 +526,6 @@ class TestMHAKVCacheLayout:
         num_layers: int,
         sliding_kv_heads: int,
         full_kv_heads: int,
-        expected_slots: int,
     ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=num_layers,
@@ -565,7 +569,8 @@ class TestMHAKVCacheLayout:
         assert type(specs["layers.5.self_attn"]) is FullAttentionSpec
         assert len(config.kv_cache_groups) == 6
         assert config.num_blocks > reported_dense_blocks
-        assert len(config.kv_cache_tensors) == expected_slots
+        # One tensor per group; the physical slots are what the layout derives.
+        assert len(config.kv_cache_tensors) == len(config.kv_cache_groups)
 
         runner.initialize_kv_cache(config)
 
@@ -682,9 +687,11 @@ class TestMHAKVCacheLayout:
         assert mx.all(cache.key_caches[0].reshape(-1) == new_key.reshape(-1)).item()
         assert mx.all(cache.value_caches[0].reshape(-1) == new_value.reshape(-1)).item()
 
-    def test_rejects_packed_upstream_tensors(self) -> None:
-        config, names = self._mixed_mha_config()
-        config.kv_cache_tensors[0].block_stride = 256
+    def test_rejects_block_outermost_upstream_tensors(self) -> None:
+        """vLLM's block-outermost layout interleaves layers inside each block."""
+        vllm_config = VllmConfig()
+        record_kv_cache_layout(vllm_config.cache_config, KVCacheLayout.BLHNC.name)
+        config, names = self._mixed_mha_config(vllm_config)
 
-        with pytest.raises(NotImplementedError, match="offset and block_stride"):
+        with pytest.raises(NotImplementedError, match="layer-outermost"):
             MHAKVCacheLayout.from_config(config, names)

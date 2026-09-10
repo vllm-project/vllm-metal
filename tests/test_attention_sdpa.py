@@ -749,7 +749,7 @@ class TestSDPAForward:
         """Full and sliding layers consume their scheduler-group metadata."""
         layout = MHAKVCacheLayout(
             num_blocks=11,
-            tensor_sizes=(1, 1),
+            allocation_bytes=2,
             layers=(
                 MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
                 MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),

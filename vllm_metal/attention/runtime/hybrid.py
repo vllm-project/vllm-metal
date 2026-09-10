@@ -149,7 +149,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         each state layer belongs to (the engine stripes same-spec layers
         across several groups) and ``layer_pool_ordinals[cache_idx]`` which
         physical state pool it shares (one pool per within-group position,
-        following ``kv_cache_tensors.shared_by``).
+        following the ``kv_cache_tensors`` byte addresses).
         """
         self._require_initialized("adopt_scheduler_group")
         if block_size != self._block_size:

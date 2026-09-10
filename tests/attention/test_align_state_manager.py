@@ -101,7 +101,7 @@ class TestAlignStateManager:
 
     def test_striped_groups_share_one_pool_without_colliding(self) -> None:
         # Two layers from different groups sharing one physical pool, the
-        # layout kv_cache_tensors.shared_by produces: each group's motion
+        # layout vLLM's aliased kv_cache_tensors produce: each group's motion
         # must touch only its own block rows of the shared array.
         cache = _make_cache(num_layers=2)
         cache.set_layer_layout([0, 1], [0, 0])

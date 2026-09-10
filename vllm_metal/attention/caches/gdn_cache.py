@@ -242,7 +242,7 @@ class GDNPagedStateCache:
 
         ``group_ordinals[cache_idx]`` selects the block-table row addressing a
         layer's slabs; ``pool_ordinals[cache_idx]`` names its physical pool
-        (vLLM's ``kv_cache_tensors.shared_by``: one pool per within-group
+        (vLLM's ``kv_cache_tensors`` byte addresses: one pool per within-group
         position).  Layers sharing a pool must belong to different groups —
         their groups then own disjoint block ids, so slab rows never collide.
         Must be called before any state is written (pool arrays are rebuilt).

@@ -154,7 +154,7 @@ def test_scheduler_spec_bills_only_the_convolution_tail(lfm_model, mode):
 
 
 def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_model):
-    """Round-trip real vLLM grouping, including its shared_by physical layout."""
+    """Round-trip real vLLM grouping, including its aliased physical layout."""
     runner = _runner(lfm_model, cache_dtype="float32")
     runtime = _runtime(runner)
     engine_config = SimpleNamespace(
@@ -193,12 +193,18 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
     cache.ensure_capacity(NUM_BLOCKS)
     assert cache.conv_states[0].dtype == mx.float32
     assert cache.num_state_pools == 2
+    # Groups overlay one allocation: conv layers whose regions start at the same
+    # byte address share a physical pool but belong to different groups.
+    indices_by_address: dict[int, list[int]] = {}
     for tensor in scheduler_cache.kv_cache_tensors:
-        indices = [
-            STATE_INDICES.index(int(name.split(".")[1]))
-            for name in tensor.shared_by
-            if name.endswith(".conv")
-        ]
+        for position, name in enumerate(tensor.layers):
+            if name.endswith(".conv"):
+                address = tensor.offset + position * tensor.layer_stride
+                indices_by_address.setdefault(address, []).append(
+                    STATE_INDICES.index(int(name.split(".")[1]))
+                )
+    assert len(indices_by_address) == 2
+    for indices in indices_by_address.values():
         assert len(indices) == 2
         assert cache.conv_states[indices[0]] is cache.conv_states[indices[1]]
         assert cache.layer_group_ordinal(indices[0]) != cache.layer_group_ordinal(

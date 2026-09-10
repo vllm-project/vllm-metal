@@ -1979,11 +1979,13 @@ class TestAutoFitMaxModelLenChain:
         assert len(full_groups) == 1
         assert sum(len(group.layer_names) for group in sliding_groups) == 50
         assert sum(len(group.layer_names) for group in full_groups) == 10
-        assert len(config.kv_cache_tensors) == 10
+        # One tensor per cache group, all describing the same backing allocation.
+        assert len(config.kv_cache_tensors) == 6
+        assert len({tensor.size for tensor in config.kv_cache_tensors}) == 1
         capacity, _ = get_kv_cache_capacity(vllm_config, config)
         assert vllm_config.model_config.max_model_len == self._DERIVED_MAX_LEN
         assert capacity >= self._DERIVED_MAX_LEN
-        assert sum(tensor.size for tensor in config.kv_cache_tensors) <= available
+        assert config.kv_cache_tensors[0].size <= available
 
     def test_insufficient_memory_for_one_block_raises(self) -> None:
         available = self._PACKED_BLOCK_BYTES - 1
