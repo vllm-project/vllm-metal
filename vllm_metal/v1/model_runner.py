@@ -2631,10 +2631,6 @@ class MetalModelRunner:
         one past this chunk's own tokens.  All conditions share the same
         two-source resolution (RequestState first, new_req fallback) and
         the same contract-bug raises.
-
-        Continuation chunks also expose the full original prompt so consumers such
-        as DraftModelProposer can reconstruct a deferred KV range that begins before
-        the current chunk.
         """
         prefill_pack: list[PrefillRequest] = []
         for entry in batch.paged_prefill_entries:
