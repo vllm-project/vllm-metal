@@ -14,11 +14,14 @@ from typing import TypeAlias
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheLayout,
     KVCacheTensor,
     SlidingWindowSpec,
 )
 
 NO_SLIDING_WINDOW = -1
+# vLLM's name for the page order Metal stores: [block, token, head, dim].
+KV_CACHE_LAYOUT = KVCacheLayout.LBNHC.name
 StandardMHASpec: TypeAlias = FullAttentionSpec | SlidingWindowSpec
 
 

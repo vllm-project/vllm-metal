@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,7 +13,18 @@ import torch
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
+import vllm.v1.worker.worker_base as worker_base  # noqa: E402
+from vllm.config import CacheConfig, VllmConfig  # noqa: E402
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout  # noqa: E402
+from vllm.v1.kv_cache_interface import (  # noqa: E402
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheLayout,
+    SlidingWindowSpec,
+)
+
 from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner  # noqa: E402
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
@@ -23,6 +35,78 @@ from vllm_metal.v1.cache_policy import (  # noqa: E402
 )
 from vllm_metal.v1.model_adapter import DefaultModelAdapter  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
+
+
+class TestKVCacheLayoutRpcs:
+    """The engine core resolves one KV layout from every worker's list."""
+
+    _MIXED_MHA_SPECS = (
+        FullAttentionSpec(
+            block_size=32, num_kv_heads=4, head_size=512, dtype=torch.bfloat16
+        ),
+        SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=16,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        ),
+    )
+
+    def test_engine_resolves_metal_page_order_without_backend_probe(
+        self, monkeypatch
+    ) -> None:
+        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        monkeypatch.setattr(
+            worker_base, "get_current_attn_backends", _refuse_backend_probe
+        )
+        vllm_config = VllmConfig()
+
+        layout = resolve_kv_cache_layout(
+            vllm_config,
+            [worker.get_supported_kv_cache_layouts()],
+            self._MIXED_MHA_SPECS,
+        )
+
+        assert layout is KVCacheLayout.LBNHC
+        assert vllm_config.cache_config.kv_cache_layout == KV_CACHE_LAYOUT
+
+    def test_explicit_block_outermost_layout_fails_loud(self, monkeypatch) -> None:
+        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "BLHNC")
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "VLLM_KV_CACHE_LAYOUT=BLHNC does not satisfy every supported set; "
+                "valid layouts: ['LBNHC']."
+            ),
+        ):
+            resolve_kv_cache_layout(
+                VllmConfig(),
+                [worker.get_supported_kv_cache_layouts()],
+                self._MIXED_MHA_SPECS,
+            )
+
+    def test_initialize_from_config_records_resolved_layout(self) -> None:
+        runner = SimpleNamespace(initialize_kv_cache=MagicMock())
+        worker = _make_worker(runner, use_paged_attention=True)
+        worker.cache_config = CacheConfig()
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
+            kv_cache_layout=KV_CACHE_LAYOUT,
+        )
+
+        worker.initialize_from_config(kv_cache_config)
+
+        assert worker.cache_config.kv_cache_layout == KV_CACHE_LAYOUT
+        runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
+
+
+def _refuse_backend_probe(vllm_config: object) -> None:
+    raise AssertionError("worker answered the layout RPC via the backend probe")
 
 
 def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWorker:

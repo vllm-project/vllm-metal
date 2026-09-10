@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 import torch
 from vllm.config import VllmConfig
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
@@ -24,7 +25,7 @@ from vllm.v1.kv_cache_interface import (
 
 from tests.stub_runner import make_gemma4_mixed_mha_runner, make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT, MHAKVCacheLayout
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.mha import (
     MHAPagedAttentionRuntime,
@@ -38,7 +39,10 @@ from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 
 def vllm_config_for_kv_grouping() -> VllmConfig:
-    return VllmConfig()
+    vllm_config = VllmConfig()
+    # The engine core resolves the layout before grouping; mirror that here.
+    record_kv_cache_layout(vllm_config.cache_config, KV_CACHE_LAYOUT)
+    return vllm_config
 
 
 def config_from_vllm_groups(

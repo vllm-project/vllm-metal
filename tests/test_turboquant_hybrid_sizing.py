@@ -10,6 +10,7 @@ import pytest
 import torch
 from vllm.config import CacheConfig
 from vllm.model_executor.models import ModelRegistry
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     resolve_kv_cache_block_sizes,
@@ -17,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT
 from vllm_metal.config import MetalConfig
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import (
@@ -165,7 +167,10 @@ class TestTurboQuantHybridAlignment:
 
     def _vllm_config_with_cache(self, cache_config: CacheConfig) -> SimpleNamespace:
         cache_config.mamba_block_size = MAMBA_BLOCK_SIZE
+        record_kv_cache_layout(cache_config, KV_CACHE_LAYOUT)
         return SimpleNamespace(
+            # vLLM 0.29.0 annotates EAGLE groups from speculative_config.
+            speculative_config=None,
             model_config=SimpleNamespace(
                 is_hybrid=True,
                 architecture="StubHybridForCausalLM",

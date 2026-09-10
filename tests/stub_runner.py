@@ -9,8 +9,11 @@ from typing import Any
 
 import mlx.core as mx
 import torch
+from vllm.config import CacheConfig
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
@@ -29,6 +32,13 @@ from vllm_metal.v1.pooling.backends.decoder.factory import (
 from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
+
+
+def make_cache_config(**kwargs: Any) -> CacheConfig:
+    """Build a real ``CacheConfig`` with Metal's KV cache layout already resolved."""
+    cache_config = CacheConfig(**kwargs)
+    record_kv_cache_layout(cache_config, KV_CACHE_LAYOUT)
+    return cache_config
 
 
 def make_stub_runner(
@@ -56,8 +66,7 @@ def make_stub_runner(
             # The value MetalPlatform resolves for the in-process executor.
             parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         ),
-        "cache_config": SimpleNamespace(
-            mamba_page_size_padded=None,
+        "cache_config": make_cache_config(
             mamba_block_size=2048,
             mamba_cache_mode="none",
             mamba_cache_dtype="auto",
@@ -185,13 +194,12 @@ def make_gemma4_mixed_mha_runner(
     assert per_layer is not None
     assert sliding_windows is not None
     kv_heads_per_layer, head_dim_per_layer = per_layer
-    cache_config = SimpleNamespace(
+    cache_config = make_cache_config(
         block_size=16,
         gpu_memory_utilization=1.0,
         num_gpu_blocks_override=num_gpu_blocks_override,
         kv_cache_memory_bytes=None,
         enable_prefix_caching=False,
-        prefix_match_unit=None,
     )
     scheduler_config = SimpleNamespace(
         max_num_batched_tokens=max_in_flight_tokens,

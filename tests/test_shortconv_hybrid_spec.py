@@ -18,7 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_cache_config, make_stub_runner
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
@@ -104,13 +104,11 @@ def _runner(model, *, mode="align", cache_dtype="auto"):
             ),
             dtype=torch.bfloat16,
         ),
-        cache_config=SimpleNamespace(
+        cache_config=make_cache_config(
             block_size=BLOCK_SIZE,
             mamba_block_size=BLOCK_SIZE if mode == "align" else 128,
-            mamba_page_size_padded=None,
             mamba_cache_mode=mode,
             mamba_cache_dtype=cache_dtype,
-            num_gpu_blocks_override=None,
         ),
         scheduler_config=SimpleNamespace(
             max_num_seqs=3,
@@ -163,6 +161,7 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
         cache_config=runner.cache_config,
         scheduler_config=runner.scheduler_config,
         kv_transfer_config=None,
+        speculative_config=None,
     )
     groups = get_kv_cache_groups(engine_config, runner.get_kv_cache_spec())
     scheduler_cache = get_kv_cache_config_from_groups(

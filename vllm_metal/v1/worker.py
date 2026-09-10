@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -26,6 +27,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT
 from vllm_metal.config import get_config
 from vllm_metal.distributed import PipelineGroup
 from vllm_metal.platform import MetalPlatform
@@ -244,12 +246,20 @@ class MetalWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """Report Metal's own page order instead of the CPU backend's LBHNC."""
+        return [KV_CACHE_LAYOUT]
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize from KV cache configuration.
 
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # Mirrors GPUWorker: workers spawned after resolution only see the
+        # layout through the config.
+        if kv_cache_config.kv_cache_layout is not None:
+            record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
