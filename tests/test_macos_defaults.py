@@ -94,3 +94,19 @@ def test_apply_macos_defaults_logs_when_setting(monkeypatch, caplog) -> None:
         metal_logger.setLevel(original_level)
 
     assert "defaulting VLLM_WORKER_MULTIPROC_METHOD" in caplog.text
+
+
+def test_apply_model_runner_default_pins_v1(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+
+    vm._apply_model_runner_default()
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+
+
+def test_apply_model_runner_default_respects_user_value(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    vm._apply_model_runner_default()
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"

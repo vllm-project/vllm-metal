@@ -83,6 +83,14 @@ def _apply_mlx_buffer_defaults() -> None:
         os.environ.setdefault(name, value)
 
 
+def _apply_model_runner_default() -> None:
+    """Pin vLLM to the V1 model runner contract MetalWorker implements.
+
+    ``setdefault`` keeps an explicit user value authoritative.
+    """
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+
+
 # Lazy imports to avoid loading vLLM dependencies when just importing the Rust extension
 def __getattr__(name):
     """Lazy import module components."""
@@ -127,6 +135,7 @@ def _register() -> str | None:
     _configure_logging()
     _apply_macos_defaults()
     _apply_mlx_buffer_defaults()
+    _apply_model_runner_default()
 
     # Register our env vars with vLLM's registry so validate_environ()
     # does not warn about unknown VLLM_METAL_* / VLLM_MLX_* variables.
