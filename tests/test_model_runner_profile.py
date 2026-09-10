@@ -44,6 +44,11 @@ class _PlainAdapter:
         return []
 
 
+class _EmptyProfileAdapter(_ProfilingAdapter):
+    def profile_features(self) -> list[MultiModalFeatureSpec]:
+        return []
+
+
 def _runner(adapter: Any) -> Any:
     runner = make_stub_runner(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
@@ -87,3 +92,11 @@ class TestProfileRunEncoder:
     def test_no_adapter_is_fine(self) -> None:
         runner = _runner(None)
         assert runner.profile_run() >= 0
+
+    def test_empty_profile_features_skips_encoding(self) -> None:
+        adapter = _EmptyProfileAdapter()
+        runner = _runner(adapter)
+
+        runner.profile_run()
+
+        assert adapter.encode_calls == []
