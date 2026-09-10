@@ -113,14 +113,53 @@ jobs:
         with:
           path: ~/.cache/huggingface/hub
           key: ${{ steps.models.outputs.cache-primary-key }}
-      - name: Compare all batch sizes
+      - name: Generate native MLX reference once
         run: |
           source .venv-vllm-metal/bin/activate
-          printf '### %s\n\nCommit: %s\n\n| Batch | EXACT | TOP_K_MATCH | FAIL | Exit |\n|---|---:|---:|---:|---:|\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PYREF' 2>&1 | tee "$RUNNER_TEMP/parity/reference.log"
+          import json
+          import os
+          from pathlib import Path
+          from tools.check_parity import mlx_generate
+          from tools.parity_prompts import PROMPTS
+
+          model = os.environ["MODEL_PATH"]
+          results = mlx_generate(model, PROMPTS, max_tokens=20, top_k=5)
+          reference = {"model": model, "max_tokens": 20, "top_k": 5, "results": results}
+          Path(os.environ["RUNNER_TEMP"], "parity", "reference.json").write_text(json.dumps(reference))
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              print(f"PARITY_MAX_MODEL_LEN={max(len(row['input_ids']) for row in results) + 20}", file=output)
+          PYREF
+      - name: Serve once and compare concurrency levels
+        run: |
+          source .venv-vllm-metal/bin/activate
+          # Give the server and its workers a process group for cleanup.
+          set -m
+          vllm serve "$MODEL_PATH" --host 127.0.0.1 --port 8000 \
+            --max-model-len "$PARITY_MAX_MODEL_LEN" --max-num-seqs 2 \
+            --no-enable-prefix-caching --generation-config vllm \
+            > "$RUNNER_TEMP/parity/serve.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill -- -"$server_pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL -- -"$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for ((attempt=0; attempt<60; attempt++)); do
+            kill -0 "$server_pid" 2>/dev/null || { cat "$RUNNER_TEMP/parity/serve.log"; exit 1; }
+            if curl -fsS --max-time 2 http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS --max-time 5 http://127.0.0.1:8000/health > /dev/null
+          printf '### %s\n\nCommit: %s\n\n| Concurrency | EXACT | TOP_K_MATCH | FAIL | Exit |\n|---|---:|---:|---:|---:|\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
           failed=0
-          for batch in 1 2; do
-            log="$RUNNER_TEMP/parity/batch-${batch}.log"
-            if python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 --batch-size "$batch" 2>&1 | tee "$log"; then
+          for concurrency in 1 2; do
+            log="$RUNNER_TEMP/parity/concurrency-${concurrency}.log"
+            if python tools/check_parity.py --base-url http://127.0.0.1:8000/v1 --reference "$RUNNER_TEMP/parity/reference.json" --concurrency "$concurrency" 2>&1 | tee "$log"; then
               code=0
             else
               code=$?
@@ -129,7 +168,7 @@ jobs:
             exact=$(awk '/^EXACT / {n++} END {print n+0}' "$log")
             topk=$(awk '/^TOP_K_MATCH / {n++} END {print n+0}' "$log")
             mismatches=$(awk '/^FAIL / {n++} END {print n+0}' "$log")
-            printf '| %s | %s | %s | %s | %s |\n' "$batch" "$exact" "$topk" "$mismatches" "$code" >> "$GITHUB_STEP_SUMMARY"
+            printf '| %s | %s | %s | %s | %s |\n' "$concurrency" "$exact" "$topk" "$mismatches" "$code" >> "$GITHUB_STEP_SUMMARY"
           done
           exit "$failed"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

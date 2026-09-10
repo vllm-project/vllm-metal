@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare greedy paged serving with the environment's native mlx-lm.
 
-Each backend runs in a fresh process with the same checkpoint and input IDs.
+Both backends use the same checkpoint and input IDs. CI can reuse a saved
+native reference and an HTTP server across request concurrency levels.
 See docs/tools.md or --help for usage.
 """
 
@@ -14,6 +15,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
 from pathlib import Path
 
@@ -149,6 +152,77 @@ def check_parity(
     return compare_results(reference, outputs, max_tokens=max_tokens, top_k=top_k)
 
 
+def http_generate(
+    base_url: str,
+    model: str,
+    reference: list[dict],
+    max_tokens: int,
+    top_k: int | None = None,
+    concurrency: int = 1,
+) -> list[dict]:
+    """Generate through one running server, preserving input order."""
+    if not reference:
+        raise ValueError("At least one reference prompt is required.")
+
+    def generate(row: dict) -> dict:
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/completions",
+            data=json.dumps(
+                {
+                    "model": model,
+                    "prompt": row["input_ids"],
+                    "temperature": 0,
+                    "max_tokens": max_tokens,
+                    "ignore_eos": True,
+                    "logprobs": top_k,
+                    "return_token_ids": True,
+                    "return_tokens_as_token_ids": True,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            [choice] = json.load(response)["choices"]
+        if choice["prompt_token_ids"] != row["input_ids"]:
+            raise ValueError("Server changed the reference input token IDs.")
+        return http_result(choice, top_k)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(generate, reference))
+
+
+def http_result(choice: dict, top_k: int | None) -> dict:
+    """Convert completion logprobs to the comparator's token-ID format."""
+    tokens = choice["token_ids"]
+    top_logprobs = []
+    if top_k is not None:
+        for sampled, step in zip(
+            tokens, choice["logprobs"]["top_logprobs"], strict=True
+        ):
+            candidates = {
+                int(token.removeprefix("token_id:")): score
+                for token, score in step.items()
+            }
+            # The API returns the sampled token plus top-K. An extra entry
+            # means the sampled token is outside top-K, just as offline.
+            if len(candidates) > top_k:
+                candidates.pop(sampled)
+            top_logprobs.append(
+                [
+                    {
+                        "id": token,
+                        "text": f"token_id:{token}",
+                        "logprob": score,
+                        "rank": rank,
+                    }
+                    for rank, (token, score) in enumerate(
+                        sorted(candidates.items(), key=lambda item: -item[1]), start=1
+                    )
+                ]
+            )
+    return {"tokens": tokens, "text": choice["text"], "top_logprobs": top_logprobs}
+
+
 def run_backend(
     backend: str,
     model: str,
@@ -273,6 +347,16 @@ def main() -> None:
         type=int,
         help="Accept mutual top-k membership at the first divergence",
     )
+    parser.add_argument("--base-url", help="Running vLLM server URL, including /v1")
+    parser.add_argument(
+        "--reference", type=Path, help="Saved native reference JSON for HTTP comparison"
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Concurrent HTTP requests (default: 1)",
+    )
     parser.add_argument("--backend", choices=("mlx", "metal"), help=argparse.SUPPRESS)
     parser.add_argument("--data", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -282,6 +366,27 @@ def main() -> None:
         parser.error("--top-k must be positive")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be positive")
+    if bool(args.base_url) != bool(args.reference):
+        parser.error("--base-url and --reference must be used together")
+    if args.reference:
+        reference = json.loads(args.reference.read_text())
+        outputs = http_generate(
+            args.base_url,
+            reference["model"],
+            reference["results"],
+            reference["max_tokens"],
+            reference["top_k"],
+            args.concurrency,
+        )
+        passed = compare_results(
+            reference["results"],
+            outputs,
+            max_tokens=reference["max_tokens"],
+            top_k=reference["top_k"],
+        )
+        raise SystemExit(0 if passed else 1)
     if args.backend:
         data = json.loads(args.data.read_text())
         if args.backend == "mlx":

@@ -116,7 +116,7 @@ def finish(check_id: str, result: str) -> None:
     summary += (
         f"[View workflow run]({workflow_url()}) for per-model "
         "summaries of EXACT, TOP_K_MATCH, and FAIL. Download the parity "
-        "artifacts for per-batch logs and environment versions."
+        "artifacts for per-concurrency logs and environment versions."
     )
     github_api(
         f"check-runs/{int(check_id)}",
