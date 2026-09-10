@@ -178,6 +178,7 @@ def check_parity(
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
+    env.setdefault("VLLM_METAL_MLA_KERNEL", "1")
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
