@@ -9,6 +9,7 @@ not allow an mm request to slip into the text path silently.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -19,7 +20,7 @@ from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.v1.mm import EncoderCache
-from vllm_metal.v1.model_runner import RequestState
+from vllm_metal.v1.model_runner import RequestState, text_path_selective_logits_allowed
 
 
 def _feature(identifier: str) -> MultiModalFeatureSpec:
@@ -128,3 +129,21 @@ class TestStartPagedForwardMmFailFast:
                 decode_reqs=[("req-mm", state)],
                 scheduler_output=self._scheduler_output(),
             )
+
+
+class TestTextPathSelectiveLogitsAllowed:
+    def test_text_only_model_is_allowed(self) -> None:
+        assert text_path_selective_logits_allowed(False, None) is True
+
+    def test_vlm_without_flag_is_refused(self) -> None:
+        adapter = SimpleNamespace(forward_ready=True)
+        assert text_path_selective_logits_allowed(True, adapter) is False
+
+    def test_vlm_with_flag_is_allowed(self) -> None:
+        adapter = SimpleNamespace(
+            forward_ready=True, text_path_selective_logits_ok=True
+        )
+        assert text_path_selective_logits_allowed(True, adapter) is True
+
+    def test_vlm_without_adapter_is_refused(self) -> None:
+        assert text_path_selective_logits_allowed(True, None) is False

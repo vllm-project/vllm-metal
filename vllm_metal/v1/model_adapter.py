@@ -74,6 +74,14 @@ class MultimodalRuntimeAdapter(Protocol):
     path.  ``call_lm`` still receives ``position_ids`` either way.
     """
 
+    text_path_selective_logits_ok: bool
+    """Whether text-only batches may use selective logits (``logits_indices``).
+
+    Only adapters whose ``text_model()`` is the same object the runner
+    profiles with ``supports_selective_logits`` may set this; the runner
+    assumes False when the attribute is absent.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 

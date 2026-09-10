@@ -312,6 +312,21 @@ class _PagedLogitsLayout(NamedTuple):
     cu_seqlens: list[int]
 
 
+def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> bool:
+    """Whether the split backbone/head path may serve this model's text batches.
+
+    Text-only models always qualify.  A VLM qualifies only when its adapter
+    declares ``text_path_selective_logits_ok``: its text batches run the
+    plain text path on the very object ``runner.model`` refers to, so the
+    bit-exactness probe in ``supports_selective_logits`` applies.  The mm
+    forward never requests selected rows, so the flag affects text batches
+    only.
+    """
+    if not is_vlm:
+        return True
+    return bool(getattr(adapter, "text_path_selective_logits_ok", False))
+
+
 class _PagedForwardState(NamedTuple):
     """State stashed by ``_start_paged_forward`` for ``_sample_paged_batch``."""
 
@@ -636,7 +651,9 @@ class MetalModelRunner:
         # other forward branches that never request selection.
         self._selective_logits_supported = (
             self.pp is None
-            and not self._is_vlm
+            and text_path_selective_logits_allowed(
+                self._is_vlm, self._multimodal_adapter
+            )
             and not self._lora.enabled
             and self._model_adapter.supports_selective_logits(self._forward_model)
         )
