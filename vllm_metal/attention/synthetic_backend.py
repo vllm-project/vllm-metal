@@ -41,7 +41,3 @@ class MetalBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls():
         raise NotImplementedError
-
-    @staticmethod
-    def get_kv_cache_shape(*args, **kwargs):
-        raise NotImplementedError
