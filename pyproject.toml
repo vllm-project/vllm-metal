@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "vllm-metal"
-version = "0.28.0"
+version = "0.29.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -49,21 +49,22 @@ dependencies = [
     # mRoPE state; 0.6.4 leaves it unset and garbles their output (#685).
     "mlx-vlm>=0.6.8,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
-    # Keep aligned with vLLM 0.28.0's Transformers lower bound.
-    "transformers>=5.5.3",
+    # Keep aligned with vLLM 0.29.0's Transformers lower bound. Unbounded like
+    # upstream's own form; vLLM's requirements/common.txt pins the effective range.
+    "transformers>=5.10.4",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
     # Imported directly (model download/cache paths); keep aligned with vLLM
-    # 0.28.0's lower bound rather than relying on vLLM's transitive install.
+    # 0.29.0's lower bound rather than relying on vLLM's transitive install.
     # Unbounded like upstream's own form: vLLM's requirements/common.txt pins
     # the effective range in every release and we re-derive it on each bump.
-    "huggingface_hub>=1.27.0",
+    "huggingface_hub>=1.28.0",
     # Native Metal extension JIT build
     "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
-    # Keep aligned with vLLM 0.28.0's FastAPI/Starlette bounds. vLLM caps fastapi
+    # Keep aligned with vLLM 0.29.0's FastAPI/Starlette bounds. vLLM caps fastapi
     # itself (requirements/common.txt): 0.133.0 is the first release supporting
     # Starlette 1.0, and <0.137.0 avoids the FastAPI 0.137 route-tree change that
     # breaks its handler overrides. The earlier prometheus crash (vllm#45597) is
