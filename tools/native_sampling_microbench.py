@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sampling-step microbench: the torch production path vs the native graph.
+"""Sampling-step microbench for the torch path and native MLX graph.
 
-Times one non-greedy sampling step over a full Qwen-sized vocabulary at
-decode-like batch sizes. The torch arm measures the full production cost the
-native path removes: evaluating the MLX logits, bridging them to torch
-(``mlx_to_torch`` after the fp32 cast), then the vLLM sampler math
-(``BatchMinPLogitsProcessor`` + ``apply_top_k_top_p`` + softmax + exponential
-+ argmax on CPU), in the order ``Sampler`` applies them. The native arm times
-the ``SamplingBatch`` mask + categorical graph synchronously — in the decode
-pipeline the same graph defers with the step and overlaps the next forward, so
-its effective cost is lower than reported here.
+Times one non-greedy sampling step over a Qwen-sized vocabulary. The torch arm
+includes MLX evaluation, torch bridging, min-p, top-k/top-p, and categorical
+sampling. The native arm times the equivalent ``SamplingBatch`` graph.
 
 Usage:
 

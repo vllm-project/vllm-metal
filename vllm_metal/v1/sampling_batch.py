@@ -202,12 +202,8 @@ class SamplingBatch:
     ) -> bool:
         """Whether MLX categorical sampling matches *sampling_params_list*.
 
-        Mirror of :meth:`params_allow_native_greedy` for the non-greedy case:
-        every request must use plain temperature/top-k/top-p/min-p sampling,
-        with one shared ``(top_k, top_p, min_p)`` across the batch so a single mask
-        graph covers every row.
-        Seeded requests keep the torch path, whose per-request
-        ``torch.Generator`` contract MLX keys do not reproduce.
+        Requests must use plain temperature/top-k/top-p/min-p sampling with
+        one shared mask. Seeded requests stay on the torch path.
         """
         if not sampling_params_list:
             return False
@@ -273,19 +269,11 @@ class SamplingBatch:
         top_p: float,
         min_p: float,
     ) -> mx.array:
-        """Mask temperature-scaled logits to the top-k/top-p/min-p candidate set.
-
-        Mask semantics match vLLM's ``MinPLogitsProcessor`` followed by
-        ``apply_top_k_top_p``, in that order: ties at the top-k threshold
-        survive, while top-p masks sorted positions individually (boundary
-        ties do NOT all survive; which tied token survives follows sort
-        order). The leading sorted position carries zero leading mass, so
-        every valid ``top_p > 0`` keeps at least one candidate, and min-p
-        compares against that same leading position's probability so it
-        keeps at least one too. Non-candidates become ``-inf``.
-        """
+        """Mask temperature-scaled logits to the native candidate set."""
         vocab_size = int(scaled_logits.shape[-1])
         if 0 < top_k < vocab_size:
+            # Top-k can run before min-p: it preserves probability ratios
+            # among survivors and removes only tokens top-k would drop anyway.
             kth_largest = mx.min(
                 mx.topk(scaled_logits, k=top_k, axis=-1), axis=-1, keepdims=True
             )
@@ -318,11 +306,7 @@ class SamplingBatch:
         sampling_params_list: Sequence[SamplingParams],
         key: mx.array,
     ) -> mx.array:
-        """Lazy temperature/top-k/top-p/min-p token ids, one per row.
-
-        Only valid for batches that pass :meth:`params_allow_native_random`:
-        per-row temperature with one shared ``(top_k, top_p, min_p)``.
-        """
+        """Lazy temperature/top-k/top-p/min-p token ids, one per row."""
         temperatures = mx.array(
             [sp.temperature for sp in sampling_params_list], dtype=mx.float32
         )

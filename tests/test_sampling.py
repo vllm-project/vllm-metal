@@ -536,19 +536,10 @@ class TestV1SamplingBatch:
         assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
 
     def test_min_p_narrows_candidates_before_top_p(self) -> None:
-        """min_p must be applied before top_p on the native MLX path.
-
-        probs are [0.5, 0.4, 0.1]. min_p=0.25 masks token 2, and the softmax
-        over the survivors then reaches top_p=0.55 inside token 0 alone, so
-        token 0 is the only candidate. Measuring top_p first — or skipping
-        min_p — leaves the un-renormalized mass below 0.55 at token 1 and
-        wrongly admits it. Mirrors vLLM's order: MinPLogitsProcessor, then
-        apply_top_k_top_p.
-        """
+        """Native sampling applies min_p before top_p."""
         probs = [0.5, 0.4, 0.1]
         logits = mx.array([[float(np.log(p)) for p in probs]], dtype=mx.float32)
         params = [SamplingParams(temperature=1.0, top_p=0.55, min_p=0.25)]
-        # Shared (top_k, top_p, min_p) keeps the batch on the native path.
         assert SamplingBatch.params_allow_native_random(params)
 
         keys = iter([mx.random.key(seed) for seed in range(64)])
@@ -563,25 +554,13 @@ class TestV1SamplingBatch:
             )
             for _ in range(64)
         }
-        # min_p then top_p leaves one candidate; either error admits token 1.
         assert sampled == {0}
 
     def test_min_p_masks_after_temperature_on_torch_path(self) -> None:
-        """Seeded requests must get min_p from the sampler, after temperature.
-
-        At temperature 2.0 the scaled probs are [0.64, 0.24, 0.09, 0.03], so
-        min_p=0.3 keeps tokens 0 and 1. Thresholding the raw logits instead —
-        as masking before Sampler.forward() does — sees [0.87, 0.12, ...] and
-        keeps only token 0, while an empty LogitsProcessors drops min_p and
-        admits tokens 2 and 3. Exercises the real Sampler.forward() path via
-        sample_from_logits (seeded requests are excluded from the native
-        path).
-        """
+        """Torch sampling applies min_p after temperature."""
         sampler = Sampler()
         sampled = set()
         for seed in range(40):
-            # Fresh logits per call: mlx_to_torch hands the sampler a
-            # zero-copy view and apply_temperature scales it in place.
             logits = mx.array([[4.0, 2.0, 0.0, -2.0]], dtype=mx.float32)
             sp = SamplingParams(temperature=2.0, min_p=0.3, seed=seed)
             assert not SamplingBatch.params_allow_native_random([sp])
@@ -592,13 +571,10 @@ class TestV1SamplingBatch:
                 vocab_size=4,
                 generators={0: torch.Generator().manual_seed(seed)},
             )
-            # min_p must ride the argmax-invariant slot, which the sampler
-            # applies after temperature and before top-k/top-p.
             metadata = batch.make_sampling_metadata(torch.zeros(1, 4))
             assert len(list(metadata.logitsprocs.argmax_invariant)) == 1
 
             sampled.add(sample_from_logits(logits, batch, sampler).token_ids[0])
-        # Tokens 2 and 3 fall under min_p * max_prob on the scaled logits.
         assert sampled == {0, 1}
 
     def test_bad_words_blocks_greedy_token(self) -> None:
