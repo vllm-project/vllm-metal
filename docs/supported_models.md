@@ -88,6 +88,10 @@ end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
+Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
+checkpoints converted from it. Direct loading of the official serialized
+block-FP8 checkpoint is not supported.
+
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
@@ -103,6 +107,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
 | Phi 1.5 / Phi 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| Ling-3.0 Tiny | 🔵 | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |

@@ -9,6 +9,11 @@ from typing import Any
 
 import torch
 
+from vllm_metal.attention.runtime.families.bailing import (
+    BAILING_FAMILY,
+    BAILING_MODEL_TYPES,
+    build_bailing_hybrid_plan,
+)
 from vllm_metal.attention.runtime.families.gdn import (
     GDN_FAMILY,
     GDN_MODEL_TYPES,
@@ -39,6 +44,11 @@ class StateFamilyPlanBuilder:
 _STATE_FAMILY_PLAN_BUILDERS = (
     # ``ModelConfig.is_hybrid`` only says a model mixes attention and state
     # layers; the family that owns its topology and geometry is resolved here.
+    StateFamilyPlanBuilder(
+        model_types=BAILING_MODEL_TYPES,
+        family=BAILING_FAMILY,
+        build=build_bailing_hybrid_plan,
+    ),
     StateFamilyPlanBuilder(
         model_types=GDN_MODEL_TYPES,
         family=GDN_FAMILY,

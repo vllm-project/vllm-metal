@@ -281,6 +281,30 @@ _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
 ).family
 
 
+def make_bailing_hybrid_plan(
+    num_layers: int,
+    *,
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.float32),
+    **overrides: Any,
+) -> HybridRuntimePlan:
+    """Build a small Bailing V3 plan through the production family owner."""
+    return build_hybrid_runtime_plan(
+        {
+            "model_type": "bailing_hybrid",
+            "architectures": ["BailingMoeV3ForCausalLM"],
+            "layer_group_size": 2,
+            "num_attention_heads": 1,
+            "head_dim": 4,
+            "short_conv_kernel_size": 2,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+            **overrides,
+        },
+        num_layers,
+        state_dtypes,
+    )
+
+
 def make_gdn_hybrid_plan(
     num_layers: int,
     attention_indices: Iterable[int],

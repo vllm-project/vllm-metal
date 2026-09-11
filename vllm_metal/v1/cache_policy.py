@@ -32,7 +32,10 @@ from vllm_metal.attention.caches.turboquant import (
     V_QUANT_PARAMS,
     packed_dim,
 )
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.hybrid import (
+    HybridPagedAttentionRuntime,
+    MLAHybridPagedAttentionRuntime,
+)
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -584,10 +587,10 @@ class ModelCachePolicy:
         runtime: PagedAttentionRuntime,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        if self._runner.is_mla:
-            return
         if self._runner.is_hybrid:
             self._adopt_hybrid_scheduler_group(runtime, kv_cache_config)
+            return
+        if self._runner.is_mla:
             return
         self._adopt_mha_layout(runtime, kv_cache_config)
 
@@ -646,8 +649,8 @@ class ModelCachePolicy:
         )
         if len(group_indices) != 1:
             raise NotImplementedError(
-                "hybrid paged attention requires all SDPA layers to share one "
-                "scheduler KV group"
+                "hybrid paged attention requires all full-attention layers "
+                "to share one scheduler KV group"
             )
         group_index = group_indices[0]
         block_size = kv_cache_config.kv_cache_groups[
@@ -935,7 +938,14 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
-        return HybridPagedAttentionRuntime(
+        runtime_cls = HybridPagedAttentionRuntime
+        if self._runner.is_mla:
+            if config.turboquant:
+                raise NotImplementedError(
+                    "TurboQuant is not supported for hybrid MLA models"
+                )
+            runtime_cls = MLAHybridPagedAttentionRuntime
+        return runtime_cls(
             hybrid_plan=self._hybrid_plan(),
             max_num_seqs=self._runner.scheduler_config.max_num_seqs,
             num_kv_heads=self._runner.num_kv_heads,

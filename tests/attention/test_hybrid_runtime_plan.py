@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract tests for the hybrid runtime plan, its GDN family owner and the
-state-family factory."""
+"""Contract tests for the hybrid runtime plan and its state-family owners."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,18 +21,24 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.stub_runner import (
     NEMOTRON_H_TINY_ARGS,
+    make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
 )
+from vllm_metal.attention.impls.kda import KDAPagedAttentionWrapper
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
 from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper
+from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.attention.runtime.families.nemotron_h import (
     build_nemotron_h_hybrid_plan,
 )
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.hybrid import (
+    HybridPagedAttentionRuntime,
+    MLAHybridPagedAttentionRuntime,
+)
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -99,6 +106,26 @@ class _FakeModel(nn.Module):
         ]
 
 
+class _FakeBailingKDA(nn.Module):
+    q_proj = object()
+    k_proj = object()
+    v_proj = object()
+    q_conv1d = object()
+    k_conv1d = object()
+    v_conv1d = object()
+    projection_size = 4
+    conv_kernel_size = 2
+
+
+class _FakeBailingMLA(nn.Module):
+    pass
+
+
+class _FakeBailingLayer:
+    def __init__(self, attention: nn.Module) -> None:
+        self.attention = attention
+
+
 def _make_tiny_plan(state_dtypes=STATE_DTYPES) -> HybridRuntimePlan:
     """Four layers, attention at 1 and 3, geometry sized for the fakes."""
     return make_gdn_hybrid_plan(
@@ -133,6 +160,17 @@ def _make_runtime(state_dtypes=STATE_DTYPES) -> HybridPagedAttentionRuntime:
         max_num_seqs=2,
         num_kv_heads=1,
         head_dim=4,
+        block_size=4,
+        dtype=mx.float32,
+    )
+
+
+def _make_bailing_runtime(num_layers: int) -> MLAHybridPagedAttentionRuntime:
+    return MLAHybridPagedAttentionRuntime(
+        hybrid_plan=make_bailing_hybrid_plan(num_layers),
+        max_num_seqs=2,
+        num_kv_heads=1,
+        head_dim=6,
         block_size=4,
         dtype=mx.float32,
     )
@@ -241,6 +279,40 @@ class TestStateFamilyFactory:
 
         with pytest.raises(ValueError, match="must be positive integers"):
             build_hybrid_runtime_plan(args, 8, STATE_DTYPES)
+
+    def test_routes_bailing_args_to_the_kda_family(self) -> None:
+        plan = make_bailing_hybrid_plan(5)
+
+        assert plan.family.label == "kda"
+        assert plan.layers.attention_indices == (1, 3, 4)
+        assert plan.layers.state_indices == (0, 2)
+
+
+class TestBailingPlan:
+    @pytest.mark.parametrize(
+        ("name", "value", "error"),
+        [
+            ("short_conv_kernel_size", None, ValueError),
+            ("no_kda_lora", False, NotImplementedError),
+            ("kda_safe_gate", False, NotImplementedError),
+        ],
+    )
+    def test_unsupported_config_rejects_at_the_family_boundary(
+        self, name: str, value: object, error: type[Exception]
+    ) -> None:
+        with pytest.raises(error, match=name):
+            make_bailing_hybrid_plan(4, **{name: value})
+
+    def test_other_bailing_architecture_rejects(self) -> None:
+        with pytest.raises(NotImplementedError, match="BailingMoeV3ForCausalLM"):
+            make_bailing_hybrid_plan(4, architectures=["BailingMoeV2_5ForCausalLM"])
+
+    @pytest.mark.parametrize(
+        "group_size", [1, 5], ids=["unit_group", "group_exceeds_layers"]
+    )
+    def test_group_size_dropping_a_layer_role_rejects(self, group_size: int) -> None:
+        with pytest.raises(ValueError, match="2 <= layer_group_size <= num_layers"):
+            make_bailing_hybrid_plan(4, layer_group_size=group_size)
 
 
 class TestNemotronHPlanDecision:
@@ -445,6 +517,36 @@ class TestHybridPatchModel:
         assert gdn_2._gdn_cache_idx == 1
         assert gdn_0._gdn_state_cache is runtime.state_cache
         assert gdn_2._gdn_state_cache is runtime.state_cache
+
+    def test_bailing_interleaved_layers_use_compact_cache_indices(self) -> None:
+        runtime = _make_bailing_runtime(4)
+        runtime.initialize(num_blocks=3)
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    _FakeBailingLayer(_FakeBailingKDA()),
+                    _FakeBailingLayer(_FakeBailingMLA()),
+                    _FakeBailingLayer(_FakeBailingKDA()),
+                    _FakeBailingLayer(_FakeBailingMLA()),
+                ]
+            )
+        )
+
+        assert runtime.patch_model(model) == 4
+
+        layers = model.model.layers
+        assert all(
+            isinstance(layers[idx].attention, KDAPagedAttentionWrapper)
+            for idx in (0, 2)
+        )
+        assert all(
+            isinstance(layers[idx].attention, MLAPagedAttentionWrapper)
+            for idx in (1, 3)
+        )
+        assert [layers[idx].attention._kda_cache_idx for idx in (0, 2)] == [0, 1]
+        assert [layers[idx].attention._mla_layer_idx for idx in (1, 3)] == [0, 1]
+        assert runtime._cache.num_layers == 2
+        assert runtime.state_cache.num_layers == 2
 
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
         runtime_a = _make_runtime()
