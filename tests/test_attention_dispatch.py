@@ -294,3 +294,181 @@ def test_mixer_is_probed_only_when_a_family_opts_in() -> None:
 
     assert find_attn_attr(block) is None
     assert find_attn_attr(block, (*DEFAULT_ATTN_ATTR_NAMES, "mixer")) == "mixer"
+
+
+# ---------------------------------------------------------------------------
+# validate_paged_attention_support refuses unmanaged native cache topologies
+# ---------------------------------------------------------------------------
+
+
+def _make_policy_runner(model, *, num_layers: int, hybrid_plan=None, **attrs):
+    """Stub runner around a real mlx_lm model for cache-policy validation."""
+    from tests.stub_runner import make_stub_runner
+
+    return make_stub_runner(
+        model=model,
+        num_layers=num_layers,
+        num_kv_cache_layers=num_layers,
+        num_kv_heads=2,
+        is_hybrid=hybrid_plan is not None,
+        hybrid_runtime_plan=hybrid_plan,
+        **attrs,
+    )
+
+
+def _tiny_gdn_plan(num_layers, attention_indices):
+    """GDN plan with explicit topology; geometry is irrelevant to validation."""
+    from tests.stub_runner import make_gdn_hybrid_plan
+
+    return make_gdn_hybrid_plan(
+        num_layers,
+        attention_indices,
+        conv_kernel_dim=2,
+        conv_dim=4,
+        num_v_heads=1,
+        value_head_dim=4,
+        key_head_dim=32,
+    )
+
+
+def test_validate_rejects_falcon_h1_parallel_mamba():
+    """Falcon-H1 runs a Mamba-2 mixer next to self_attn in every layer (#655).
+
+    mlx-lm declares that topology as a ``CacheList`` per layer; no state
+    family owns it, and the dense paged runtimes manage one KV-style cache
+    per slot, so setup must refuse at validation time rather than crash on
+    the first request.
+    """
+    from mlx_lm.models.falcon_h1 import Model, ModelArgs
+
+    args = ModelArgs(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        mamba_n_heads=4,
+        mamba_d_head=16,
+        mamba_d_ssm=64,
+        mamba_d_state=16,
+        vocab_size=100,
+    )
+    runner = _make_policy_runner(Model(args), num_layers=2)
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        runner.validate_paged_attention_support()
+
+    message = str(excinfo.value)
+    assert "CacheList" in message
+    assert "native cache slot 0" in message
+    assert "VLLM_METAL_USE_PAGED_ATTENTION=0" in message
+
+
+def test_validate_rejects_native_cache_count_mismatch():
+    """A model declaring fewer native slots than KV layers must refuse."""
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import KVCache
+
+    model = SimpleNamespace(make_cache=lambda: [KVCache()])
+    runner = _make_policy_runner(model, num_layers=2)
+
+    with pytest.raises(
+        NotImplementedError, match=r"expected 2 native cache slots.*declares 1"
+    ):
+        runner.validate_paged_attention_support()
+
+
+def test_validate_accepts_dense_and_gdn_hybrid_models():
+    """Qwen3 (all KV slots) and Qwen3.5 (matching GDN plan) both pass."""
+    from mlx_lm.models.qwen3 import Model as Qwen3Model
+    from mlx_lm.models.qwen3 import ModelArgs as Qwen3Args
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    dense = _make_policy_runner(
+        Qwen3Model(Qwen3Args(**_QWEN3_ARGS_KWARGS)), num_layers=2
+    )
+    dense.validate_paged_attention_support()
+
+    hybrid = _make_policy_runner(
+        TextModel(TextModelArgs(**_QWEN35_ARGS_KWARGS)),
+        num_layers=4,
+        hybrid_plan=_tiny_gdn_plan(4, [3]),
+    )
+    hybrid.validate_paged_attention_support()
+
+
+def test_validate_accepts_shortconv_and_mamba2_state_families():
+    """LFM2 conv slots and Nemotron-H mixer slots match their family plans.
+
+    Nemotron-H also carries a stateless MLP block ('-'), which mlx-lm skips
+    when declaring caches; validation must line native slots up against the
+    plan's attention and state layers only.
+    """
+    import torch
+    from mlx_lm.models.lfm2 import Model as LFM2Model
+    from mlx_lm.models.lfm2 import ModelArgs as LFM2Args
+    from mlx_lm.models.nemotron_h import Model as NemotronHModel
+    from mlx_lm.models.nemotron_h import ModelArgs as NemotronHArgs
+
+    from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_nemotron_hybrid_plan
+    from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
+
+    lfm2_args = {
+        "model_type": "lfm2",
+        "vocab_size": 100,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 512,
+        "norm_eps": 1e-5,
+        "conv_bias": False,
+        "conv_L_cache": 3,
+        "block_dim": 64,
+        "block_ff_dim": 128,
+        "block_multiple_of": 64,
+        "block_ffn_dim_multiplier": 1.0,
+        "block_auto_adjust_ff_dim": False,
+        "layer_types": ["conv", "full_attention"],
+    }
+    lfm2 = _make_policy_runner(
+        LFM2Model(LFM2Args(**lfm2_args)),
+        num_layers=2,
+        hybrid_plan=build_hybrid_runtime_plan(lfm2_args, 2, (torch.float16,)),
+    )
+    lfm2.validate_paged_attention_support()
+
+    nemotron_args = {
+        **NEMOTRON_H_TINY_ARGS,
+        "num_hidden_layers": 3,
+        "hybrid_override_pattern": "M*-",
+    }
+    nemotron = _make_policy_runner(
+        NemotronHModel(NemotronHArgs(**nemotron_args)),
+        num_layers=3,
+        hybrid_plan=make_nemotron_hybrid_plan("M*-"),
+    )
+    nemotron.validate_paged_attention_support()
+
+
+def test_validate_rejects_hybrid_plan_disagreement():
+    """A hybrid whose declared split disagrees with the layer plan refuses.
+
+    The plan expects attention at slots 1 and 3, but the Qwen3.5 model
+    built with ``full_attention_interval=4`` declares ArraysCache at
+    slot 1 -- state the runtime would map to a KV-style cache.
+    """
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    runner = _make_policy_runner(
+        TextModel(TextModelArgs(**_QWEN35_ARGS_KWARGS)),
+        num_layers=4,
+        hybrid_plan=_tiny_gdn_plan(4, [1, 3]),
+    )
+
+    with pytest.raises(
+        NotImplementedError, match=r"ArraysCache at native cache slot 1"
+    ):
+        runner.validate_paged_attention_support()

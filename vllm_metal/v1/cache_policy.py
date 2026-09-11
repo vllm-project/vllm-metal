@@ -5,10 +5,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import mlx.core as mx
 import torch
+from mlx_lm.models import cache as mlx_lm_cache
+from mlx_vlm.models import cache as mlx_vlm_cache
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
@@ -33,7 +35,11 @@ from vllm_metal.attention.caches.turboquant import (
     packed_dim,
 )
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
-from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
+from vllm_metal.attention.runtime.hybrid_plan import (
+    ATTENTION_LAYER,
+    STATELESS_LAYER,
+    HybridRuntimePlan,
+)
 from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
@@ -69,6 +75,13 @@ def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int
 
 
 HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
+
+
+# Model loading goes through either package (mlx-vlm serves VLM-capable
+# families such as Qwen3.5), and each declares its own parallel cache class
+# hierarchy, so isinstance checks against native caches accept both.
+_STATE_CACHE_CLASSES = (mlx_lm_cache.ArraysCache, mlx_vlm_cache.ArraysCache)
+_STACKED_CACHE_CLASSES = (mlx_lm_cache.CacheList, mlx_vlm_cache.CacheList)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -281,6 +294,7 @@ class ModelCachePolicy:
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._require_supported_per_layer_shapes()
+        self._require_managed_native_caches()
         # ``require_uniform_kv_heads`` is the fail-fast for configs whose
         # ``num_global_key_value_heads`` differs from ``num_key_value_heads``
         # and which would silently fall back to the scalar uniform cache
@@ -294,6 +308,94 @@ class ModelCachePolicy:
                 self._runner.model_args,
                 self._runner.num_kv_heads,
             )
+
+    def _require_managed_native_caches(self) -> None:
+        """Refuse cache topologies no selected paged runtime manages.
+
+        ``make_prompt_cache`` is mlx-lm's declaration of the per-request
+        state each layer keeps.  The dense runtimes replace exactly one
+        KV-style cache per native slot, and a hybrid family's runtime
+        manages exactly the split its layer plan declares; a layer whose
+        declared state is a Mamba/conv ``ArraysCache`` outside that plan
+        or a ``CacheList`` stacking several caches (Falcon-H1, Jamba, ...)
+        would be left running against state nothing manages -- crashing on
+        the first request or silently losing state between decode steps
+        (#655).  Fail loud at setup instead.
+        """
+        runner = self._runner
+        native_caches = mlx_lm_cache.make_prompt_cache(runner._forward_model)
+
+        # Registered hybrid families validate against their layer plan.
+        if runner.is_hybrid:
+            self._validate_hybrid_native_caches(native_caches)
+            return
+
+        expected = runner.num_kv_cache_layers
+        if len(native_caches) != expected:
+            raise NotImplementedError(
+                f"Paged attention expected {expected} native cache slots, "
+                f"but mlx-lm declares {len(native_caches)}. This model uses "
+                "a cache topology the selected paged runtime does not "
+                "manage; set VLLM_METAL_USE_PAGED_ATTENTION=0."
+            )
+
+        unmanaged_classes = _STATE_CACHE_CLASSES + _STACKED_CACHE_CLASSES
+        for slot, cache in enumerate(native_caches):
+            if isinstance(cache, unmanaged_classes):
+                raise NotImplementedError(
+                    f"Paged attention cannot serve this model: mlx-lm "
+                    f"declares {type(cache).__name__} at native cache slot "
+                    f"{slot}, but the selected runtime manages only one "
+                    "KV-style cache per slot. Set "
+                    "VLLM_METAL_USE_PAGED_ATTENTION=0."
+                )
+
+    def _validate_hybrid_native_caches(self, native_caches: list[Any]) -> None:
+        """Check mlx-lm's declared cache layout against the hybrid layer plan.
+
+        A hybrid family's runtime manages one KV-style cache per attention
+        layer and the recurrent/conv state of every state layer; mlx-lm
+        declares that same split as KV-style vs ``ArraysCache`` slots, with
+        no slot for stateless layers (Nemotron-H MLP and MoE blocks).  Any
+        other layout carries state the runtime would not manage.
+        """
+        plan = self._hybrid_plan()
+        label = plan.family.label
+        stateful_layers = [
+            (layer_idx, role)
+            for layer_idx, role in enumerate(plan.layers.layer_roles)
+            if role != STATELESS_LAYER
+        ]
+        if len(native_caches) != len(stateful_layers):
+            raise NotImplementedError(
+                f"Hybrid paged attention expected {len(stateful_layers)} "
+                f"native cache slots (one per attention or state layer), "
+                f"but mlx-lm declares {len(native_caches)}. This model uses "
+                f"a cache topology the {label!r} runtime does not manage; "
+                "set VLLM_METAL_USE_PAGED_ATTENTION=0."
+            )
+        unmanaged_classes = _STATE_CACHE_CLASSES + _STACKED_CACHE_CLASSES
+        for slot, (cache, (layer_idx, role)) in enumerate(
+            zip(native_caches, stateful_layers, strict=True)
+        ):
+            if role == ATTENTION_LAYER:
+                if isinstance(cache, unmanaged_classes):
+                    raise NotImplementedError(
+                        f"Hybrid paged attention cannot serve this model: "
+                        f"mlx-lm declares {type(cache).__name__} at native "
+                        f"cache slot {slot}, but the {label!r} layer plan "
+                        f"maps layer {layer_idx} to attention, which manages "
+                        "only one KV-style cache. Set "
+                        "VLLM_METAL_USE_PAGED_ATTENTION=0."
+                    )
+            elif not isinstance(cache, _STATE_CACHE_CLASSES):
+                raise NotImplementedError(
+                    f"Hybrid paged attention cannot serve this model: mlx-lm "
+                    f"declares {type(cache).__name__} at native cache slot "
+                    f"{slot}, but the {label!r} layer plan maps layer "
+                    f"{layer_idx} to recurrent state, which manages only "
+                    f"{label!r} state. Set VLLM_METAL_USE_PAGED_ATTENTION=0."
+                )
 
     def scheduler_memory_reporting_mode(
         self,

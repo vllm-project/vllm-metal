@@ -61,6 +61,18 @@ load, since mlx-lm does not read `attention_head_dim` from the
 `nvidia/Nemotron-H-*` configs yet. These values describe default engine
 behavior, not exhaustive per-model benchmarking on Metal.
 
+Hybrid checkpoints route through the state-family table in
+`vllm_metal/attention/runtime/families/`; a hybrid model type with no
+registered family (Falcon-H1, Jamba, PLaMo-2) is refused at startup with a
+clear error ([#655](https://github.com/vllm-project/vllm-metal/issues/655)).
+Paged-attention setup also validates every native cache slot mlx-lm declares
+(`ModelCachePolicy.validate_paged_attention_support`): dense models must
+declare one KV-style cache per layer, and a hybrid family's declaration must
+match its layer plan, so per-request state nothing manages fails loud at
+setup instead of corrupting requests. Supporting a new family means
+registering an owner in the table (the GDN, Nemotron-H, and ShortConv owners
+are the examples).
+
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
 uppercase `"GEMM"`) and rejects unsupported variants (`gemv`, `bits != 4`,
