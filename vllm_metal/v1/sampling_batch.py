@@ -263,11 +263,11 @@ class SamplingBatch:
         )
 
     @staticmethod
-    def _top_k_top_p_min_p_masked_logits(
+    def _top_k_top_p_masked_logits(
         scaled_logits: mx.array,
         top_k: int,
         top_p: float,
-        min_p: float,
+        min_p: float = 0.0,
     ) -> mx.array:
         """Mask temperature-scaled logits to the native candidate set."""
         vocab_size = int(scaled_logits.shape[-1])
@@ -311,11 +311,11 @@ class SamplingBatch:
             [sp.temperature for sp in sampling_params_list], dtype=mx.float32
         )
         scaled = logits_2d.astype(mx.float32) / temperatures[:, None]
-        masked = cls._top_k_top_p_min_p_masked_logits(
+        masked = cls._top_k_top_p_masked_logits(
             scaled,
             sampling_params_list[0].top_k,
             sampling_params_list[0].top_p,
-            sampling_params_list[0].min_p,
+            min_p=sampling_params_list[0].min_p,
         )
         return mx.random.categorical(masked, axis=-1, key=key)
 
