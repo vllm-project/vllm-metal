@@ -55,6 +55,7 @@ class HybridGDNStateManager:
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
+        kv_block_ids: set[int] | None = None,
     ) -> None:
         """Attach stable GDN slot ids to one forward-pass context.
 
@@ -63,7 +64,7 @@ class HybridGDNStateManager:
         per request for its whole lifetime, so it ignores them.  Accepting
         them keeps both managers on one signature.
         """
-        del state_block_ids, step_positions
+        del state_block_ids, step_positions, kv_block_ids
         ctx.gdn_slot_mapping = self.assign_step_slots(req_ids)
 
     def assign_step_slots(self, req_ids: list[str]) -> list[int]:

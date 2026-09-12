@@ -26,7 +26,7 @@ Pending state handoff:
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -140,6 +140,11 @@ class GDNPagedStateCache:
     def num_state_pools(self) -> int:
         """Number of distinct physical state pools under the adopted layout."""
         return len(self._canonical_layers)
+
+    @property
+    def canonical_layers(self) -> list[int]:
+        """Cache indices owning the distinct physical pools."""
+        return list(self._canonical_layers)
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""
@@ -278,17 +283,6 @@ class GDNPagedStateCache:
             self.write_recurrent_rows(
                 layer_idx, self.recurrent_states[layer_idx][src], dst
             )
-
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler copy-on-write operations to every physical pool."""
-        if not block_copies:
-            return
-
-        src_ids, dst_ids = zip(*block_copies, strict=True)
-        self.apply_pending_states()
-        high_water = max(*src_ids, *dst_ids) + 1
-        self.ensure_capacity(high_water)
-        self.copy_slots(list(src_ids), list(dst_ids), self._canonical_layers)
 
     def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None:
         """Zero state slabs for the given layers (batched, lazy).

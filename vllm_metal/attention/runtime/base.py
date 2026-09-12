@@ -80,9 +80,10 @@ class PagedAttentionRuntimeBase:
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
+        kv_block_ids: set[int] | None = None,
     ) -> None:
         """Attach runtime-specific metadata to one forward-pass context."""
-        del req_ids, ctx, state_block_ids, step_positions
+        del req_ids, ctx, state_block_ids, step_positions, kv_block_ids
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         """Append runtime-owned side-effect arrays that must be eval'd."""

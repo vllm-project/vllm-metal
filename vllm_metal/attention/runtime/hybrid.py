@@ -101,15 +101,13 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             v_quant=self._v_quant,
         )
 
-        # Align-mode slabs are addressed directly by scheduler block id; any
-        # of the pool's blocks can become a mamba state block (the block pool
-        # is fungible across cache groups), so the id space is
-        # [0, num_blocks).  The paged plan charges every block for its state
-        # bytes (admission worst case), but the pool materializes lazily by
-        # high-water block id — vLLM's BlockPool hands out low ids first, so
-        # resident state memory tracks the live + cached set instead of
-        # wiring the whole worst case up front. Start empty so the scheduler's
-        # shared tensor layout is adopted before any physical pool exists.
+        # Align-mode slabs sit behind the state manager's compact
+        # block-id → slot indirection: a physical row exists per distinct
+        # mamba block holding state (live or cached), never per block-id
+        # span of the pool.  The paged plan still charges every block for
+        # its state bytes (admission worst case — any block can become a
+        # mamba block), but the pool materializes lazily by slot count and
+        # reclaims slots when ids move back to full-attention groups.
         # None mode keeps one slab per resident request and grows on demand.
         align = self._mamba_cache_mode == "align"
         state_slots = num_blocks if align else self._max_num_seqs
@@ -248,7 +246,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         """Apply scheduler CoW copies to SDPA KV and align-mode GDN state."""
         self.kv_cache.copy_blocks(block_copies)
         if self._mamba_cache_mode == "align":
-            self.state_cache.copy_blocks(block_copies)
+            assert isinstance(self._gdn_state_manager, AlignGDNStateManager)
+            self._gdn_state_manager.apply_block_copies(block_copies)
 
     def populate_step_context(
         self,
@@ -257,12 +256,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
+        kv_block_ids: set[int] | None = None,
     ) -> None:
         self.gdn_state_manager.populate_step_context(
             req_ids=req_ids,
             ctx=ctx,
             state_block_ids=state_block_ids,
             step_positions=step_positions,
+            kv_block_ids=kv_block_ids,
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:

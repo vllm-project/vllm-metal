@@ -1341,6 +1341,7 @@ class MetalModelRunner:
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
                 step_state_ids: list[list[list[int]]] | None = None
                 step_positions: list[tuple[int, int]] | None = None
+                step_kv_block_ids: set[int] | None = None
                 if self._paged_state_group_indices:
                     try:
                         step_state_ids = [
@@ -1363,11 +1364,27 @@ class MetalModelRunner:
                     step_positions.extend(
                         (pr.start_pos, len(pr.token_ids)) for pr in prefill_reqs
                     )
+                    # Full-attention group ids the scheduled requests hold:
+                    # a mamba-mapped id surfacing here has been reallocated
+                    # by the block pool, so its GDN slot can be reclaimed.
+                    step_kv_block_ids = {
+                        block_id
+                        for tables, _, _ in decode_info
+                        for row in tables
+                        for block_id in row
+                    }
+                    step_kv_block_ids.update(
+                        block_id
+                        for tables, _, _ in prefill_info
+                        for row in tables
+                        for block_id in row
+                    )
                 runtime.populate_step_context(
                     req_ids=step_req_ids,
                     ctx=ctx,
                     state_block_ids=step_state_ids,
                     step_positions=step_positions,
+                    kv_block_ids=step_kv_block_ids,
                 )
 
             # ---- forward (lazy graph + async submit) ----
