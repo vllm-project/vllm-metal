@@ -61,13 +61,13 @@ CORPUS_A = (
     "cache into fixed size blocks that the scheduler allocates on "
     "demand, and prefix caching lets a later request reuse blocks "
     "whose content hashes match. "
-) * 60
+)
 CORPUS_B = (
     "Recurrent state space layers summarize an arbitrarily long history "
     "into a fixed size matrix that is updated once per token, trading "
     "recall precision for constant memory and linear compute on long "
     "sequences of text. "
-) * 60
+)
 
 SUFFIXES = (
     " Summarize the key points now.",
@@ -86,10 +86,24 @@ def _child_env() -> None:
         os.environ.setdefault(key, val)
 
 
+def _tokens_at_least(tok, corpus: str, min_tokens: int) -> list[int]:
+    """Tokenize ``corpus`` repeated to exceed ``min_tokens``.
+
+    TurboQuant hybrid alignment grows ``block_size`` with the model's
+    state page (544 tokens for Qwen3.5-0.8B, ~3x that for the 27B), so a
+    fixed repetition count cannot cover every qualification target.
+    """
+    ids = tok(corpus)["input_ids"]
+    while len(ids) <= min_tokens:
+        ids = ids + ids
+    return ids
+
+
 def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
-    ids_edge = tok(CORPUS_A)["input_ids"]
-    ids_hit = ids_edge if shared_corpus else tok(CORPUS_B)["input_ids"]
-    assert min(len(ids_edge), len(ids_hit)) > 3 * block_size + 64
+    need = 3 * block_size + 64
+    ids_edge = _tokens_at_least(tok, CORPUS_A, need)
+    ids_hit = ids_edge if shared_corpus else _tokens_at_least(tok, CORPUS_B, need)
+    assert min(len(ids_edge), len(ids_hit)) > need
 
     singles: list[tuple[str, list[int]]] = []
     for k in (1,) if quick else (1, 2, 3):
