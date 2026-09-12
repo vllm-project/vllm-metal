@@ -7,6 +7,36 @@ import mlx.core as mx
 import numpy as np
 
 
+def native_sdpa_contiguous_decode(
+    query: mx.array,
+    key_cache: mx.array,
+    value_cache: mx.array,
+    first_block: int,
+    seq: int,
+    scale: float,
+) -> mx.array:
+    """Test-only reference: MLX native SDPA over a contiguous paged run.
+
+    ``query`` is ``(1, n_heads, head_dim)``.  The sequence occupies
+    ``key_cache`` rows ``[first_block * block_size, first_block * block_size + seq)``.
+    Production decode does **not** call this; it is the performance/numeric
+    ceiling used to check the paged GQA-decode kernel.
+    """
+    n_heads = int(query.shape[1])
+    dim = int(query.shape[2])
+    n_kv_heads = int(key_cache.shape[2])
+    block = int(key_cache.shape[1])
+    group = n_heads // n_kv_heads
+    flat_k = key_cache.reshape(-1, n_kv_heads, dim)
+    flat_v = value_cache.reshape(-1, n_kv_heads, dim)
+    row0 = first_block * block
+    k_view = flat_k[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
+    v_view = flat_v[row0 : row0 + seq].transpose(1, 0, 2)[:, None]
+    q_sdpa = query.reshape(n_kv_heads, group, 1, dim)
+    out = mx.fast.scaled_dot_product_attention(q_sdpa, k_view, v_view, scale=scale)
+    return out.reshape(1, n_heads, dim)
+
+
 def ref_paged_attn(
     query: mx.array,
     key_cache: mx.array,

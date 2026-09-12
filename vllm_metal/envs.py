@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -90,6 +91,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
+    # Emergency override for the GQA-shared flash-decode dispatch gate
+    # (issue #713): force long-context decode back to the established
+    # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
+    # hatch so controlled comparisons can run under the server topology.
+    "VLLM_METAL_DISABLE_GQA_DECODE": lambda: (
+        os.getenv("VLLM_METAL_DISABLE_GQA_DECODE", "0") == "1"
+    ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
     # unless this opt-in is set. Set to "1" to merge K+1 verify windows
