@@ -25,6 +25,13 @@ prefill — is mathematically but not bitwise equal, so downstream greedy
 near-ties may flip (observed: identical top-2 logprobs at the flip).  This
 is the same fp-path caveat as upstream's decode-KV block reuse.
 
+Since the tie-level mechanism is inherent to any restore-vs-recompute
+pair on fp hardware (not just the decode-completed-checkpoint case above),
+the gate waives a mismatch when either arm's top-2 logprobs are bitwise
+equal at the flip position (an exact tie): neither choice is wrong.
+Mismatches without an exact tie stay hard failures — that class is what
+the gate exists to catch (real state corruption).
+
 Both children assert reach so the gate cannot silently test the wrong
 thing: the cached child must resolve to align mode with
 ``mamba_block_size == block_size`` and must admit at least one request at a
@@ -137,6 +144,23 @@ def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
     return singles, batch
 
 
+def _top2_gaps(output) -> list[float]:
+    """Per generated token: top1 logprob minus top2 logprob.
+
+    An exact 0.0 means the greedy choice sat on a bitwise tie — the
+    documented tie-level property (see module docstring): a restore path
+    that lands two candidates on identical logprobs can pick either
+    without either arm being wrong.
+    """
+    gaps = []
+    for lp_dict in output.logprobs:
+        ranked = sorted(lp_dict.values(), key=lambda lp: -lp.logprob)
+        gaps.append(
+            ranked[0].logprob - ranked[1].logprob if len(ranked) > 1 else float("inf")
+        )
+    return gaps
+
+
 def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
     _child_env()
     from vllm import LLM, SamplingParams
@@ -180,16 +204,21 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
 
         tok = llm.get_tokenizer()
         singles, batch = build_cases(tok, block_size, shared_corpus, quick)
-        sp = SamplingParams(temperature=0, max_tokens=24)
+        sp = SamplingParams(temperature=0, max_tokens=24, logprobs=2)
 
         results: dict[str, list[int]] = {}
+        gaps: dict[str, list[float]] = {}
         for rnd in (1, 2):
             for tag, token_ids in singles:
                 out = llm.generate([{"prompt_token_ids": token_ids}], sp)[0]
-                results[f"{tag}/r{rnd}"] = list(out.outputs[0].token_ids)
+                key = f"{tag}/r{rnd}"
+                results[key] = list(out.outputs[0].token_ids)
+                gaps[key] = _top2_gaps(out.outputs[0])
         outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
         for (tag, _), out in zip(batch, outs, strict=True):
-            results[f"{tag}/batched"] = list(out.outputs[0].token_ids)
+            key = f"{tag}/batched"
+            results[key] = list(out.outputs[0].token_ids)
+            gaps[key] = _top2_gaps(out.outputs[0])
     finally:
         mr_mod.MetalModelRunner._handle_new_requests = orig
 
@@ -198,7 +227,7 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
         assert hits and any(n % block_size == 0 for n in hits), (
             f"cached arm admitted no block-aligned restore: {admissions}"
         )
-    queue.put(results)
+    queue.put((results, gaps))
 
 
 def run_pair(model, mnbt, shared_corpus, quick=False):
@@ -236,13 +265,24 @@ def run_pair(model, mnbt, shared_corpus, quick=False):
                 proc.terminate()
         if proc.exitcode != 0:
             raise RuntimeError(f"child exited with {proc.exitcode}")
-    reference, cached = per_mode[False], per_mode[True]
-    mismatches = {
-        key: {"ref": reference[key], "cached": cached[key]}
-        for key in reference
-        if reference[key] != cached[key]
-    }
-    return len(reference), mismatches
+    reference, cached = per_mode[False][0], per_mode[True][0]
+    ref_gaps, cached_gaps = per_mode[False][1], per_mode[True][1]
+    mismatches: dict[str, dict] = {}
+    tie_level: dict[str, dict] = {}
+    for key in reference:
+        if reference[key] == cached[key]:
+            continue
+        entry = {"ref": reference[key], "cached": cached[key]}
+        flip = next(
+            i
+            for i, (a, b) in enumerate(zip(reference[key], cached[key], strict=False))
+            if a != b
+        )
+        exact_tie = (flip < len(ref_gaps[key]) and ref_gaps[key][flip] == 0.0) or (
+            flip < len(cached_gaps[key]) and cached_gaps[key][flip] == 0.0
+        )
+        (tie_level if exact_tie else mismatches)[key] = entry
+    return len(reference), mismatches, tie_level
 
 
 def main() -> int:
@@ -267,12 +307,21 @@ def main() -> int:
         arms = (("defaults", None), ("mnbt1088", 1088))
     failed = False
     for arm_name, mnbt in arms:
-        n_cases, mismatches = run_pair(args.model, mnbt, args.shared_corpus, args.quick)
+        n_cases, mismatches, tie_level = run_pair(
+            args.model, mnbt, args.shared_corpus, args.quick
+        )
         failed = failed or bool(mismatches)
         print(
-            f"[{arm_name}] {n_cases} comparisons, {len(mismatches)} mismatches",
+            f"[{arm_name}] {n_cases} comparisons, {len(mismatches)} divergent, "
+            f"{len(tie_level)} tie-level (waived)",
             flush=True,
         )
+        if tie_level:
+            print(
+                f"  tie-level (exact top-2 logprob ties at the flip): "
+                f"{sorted(tie_level)}",
+                flush=True,
+            )
         if mismatches:
             print(json.dumps(mismatches, indent=2), flush=True)
     print("PARITY FAIL" if failed else "PARITY PASS")
