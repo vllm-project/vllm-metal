@@ -244,6 +244,60 @@ class TestAlignGDNStateManager:
         assert manager.occupied_slots == 2
         assert cache.allocated_seqs == 2  # no growth
 
+    def test_pending_state_drains_before_retirement(self) -> None:
+        # A deferred compact update parked on a slot must be written back
+        # before that slot's block retires inside the same CoW step — the
+        # drain settles writes into rows about to be handed out again.
+        cache = _make_cache(num_blocks=8, initial_blocks=0)
+        manager = AlignGDNStateManager(cache, BLOCK)
+        self._populate(manager, ["req-A"], [[[2]]], [(3, 1)])
+        self._populate(manager, ["req-B"], [[[3]]], [(3, 1)])
+        _fill_slab(cache, 0, manager.slot_for(3), 5.0)
+        slot2 = manager.slot_for(2)
+        update = mx.full(
+            (1,) + cache.conv_states[0].shape[1:],
+            9.0,
+            dtype=cache.conv_states[0].dtype,
+        )
+        cache.set_pending_conv_state(0, [slot2], update)
+
+        # Block 2 retires via KV ids while CoW 3→7 reuses its slot.
+        manager.apply_block_copies([(3, 7)], kv_block_ids={2})
+
+        assert not cache.has_pending_conv_state(0)  # drained, not dropped
+        assert manager.slot_for(2) is None
+        assert manager.slot_for(7) == slot2
+        conv, _ = _slab(cache, 0, manager.slot_for(7))
+        np.testing.assert_array_equal(conv, 5.0)  # src bytes won the slot
+
+    def test_shared_pool_cow_after_retirement_keeps_aliased_content(self) -> None:
+        # One physical pool shared by two groups: CoW + retirement in the
+        # same step must land dst rows in the shared array (visible
+        # through either layer index) and leave the other group's
+        # still-mapped rows untouched.
+        cache = _make_cache(num_layers=2, num_blocks=8, initial_blocks=0)
+        cache.set_layer_layout([0, 1], [0, 0])
+        assert cache.num_state_pools == 1
+        manager = AlignGDNStateManager(cache, BLOCK)
+        self._populate(manager, ["req-A"], [[[2, 6], [3, 4]]], [(4, 1)])
+        freed_slot = manager.slot_for(3)
+        _fill_slab(cache, 0, manager.slot_for(2), 5.0)
+        _fill_slab(cache, 1, manager.slot_for(4), 8.0)
+
+        # Group 1's block 3 flips to a KV group; group 0's CoW 2→7
+        # arrives with the same step's KV ids.
+        manager.apply_block_copies([(2, 7)], kv_block_ids={3})
+
+        assert manager.slot_for(3) is None
+        assert cache.allocated_seqs == 4  # no growth beyond the 4 mapped
+        assert manager.slot_for(7) == freed_slot
+        conv_l0, _ = _slab(cache, 0, manager.slot_for(7))
+        conv_l1, _ = _slab(cache, 1, manager.slot_for(7))
+        np.testing.assert_array_equal(conv_l0, 5.0)
+        np.testing.assert_array_equal(conv_l1, 5.0)  # alias sees the copy
+        conv_survivor, _ = _slab(cache, 1, manager.slot_for(4))
+        np.testing.assert_array_equal(conv_survivor, 8.0)  # untouched
+
 
 class TestHybridAlignRuntime:
     def _make_runtime(self) -> HybridPagedAttentionRuntime:
