@@ -27,10 +27,15 @@ is the same fp-path caveat as upstream's decode-KV block reuse.
 
 Since the tie-level mechanism is inherent to any restore-vs-recompute
 pair on fp hardware (not just the decode-completed-checkpoint case above),
-the gate waives a mismatch when either arm's top-2 logprobs are bitwise
-equal at the flip position (an exact tie): neither choice is wrong.
-Mismatches without an exact tie stay hard failures — that class is what
-the gate exists to catch (real state corruption).
+the gate can waive a mismatch as tie-level — but only when a diagnostic
+rerun reproduces the strict pass's flip exactly (same index, same per-arm
+tokens, same common prefix) and one of its arms sits on a bitwise-equal
+top-2 tie whose pair is exactly the two tokens the arms chose: neither
+choice is wrong. Everything else — no tie, a tie between other tokens, or
+a rerun that tells a different story — stays a hard failure; that class
+is what the gate exists to catch (real state corruption). The strict pass
+requests no logprobs so native greedy and the decode pipeline stay
+eligible; the diagnostic rerun alone pays the logprobs path cost.
 
 Both children assert reach so the gate cannot silently test the wrong
 thing: the cached child must resolve to align mode with
@@ -317,15 +322,84 @@ def _run_child_pair(ctx, model, mnbt, shared_corpus, quick, collect_gaps=False):
     return per_mode
 
 
+def first_flip(ref_toks, cached_toks) -> int | None:
+    """Index of the first position where the two outputs disagree.
+
+    ``None`` when identical. A pure length difference (one output a
+    prefix of the other) flips at the shorter output's end — a real
+    mismatch, not an exception.
+    """
+    for i, (a, b) in enumerate(zip(ref_toks, cached_toks, strict=False)):
+        if a != b:
+            return i
+    if len(ref_toks) != len(cached_toks):
+        return min(len(ref_toks), len(cached_toks))
+    return None
+
+
+def _tok_at(toks, i):
+    return toks[i] if i < len(toks) else None
+
+
+def classify_mismatches(
+    strict_ref: dict[str, list[int]],
+    strict_cached: dict[str, list[int]],
+    diag_ref: dict[str, list[int]] | None,
+    diag_cached: dict[str, list[int]] | None,
+    diag_ref_gaps: dict[str, list[list]] | None,
+    diag_cached_gaps: dict[str, list[list]] | None,
+) -> tuple[list[str], list[str]]:
+    """Split strict-pass mismatches into (divergent, tie-level-waived).
+
+    A strict mismatch may only be waived when the diagnostic rerun
+    *reproduces* it — same first-flip index, same per-arm token at that
+    index, same common prefix — and an arm of the rerun sits on an exact
+    top-2 tie whose pair is exactly the two tokens the arms chose. The
+    diagnostic pass takes the non-native sampling path, so anything it
+    shows that the strict pass did not reproduce cannot excuse the
+    strict failure: it describes a different execution, and the failure
+    stays (including when the rerun converged outright).
+    """
+    divergent: list[str] = []
+    waived: list[str] = []
+    for key in strict_ref:
+        if strict_ref[key] == strict_cached[key]:
+            continue
+        s_flip = first_flip(strict_ref[key], strict_cached[key])
+        tied = False
+        if (
+            diag_ref is not None
+            and diag_cached is not None
+            and key in diag_ref
+            and key in diag_cached
+            and diag_ref[key] != diag_cached[key]
+        ):
+            d_flip = first_flip(diag_ref[key], diag_cached[key])
+            reproduced = (
+                d_flip == s_flip
+                and _tok_at(diag_ref[key], d_flip) == _tok_at(strict_ref[key], s_flip)
+                and _tok_at(diag_cached[key], d_flip)
+                == _tok_at(strict_cached[key], s_flip)
+                and diag_ref[key][:d_flip] == strict_ref[key][:s_flip]
+            )
+            if reproduced:
+                chosen = {
+                    _tok_at(strict_ref[key], s_flip),
+                    _tok_at(strict_cached[key], s_flip),
+                }
+                for gaps in (diag_ref_gaps, diag_cached_gaps):
+                    rows = None if gaps is None else gaps.get(key)
+                    if rows is None or s_flip >= len(rows):
+                        continue
+                    gap, t1, t2 = rows[s_flip]
+                    if gap == 0.0 and {t1, t2} == chosen:
+                        tied = True
+        (waived if tied else divergent).append(key)
+    return divergent, waived
+
+
 def run_pair(model, mnbt, shared_corpus, quick=False):
     ctx = mp.get_context("spawn")
-
-    def first_flip(ref_toks, cached_toks):
-        return next(
-            i
-            for i, (a, b) in enumerate(zip(ref_toks, cached_toks, strict=False))
-            if a != b
-        )
 
     # Pass 1 — strict, production sampling path (no logprobs requested).
     strict = _run_child_pair(ctx, model, mnbt, shared_corpus, quick)
@@ -337,43 +411,30 @@ def run_pair(model, mnbt, shared_corpus, quick=False):
             print(f"  [arm] SKIPPED: {reason}", flush=True)
         return 0, {}, {}
     reference, cached = strict[False][0], strict[True][0]
-    mismatched_keys = [k for k in reference if reference[k] != cached[k]]
-    tie_level: dict[str, dict] = {}
-    if mismatched_keys:
+    diag_ref = diag_cached = diag_ref_gaps = diag_cached_gaps = None
+    if any(reference[k] != cached[k] for k in reference):
         # Pass 2 — diagnostic rerun with logprobs to classify the flips.
-        # The rerun itself takes the non-native path, so its tokens may
-        # differ from the strict pass; classification therefore uses the
-        # rerun's own flip, and strict-only flips stay hard failures.
         diag = _run_child_pair(
             ctx, model, mnbt, shared_corpus, quick, collect_gaps=True
         )
-        d_ref, d_cached = diag[False][0], diag[True][0]
-        d_ref_gaps, d_cached_gaps = diag[False][1], diag[True][1]
-        still_bad = []
-        for key in mismatched_keys:
-            if key not in d_ref or d_ref[key] == d_cached[key]:
-                print(
-                    f"  [diag] {key}: rerun converged — path-sensitive, "
-                    "kept as failure",
-                    flush=True,
-                )
-                continue
-            flip = first_flip(d_ref[key], d_cached[key])
-            chosen = {d_ref[key][flip], d_cached[key][flip]}
-
-            def tied_pair(arm_gaps, _flip=flip, _chosen=chosen):
-                if arm_gaps is None or _flip >= len(arm_gaps):
-                    return False
-                gap, t1, t2 = arm_gaps[_flip]
-                return gap == 0.0 and {t1, t2} == _chosen
-
-            if tied_pair(d_ref_gaps.get(key)) or tied_pair(d_cached_gaps.get(key)):
-                tie_level[key] = {"ref": reference[key], "cached": cached[key]}
-            else:
-                still_bad.append(key)
-        mismatched_keys = still_bad
+        diag_ref, diag_cached = diag[False][0], diag[True][0]
+        diag_ref_gaps, diag_cached_gaps = diag[False][1], diag[True][1]
+    divergent, waived = classify_mismatches(
+        reference, cached, diag_ref, diag_cached, diag_ref_gaps, diag_cached_gaps
+    )
+    for key in divergent:
+        if (
+            diag_ref is not None
+            and key in diag_ref
+            and diag_ref[key] == diag_cached.get(key)
+        ):
+            print(
+                f"  [diag] {key}: rerun converged — path-sensitive, failure retained",
+                flush=True,
+            )
+    tie_level = {key: {"ref": reference[key], "cached": cached[key]} for key in waived}
     mismatches = {
-        key: {"ref": reference[key], "cached": cached[key]} for key in mismatched_keys
+        key: {"ref": reference[key], "cached": cached[key]} for key in divergent
     }
     return len(reference), mismatches, tie_level
 
@@ -388,6 +449,15 @@ def main() -> int:
         "documented decode-completed-checkpoint tie-level divergence)",
     )
     parser.add_argument(
+        "--chunked-mnbt",
+        type=int,
+        default=1088,
+        help="max_num_batched_tokens for the chunked arm. The default 1088 "
+        "= 2x544 targets 544-block models; for e.g. 784-block models pass "
+        "1568 (= 2x784) — a non-block-aligned chunk size makes the arm "
+        "skip loudly instead of running misaligned",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="reduced gate for the slow pytest wrapper: defaults arm only, "
@@ -397,7 +467,7 @@ def main() -> int:
 
     arms = (("defaults", None),)
     if not args.quick:
-        arms = (("defaults", None), ("mnbt1088", 1088))
+        arms = (("defaults", None), (f"mnbt{args.chunked_mnbt}", args.chunked_mnbt))
     failed = False
     for arm_name, mnbt in arms:
         n_cases, mismatches, tie_level = run_pair(
