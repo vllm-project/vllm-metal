@@ -42,7 +42,14 @@ class MultimodalEncodeResult(Protocol):
 
 
 class MultimodalRuntimeAdapter(Protocol):
-    """Model-owned behavior needed for native multimodal execution."""
+    """Model-owned behavior needed for native multimodal execution.
+
+    Adapters may additionally implement ``profile_features() ->
+    list[MultiModalFeatureSpec]`` returning one feature of the largest
+    encoder input; ``MetalModelRunner.profile_run`` encodes it so the
+    measured allocator overhead covers the vision tower.  Absent method
+    means no encoder profiling (Qwen3-VL, PaddleOCR-VL today).
+    """
 
     forward_ready: bool
     """Whether scheduled multimodal encoder inputs may be executed.
@@ -60,6 +67,26 @@ class MultimodalRuntimeAdapter(Protocol):
     zero-offset caches and no ``position_ids``, so the LM would re-derive
     every position from 0.  Routing through ``call_lm`` keeps positions
     explicit on every batch.
+    """
+
+    supplies_segment_positions: bool
+    """Whether the runner hands this adapter's per-segment positions to the
+    paged attention context (``ctx.segment_positions``).
+
+    True for M-RoPE models whose attention reads caller-supplied positions
+    (the runner assumes True when the attribute is absent).  False for
+    models with plain 1-D RoPE driven by ``ctx.offsets``: their mlx_lm
+    ``rope(x, offset=)`` modules reject caller-supplied positions, and
+    keeping the context field ``None`` preserves the batched decode RoPE
+    path.  ``call_lm`` still receives ``position_ids`` either way.
+    """
+
+    text_path_selective_logits_ok: bool
+    """Whether text-only batches may use selective logits (``logits_indices``).
+
+    Only adapters whose ``text_model()`` is the same object the runner
+    profiles with ``supports_selective_logits`` may set this; the runner
+    assumes False when the attribute is absent.
     """
 
     def text_model(self) -> Any:

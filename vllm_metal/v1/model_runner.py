@@ -312,6 +312,21 @@ class _PagedLogitsLayout(NamedTuple):
     cu_seqlens: list[int]
 
 
+def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> bool:
+    """Whether the split backbone/head path may serve this model's text batches.
+
+    Text-only models always qualify.  A VLM qualifies only when its adapter
+    declares ``text_path_selective_logits_ok``: its text batches run the
+    plain text path on the very object ``runner.model`` refers to, so the
+    bit-exactness probe in ``supports_selective_logits`` applies.  The mm
+    forward never requests selected rows, so the flag affects text batches
+    only.
+    """
+    if not is_vlm:
+        return True
+    return bool(getattr(adapter, "text_path_selective_logits_ok", False))
+
+
 class _PagedForwardState(NamedTuple):
     """State stashed by ``_start_paged_forward`` for ``_sample_paged_batch``."""
 
@@ -636,7 +651,9 @@ class MetalModelRunner:
         # other forward branches that never request selection.
         self._selective_logits_supported = (
             self.pp is None
-            and not self._is_vlm
+            and text_path_selective_logits_allowed(
+                self._is_vlm, self._multimodal_adapter
+            )
             and not self._lora.enabled
             and self._model_adapter.supports_selective_logits(self._forward_model)
         )
@@ -867,9 +884,27 @@ class MetalModelRunner:
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
         mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        # The vision encoder runs outside the text forward; profile it too so
+        # the buffer-cache cap covers one encoder pass (the runner encodes
+        # features one adapter call per step, so one maximal feature is the
+        # peak).
+        mx.eval(*self._dummy_encoder_outputs())
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
+
+    def _dummy_encoder_outputs(self) -> list[mx.array]:
+        """Encoder outputs for one profiling feature, when the adapter offers one."""
+        adapter = self._multimodal_adapter
+        if adapter is None or not adapter.forward_ready:
+            return []
+        profile_features = getattr(adapter, "profile_features", None)
+        if profile_features is None:
+            return []
+        features = profile_features()
+        if not features:
+            return []
+        return [result.hidden_states for result in adapter.encode_multimodal(features)]
 
     def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
         if self._is_pooling:
@@ -1920,9 +1955,11 @@ class MetalModelRunner:
         positions for mm prefill chunks, computed as ``cache_start_pos +
         delta + arange(num_query_tokens)`` for mm decode), splices vision
         embeds into the packed text embeds at placeholder positions
-        (chunk-aware: each feature only contributes the slice that lands
-        in *this* chunk), and concatenates per-layer deepstack residual
-        arrays across all mm prefill segments in packed order.
+        flagged by ``mm_position.is_embed`` (all positions when the mask
+        is absent), chunk-aware: each feature only contributes the
+        encoder rows whose placeholders land in *this* chunk, and
+        concatenates per-layer deepstack residual arrays across all mm
+        prefill segments in packed order.
 
         Sets ``ctx.segment_positions`` so ``apply_packed_rope`` reads
         caller-supplied positions on mm segments and falls back to the
@@ -2019,8 +2056,9 @@ class MetalModelRunner:
                 position_ids_parts.append(seg_positions)
 
                 for feature in sorted_features:
-                    f_start = feature.mm_position.offset
-                    f_end = f_start + feature.mm_position.length
+                    position = feature.mm_position
+                    f_start = position.offset
+                    f_end = f_start + position.length
                     chunk_start = pr.start_pos
                     chunk_end = pr.start_pos + n
                     inter_start = max(f_start, chunk_start)
@@ -2031,6 +2069,16 @@ class MetalModelRunner:
                     chunk_local = inter_start - chunk_start
                     feature_local = inter_start - f_start
 
+                    # ``is_embed`` marks which placeholder positions take an
+                    # encoder row: Gemma 4 wraps its image tokens in boi/eoi
+                    # text tokens, so the encoder emits fewer rows than the
+                    # placeholder is long.  ``None`` means every position.
+                    embed_start, embed_end = position.get_embeds_indices_in_range(
+                        feature_local, feature_local + length
+                    )
+                    if embed_start == embed_end:
+                        continue  # only boi/eoi landed in this chunk
+
                     result = encoder_cache.encoder_outputs.get(feature.identifier)
                     if result is None:
                         raise RuntimeError(
@@ -2040,13 +2088,19 @@ class MetalModelRunner:
                         )
 
                     packed_start = cursor + chunk_local
-                    visual_pos_masks_np[packed_start : packed_start + length] = True
+                    is_embed = position.is_embed
+                    if is_embed is None:
+                        visual_pos_masks_np[packed_start : packed_start + length] = True
+                    else:
+                        visual_pos_masks_np[packed_start : packed_start + length] = (
+                            is_embed[feature_local : feature_local + length]
+                            .cpu()
+                            .numpy()
+                        )
 
-                    mm_embeds_parts.append(
-                        result.hidden_states[feature_local : feature_local + length]
-                    )
+                    mm_embeds_parts.append(result.hidden_states[embed_start:embed_end])
 
-                    # Deepstack: same chunk-aware slice per layer.
+                    # Deepstack: same embed-aware slice per layer.
                     layers = result.deepstack_visual_embeds
                     this_has = layers is not None
                     if deepstack_present is None:
@@ -2065,8 +2119,7 @@ class MetalModelRunner:
                     assert layers is not None
                     if not deepstack_per_layer:
                         deepstack_per_layer = [
-                            [layer[feature_local : feature_local + length]]
-                            for layer in layers
+                            [layer[embed_start:embed_end]] for layer in layers
                         ]
                     elif len(deepstack_per_layer) != len(layers):
                         raise RuntimeError(
@@ -2077,7 +2130,7 @@ class MetalModelRunner:
                     else:
                         for layer_idx, layer in enumerate(layers):
                             deepstack_per_layer[layer_idx].append(
-                                layer[feature_local : feature_local + length]
+                                layer[embed_start:embed_end]
                             )
             else:
                 # text prefill: mark segment as None so attention uses the
@@ -2108,11 +2161,18 @@ class MetalModelRunner:
 
         position_ids = mx.concatenate(position_ids_parts, axis=2)
 
-        # Hand per-segment positions to ``apply_packed_rope`` via the
-        # paged context, overriding the sequential-arange policy.
+        # Hand per-segment positions to ``apply_packed_rope`` via the paged
+        # context, unless the adapter's LM derives positions from
+        # ``ctx.offsets`` (mlx_lm ``rope(x, offset=)`` rejects explicit
+        # positions, and a list of ``None`` would also defeat the batched
+        # decode RoPE path).
         ctx = get_context()
         if ctx is not None:
-            ctx.segment_positions = ctx_segment_positions
+            ctx.segment_positions = (
+                ctx_segment_positions
+                if getattr(adapter, "supplies_segment_positions", True)
+                else None
+            )
 
         mm_prefill_deltas = {
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
