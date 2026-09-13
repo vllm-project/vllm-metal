@@ -501,6 +501,7 @@ class TestMetalPlatform:
             "max_model_len": 32768,
             "hf_config": SimpleNamespace(model_type="qwen3"),
             "is_hybrid": False,
+            "dtype": torch.float16,
         }
         model_fields.update(model or {})
         return self._platform_config(
@@ -694,6 +695,57 @@ class TestMetalPlatform:
 
         with pytest.raises(NotImplementedError, match="heterogeneous KV cache dtypes"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        "cache_dtype", ["fp8", "fp8_e4m3", "fp8_e5m2", "int8_per_token_head", "nvfp4"]
+    )
+    def test_check_and_update_config_rejects_resolved_quantized_kv_cache_dtype(
+        self, cache_dtype: str
+    ) -> None:
+        """Quantized KV dtypes are rejected rather than silently ignored.
+
+        vLLM logs the quantized dtype as in use, but Metal stores the paged KV
+        cache in the model dtype, so the memory saving would never happen.
+        """
+        vllm_config = self._dp_vllm_config()
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.cache_config.cache_dtype = cache_dtype
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            MetalPlatform.check_and_update_config(vllm_config)
+        message = str(exc_info.value)
+        assert f"--kv-cache-dtype {cache_dtype}" in message
+        assert "--kv-cache-dtype float16" in message
+        assert "--kv-cache-dtype auto" not in message
+
+    @pytest.mark.parametrize(
+        ("model_dtype", "cache_dtype"),
+        [(torch.float16, "bfloat16"), (torch.bfloat16, "float16")],
+        ids=["fp16-model-bf16-cache", "bf16-model-fp16-cache"],
+    )
+    def test_check_and_update_config_rejects_dense_kv_cache_dtype_mismatch(
+        self, model_dtype: torch.dtype, cache_dtype: str
+    ) -> None:
+        vllm_config = self._dp_vllm_config(model={"dtype": model_dtype})
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.cache_config.cache_dtype = cache_dtype
+
+        with pytest.raises(NotImplementedError, match="stored in the model dtype"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("model_dtype", "cache_dtype"),
+        [(torch.float16, "float16"), (torch.bfloat16, "bfloat16")],
+        ids=["fp16", "bf16"],
+    )
+    def test_check_and_update_config_accepts_matching_dense_kv_cache_dtype(
+        self, model_dtype: torch.dtype, cache_dtype: str
+    ) -> None:
+        vllm_config = self._dp_vllm_config(model={"dtype": model_dtype})
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.cache_config.cache_dtype = cache_dtype
+
+        MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_heterogeneous_draft_vocab(self) -> None:
         """A draft vocabulary that differs from the target is unsupported.

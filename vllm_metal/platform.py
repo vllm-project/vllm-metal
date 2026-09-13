@@ -33,6 +33,13 @@ _MB_BUFFER_MAX_BATCHED_TOKENS = 4096
 # Only the local executors share this process's memory and inherit its
 # environment; Ray workers must not receive a driver-derived value.
 _MB_BUFFER_LOCAL_BACKENDS = ("uni", "mp")
+_METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+_METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
+    dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
+}
 
 
 def _pick_mb_buffer_default(
@@ -473,6 +480,35 @@ class MetalPlatform(Platform):
                 "which populates skip layers upstream). Enable TurboQuant with "
                 "--additional-config '{\"turboquant\": true}' instead."
             )
+
+        # vLLM accepts quantized KV cache dtypes and logs them as in use, but the
+        # Metal paged KV cache is always stored in the model dtype, so the
+        # requested memory saving would silently never happen. TurboQuant is
+        # Metal's quantized KV cache.
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype != "auto":
+            model_dtype = vllm_config.model_config.dtype
+            model_cache_dtype = _METAL_DENSE_KV_CACHE_DTYPE_NAMES.get(model_dtype)
+            if cache_dtype in _METAL_DENSE_KV_CACHE_DTYPES:
+                if _METAL_DENSE_KV_CACHE_DTYPES[cache_dtype] != model_dtype:
+                    dtype_detail = model_cache_dtype or str(model_dtype)
+                    raise NotImplementedError(
+                        f"vllm-metal does not support --kv-cache-dtype {cache_dtype} "
+                        f"with model dtype {dtype_detail}: the paged KV cache is "
+                        "stored in the model dtype."
+                    )
+            else:
+                dense_dtype_hint = (
+                    f"--kv-cache-dtype {model_cache_dtype}"
+                    if model_cache_dtype is not None
+                    else "--kv-cache-dtype auto"
+                )
+                raise NotImplementedError(
+                    f"vllm-metal does not support --kv-cache-dtype {cache_dtype}: "
+                    "the paged KV cache is stored in the model dtype. Use "
+                    f"{dense_dtype_hint}, or enable TurboQuant with "
+                    "--additional-config '{\"turboquant\": true}'."
+                )
 
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
