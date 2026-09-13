@@ -100,6 +100,7 @@ def _proposer(
     *,
     committed_num_blocks: int = COMMITTED_NUM_BLOCKS,
     scratch_reserve_blocks: int = SCRATCH_RESERVE_BLOCKS,
+    defer_zero_k_ingest: bool = False,
 ) -> DraftModelProposer:
     proposer = DraftModelProposer(
         model=model,
@@ -109,6 +110,7 @@ def _proposer(
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
+        defer_zero_k_ingest=defer_zero_k_ingest,
     )
     proposer.adopt_committed_group(COMMITTED_GROUP_INDEX)
     return proposer
@@ -158,6 +160,9 @@ def _context(
 def _prefills_context(
     prefills: list[tuple[str, list[int]]],
     *,
+    start_pos: int = 0,
+    result_mode: str = "final",
+    full_prompt_token_ids: list[int] | None = None,
     num_speculative_tokens: int = 1,
 ) -> ProposeContext:
     """Context whose requests are final-chunk prefills (greedy, drafting)."""
@@ -169,8 +174,8 @@ def _prefills_context(
             block_ids=[[0]],
             generator=None,
             prompt_len=None,
-            start_pos=0,
-            full_prompt_token_ids=None,
+            start_pos=start_pos,
+            full_prompt_token_ids=full_prompt_token_ids,
         )
         for req_id, token_ids in prefills
     ]
@@ -181,7 +186,7 @@ def _prefills_context(
         decode_token_ids=[],
         prefill_reqs=prefill_reqs,
         prefill_token_ids=[42] * len(prefill_reqs),
-        prefill_result_modes=["final"] * len(prefill_reqs),
+        prefill_result_modes=[result_mode] * len(prefill_reqs),
         request_states={
             req_id: _request_state(committed_block_ids=[0]) for req_id, _ in prefills
         },
@@ -316,6 +321,95 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
 
     assert drafts is None
     assert len(model.block_tables) == 1
+
+
+def test_eager_zero_k_still_ingests() -> None:
+    """Prefix-cache mode must materialize scheduler-publishable draft KV."""
+    model = _StubDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(
+        _prefills_context(
+            [("r1", list(range(8)))],
+            result_mode="intermediate",
+            num_speculative_tokens=0,
+        )
+    )
+
+    assert drafts is None
+    assert model.input_lens == [8]
+    assert proposer._draft_seq_lens == {"r1": 8}
+
+
+def test_lazy_zero_to_positive_k_catches_up_before_drafting() -> None:
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model, defer_zero_k_ingest=True)
+    prompt = list(range(12))
+
+    zero_k_drafts = proposer.propose(
+        _prefills_context(
+            [("r1", prompt[:4])],
+            result_mode="intermediate",
+            num_speculative_tokens=0,
+        )
+    )
+
+    assert zero_k_drafts is None
+    assert model.input_lens == []
+    assert proposer._draft_seq_lens == {"r1": 0}
+
+    drafts = proposer.propose(
+        _prefills_context(
+            [("r1", prompt[4:])],
+            start_pos=4,
+            full_prompt_token_ids=prompt,
+        )
+    )
+
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[len(prompt) % VOCAB_SIZE]]
+    assert model.input_lens == [len(prompt) + 1]
+    assert proposer._draft_seq_lens == {"r1": len(prompt) + 1}
+
+
+def test_lazy_positive_to_zero_k_preserves_boundary() -> None:
+    """Keep the physical boundary when traced decode progress reports zero."""
+    model = _StubDraftModel()
+    proposer = _proposer(model, defer_zero_k_ingest=True)
+
+    initial_state = _request_state(
+        committed_block_ids=[0, 1],
+        token_ids=list(range(8)),
+    )
+    proposer.propose(_context("r1", initial_state, {"r1": initial_state}))
+    assert proposer._draft_seq_lens == {"r1": 8}
+
+    zero_k_state = _request_state(
+        committed_block_ids=[0, 1],
+        num_computed_tokens=0,
+        token_ids=list(range(16)),
+    )
+    zero_k_drafts = proposer.propose(
+        _context(
+            "r1",
+            zero_k_state,
+            {"r1": zero_k_state},
+            num_speculative_tokens=0,
+        )
+    )
+
+    assert zero_k_drafts is None
+    assert model.input_lens == [8]
+    assert proposer._draft_seq_lens == {"r1": 8}
+
+    resumed_state = _request_state(
+        committed_block_ids=[0, 1],
+        token_ids=list(range(PROMPT_LEN)),
+    )
+    proposer.propose(_context("r1", resumed_state, {"r1": resumed_state}))
+
+    assert model.input_lens == [8, PROMPT_LEN - 8]
+    assert proposer._draft_seq_lens == {"r1": PROMPT_LEN}
 
 
 def test_release_requests_returns_scratch_blocks_to_the_free_pool() -> None:
