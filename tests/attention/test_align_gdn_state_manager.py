@@ -223,6 +223,27 @@ class TestAlignGDNStateManager:
             np.testing.assert_array_equal(conv, 5.0)
             np.testing.assert_array_equal(rec, 5.0)
 
+    def test_cow_reuses_slots_retired_in_the_same_step(self) -> None:
+        # Retirement must run before the CoW allocation: capacity never
+        # shrinks, so allocating first would grow the pool to cover the
+        # dst that this step's about-to-be-freed slot could have served.
+        cache = _make_cache(num_blocks=8, initial_blocks=0)
+        manager = AlignGDNStateManager(cache, BLOCK)
+        self._populate(manager, ["req-A"], [[[2]]], [(3, 1)])
+        self._populate(manager, ["req-B"], [[[3]]], [(3, 1)])
+        assert manager.occupied_slots == 2
+        freed_slot = manager.slot_for(3)
+
+        # Block 3 flips to a KV group this step; mamba CoW 2→7 arrives
+        # with the same step's KV ids. The dst must reuse the freed slot
+        # instead of growing the pool.
+        manager.apply_block_copies([(2, 7)], kv_block_ids={3})
+
+        assert manager.slot_for(3) is None
+        assert manager.slot_for(7) == freed_slot
+        assert manager.occupied_slots == 2
+        assert cache.allocated_seqs == 2  # no growth
+
 
 class TestHybridAlignRuntime:
     def _make_runtime(self) -> HybridPagedAttentionRuntime:

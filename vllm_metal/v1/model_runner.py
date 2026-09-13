@@ -1331,17 +1331,38 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            # Full-attention group ids the scheduled requests hold, for the
+            # align state manager's slot retirement. Collected before CoW so
+            # retirement can free this step's role-flipped slots *before*
+            # CoW allocation grows the pool to cover them (capacity never
+            # shrinks; growing first would strand the freed slots).
+            step_kv_block_ids: set[int] | None = None
+            if self._paged_state_group_indices:
+                step_kv_block_ids = {
+                    block_id
+                    for tables, _, _ in decode_info
+                    for row in tables
+                    for block_id in row
+                }
+                step_kv_block_ids.update(
+                    block_id
+                    for tables, _, _ in prefill_info
+                    for row in tables
+                    for block_id in row
+                )
             if runtime is not None and scheduler_output.kv_cache_block_copies:
                 # vLLM has already rewritten request block tables to the CoW
                 # destinations. Populate those physical blocks before the
                 # hybrid state manager reads the rewritten tables.
-                runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
+                runtime.copy_blocks(
+                    scheduler_output.kv_cache_block_copies,
+                    kv_block_ids=step_kv_block_ids,
+                )
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
                 step_state_ids: list[list[list[int]]] | None = None
                 step_positions: list[tuple[int, int]] | None = None
-                step_kv_block_ids: set[int] | None = None
                 if self._paged_state_group_indices:
                     try:
                         step_state_ids = [
@@ -1364,21 +1385,9 @@ class MetalModelRunner:
                     step_positions.extend(
                         (pr.start_pos, len(pr.token_ids)) for pr in prefill_reqs
                     )
-                    # Full-attention group ids the scheduled requests hold:
-                    # a mamba-mapped id surfacing here has been reallocated
-                    # by the block pool, so its GDN slot can be reclaimed.
-                    step_kv_block_ids = {
-                        block_id
-                        for tables, _, _ in decode_info
-                        for row in tables
-                        for block_id in row
-                    }
-                    step_kv_block_ids.update(
-                        block_id
-                        for tables, _, _ in prefill_info
-                        for row in tables
-                        for block_id in row
-                    )
+                    # Retirement already ran ahead of CoW; passing the ids
+                    # again is an idempotent no-op that keeps the manager
+                    # self-sufficient when no CoW pairs exist this step.
                 runtime.populate_step_context(
                     req_ids=step_req_ids,
                     ctx=ctx,

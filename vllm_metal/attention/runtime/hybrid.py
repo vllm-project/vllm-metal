@@ -242,12 +242,19 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def needs_step_context(self) -> bool:
         return True
 
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+    def copy_blocks(
+        self,
+        block_copies: Sequence[tuple[int, int]],
+        *,
+        kv_block_ids: set[int] | None = None,
+    ) -> None:
         """Apply scheduler CoW copies to SDPA KV and align-mode GDN state."""
         self.kv_cache.copy_blocks(block_copies)
         if self._mamba_cache_mode == "align":
             assert isinstance(self._gdn_state_manager, AlignGDNStateManager)
-            self._gdn_state_manager.apply_block_copies(block_copies)
+            self._gdn_state_manager.apply_block_copies(
+                block_copies, kv_block_ids=kv_block_ids
+            )
 
     def populate_step_context(
         self,

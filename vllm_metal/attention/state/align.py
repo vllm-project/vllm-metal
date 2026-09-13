@@ -121,18 +121,31 @@ class AlignGDNStateManager:
         for block_id in set(kv_block_ids).intersection(self._slot_of):
             self._free_slots.append(self._slot_of.pop(block_id))
 
-    def apply_block_copies(self, block_copies: Sequence[tuple[int, int]]) -> None:
+    def apply_block_copies(
+        self,
+        block_copies: Sequence[tuple[int, int]],
+        *,
+        kv_block_ids: set[int] | None = None,
+    ) -> None:
         """Apply scheduler copy-on-write to GDN slabs through the indirection.
 
         Pairs outside the mamba groups (full-attention CoW — the common case
         in hybrid models) have an unmapped source and are skipped: they hold
         no state, and copying them would both waste bandwidth and grow the
         pool toward the shared id-span worst case.
+
+        Retirement (when the runner forwards this step's KV-group ids) runs
+        *before* the CoW allocation: capacity never shrinks, so allocating
+        first would grow the pool to cover dst slots that the about-to-be-
+        freed ones could have served, stranding the difference.
         """
         pairs = [(src, dst) for src, dst in block_copies if src in self._slot_of]
-        if not pairs:
+        if not pairs and not kv_block_ids:
             return
         self._state_cache.apply_pending_states()
+        self._retire_slots(kv_block_ids)
+        if not pairs:
+            return
         src_slots: list[int] = []
         dst_slots: list[int] = []
         for src, dst in pairs:

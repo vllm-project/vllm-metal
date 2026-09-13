@@ -646,7 +646,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             scheduler_output=scheduler_output,
         )
 
-        runtime.copy_blocks.assert_called_once_with([(2, 6)])
+        runtime.copy_blocks.assert_called_once_with([(2, 6)], kv_block_ids=None)
         method_order = [call[0] for call in runtime.mock_calls]
         assert method_order.index("copy_blocks") < method_order.index(
             "populate_step_context"

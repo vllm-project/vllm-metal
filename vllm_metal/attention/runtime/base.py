@@ -65,8 +65,20 @@ class PagedAttentionRuntimeBase:
         """Return scheduler groups holding per-request state (mamba) blocks."""
         return self._state_group_indices
 
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler copy-on-write operations to the primary cache."""
+    def copy_blocks(
+        self,
+        block_copies: Sequence[tuple[int, int]],
+        *,
+        kv_block_ids: set[int] | None = None,
+    ) -> None:
+        """Apply scheduler copy-on-write operations to the primary cache.
+
+        ``kv_block_ids`` carries this step's full-attention group ids so
+        state-backed runtimes can retire role-flipped slots before the CoW
+        allocation grows their pools; runtimes without secondary state
+        ignore it.
+        """
+        del kv_block_ids
         self._require_initialized("copy_blocks").copy_blocks(block_copies)
 
     def needs_step_context(self) -> bool:

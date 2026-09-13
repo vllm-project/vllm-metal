@@ -106,24 +106,37 @@ def _tokens_at_least(tok, corpus: str, min_tokens: int) -> list[int]:
     return ids
 
 
-def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
-    need = 3 * block_size + 64
+def build_cases(
+    tok, block_size: int, shared_corpus: bool, quick: bool = False, max_len: int = 2048
+):
+    """Build the case matrix, reduced to fit ``max_len`` when necessary.
+
+    The full matrix's k=3 edges need 3*block_size+1 prompt tokens; large
+    aligned block sizes (784 for Qwen3.8-27B) do not fit the harness's
+    2048 cap, so k and the shared depths shrink with a notice instead of
+    producing prompts the engine must reject. (Growing max_model_len with
+    the block size needs a two-phase build — documented as follow-up.)
+    """
+    k_fit = max(1, (max_len - 64) // block_size)
+    ks = (1,) if quick else tuple(range(1, min(3, k_fit) + 1))
+    if not quick and k_fit < 3:
+        print(
+            f"  [cases] k reduced to {ks[-1]}: 3 edges need "
+            f"{3 * block_size + 1} tokens > max_model_len {max_len}",
+            flush=True,
+        )
+    need = max(ks[-1] * block_size, 2 * block_size) + 64
     ids_edge = _tokens_at_least(tok, CORPUS_A, need)
     ids_hit = ids_edge if shared_corpus else _tokens_at_least(tok, CORPUS_B, need)
     assert min(len(ids_edge), len(ids_hit)) > need
 
     singles: list[tuple[str, list[int]]] = []
-    for k in (1,) if quick else (1, 2, 3):
+    for k in ks:
         for d in (-1, 0, 1):
             singles.append((f"edge_k{k}{d:+d}", ids_edge[: k * block_size + d]))
-    depths = (
-        (("1B", block_size),)
-        if quick
-        else (
-            ("1B", block_size),
-            ("2B", 2 * block_size),
-        )
-    )
+    depths = (("1B", block_size),)
+    if not quick and 2 * block_size + 64 <= max_len:
+        depths = (("1B", block_size), ("2B", 2 * block_size))
     for depth_name, depth in depths:
         prefix = ids_hit[:depth]
         for i, suffix in enumerate(SUFFIXES):
@@ -131,10 +144,11 @@ def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
             singles.append((f"div_{depth_name}_{i}", prefix + sids))
     singles.append(("short_after_long", ids_hit[: block_size + 100]))
 
+    batch_blocks = 2 if 2 * block_size + 64 <= max_len else 1
     batch = [
         (
             f"batch_{i}",
-            ids_hit[: 2 * block_size]
+            ids_hit[: batch_blocks * block_size]
             + tok(f" Task {i}: name one advantage.", add_special_tokens=False)[
                 "input_ids"
             ],
@@ -144,24 +158,28 @@ def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
     return singles, batch
 
 
-def _top2_gaps(output) -> list[float]:
-    """Per generated token: top1 logprob minus top2 logprob.
+def _top2_gaps(output) -> list[list]:
+    """Per generated token: ``[top1_logprob - top2_logprob, top1, top2]``.
 
-    An exact 0.0 means the greedy choice sat on a bitwise tie — the
-    documented tie-level property (see module docstring): a restore path
-    that lands two candidates on identical logprobs can pick either
-    without either arm being wrong.
+    An exact 0.0 gap means the greedy choice sat on a bitwise tie — the
+    documented tie-level property (see module docstring) — but it only
+    excuses a divergence when the tied pair *is* the two tokens the arms
+    respectively chose; the caller checks that identity.
     """
-    gaps = []
+    rows = []
     for lp_dict in output.logprobs:
-        ranked = sorted(lp_dict.values(), key=lambda lp: -lp.logprob)
-        gaps.append(
-            ranked[0].logprob - ranked[1].logprob if len(ranked) > 1 else float("inf")
-        )
-    return gaps
+        ranked = sorted(lp_dict.items(), key=lambda kv: -kv[1].logprob)
+        if len(ranked) > 1:
+            (t1, lp1), (t2, lp2) = ranked[0], ranked[1]
+            rows.append([lp1.logprob - lp2.logprob, t1, t2])
+        else:
+            rows.append([float("inf"), ranked[0][0], -1])
+    return rows
 
 
-def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
+def run_child(
+    model, enable_prefix_caching, mnbt, shared_corpus, quick, queue, collect_gaps=False
+):
     _child_env()
     from vllm import LLM, SamplingParams
 
@@ -202,23 +220,54 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
             assert cache_config.mamba_block_size == cache_config.block_size
         block_size = cache_config.block_size
 
+        if mnbt is not None and mnbt % block_size != 0:
+            queue.put(
+                (
+                    {
+                        "__skipped__": (
+                            f"chunked arm mnbt={mnbt} is not block-aligned with "
+                            f"block_size={block_size}; pass an mnbt that is a "
+                            "multiple of the model's block size once the harness "
+                            "supports adaptive chunk sizing"
+                        )
+                    },
+                    None,
+                )
+            )
+            return
+
         tok = llm.get_tokenizer()
-        singles, batch = build_cases(tok, block_size, shared_corpus, quick)
-        sp = SamplingParams(temperature=0, max_tokens=24, logprobs=2)
+        singles, batch = build_cases(
+            tok,
+            block_size,
+            shared_corpus,
+            quick,
+            max_len=llm.llm_engine.vllm_config.model_config.max_model_len,
+        )
+        # The strict pass must not request logprobs: num_logprobs disables
+        # native greedy (SamplingBatch.params_allow_native_greedy) and with
+        # it the decode pipeline, so a logprobs-instrumented run exercises a
+        # different production path. Gaps are collected only in the
+        # diagnostic rerun of already-mismatched cases.
+        sp = SamplingParams(
+            temperature=0, max_tokens=24, logprobs=2 if collect_gaps else None
+        )
 
         results: dict[str, list[int]] = {}
-        gaps: dict[str, list[float]] = {}
+        gaps: dict[str, list[list]] | None = {} if collect_gaps else None
         for rnd in (1, 2):
             for tag, token_ids in singles:
                 out = llm.generate([{"prompt_token_ids": token_ids}], sp)[0]
                 key = f"{tag}/r{rnd}"
                 results[key] = list(out.outputs[0].token_ids)
-                gaps[key] = _top2_gaps(out.outputs[0])
+                if gaps is not None:
+                    gaps[key] = _top2_gaps(out.outputs[0])
         outs = llm.generate([{"prompt_token_ids": t} for _, t in batch], sp)
         for (tag, _), out in zip(batch, outs, strict=True):
             key = f"{tag}/batched"
             results[key] = list(out.outputs[0].token_ids)
-            gaps[key] = _top2_gaps(out.outputs[0])
+            if gaps is not None:
+                gaps[key] = _top2_gaps(out.outputs[0])
     finally:
         mr_mod.MetalModelRunner._handle_new_requests = orig
 
@@ -230,13 +279,13 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
     queue.put((results, gaps))
 
 
-def run_pair(model, mnbt, shared_corpus, quick=False):
-    ctx = mp.get_context("spawn")
-    per_mode: dict[bool, dict[str, list[int]]] = {}
+def _run_child_pair(ctx, model, mnbt, shared_corpus, quick, collect_gaps=False):
+    per_mode: dict[bool, tuple] = {}
     for enable in (False, True):
         queue = ctx.Queue()
         proc = ctx.Process(
-            target=run_child, args=(model, enable, mnbt, shared_corpus, quick, queue)
+            target=run_child,
+            args=(model, enable, mnbt, shared_corpus, quick, queue, collect_gaps),
         )
         proc.start()
         try:
@@ -265,23 +314,67 @@ def run_pair(model, mnbt, shared_corpus, quick=False):
                 proc.terminate()
         if proc.exitcode != 0:
             raise RuntimeError(f"child exited with {proc.exitcode}")
-    reference, cached = per_mode[False][0], per_mode[True][0]
-    ref_gaps, cached_gaps = per_mode[False][1], per_mode[True][1]
-    mismatches: dict[str, dict] = {}
-    tie_level: dict[str, dict] = {}
-    for key in reference:
-        if reference[key] == cached[key]:
-            continue
-        entry = {"ref": reference[key], "cached": cached[key]}
-        flip = next(
+    return per_mode
+
+
+def run_pair(model, mnbt, shared_corpus, quick=False):
+    ctx = mp.get_context("spawn")
+
+    def first_flip(ref_toks, cached_toks):
+        return next(
             i
-            for i, (a, b) in enumerate(zip(reference[key], cached[key], strict=False))
+            for i, (a, b) in enumerate(zip(ref_toks, cached_toks, strict=False))
             if a != b
         )
-        exact_tie = (flip < len(ref_gaps[key]) and ref_gaps[key][flip] == 0.0) or (
-            flip < len(cached_gaps[key]) and cached_gaps[key][flip] == 0.0
+
+    # Pass 1 — strict, production sampling path (no logprobs requested).
+    strict = _run_child_pair(ctx, model, mnbt, shared_corpus, quick)
+    skipped = [
+        arm[0]["__skipped__"] for arm in strict.values() if "__skipped__" in arm[0]
+    ]
+    if skipped:
+        for reason in skipped:
+            print(f"  [arm] SKIPPED: {reason}", flush=True)
+        return 0, {}, {}
+    reference, cached = strict[False][0], strict[True][0]
+    mismatched_keys = [k for k in reference if reference[k] != cached[k]]
+    tie_level: dict[str, dict] = {}
+    if mismatched_keys:
+        # Pass 2 — diagnostic rerun with logprobs to classify the flips.
+        # The rerun itself takes the non-native path, so its tokens may
+        # differ from the strict pass; classification therefore uses the
+        # rerun's own flip, and strict-only flips stay hard failures.
+        diag = _run_child_pair(
+            ctx, model, mnbt, shared_corpus, quick, collect_gaps=True
         )
-        (tie_level if exact_tie else mismatches)[key] = entry
+        d_ref, d_cached = diag[False][0], diag[True][0]
+        d_ref_gaps, d_cached_gaps = diag[False][1], diag[True][1]
+        still_bad = []
+        for key in mismatched_keys:
+            if key not in d_ref or d_ref[key] == d_cached[key]:
+                print(
+                    f"  [diag] {key}: rerun converged — path-sensitive, "
+                    "kept as failure",
+                    flush=True,
+                )
+                continue
+            flip = first_flip(d_ref[key], d_cached[key])
+            chosen = {d_ref[key][flip], d_cached[key][flip]}
+
+            def tied_pair(arm_gaps, _flip=flip, _chosen=chosen):
+                if arm_gaps is None or _flip >= len(arm_gaps):
+                    return False
+                gap, t1, t2 = arm_gaps[_flip]
+                return gap == 0.0 and {t1, t2} == _chosen
+
+            if tied_pair(d_ref_gaps.get(key)) or tied_pair(d_cached_gaps.get(key)):
+                tie_level[key] = {"ref": reference[key], "cached": cached[key]}
+            else:
+                still_bad.append(key)
+        mismatched_keys = still_bad
+    mismatches = {
+        key: {"ref": reference[key], "cached": cached[key]} for key in mismatched_keys
+    }
     return len(reference), mismatches, tie_level
 
 
@@ -310,7 +403,7 @@ def main() -> int:
         n_cases, mismatches, tie_level = run_pair(
             args.model, mnbt, args.shared_corpus, args.quick
         )
-        failed = failed or bool(mismatches)
+        failed = failed or bool(mismatches) or n_cases == 0
         print(
             f"[{arm_name}] {n_cases} comparisons, {len(mismatches)} divergent, "
             f"{len(tie_level)} tie-level (waived)",
