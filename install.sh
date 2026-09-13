@@ -216,8 +216,8 @@ EOF
   # Source shared library functions
   # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
   local local_lib=""
+  local script_dir=""
   if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-    local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
     local_lib="$script_dir/scripts/lib.sh"
   fi
@@ -251,7 +251,11 @@ EOF
 
   local venv="$HOME/.venv-vllm-metal"
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    venv="$PWD/.venv-vllm-metal"
+    # Source checkouts read the release tag file, run the editable install,
+    # and build native artifacts relative to the repo root, so anchor the
+    # working directory there instead of the caller's cwd.
+    cd "$script_dir" || exit 1
+    venv="$script_dir/.venv-vllm-metal"
   fi
 
   ensure_venv "$venv"
