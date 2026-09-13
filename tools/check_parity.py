@@ -38,6 +38,9 @@ def mlx_generate(
     from mlx_lm.generate import generate_step
     from mlx_lm.sample_utils import make_sampler
 
+    from vllm_metal.compat import _patch_transformers_exaone4_config
+
+    _patch_transformers_exaone4_config()
     model, tokenizer = load(model_path)
     results = []
     for prompt in prompts:
@@ -168,6 +171,7 @@ def check_parity(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
     env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.3")
+    env.setdefault("VLLM_METAL_MLA_KERNEL", "1")
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))

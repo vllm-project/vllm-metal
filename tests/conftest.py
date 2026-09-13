@@ -10,6 +10,12 @@ import pytest
 import torch
 
 
+def pytest_configure() -> None:
+    # M5 TF32 matmul can exceed FP32 parity tolerances. Set the default before
+    # collection because MLX caches this flag on its first matmul.
+    os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
+
 def _get_test_seed() -> int:
     """Return the deterministic seed used across tests.
 
