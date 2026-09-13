@@ -2147,12 +2147,12 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
 // GQA-shared flash-decode pass for pure-decode batches.
 //
 // One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
-// each simdgroup owns one query head of the GQA group, so the whole group
-// shares every K/V row load — the per-token kernel above instead re-reads
-// the same KV rows once per query head from separate threadgroups — and the
-// online softmax stays entirely in registers (no threadgroup-memory score
-// staging, no barriers).  At long contexts this lifts single-sequence decode
-// KV-scan bandwidth from ~40GB/s to ~190GB/s on M5 Pro.
+// each simdgroup owns one query head of the GQA group. Co-locating these
+// heads can improve KV cache locality, but each simdgroup still issues its
+// own K/V loads (there is no explicit cross-simdgroup broadcast). The online
+// softmax stays in registers, with no score staging or barriers. The serial
+// token loop trades intra-head parallelism for this locality, so dispatch
+// must account for the shape and device rather than context length alone.
 //
 // Partials are written in the exact contract paged_attention_v2_reduce
 // consumes: log2-space running (max, exp-sum) stats plus the

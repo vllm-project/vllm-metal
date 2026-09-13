@@ -37,11 +37,10 @@ using namespace mlx::core;
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
-// Below this context length the GQA-shared decode pass loses to the
-// established per-token / split-KV kernel (measured on M5 Pro).  Kept as
-// a named constant so the dispatch gate and the Python test surface cannot
-// drift.
-constexpr int kGqaDecodeMinSeqLen = 16384;
+// Default routing is limited to the documented, measured long-context range.
+// Numerical shader support is broader than this empirical performance policy.
+constexpr int kGqaDecodeMinSeqLen = 32768;
+constexpr int kGqaDecodeMaxSeqLen = 131072;
 
 // Last dispatch family chosen by dispatch_paged_attention_v2_online
 // ("gqa_decode" / "per_token_ps0" / "per_token_ps512" / "window_ps0" /
@@ -88,9 +87,9 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 
 // GPU core count via IORegistry.  Metal/MLX expose no core-count API, but the
 // split-KV gate needs to scale per machine — a small laptop GPU and a large
-// desktop one saturate at very different grid sizes.  Read once; falls back to
-// a modest default if the query ever fails (future macOS / service tree).
-static int gpu_core_count() {
+// desktop one saturate at very different grid sizes. Read once; zero means
+// unknown so the new GQA performance gate can fail closed.
+static int detected_gpu_core_count() {
   static const int v = []() {
     int cores = 0;
     io_iterator_t it;
@@ -112,9 +111,42 @@ static int gpu_core_count() {
       }
       IOObjectRelease(it);
     }
-    return cores > 0 ? cores : 14;
+    return cores;
   }();
   return v;
+}
+
+// Preserve the established split-KV fallback when detection is unavailable.
+static int gpu_core_count() {
+  const int cores = detected_gpu_core_count();
+  return cores > 0 ? cores : 14;
+}
+
+// Conservative default scope, based on the measured single-request cases in
+// docs/gqa-decode.md. This is an empirical policy, not a universal cost model:
+// do not infer eligibility for unmeasured geometries from a byte-traffic proxy.
+// The MiniCPM-style 32K gain was small, so its default starts at 64K. All
+// defaults stop at 128K; larger contexts require their own serving evidence.
+static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
+                                     int head_size, int max_seq_len,
+                                     int gpu_cores) {
+  if (gpu_cores <= 0 || max_seq_len < kGqaDecodeMinSeqLen ||
+      max_seq_len > kGqaDecodeMaxSeqLen)
+    return false;
+  const bool measured_32k =
+      (num_heads == 32 && num_kv_heads == 8 && head_size == 128) ||
+      (num_heads == 24 && num_kv_heads == 4 && head_size == 256);
+  const bool measured_64k =
+      num_heads == 16 && num_kv_heads == 2 && head_size == 128 &&
+      max_seq_len >= 65536;
+  if (!measured_32k && !measured_64k) return false;
+
+  // Retain the conservative occupancy floor to avoid routing an underfilled
+  // GQA grid on a larger GPU. Core count is detected, not a device-name table.
+  // This guard does not promise that shared-GPU load cannot change the gain.
+  const int64_t partitions =
+      (static_cast<int64_t>(max_seq_len) + kPartitionSize - 1) / kPartitionSize;
+  return partitions * num_kv_heads >= 3LL * gpu_cores;
 }
 
 // Engage the split while the base decode grid (num_q_heads * num_seqs) stays
@@ -708,17 +740,11 @@ static void dispatch_paged_attention_v2_online(
   };
 
   // ----- GQA-shared flash-decode pass -------------------------------------
-  // Pure-decode batches without TurboQuant/FP8/sinks/softcap/sliding-window
-  // take a dedicated split-KV kernel whose threadgroups share every KV row
-  // load across the whole GQA group (the per-token kernel re-reads each row
-  // once per query head from separate threadgroups) and keep the online
-  // softmax in registers — no threadgroup-memory score staging, no barriers.
-  // This lifts long-context decode from ~40GB/s to ~190GB/s effective
-  // KV-scan bandwidth on M5 Pro.  Partials follow the ps512 contract and
-  // merge through the standard v2 reduce.  Instantiated for head sizes
-  // {64,96,128,256}, GQA groups <= 8 (one simdgroup per q head), and
-  // same-dtype half/bfloat16 Q/K/V; anything else falls through to the
-  // per-token kernel below.
+  // Pure decode without TurboQuant/FP8/sinks/softcap/sliding-window.
+  // One threadgroup per (partition, KV head, sequence), with one SIMD
+  // group per query head. Co-locating query heads can improve KV cache
+  // locality; each SIMD group still issues its own loads. Online softmax
+  // stays in registers. Partials use the ps512 contract and standard reduce.
   //
   // Scoped to the single-request, long-context case that was measured and
   // parity-tested (review on #715): num_seqs == 1 and the scheduler
@@ -731,23 +757,26 @@ static void dispatch_paged_attention_v2_online(
   // established kernels (A/B escape hatch for the benchmarking pitfalls
   // documented in issue #713).
   //
-  // Occupancy: a single short sequence underfills the GPU (measured
-  // crossover ~16k tokens on M5 Pro).  num_seqs is 1 here, so this is
-  // just max_seq_len >= kGqaDecodeMinSeqLen.
+  // Default eligibility is narrower than the compiled shader domain. Keep
+  // the measured head geometries, length range and block16 serving layout;
+  // all other shapes use the established family. There is no startup timing
+  // or mutable process-wide threshold in this path.
   const int gqa_group = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
   const bool gqa_single_request =
-      num_seqs == 1 && (num_decode_requests < 0 || num_decode_requests == 1);
+      num_seqs == 1 && (num_decode_requests == -1 || num_decode_requests == 1);
   const bool gqa_decode =
       !gqa_disabled
       && pure_decode && window_seqlen_q <= 1 && gqa_single_request
+      && (query.dtype() == float16 || query.dtype() == bfloat16)
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
-      && sliding_window < 0 && num_kv_heads > 0
+      && sliding_window < 0 && block_size == 16 && num_kv_heads > 0
       && num_heads % num_kv_heads == 0 && gqa_group >= 1 && gqa_group <= 8
       && (head_size == 64 || head_size == 96 || head_size == 128 ||
           head_size == 256)
       && max_num_partitions >= 2
-      && max_seq_len >= kGqaDecodeMinSeqLen;
+      && gqa_decode_shape_eligible(num_heads, num_kv_heads, head_size,
+                                  max_seq_len, detected_gpu_core_count());
   if (gqa_decode) {
     record_paged_dispatch("gqa_decode");
     std::string gname =
@@ -1771,6 +1800,14 @@ void gdn_linear_attention_impl(
 NB_MODULE(_paged_ops, m) {
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.attr("GQA_DECODE_MIN_SEQ_LEN") = nb::int_(kGqaDecodeMinSeqLen);
+  m.attr("GQA_DECODE_MAX_SEQ_LEN") = nb::int_(kGqaDecodeMaxSeqLen);
+  m.def("detected_gpu_core_count", &detected_gpu_core_count,
+        "Detected GPU core count, or zero when detection is unavailable.");
+  m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
+        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("max_seq_len"), nb::arg("gpu_cores"),
+        "Measured default scope with a conservative grid guard; "
+        "functional dispatch checks also apply.");
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
         "engages on this machine.");

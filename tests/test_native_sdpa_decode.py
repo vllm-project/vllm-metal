@@ -19,7 +19,7 @@ import vllm_metal.attention.impls.sdpa as sdpa_mod
 from tools.attention_bench_utils import native_sdpa_contiguous_decode
 from vllm_metal.metal import get_ops
 
-NUM_QUERY_HEADS = 16
+NUM_QUERY_HEADS = 32
 NUM_KV_HEADS = 8
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
@@ -42,7 +42,13 @@ def test_production_decode_does_not_call_native_sdpa() -> None:
 def test_paged_gqa_matches_native_sdpa_reference(dtype: mx.Dtype) -> None:
     """Contiguous long decode: shipped primitive vs MLX native SDPA."""
     ops = get_ops()
-    seq = ops.GQA_DECODE_MIN_SEQ_LEN
+    cores = ops.detected_gpu_core_count()
+    if cores <= 0:
+        pytest.skip("GPU core count unavailable: GQA conservatively disabled")
+    n_grid = ((3 * cores + NUM_KV_HEADS - 1) // NUM_KV_HEADS) * 512
+    seq = max(32768, n_grid)
+    if seq > 131072:
+        pytest.skip("No context inside the scoped range meets the GPU grid guard")
     assert ops.has_gqa_decode_kernel()
     mx.random.seed(11)
     n_blocks = seq // BLOCK_SIZE
@@ -67,6 +73,7 @@ def test_paged_gqa_matches_native_sdpa_reference(dtype: mx.Dtype) -> None:
         q, kc, vc, NUM_KV_HEADS, scale, 0.0, bt, sl, cu, BLOCK_SIZE, seq, -1, out
     )
     mx.eval(out)
+    assert ops.last_paged_dispatch() == "gqa_decode"
     ref = native_sdpa_contiguous_decode(q, kc, vc, first, seq, scale)
     mx.eval(ref)
     atol, rtol = _TOLERANCES[dtype]
