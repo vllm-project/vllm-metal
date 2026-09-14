@@ -390,6 +390,7 @@ class MetalWorker(WorkerBase):
                 logger.warning("Profiler was not started; nothing to stop.")
                 return
             self._metal_profiler.stop()
+            self._metal_profiler = None
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
