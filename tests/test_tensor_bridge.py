@@ -1,21 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for tensor bridge between MLX and PyTorch."""
 
+import gc
+
 import mlx.core as mx
 import numpy as np
 import pytest
 import torch
 
-import vllm_metal.pytorch_backend.tensor_bridge as tensor_bridge
 from vllm_metal.pytorch_backend.tensor_bridge import (
-    _MPS_SAFE_SIZE_BYTES,
     MLX_TO_TORCH_DTYPE,
     TORCH_TO_MLX_DTYPE,
-    _get_tensor_size_bytes,
-    _is_safe_for_mps,
     get_torch_device,
     mlx_to_torch,
-    sync_mlx,
     torch_to_mlx,
 )
 
@@ -172,84 +169,100 @@ class TestTensorConversion:
         assert torch_tensor.device.type in ("mps", "cpu")
 
 
-class TestSynchronization:
-    """Tests for synchronization functions."""
+@pytest.fixture(params=["cpu", "mps"])
+def torch_device(request: pytest.FixtureRequest) -> str:
+    if request.param == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("PyTorch MPS is required")
+    return request.param
 
-    def test_sync_mlx_uses_barrier_when_available(
-        self, monkeypatch: pytest.MonkeyPatch
+
+class TestDLPackSharing:
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.bool],
+    )
+    def test_import_shares_offset_strided_view(
+        self, torch_device: str, dtype: torch.dtype
     ) -> None:
-        """Sync should call the pinned MLX barrier."""
+        source = torch.arange(40, device=torch_device, dtype=torch.float32)
+        view = source.to(dtype).reshape(5, 8)[1::2, 1::2].T
+        array = torch_to_mlx(view)
+        assert array.tolist() == view.tolist()
+        assert array.dtype == TORCH_TO_MLX_DTYPE[dtype]
 
-        called = False
+        round_trip = mlx_to_torch(array, device=torch_device)
+        assert round_trip.device.type == torch_device
+        assert round_trip.stride() == view.stride()
+        assert round_trip.data_ptr() == view.data_ptr()
 
-        def fake_sync() -> None:
-            nonlocal called
-            called = True
+        view.zero_()
+        if torch_device == "mps":
+            torch.mps.synchronize()
+        assert array.tolist() == view.tolist()
 
-        monkeypatch.setattr(tensor_bridge.mx, "synchronize", fake_sync)
-        sync_mlx()
-        assert called is True
+    @pytest.mark.parametrize(
+        "dtype", [mx.float32, mx.float16, mx.bfloat16, mx.int32, mx.bool_]
+    )
+    def test_export_shares_offset_strided_view(
+        self, torch_device: str, dtype: mx.Dtype
+    ) -> None:
+        array = mx.arange(40).astype(dtype).reshape(5, 8)[1::2, 1::2].T
+        tensor = mlx_to_torch(array, device=torch_device)
+        assert tensor.tolist() == array.tolist()
+        assert tensor.dtype == MLX_TO_TORCH_DTYPE[dtype]
+        assert tensor.device.type == torch_device
+        assert tensor.stride() == (2, 16)
 
+        tensor.zero_()
+        if torch_device == "mps":
+            torch.mps.synchronize()
+        assert array.tolist() == tensor.tolist()
 
-class TestMPSSizeLimit:
-    """Tests for MPS 4GB size limit handling.
+    def test_import_keeps_source_alive(self, torch_device: str) -> None:
+        source = torch.arange(16, device=torch_device, dtype=torch.float32)[3:12:2]
+        array = torch_to_mlx(source)
+        del source
+        gc.collect()
+        assert (array + 1).tolist() == [4, 6, 8, 10, 12]
 
-    See: https://github.com/anthropics/vllm-metal/issues/43
-    """
+    def test_export_keeps_source_alive(self, torch_device: str) -> None:
+        array = mx.arange(16, dtype=mx.float32)[3:12:2]
+        tensor = mlx_to_torch(array, device=torch_device)
+        del array
+        gc.collect()
+        assert (tensor + 1).tolist() == [4, 6, 8, 10, 12]
 
-    def test_get_tensor_size_bytes_float32(self) -> None:
-        """Test tensor size calculation for float32."""
-        # 2x3 float32 = 6 elements * 4 bytes = 24 bytes
-        array = mx.zeros((2, 3), dtype=mx.float32)
-        assert _get_tensor_size_bytes(array) == 24
+    def test_import_detaches_autograd(self, torch_device: str) -> None:
+        source = torch.tensor([1.0, 2.0], device=torch_device, requires_grad=True)
+        array = torch_to_mlx(source)
+        assert array.tolist() == [1.0, 2.0]
+        assert source.requires_grad
 
-    def test_get_tensor_size_bytes_float16(self) -> None:
-        """Test tensor size calculation for float16."""
-        # 4x5 float16 = 20 elements * 2 bytes = 40 bytes
-        array = mx.zeros((4, 5), dtype=mx.float16)
-        assert _get_tensor_size_bytes(array) == 40
+    @pytest.mark.parametrize("shape", [(), (0,), (2, 0)])
+    def test_scalar_and_empty_round_trip(
+        self, torch_device: str, shape: tuple[int, ...]
+    ) -> None:
+        source = torch.zeros(shape, device=torch_device, dtype=torch.bfloat16)
+        result = mlx_to_torch(torch_to_mlx(source), device=torch_device)
+        assert result.shape == source.shape
+        assert result.dtype == source.dtype
+        assert result.device.type == torch_device
+        assert result.tolist() == source.tolist()
 
-    def test_get_tensor_size_bytes_int32(self) -> None:
-        """Test tensor size calculation for int32."""
-        # 10x10 int32 = 100 elements * 4 bytes = 400 bytes
-        array = mx.zeros((10, 10), dtype=mx.int32)
-        assert _get_tensor_size_bytes(array) == 400
-
-    def test_is_safe_for_mps_small_tensor(self) -> None:
-        """Test that small tensors are safe for MPS."""
-        # 100 float32 = 400 bytes, well under 1GB limit
-        array = mx.zeros((100,), dtype=mx.float32)
-        assert _is_safe_for_mps(array) is True
-
-    def test_is_safe_for_mps_large_tensor(self) -> None:
-        """Test that large tensors are detected as unsafe for MPS."""
-        # Create a tensor larger than the safe limit
-        # _MPS_SAFE_SIZE_BYTES is 1GB = 2^30 bytes
-        # We need more than 2^30 / 4 = 2^28 = 268,435,456 float32 elements
-        # Use a shape that exceeds this: e.g., 512 * 1024 * 1024 = 536,870,912
-        # But we don't want to actually allocate that much memory in tests
-        # Instead, verify the threshold constant is correct
-        assert _MPS_SAFE_SIZE_BYTES == 1 << 30  # 1GB
-
-        # Small tensor should be safe
-        small_array = mx.zeros((1000, 1000), dtype=mx.float32)  # 4MB
-        assert _is_safe_for_mps(small_array) is True
-
-    def test_mlx_to_torch_small_tensor_uses_mps(self) -> None:
-        """Test that small tensors go to MPS when available."""
-        if not torch.backends.mps.is_available():
-            return  # Skip on non-MPS systems
-
-        array = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
-        mx.eval(array)
-
-        tensor = mlx_to_torch(array, device="mps")
-        assert tensor.device.type == "mps"
-
-    def test_mlx_to_torch_explicit_cpu(self) -> None:
-        """Test that explicit CPU device is respected."""
-        array = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
-        mx.eval(array)
-
-        tensor = mlx_to_torch(array, device="cpu")
-        assert tensor.device.type == "cpu"
+    @pytest.mark.parametrize("layout", ["negative", "broadcast"])
+    def test_materialized_views_are_writable(
+        self, torch_device: str, layout: str
+    ) -> None:
+        array = (
+            mx.arange(8, dtype=mx.float32)[::-2]
+            if layout == "negative"
+            else mx.broadcast_to(mx.array(2.0), (4, 3))
+        )
+        expected = array.tolist()
+        tensor = mlx_to_torch(array, device=torch_device)
+        assert tensor.is_contiguous()
+        tensor.add_(1)
+        if torch_device == "mps":
+            torch.mps.synchronize()
+        assert tensor.tolist() == (np.array(expected) + 1).tolist()
+        assert array.tolist() == expected

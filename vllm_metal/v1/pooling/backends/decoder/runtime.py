@@ -116,13 +116,13 @@ class LastTokenEmbeddingPooler:
 
         vector = hidden_states[0, token_index, :dimensions].astype(mx.float32)
         vector = self._normalize_vector(vector)
-        tensor = mlx_to_torch(vector, device="cpu", already_contiguous=True)
+        tensor = mlx_to_torch(vector, device="cpu")
         return tensor.detach().clone()
 
     def _normalize_vector(self, vector: mx.array) -> mx.array:
         norm = mx.sqrt(mx.sum(vector * vector))
         norm = mx.maximum(norm, mx.array(1e-12, dtype=mx.float32))
-        return mx.contiguous(vector / norm)
+        return vector / norm
 
     def _is_decoder_embedding(self) -> bool:
         return is_embed_pooling_architecture(self.config.architectures)

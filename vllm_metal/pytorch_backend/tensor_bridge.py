@@ -1,24 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tensor bridge between MLX and PyTorch.
+"""Tensor bridge between MLX and PyTorch using DLPack."""
 
-Provides zero-copy conversion when possible using Apple Silicon's unified memory.
-"""
-
-import logging
 from typing import Literal
 
 import mlx.core as mx
 import torch
 
-logger = logging.getLogger(__name__)
-
-# MPS has a 4GB (2^32 bytes) limit for MPSTemporaryNDArray allocations.
-# Metal may allocate multiple temporary buffers internally, so we use a
-# conservative threshold of 1GB to avoid hitting the limit.
-# See: https://github.com/anthropics/vllm-metal/issues/43
-_MPS_SAFE_SIZE_BYTES = 1 << 30  # 1GB
-
-# MLX to PyTorch dtype mapping
+# These mappings are also used by cache allocation and model loading.
 MLX_TO_TORCH_DTYPE: dict[mx.Dtype, torch.dtype] = {
     mx.float32: torch.float32,
     mx.float16: torch.float16,
@@ -30,150 +18,57 @@ MLX_TO_TORCH_DTYPE: dict[mx.Dtype, torch.dtype] = {
     mx.uint8: torch.uint8,
     mx.bool_: torch.bool,
 }
-
-# PyTorch to MLX dtype mapping
 TORCH_TO_MLX_DTYPE: dict[torch.dtype, mx.Dtype] = {
     v: k for k, v in MLX_TO_TORCH_DTYPE.items()
 }
 
 
 def get_torch_device() -> torch.device:
-    """Get the PyTorch device for Metal/MPS.
-
-    Returns:
-        torch.device for MPS if available, else CPU
-    """
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _get_tensor_size_bytes(array: mx.array) -> int:
-    """Calculate the size of an MLX array in bytes.
-
-    Args:
-        array: MLX array
-
-    Returns:
-        Size in bytes
-    """
-    return array.size * array.dtype.size
-
-
-def _is_safe_for_mps(array: mx.array) -> bool:
-    """Check if an array is safe to transfer to MPS without hitting size limits.
-
-    MPS has a 4GB limit for MPSTemporaryNDArray, but Metal may allocate
-    multiple temporary buffers internally. We use a conservative threshold.
-
-    Args:
-        array: MLX array to check
-
-    Returns:
-        True if safe to transfer to MPS, False if should stay on CPU
-    """
-    return _get_tensor_size_bytes(array) < _MPS_SAFE_SIZE_BYTES
+    """Get the PyTorch device for Metal/MPS, or CPU if MPS is unavailable."""
+    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
-    """Convert PyTorch tensor to MLX array.
+    """Import a detached tensor, sharing its storage when possible.
 
-    Uses numpy as an intermediate to enable zero-copy on unified memory.
-
-    Args:
-        tensor: PyTorch tensor (can be on any device)
-
-    Returns:
-        MLX array with the same data
+    MPS writes are synchronized before MLX can read them. The source must not
+    be mutated while MLX is using the shared data.
     """
-    # Move to CPU if on MPS for numpy conversion
-    if tensor.device.type != "cpu":
-        tensor = tensor.cpu()
-
     tensor = tensor.detach()
-
-    # Note: numpy does not support bfloat16.
-    if tensor.dtype == torch.bfloat16:
-        return mx.array(tensor)
-
-    return mx.array(tensor.numpy())
+    if tensor.device.type == "mps":
+        torch.mps.synchronize()
+    elif tensor.device.type != "cpu":
+        tensor = tensor.cpu()
+    return mx.from_dlpack(tensor)
 
 
 def mlx_to_torch(
     array: mx.array,
     device: torch.device | Literal["mps", "cpu"] | None = None,
-    already_contiguous: bool = False,
 ) -> torch.Tensor:
-    """Convert MLX array to PyTorch tensor.
+    """Export an evaluated array, sharing storage on CPU and MPS.
 
-    Uses numpy as an intermediate to enable zero-copy on unified memory.
-
-    Args:
-        array: MLX array
-        device: Target PyTorch device (default: MPS if available)
-        already_contiguous: Skip contiguity check if array is known contiguous
-
-    Returns:
-        PyTorch tensor with the same data
+    Reversed and broadcast views are materialized for a writable Torch layout.
+    Other views retain their strides. Torch writes affect the shared MLX data;
+    synchronize MPS writes before reading that data from MLX again.
     """
     if device is None:
         device = get_torch_device()
-    elif isinstance(device, str):
+    else:
         device = torch.device(device)
 
-    # Use memoryview for zero-copy conversion (bypasses numpy for bfloat16)
-    # reference: https://github.com/ml-explore/mlx/issues/403
-    torch_dtype = MLX_TO_TORCH_DTYPE.get(array.dtype)
-    if torch_dtype is not None:
-        if already_contiguous:
-            # Fast path: skip contiguity check, single eval
-            mx.eval(array)
-            buffer = memoryview(array)
-        else:
-            # MLX views / non-contiguous arrays expose a non-contiguous buffer (or
-            # sometimes no usable buffer), which `torch.frombuffer` can't consume.
-            # Make contiguous first, then eval once
-            array = mx.contiguous(array)
-            mx.eval(array)
-            buffer = memoryview(array)
+    # PyTorch aborts on negative strides and cannot update broadcast views in place.
+    strides = memoryview(array).strides
+    if any(
+        stride < 0 or (stride == 0 and size > 1)
+        for size, stride in zip(array.shape, strides, strict=True)
+    ):
+        array = mx.contiguous(array)
 
-        tensor = torch.frombuffer(buffer, dtype=torch_dtype).reshape(array.shape)
-    else:
-        # Fallback to numpy path for unsupported dtypes
-        raise ValueError(f"Unsupported MLX dtype: {array.dtype}")
-
-    # Move to target device, but check for MPS size limits first
-    if device.type == "mps":
-        # Ensure all MLX Metal commands complete before MPS uses the GPU
-        sync_mlx()
-        if _is_safe_for_mps(array):
-            tensor = tensor.to(device)
-        else:
-            # Large tensor - keep on CPU to avoid MPS 4GB limit crash
-            # See: https://github.com/anthropics/vllm-metal/issues/43
-            logger.debug(
-                "Tensor too large for MPS (%d bytes > %d limit), keeping on CPU",
-                _get_tensor_size_bytes(array),
-                _MPS_SAFE_SIZE_BYTES,
-            )
-    elif device.type != "cpu":
+    # Request CPU storage explicitly: importing as MPS and then calling .cpu()
+    # would copy, even though both frameworks can access the same Metal buffer.
+    dl_device = (8, 0) if device.type == "mps" else (1, 0)
+    tensor = torch.from_dlpack(array.__dlpack__(dl_device=dl_device))
+    if device.type not in ("cpu", "mps"):
         tensor = tensor.to(device)
-
     return tensor
-
-
-def sync_mlx() -> None:
-    """Synchronize MLX operations.
-
-    Call this before converting MLX arrays to ensure all operations complete.
-    """
-    mx.synchronize()
-
-
-def sync_torch() -> None:
-    """Synchronize PyTorch MPS operations.
-
-    Call this before converting PyTorch tensors to ensure all operations complete.
-    """
-    if torch.backends.mps.is_available():
-        torch.mps.synchronize()
