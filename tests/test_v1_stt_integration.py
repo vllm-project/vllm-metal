@@ -213,39 +213,6 @@ class TestExtractAudioFeatureValidation:
             adapter.extract_audio_features(mel)
 
 
-class TestSamplingParamsValidation:
-    """Tests for sampling params validation in _execute_stt."""
-
-    def test_non_greedy_raises_valueerror(self) -> None:
-        """Non-zero temperature should raise ValueError."""
-        runner = _make_runner()
-        non_greedy = SamplingParams(temperature=0.7)
-        req = _make_new_req(
-            sampling_params=non_greedy,
-            mm_features=_make_valid_mm_features(),
-        )
-        sched = _make_scheduler_output(new_reqs=[req])
-
-        with pytest.raises(ValueError, match="greedy"):
-            runner._execute_stt(sched)
-
-    def test_greedy_accepted(self) -> None:
-        """temperature=0 should not raise."""
-        runner = _make_runner()
-        greedy = SamplingParams(temperature=0)
-        req = _make_new_req(
-            sampling_params=greedy,
-            mm_features=_make_valid_mm_features(),
-        )
-        sched = _make_scheduler_output(new_reqs=[req])
-
-        result = runner._execute_stt(sched)
-
-        assert result is None
-        assert runner._pending_output is not None
-        assert runner._pending_output.sampled_token_ids == [[100, 200, 50257]]
-
-
 class TestExecuteSTTProtocol:
     """Tests for _execute_stt output protocol and request lifecycle."""
 
@@ -268,6 +235,21 @@ class TestExecuteSTTProtocol:
         assert runner._pending_output is not None
         assert runner._pending_output.req_ids == ["req-1"]
         assert runner._pending_output.sampled_token_ids == [[100, 200, 50257]]
+
+    def test_non_greedy_request_does_not_raise(self) -> None:
+        """Raising here kills the engine core, so sampling limits belong to
+        ``MetalPlatform.validate_request``, not to this method."""
+        runner = _make_runner()
+        req = _make_new_req(
+            sampling_params=SamplingParams(temperature=0.7),
+            mm_features=_make_valid_mm_features(),
+        )
+        sched = _make_scheduler_output(new_reqs=[req])
+
+        result = self._run_stt(runner, sched)
+
+        assert result is None
+        assert runner._pending_output is not None
 
     def test_invalid_audio_request_raises_with_req_id(self) -> None:
         """Malformed STT requests should fail with request context."""

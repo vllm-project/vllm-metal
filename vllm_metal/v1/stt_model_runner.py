@@ -20,7 +20,6 @@ from typing import Any, Literal
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -169,11 +168,7 @@ class STTModelRunner:
     def _execute_stt(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
-        """Execute STT inference for all new requests in the batch.
-
-        Raises:
-            ValueError: If a request uses non-greedy sampling params.
-        """
+        """Execute STT inference for all new requests in the batch."""
         assert self._stt_runtime_adapter is not None
 
         req_ids: list[str] = []
@@ -184,14 +179,6 @@ class STTModelRunner:
 
         for new_req in scheduler_output.scheduled_new_reqs:
             stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
-            sampling_params = new_req.sampling_params or SamplingParams()
-
-            # Only greedy decoding is supported for STT
-            if sampling_params.temperature > 0:
-                raise ValueError(
-                    "STT models only support greedy decoding (temperature=0). "
-                    f"Got temperature={sampling_params.temperature}"
-                )
 
             audio_features = self._stt_runtime_adapter.extract_audio_features(
                 stt_request.input_features
