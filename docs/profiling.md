@@ -58,8 +58,6 @@ llm.stop_profile()  # → stop_capture
 
 The trace filename includes the optional prefix, vLLM's worker-rank suffix, and a unique capture ID: `<prefix>_<worker-ranks>_<capture-id>.gputrace`. Each start/stop cycle writes a separate bundle, including when a worker is restarted with the same prefix and output directory. The full path is logged when capture starts.
 
-Each new capture honors the `profile_prefix` passed to that start call.
-
 ## Opening and Reading the Trace
 
 The `.gputrace` is an Apple bundle (a folder, not a single file). To inspect:
@@ -170,3 +168,4 @@ open /tmp/run.trace
 ```
 
 Trace size is typically 50–150 MB regardless of run length. **Caveat**: Apple's Metal System Trace template was designed for graphics workloads, so MLX's compute kernels don't surface as named encoders in the Metal Application track. You get GPU utilization and CPU sampling, **not per-kernel timing** — for that, use frame capture's Profile pane.
+

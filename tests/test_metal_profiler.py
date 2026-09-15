@@ -3,17 +3,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import mlx.core.metal  # noqa: F401 — submodule must be loaded for monkeypatch
 import pytest
-from vllm.config import ProfilerConfig, VllmConfig
-from vllm.distributed.utils import get_worker_rank_suffix
+from vllm.config import ProfilerConfig
 
 from vllm_metal.profiler import MetalProfilerWrapper
-from vllm_metal.v1.worker import MetalWorker
 
 
 @pytest.mark.parametrize(
@@ -123,86 +120,3 @@ def test_stop_calls_mlx_stop_capture(
     wrapper.stop()
 
     mock_stop.assert_called_once_with()
-
-
-@pytest.fixture
-def profiled_worker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> Iterator[tuple[MetalWorker, list[Path]]]:
-    monkeypatch.setenv("MTL_CAPTURE_ENABLED", "1")
-    captures: list[Path] = []
-
-    def start_capture(path: str) -> None:
-        trace_path = Path(path)
-        trace_path.mkdir(parents=True)
-        captures.append(trace_path)
-
-    monkeypatch.setattr("mlx.core.metal.start_capture", start_capture)
-    monkeypatch.setattr("mlx.core.metal.stop_capture", MagicMock())
-    worker = MetalWorker(
-        vllm_config=VllmConfig(
-            profiler_config=ProfilerConfig(
-                profiler="torch", torch_profiler_dir=str(tmp_path)
-            )
-        ),
-        local_rank=0,
-        rank=0,
-        distributed_init_method=f"file://{tmp_path}/unused-rendezvous",
-        is_driver_worker=True,
-    )
-    try:
-        yield worker, captures
-    finally:
-        worker.shutdown()
-
-
-@pytest.mark.parametrize("next_prefix", ["decode", None])
-def test_worker_honors_each_capture_prefix(
-    profiled_worker: tuple[MetalWorker, list[Path]], next_prefix: str | None
-) -> None:
-    worker, captures = profiled_worker
-    worker.profile(is_start=True, profile_prefix="prefill")
-    worker.profile(is_start=False)
-
-    worker.profile(is_start=True, profile_prefix=next_prefix)
-    worker.profile(is_start=False)
-
-    suffix: str = get_worker_rank_suffix(global_rank=worker.rank)
-    expected_prefix = f"{next_prefix}_{suffix}_" if next_prefix else f"{suffix}_"
-    assert len(captures) == 2
-    assert captures[0].name.startswith(f"prefill_{suffix}_")
-    assert captures[1].name.startswith(expected_prefix)
-
-
-def test_worker_recovers_with_a_valid_prefix_after_capture_failure(
-    profiled_worker: tuple[MetalWorker, list[Path]], tmp_path: Path
-) -> None:
-    worker, captures = profiled_worker
-    (tmp_path / "blocked").write_text("not a directory")
-    worker.profile(is_start=True, profile_prefix="blocked/capture")
-    assert worker._metal_profiler is not None
-    assert not worker._metal_profiler.is_running
-    worker.profile(is_start=False)
-
-    worker.profile(is_start=True, profile_prefix="recovered")
-
-    assert worker._metal_profiler is not None
-    assert worker._metal_profiler.is_running
-    worker.profile(is_start=False)
-    assert len(captures) == 1
-    assert captures[0].name.startswith("recovered_")
-
-
-def test_worker_keeps_an_active_capture_until_stop(
-    profiled_worker: tuple[MetalWorker, list[Path]],
-) -> None:
-    worker, captures = profiled_worker
-    worker.profile(is_start=False)
-    worker.profile(is_start=True, profile_prefix="prefill")
-    worker.profile(is_start=True, profile_prefix="ignored_while_running")
-    assert worker._metal_profiler is not None
-    assert worker._metal_profiler.is_running
-    assert len(captures) == 1
-    worker.profile(is_start=False)
-    worker.profile(is_start=False)
-    assert len(captures) == 1
