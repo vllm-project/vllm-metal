@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
@@ -846,3 +847,177 @@ class TestMmIdentifierFlowsEncoderToCallLm:
         # Placeholder rows at offsets 1, 2 carry the encoder output rows.
         assert mx.allclose(embeds[0, 1], sentinel[0]).item()
         assert mx.allclose(embeds[0, 2], sentinel[1]).item()
+
+
+class _SequentialPositionsAdapter(_MmAdapter):
+    """Adapter whose language model derives RoPE from ``ctx.offsets``."""
+
+    supplies_segment_positions = False
+
+
+class TestSegmentPositionsOptOut:
+    def _captured_segment_positions(self, adapter: _MmAdapter) -> Any:
+        runner = _runner(adapter)
+        runner.encoder_cache.add_request(
+            "req-0", [_feature("img-0", offset=1, length=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+        captured: dict[str, Any] = {}
+        original_call_lm = adapter.call_lm
+
+        def _call_lm(*args: Any, **kwargs: Any) -> Any:
+            ctx = get_context()
+            captured["segment_positions"] = (
+                None if ctx is None else ctx.segment_positions
+            )
+            return original_call_lm(*args, **kwargs)
+
+        adapter.call_lm = _call_lm  # type: ignore[method-assign]
+        prefill = _mm_prefill(
+            "req-0",
+            token_ids=[10, 99, 99, 11],
+            prompt_len=4,
+            full_prompt=[10, 99, 99, 11],
+        )
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+        assert "segment_positions" in captured
+        return captured["segment_positions"]
+
+    def test_opt_out_leaves_context_positions_none(self) -> None:
+        assert self._captured_segment_positions(_SequentialPositionsAdapter()) is None
+
+    def test_default_adapter_still_supplies_positions(self) -> None:
+        positions = self._captured_segment_positions(_MmAdapter())
+        assert isinstance(positions, list)
+        assert len(positions) == 1
+        assert positions[0].shape == (3, 1, 4)
+
+
+def _boi_eoi_feature(
+    identifier: str, *, offset: int, num_embeds: int
+) -> MultiModalFeatureSpec:
+    """Gemma 4 style placeholder: boi + image tokens + eoi, embeds only inside."""
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier=identifier,
+        mm_position=PlaceholderRange(
+            offset=offset,
+            length=num_embeds + 2,
+            is_embed=torch.tensor([False] + [True] * num_embeds + [False]),
+        ),
+    )
+
+
+class TestIsEmbedSplice:
+    def test_single_chunk_splices_only_masked_rows(self) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        # tokens: text, boi, img, img, eoi, text
+        tokens = [10, 5, 99, 99, 6, 11]
+        runner.encoder_cache.add_request(
+            "req-0", [_boi_eoi_feature("img-0", offset=1, num_embeds=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill("req-0", token_ids=tokens, prompt_len=6, full_prompt=tokens)
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        call = adapter.call_lm_calls[0]
+        assert call["visual_pos_masks"].tolist() == [
+            [False, False, True, True, False, False]
+        ]
+        embeds = call["inputs_embeds"]
+        ones = mx.ones(adapter.hidden_size, dtype=mx.float32)
+        zeros = mx.zeros(adapter.hidden_size, dtype=mx.float32)
+        assert mx.allclose(embeds[0, 2], ones).item()
+        assert mx.allclose(embeds[0, 3], ones).item()
+        assert mx.allclose(embeds[0, 1], zeros).item()  # boi keeps its text embedding
+        assert mx.allclose(embeds[0, 4], zeros).item()  # eoi keeps its text embedding
+
+    def test_chunk_with_only_boi_skips_the_feature(self) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        tokens = [10, 5, 99, 99, 6, 11]
+        runner.encoder_cache.add_request(
+            "req-0", [_boi_eoi_feature("img-0", offset=1, num_embeds=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        # First chunk: [text, boi] -- the feature overlaps but carries no embeds.
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill(
+                    "req-0",
+                    token_ids=tokens[:2],
+                    prompt_len=None,
+                    start_pos=0,
+                    full_prompt=tokens,
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+        call = adapter.call_lm_calls[-1]
+        assert call["visual_pos_masks"].tolist() == [[False, False]]
+        assert mx.allclose(
+            call["inputs_embeds"], mx.zeros((1, 2, adapter.hidden_size))
+        ).item()
+
+    def test_second_chunk_takes_remaining_rows_and_eoi_stays_text(self) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        tokens = [10, 5, 99, 99, 6, 11]
+        runner.encoder_cache.add_request(
+            "req-0", [_boi_eoi_feature("img-0", offset=1, num_embeds=2)]
+        )
+        rows = mx.array([[1.0] * adapter.hidden_size, [2.0] * adapter.hidden_size])
+        _put_encode(runner, "img-0", hidden_states=rows)
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        # Second chunk: [img, img, eoi, text] starting at position 2.
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill(
+                    "req-0",
+                    token_ids=tokens[2:],
+                    prompt_len=6,
+                    start_pos=2,
+                    full_prompt=tokens,
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+        call = adapter.call_lm_calls[-1]
+        assert call["visual_pos_masks"].tolist() == [[True, True, False, False]]
+        embeds = call["inputs_embeds"]
+        assert mx.allclose(embeds[0, 0], rows[0]).item()
+        assert mx.allclose(embeds[0, 1], rows[1]).item()
+        assert mx.allclose(
+            embeds[0, 2], mx.zeros(adapter.hidden_size, dtype=mx.float32)
+        ).item()
