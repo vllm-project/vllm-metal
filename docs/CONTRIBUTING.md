@@ -1,140 +1,75 @@
 # Contributing to vLLM Metal
 
-Thanks for your interest in contributing! This plugin targets **Apple Silicon Macs only** — you'll need an M-series Mac running macOS to build, test, and run it.
+To run a released build, use the [installation guide](installation.md).
+The setup below is for editing vllm-metal itself.
 
 ## Development setup
 
+On an Apple Silicon Mac, install [Rust](https://rustup.rs/) and full
+[Xcode](https://developer.apple.com/xcode/) with macOS SDK 26.2 or newer.
+Select Xcode as the active developer directory. Initial source setup builds
+the Rust and Metal components, including for Python-only contributions.
+
+Fork the repository on GitHub, then clone your fork (replace `YOUR_USERNAME`):
+
 ```bash
-git clone https://github.com/vllm-project/vllm-metal.git
+git clone https://github.com/YOUR_USERNAME/vllm-metal.git
 cd vllm-metal
-
-# Creates ./.venv-vllm-metal/, installs vLLM core + the plugin, and
-# prebuilds the native Metal kernels from your checkout
+git remote add upstream https://github.com/vllm-project/vllm-metal.git
+git switch -c my-change
 ./install.sh
-
-# Activate the virtualenv
 source .venv-vllm-metal/bin/activate
-
-# Install dev dependencies (pytest, ruff, mypy, ...)
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
+
+`./install.sh` creates the local environment, installs the matching vLLM core
+and editable plugin, and builds the native artifacts. It downloads the Metal
+toolchain if needed. Restart the server after editing Python files.
 
 ## Editing the Metal kernels
 
-Release wheels ship the native paged-attention extension and its Metal shader
-libraries **prebuilt**, so end users never compile them. To edit the kernels —
-the `.metal` shaders or `paged_ops.cpp` — and run from your local source, set:
+When changing `.metal` shaders or `paged_ops.cpp`, enable source builds:
 
 ```bash
-VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve ...   # or: pytest, your script, etc.
+VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve <model>
 ```
 
-In this mode the C++ extension is recompiled when its inputs change (the build
-is hash-checked, so unchanged sources are skipped) and the shaders are compiled
-in-process by MLX from the `.metal` source at runtime. There is **no manual
-`.metallib` rebuild step**: edit a kernel, restart the Python process, and the
-change is picked up.
+Restart the process after each edit. This mode rebuilds the C++ extension when
+its inputs change and compiles shaders through MLX; no separate `.metallib`
+build is needed. To refresh the prebuilt artifacts instead, run
+`python -m vllm_metal.metal.build`. Stale local artifacts are rejected when
+source mode is disabled.
 
-Requirements:
+## Checks
 
-- **Xcode Command Line Tools** (`xcode-select --install`) — `clang++` rebuilds
-  the `.so`; keep it current enough for the pinned MLX headers.
-- No Metal toolchain needed: MLX compiles the `.metal` shaders in-process.
-
-Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts are loaded as-is.
-If you edited a kernel source after building them locally, loading **fails
-loudly** on the stale-hash mismatch rather than silently running the old kernel —
-set the variable, or rerun `python -m vllm_metal.metal.build` to refresh the
-prebuilt artifacts. (A plain wheel install ships no hash stamps, so end users
-never hit this.)
-
-## Run lint locally
-
-Mirrors the `lint` job in CI (`ruff`, `ruff format --check`, `mypy`, `shellcheck`):
+Run from the repository root:
 
 ```bash
 scripts/lint.sh
-```
-
-## Run CI locally
-
-Mirrors the `test` job in CI: wheel validation, Metal platform checks, and the non-slow pytest suite. Model parity runs separately in the [daily and requested workflow](tools.md#scheduled-and-requested-ci):
-
-```bash
 scripts/test.sh
 ```
 
-> For a faster inner loop while iterating, run pytest directly:
->
-> ```bash
-> pytest -m "not slow" tests/ -v --tb=short
-> ```
+For a shorter loop, run `pytest -m "not slow" tests/` in the activated environment.
+Model parity runs separately through [scheduled and requested CI](tools.md#scheduled-and-requested-ci).
 
-🎉 **Congratulations!** You have completed the development environment setup.
+## Pull requests
 
----
+- **Model changes:** run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
+- **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results.
 
-## Before you open the PR
-
-Two conditional checks apply depending on what your PR touches:
-
-**If your PR adds or modifies a model**, run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
-
-**If your PR claims a performance improvement**, attach before/after benchmark results. For example, using `vllm bench serve` with the sonnet dataset:
+Sign off each commit to certify agreement with the [Developer Certificate of
+Origin](https://developercertificate.org/), then push to your fork:
 
 ```bash
-curl -O https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/sonnet.txt
-
-# 1. Start the server
-VLLM_METAL_MEMORY_FRACTION=0.8 \
-  vllm serve Qwen/Qwen3-0.6B --port 8000 --max-model-len 2048
-
-# 2. Run the benchmark
-vllm bench serve \
-  --backend openai \
-  --base-url http://localhost:8000 \
-  --model Qwen/Qwen3-0.6B \
-  --dataset-name sonnet \
-  --dataset-path sonnet.txt \
-  --num-prompts 100 \
-  --request-rate inf \
-  --percentile-metrics ttft,tpot,e2el \
-  --metric-percentiles 50,99
+git commit -s -m "Describe your change"
+git push -u origin my-change
 ```
 
-## Developer Certificate of Origin (DCO)
+Open a pull request against `main` in `vllm-project/vllm-metal`.
 
-When contributing changes to this project, you must agree to the [DCO](https://developercertificate.org/). Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
+## Building documentation
 
-Using `-s` with `git commit` will automatically add this header.
-
-## Submit your changes
-
-1. **Fork** the repository on GitHub.
-
-2. **Re-point `origin` to your fork and add `upstream`:**
-
-   ```bash
-   git remote set-url origin https://github.com/<your-username>/vllm-metal.git
-   git remote add upstream https://github.com/vllm-project/vllm-metal.git
-   ```
-
-3. **Create a feature branch:**
-
-   ```bash
-   git checkout -b my-feature
-   ```
-
-4. **Commit your changes using `-s`** (adds the DCO sign-off automatically):
-
-   ```bash
-   git commit -sm "your commit info"
-   ```
-
-5. **Push to your fork:**
-
-   ```bash
-   git push -u origin my-feature
-   ```
-
-6. **Open a pull request** against `main` in the upstream repository.
+```bash
+uv pip install -r docs/requirements-docs.txt
+mkdocs serve
+```

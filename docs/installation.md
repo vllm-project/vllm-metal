@@ -1,75 +1,42 @@
 # Installation
 
-## Requirements
+Requires Apple Silicon and macOS 15 or later. Both methods install Python 3.12,
+vLLM core, and prebuilt vllm-metal wheels. No compiler is needed.
+For an editable checkout, see [Contributing](CONTRIBUTING.md#development-setup).
 
-- macOS 15 (Sequoia) or later, on Apple Silicon. The prebuilt wheel's
-  native extension and Metal kernels target macOS 15, so the wheel is
-  tagged `macosx_15_0_arm64` and will not install on earlier releases.
-- Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
+## Homebrew
 
-> **No compiler required.** The install script below fetches vLLM core and the
-> vllm-metal plugin as prebuilt wheels, so nothing is compiled on your machine.
-> Installing from a source checkout instead builds the native Metal kernels
-> locally and needs a toolchain; see [Contributing](CONTRIBUTING.md).
-
-`uv` is bootstrapped automatically.
-
-Verify the Python architecture before installing:
+Install the stable release:
 
 ```bash
-python3 -c "import platform; print(platform.machine())"
-file "$(which python3)"
+brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
+brew install vllm-project/vllm-metal/vllm-metal
 ```
 
-The first command should print `arm64`. If it prints `x86_64`, switch to a native arm64 Python and remove `~/.venv-vllm-metal` before reinstalling.
+Run `vllm serve <model>` directly.
+Upgrade with `brew update && brew upgrade vllm-metal`; remove with `brew uninstall vllm-metal`.
 
-## Install
+## Install script
 
-Using the install script, the following will be installed under the `~/.venv-vllm-metal` directory (the default).
-- vllm-metal plugin
-- vllm core
-- Related libraries
-
-If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes available and you can access the vLLM right away.
-
-For how to use the `vllm` CLI, please refer to the [official vLLM guide](https://docs.vllm.ai/en/latest/cli/).
-
-Development channel (default):
+Install the latest development build and activate its environment:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+source ~/.venv-vllm-metal/bin/activate
 ```
 
-Stable channel:
+The script installs `uv` if needed and uses `~/.venv-vllm-metal` for the Python
+environment. Activate it in each new shell before running `vllm`.
+For a stable release, replace `bash` with `bash -s -- --stable` in the command above.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash -s -- --stable
-```
-
-`pip install vllm-metal` is not supported. Use one of the commands above.
-
-## Reinstallation and Update
-
-If any issues occur, please use the following command to switch to the latest release version and check if the problem is resolved.
-If the issue continues to occur in the latest release, please report the details of the issue.
-(If you have installed it in a directory other than the default `~/.venv-vllm-metal`, substitute that path and run the command accordingly.)
-
-```bash
-rm -rf ~/.venv-vllm-metal && curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-```
-
-## Uninstall
-
-Please delete the directory that was installed by the installation script.
-(If you have installed it in a directory other than the default `~/.venv-vllm-metal`, substitute that path and run the command accordingly.)
+To remove the installation:
 
 ```bash
 rm -rf ~/.venv-vllm-metal
 ```
 
-## Building Documentation
+For a clean update, remove the environment and repeat the installation commands.
+Model weights in the Hugging Face cache are kept.
 
-```bash
-uv pip install -r docs/requirements-docs.txt
-mkdocs serve
-```
+`pip install vllm-metal` is not supported. For serving options, see the
+[vLLM CLI guide](https://docs.vllm.ai/en/latest/cli/).

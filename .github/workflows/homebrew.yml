@@ -1,0 +1,37 @@
+name: Homebrew
+
+on:
+  pull_request:
+    paths:
+      - 'Formula/**'
+      - '.github/workflows/homebrew.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Formula/**'
+      - '.github/workflows/homebrew.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Link checkout as a tap
+        run: |
+          mkdir -p "$(brew --repository)/Library/Taps/vllm-project"
+          ln -s "$GITHUB_WORKSPACE" "$(brew --repository)/Library/Taps/vllm-project/homebrew-vllm-metal"
+      - name: Check formula style
+        run: brew style Formula/vllm-metal.rb
+      - name: Install
+        run: brew install --verbose vllm-project/vllm-metal/vllm-metal
+      - name: Test installed package
+        run: brew test vllm-project/vllm-metal/vllm-metal

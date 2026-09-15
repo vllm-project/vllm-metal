@@ -1,0 +1,89 @@
+name: Update Homebrew
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# The repository must allow GitHub Actions to create pull requests.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency: update-homebrew
+
+jobs:
+  update:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Update formula from the latest stable release
+        id: update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def api(path):
+              return json.loads(subprocess.check_output(["gh", "api", path]))
+
+          def wheel(release, name):
+              asset = next((a for a in release["assets"] if a["name"] == name), None)
+              if asset is None:
+                  raise ValueError(f"Release {release['tag_name']} is missing expected wheel asset: {name}")
+              digest = asset.get("digest") or ""
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise ValueError(f"Missing SHA-256 for {name}")
+              return asset["browser_download_url"], digest.removeprefix("sha256:")
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release = api(f"repos/{repo}/releases/latest")
+          tag = release["tag_name"]
+          if release["draft"] or release["prerelease"] or not re.fullmatch(r"v\d+\.\d+\.\d+(?:\.post\d+)?", tag):
+              raise ValueError(f"Expected a stable release, got {tag}")
+          version = tag.removeprefix("v")
+          metadata = api(f"repos/{repo}/contents/.github/vllm-release-tag.commit?ref={tag}")
+          core_tag = base64.b64decode(metadata["content"]).decode().strip()
+          core_name = f"vllm-{core_tag.removeprefix('v')}+cpu-cp312-cp312-macosx_11_0_arm64.whl"
+          plugin_url, plugin_sha = wheel(release, f"vllm_metal-{version}-cp312-cp312-macosx_15_0_arm64.whl")
+          core_url, core_sha = wheel(api(f"repos/vllm-project/vllm/releases/tags/{core_tag}"), core_name)
+
+          formula = Path("Formula/vllm-metal.rb")
+          text = formula.read_text()
+          replacements = {
+              r'^  url ".*"': f'  url "{plugin_url}"',
+              r'^  version ".*"$': f'  version "{version}"',
+              r'^  sha256 ".*"$': f'  sha256 "{plugin_sha}"',
+              r'^    url ".*"$': f'    url "{core_url}"',
+              r'^    sha256 ".*"$': f'    sha256 "{core_sha}"',
+          }
+          for pattern, replacement in replacements.items():
+              text, count = re.subn(pattern, lambda _: replacement, text, flags=re.MULTILINE)
+              if count != 1:
+                  raise ValueError(f"Expected one formula field matching {pattern}, found {count}")
+          formula.write_text(text)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+          ruby -c Formula/vllm-metal.rb
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: codex/update-homebrew
+          add-paths: Formula/vllm-metal.rb
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          signoff: true
+          commit-message: "Update Homebrew to v${{ steps.update.outputs.version }}"
+          title: "Update Homebrew to v${{ steps.update.outputs.version }}"
+          body: |
+            Update the formula from the latest stable release and its matching vLLM wheel.
+            Approve the Homebrew CI run if GitHub requests it, then review and merge.
