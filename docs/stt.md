@@ -78,6 +78,7 @@ Transcribe audio to text.
 | `language` | string | `null` | ISO 639-1 language code (e.g. `en`, `zh`) |
 | `prompt` | string | `null` | Guide transcription (e.g. proper nouns) |
 | `response_format` | string | `"json"` | `json`, `text`, or `verbose_json` |
+| `temperature` | float | `0.0` | Must be `0`; transcription decodes greedily, and any other value is rejected before decoding |
 
 ### `POST /v1/audio/translations`
 

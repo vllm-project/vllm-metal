@@ -77,6 +77,10 @@ class MetalPlatform(Platform):
     # recomputes instead of sticking (#585 shape via a second engine).
     _mb_default_installed: ClassVar[str | None] = None
 
+    # Recomputed per ``check_and_update_config``; ``validate_request`` gets no
+    # config, so the answer has to be cached here.
+    _serves_stt_model: ClassVar[bool] = False
+
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
     # is not "GPU", vLLM's Ray executor uses the generic
@@ -264,6 +268,11 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
+
+        if cls._serves_stt_model:
+            from vllm_metal.stt.policy import reject_non_greedy_stt_sampling
+
+            reject_non_greedy_stt_sampling(params)
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -795,9 +804,10 @@ class MetalPlatform(Platform):
             if model_config is not None
             else None
         )
-        if resolved_model is not None and is_stt_model(
+        cls._serves_stt_model = resolved_model is not None and is_stt_model(
             resolved_model, revision=model_config.revision
-        ):
+        )
+        if cls._serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
             # before any worker spawns.
