@@ -69,30 +69,34 @@ def test_scheduler_copies_each_physical_pool_once_and_grows_for_destination() ->
 
 
 def test_partial_prefix_cow_preserves_producer_and_consumer_checkpoint() -> None:
-    cache = _cache(num_layers=1)
-    _write(cache, 0, 2, 5)  # state after six tokens, inside scheduler block 1
+    cache = _cache(num_layers=1, initial_seqs=0)
     manager = AlignStateManager(cache, block_size=4)
 
-    # A producer keeps its append-only running table; scheduler moves the
-    # partial cache entry to block 5 before another token overwrites block 2.
-    cache.copy_blocks([(2, 5)])
+    # Producer's state after six tokens lives in scheduler block 2: map its
+    # slab and seed the checkpoint value.
     _populate(manager, ["producer"], [[[0, 2]]], [(6, 1)])
-    _write(cache, 0, 2, 7)
+    _write(cache, 0, manager.slot_for(2), 5)
+
+    # The producer keeps its append-only running table; scheduler moves the
+    # partial cache entry to block 5 before another token overwrites block 2.
+    # CoW goes through the manager so ids translate to compact slots.
+    manager.apply_block_copies([(2, 5)])
+    _write(cache, 0, manager.slot_for(2), 7)
 
     # A new hit is redirected to private block 6. Copy precedes state planning
     # because both computed and scheduled positions are in that same block.
-    cache.copy_blocks([(5, 6)])
+    manager.apply_block_copies([(5, 6)])
     ctx = _populate(manager, ["consumer"], [[[0, 6]]], [(6, 2)])
-    assert ctx.state_group_slot_mappings == ([6],)
+    assert ctx.state_group_slot_mappings == ([manager.slot_for(6)],)
     values = _values(cache)
-    np.testing.assert_array_equal(values[2], 7)
-    np.testing.assert_array_equal(values[5], 5)
-    np.testing.assert_array_equal(values[6], 5)
+    np.testing.assert_array_equal(values[manager.slot_for(2)], 7)
+    np.testing.assert_array_equal(values[manager.slot_for(5)], 5)
+    np.testing.assert_array_equal(values[manager.slot_for(6)], 5)
 
-    _write(cache, 0, 6, 11)
+    _write(cache, 0, manager.slot_for(6), 11)
     values = _values(cache)
-    np.testing.assert_array_equal(values[5], 5)
-    np.testing.assert_array_equal(values[6], 11)
+    np.testing.assert_array_equal(values[manager.slot_for(5)], 5)
+    np.testing.assert_array_equal(values[manager.slot_for(6)], 11)
 
 
 def test_none_mode_recycled_request_slot_is_reset_in_every_layer() -> None:

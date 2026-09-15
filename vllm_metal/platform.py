@@ -846,6 +846,9 @@ class MetalPlatform(Platform):
         cls._default_mb_per_buffer(vllm_config)
 
         # Log memory configuration
+        from vllm_metal.state_budget import configure_state_cache_budget
+
+        configure_state_cache_budget(vllm_config)
         total_mem = cls.get_device_total_memory()
         available_mem = cls.get_device_available_memory()
         logger.info(

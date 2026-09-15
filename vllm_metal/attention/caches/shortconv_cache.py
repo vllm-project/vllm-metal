@@ -73,6 +73,11 @@ class ShortConvStateCache:
         """Number of distinct physical pools under the adopted layout."""
         return len(self._canonical_layers)
 
+    @property
+    def canonical_layers(self) -> list[int]:
+        """Cache indices owning the distinct physical pools."""
+        return list(self._canonical_layers)
+
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Rebind every layer sharing this physical pool to its new handle."""
         for sibling in self._pool_siblings[layer_idx]:

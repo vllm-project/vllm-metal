@@ -42,6 +42,15 @@ from vllm_metal.config import (
     get_config,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+from vllm_metal.state_budget import (
+    StateCacheBudget,
+    StateCacheScratchAllowance,
+    resolve_state_cache_budget,
+    state_cache_budget_bytes,
+    state_cache_budget_from_kv_config,
+    state_cache_rows_per_request,
+    state_cache_scratch_allowance,
+)
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
@@ -64,6 +73,43 @@ def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int
     if num_sdpa_layers > 0 and num_linear_layers % num_sdpa_layers == 0:
         return num_sdpa_layers
     return num_linear_layers
+
+
+def _state_budget_for_runner(runner: MetalModelRunner) -> StateCacheBudget | None:
+    if state_cache_budget_bytes(getattr(runner, "vllm_config", None)) is None:
+        return None
+    plan = getattr(runner, "hybrid_runtime_plan", None)
+    if (
+        not runner.is_hybrid
+        or plan is None
+        or plan.family.label != "gdn"
+        or runner.cache_config.mamba_cache_mode != "align"
+    ):
+        raise NotImplementedError(
+            "state_cache_budget_mib currently requires GDN align prefix caching"
+        )
+    if (
+        plan.layers.num_attention <= 0
+        or plan.layers.num_state % plan.layers.num_attention != 0
+    ):
+        raise NotImplementedError(
+            "state_cache_budget_mib requires equally striped GDN cache groups"
+        )
+    budget = resolve_state_cache_budget(
+        runner.vllm_config, runner.hybrid_align_state_bytes_per_block()
+    )
+    assert budget is not None
+    minimum_rows = state_cache_rows_per_request(
+        runner.vllm_config, plan.layers.num_state // plan.layers.num_attention
+    )
+    if budget.capacity < minimum_rows:
+        minimum_mib = cdiv(minimum_rows * budget.slot_bytes, 1024**2)
+        raise ValueError(
+            "state_cache_budget_mib cannot support one request's working states: "
+            f"needs at least {minimum_rows} rows ({minimum_mib} MiB), "
+            f"got {budget.capacity} rows"
+        )
+    return budget
 
 
 HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
@@ -224,6 +270,8 @@ class _PagedAttentionPlan:
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+    state_cache_budget: StateCacheBudget | None = None
+    state_cache_scratch: StateCacheScratchAllowance | None = None
 
     def format_breakdown(self) -> str:
         parts = [
@@ -237,6 +285,21 @@ class _PagedAttentionPlan:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
         if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
+        if self.state_cache_budget is not None:
+            budget = self.state_cache_budget
+            parts.append(
+                f"stable_state_budget={budget.allocated_bytes / 1e9:.2f}GB "
+                f"({budget.capacity} physical slots, runtime overhead is estimated)"
+            )
+        if self.state_cache_scratch is not None:
+            scratch = self.state_cache_scratch
+            parts.append(
+                f"state_scratch_allowance={scratch.total_bytes / 1e9:.2f}GB "
+                f"({scratch.payload_copies} payloads * {scratch.active_requests} "
+                f"requests * {scratch.bytes_per_request}B, "
+                f"in_flight_batches={scratch.in_flight_batches}; "
+                "additional to profile, not a total peak bound)"
+            )
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
 
@@ -721,6 +784,15 @@ class ModelCachePolicy:
                     f"the memory plan budgeted {budgeted}; refusing to "
                     "exceed the paged memory budget"
                 )
+        state_budget = _state_budget_for_runner(self._runner)
+        if state_budget is not None:
+            adopted_budget = state_cache_budget_from_kv_config(
+                self._runner.vllm_config, kv_cache_config
+            )
+            if adopted_budget != state_budget:
+                raise RuntimeError(
+                    "scheduler and Metal disagree on the physical state cache budget"
+                )
         runtime.adopt_scheduler_group(
             group_index,
             block_size,
@@ -935,6 +1007,7 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
+        state_budget = _state_budget_for_runner(self._runner)
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
             max_num_seqs=self._runner.scheduler_config.max_num_seqs,
@@ -946,6 +1019,11 @@ class ModelCachePolicy:
             turboquant=config.turboquant,
             k_quant=config.k_quant if config.turboquant else None,
             v_quant=config.v_quant if config.turboquant else None,
+            **(
+                {"state_slot_capacity": state_budget.capacity}
+                if state_budget is not None
+                else {}
+            ),
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
@@ -1204,8 +1282,10 @@ class WorkerCachePlanner:
         # fungible; the per-request reservation below stays zero instead).
         # Growing the lazy state cache holds one old physical pool while its
         # replacement materializes, so budget that one-pool overlap too.
-        per_block_bytes += self._hybrid_align_state_bytes_per_block()
-        per_block_bytes += self._hybrid_align_growth_bytes_per_block()
+        state_budget = _state_budget_for_runner(self._worker.model_runner)
+        if state_budget is None:
+            per_block_bytes += self._hybrid_align_state_bytes_per_block()
+            per_block_bytes += self._hybrid_align_growth_bytes_per_block()
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
@@ -1216,6 +1296,21 @@ class WorkerCachePlanner:
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
         kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        state_scratch = None
+        if state_budget is not None:
+            # Stable GDN pools are preallocated once after layout adoption.
+            # The single-sequence profile does not establish batched state
+            # scratch coverage. Reserve known row-shaped temporary payloads
+            # explicitly, without assuming overlap with that profile.
+            hybrid_plan = self._worker.model_runner.hybrid_runtime_plan
+            assert hybrid_plan is not None
+            state_groups = (
+                hybrid_plan.layers.num_state // hybrid_plan.layers.num_attention
+            )
+            state_scratch = state_cache_scratch_allowance(
+                self._worker.vllm_config, state_budget, state_groups
+            )
+            kv_budget -= state_budget.allocated_bytes + state_scratch.total_bytes
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1228,6 +1323,8 @@ class WorkerCachePlanner:
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            state_cache_budget=state_budget,
+            state_cache_scratch=state_scratch,
         )
         self._validate_paged_attention_plan(
             plan,

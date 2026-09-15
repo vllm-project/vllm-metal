@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.impls import linear as attention_linear
 from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
     GDNRecurrentDecodeRequest,
@@ -1640,6 +1641,114 @@ class TestLazyRecurrentPrefill:
 
 
 class TestLazyDecodeFallbacks:
+    @pytest.mark.parametrize(
+        ("capacity", "slot_ids", "checkpoint_ids"),
+        [
+            (96, [49, 57, 63, 69], [48, 56, 62, 68]),
+            (41, [11, 25, 20, 0], [10, 24, 19, 1]),
+        ],
+        ids=["large-pool-high-slots", "compact-pool-reused-slots"],
+    )
+    def test_recurrent_fallback_output_survives_encoder_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capacity: int,
+        slot_ids: list[int],
+        checkpoint_ids: list[int],
+    ) -> None:
+        """A BF16 consumer must see completed raw FP32 writes after an encoder split."""
+        _require_metal()
+        ops = _get_native_ops_or_skip()
+        rng = np.random.default_rng(42)
+        num_requests, n_hk, n_hv, d_k, d_v = 4, 16, 48, 128, 128
+        q_np = rng.standard_normal((num_requests, n_hk, d_k), dtype=np.float32)
+        k_np = rng.standard_normal((num_requests, n_hk, d_k), dtype=np.float32)
+        q_np /= np.linalg.norm(q_np, axis=-1, keepdims=True)
+        k_np /= np.linalg.norm(k_np, axis=-1, keepdims=True)
+        q, k = mx.array(q_np), mx.array(k_np)
+        v = mx.array(
+            rng.standard_normal((num_requests, n_hv, d_v), dtype=np.float32) * 0.1
+        )
+        g = mx.array(rng.uniform(0.8, 0.999, (num_requests, n_hv)).astype(np.float32))
+        beta = mx.array(rng.uniform(0.1, 0.9, (num_requests, n_hv)).astype(np.float32))
+        initial_state = (
+            rng.standard_normal((num_requests, n_hv, d_v, d_k), dtype=np.float32) * 0.01
+        )
+        cache = _make_state_cache(
+            max_seqs=capacity,
+            num_v_heads=n_hv,
+            value_head_dim=d_v,
+            key_head_dim=d_k,
+            dtype=mx.bfloat16,
+        )
+        cache.write_recurrent_rows(
+            0,
+            mx.array(np.concatenate([initial_state, initial_state], axis=0)),
+            mx.array(slot_ids + checkpoint_ids, dtype=mx.int32),
+        )
+        mx.eval(cache.recurrent_states[0])
+        mx.synchronize()
+
+        class Inner(nn.Module):
+            num_k_heads = n_hk
+            num_v_heads = n_hv
+            head_k_dim = d_k
+            head_v_dim = d_v
+
+        wrapper = GDNPagedAttentionWrapper(
+            Inner(), layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        raw_outputs: list[mx.array] = []
+
+        class RecordingOps:
+            def gdn_linear_attention(self, *args: Any) -> None:
+                # Retain the native FP32 output without evaluating or changing
+                # dispatch: the test exercises the real fallback and kernel.
+                raw_outputs.append(args[8])
+                ops.gdn_linear_attention(*args)
+
+        monkeypatch.setattr(attention_linear, "get_ops", lambda: RecordingOps())
+        state = _GDNForwardState(
+            x=mx.zeros((1, num_requests, 1), dtype=mx.bfloat16),
+            cu_seqlens=list(range(num_requests + 1)),
+            num_requests=num_requests,
+            total_tokens=num_requests,
+            slot_ids=slot_ids,
+            num_decode_requests=0,
+        )
+        result = wrapper._run_recurrent_fallback(q, k, v, g, beta, state)
+
+        # The independent marker finalizes the raw producer's encoder without
+        # a CPU wait. It is not a dependency of either consumer below. Before
+        # the fallback completion fix, add_temporary stripped y/state from
+        # cross-encoder fence tracking and these consumers could read zeros.
+        marker = mx.square(mx.arange(4096, dtype=mx.float32))
+        mx.async_eval(marker)
+        normalized = mx.fast.rms_norm(result, None, 1e-6)
+        mx.eval(result, normalized)
+        mx.synchronize()
+
+        assert len(raw_outputs) == 1
+        final_fp32 = np.array(raw_outputs[0])
+        assert np.isfinite(final_fp32).all() and np.any(final_fp32 != 0)
+        # Build the oracle from a fresh copy after GPU completion. Reusing the
+        # earlier BF16 graph would preserve its stale read and hide this bug.
+        expected = mx.array(final_fp32).astype(mx.bfloat16)
+        expected_normalized = mx.fast.rms_norm(expected, None, 1e-6)
+        mx.eval(expected, expected_normalized)
+        np.testing.assert_array_equal(
+            np.array(result.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+        )
+        np.testing.assert_array_equal(
+            np.array(normalized.astype(mx.float32)),
+            np.array(expected_normalized.astype(mx.float32)),
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0][mx.array(checkpoint_ids)]),
+            initial_state,
+        )
+
     def test_falls_back_for_multi_token_requests(self) -> None:
         # Arrange
         cache = _make_state_cache()
