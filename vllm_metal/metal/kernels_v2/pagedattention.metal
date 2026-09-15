@@ -2143,6 +2143,123 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
+// ---------------------------------------------------------------------------
+// GQA-shared flash-decode pass for pure-decode batches.
+//
+// One threadgroup per (PARTITION_SIZE-token partition, kv head, sequence);
+// each simdgroup owns one query head of the GQA group, so the whole group
+// shares every K/V row load — the per-token kernel above instead re-reads
+// the same KV rows once per query head from separate threadgroups — and the
+// online softmax stays entirely in registers (no threadgroup-memory score
+// staging, no barriers).  At long contexts this lifts single-sequence decode
+// KV-scan bandwidth from ~40GB/s to ~190GB/s on M5 Pro.
+//
+// Partials are written in the exact contract paged_attention_v2_reduce
+// consumes: log2-space running (max, exp-sum) stats plus the
+// epsilon-normalised partial at tmp_out[token, head, partition, :], so the
+// existing reduce pass merges them unchanged.  Engaged only for pure-decode
+// batches without TurboQuant/FP8/sinks/softcap/sliding-window (dispatch gate
+// in paged_ops.cpp); everything else keeps the established paths.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
+[[kernel]] void paged_attention_gqa_decode(
+    device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
+    device const T *k_cache [[buffer(4)]], device const T *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_per_grid [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
+  constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
+  const int partition_idx = tg_pos.x;
+  const int kv_head_idx = tg_pos.y;
+  const int seq_idx = tg_pos.z;
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
+  const int t0 = partition_idx * PARTITION_SIZE;
+  if (t0 >= context_len) {
+    // The reduce reads only ceil(context_len / PARTITION_SIZE) partitions,
+    // so stats for later partitions are never consumed (same early-out as
+    // the partitioned per-token kernel).
+    return;
+  }
+  const int t_end = min(t0 + PARTITION_SIZE, context_len);
+
+  const int group = tptg.x / 32;  // query heads per kv head (GQA group)
+  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
+  const int num_heads = num_kv_heads * group;
+  const int max_num_partitions = tg_per_grid.x;
+  const int64_t kv_token_stride =
+      static_cast<int64_t>(num_kv_heads) * kv_head_stride;
+
+  // Lane-strided query slice, loaded once.
+  device const T *q_ptr =
+      q + seq_idx * q_stride + head_idx * HEAD_SIZE + lane * SLICE;
+  float qv[SLICE];
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    qv[i] = float(q_ptr[i]);
+  }
+
+  device const uint32_t *bt =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+
+  // Online softmax in log2 space (v2_reduce contract): folding log2(e) into
+  // the scale turns every exp into a 1-instruction exp2 on Apple GPUs.
+  float m = -FLT_MAX;
+  float l = 0.f;
+  float acc[SLICE] = {0.f};
+  const float log2e_scale = scale * M_LOG2E_F;
+  for (int t = t0; t < t_end; t++) {
+    const int64_t row = static_cast<int64_t>(bt[t / BLOCK_SIZE]) *
+            kv_block_stride +
+        (t % BLOCK_SIZE) * kv_token_stride + kv_head_idx * kv_head_stride +
+        lane * SLICE;
+    device const T *krow = k_cache + row;
+    float dot = 0.f;
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      dot += qv[i] * float(krow[i]);
+    }
+    const float s = simd_sum(dot) * log2e_scale;
+    const float m_new = max(m, s);
+    // exp2(-FLT_MAX - s) == 0 under -fno-fast-math, so the first-iteration
+    // rescale needs no guard (same identity the masked-score path uses).
+    const float alpha = exp2(m - m_new);
+    const float p = exp2(s - m_new);
+    l = l * alpha + p;
+    device const T *vrow = v_cache + row;
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      acc[i] = acc[i] * alpha + p * float(vrow[i]);
+    }
+    m = m_new;
+  }
+
+  const int64_t pidx =
+      (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+          max_num_partitions +
+      partition_idx;
+  if (lane == 0) {
+    max_logits[pidx] = m;
+    exp_sums[pidx] = l;
+  }
+  device T *out_ptr = tmp_out + pidx * HEAD_SIZE + lane * SLICE;
+  const float inv_l = 1.f / (l + 1e-6f);
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    out_ptr[i] = T(acc[i] * inv_l);
+  }
+}
+
 // Tiled paged attention kernel (paged_attention_tiled) is in
 // pagedattention_tiled.metal.
 
@@ -2337,3 +2454,46 @@ instantiate_paged_attention_v1(half, char, uchar, 32);
 instantiate_paged_attention_v2(float, char, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, char, uchar, 32);
 instantiate_paged_attention_v2(half, char, uchar, 32);
+
+// GQA-shared flash-decode pass (pure decode, non-TQ): half/bfloat16 caches,
+// head sizes divisible by 32 up to 256, kernel block sizes 8/16/32.  Other
+// configs keep the per-token kernel via the dispatch gate in paged_ops.cpp.
+#define instantiate_gqa_decode_inner(type, head_size, block_size,            \
+                                     partition_size)                         \
+  template [[host_name("paged_attention_gqa_decode_" #type "_hs" #head_size  \
+                       "_bs" #block_size "_ps" #partition_size)]]            \
+  [[kernel]] void paged_attention_gqa_decode<type, head_size, block_size,    \
+                                             partition_size>(                \
+      device float *exp_sums [[buffer(0)]],                                  \
+      device float *max_logits [[buffer(1)]], device type *tmp_out           \
+      [[buffer(2)]],                                                         \
+      device const type *q [[buffer(3)]],                                    \
+      device const type *k_cache [[buffer(4)]],                              \
+      device const type *v_cache [[buffer(5)]],                              \
+      const constant int &num_kv_heads [[buffer(8)]],                        \
+      const constant float &scale [[buffer(9)]],                             \
+      device const uint32_t *block_tables [[buffer(11)]],                    \
+      device const uint32_t *context_lens [[buffer(12)]],                    \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],             \
+      const constant int &q_stride [[buffer(15)]],                           \
+      const constant int &kv_block_stride [[buffer(16)]],                    \
+      const constant int &kv_head_stride [[buffer(17)]],                     \
+      uint3 tg_pos [[threadgroup_position_in_grid]],                         \
+      uint3 tg_per_grid [[threadgroups_per_grid]],                           \
+      uint3 tptg [[threads_per_threadgroup]],                                \
+      uint sg [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_gqa_decode_hs(type, block_size, partition_size)          \
+  instantiate_gqa_decode_inner(type, 64, block_size, partition_size);        \
+  instantiate_gqa_decode_inner(type, 96, block_size, partition_size);        \
+  instantiate_gqa_decode_inner(type, 128, block_size, partition_size);       \
+  instantiate_gqa_decode_inner(type, 256, block_size, partition_size);
+
+#define instantiate_gqa_decode_bs(type, partition_size)                      \
+  instantiate_gqa_decode_hs(type, 8, partition_size);                        \
+  instantiate_gqa_decode_hs(type, 16, partition_size);                       \
+  instantiate_gqa_decode_hs(type, 32, partition_size);
+
+instantiate_gqa_decode_bs(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode_bs(half, VLLM_METAL_PARTITION_SIZE);
