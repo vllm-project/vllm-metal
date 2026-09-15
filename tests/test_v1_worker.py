@@ -112,7 +112,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(mlx_device="gpu")
     worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
-    worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
+    worker.vllm_config = SimpleNamespace(
+        cache_config=worker.cache_config, speculative_config=None
+    )
     return worker
 
 

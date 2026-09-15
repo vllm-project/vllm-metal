@@ -1163,6 +1163,7 @@ class TestMetalPlatform:
             speculative_config=SimpleNamespace(
                 use_heterogeneous_vocab=False,
                 num_speculative_tokens=3,
+                method="ngram",
             ),
             scheduler_config=SimpleNamespace(async_scheduling=True),
         )
@@ -1217,6 +1218,7 @@ class TestMetalPlatform:
                 speculative_config=SimpleNamespace(
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
+                    method="ngram",
                 ),
             )
             # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
@@ -1254,7 +1256,9 @@ class TestMetalPlatform:
                     mamba_ssm_cache_dtype="float32",
                 ),
                 speculative_config=SimpleNamespace(
-                    use_heterogeneous_vocab=False, num_speculative_tokens=2
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=2,
+                    method="ngram",
                 ),
             )
             assert vllm_config.cache_config.user_specified_mamba_block_size is True

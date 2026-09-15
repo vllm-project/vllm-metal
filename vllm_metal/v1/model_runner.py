@@ -75,6 +75,11 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.dspark.config import DSparkConfig
+from vllm_metal.v1.dspark.contracts import is_dspark_config
+from vllm_metal.v1.dspark.loader import load_drafter
+from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
+from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -389,13 +394,16 @@ class MetalModelRunner:
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        self._dspark_memory_plan: DSparkMemoryPlan | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
         # before `determine_available_memory()`/`get_kv_cache_spec()` run.
         # The draft's MLX weights load later, in `install_drafter`.
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
-        if spec is not None and spec.uses_draft_model():
+        # A DSpark drafter travels under the draft_model label (see
+        # contracts.present_dspark_as_draft_model) but owns no scheduler KV group.
+        if spec is not None and spec.uses_draft_model() and not is_dspark_config(spec):
             from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
 
             self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
@@ -642,6 +650,69 @@ class MetalModelRunner:
         )
         if self._is_pooling:
             self._model_lifecycle.install_pooling_backend()
+        self._load_dspark_drafter()
+
+    def _load_dspark_drafter(self) -> None:
+        """Materialize DSpark before profiling and target KV capacity planning."""
+        spec = self.vllm_config.speculative_config
+        if not is_dspark_config(spec):
+            return
+        assert spec is not None and spec.draft_model_config is not None
+        if self._drafter is not None:
+            raise RuntimeError("DSpark drafter has already been loaded")
+        limit = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        if limit <= 0:
+            raise RuntimeError("DSpark requires the Metal recommended working-set size")
+        budget = int(limit * self.cache_config.gpu_memory_utilization)
+        mx.eval(self.model.parameters())
+        mx.clear_cache()
+        draft = spec.draft_model_config
+        model, config = load_drafter(
+            draft.model,
+            revision=draft.revision,
+            memory_budget_bytes=budget - mx.get_active_memory(),
+            expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
+        )
+        plan = DSparkMemoryPlan.build(
+            config,
+            itemsize=model.hidden_norm.weight.itemsize,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
+        # Reject an impossible reservation before the target profiling forward
+        # allocates activations. Allow FP32 storage for its full-logits output;
+        # the measured profile supplies the remaining target workspace reserve.
+        profile_logits = (
+            self.scheduler_config.max_num_batched_tokens * config.vocab_size * 4
+        )
+        if mx.get_active_memory() + plan.reserve_bytes + profile_logits >= budget:
+            raise ValueError(
+                "DSpark context/workspace and target profiling output do not fit "
+                "the Metal memory allowance. Lower --max-model-len, --max-num-seqs "
+                "or --max-num-batched-tokens, or raise --gpu-memory-utilization."
+            )
+        self._dspark_memory_plan = plan
+        self._drafter = DSparkProposer(
+            drafter=model,
+            config=config,
+            runner=self,
+            controller=self._spec_decode_controller,
+            memory_plan=plan,
+            memory_budget_bytes=budget,
+        )
+        logger.info(
+            "DSpark drafter loaded for speculative decoding: %s "
+            "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "
+            "capture=%.2f MB, workspace=%.2f MB, context_slots=%d",
+            draft.model,
+            config.block_size,
+            config.target_layer_ids,
+            plan.context_bytes / 1e6,
+            plan.capture_bytes / 1e6,
+            plan.workspace_bytes / 1e6,
+            plan.max_contexts,
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
@@ -746,6 +817,7 @@ class MetalModelRunner:
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
@@ -753,6 +825,7 @@ class MetalModelRunner:
             cache=cache,
             collect_hidden_states=collect_hidden_states,
             logits_indices=logits_indices,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def _paged_logits_layout(
@@ -968,11 +1041,15 @@ class MetalModelRunner:
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
+
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif is_dspark_config(spec):
+            # DSpark has no autoregressive KV group. Its weights and bounded
+            # context/workspace reservation must exist BEFORE target KV sizing.
+            if not isinstance(self._drafter, DSparkProposer):
+                raise RuntimeError("DSpark must be loaded before target KV allocation")
         elif spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
             # `num_blocks` is the scheduler-visible committed-KV capacity for
             # the draft group (see cache_policy._draft_layer_specs); the
             # physical backend needs `scratch_reserve_blocks` on top of that
@@ -981,6 +1058,8 @@ class MetalModelRunner:
             # budget already reserved this many blocks' worth of bytes off
             # the top (WorkerCachePlanner._paged_attention_plan), so this is
             # guaranteed to fit.
+            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
@@ -992,10 +1071,10 @@ class MetalModelRunner:
                 dtype=self.kv_cache_dtype,
             )
         elif spec.method == "ngram":
-            from vllm_metal.v1.ngram_proposer import NgramProposer
-
             # N-gram drafts from token history alone — no model, no KV cache, so
             # num_blocks/block_size are unused here.
+            from vllm_metal.v1.ngram_proposer import NgramProposer
+
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,
@@ -1050,10 +1129,9 @@ class MetalModelRunner:
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
         has_pooling_work = self._has_paged_pooling_work(prefill_reqs, decode_reqs)
 
-        # prompt_len=None marks an intermediate prefill chunk; only final
-        # prefill rows can seed the next Gemma4 MTP draft step. Pooling batches
-        # do not sample or draft tokens, so they never request target hidden
-        # states here.
+        # Each proposer owns its capture policy: MTP needs sampling rows,
+        # while DSpark needs every prefill chunk to build contiguous context.
+        # Pooling batches never draft tokens.
         collect_target_hidden_states = (
             not has_pooling_work
             and self._drafter is not None
@@ -1242,17 +1320,22 @@ class MetalModelRunner:
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
                 # theirs contributes a token, so the lm_head projection over
-                # the whole chunk (and the sampling sync) is pure waste. The
-                # adapter runs the model without the projection — the KV and
-                # GDN cache writes are the step's real output. Any installed
-                # drafter is excluded outright: propose() runs unconditional
-                # per-step bookkeeping (finished-id pruning, pending-draft
-                # resolution) that the no-logits short-circuit would skip.
+                # the whole chunk (and the sampling sync) is pure waste.
+                # A drafter may request specific layers' residuals; forward its
+                # selection alongside the hidden-state request. Drafters without
+                # a capture selection (e.g. Gemma4 MTP) contribute None.
+                capture_layer_ids = (
+                    self._drafter.capture_layer_ids
+                    if collect_target_hidden_states and self._drafter is not None
+                    else None
+                )
+                # Feature-capturing drafters receive a no-sample ProposeContext
+                # below, so context ingestion is not lost on body-only steps.
                 intermediate_only = (
                     not decode_reqs
                     and bool(prefill_reqs)
                     and all(pr.prompt_len is None for pr in prefill_reqs)
-                    and self._drafter is None
+                    and (self._drafter is None or capture_layer_ids is not None)
                 )
                 # Prompt-logprobs requests need a logits row for every prompt
                 # position, so their steps skip both head-pruning paths: the
@@ -1266,11 +1349,15 @@ class MetalModelRunner:
                     and self._intermediate_forward_supported
                     and not needs_prompt_logprob_rows
                 ):
-                    intermediate_hidden = self._model_adapter.intermediate_forward(
-                        self._forward_model, input_ids, cache=offset_caches
-                    ).hidden_states
+                    intermediate_output = self._model_adapter.intermediate_forward(
+                        self._forward_model,
+                        input_ids,
+                        cache=offset_caches,
+                        capture_layer_ids=capture_layer_ids,
+                    )
+                    intermediate_hidden = intermediate_output.hidden_states
                     logits = None
-                    target_hidden_states = None
+                    target_hidden_states = intermediate_output.captured_hidden_states
                 else:
                     if not needs_prompt_logprob_rows:
                         logits_layout = self._paged_logits_layout(
@@ -1282,6 +1369,7 @@ class MetalModelRunner:
                         cache=offset_caches,
                         collect_hidden_states=collect_target_hidden_states,
                         logits_indices=logits_layout.indices,
+                        capture_layer_ids=capture_layer_ids,
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
@@ -1296,7 +1384,10 @@ class MetalModelRunner:
         elif intermediate_hidden is not None:
             # Intermediate-only prefill: the KV/GDN cache writes are the real
             # output; the hidden states force them through the lazy graph.
-            self._submit_paged_forward_outputs(intermediate_hidden)
+            intermediate_outputs = [intermediate_hidden]
+            if target_hidden_states is not None:
+                intermediate_outputs.append(target_hidden_states)
+            self._submit_paged_forward_outputs(*intermediate_outputs)
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
             # the next stage, plus any runtime-owned forward side effects.
@@ -1492,6 +1583,23 @@ class MetalModelRunner:
             for pr in prefill_reqs:
                 self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
                     pr.token_ids
+                )
+            if self._drafter is not None:
+                self._draft_token_ids = self._drafter.propose(
+                    ProposeContext(
+                        target_hidden_states=target_hidden_states,
+                        decode_reqs=[],
+                        decode_segments=(),
+                        decode_token_ids=[],
+                        prefill_reqs=prefill_reqs,
+                        prefill_token_ids=[],
+                        prefill_result_modes=["intermediate"] * len(prefill_reqs),
+                        request_states=self._request_states,
+                        cu_seqlens=cu_seqlens,
+                        num_decode_segments=0,
+                        num_speculative_tokens=scheduler_output.num_spec_tokens_to_schedule,
+                        finished_req_ids=scheduler_output.finished_req_ids,
+                    )
                 )
             return batch, scheduler_output
 

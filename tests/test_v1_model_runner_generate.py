@@ -367,7 +367,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["merge_verify_windows"] = merge_verify_windows
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache
             captured["logits_indices"] = (
@@ -432,7 +432,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["decode_info"] = decode_info
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["input_ids"] = input_ids.tolist()
@@ -482,7 +482,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["block_size"] = block_sizes[0]
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache
             captured["logits_indices"] = (
@@ -631,7 +631,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["block_size"] = block_sizes[0]
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache
             captured["logits_indices"] = (
@@ -687,7 +687,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["block_size"] = block_sizes[0]
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache
             captured["logits_indices"] = (
@@ -752,7 +752,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["block_size"] = block_sizes[0]
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache
             captured["logits_indices"] = (
@@ -1864,7 +1864,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         captured: dict[str, object] = {}
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             ctx = mr.get_context()
@@ -2096,7 +2096,7 @@ class TestStartPagedForwardSelectiveLogits:
         captured: dict[str, object] = {}
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states
             captured["logits_indices"] = (
@@ -2796,7 +2796,7 @@ class TestDeferredDecodeSampleThreading:
         captured: dict[str, object] = {}
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["input_ids"] = input_ids.tolist()
@@ -3212,13 +3212,14 @@ class TestIntermediateBodyOnlyForward:
             scheduled["d0"] = 1
         else:
             runner._drafter = SimpleNamespace(
+                capture_layer_ids=None,
                 needs_target_hidden_states=lambda decode_segments, has_final_prefill: (
                     False
-                )
+                ),
             )
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
@@ -3258,7 +3259,7 @@ class TestIntermediateBodyOnlyForward:
         runner._intermediate_forward_supported = False
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
@@ -3327,11 +3328,12 @@ class TestIntermediateBodyOnlyForward:
         runner.num_layers = 0
         runner._paged_block_size = 4
         runner._drafter = SimpleNamespace(
-            needs_target_hidden_states=lambda decode_segments, has_final_prefill: True
+            capture_layer_ids=None,
+            needs_target_hidden_states=lambda decode_segments, has_final_prefill: True,
         )
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, logits_indices
             captured["collect_hidden_states"] = collect_hidden_states

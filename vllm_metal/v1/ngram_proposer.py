@@ -70,6 +70,9 @@ _COOLDOWN_STEPS = 8
 class NgramProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
 
+    #: This proposer reads no target hidden states.
+    capture_layer_ids: list[int] | None = None
+
     def __init__(
         self,
         *,

@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.v1.hidden_state_tap import run_backbone_with_capture
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
@@ -32,6 +34,7 @@ class IntermediateForwardOutput:
     """Projection-free forward output for a no-sample intermediate step."""
 
     hidden_states: mx.array
+    captured_hidden_states: mx.array | None = None
 
 
 class MultimodalEncodeResult(Protocol):
@@ -146,6 +149,7 @@ class ModelAdapter(Protocol):
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> IntermediateForwardOutput:
         """Run *model* without the output projection (cache writes only)."""
 
@@ -157,11 +161,14 @@ class ModelAdapter(Protocol):
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target text model and optionally retain target hidden states.
 
         ``logits_indices`` requests logits for those input rows only, and is
         valid only when :meth:`supports_selective_logits` returned ``True``.
+        ``capture_layer_ids`` selects the layers whose residuals fuse into
+        ``hidden_states``.
         """
 
     def supports_selective_logits(self, model: Any) -> bool:
@@ -398,6 +405,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> IntermediateForwardOutput:
         """Run *model*'s transformer body without the output projection.
 
@@ -410,6 +418,14 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             raise ValueError(
                 f"{type(model).__name__} has no resolvable transformer body; "
                 "callers must gate on supports_intermediate_forward()."
+            )
+        if capture_layer_ids:
+            final, fused = run_backbone_with_capture(
+                body, input_ids, cache=cache, layer_ids=capture_layer_ids
+            )
+            return IntermediateForwardOutput(
+                hidden_states=final,
+                captured_hidden_states=self._flatten_target_hidden_states(fused),
             )
         return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
 
@@ -425,13 +441,42 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target model and return logits plus optional hidden states.
 
         ``logits_indices`` projects the head outside the model's own
         ``__call__``, so callers must gate it on
         :meth:`supports_selective_logits`; this method trusts them.
+
+        ``capture_layer_ids`` (a non-empty list of layer indices) runs the body
+        forward while capturing the residual after each named layer and fusing
+        them into ``hidden_states``; the target's own logits are still computed
+        from the same forward's final hidden, so the integrated path needs only
+        one forward. ``None`` preserves the existing execution path with no
+        additional operations. Logits selection is independent of capture:
+        fused features always retain every packed input row.
         """
+        if capture_layer_ids:
+            backbone = self._target_backbone(model)
+            if backbone is None:
+                raise NotImplementedError(
+                    "capture_layer_ids requires a text model with a `.model` "
+                    "backbone; this model does not expose hidden states."
+                )
+            final, fused = run_backbone_with_capture(
+                backbone, input_ids, cache=cache, layer_ids=capture_layer_ids
+            )
+            if logits_indices is not None:
+                final = mx.take(
+                    self._flatten_target_hidden_states(final), logits_indices, axis=0
+                )[None]
+            logits = self._compute_target_logits(model, final)
+            return TargetModelForwardOutput(
+                logits=logits,
+                hidden_states=self._flatten_target_hidden_states(fused),
+            )
+
         if logits_indices is None and not collect_hidden_states:
             output = model(input_ids, cache=cache)
             return TargetModelForwardOutput(

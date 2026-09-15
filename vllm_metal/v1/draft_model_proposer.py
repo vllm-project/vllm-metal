@@ -139,6 +139,9 @@ _DECODE_INGEST_MAX_TOKENS = 16
 class DraftModelProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
+    #: This proposer reads no target hidden states.
+    capture_layer_ids: list[int] | None = None
+
     def __init__(
         self,
         *,

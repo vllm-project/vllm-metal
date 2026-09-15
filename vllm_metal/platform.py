@@ -514,6 +514,17 @@ class MetalPlatform(Platform):
                 "draft model that shares the target vocabulary."
             )
 
+        from vllm_metal.v1.dspark.contracts import (
+            present_dspark_as_draft_model,
+            validate_dspark_config,
+        )
+
+        validate_dspark_config(vllm_config)
+        # After validation: upstream rejects method="dspark" on the V1 runner
+        # once this hook returns, so the pair continues under the draft_model
+        # label, which is_dspark_config() still recognises by its drafter.
+        present_dspark_as_draft_model(vllm_config)
+
         # Upstream's scheduler pads a newly admitted decode request to the uniform
         # speculative width, then still clips it to long_prefill_token_threshold,
         # leaving num_speculative_tokens placeholder drafts against fewer scheduled
@@ -532,7 +543,7 @@ class MetalPlatform(Platform):
                 "1 + num_speculative_tokens, or leave it unset."
             )
 
-        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
+        # All four Metal proposers (draft-model, MTP, n-gram, DSpark) hand drafts back
         # to the scheduler synchronously via take_draft_token_ids(), so async
         # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
         # async scheduling for draft-model SD (vllm#48341); restore the working

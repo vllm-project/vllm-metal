@@ -38,6 +38,12 @@ class ProposeContext:
     Carries everything computed during target sampling that a drafter needs.
     Long-lived collaborators (models, caches, the assistant runtime) are held
     by the proposer implementation itself, not here.
+
+    Hidden rows use ``cu_seqlens`` in decode-then-prefill order. Absolute token
+    positions come from ``PagedDecodeSegment.cache_start_pos`` and
+    ``PrefillRequest.start_pos``; they must not be inferred from a sampled
+    token count. Pure intermediate steps supply an empty ``prefill_token_ids``
+    sequence and still deliver every scheduled feature span for ingestion.
     """
 
     target_hidden_states: mx.array | None
@@ -61,6 +67,8 @@ class ProposeContext:
 
 class MetalProposer(Protocol):
     """Uniform drafting seam."""
+
+    capture_layer_ids: list[int] | None
 
     def needs_target_hidden_states(
         self,
@@ -94,6 +102,11 @@ class Gemma4MTPProposer:
     after model load, so capturing it at construction time would pin the
     pre-sharing object.
     """
+
+    # Default to None: target_forward uses the existing collect_hidden_states
+    # path (single final layer). DSparkProposer overrides this with a non-empty
+    # list to trigger fused intermediate-layer capture.
+    capture_layer_ids: list[int] | None = None
 
     def __init__(self, runner: MetalModelRunner) -> None:
         self._runner = runner

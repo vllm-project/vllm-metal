@@ -19,6 +19,53 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
+## Speculative decoding losslessness
+
+Greedy speculative decoding must reproduce the target-only greedy output
+token for token: the verifier accepts a draft only where it equals the
+target's argmax, so a difference means either the verification forward (or
+the draft plumbing behind it) is wrong, or the target itself chose between two
+near-tied tokens differently because the verify batch has a different shape
+than the target-only decode batch. `tools/check_sd_lossless.py` runs a
+target-only engine and a speculative engine in separate subprocesses over the
+same 12 fixed prompts (64 greedy tokens each, `ignore_eos`, prefix caching
+off, synchronous scheduling), compares the token ids, and classifies every
+first divergence with the base engine's top-K logprobs at that position:
+
+```bash
+python tools/check_sd_lossless.py --method ngram --model Qwen/Qwen3-0.6B -k 3
+python tools/check_sd_lossless.py --method dspark \
+    --model mlx-community/Qwen3-4B-4bit \
+    --draft deepseek-ai/dspark_qwen3_4b_block7 -k 4 --top-k 2 --control-max-num-seqs 1
+```
+
+- `EXACT`: every output token matches.
+- `TOP_K_MATCH`: the SD token at the first divergence is within the base
+  engine's top-K there (printed with the logprob gap; later tokens are not
+  compared, as for `check_parity.py`). Accepted only with `--top-k K`.
+- `FAIL`: any other difference. The base engine's top-K at the position is
+  printed for follow-up.
+- `INCONCLUSIVE` (exit 2): the speculative engine drafted no tokens, or
+  reported no spec-decode metrics at all. A request the method declines falls
+  back to target-only generation and then emits the target's own tokens, so
+  every prompt would match exactly without verification ever running. The tool
+  reports that rather than passing on it.
+
+`--method` selects `draft_model` (the default, self-drafting Qwen3-0.6B),
+`dspark`, `ngram` or `mtp`; `--draft` names the draft checkpoint
+and `-k` the speculative width. `--max-tokens`, `--num-prompts` or repeated
+`--prompt`, `--max-model-len` and `--gpu-memory-utilization` (both engines,
+default 0.35) bound the run. `--max-num-seqs 1` serves the prompts one at a
+time, which removes the batch-shape difference between the engines;
+`--control-max-num-seqs N` additionally runs the target-only engine at that
+limit and reports where its output differs from the base run, so a divergence
+the target reproduces on its own is attributed to the target, not the
+verifier. `--dump DIR` keeps each engine's tokens, logprobs and statistics.
+The tool prints each engine's throughput and spec-decode metrics and exits
+nonzero when any prompt fails (1) or when the run was inconclusive (2). See the
+[speculative decoding guide](speculative_decoding.md) for what each method
+guarantees.
+
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
