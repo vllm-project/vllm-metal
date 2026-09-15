@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""STT-specific scheduler policy at the platform boundary."""
+"""STT-specific scheduler and request policy at the platform boundary."""
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
 
 # Nominal memory reported to vLLM scheduler for STT models.
 # No KV cache is actually allocated; this just passes minimum-memory checks.
@@ -38,3 +41,20 @@ def apply_stt_scheduler_policy(
         model_config.tokenizer = model_config.model
     if scheduler_config.async_scheduling:
         scheduler_config.async_scheduling = False
+
+
+def reject_non_greedy_stt_sampling(params: SamplingParams) -> None:
+    """Reject a transcription request the one-shot STT decode cannot honour."""
+    # Imported here so this module stays importable without vLLM's sampling
+    # stack, which pulls in torch and mlx.
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingType
+
+    if params.sampling_type is SamplingType.GREEDY:
+        return
+    raise VLLMValidationError(
+        "vllm-metal transcribes with greedy decoding, so speech-to-text "
+        "requests require temperature=0.",
+        parameter="temperature",
+        value=params.temperature,
+    )

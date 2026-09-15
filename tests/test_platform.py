@@ -48,6 +48,13 @@ def _isolate_mb_buffer_default(monkeypatch):
         os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
 
 
+@pytest.fixture(autouse=True)
+def _reset_stt_marker(monkeypatch):
+    """``check_and_update_config`` records whether the engine serves STT; keep
+    one test's answer from leaking into the next."""
+    monkeypatch.setattr(MetalPlatform, "_serves_stt_model", False)
+
+
 class TestMetalPlatform:
     """Tests for MetalPlatform class."""
 
@@ -120,6 +127,40 @@ class TestMetalPlatform:
         )
         monkeypatch.setattr("vllm_metal.stt.detection.is_stt_model", detect)
 
+    def _detection_platform_config(
+        self,
+        *,
+        model: str = "openai/whisper-tiny",
+        tokenizer: str | None = None,
+        model_type: str = "whisper",
+    ) -> VllmConfig:
+        return self._platform_config(
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[],
+                block_size=None,
+            ),
+            model_config=SimpleNamespace(
+                model=model,
+                disable_cascade_attn=False,
+                tokenizer=tokenizer,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type=model_type),
+                is_hybrid=False,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=False,
+            ),
+        )
+
     def test_device_name(self) -> None:
         """Test device name retrieval."""
         name = MetalPlatform.get_device_name()
@@ -160,6 +201,42 @@ class TestMetalPlatform:
 
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
+
+    def test_stt_engine_rejects_non_greedy_requests(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Serving STT makes a sampled request fail admission, not the engine."""
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        MetalPlatform.check_and_update_config(self._detection_platform_config())
+
+        with pytest.raises(VLLMValidationError) as exc_info:
+            MetalPlatform.validate_request({}, SamplingParams(temperature=0.7))
+
+        assert str(exc_info.value) == (
+            "vllm-metal transcribes with greedy decoding, so speech-to-text "
+            "requests require temperature=0. (parameter=temperature, value=0.7)"
+        )
+
+    def test_stt_engine_accepts_greedy_requests(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        MetalPlatform.check_and_update_config(self._detection_platform_config())
+
+        MetalPlatform.validate_request({}, SamplingParams(temperature=0.0))
+
+    def test_generate_engine_keeps_sampling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-STT engine must not inherit a previous engine's restriction."""
+        self._patch_stt_resolution(monkeypatch, is_stt=True)
+        MetalPlatform.check_and_update_config(self._detection_platform_config())
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        MetalPlatform.check_and_update_config(
+            self._detection_platform_config(model="Qwen/Qwen3-0.6B", model_type="qwen3")
+        )
+
+        MetalPlatform.validate_request({}, SamplingParams(temperature=0.7))
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
@@ -1378,32 +1455,7 @@ class TestMetalPlatform:
     ) -> None:
         """STT models should get tokenizer fallback and async scheduling disabled."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(
-                kv_cache_dtype_skip_layers=[],
-                block_size=None,
-            ),
-            model_config=SimpleNamespace(
-                model="openai/whisper-tiny",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="whisper"),
-                is_hybrid=False,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=False,
-            ),
-        )
+        vllm_config = self._detection_platform_config()
 
         MetalPlatform.check_and_update_config(vllm_config)
 
@@ -1415,32 +1467,7 @@ class TestMetalPlatform:
     ) -> None:
         """STT policy should not overwrite an explicitly configured tokenizer."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(
-                kv_cache_dtype_skip_layers=[],
-                block_size=None,
-            ),
-            model_config=SimpleNamespace(
-                model="openai/whisper-tiny",
-                disable_cascade_attn=False,
-                tokenizer="custom-tokenizer",
-                multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="whisper"),
-                is_hybrid=False,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=False,
-            ),
-        )
+        vllm_config = self._detection_platform_config(tokenizer="custom-tokenizer")
 
         MetalPlatform.check_and_update_config(vllm_config)
 
