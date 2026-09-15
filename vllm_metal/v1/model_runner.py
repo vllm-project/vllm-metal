@@ -1147,11 +1147,33 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            # Full-attention group ids the scheduled requests hold, for the
+            # align state manager's slot retirement. Collected before CoW so
+            # retirement can free this step's role-flipped slots *before*
+            # CoW allocation grows the pool to cover them (capacity never
+            # shrinks; growing first would strand the freed slots).
+            step_kv_block_ids: set[int] | None = None
+            if self._paged_state_group_indices:
+                step_kv_block_ids = {
+                    block_id
+                    for tables, _, _ in decode_info
+                    for row in tables
+                    for block_id in row
+                }
+                step_kv_block_ids.update(
+                    block_id
+                    for tables, _, _ in prefill_info
+                    for row in tables
+                    for block_id in row
+                )
             if runtime is not None and scheduler_output.kv_cache_block_copies:
                 # vLLM has already rewritten request block tables to the CoW
                 # destinations. Populate those physical blocks before the
                 # hybrid state manager reads the rewritten tables.
-                runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
+                runtime.copy_blocks(
+                    scheduler_output.kv_cache_block_copies,
+                    kv_block_ids=step_kv_block_ids,
+                )
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
@@ -1184,6 +1206,7 @@ class MetalModelRunner:
                     ctx=ctx,
                     state_block_ids=step_state_ids,
                     step_positions=step_positions,
+                    kv_block_ids=step_kv_block_ids,
                 )
 
             # ---- forward (lazy graph + async submit) ----

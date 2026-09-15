@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Protocol
 
 import mlx.core as mx
@@ -18,6 +17,9 @@ class PagedStateCache(Protocol):
     @property
     def num_state_pools(self) -> int: ...
 
+    @property
+    def canonical_layers(self) -> list[int]: ...
+
     def ensure_capacity(self, num_seqs: int) -> None: ...
 
     def reset_slot(self, slot: int) -> None: ...
@@ -31,8 +33,6 @@ class PagedStateCache(Protocol):
     def copy_slots(
         self, src_ids: list[int], dst_ids: list[int], layer_indices: list[int]
     ) -> None: ...
-
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None: ...
 
     def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None: ...
 
