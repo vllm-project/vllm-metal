@@ -85,6 +85,7 @@ def make_stub_runner(
         "_multimodal_adapter": None,
         "_gemma4_mtp_assistant": None,
         "_drafter": None,
+        "_target_aux_capture": None,
         "_draft_dims": None,
         "encoder_cache": None,
         "_paged_attention_runtime": None,

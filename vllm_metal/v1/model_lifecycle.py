@@ -558,6 +558,30 @@ class ModelLifecycle:
         )
         runner.kv_cache_dtype = request.target_dtype
         runner._gemma4_mtp_assistant = gemma4_mtp_assistant
+        runner._eagle3_model = None
+        runner._target_aux_capture = None
+        spec = runner.vllm_config.speculative_config
+        if spec is not None and spec.method == "eagle3":
+            from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
+            from vllm_metal.v1.eagle3 import Eagle3Model
+
+            if runner._is_vlm or runner.vllm_config.lora_config is not None:
+                raise NotImplementedError(
+                    "Metal EAGLE3 currently supports text-only targets without LoRA"
+                )
+            runner._eagle3_model = Eagle3Model.load(
+                spec.model,
+                dict(model_args),
+                request.target_dtype,
+                revision=getattr(spec, "revision", None),
+                target_embedding=self._model_adapter.text_model(
+                    runner.model
+                ).model.embed_tokens,
+            )
+            runner._target_aux_capture = AuxHiddenStateCapture(
+                self._model_adapter.text_model(runner.model),
+                runner._eagle3_model.config.aux_layer_ids,
+            )
 
     def _extract_model_args(self, model: Any, is_vlm: bool) -> dict[str, Any]:
         # Both the .args (mlx-lm) and .config (HF) paths may expose a nested

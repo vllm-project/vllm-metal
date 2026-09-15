@@ -12,10 +12,10 @@ import pytest
 
 from vllm_metal.attention.context import get_context
 from vllm_metal.v1.draft_model_proposer import (
-    _DECODE_INGEST_MAX_TOKENS,
     DraftModelProposer,
     _DraftPlan,
 )
+from vllm_metal.v1.proposer import _DECODE_INGEST_MAX_TOKENS
 
 BLOCK_SIZE = 16
 VOCAB = 32
@@ -36,8 +36,7 @@ def _proposer(model, **kwargs) -> DraftModelProposer:
     return DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
-        committed_num_blocks=64,
-        scratch_reserve_blocks=0,
+        max_model_len=32768,
         num_layers=1,
         controller=None,
         extract_logits=lambda logits: logits,

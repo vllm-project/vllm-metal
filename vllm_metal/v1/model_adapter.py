@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from vllm_metal.distributed import PipelineGroup
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+    from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 
 logger = init_logger(__name__)
 
@@ -24,7 +25,10 @@ class TargetModelForwardOutput:
     """Target-model forward output needed by sampling and speculative decode."""
 
     logits: mx.array
+    # Final backbone states and selected intermediate states retain all rows,
+    # even when logits_indices selects a subset for vocabulary projection.
     hidden_states: mx.array | None = None
+    aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,7 @@ class ModelAdapter(Protocol):
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target text model and optionally retain target hidden states.
 
@@ -418,6 +423,34 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return backbone if callable(backbone) else None
 
     def target_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+        collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
+    ) -> TargetModelForwardOutput:
+        """Run native execution with optional, separately returned auxiliary states."""
+        kwargs = {
+            "cache": cache,
+            "collect_hidden_states": collect_hidden_states,
+            "logits_indices": logits_indices,
+        }
+        if aux_capture is None:
+            return self._target_forward(model, input_ids, **kwargs)
+        output, auxiliary = aux_capture.run(
+            self._target_forward, model, input_ids, **kwargs
+        )
+        return replace(
+            output,
+            aux_hidden_states=tuple(
+                self._flatten_target_hidden_states(h) for h in auxiliary
+            ),
+        )
+
+    def _target_forward(
         self,
         model: Any,
         input_ids: mx.array,

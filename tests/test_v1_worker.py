@@ -221,7 +221,6 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=2),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner)
         worker.cache_config.gpu_memory_utilization = 0.5
@@ -256,7 +255,6 @@ class TestPagedAttentionPlanDiagnostics:
     def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.15)
         monkeypatch.setattr(
@@ -283,7 +281,6 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -325,7 +322,6 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -359,7 +355,6 @@ class TestPagedAttentionPlanDiagnostics:
             # old pool retained during growth.
             hybrid_align_state_bytes_per_block=MagicMock(return_value=600),
             hybrid_align_growth_bytes_per_block=MagicMock(return_value=100),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -390,7 +385,6 @@ class TestPagedAttentionPlanDiagnostics:
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.1)
         monkeypatch.setattr(

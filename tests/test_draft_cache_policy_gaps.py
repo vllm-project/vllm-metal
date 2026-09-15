@@ -9,16 +9,13 @@ rejected (see #500):
   reuse draft KV.
 - ``skip_reading_prefix_cache``: a request that opts out of cache reads
   must not reuse draft KV.
-- Allocation limit: the proposer-local scratch reserve is sized to cover
-  every concurrently active request drafting ``num_speculative_tokens``
-  positions, so the draft pool cannot exhaust near the request limit.
 
-The first two run end-to-end in a spawned child process (``spawn`` start
+These run end-to-end in a spawned child process (``spawn`` start
 method -- Metal is not fork-safe) with Qwen3-0.6B draft==target, recording
 each request's first draft plan (``draft_seq_len`` / ingest length) via a
-monkeypatched proposer. The third is stub-level, no weights.
+monkeypatched proposer.
 
-A fourth test (``test_chunked_cold_ingest_token_identity_e2e``) runs two
+Another test (``test_chunked_cold_ingest_token_identity_e2e``) runs two
 spawned children -- ``VLLM_METAL_SPEC_INGEST_CHUNK=16`` (chunked cold
 ingest) vs ``0`` (single forward) -- and asserts the generated tokens are
 identical, i.e. the chunk boundaries are lossless (#482 direction 3).
@@ -30,13 +27,7 @@ import multiprocessing as mp
 import os
 
 import pytest
-from vllm.utils.math_utils import cdiv
 
-from tests.test_draft_model_proposer import (
-    BLOCK_SIZE,
-    _proposer,
-    _StubDraftModel,
-)
 from tests.test_paged_deterministic import (
     DEFAULT_PAGED_MEMORY_FRACTION,
     MODEL_NAME,
@@ -264,61 +255,3 @@ def test_chunked_cold_ingest_token_identity_e2e() -> None:
             "chunked cold ingest changed the generated tokens:\n"
             f"chunk=16: {chunked[2]}\nchunk=0:  {control[2]}"
         )
-
-
-def test_scratch_reserve_covers_max_concurrency() -> None:
-    """The reserve formula fits every concurrent drafter at full concurrency.
-
-    Each request's committed allocation covers its committed length (one
-    block for 16 tokens here); the lookahead to ``committed_len + K - 1``
-    then needs exactly ``cdiv(K, block_size)`` scratch block(s) per request.
-    ``max_num_seqs`` requests must fit in ``max_num_seqs * cdiv(K, BLOCK_SIZE)``
-    scratch blocks, and one block short must exhaust.
-    """
-    num_speculative_tokens = 4
-    max_num_seqs = 3
-    reserve = max_num_seqs * cdiv(num_speculative_tokens, BLOCK_SIZE)
-
-    from vllm.sampling_params import SamplingParams
-
-    from vllm_metal.v1.model_runner import RequestState
-    from vllm_metal.v1.proposer import ProposeContext
-
-    def _state() -> RequestState:
-        return RequestState(
-            token_ids=list(range(16)),
-            prompt_len=16,
-            sampling_params=SamplingParams(temperature=0.0),
-            block_ids=[[0]],
-            num_computed_tokens=0,
-        )
-
-    def _context_for(states: dict[str, RequestState]) -> ProposeContext:
-        return ProposeContext(
-            target_hidden_states=None,
-            decode_reqs=list(states.items()),
-            decode_segments=[],
-            decode_token_ids=[[state.token_ids[-1]] for state in states.values()],
-            prefill_reqs=[],
-            prefill_token_ids=[],
-            prefill_result_modes=[],
-            request_states=states,
-            cu_seqlens=[],
-            num_decode_segments=1,
-            num_speculative_tokens=num_speculative_tokens,
-            finished_req_ids=set(),
-        )
-
-    states = {f"r{i}": _state() for i in range(max_num_seqs)}
-
-    model = _StubDraftModel()
-    proposer = _proposer(model, committed_num_blocks=1, scratch_reserve_blocks=reserve)
-    drafts = proposer.propose(_context_for(states))
-    assert drafts is not None
-
-    model = _StubDraftModel()
-    starved = _proposer(
-        model, committed_num_blocks=1, scratch_reserve_blocks=reserve - 1
-    )
-    with pytest.raises(RuntimeError, match="scratch pool exhausted"):
-        starved.propose(_context_for(states))
