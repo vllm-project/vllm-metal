@@ -42,6 +42,7 @@ __all__ = [
     "DSparkPagedContext",
     "DraftBatch",
     "PagedContextFullError",
+    "PagedCtxCache",
     "PagedLayerBatch",
 ]
 
@@ -144,6 +145,15 @@ class DSparkPagedContext:
     def bytes_reserved(self) -> int:
         cache = self.key_caches[0]
         return 2 * len(self.key_caches) * cache.size * cache.dtype.size
+
+    def request_bytes(self, req_id: str) -> int:
+        """Bytes of pool the request's blocks occupy across every layer."""
+        table = self._tables.get(req_id)
+        if not table:
+            return 0
+        cache = self.key_caches[0]
+        per_block = cache.size // self._num_blocks * cache.dtype.size
+        return 2 * len(self.key_caches) * len(table) * per_block
 
     def pages_for(self, context_length: int) -> int:
         """Pages a context of this length needs, including the draft block's scratch."""
@@ -349,3 +359,84 @@ class PagedLayerBatch:
         rows, heads, block, dim = q.shape
         out = self._pool.attend(self._layer, self._pack(q), self._batch, scale)
         return out.reshape(rows, block, heads, dim).transpose(0, 2, 1, 3)
+
+
+class PagedCtxCache:
+    """One layer's view of a request's context, stored in the paged pool.
+
+    Satisfies the parts of :class:`~vllm_metal.v1.dspark.model.CtxCache` the proposer's
+    lifecycle uses — ``length``, ``append``, ``trim_to``, ``extend_to``,
+    ``allocated_bytes`` — so admission, rollback, recompute and release keep working
+    unchanged when the context moves from a private arena into the pool.
+
+    ``k``/``v`` are deliberately absent. They exist on the arena cache so a
+    single-request step can concatenate the context and attend it densely; a paged
+    context is never materialised that way, and every drafting step goes through
+    :class:`PagedLayerBatch`. Reaching for them is a bug, so it raises rather than
+    quietly rebuilding the dense tensor the pool exists to avoid.
+    """
+
+    __slots__ = ("_layer", "_length", "_pool", "_req_id", "capacity")
+
+    def __init__(
+        self, pool: DSparkPagedContext, layer: int, req_id: str, capacity: int
+    ) -> None:
+        self._pool = pool
+        self._layer = layer
+        self._req_id = req_id
+        self._length = 0
+        self.capacity = capacity
+
+    @property
+    def length(self) -> int:
+        return self._length
+
+    @property
+    def k(self) -> mx.array:
+        raise NotImplementedError(
+            "a paged draft context is read through PagedLayerBatch, not materialised"
+        )
+
+    @property
+    def v(self) -> mx.array:
+        raise NotImplementedError(
+            "a paged draft context is read through PagedLayerBatch, not materialised"
+        )
+
+    @property
+    def allocated_bytes(self) -> int:
+        """This layer's share of the blocks the request currently holds."""
+        return self._pool.request_bytes(self._req_id) // max(
+            1, len(self._pool.key_caches)
+        )
+
+    def append(self, k: mx.array, v: mx.array) -> None:
+        """Write ``[1, kv_heads, tokens, dim]`` at the positions after the committed end."""
+        if k.ndim != 4 or v.ndim != 4 or k.shape[:3] != v.shape[:3]:
+            raise ValueError(
+                "context K/V must cover matching batch, head and token axes"
+            )
+        count = k.shape[2]
+        end = self._length + count
+        if end > self.capacity:
+            raise ValueError("DSpark context append exceeds reserved capacity")
+        self._pool.reserve(self._req_id, end)
+        slots = self._pool.slot_mapping_for(self._req_id, range(self._length, end))
+        self._pool.write(
+            self._layer,
+            mx.contiguous(k[0].transpose(1, 0, 2)),
+            mx.contiguous(v[0].transpose(1, 0, 2)),
+            slots,
+        )
+        self._length = end
+
+    def trim_to(self, length: int) -> None:
+        if not 0 <= length <= self._length:
+            raise ValueError("context trim must retain an existing prefix")
+        self._length = length
+
+    def extend_to(self, length: int) -> None:
+        """Account for positions written through :meth:`DSparkPagedContext.write`."""
+        if not self._length <= length <= self.capacity:
+            raise ValueError("context extension must stay within reserved capacity")
+        self._length = length

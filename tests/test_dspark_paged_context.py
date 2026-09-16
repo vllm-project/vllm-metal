@@ -349,3 +349,102 @@ class TestRaggedIngestAddressing:
         pool = make(num_blocks=8)
         with pytest.raises(KeyError):
             pool.span_slot_mapping([(0, 0, 1, "nobody")], width=1)
+
+
+class TestPagedCtxCacheLifecycle:
+    """The pool-backed cache must satisfy the lifecycle the proposer already drives."""
+
+    @staticmethod
+    def _kv(tokens, seed=3):
+        rng = np.random.default_rng(seed)
+        shape = (1, KV_HEADS, tokens, HEAD_DIM)
+        return (
+            mx.array(rng.normal(size=shape).astype(np.float32)),
+            mx.array(rng.normal(size=shape).astype(np.float32)),
+        )
+
+    def _cache(self, pool=None, capacity=512):
+        from vllm_metal.v1.dspark.paged_context import PagedCtxCache
+
+        pool = pool or make(num_blocks=128, layers=1)
+        return PagedCtxCache(pool, 0, "r", capacity), pool
+
+    def test_append_advances_the_length_and_reserves_blocks(self):
+        cache, pool = self._cache()
+        k, v = self._kv(20)
+        cache.append(k, v)
+        assert cache.length == 20
+        assert pool.holds("r")
+
+    def test_appends_accumulate(self):
+        cache, _ = self._cache()
+        cache.append(*self._kv(10))
+        cache.append(*self._kv(7))
+        assert cache.length == 17
+
+    def test_trim_keeps_a_prefix_and_rejects_a_longer_one(self):
+        cache, _ = self._cache()
+        cache.append(*self._kv(20))
+        cache.trim_to(8)
+        assert cache.length == 8
+        with pytest.raises(ValueError):
+            cache.trim_to(9)
+
+    def test_append_past_capacity_is_refused(self):
+        cache, _ = self._cache(capacity=16)
+        with pytest.raises(ValueError):
+            cache.append(*self._kv(17))
+
+    def test_extend_to_accounts_for_a_batched_write(self):
+        cache, pool = self._cache()
+        pool.reserve("r", 40)
+        cache.extend_to(40)
+        assert cache.length == 40
+        with pytest.raises(ValueError):
+            cache.extend_to(39)
+
+    def test_reading_the_dense_context_is_refused(self):
+        """The pool exists to avoid materialising this; asking must fail loudly."""
+        cache, _ = self._cache()
+        cache.append(*self._kv(4))
+        with pytest.raises(NotImplementedError):
+            _ = cache.k
+        with pytest.raises(NotImplementedError):
+            _ = cache.v
+
+    def test_appended_context_reads_back_through_the_batch(self):
+        """What append wrote is what a drafting step attends."""
+        from vllm_metal.v1.dspark.paged_context import PagedLayerBatch
+
+        pool = make(num_blocks=128, layers=1)
+        cache, _ = self._cache(pool=pool)
+        rng = np.random.default_rng(5)
+        keys = rng.normal(size=(30, KV_HEADS, HEAD_DIM)).astype(np.float32)
+        values = rng.normal(size=(30, KV_HEADS, HEAD_DIM)).astype(np.float32)
+        cache.append(
+            mx.array(keys.transpose(1, 0, 2))[None],
+            mx.array(values.transpose(1, 0, 2))[None],
+        )
+        q = mx.array(
+            rng.normal(size=(1, N_HEADS, DRAFT_BLOCK, HEAD_DIM)).astype(np.float32)
+        )
+        blk_k = mx.zeros((1, KV_HEADS, DRAFT_BLOCK, HEAD_DIM))
+        batch = PagedLayerBatch(pool, 0, pool.plan([("r", 30)]))
+        batch.write_block(blk_k, blk_k)
+        out = np.array(batch.attend(q, HEAD_DIM**-0.5))
+        # dense reference over exactly what was appended, plus the zero block
+        k_all = np.concatenate(
+            [keys, np.zeros((DRAFT_BLOCK, KV_HEADS, HEAD_DIM), np.float32)]
+        )
+        v_all = np.concatenate(
+            [values, np.zeros((DRAFT_BLOCK, KV_HEADS, HEAD_DIM), np.float32)]
+        )
+        expected = np.array(
+            mx.fast.scaled_dot_product_attention(
+                q,
+                mx.array(k_all.transpose(1, 0, 2))[None],
+                mx.array(v_all.transpose(1, 0, 2))[None],
+                scale=HEAD_DIM**-0.5,
+            )
+        )
+        assert np.abs(out - expected).max() < 2e-3
