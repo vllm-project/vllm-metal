@@ -190,6 +190,15 @@ class DSparkProposer:
                 dtype=drafter.hidden_norm.weight.dtype,
             )
             mx.eval(self._pool.key_caches, self._pool.value_caches)
+            logger.info(
+                "DSpark draft context: paged pool, %d blocks of %d tokens "
+                "(%d usable, 1 padding sink), %.2f GB reserved across %d layers",
+                self._pool.total_blocks,
+                PAGED_BLOCK_SIZE,
+                self._pool.usable_blocks,
+                self._pool.bytes_reserved() / 1e9,
+                len(drafter.layers),
+            )
         elif envs.VLLM_METAL_DSPARK_PAGED_CONTEXT:
             logger.warning(
                 "DSpark paged context requested but the attention kernel is not "
@@ -211,6 +220,13 @@ class DSparkProposer:
         ]
         if self._arena:
             mx.eval([(layer.keys, layer.values) for layer in self._arena])
+            logger.info(
+                "DSpark draft context: private arena, %d slots of %d tokens "
+                "across %d layers",
+                memory_plan.max_contexts,
+                memory_plan.max_context_tokens,
+                len(drafter.layers),
+            )
         self._memory_budget_bytes = memory_budget_bytes
         limit = memory_plan.max_contexts
         if max_drafts_per_step is not None:
