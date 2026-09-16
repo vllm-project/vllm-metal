@@ -214,10 +214,17 @@ def verify_rows(
 class RequestRandomStreams:
     """Three independent per-request streams: proposal, acceptance, target.
 
-    A seeded request derives all three from its seed alone, so the same seed
-    reproduces the same draws regardless of batch composition; an unseeded
-    request derives them from the engine seed and its admission ordinal, or
-    from operating-system entropy when the engine has no seed.
+    A seeded request derives all three from its seed alone, and each draws only
+    that request's own width, so no co-scheduled request consumes from a stream
+    that is not its own. An unseeded request derives them from the engine seed
+    and its admission ordinal, or from operating-system entropy when the engine
+    has no seed.
+
+    At a fixed draft width the same seed therefore reproduces the same draws
+    whatever else is in the batch. Under the adaptive planner it does not: the
+    width itself comes from ``decide(active_requests=...)``, so how far a stream
+    advances on a step depends on how many requests were co-scheduled. Reproducing
+    a sampled run byte-for-byte needs the fixed mode.
     """
 
     __slots__ = ("acceptance", "proposal", "target")

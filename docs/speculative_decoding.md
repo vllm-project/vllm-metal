@@ -196,7 +196,9 @@ compares a pair's greedy output against a target-only engine
   and verification accepts each draft with probability `min(1, p/q)`, samples
   the first rejected position from the normalized residual and the bonus
   token from the target distribution, all from the request's own random
-  streams (seeded requests reproduce). The emitted distribution equals the
+  streams (at a fixed draft width, a seeded request reproduces whatever else is
+  in the batch; under the adaptive planner the width itself depends on the batch).
+  The emitted distribution equals the
   target's; the tokens at a given seed differ from target-only serving.
 - **Load regime.** When the calibrated planner declines to draft for 32
   consecutive steps (the batch is too large for verification to pay on this
