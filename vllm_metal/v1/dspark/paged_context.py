@@ -38,7 +38,17 @@ import mlx.core as mx
 
 from vllm_metal.metal import get_ops
 
+KERNEL_HEAD_SIZES = (64, 80, 96, 112, 128, 192, 256, 512)
+"""Head sizes the paged attention kernel is instantiated for.
+
+From the instantiate_paged_attention_heads macro in
+vllm_metal/metal/kernels_v2/pagedattention.metal. A drafter outside this set cannot
+use the pool; the caller keeps the private arena for it rather than failing at the
+first drafting step with a missing Metal function.
+"""
+
 __all__ = [
+    "KERNEL_HEAD_SIZES",
     "DSparkPagedContext",
     "DraftBatch",
     "PagedContextFullError",
@@ -112,6 +122,11 @@ class DSparkPagedContext:
         if block_size not in (8, 16, 32):
             raise ValueError(
                 f"paged attention supports block sizes 8, 16 and 32, not {block_size}"
+            )
+        if head_dim not in KERNEL_HEAD_SIZES:
+            raise ValueError(
+                f"paged attention is not instantiated for head size {head_dim}; "
+                f"supported: {', '.join(str(h) for h in KERNEL_HEAD_SIZES)}"
             )
         shape = (num_blocks, block_size, kv_heads, head_dim)
         self.key_caches = [mx.zeros(shape, dtype=dtype) for _ in range(num_layers)]
@@ -386,6 +401,10 @@ class PagedCtxCache:
         self._req_id = req_id
         self._length = 0
         self.capacity = capacity
+
+    @property
+    def request_id(self) -> str:
+        return self._req_id
 
     @property
     def length(self) -> int:

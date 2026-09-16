@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
     VLLM_METAL_DSPARK_MODE: str = "fixed"
     VLLM_METAL_DSPARK_LAPSE: bool = True
+    VLLM_METAL_DSPARK_PAGED_CONTEXT: bool = False
     VLLM_METAL_DSPARK_DRAFT_PRECISION: str = "quantized"
     VLLM_METAL_DSPARK_CALIBRATION: str = ""
     VLLM_METAL_DSPARK_COST_MODEL: str = ""
@@ -136,6 +137,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # planner would draft, on 8 consecutive steps. Set to "0"
     # to keep every context current at all loads.
     "VLLM_METAL_DSPARK_LAPSE": lambda: os.getenv("VLLM_METAL_DSPARK_LAPSE", "1") == "1",
+    # Where the drafter keeps each request's context K/V. The default arena gives
+    # every admitted request a private slot sized for the whole model length and
+    # attends it with one call per row. "1" stores the same K/V in a paged pool in
+    # the target's own layout, allocating blocks as a context grows and attending
+    # the batch with one paged-attention dispatch per layer.
+    "VLLM_METAL_DSPARK_PAGED_CONTEXT": lambda: (
+        os.getenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", "0") == "1"
+    ),
     # DSpark serving mode: "fixed" verifies the configured width; "adaptive"
     # plans each request's draft prefix (and whether to draft at all) from the
     # calibrated confidence and the measured cost model, and needs both

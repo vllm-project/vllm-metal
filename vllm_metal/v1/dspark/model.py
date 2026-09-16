@@ -462,6 +462,26 @@ class DSparkAttention(nn.Module):
         k = self.rope(k, offset=mx.array(offsets, dtype=mx.int32))
         arena.write_spans(slots, offsets, counts, k, v)  # V is not roped
 
+    def update_ctx_spans_paged(
+        self,
+        fused_rows: mx.array,
+        pool,
+        layer_index: int,
+        offsets: list[int],
+        slot_mapping: mx.array,
+    ) -> None:
+        """Batched :meth:`update_ctx` into the paged pool: ``[rows, width, hidden]``."""
+        k, v = self._kv(fused_rows)
+        # One RoPE launch with a per-row start position; V is not roped.
+        k = self.rope(k, offset=mx.array(offsets, dtype=mx.int32))
+        rows, kv_heads, width, dim = k.shape
+        pool.write(
+            layer_index,
+            mx.contiguous(k.transpose(0, 2, 1, 3).reshape(rows * width, kv_heads, dim)),
+            mx.contiguous(v.transpose(0, 2, 1, 3).reshape(rows * width, kv_heads, dim)),
+            slot_mapping,
+        )
+
     def attend(self, hidden: mx.array, block_offset, cache, mask=None) -> mx.array:
         """``block_offset`` may be an int (single sequence) or a per-row ``[B]`` array (batched
         drafting — rows sit at different context lengths). The block attends the whole context
@@ -697,6 +717,40 @@ class DSparkDrafter(nn.Module):
         slots = [slot for _, _, _, slot in spans]
         for layer, arena in zip(self.layers, arenas, strict=True):
             layer.self_attn.update_ctx_spans(fused, arena, slots, offsets, counts)
+
+    def update_context_spans_paged(
+        self,
+        target_hidden_cat: mx.array,
+        spans: list[tuple[int, int, int, str]],
+        pool,
+    ) -> None:
+        """Ingest several requests' new features into the paged pool, one pass per layer.
+
+        ``spans`` are ``(start_row, ctx_offset, count, req_id)``. Rows are padded to
+        the longest span the same way :meth:`update_context_spans` pads, by repeating
+        the last feature row; the pool addresses those columns to its sink, so the
+        padding is written and never read back. Unlike the arena path there is no
+        per-request gather: the scatter addresses each token individually.
+        """
+        if not spans:
+            return
+        width = max(count for _, _, count, _ in spans)
+        index = mx.array(
+            [
+                [start + min(column, count - 1) for column in range(width)]
+                for start, _, count, _ in spans
+            ],
+            dtype=mx.int32,
+        )
+        fused = self.fuse_target(
+            target_hidden_cat[index].astype(self.hidden_norm.weight.dtype)
+        )
+        offsets = [offset for _, offset, _, _ in spans]
+        slot_mapping = pool.span_slot_mapping(spans, width)
+        for layer_index, layer in enumerate(self.layers):
+            layer.self_attn.update_ctx_spans_paged(
+                fused, pool, layer_index, offsets, slot_mapping
+            )
 
     def backbone(
         self, noise_embedding, block_offset, ctx_caches, mask=None

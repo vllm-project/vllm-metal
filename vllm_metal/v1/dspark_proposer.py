@@ -30,6 +30,13 @@ from vllm_metal.v1.dspark.model import (
     CtxCache,
     DSparkDrafter,
 )
+from vllm_metal.v1.dspark.paged_context import (
+    KERNEL_HEAD_SIZES,
+    DSparkPagedContext,
+    PagedContextFullError,
+    PagedCtxCache,
+    PagedLayerBatch,
+)
 from vllm_metal.v1.dspark.sampling import (
     DSparkProposal,
     RequestRandomStreams,
@@ -62,6 +69,24 @@ COUNTER_LOG_EVERY = 2000
 # that ran through a lapse keep target-only generation. (A verdict alone is
 # not enough to leave: at a steady load near the planner's threshold it flips
 # between arrivals, and every flip re-primed every new prompt for nothing.)
+PAGED_BLOCK_SIZE = 16  # kernel page sizes are 8, 16 and 32
+
+
+def _pool_blocks(memory_plan, config) -> int:
+    """Blocks to give the drafter's context pool.
+
+    The arena reserved `max_contexts * max_context_tokens` up front because every
+    slot was sized for the whole model length. The pool holds the same worst case
+    but hands blocks out as contexts grow, so a server that never reaches that
+    length never touches most of them, and one request's unused tail is available
+    to another. The extra block is the padding sink.
+    """
+    per_context = (
+        memory_plan.max_context_tokens + config.block_size + PAGED_BLOCK_SIZE - 1
+    ) // PAGED_BLOCK_SIZE
+    return memory_plan.max_contexts * per_context + 1
+
+
 LAPSE_ENTER_STEPS = 32
 LAPSE_EXIT_STEPS = 8
 
@@ -147,6 +172,32 @@ class DSparkProposer:
         # One shared K/V arena per draft layer: a slot per reserved context,
         # the committed context first and the block's scratch positions after
         # it, so a drafting batch gathers its rows with one op per layer.
+        # The drafter's context K/V is a KV cache: one entry per layer per committed
+        # token, a pure function of the prefix. The pool keeps it in the target's own
+        # paged layout; the arena is the private per-request store it replaces.
+        self._pool: DSparkPagedContext | None = None
+        if (
+            envs.VLLM_METAL_DSPARK_PAGED_CONTEXT
+            and config.attn_head_dim in KERNEL_HEAD_SIZES
+        ):
+            self._pool = DSparkPagedContext(
+                num_layers=len(drafter.layers),
+                kv_heads=config.n_kv_heads,
+                head_dim=config.attn_head_dim,
+                block_size=PAGED_BLOCK_SIZE,
+                num_blocks=_pool_blocks(memory_plan, config),
+                draft_block=config.block_size,
+                dtype=drafter.hidden_norm.weight.dtype,
+            )
+            mx.eval(self._pool.key_caches, self._pool.value_caches)
+        elif envs.VLLM_METAL_DSPARK_PAGED_CONTEXT:
+            logger.warning(
+                "DSpark paged context requested but the attention kernel is not "
+                "instantiated for head size %d (supported: %s); keeping the private "
+                "context arena for this drafter",
+                config.attn_head_dim,
+                ", ".join(str(h) for h in KERNEL_HEAD_SIZES),
+            )
         self._arena = [
             ContextArena(
                 slots=memory_plan.max_contexts,
@@ -156,9 +207,10 @@ class DSparkProposer:
                 head_dim=config.attn_head_dim,
                 dtype=drafter.hidden_norm.weight.dtype,
             )
-            for _ in drafter.layers
+            for _ in ([] if self._pool is not None else drafter.layers)
         ]
-        mx.eval([(layer.keys, layer.values) for layer in self._arena])
+        if self._arena:
+            mx.eval([(layer.keys, layer.values) for layer in self._arena])
         self._memory_budget_bytes = memory_budget_bytes
         limit = memory_plan.max_contexts
         if max_drafts_per_step is not None:
@@ -395,16 +447,21 @@ class DSparkProposer:
             # work without a host wait (a drafting step's own evaluation
             # waits for it, a non-drafting step overlaps it with the next
             # step's preparation).
-            mx.async_eval(
-                [(arena.keys, arena.values) for arena in self._arena]
-                + [
-                    (cache.k, cache.v)
-                    for req_id in scheduled
-                    if (record := self._contexts.get(req_id)) is not None
-                    for cache in record.caches
-                    if not isinstance(cache, ArenaCache)
-                ]
-            )
+            if self._pool is not None:
+                # The pool's per-layer caches hold every request's context; a
+                # PagedCtxCache is a view on them and owns no tensors itself.
+                mx.async_eval(self._pool.key_caches + self._pool.value_caches)
+            else:
+                mx.async_eval(
+                    [(arena.keys, arena.values) for arena in self._arena]
+                    + [
+                        (cache.k, cache.v)
+                        for req_id in scheduled
+                        if (record := self._contexts.get(req_id)) is not None
+                        for cache in record.caches
+                        if not isinstance(cache, ArenaCache)
+                    ]
+                )
             if ctx.num_speculative_tokens <= 0:
                 return None
             eligible = self._controller.draft_eligible_requests(
@@ -735,6 +792,9 @@ class DSparkProposer:
         for cache in record.caches:
             if isinstance(cache, ArenaCache):
                 cache.arena.release(cache.slot)
+            elif isinstance(cache, PagedCtxCache) and self._pool is not None:
+                self._pool.release(cache.request_id)
+                break  # one block table serves every layer of the request
         record.caches = []
 
     def _disable(self, req_id: str, record: _RequestContext, reason: str) -> None:
@@ -866,13 +926,29 @@ class DSparkProposer:
             self._disable(req_id, record, "context length exceeds reserved capacity")
             return
         if not record.caches:
-            if self._arena[0].free_slots == 0:
-                self._disable(req_id, record, "context capacity exhausted")
-                return
-            slot = self._arena[0].acquire()
-            for layer in self._arena[1:]:
-                assert layer.acquire() == slot
-            record.caches = [ArenaCache(layer, slot) for layer in self._arena]
+            if self._pool is not None:
+                try:
+                    self._pool.reserve(req_id, end_pos)
+                except PagedContextFullError:
+                    self._disable(req_id, record, "context capacity exhausted")
+                    return
+                record.caches = [
+                    PagedCtxCache(
+                        self._pool,
+                        layer,
+                        req_id,
+                        self.memory_plan.max_context_tokens,
+                    )
+                    for layer in range(len(self._drafter.layers))
+                ]
+            else:
+                if self._arena[0].free_slots == 0:
+                    self._disable(req_id, record, "context capacity exhausted")
+                    return
+                slot = self._arena[0].acquire()
+                for layer in self._arena[1:]:
+                    assert layer.acquire() == slot
+                record.caches = [ArenaCache(layer, slot) for layer in self._arena]
         required = (
             min(
                 self.memory_plan.max_context_tokens,
@@ -938,14 +1014,28 @@ class DSparkProposer:
         spans = []
         for write in pending:
             caches = write.record.caches
-            if not caches or not all(isinstance(cache, ArenaCache) for cache in caches):
-                raise RuntimeError("batched context ingest needs arena-backed contexts")
-            slot = cast("ArenaCache", caches[0]).slot
-            spans.append((write.start_row, write.start_pos, write.count, slot))
-        self._drafter.update_context_spans(hidden, spans, self._arena)
+            if not caches:
+                raise RuntimeError("batched context ingest needs a reserved context")
+            if self._pool is not None:
+                spans.append(
+                    (write.start_row, write.start_pos, write.count, write.req_id)
+                )
+            else:
+                if not all(isinstance(cache, ArenaCache) for cache in caches):
+                    raise RuntimeError(
+                        "batched context ingest needs arena-backed contexts"
+                    )
+                slot = cast("ArenaCache", caches[0]).slot
+                spans.append((write.start_row, write.start_pos, write.count, slot))
+        if self._pool is not None:
+            for write in pending:
+                self._pool.reserve(write.req_id, write.end_pos)
+            self._drafter.update_context_spans_paged(hidden, spans, self._pool)
+        else:
+            self._drafter.update_context_spans(hidden, spans, self._arena)
         for write in pending:
             for cache in write.record.caches:
-                cast("ArenaCache", cache).extend_to(write.end_pos)
+                cast("ArenaCache | PagedCtxCache", cache).extend_to(write.end_pos)
             self._commit_span(write.record, write.end_pos)
 
     def _batch_draft(
@@ -980,7 +1070,15 @@ class DSparkProposer:
                 raise RuntimeError(
                     "DSpark draft context has inconsistent physical lengths"
                 )
-            if all(isinstance(cache, ArenaCache) for cache in caches):
+            if self._pool is not None:
+                if layer_index == 0:
+                    paged_batch = self._pool.plan(
+                        list(zip([plan.req_id for plan in plans], lengths, strict=True))
+                    )
+                batched_ctx.append(
+                    PagedLayerBatch(self._pool, layer_index, paged_batch)
+                )
+            elif all(isinstance(cache, ArenaCache) for cache in caches):
                 batched_ctx.append(
                     ArenaBatch(
                         self._arena[layer_index],
