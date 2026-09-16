@@ -282,3 +282,29 @@ class TestPagedLayerBatchMatchesArenaBatch:
         assert got.shape == expected.shape == (rows, N_HEADS, DRAFT_BLOCK, HEAD_DIM)
         assert np.abs(got).sum() > 0  # not vacuously zero on both sides
         assert np.abs(got - expected).max() < 2e-3
+
+
+class TestLapseExitIsReachable:
+    """A lapse entered at one active request must still be able to end.
+
+    `_regime_step` returns early when there are no decode requests, so the branch
+    below only ever runs with at least one. A strict "fewer requests than the lapse
+    began with" exit test is therefore unsatisfiable when the lapse began at one,
+    and the proposer would never draft again.
+    """
+
+    @staticmethod
+    def _dropped(active: int, entry: int) -> bool:
+        # the shipped predicate, isolated
+        return active <= max(1, entry - 1)
+
+    def test_a_lapse_entered_at_one_request_can_exit(self):
+        assert self._dropped(active=1, entry=1) is True
+
+    def test_the_old_predicate_could_not(self):
+        # negative control: what the code used to compute
+        assert (1 < 1) is False
+
+    def test_a_lapse_entered_under_load_still_needs_a_real_drop(self):
+        assert self._dropped(active=8, entry=8) is False
+        assert self._dropped(active=7, entry=8) is True

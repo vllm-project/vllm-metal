@@ -523,9 +523,14 @@ class DSparkProposer:
         if not ctx.decode_reqs:
             return
         if self._lapsed:
-            # Leave only on a real drop in load: fewer requests than the lapse
-            # began with, and the planner's verdict for that batch is to draft.
-            dropped = len(ctx.decode_reqs) < self._lapse_entry_active
+            # Leave only on a real drop in load: at or below the load the lapse
+            # began with, less one, and the planner's verdict for that batch is to
+            # draft. The floor of one matters: a lapse entered while a single
+            # request was decoding has no lower load to wait for -- this branch
+            # only runs with at least one decode request -- so a strict "fewer
+            # than the entry load" test could never be satisfied and the server
+            # stayed lapsed for the rest of its life.
+            dropped = len(ctx.decode_reqs) <= max(1, self._lapse_entry_active - 1)
             resume = dropped and self._would_draft(ctx)
             self._draft_streak = self._draft_streak + 1 if resume else 0
             if self._draft_streak >= LAPSE_EXIT_STEPS:

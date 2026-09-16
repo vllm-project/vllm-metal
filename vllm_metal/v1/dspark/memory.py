@@ -2,7 +2,9 @@
 """Conservative, enforced storage/workspace bounds for standalone DSpark.
 
 This is a request-local reservation, not an autoregressive scheduler KV group.
-The target cache planner subtracts the whole reservation before sizing its pool.
+The target cache planner subtracts the capture staging and the per-step workspace
+before sizing its pool; the context arena is allocated when the drafter loads and is
+already accounted in the profiled model memory.
 """
 
 from __future__ import annotations

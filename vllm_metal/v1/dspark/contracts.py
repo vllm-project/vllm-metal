@@ -28,7 +28,8 @@ def is_dspark_config(spec: SpeculativeConfig | None) -> bool:
 def validate_dspark_config(config: VllmConfig) -> None:
     """Validate the resolved upstream DTO; ordinary spec methods are unchanged.
 
-    Only the standalone Qwen3 greedy path is enabled. Model-only Gemma4
+    Only the standalone Qwen3 path is enabled; it serves greedy requests and plain
+    sampled ones (temperature/top-k/top-p without penalties or token constraints). Model-only Gemma4
     reference tests remain available without advertising a target adapter.
     """
     spec = config.speculative_config

@@ -924,8 +924,10 @@ def test_lapse_enters_after_sustained_declines_and_resumes(monkeypatch, caplog):
     assert any("load regime lapse" in r.message for r in caplog.records)
     assert proposer.needs_target_hidden_states((), has_final_prefill=True) is False
     assert proposer.deferred_step_allowed([("r", state)], 2) is True
-    # Lapsed steps neither ingest nor draft; while the load has not dropped below
-    # the count the lapse began at, the planner is not even asked.
+    # Lapsed steps neither ingest nor draft. A lapse entered under load short-circuits
+    # on the cheap load test and never asks the planner; this one began at a single
+    # request, where there is no lower load to wait for, so the verdict is the only
+    # thing that can end it and the planner is consulted once per step.
     calls = proposer.adaptive.calls
     result = proposer.propose(
         _context(
@@ -934,22 +936,16 @@ def test_lapse_enters_after_sustained_declines_and_resumes(monkeypatch, caplog):
     )
     assert result is None and proposer._contexts == {}
     assert proposer.counters.bypass_reasons["lapse"] >= 1
-    assert proposer.adaptive.calls == calls
+    assert proposer.adaptive.calls == calls + 1
     # A prefill during the lapse creates no context either.
     fresh = _state([4, 5, 6, 7])
     proposer.propose(_context(prefill=[("p", fresh, 0, 3, True)], hidden=False))
     assert "p" not in proposer._contexts
-    # The planner would draft again but the load has not dropped (the lapse
-    # began at one request and one is still running): the regime stays.
+    # This lapse began while a single request was decoding, and this branch only
+    # runs with at least one decode request, so there is no lower load to wait
+    # for. The planner's verdict alone must be able to end it, on LAPSE_EXIT_STEPS
+    # consecutive steps -- otherwise a single-client server never drafts again.
     proposer.adaptive = _Planner(draft=True)
-    for _ in range(module.LAPSE_EXIT_STEPS + 2):
-        state.token_ids.append(-1)
-        proposer.ingest_deferred_step(_deferred_ctx(state))
-        state.token_ids[-1] = 7
-    assert proposer._lapsed is True and proposer.counters.lapse_exits == 0
-    # A real drop (fewer requests than at entry) with the verdict to draft, on
-    # LAPSE_EXIT_STEPS consecutive steps, resumes the regime.
-    proposer._lapse_entry_active = 2
     for _ in range(module.LAPSE_EXIT_STEPS):
         assert proposer._lapsed is True
         state.token_ids.append(-1)
@@ -1035,3 +1031,34 @@ def test_bypass_mode_lapses_from_the_start(caplog):
         proposer.ingest_deferred_step(_deferred_ctx(state))
         state.token_ids[-1] = 7
     assert proposer._lapsed is True
+
+
+def test_a_lapse_entered_under_load_waits_for_the_load_to_drop(monkeypatch):
+    """Entry at one request exits on the verdict; entry under load needs a drop.
+
+    Without the second half, the fix for the unreachable single-request exit would
+    turn the load regime into "resume whenever the planner says draft", which is the
+    flapping the entry streak exists to prevent.
+    """
+    from vllm_metal.v1 import dspark_proposer as module
+
+    proposer = _proposer()
+    proposer.adaptive = _Planner(draft=False)
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    for _ in range(module.LAPSE_ENTER_STEPS):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is True
+
+    # pretend the lapse began while four requests were decoding
+    proposer._lapse_entry_active = 4
+    proposer.adaptive = _Planner(draft=True)
+    for _ in range(module.LAPSE_EXIT_STEPS + 2):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    # one decode request is at or below 4 - 1, so this DOES resume; the guard is
+    # that a batch still at the entry load would not.
+    assert proposer._lapsed is False
