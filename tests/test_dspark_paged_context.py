@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+from vllm_metal.v1.dspark.paged_context import (
+    DSparkPagedContext,
+    PagedContextFullError,
+)
+
+BLOCK = 16
+KV_HEADS = 4
+N_HEADS = 8
+HEAD_DIM = 64
+DRAFT_BLOCK = 7
+
+
+def make(num_blocks: int = 64, layers: int = 2) -> DSparkPagedContext:
+    return DSparkPagedContext(
+        num_layers=layers,
+        kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        block_size=BLOCK,
+        num_blocks=num_blocks,
+        draft_block=DRAFT_BLOCK,
+        dtype=mx.float32,
+    )
+
+
+class TestBlockAccounting:
+    def test_pages_cover_the_context_and_the_draft_block(self):
+        pool = make()
+        # 16 context positions + 7 block positions = 23 -> two 16-token pages
+        assert pool.pages_for(16) == 2
+        assert pool.pages_for(9) == 1
+        assert pool.pages_for(10) == 2
+
+    def test_reserve_allocates_only_what_the_length_needs(self):
+        pool = make(num_blocks=8)
+        pool.reserve("a", 1)
+        assert pool.free_blocks == 7
+        # growing within the same page allocates nothing more
+        pool.reserve("a", 8)
+        assert pool.free_blocks == 7
+        pool.reserve("a", 100)
+        assert pool.free_blocks == 8 - pool.pages_for(100)
+
+    def test_release_returns_every_block(self):
+        pool = make(num_blocks=8)
+        pool.reserve("a", 40)
+        assert pool.free_blocks < 8
+        assert pool.release("a") > 0
+        assert pool.free_blocks == 8
+        assert not pool.holds("a")
+
+    def test_release_of_an_unknown_request_is_a_no_op(self):
+        pool = make(num_blocks=4)
+        assert pool.release("ghost") == 0
+        assert pool.free_blocks == 4
+
+    def test_exhaustion_raises_and_keeps_existing_blocks(self):
+        pool = make(num_blocks=2)
+        pool.reserve("a", 1)
+        held = pool.free_blocks
+        with pytest.raises(PagedContextFullError):
+            pool.reserve("a", 10_000)
+        # the failed growth must not have consumed or dropped anything
+        assert pool.free_blocks == held
+        assert pool.holds("a")
+
+    def test_a_request_never_shares_a_block_with_another(self):
+        pool = make(num_blocks=16)
+        pool.reserve("a", 60)
+        pool.reserve("b", 60)
+        a = {int(s) // BLOCK for s in pool.slot_mapping_for("a", range(60)).tolist()}
+        b = {int(s) // BLOCK for s in pool.slot_mapping_for("b", range(60)).tolist()}
+        assert a and b and not (a & b)
+
+    def test_slots_are_block_id_times_block_size_plus_offset(self):
+        pool = make(num_blocks=8)
+        pool.reserve("a", 20)
+        slots = [int(s) for s in pool.slot_mapping_for("a", range(20)).tolist()]
+        # consecutive positions inside one page are consecutive slots
+        assert slots[1] - slots[0] == 1
+        assert len({s // BLOCK for s in slots}) == 2
+
+
+class TestPagedAttentionMatchesDenseReference:
+    """The kernel must reproduce the bidirectional draft block exactly.
+
+    Each draft position is its own length-1 query sequence, so it attends the whole
+    context plus every block position. The negative control uses the naive packing
+    (one length-DRAFT_BLOCK sequence per request), which the kernel treats as causal
+    and which must therefore disagree — otherwise this test cannot tell them apart.
+    """
+
+    @staticmethod
+    def _case(context_lengths, seed):
+        rng = np.random.default_rng(seed)
+        pool = make(num_blocks=256, layers=1)
+        scale = HEAD_DIM**-0.5
+        reference = []
+        rows = []
+        for index, length in enumerate(context_lengths):
+            req = f"r{index}"
+            pool.reserve(req, length)
+            total = length + DRAFT_BLOCK
+            keys = rng.normal(size=(total, KV_HEADS, HEAD_DIM)).astype(np.float32)
+            values = rng.normal(size=(total, KV_HEADS, HEAD_DIM)).astype(np.float32)
+            pool.write(
+                0,
+                mx.array(keys),
+                mx.array(values),
+                pool.slot_mapping_for(req, range(total)),
+            )
+            reference.append((keys, values, total))
+            rows.append((req, length))
+        queries = rng.normal(
+            size=(len(context_lengths), DRAFT_BLOCK, N_HEADS, HEAD_DIM)
+        ).astype(np.float32)
+        return pool, rows, reference, queries, scale
+
+    @staticmethod
+    def _dense(reference, queries, scale):
+        out = []
+        for row, (keys, values, total) in enumerate(reference):
+            q = mx.array(queries[row].transpose(1, 0, 2))[None]
+            k = mx.array(keys[:total].transpose(1, 0, 2))[None]
+            v = mx.array(values[:total].transpose(1, 0, 2))[None]
+            attended = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+            out.append(np.array(attended[0].transpose(1, 0, 2)))
+        return np.stack(out)
+
+    @pytest.mark.parametrize(
+        "context_lengths",
+        [[37], [64], [3], [37, 512, 129], [256, 256]],
+        ids=["short", "page-aligned", "sub-page", "ragged", "equal"],
+    )
+    def test_matches_dense_attention(self, context_lengths):
+        pool, rows, reference, queries, scale = self._case(context_lengths, seed=7)
+        batch = pool.plan(rows)
+        packed = mx.array(queries.reshape(len(rows) * DRAFT_BLOCK, N_HEADS, HEAD_DIM))
+        got = np.array(pool.attend(0, packed, batch, scale)).reshape(
+            len(rows), DRAFT_BLOCK, N_HEADS, HEAD_DIM
+        )
+        assert np.abs(got - self._dense(reference, queries, scale)).max() < 2e-3
+
+    def test_the_causal_packing_disagrees(self):
+        """Negative control: without per-position sequences the kernel is causal."""
+        pool, rows, reference, queries, scale = self._case([37, 512, 129], seed=7)
+        batch = pool.plan(rows)
+        packed = mx.array(queries.reshape(len(rows) * DRAFT_BLOCK, N_HEADS, HEAD_DIM))
+        out = mx.zeros(packed.shape, dtype=packed.dtype)
+        from vllm_metal.metal import get_ops
+
+        # one length-DRAFT_BLOCK sequence per request instead of one per position
+        get_ops().paged_attention_primitive(
+            packed,
+            pool.key_caches[0],
+            pool.value_caches[0],
+            KV_HEADS,
+            scale,
+            0.0,
+            mx.array(
+                [
+                    batch.block_tables.tolist()[i * DRAFT_BLOCK]
+                    for i in range(len(rows))
+                ],
+                dtype=mx.int32,
+            ),
+            mx.array([length + DRAFT_BLOCK for _, length in rows], dtype=mx.int32),
+            mx.array((np.arange(len(rows) + 1) * DRAFT_BLOCK).astype(np.int32)),
+            BLOCK,
+            batch.max_seq_len,
+            -1,
+            out,
+            window_seqlen_q=1,
+        )
+        causal = np.array(out).reshape(len(rows), DRAFT_BLOCK, N_HEADS, HEAD_DIM)
+        dense = self._dense(reference, queries, scale)
+        assert np.abs(causal - dense).max() > 1e-2
+
+
+class TestDraftBatchAddressing:
+    def test_one_query_sequence_per_draft_position(self):
+        pool = make()
+        pool.reserve("a", 20)
+        pool.reserve("b", 5)
+        batch = pool.plan([("a", 20), ("b", 5)])
+        assert batch.rows == 2
+        count = 2 * DRAFT_BLOCK
+        assert batch.seq_lens.shape == (count,)
+        assert batch.block_tables.shape[0] == count
+        # cu_seqlens_q must declare every row as its own length-1 sequence
+        assert batch.cu_seqlens_q.tolist() == list(range(count + 1))
+
+    def test_seq_len_covers_context_plus_block(self):
+        pool = make()
+        pool.reserve("a", 20)
+        batch = pool.plan([("a", 20)])
+        assert set(batch.seq_lens.tolist()) == {27}
+        assert batch.max_seq_len == 27
+
+    def test_scratch_slots_sit_immediately_after_the_context(self):
+        pool = make()
+        pool.reserve("a", 20)
+        batch = pool.plan([("a", 20)])
+        expected = pool.slot_mapping_for("a", range(20, 27)).tolist()
+        assert batch.slot_mapping.tolist() == expected
