@@ -9,6 +9,8 @@ import mlx.core as mx
 from transformers import AutoTokenizer
 from vllm.tokenizers import TokenizerLike
 
+from vllm_metal.stt.sampling import STTSampling
+
 from .config import QWEN3_ASR_MAX_DECODE_TOKENS
 from .model import Qwen3ASRModel
 
@@ -36,10 +38,11 @@ class Qwen3ASRTranscriber:
             AutoTokenizer.from_pretrained(model_path, trust_remote_code=True),
         )
 
-    def greedy_decode_tokens(
+    def decode_tokens(
         self,
         audio_features: mx.array,
         prompt_token_ids: list[int],
+        sampling: STTSampling,
         max_tokens: int | None = None,
     ) -> list[int]:
         if max_tokens is None:
@@ -56,7 +59,9 @@ class Qwen3ASRTranscriber:
         mx.eval(logits)
 
         output_tokens: list[int] = []
-        next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+        next_token = sampling.next_token(
+            prompt_token_ids, output_tokens, logits[:, -1, :]
+        )
         if next_token in eos_tokens:
             return output_tokens
         output_tokens.append(next_token)
@@ -65,7 +70,9 @@ class Qwen3ASRTranscriber:
             token_input = mx.array([[next_token]], dtype=mx.int32)
             logits, cache = self.model.decode_step(token_input, cache)
             mx.eval(logits)
-            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            next_token = sampling.next_token(
+                prompt_token_ids, output_tokens, logits[:, -1, :]
+            )
             if next_token in eos_tokens:
                 break
             output_tokens.append(next_token)

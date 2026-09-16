@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from vllm_metal.stt.sampling import STTSampling
+
 STTAudioInput: TypeAlias = (
     mx.array
     | torch.Tensor
@@ -69,6 +71,7 @@ class STTRuntimeAdapter(ABC):
         self,
         audio_features: mx.array,
         prompt_token_ids: list[int],
+        sampling: STTSampling,
     ) -> list[int]: ...
 
     @abstractmethod

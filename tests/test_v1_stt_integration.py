@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,7 @@ import torch
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import (
     N_FRAMES,
@@ -28,8 +30,11 @@ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.sampling import STTSampling
 from vllm_metal.stt.whisper import WhisperConfig
 from vllm_metal.stt.whisper.adapter import WhisperRuntimeAdapter
+from vllm_metal.stt.whisper.transcriber import WhisperTranscriber
+from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.stt_model_runner import STTModelRunner
 
 
@@ -47,6 +52,7 @@ class _StubRunner:
         self.model = runtime_adapter.model
         self._pending_output = None
         self._stt_runtime_adapter = runtime_adapter
+        self._sampler = Sampler()
 
 
 def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:
@@ -59,9 +65,13 @@ def _make_whisper_runtime_adapter() -> STTRuntimeAdapter:
     mock_tokenizer.convert_tokens_to_ids.return_value = 50257
     mock_transcriber = MagicMock()
     mock_transcriber.tokenizer = mock_tokenizer
-    mock_transcriber.greedy_decode_tokens.return_value = [100, 200]
+    mock_transcriber.decode_tokens.return_value = [100, 200]
     adapter._transcriber = mock_transcriber
     return adapter
+
+
+def _greedy_sampling() -> STTSampling:
+    return STTSampling.from_request(None, Sampler())
 
 
 def _make_valid_mm_features() -> list[SimpleNamespace]:
@@ -116,32 +126,39 @@ class TestWhisperRuntimeAdapterDecode:
         result = adapter.decode_tokens(
             audio_features=mx.zeros((1, 10, 80)),
             prompt_token_ids=[],
+            sampling=_greedy_sampling(),
         )
 
         assert result == [50257]
-        adapter._transcriber.greedy_decode_tokens.assert_not_called()
+        adapter._transcriber.decode_tokens.assert_not_called()
 
     def test_delegates_to_transcriber(self) -> None:
-        """Should delegate to transcriber.greedy_decode_tokens and append EOT."""
+        """Should delegate to transcriber.decode_tokens and append EOT."""
         adapter = _make_whisper_runtime_adapter()
-        adapter._transcriber.greedy_decode_tokens.return_value = [100, 200]
+        adapter._transcriber.decode_tokens.return_value = [100, 200]
+        audio_features = mx.zeros((1, 10, 80))
+        sampling = _greedy_sampling()
 
         result = adapter.decode_tokens(
-            audio_features=mx.zeros((1, 10, 80)),
+            audio_features=audio_features,
             prompt_token_ids=[50258],
+            sampling=sampling,
         )
 
         assert result == [100, 200, 50257]
-        adapter._transcriber.greedy_decode_tokens.assert_called_once()
+        adapter._transcriber.decode_tokens.assert_called_once_with(
+            audio_features, [50258], sampling=sampling
+        )
 
     def test_eot_always_appended(self) -> None:
         """EOT must always be the last token for vLLM to finish the request."""
         adapter = _make_whisper_runtime_adapter()
-        adapter._transcriber.greedy_decode_tokens.return_value = [42]
+        adapter._transcriber.decode_tokens.return_value = [42]
 
         result = adapter.decode_tokens(
             audio_features=mx.zeros((1, 10, 80)),
             prompt_token_ids=[50258],
+            sampling=_greedy_sampling(),
         )
 
         assert result[-1] == 50257
@@ -235,21 +252,6 @@ class TestExecuteSTTProtocol:
         assert runner._pending_output is not None
         assert runner._pending_output.req_ids == ["req-1"]
         assert runner._pending_output.sampled_token_ids == [[100, 200, 50257]]
-
-    def test_non_greedy_request_does_not_raise(self) -> None:
-        """Raising here kills the engine core, so sampling limits belong to
-        ``MetalPlatform.validate_request``, not to this method."""
-        runner = _make_runner()
-        req = _make_new_req(
-            sampling_params=SamplingParams(temperature=0.7),
-            mm_features=_make_valid_mm_features(),
-        )
-        sched = _make_scheduler_output(new_reqs=[req])
-
-        result = self._run_stt(runner, sched)
-
-        assert result is None
-        assert runner._pending_output is not None
 
     def test_invalid_audio_request_raises_with_req_id(self) -> None:
         """Malformed STT requests should fail with request context."""
@@ -534,7 +536,7 @@ class TestWhisperRuntimeAdapterEndToEnd:
             )
         )
 
-        result = adapter.decode_tokens(features, prompt_ids)
+        result = adapter.decode_tokens(features, prompt_ids, _greedy_sampling())
         assert isinstance(result, list)
         assert len(result) >= 1
         # Must end with EOT
@@ -563,7 +565,7 @@ def _make_qwen3_runtime_adapter():
     mock_transcriber = MagicMock()
     mock_transcriber.tokenizer = mock_tokenizer
     # Return token stream: <lang> <asr_text> hello world <|im_end|>
-    mock_transcriber.greedy_decode_tokens = MagicMock(
+    mock_transcriber.decode_tokens = MagicMock(
         return_value=[100, 151674, 200, 300, 151645]
     )
     adapter._transcriber = mock_transcriber
@@ -635,10 +637,11 @@ class TestQwen3ASRRuntimeAdapterDispatch:
 
         audio = mx.ones((50, 1024))  # 50 audio frames
         prompt_ids = [1, 2, 3]
-        adapter.decode_tokens(audio, prompt_ids)
+        sampling = _greedy_sampling()
+        adapter.decode_tokens(audio, prompt_ids, sampling)
 
-        adapter.transcriber.greedy_decode_tokens.assert_called_once_with(
-            audio, prompt_ids
+        adapter.transcriber.decode_tokens.assert_called_once_with(
+            audio, prompt_ids, sampling=sampling
         )
 
     def test_decode_extracts_asr_text_tokens(self) -> None:
@@ -646,9 +649,9 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         adapter = _make_qwen3_runtime_adapter()
 
         audio = mx.ones((50, 1024))
-        result = adapter.decode_tokens(audio, [1, 2, 3])
+        result = adapter.decode_tokens(audio, [1, 2, 3], _greedy_sampling())
 
-        # greedy_decode_tokens returns [100, 151674, 200, 300, 151645]
+        # decode_tokens returns [100, 151674, 200, 300, 151645]
         # _extract_asr_text_tokens: between 151674 (<asr_text>) and 151645 (<|im_end|>)
         # → [200, 300]
         # + eot (151643) appended
@@ -658,7 +661,7 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         """Qwen3-ASR requires vLLM to provide prompt_token_ids."""
         adapter = _make_qwen3_runtime_adapter()
         with pytest.raises(ValueError, match="prompt_token_ids"):
-            adapter.decode_tokens(mx.ones((50, 1024)), [])
+            adapter.decode_tokens(mx.ones((50, 1024)), [], _greedy_sampling())
 
     def test_runner_ignores_transcript_after_tokenizer_eos(self) -> None:
         adapter = _make_qwen3_runtime_adapter()
@@ -701,6 +704,250 @@ class TestQwen3ASRRuntimeAdapterDispatch:
         runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
 
         assert runner._pending_output.sampled_token_ids == [[151643]]
+
+
+WHISPER_VOCAB_SIZE = 51865
+WHISPER_EOT = 50257
+QWEN3_ASR_VOCAB_SIZE = 151675
+QWEN3_ASR_EOS = 151643
+# Far enough below the scored ids that sampling never reaches the rest of vocab.
+_UNSCORED_LOGIT = -30.0
+
+
+def _scored_logits(scores: dict[int, float], vocab_size: int) -> mx.array:
+    """One step of logits scoring only ``scores``; the rest are hopeless."""
+    row = mx.full((vocab_size,), _UNSCORED_LOGIT)
+    for token_id, score in scores.items():
+        row[token_id] = score
+    return row[None, None, :]
+
+
+def _spy(original, seen: list[str], label: str):
+    """Wrap ``original`` so each call records ``label``."""
+
+    def wrapper(*args, **kwargs):
+        seen.append(label)
+        return original(*args, **kwargs)
+
+    return wrapper
+
+
+def _script(token_ids: list[int], vocab_size: int):
+    """Model side effect forcing ``token_ids`` in order, then repeating the last."""
+    remaining = list(token_ids)
+
+    def step(*_args, **_kwargs):
+        token = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return _scored_logits({token: 1.0}, vocab_size), None
+
+    return step
+
+
+def _steps(
+    make_row: Callable[[], mx.array], count: int, make_last: Callable[[], mx.array]
+):
+    """Model side effect playing ``count`` fresh rows, then ``make_last`` forever."""
+    remaining = count
+
+    def step(*_args, **_kwargs):
+        nonlocal remaining
+        if remaining > 0:
+            remaining -= 1
+            return make_row(), None
+        return make_last(), None
+
+    return step
+
+
+class TestRequestSamplingReachesTheDecode:
+    """The request's sampling params must drive the transcription decode."""
+
+    SAMPLED_STEPS = 6
+    TIED_TOKENS = [200, 300, 400, 500]
+    GREEDY_TOKEN = 400
+
+    def _make_whisper(
+        self, make_row: Callable[[], mx.array], steps: int | None = None
+    ) -> STTRuntimeAdapter:
+        model = MagicMock()
+        model.config = SimpleNamespace(n_text_ctx=448)
+        model.encode = MagicMock(return_value=mx.ones((1, 1500, 512)))
+        model.decode = MagicMock(
+            side_effect=_steps(
+                make_row,
+                self.SAMPLED_STEPS if steps is None else steps,
+                lambda: _scored_logits({WHISPER_EOT: 1.0}, WHISPER_VOCAB_SIZE),
+            )
+        )
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.return_value = WHISPER_EOT
+
+        adapter = WhisperRuntimeAdapter(model, "/fake/whisper")
+        adapter._transcriber = WhisperTranscriber(model, tokenizer=tokenizer)
+        return adapter
+
+    def _run_whisper(
+        self, sampling_params: SamplingParams, scores: dict[int, float] | None = None
+    ) -> list[int]:
+        row = scores or dict.fromkeys(self.TIED_TOKENS, 1.0)
+        adapter = self._make_whisper(lambda: _scored_logits(row, WHISPER_VOCAB_SIZE))
+        return self._run(adapter, sampling_params)
+
+    def _run_qwen3_asr(
+        self, sampling_params: SamplingParams, scores: dict[int, float] | None = None
+    ) -> list[int]:
+        adapter = _make_qwen3_runtime_adapter()
+        tokenizer = adapter.transcriber.tokenizer
+        tokenizer.eos_token_id = QWEN3_ASR_EOS
+        row = scores or dict.fromkeys(self.TIED_TOKENS, 1.0)
+
+        def make_row() -> mx.array:
+            return _scored_logits(row, QWEN3_ASR_VOCAB_SIZE)
+
+        def make_eos() -> mx.array:
+            return _scored_logits({QWEN3_ASR_EOS: 1.0}, QWEN3_ASR_VOCAB_SIZE)
+
+        adapter.model.prefill.side_effect = _steps(make_row, 1, make_eos)
+        adapter.model.decode_step.side_effect = _steps(
+            make_row, self.SAMPLED_STEPS - 1, make_eos
+        )
+        adapter._transcriber = Qwen3ASRTranscriber(adapter.model, tokenizer=tokenizer)
+        return self._run(adapter, sampling_params)
+
+    @staticmethod
+    def _run(
+        adapter: STTRuntimeAdapter,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None = None,
+    ) -> list[int]:
+        runner = _StubRunner(adapter)
+        request = _make_new_req(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            mm_features=_make_valid_mm_features(),
+        )
+
+        runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
+
+        return runner._pending_output.sampled_token_ids[0]
+
+    @pytest.mark.parametrize("model", ["whisper", "qwen3_asr"])
+    def test_seeded_request_repeats_its_transcript(self, model: str) -> None:
+        run = self._run_whisper if model == "whisper" else self._run_qwen3_asr
+
+        first = run(SamplingParams(temperature=1.0, seed=11))
+        repeat = run(SamplingParams(temperature=1.0, seed=11))
+        other_seed = run(SamplingParams(temperature=1.0, seed=12))
+
+        assert len(first) == self.SAMPLED_STEPS + 1
+        assert first == repeat
+        assert first != other_seed
+
+    @pytest.mark.parametrize("model", ["whisper", "qwen3_asr"])
+    def test_greedy_request_keeps_the_top_logit(self, model: str) -> None:
+        run = self._run_whisper if model == "whisper" else self._run_qwen3_asr
+        leading = dict.fromkeys(self.TIED_TOKENS, 1.0)
+        leading[self.GREEDY_TOKEN] = 2.0
+
+        first = run(SamplingParams(temperature=0.0), scores=leading)
+        repeat = run(SamplingParams(temperature=0.0), scores=leading)
+
+        assert first == repeat
+        assert set(first[:-1]) == {self.GREEDY_TOKEN}
+
+    def test_runner_threads_its_own_sampler(self) -> None:
+        adapter = _make_whisper_runtime_adapter()
+        adapter._transcriber.decode_tokens.return_value = [100]
+        runner = _StubRunner(adapter)
+        request = _make_new_req(mm_features=_make_valid_mm_features())
+
+        runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
+
+        sampling = adapter._transcriber.decode_tokens.call_args.kwargs["sampling"]
+        assert sampling.sampler is runner._sampler
+
+    def test_language_detection_stops_at_its_one_token_budget(self) -> None:
+        """vLLM masks the stop token out of Whisper language detection, so only
+        the request's max_tokens ends the decode."""
+        language_token = self.TIED_TOKENS[0]
+
+        transcript = self._run_whisper(
+            SamplingParams(
+                temperature=0.0, max_tokens=1, allowed_token_ids=[language_token]
+            ),
+            scores=dict.fromkeys(self.TIED_TOKENS, 1.0),
+        )
+
+        assert transcript == [language_token, WHISPER_EOT]
+
+    def test_request_budget_does_not_shorten_a_qwen3_asr_transcript(self) -> None:
+        """Qwen3-ASR decodes a protocol envelope the adapter unwraps, so a budget
+        on the raw stream would cut transcript instead of overhead."""
+        asr_text, im_end, language = 151674, 151645, 100
+        spoken = [200, 300]
+        adapter = _make_qwen3_runtime_adapter()
+        tokenizer = adapter.transcriber.tokenizer
+        tokenizer.eos_token_id = im_end
+        script = _script([language, asr_text, *spoken, im_end], QWEN3_ASR_VOCAB_SIZE)
+        adapter.model.prefill.side_effect = script
+        adapter.model.decode_step.side_effect = script
+        adapter._transcriber = Qwen3ASRTranscriber(adapter.model, tokenizer=tokenizer)
+
+        transcript = self._run(adapter, SamplingParams(temperature=0.0, max_tokens=1))
+
+        assert transcript == [*spoken, QWEN3_ASR_EOS]
+
+    def test_decode_with_no_request_keeps_the_model_budget(self) -> None:
+        """``WhisperTranscriber.transcribe`` decodes without a request behind it."""
+        steps = 40
+        adapter = self._make_whisper(
+            lambda: _scored_logits({self.GREEDY_TOKEN: 1.0}, WHISPER_VOCAB_SIZE),
+            steps=steps,
+        )
+
+        transcript = adapter.transcriber.decode_tokens(
+            mx.ones((1, 1500, 512)), [50258], STTSampling.from_request(None, Sampler())
+        )
+
+        assert len(transcript) == steps
+
+    def test_default_request_stays_on_the_native_greedy_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Greedy transcription must not move onto the torch sampler."""
+        routed: list[str] = []
+        monkeypatch.setattr(
+            sampling_batch,
+            "mlx_greedy_tokens",
+            _spy(sampling_batch.mlx_greedy_tokens, routed, "native"),
+        )
+        monkeypatch.setattr(Sampler, "forward", _spy(Sampler.forward, routed, "torch"))
+
+        self._run_whisper(SamplingParams(temperature=0.0))
+        greedy_route = list(routed)
+        routed.clear()
+        self._run_whisper(SamplingParams(temperature=1.0, seed=11))
+
+        assert set(greedy_route) == {"native"}
+        assert set(routed) == {"torch"}
+
+    def test_penalties_count_the_task_prompt(self) -> None:
+        """vLLM's repetition penalty spans prompt and transcript alike."""
+        prompt_token = 50259
+        runner_up = 300
+        adapter = self._make_whisper(
+            lambda: _scored_logits(
+                {prompt_token: 1.5, runner_up: 1.0}, WHISPER_VOCAB_SIZE
+            )
+        )
+
+        transcript = self._run(
+            adapter,
+            SamplingParams(temperature=0.0, repetition_penalty=2.0),
+            prompt_token_ids=[50258, prompt_token],
+        )
+
+        assert transcript[0] == runner_up
 
 
 class TestQwen3ASRUpstreamContract:

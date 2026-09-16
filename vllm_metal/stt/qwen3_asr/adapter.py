@@ -6,6 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from vllm_metal.stt.runtime import STTAudioInput, STTRuntimeAdapter
+from vllm_metal.stt.sampling import STTSampling
 
 from .model import Qwen3ASRModel
 from .transcriber import Qwen3ASRTranscriber
@@ -54,11 +55,14 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
         self,
         audio_features: mx.array,
         prompt_token_ids: list[int],
+        sampling: STTSampling,
     ) -> list[int]:
         if not prompt_token_ids:
             raise ValueError("Qwen3-ASR request must include prompt_token_ids.")
 
-        tokens = self.transcriber.greedy_decode_tokens(audio_features, prompt_token_ids)
+        tokens = self.transcriber.decode_tokens(
+            audio_features, prompt_token_ids, sampling=sampling
+        )
         tokens = self._extract_asr_text_tokens(tokens)
         tokens.append(self.eot_token)
         return tokens

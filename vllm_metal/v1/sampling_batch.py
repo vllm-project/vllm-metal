@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Internal sampling batch ownership and token sampling for Metal v1.
+"""Sampling batch ownership and token sampling for the Metal runners.
 
 Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
@@ -34,13 +34,10 @@ class _SamplingResult:
 
 
 class SamplingBatch:
-    """Sampling-side batch owner for ``MetalModelRunner``.
+    """Sampling-side state for one step of one batch.
 
-    This is an interim extraction that keeps sampling policy and
-    ``SamplingMetadata`` construction out of ``model_runner.py`` while the
-    runner is being slimmed down.
-
-    Today it owns only the sampling-side state for one step.
+    Both the generation runner and the one-shot STT decode build one of these
+    per step and hand it to :func:`sample_from_logits`.
     """
 
     # The torch sampler always runs on CPU. ``Tensor.exponential_()`` on MPS
@@ -572,6 +569,9 @@ def sample_from_logits(
     ``SamplingBatch.SAMPLER_DEVICE``. Requests that need sample logprobs must
     use the vLLM sampler so ``ModelRunnerOutput`` can satisfy the OpenAI
     serving contract.
+
+    The bridged tensor aliases ``logits_2d``, so a penalized call rewrites the
+    caller's array; callers pass logits they do not read again.
     """
     if batch.can_use_native_greedy() and not batch.needs_logprobs:
         tokens = mlx_greedy_tokens(logits_2d)

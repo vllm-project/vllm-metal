@@ -13,6 +13,7 @@ from transformers import WhisperTokenizer
 from transformers.models.whisper.tokenization_whisper import LANGUAGES, TO_LANGUAGE_CODE
 from vllm.config import SpeechToTextConfig
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import (
     N_SAMPLES,
@@ -24,6 +25,7 @@ from vllm_metal.stt.audio import (
     split_audio,
 )
 from vllm_metal.stt.protocol import TranscriptionResult, TranscriptionSegment
+from vllm_metal.stt.sampling import STTSampling
 
 from .config import WHISPER_MAX_DECODE_TOKENS
 from .model import WhisperModel
@@ -76,6 +78,7 @@ class WhisperTranscriber:
         self.config = config or SpeechToTextConfig()
         self._model_path = model_path
         self._tokenizer = tokenizer
+        self._sampler = Sampler()
 
     @staticmethod
     def load_tokenizer(
@@ -216,10 +219,11 @@ class WhisperTranscriber:
             sample_rate=SAMPLE_RATE,
         )
 
-    def greedy_decode_tokens(
+    def decode_tokens(
         self,
         audio_features: mx.array,
         prompt_token_ids: list[int],
+        sampling: STTSampling,
         max_tokens: int | None = None,
     ) -> list[int]:
         if max_tokens is None:
@@ -237,7 +241,7 @@ class WhisperTranscriber:
                 self.model.config.n_text_ctx,
             )
             return []
-        max_tokens = min(max_tokens, remaining)
+        max_tokens = sampling.decode_budget(min(max_tokens, remaining))
 
         eot_token = self._get_token_id("<|endoftext|>")
         tokens = mx.array([prompt_token_ids], dtype=mx.int32)
@@ -246,7 +250,9 @@ class WhisperTranscriber:
 
         for _ in range(max_tokens):
             logits, kv_cache = self.model.decode(tokens, audio_features, kv_cache)
-            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            next_token = sampling.next_token(
+                prompt_token_ids, output_tokens, logits[:, -1, :]
+            )
             if next_token == eot_token:
                 break
             output_tokens.append(next_token)
@@ -331,7 +337,12 @@ class WhisperTranscriber:
             )
         )
 
-        return self.greedy_decode_tokens(audio_features, prefix, max_tokens)
+        return self.decode_tokens(
+            audio_features,
+            prefix,
+            STTSampling.from_request(None, self._sampler),
+            max_tokens,
+        )
 
     def _extract_segments(
         self,

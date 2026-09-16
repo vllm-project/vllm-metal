@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_metal.stt.serve import STTRequestInput, VLLMSTTRequestAdapter
 
@@ -21,11 +22,13 @@ class TestSTTServeRequestAdapter:
         req_id: str = "req-1",
         prompt_token_ids: list[int] | None = None,
         mm_features=None,
+        sampling_params: SamplingParams | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             req_id=req_id,
             prompt_token_ids=prompt_token_ids,
             mm_features=mm_features or [],
+            sampling_params=sampling_params or SamplingParams(temperature=0.0),
         )
 
     def test_normalizes_multimodal_feature_spec_payload(self) -> None:
@@ -54,6 +57,22 @@ class TestSTTServeRequestAdapter:
         )
 
         assert normalized.input_features is mel
+
+    def test_carries_request_sampling_params_to_the_decode(self) -> None:
+        mel = np.zeros((80, 3000), dtype=np.float32)
+        field_elem = SimpleNamespace(data=mel)
+        feature_spec = SimpleNamespace(data=UserDict({"input_features": field_elem}))
+        sampling_params = SamplingParams(temperature=0.7, seed=11)
+
+        normalized = VLLMSTTRequestAdapter.from_vllm_request(
+            self._make_request(
+                prompt_token_ids=[1, 2],
+                mm_features=[feature_spec],
+                sampling_params=sampling_params,
+            )
+        )
+
+        assert normalized.sampling_params is sampling_params
 
     def test_rejects_empty_mm_features(self) -> None:
         request = self._make_request(req_id="broken-req", mm_features=[])

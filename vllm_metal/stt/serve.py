@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,7 @@ class STTRequestInput:
     req_id: str
     prompt_token_ids: tuple[int, ...]
     input_features: Any
+    sampling_params: SamplingParams | None
 
 
 class VLLMSTTRequestAdapter:
@@ -33,6 +37,7 @@ class VLLMSTTRequestAdapter:
             req_id=req_id,
             prompt_token_ids=tuple(request.prompt_token_ids or ()),
             input_features=cls._extract_input_features(req_id, request.mm_features),
+            sampling_params=request.sampling_params,
         )
 
     @staticmethod

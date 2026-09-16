@@ -14,6 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.audio import load_audio
 from vllm_metal.stt.detection import is_stt_model
@@ -31,6 +32,7 @@ from vllm_metal.stt.qwen3_asr.model import (
     Qwen3LM,
 )
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
+from vllm_metal.stt.sampling import STTSampling
 
 
 class TestQwen3ASRConfigAdaptation:
@@ -485,7 +487,9 @@ class TestGreedyDecodeStopping:
             model, tokenizer=SimpleNamespace(eos_token_id=3)
         )
 
-        tokens = transcriber.greedy_decode_tokens(mx.zeros((1, 4)), [1])
+        tokens = transcriber.decode_tokens(
+            mx.zeros((1, 4)), [1], STTSampling.from_request(None, Sampler())
+        )
 
         assert tokens == prefix
         assert model.decode_step.call_count == len(prefix)
@@ -614,7 +618,9 @@ class TestModelLoad:
         )
 
         # Decode
-        tokens = transcriber.greedy_decode_tokens(audio_emb, prompt, max_tokens=100)
+        tokens = transcriber.decode_tokens(
+            audio_emb, prompt, STTSampling.from_request(None, Sampler()), max_tokens=100
+        )
         assert isinstance(tokens, list)
         assert len(tokens) > 0
 
