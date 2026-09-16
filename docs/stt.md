@@ -78,7 +78,13 @@ Transcribe audio to text.
 | `language` | string | `null` | ISO 639-1 language code (e.g. `en`, `zh`) |
 | `prompt` | string | `null` | Guide transcription (e.g. proper nouns) |
 | `response_format` | string | `"json"` | `json`, `text`, or `verbose_json` |
-| `temperature` | float | `0.0` | Must be `0`; transcription decodes greedily, and any other value is rejected before decoding |
+| `temperature` | float | `0.0` | Sampling temperature; `0` decodes greedily |
+| `top_p` / `top_k` / `min_p` | float / int / float | disabled | Restrict the candidate tokens sampled at each step |
+| `seed` | int | `null` | Makes a sampled transcription reproducible |
+| `repetition_penalty` | float | `1.0` | Penalize tokens already in the prompt or the transcript |
+| `frequency_penalty` / `presence_penalty` | float | `0.0` | Penalize tokens already in the transcript |
+
+`logit_bias` and `min_tokens` are rejected for every vllm-metal request.
 
 ### `POST /v1/audio/translations`
 

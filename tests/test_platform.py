@@ -48,13 +48,6 @@ def _isolate_mb_buffer_default(monkeypatch):
         os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
 
 
-@pytest.fixture(autouse=True)
-def _reset_stt_marker(monkeypatch):
-    """``check_and_update_config`` records whether the engine serves STT; keep
-    one test's answer from leaking into the next."""
-    monkeypatch.setattr(MetalPlatform, "_serves_stt_model", False)
-
-
 class TestMetalPlatform:
     """Tests for MetalPlatform class."""
 
@@ -201,42 +194,6 @@ class TestMetalPlatform:
 
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
-
-    def test_stt_engine_rejects_non_greedy_requests(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Serving STT makes a sampled request fail admission, not the engine."""
-        self._patch_stt_resolution(monkeypatch, is_stt=True)
-        MetalPlatform.check_and_update_config(self._detection_platform_config())
-
-        with pytest.raises(VLLMValidationError) as exc_info:
-            MetalPlatform.validate_request({}, SamplingParams(temperature=0.7))
-
-        assert str(exc_info.value) == (
-            "vllm-metal transcribes with greedy decoding, so speech-to-text "
-            "requests require temperature=0. (parameter=temperature, value=0.7)"
-        )
-
-    def test_stt_engine_accepts_greedy_requests(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._patch_stt_resolution(monkeypatch, is_stt=True)
-        MetalPlatform.check_and_update_config(self._detection_platform_config())
-
-        MetalPlatform.validate_request({}, SamplingParams(temperature=0.0))
-
-    def test_generate_engine_keeps_sampling(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A non-STT engine must not inherit a previous engine's restriction."""
-        self._patch_stt_resolution(monkeypatch, is_stt=True)
-        MetalPlatform.check_and_update_config(self._detection_platform_config())
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        MetalPlatform.check_and_update_config(
-            self._detection_platform_config(model="Qwen/Qwen3-0.6B", model_type="qwen3")
-        )
-
-        MetalPlatform.validate_request({}, SamplingParams(temperature=0.7))
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
