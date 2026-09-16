@@ -534,6 +534,23 @@ class SamplingBatch:
 # ---------------------------------------------------------------------------
 
 
+def create_request_generator(
+    sampling_params: SamplingParams,
+) -> torch.Generator | None:
+    """Create a per-request generator for seeded sampling.
+
+    vLLM uses a per-request generator only when an explicit seed is provided.
+    For unseeded sampling, vLLM relies on the global RNG state.
+    """
+    if sampling_params.seed is None:
+        return None
+    if sampling_params.temperature < GREEDY_TEMPERATURE_EPS:
+        return None
+    generator = torch.Generator(device=SamplingBatch.SAMPLER_DEVICE)
+    generator.manual_seed(sampling_params.seed)
+    return generator
+
+
 def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
     """Lazy native-greedy token ids for pre-sliced 2D logits.
 

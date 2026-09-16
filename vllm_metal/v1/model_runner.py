@@ -105,8 +105,8 @@ from vllm_metal.v1.proposer import (
     ProposeContext,
 )
 from vllm_metal.v1.sampling_batch import (
-    GREEDY_TEMPERATURE_EPS,
     SamplingBatch,
+    create_request_generator,
     sample_decode_tokens,
     sample_from_logits,
     sample_prefill_tokens,
@@ -140,23 +140,6 @@ def _lora_id_from_request_data(new_req: NewRequestData) -> int | None:
     if new_req.lora_request is None:
         return None
     return int(new_req.lora_request.lora_int_id)
-
-
-def _create_request_generator(
-    sampling_params: SamplingParams,
-) -> torch.Generator | None:
-    """Create a per-request generator for seeded sampling.
-
-    vLLM uses a per-request generator only when an explicit seed is provided.
-    For unseeded sampling, vLLM relies on the global RNG state.
-    """
-    if sampling_params.seed is None:
-        return None
-    if sampling_params.temperature < GREEDY_TEMPERATURE_EPS:
-        return None
-    generator = torch.Generator(device=SamplingBatch.SAMPLER_DEVICE)
-    generator.manual_seed(sampling_params.seed)
-    return generator
 
 
 @dataclass
@@ -2163,7 +2146,7 @@ class MetalModelRunner:
                 batch.add_output(req_id, [0])
                 continue
 
-            generator = _create_request_generator(sampling_params)
+            generator = create_request_generator(sampling_params)
 
             if sampling_params.prompt_logprobs is not None:
                 self._prompt_logprobs_tracker.register(

@@ -20,11 +20,11 @@ from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.model_runner import (
     PrefillRequest,
     RequestState,
-    _create_request_generator,
     _ExecutionBatch,
 )
 from vllm_metal.v1.sampling_batch import (
     SamplingBatch,
+    create_request_generator,
     sample_decode_tokens,
     sample_from_logits,
 )
@@ -274,7 +274,7 @@ class TestV1SeededSamplingGenerator:
         sampler = Sampler()
 
         sp = SamplingParams(temperature=1.0, seed=123)
-        generator = _create_request_generator(sp)
+        generator = create_request_generator(sp)
         assert generator is not None
 
         state = RequestState(
@@ -343,7 +343,7 @@ class TestSamplerDevicePolicy:
         assert metadata.allowed_token_ids_mask.device.type == "cpu"
 
     def test_seeded_generator_lives_on_cpu(self) -> None:
-        generator = _create_request_generator(SamplingParams(temperature=1.0, seed=7))
+        generator = create_request_generator(SamplingParams(temperature=1.0, seed=7))
 
         assert generator is not None
         assert generator.device.type == "cpu"
