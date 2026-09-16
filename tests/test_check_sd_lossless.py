@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from tools.check_sd_lossless import drafted_tokens, main
+from tools.check_sd_lossless import drafted_counter, drafted_tokens, main
 
 
 class TestDraftedTokens:
@@ -60,6 +60,26 @@ class TestDraftedTokens:
             is None
         )
 
+    def test_the_counter_name_comes_back_with_the_value(self):
+        assert drafted_counter(self.REAL) == (681, "spec_decode_num_draft_tokens")
+
+    def test_an_unreadable_value_is_unknown_rather_than_a_crash(self):
+        # The worker reads `value`, then `values`, and stores None when a metric
+        # type carries neither. int(None) would raise and lose the INCONCLUSIVE
+        # verdict that an unknown counter is supposed to produce.
+        assert drafted_tokens({"spec_decode_num_draft_tokens": None}) is None
+
+    def test_an_unreadable_counter_does_not_hide_a_readable_one(self):
+        assert (
+            drafted_tokens(
+                {
+                    "spec_decode_num_draft_tokens": None,
+                    "spec_decode_num_drafts": 128,
+                }
+            )
+            == 128
+        )
+
 
 class TestVerdict:
     """A speculative run that never drafted must not be reported as lossless."""
@@ -107,3 +127,46 @@ class TestVerdict:
 
     def test_a_divergence_still_fails(self, run):
         assert run((1, 9, 3), {"spec_decode_num_draft_tokens": 12}) == 1
+
+    def test_an_sd_run_longer_than_the_base_run_fails_rather_than_raising(self, run):
+        # Base is a strict prefix of the SD output, so the first divergence sits at
+        # exactly len(base) -- one past the last top-K row, since there is one row
+        # per base token. Emitting past the verified prefix is a real spec-decode
+        # fault and has to be reported; indexing the ranking blindly raised instead.
+        assert run((1, 2, 3, 4, 5), {"spec_decode_num_draft_tokens": 12}) == 1
+
+    def test_an_sd_run_shorter_than_the_base_run_fails(self, run):
+        assert run((1, 2), {"spec_decode_num_draft_tokens": 12}) == 1
+
+    def test_the_control_run_differs_from_base_only_in_the_sequence_limit(
+        self, monkeypatch
+    ):
+        """The control exists to isolate batch shape, so it may vary one thing.
+
+        Running it without the logprobs the base run asks for made base-vs-control
+        differ in two variables at once, and a difference between them could then be
+        attributed to a sequence limit that did not cause it.
+        """
+        seen = []
+
+        def fake_run_engine(args, spec_config, out_path, *, logprobs):
+            seen.append((spec_config, args.max_num_seqs, logprobs))
+            return self._result([1, 2, 3], {"spec_decode_num_draft_tokens": 12})
+
+        monkeypatch.setattr("tools.check_sd_lossless.run_engine", fake_run_engine)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "check_sd_lossless.py",
+                "--prompt",
+                self.PROMPT,
+                "--control-max-num-seqs",
+                "1",
+            ],
+        )
+        assert main() == 0
+        base, _sd, control = seen
+        assert base[0] is None and control[0] is None  # both target-only
+        assert base[1] != control[1]  # the sequence limit is what moves
+        assert base[2] == control[2]  # and the logprobs request does not

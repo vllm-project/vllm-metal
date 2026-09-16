@@ -131,14 +131,30 @@ def drafted_tokens(stats: dict) -> int | None:
     today). Match on the suffix so a prefix or a ``_total`` spelling does not
     silently turn every run into "no metrics".
     """
+    found = drafted_counter(stats)
+    return None if found is None else found[0]
+
+
+def drafted_counter(stats: dict) -> tuple[int, str] | None:
+    """The counter that shows the drafter ran, with the name it came from.
+
+    A metric whose value the worker could not read is stored as ``None`` (it reads
+    ``value`` then ``values``, and a type carrying neither leaves nothing). Skip it
+    and keep looking rather than calling ``int(None)``: an unreadable counter is the
+    "unknown" this returns None for, and crashing on it loses the INCONCLUSIVE verdict
+    the caller would otherwise report.
+    """
     if "metrics_error" in stats:
         return None
     for suffix in ("num_draft_tokens", "num_drafts"):
         for key, value in stats.items():
-            if key.endswith((suffix, f"{suffix}_total")):
-                if isinstance(value, (list, tuple)):
-                    value = sum(value)
-                return int(value)
+            if not key.endswith((suffix, f"{suffix}_total")):
+                continue
+            if isinstance(value, (list, tuple)):
+                value = sum(value)
+            if value is None:
+                continue
+            return int(value), key
     return None
 
 
@@ -242,8 +258,16 @@ def main() -> int:
         if args.control_max_num_seqs is not None:
             control_args = argparse.Namespace(**vars(args))
             control_args.max_num_seqs = args.control_max_num_seqs
+            # Same logprobs request as the base run: the control exists to isolate
+            # the sequence limit, and a control that also drops logprobs differs from
+            # base in two things at once. Safe here because the control carries no
+            # speculative config, so the "logprobs are never drafted" exclusion that
+            # keeps the SD engine from asking for them does not apply.
             control = run_engine(
-                control_args, None, os.path.join(td, "control.json"), logprobs=None
+                control_args,
+                None,
+                os.path.join(td, "control.json"),
+                logprobs=record_k,
             )
     if args.dump:
         os.makedirs(args.dump, exist_ok=True)
@@ -287,7 +311,12 @@ def main() -> int:
             (i for i, (x, y) in enumerate(zip(b, s, strict=False)) if x != y),
             min(len(b), len(s)),
         )
-        ranked = (base_result["topk"].get(prompt) or [[]] * (div + 1))[div]
+        # One top-K row per BASE token. When the SD engine runs PAST the base
+        # output -- base a strict prefix of it -- `div` is exactly len(rows), so
+        # indexing blindly raises instead of reporting the over-emission this tool
+        # exists to catch. No row means no ranking to show, which FAIL handles.
+        rows = base_result["topk"].get(prompt) or []
+        ranked = rows[div] if div < len(rows) else []
         top_ids = [tid for tid, _ in ranked[:record_k]]
         sd_token = s[div] if div < len(s) else None
         within = args.top_k > 0 and sd_token in top_ids[: args.top_k]
@@ -318,7 +347,11 @@ def main() -> int:
         f"{near} top-{args.top_k} near-tie, {failed} failed"
     )
     # A comparison only says something about verification if the drafter ran.
-    drafted = drafted_tokens(sd_result["stats"])
+    counted = drafted_counter(sd_result["stats"])
+    drafted = None if counted is None else counted[0]
+    # Name the counter: the fallback arm counts DRAFTS, not draft tokens, and
+    # printing either as "draft tokens" misreports the run by a factor of K.
+    counter = "drafted" if counted is None else counted[1]
     if drafted is None:
         print(
             f"INCONCLUSIVE: {summary} — the SD engine reported no spec-decode "
@@ -333,9 +366,9 @@ def main() -> int:
         )
         return 2
     if failed:
-        print(f"FAIL: {summary}, {drafted} draft tokens — SD is NOT lossless")
+        print(f"FAIL: {summary}, {counter}={drafted} — SD is NOT lossless")
         return 1
-    print(f"PASS: {summary}, {drafted} draft tokens")
+    print(f"PASS: {summary}, {counter}={drafted}")
     return 0
 
 
