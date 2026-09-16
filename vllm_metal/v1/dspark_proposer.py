@@ -31,12 +31,12 @@ from vllm_metal.v1.dspark.model import (
     DSparkDrafter,
 )
 from vllm_metal.v1.dspark.paged_context import (
-    KERNEL_HEAD_SIZES,
     DSparkPagedContext,
     PagedContextFullError,
     PagedCtxCache,
     PagedLayerBatch,
 )
+from vllm_metal.v1.dspark.paging import KERNEL_HEAD_SIZES, PAGED_BLOCK_SIZE
 from vllm_metal.v1.dspark.sampling import (
     DSparkProposal,
     RequestRandomStreams,
@@ -69,22 +69,6 @@ COUNTER_LOG_EVERY = 2000
 # that ran through a lapse keep target-only generation. (A verdict alone is
 # not enough to leave: at a steady load near the planner's threshold it flips
 # between arrivals, and every flip re-primed every new prompt for nothing.)
-PAGED_BLOCK_SIZE = 16  # kernel page sizes are 8, 16 and 32
-
-
-def _pool_blocks(memory_plan, config) -> int:
-    """Blocks to give the drafter's context pool.
-
-    The arena reserved `max_contexts * max_context_tokens` up front because every
-    slot was sized for the whole model length. The pool holds the same worst case
-    but hands blocks out as contexts grow, so a server that never reaches that
-    length never touches most of them, and one request's unused tail is available
-    to another. The extra block is the padding sink.
-    """
-    per_context = (
-        memory_plan.max_context_tokens + config.block_size + PAGED_BLOCK_SIZE - 1
-    ) // PAGED_BLOCK_SIZE
-    return memory_plan.max_contexts * per_context + 1
 
 
 LAPSE_ENTER_STEPS = 32
@@ -175,17 +159,19 @@ class DSparkProposer:
         # The drafter's context K/V is a KV cache: one entry per layer per committed
         # token, a pure function of the prefix. The pool keeps it in the target's own
         # paged layout; the arena is the private per-request store it replaces.
+        #
+        # The planner already decided which backend this drafter gets, and reserved for
+        # it: a non-zero `paged_blocks` IS that decision. Asking the question a second
+        # time here would let the two answer differently -- a planner that sized for one
+        # backend while the proposer built the other reserves the wrong thing.
         self._pool: DSparkPagedContext | None = None
-        if (
-            envs.VLLM_METAL_DSPARK_PAGED_CONTEXT
-            and config.attn_head_dim in KERNEL_HEAD_SIZES
-        ):
+        if memory_plan.paged_blocks:
             self._pool = DSparkPagedContext(
                 num_layers=len(drafter.layers),
                 kv_heads=config.n_kv_heads,
                 head_dim=config.attn_head_dim,
                 block_size=PAGED_BLOCK_SIZE,
-                num_blocks=_pool_blocks(memory_plan, config),
+                num_blocks=memory_plan.paged_blocks,
                 draft_block=config.block_size,
                 dtype=drafter.hidden_norm.weight.dtype,
             )
@@ -1018,6 +1004,25 @@ class DSparkProposer:
             return
         if hidden is None:
             raise RuntimeError("deferred DSpark spans need target features")
+        if self._pool is not None:
+            # Grow every row's table here, before either path below writes anything.
+            # Both of them reach the pool -- the batched one directly, the single-row
+            # one through PagedCtxCache.append -- and neither can recover once it has
+            # started writing, so a row that will not fit has to be dropped first.
+            rejected = set(
+                self._pool.reserve_many(
+                    [(write.req_id, write.end_pos) for write in pending]
+                )
+            )
+            if rejected:
+                for write in pending:
+                    if write.req_id in rejected:
+                        self._disable(
+                            write.req_id, write.record, "context capacity exhausted"
+                        )
+                pending = [w for w in pending if w.req_id not in rejected]
+                if not pending:
+                    return
         if len(pending) == 1:
             write = pending[0]
             self._drafter.update_context(
@@ -1044,8 +1049,7 @@ class DSparkProposer:
                 slot = cast("ArenaCache", caches[0]).slot
                 spans.append((write.start_row, write.start_pos, write.count, slot))
         if self._pool is not None:
-            for write in pending:
-                self._pool.reserve(write.req_id, write.end_pos)
+            # reserve_many above already grew every surviving row's table.
             self._drafter.update_context_spans_paged(hidden, spans, self._pool)
         else:
             self._drafter.update_context_spans(hidden, spans, self._arena)

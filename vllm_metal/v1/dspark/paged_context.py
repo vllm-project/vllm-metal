@@ -38,14 +38,7 @@ import mlx.core as mx
 
 from vllm_metal.metal import get_ops
 
-KERNEL_HEAD_SIZES = (64, 80, 96, 112, 128, 192, 256, 512)
-"""Head sizes the paged attention kernel is instantiated for.
-
-From the instantiate_paged_attention_heads macro in
-vllm_metal/metal/kernels_v2/pagedattention.metal. A drafter outside this set cannot
-use the pool; the caller keeps the private arena for it rather than failing at the
-first drafting step with a missing Metal function.
-"""
+from .paging import KERNEL_HEAD_SIZES
 
 __all__ = [
     "KERNEL_HEAD_SIZES",
@@ -197,6 +190,39 @@ class DSparkPagedContext:
         for _ in range(short):
             table.append(self._free.pop())
 
+    def reserve_many(self, rows: list[tuple[str, int]]) -> list[str]:
+        """Grow every row's block table, or grow none of the rows that cannot fit.
+
+        ``rows`` is ``(req_id, context_length)`` per row. Returns the request ids the
+        pool could not house, in the order given; every other row is grown.
+
+        Growing row by row is what a caller must not do: the pool can empty partway
+        through, leaving the earlier rows grown while the batch that was built around
+        all of them is abandoned, so their pages are held by a context whose span was
+        never written and never committed. This plans the whole batch against the free
+        list before it touches a single table, and grants in arrival order so a large
+        latecomer cannot starve the rows already being served.
+        """
+        wanted: list[tuple[str, int]] = []
+        for req_id, context_length in rows:
+            short = self.pages_for(context_length) - len(self._tables.get(req_id, []))
+            if short > 0:
+                wanted.append((req_id, short))
+        available = len(self._free)
+        granted: list[tuple[str, int]] = []
+        rejected: list[str] = []
+        for req_id, short in wanted:
+            if short <= available:
+                granted.append((req_id, short))
+                available -= short
+            else:
+                rejected.append(req_id)
+        for req_id, short in granted:
+            table = self._tables.setdefault(req_id, [])
+            for _ in range(short):
+                table.append(self._free.pop())
+        return rejected
+
     def release(self, req_id: str) -> int:
         """Return ``req_id``'s blocks to the pool. Returns how many were freed."""
         table = self._tables.pop(req_id, None)
@@ -207,6 +233,13 @@ class DSparkPagedContext:
 
     def holds(self, req_id: str) -> bool:
         return req_id in self._tables
+
+    def table_for(self, req_id: str) -> list[int]:
+        """The blocks a request holds, in context order. Empty if it holds none.
+
+        A copy: the pool's own table is not the caller's to edit.
+        """
+        return list(self._tables.get(req_id, ()))
 
     def slot_mapping_for(self, req_id: str, positions: range | list[int]) -> mx.array:
         """Flat cache slots for a request's absolute context positions.

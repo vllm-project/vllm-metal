@@ -95,6 +95,100 @@ class TestBlockAccounting:
         assert len({s // BLOCK for s in slots}) == 2
 
 
+class TestAWriteTouchesItsSlotsAndNotThePool:
+    """The memory plan depends on this and would be wrong without it.
+
+    `DSparkMemoryPlan` reserves a second copy of the context arena for "an in-place
+    update that cannot reuse its buffer (a view still alive)", and drops that term for
+    the pool because `reshape_and_cache` is a scatter whose cache is a designated
+    in-place output. Those bytes go to the target model's KV cache instead, so if a pool
+    write ever does rewrite the pool, the target is over-committed. This is the assertion
+    that catches it.
+    """
+
+    def _peak_rise_over_a_write(self, hold_a_view: bool) -> tuple[int, int]:
+        pool = make(num_blocks=512, layers=1)
+        rows = [(f"r{i}", 120) for i in range(8)]
+        for req_id, length in rows:
+            pool.reserve(req_id, length)
+        mx.eval(pool.key_caches, pool.value_caches)
+        batch = pool.plan(rows)
+        view = None
+        if hold_a_view:
+            view = pool.key_caches[0][:256]
+            mx.eval(view)
+        mx.reset_peak_memory()
+        base = mx.get_active_memory()
+        packed = mx.zeros(
+            (len(rows) * DRAFT_BLOCK, KV_HEADS, HEAD_DIM), dtype=mx.float32
+        )
+        pool.write(0, packed, packed, batch.slot_mapping)
+        mx.eval(pool.key_caches, pool.value_caches)
+        if view is not None:
+            mx.eval(view)
+        return mx.get_peak_memory() - base, pool.bytes_reserved()
+
+    @pytest.mark.parametrize("hold_a_view", [False, True])
+    def test_a_write_does_not_rewrite_the_pool(self, hold_a_view):
+        rise, reserved = self._peak_rise_over_a_write(hold_a_view)
+        # A whole-pool rewrite would put peak at roughly twice the reservation. The bar
+        # is loose on purpose: the claim is "not another pool", not an exact figure.
+        assert rise < reserved // 4, (
+            f"a write raised peak by {rise} bytes against a {reserved}-byte pool"
+        )
+
+
+class TestBatchGrowthIsAllOrNothingPerRow:
+    """`reserve_many` is the pool's only growth path for a drafting batch.
+
+    Growing row by row is the bug it exists to prevent: the pool can empty partway
+    through, and the rows already grown then hold pages for a batch that is abandoned.
+    """
+
+    def test_a_batch_that_fits_grows_every_row(self):
+        pool = make(num_blocks=64)
+        assert pool.reserve_many([("a", 16), ("b", 32), ("c", 9)]) == []
+        assert pool.pages_for(16) == len(pool.table_for("a"))
+        assert pool.pages_for(32) == len(pool.table_for("b"))
+        assert pool.pages_for(9) == len(pool.table_for("c"))
+
+    def test_rows_that_do_not_fit_are_named_and_left_untouched(self):
+        # 4 usable blocks: "a" takes 2, "b" takes 2, "c" cannot be housed at all.
+        pool = make(num_blocks=5)
+        rejected = pool.reserve_many([("a", 16), ("b", 16), ("c", 16)])
+        assert rejected == ["c"]
+        assert len(pool.table_for("a")) == 2
+        assert len(pool.table_for("b")) == 2
+        assert pool.table_for("c") == []
+        assert pool.free_blocks == 0
+
+    def test_a_rejected_row_does_not_strand_the_pages_of_earlier_rows(self):
+        """The whole point: no block is lost when part of a batch is refused."""
+        pool = make(num_blocks=5)
+        pool.reserve_many([("a", 16), ("b", 16), ("c", 16)])
+        held = sum(len(pool.table_for(r)) for r in ("a", "b", "c"))
+        # every usable block is either free or in exactly one table
+        assert held + pool.free_blocks == pool.usable_blocks
+        assert len(set(pool.table_for("a")) & set(pool.table_for("b"))) == 0
+
+    def test_a_row_already_large_enough_is_not_regrown(self):
+        pool = make(num_blocks=64)
+        pool.reserve_many([("a", 32)])
+        before = list(pool.table_for("a"))
+        free_before = pool.free_blocks
+        assert pool.reserve_many([("a", 16)]) == []
+        assert pool.table_for("a") == before
+        assert pool.free_blocks == free_before
+
+    def test_nothing_fits_when_the_pool_is_empty(self):
+        pool = make(num_blocks=3)  # 2 usable
+        assert pool.reserve_many([("a", 16)]) == []  # takes both
+        assert pool.free_blocks == 0
+        assert pool.reserve_many([("b", 16), ("c", 16)]) == ["b", "c"]
+        assert pool.table_for("b") == []
+        assert pool.table_for("c") == []
+
+
 class TestPagedAttentionMatchesDenseReference:
     """The kernel must reproduce the bidirectional draft block exactly.
 
@@ -217,6 +311,36 @@ class TestDraftBatchAddressing:
         batch = pool.plan([("a", 20)])
         expected = pool.slot_mapping_for("a", range(20, 27)).tolist()
         assert batch.slot_mapping.tolist() == expected
+
+
+class TestWhatReserveAllocatesIsWhatPlanAddresses:
+    """`plan` indexes a request's table directly, so a short table is an IndexError
+    inside a drafting step rather than an error the proposer can act on.
+
+    Both sides derive from `pages_for`, so they agree by construction -- but only if
+    that function counts the draft block's own positions, and only at every offset
+    relative to a page boundary. One sweep across two pages' worth of lengths is what
+    would catch an off-by-one that a fixed-length fixture sits either side of.
+    """
+
+    @pytest.mark.parametrize("context_length", range(0, 2 * BLOCK + DRAFT_BLOCK + 1))
+    def test_every_block_position_lands_in_a_reserved_page(self, context_length):
+        pool = make(num_blocks=64, layers=1)
+        pool.reserve("r", context_length)
+        reserved = set(pool.table_for("r"))
+        batch = pool.plan([("r", context_length)])
+        slots = batch.slot_mapping.tolist()
+        assert len(slots) == DRAFT_BLOCK
+        for slot in slots:
+            assert slot // BLOCK in reserved, (
+                f"context {context_length}: slot {slot} is in page {slot // BLOCK}, "
+                f"which the request does not hold ({sorted(reserved)})"
+            )
+        # and they are exactly the positions after the context, in order
+        assert slots == [
+            pool.table_for("r")[p // BLOCK] * BLOCK + p % BLOCK
+            for p in range(context_length, context_length + DRAFT_BLOCK)
+        ]
 
 
 class TestPagedLayerBatchMatchesArenaBatch:

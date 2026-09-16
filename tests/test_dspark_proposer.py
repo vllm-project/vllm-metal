@@ -21,7 +21,12 @@ from vllm_metal.v1.dspark.sampling import (
     SamplingTransforms,
     sample_from_distribution,
 )
-from vllm_metal.v1.dspark_proposer import DSparkProposer, _DraftPlan, _RequestContext
+from vllm_metal.v1.dspark_proposer import (
+    DSparkProposer,
+    _DraftPlan,
+    _RequestContext,
+    _SpanWrite,
+)
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
@@ -1062,3 +1067,132 @@ def test_a_lapse_entered_under_load_waits_for_the_load_to_drop(monkeypatch):
     # one decode request is at or below 4 - 1, so this DOES resume; the guard is
     # that a batch still at the entry load would not.
     assert proposer._lapsed is False
+
+
+class TestPagedIngestSurvivesAnExhaustedPool:
+    """A full context pool degrades to target-only; it does not abort the ingest.
+
+    `_flush_span_writes` used to grow the pool inside its own loop with nothing to
+    catch `PagedContextFullError`, so a pool that emptied on the third row raised
+    through the engine step with the first two rows already grown and neither their
+    span written nor their context committed. The pool cannot run out while it is
+    sized for the worst case, which is exactly why the path was never exercised.
+    """
+
+    def _exhausted_pool(self, proposer):
+        from vllm_metal.v1.dspark.paged_context import DSparkPagedContext
+
+        # One block, which is the padding sink, so nothing at all can be handed out.
+        return DSparkPagedContext(
+            num_layers=1,
+            kv_heads=1,
+            head_dim=64,
+            block_size=16,
+            num_blocks=1,
+            draft_block=proposer._config.block_size,
+            dtype=mx.float32,
+        )
+
+    def test_every_row_falls_back_instead_of_raising(self):
+        proposer = _proposer()
+        proposer._pool = self._exhausted_pool(proposer)
+        records = [_RequestContext(owner=_state([1, 2, 3])) for _ in range(3)]
+        pending = [
+            _SpanWrite(
+                req_id=f"r{i}",
+                record=record,
+                start_row=i,
+                start_pos=0,
+                count=1,
+                end_pos=8,
+            )
+            for i, record in enumerate(records)
+        ]
+        # Must return, not raise: the engine step cannot recover from an exception here.
+        proposer._flush_span_writes(mx.zeros((3, 1)), pending)
+        assert [r.disabled_reason for r in records] == [
+            "context capacity exhausted"
+        ] * 3
+        assert all(r.covered_end == 0 for r in records)
+
+    def test_the_pool_is_left_whole_when_a_batch_is_refused(self):
+        proposer = _proposer()
+        pool = self._exhausted_pool(proposer)
+        proposer._pool = pool
+        free_before = pool.free_blocks
+        record = _RequestContext(owner=_state([1, 2, 3]))
+        proposer._flush_span_writes(
+            mx.zeros((1, 1)),
+            [
+                _SpanWrite(
+                    req_id="r",
+                    record=record,
+                    start_row=0,
+                    start_pos=0,
+                    count=1,
+                    end_pos=8,
+                )
+            ],
+        )
+        assert pool.free_blocks == free_before
+        assert pool.table_for("r") == []
+
+
+class TestTheProposerBuildsTheBackendThePlannerReservedFor:
+    """One decision, made once.
+
+    `cache_policy` subtracts the plan's reserve from the target model's KV cache before
+    the proposer exists. If the proposer then chose its backend independently, a planner
+    that sized for the arena could be paired with a pool, or the reverse, and the target
+    cache would be wrong in whichever direction. The plan's `paged_blocks` IS the choice.
+    """
+
+    def _build(self, monkeypatch, *, env_at_plan: bool, env_at_build: bool):
+        config = replace(
+            DSparkConfig.from_dict(draft_hf_config().to_dict()), head_dim=64
+        )
+        if env_at_plan:
+            monkeypatch.setenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", "1")
+        else:
+            monkeypatch.delenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", raising=False)
+        plan = DSparkMemoryPlan.build(
+            config,
+            itemsize=4,
+            max_num_seqs=4,
+            max_model_len=256,
+            max_num_batched_tokens=512,
+        )
+        if env_at_build:
+            monkeypatch.setenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", "1")
+        else:
+            monkeypatch.delenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", raising=False)
+        proposer = DSparkProposer(
+            drafter=DSparkDrafter(config),
+            config=config,
+            runner=make_stub_runner(),
+            controller=SpeculativeDecodeController(),
+            memory_plan=plan,
+        )
+        return plan, proposer
+
+    def test_the_plan_and_the_backend_agree(self, monkeypatch):
+        for enabled in (False, True):
+            plan, proposer = self._build(
+                monkeypatch, env_at_plan=enabled, env_at_build=enabled
+            )
+            assert bool(plan.paged_blocks) is enabled
+            assert (proposer._pool is not None) is enabled
+
+    def test_the_env_flipping_after_planning_does_not_change_the_backend(
+        self, monkeypatch
+    ):
+        # The plan reserved for the arena. Whatever the environment says now, building a
+        # pool here would use memory the target model was already given.
+        plan, proposer = self._build(monkeypatch, env_at_plan=False, env_at_build=True)
+        assert plan.paged_blocks == 0
+        assert proposer._pool is None
+
+    def test_the_pool_gets_exactly_the_pages_the_plan_reserved(self, monkeypatch):
+        plan, proposer = self._build(monkeypatch, env_at_plan=True, env_at_build=True)
+        assert proposer._pool is not None
+        assert proposer._pool.total_blocks == plan.paged_blocks

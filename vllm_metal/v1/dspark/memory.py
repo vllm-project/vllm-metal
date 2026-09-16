@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import DSparkConfig
+from .paging import PAGED_BLOCK_SIZE, paged_context_enabled, pool_blocks
 
 MAX_CONTEXTS = 32
 CONTEXT_ALIGNMENT = 256
@@ -29,9 +30,13 @@ class DSparkMemoryPlan:
     # Scratch positions per context slot for the drafted block's own K/V
     # (the arena stores them right after the committed context).
     block_size: int = 0
+    # Pages when the context lives in the paged pool; zero when it lives in the arena.
+    paged_blocks: int = 0
 
     @property
     def context_bytes(self) -> int:
+        if self.paged_blocks:
+            return self.paged_blocks * PAGED_BLOCK_SIZE * self.kv_bytes_per_token
         return (
             self.max_contexts
             * (self.max_context_tokens + self.block_size)
@@ -83,20 +88,31 @@ class DSparkMemoryPlan:
         tokens = max_num_batched_tokens
         kv_width = config.n_kv_heads * config.attn_head_dim
         kv_bytes = 2 * config.num_hidden_layers * kv_width * itemsize
-        context = rows * length * kv_bytes
+        block = config.block_size
+        paged = paged_context_enabled(config)
+        blocks = pool_blocks(rows, length, block) if paged else 0
+        context = (
+            blocks * PAGED_BLOCK_SIZE * kv_bytes if paged else rows * length * kv_bytes
+        )
         # Captured layer outputs and their concatenation can coexist. Use FP32
         # sizing even for a two-byte target, including target/draft dtype casts.
         capture = 2 * tokens * len(config.target_layer_ids) * config.hidden_size * 4
         # One transient copy of the context arena: an in-place update that
         # cannot reuse its buffer (a view still alive) rewrites the whole arena
         # once. Drafting attends rows in place, so no padded batch copy exists.
-        copies = context
+        #
+        # The pool has no such copy. It is written by `reshape_and_cache`, a scatter
+        # whose cache is a designated in-place output, so a write touches the mapped
+        # slots and leaves the rest of the pool alone. Reserving a second pool here
+        # would take the bytes out of the TARGET model's KV cache
+        # (`planning_reserve_bytes` is subtracted from it) to cover a rewrite that
+        # cannot happen.
+        copies = 0 if paged else context
         ingest = (
             tokens
             * (4 * config.hidden_size + 4 * config.num_hidden_layers * kv_width)
             * 4
         )
-        block = config.block_size
         draft = (
             rows
             * block
@@ -129,4 +145,5 @@ class DSparkMemoryPlan:
             + proposals
             + KERNEL_RESERVE_BYTES,
             block,
+            blocks,
         )

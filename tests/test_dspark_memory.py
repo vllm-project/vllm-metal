@@ -15,6 +15,7 @@ from tests.test_v1_worker import TestPagedAttentionPlanDiagnostics as PlanDiagno
 from vllm_metal.v1.dspark.loader import load_drafter
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import ContextArena, CtxCache
+from vllm_metal.v1.dspark.paging import PAGED_BLOCK_SIZE
 
 
 def test_append_reuses_chunks_and_rollback_hides_old_suffix(monkeypatch):
@@ -232,3 +233,89 @@ def test_memory_plan_honors_configured_context_cap():
     )
     with pytest.raises(ValueError, match="at least one"):
         build(proposer._config, max_num_seqs=8, max_contexts=0, **common)
+
+
+class TestTheMemoryPlanSizesForTheBackendItWillGet:
+    """The plan must reserve for the context backend the proposer will actually build.
+
+    `planning_reserve_bytes` is not a private drafter number: `cache_policy` subtracts it
+    from what the TARGET model's KV cache may use. A drafter that reserves for a rewrite
+    it cannot perform takes those blocks away from the target and hands back nothing.
+    """
+
+    KWARGS = {
+        "itemsize": 2,
+        "max_num_seqs": 16,
+        "max_model_len": 4096,
+        "max_num_batched_tokens": 2048,
+    }
+
+    def _plans(self, monkeypatch):
+        from tests.test_dspark_contracts import draft_hf_config
+        from vllm_metal.v1.dspark.config import DSparkConfig
+
+        # The toy config's head dim has no kernel, so the pool would be refused; the
+        # plan is pure arithmetic and only needs a head size the kernels are built for.
+        config = replace(
+            DSparkConfig.from_dict(draft_hf_config().to_dict()), head_dim=64
+        )
+        monkeypatch.delenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", raising=False)
+        arena = DSparkMemoryPlan.build(config, **self.KWARGS)
+        monkeypatch.setenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", "1")
+        paged = DSparkMemoryPlan.build(config, **self.KWARGS)
+        return arena, paged
+
+    def test_only_the_arena_reserves_a_transient_copy_of_itself(self, monkeypatch):
+        arena, paged = self._plans(monkeypatch)
+        # Every other workspace term is a function of the config and the scheduler
+        # limits alone, so the entire difference between the two is that copy.
+        second_arena = (
+            arena.max_contexts * arena.max_context_tokens * arena.kv_bytes_per_token
+        )
+        assert second_arena > 0
+        assert arena.workspace_bytes - paged.workspace_bytes == second_arena
+
+    def test_the_target_cache_gets_those_bytes_back(self, monkeypatch):
+        arena, paged = self._plans(monkeypatch)
+        saved = arena.planning_reserve_bytes - paged.planning_reserve_bytes
+        assert saved == (
+            arena.max_contexts * arena.max_context_tokens * arena.kv_bytes_per_token
+        )
+        # not a rounding difference: most of what the drafter asks the target to give up
+        assert saved > 0.4 * arena.planning_reserve_bytes
+
+    def test_the_saving_at_the_shipped_drafter_geometry(self, monkeypatch):
+        """The number the PR claims, at the drafter it claims it for.
+
+        The pinned Qwen3 DSpark drafter is five layers, eight KV heads, head dim 128,
+        bf16. At 16 requests x 4096 tokens that is 20 KiB of context per token.
+        """
+        from tests.test_dspark_contracts import draft_hf_config
+        from vllm_metal.v1.dspark.config import DSparkConfig
+
+        config = replace(
+            DSparkConfig.from_dict(draft_hf_config().to_dict()),
+            head_dim=128,
+            num_hidden_layers=5,
+            num_key_value_heads=8,
+            num_attention_heads=32,
+        )
+        monkeypatch.delenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", raising=False)
+        arena = DSparkMemoryPlan.build(config, **self.KWARGS)
+        monkeypatch.setenv("VLLM_METAL_DSPARK_PAGED_CONTEXT", "1")
+        paged = DSparkMemoryPlan.build(config, **self.KWARGS)
+        assert arena.kv_bytes_per_token == 20480  # 20 KiB per token across five layers
+        saved = arena.planning_reserve_bytes - paged.planning_reserve_bytes
+        assert saved == 16 * 4096 * 20480  # 1.34 GB returned to the target KV cache
+
+    def test_the_pool_still_houses_the_arena_worst_case(self, monkeypatch):
+        arena, paged = self._plans(monkeypatch)
+        assert paged.paged_blocks > 0
+        assert arena.paged_blocks == 0
+        # whole pages plus the sink: never short, and never more than one page per
+        # context over
+        slack = paged.context_bytes - arena.context_bytes
+        assert -paged.kv_bytes_per_token * paged.block_size <= slack
+        assert slack <= (paged.max_contexts + 1) * PAGED_BLOCK_SIZE * (
+            paged.kv_bytes_per_token
+        )
