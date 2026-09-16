@@ -111,6 +111,11 @@ class DraftDims:
     num_layers: int
     num_kv_heads: int
     head_dim: int
+    #: Positions a drafting step writes past a request's committed length. The
+    #: draft model looks ahead ``num_speculative_tokens``; a block drafter writes
+    #: its whole block. Sizes the proposer-local scratch tail the scheduler never
+    #: sees (``ModelCachePolicy.draft_scratch_reserve_blocks``).
+    lookahead_positions: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +739,7 @@ def resolve_draft_dims(
         num_layers=draft_model_config.get_total_num_hidden_layers(),
         num_kv_heads=draft_model_config.get_num_kv_heads(parallel_config),
         head_dim=draft_model_config.get_head_size(),
+        lookahead_positions=speculative_config.num_speculative_tokens,
     )
 
 

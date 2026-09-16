@@ -769,13 +769,13 @@ class ModelCachePolicy:
                 "to share one scheduler KV cache group"
             )
 
-        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+        from vllm_metal.v1.proposer import CommittedKVGroupConsumer
 
         drafter = self._runner._drafter
-        if not isinstance(drafter, DraftModelProposer):
+        if not isinstance(drafter, CommittedKVGroupConsumer):
             raise RuntimeError(
-                "draft KV-cache spec registered but no DraftModelProposer is "
-                f"installed (got {type(drafter).__name__})"
+                "draft KV-cache spec registered but the installed drafter "
+                f"({type(drafter).__name__}) does not consume a committed KV group"
             )
         drafter.adopt_committed_group(group_indices[0])
 
@@ -856,11 +856,11 @@ class ModelCachePolicy:
         this over-provisions the draft's *physical* backend beyond the
         scheduler-visible block count.
         """
-        spec = self._runner.vllm_config.speculative_config
-        if self._runner._draft_dims is None or spec is None:
+        draft_dims = self._runner._draft_dims
+        if draft_dims is None:
             return 0
         block_size = self._runner.cache_config.block_size
-        extra_per_req = cdiv(spec.num_speculative_tokens, block_size)
+        extra_per_req = cdiv(draft_dims.lookahead_positions, block_size)
         return self._runner.scheduler_config.max_num_seqs * extra_per_req
 
     def draft_scratch_reserve_bytes(self) -> int:

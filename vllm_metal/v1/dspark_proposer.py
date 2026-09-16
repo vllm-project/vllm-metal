@@ -36,7 +36,7 @@ from vllm_metal.v1.dspark.paged_context import (
     PagedCtxCache,
     PagedLayerBatch,
 )
-from vllm_metal.v1.dspark.paging import KERNEL_HEAD_SIZES, PAGED_BLOCK_SIZE
+from vllm_metal.v1.dspark.paging import KERNEL_HEAD_SIZES
 from vllm_metal.v1.dspark.sampling import (
     DSparkProposal,
     RequestRandomStreams,
@@ -160,32 +160,18 @@ class DSparkProposer:
         # token, a pure function of the prefix. The pool keeps it in the target's own
         # paged layout; the arena is the private per-request store it replaces.
         #
-        # The planner already decided which backend this drafter gets, and reserved for
-        # it: a non-zero `paged_blocks` IS that decision. Asking the question a second
-        # time here would let the two answer differently -- a planner that sized for one
-        # backend while the proposer built the other reserves the wrong thing.
+        # The planner already decided which backend this drafter gets: `paged` IS
+        # that decision. When paged, the committed context is a scheduler-owned
+        # KV-cache group (cache_policy._draft_layer_specs, from the runner's
+        # DraftDims), so its physical cache cannot exist yet -- the scheduler has
+        # not sized it. It is attached in `attach_context_cache` once
+        # `install_drafter` knows `num_blocks`, and told its group index by
+        # `adopt_committed_group` once `kv_cache_config` exists, exactly as the
+        # draft-model proposer is.
         self._pool: DSparkPagedContext | None = None
-        if memory_plan.paged_blocks:
-            self._pool = DSparkPagedContext(
-                num_layers=len(drafter.layers),
-                kv_heads=config.n_kv_heads,
-                head_dim=config.attn_head_dim,
-                block_size=PAGED_BLOCK_SIZE,
-                num_blocks=memory_plan.paged_blocks,
-                draft_block=config.block_size,
-                dtype=drafter.hidden_norm.weight.dtype,
-            )
-            mx.eval(self._pool.key_caches, self._pool.value_caches)
-            logger.info(
-                "DSpark draft context: paged pool, %d blocks of %d tokens "
-                "(%d usable, 1 padding sink), %.2f GB reserved across %d layers",
-                self._pool.total_blocks,
-                PAGED_BLOCK_SIZE,
-                self._pool.usable_blocks,
-                self._pool.bytes_reserved() / 1e9,
-                len(drafter.layers),
-            )
-        elif envs.VLLM_METAL_DSPARK_PAGED_CONTEXT:
+        self._paged = bool(memory_plan.paged)
+        self._committed_group_index: int | None = None
+        if not self._paged and envs.VLLM_METAL_DSPARK_PAGED_CONTEXT:
             logger.warning(
                 "DSpark paged context requested but the attention kernel is not "
                 "instantiated for head size %d (supported: %s); keeping the private "
@@ -202,7 +188,7 @@ class DSparkProposer:
                 head_dim=config.attn_head_dim,
                 dtype=drafter.hidden_norm.weight.dtype,
             )
-            for _ in ([] if self._pool is not None else drafter.layers)
+            for _ in ([] if self._paged else drafter.layers)
         ]
         if self._arena:
             mx.eval([(layer.keys, layer.values) for layer in self._arena])
@@ -790,12 +776,63 @@ class DSparkProposer:
             ),
         )
 
+    def attach_context_cache(
+        self, *, committed_blocks: int, scratch_blocks: int, block_size: int
+    ) -> None:
+        """Build the paged context once the scheduler has sized its committed group.
+
+        ``committed_blocks`` is the scheduler-visible page count for the drafter's
+        group; its pages reach each request as ``RequestState.block_ids[group]``.
+        ``scratch_blocks`` is the proposer-local tail for the draft block
+        (``draft_scratch_reserve_blocks``), plus one page here for the padding sink.
+        ``block_size`` must be the scheduler's, since block tables are shared.
+        """
+        if not self._paged:
+            raise RuntimeError("this drafter's context lives in the private arena")
+        if self._pool is not None:
+            raise RuntimeError("the paged context is already attached")
+        config, drafter = self._config, self._drafter
+        self._pool = DSparkPagedContext(
+            num_layers=len(drafter.layers),
+            kv_heads=config.n_kv_heads,
+            head_dim=config.attn_head_dim,
+            block_size=block_size,
+            committed_blocks=committed_blocks,
+            scratch_blocks=scratch_blocks + 1,
+            draft_block=config.block_size,
+            dtype=drafter.hidden_norm.weight.dtype,
+        )
+        mx.eval(self._pool.key_caches, self._pool.value_caches)
+        logger.info(
+            "DSpark draft context: scheduler-owned KV-cache group, %d committed "
+            "blocks of %d tokens plus %d scratch (1 padding sink), %.2f GB across "
+            "%d layers",
+            committed_blocks,
+            block_size,
+            scratch_blocks + 1,
+            self._pool.bytes_reserved() / 1e9,
+            len(drafter.layers),
+        )
+
+    def adopt_committed_group(self, group_index: int) -> None:
+        """Record which scheduler KV-cache group owns the committed context."""
+        self._committed_group_index = group_index
+
+    def _committed_pages(self, record: _RequestContext) -> list[int]:
+        """The scheduler's block-table row for this request in the drafter's group."""
+        if self._committed_group_index is None:
+            raise RuntimeError(
+                "DSpark paged context has no scheduler group yet -- "
+                "initialize_kv_cache() must run before the first step"
+            )
+        return record.owner.block_ids[self._committed_group_index]
+
     def _release_slot(self, record: _RequestContext) -> None:
         for cache in record.caches:
             if isinstance(cache, ArenaCache):
                 cache.arena.release(cache.slot)
             elif isinstance(cache, PagedCtxCache) and self._pool is not None:
-                self._pool.release(cache.request_id)
+                self._pool.unbind(cache.request_id)
                 break  # one block table serves every layer of the request
         record.caches = []
 
@@ -930,9 +967,9 @@ class DSparkProposer:
         if not record.caches:
             if self._pool is not None:
                 try:
-                    self._pool.reserve(req_id, end_pos)
+                    self._pool.bind(req_id, self._committed_pages(record), end_pos)
                 except PagedContextFullError:
-                    self._disable(req_id, record, "context capacity exhausted")
+                    self._disable(req_id, record, "draft scratch exhausted")
                     return
                 record.caches = [
                     PagedCtxCache(
@@ -1010,15 +1047,22 @@ class DSparkProposer:
             # one through PagedCtxCache.append -- and neither can recover once it has
             # started writing, so a row that will not fit has to be dropped first.
             rejected = set(
-                self._pool.reserve_many(
-                    [(write.req_id, write.end_pos) for write in pending]
+                self._pool.bind_many(
+                    [
+                        (
+                            write.req_id,
+                            self._committed_pages(write.record),
+                            write.end_pos,
+                        )
+                        for write in pending
+                    ]
                 )
             )
             if rejected:
                 for write in pending:
                     if write.req_id in rejected:
                         self._disable(
-                            write.req_id, write.record, "context capacity exhausted"
+                            write.req_id, write.record, "draft scratch exhausted"
                         )
                 pending = [w for w in pending if w.req_id not in rejected]
                 if not pending:
@@ -1049,7 +1093,7 @@ class DSparkProposer:
                 slot = cast("ArenaCache", caches[0]).slot
                 spans.append((write.start_row, write.start_pos, write.count, slot))
         if self._pool is not None:
-            # reserve_many above already grew every surviving row's table.
+            # bind_many above already addressed every surviving row.
             self._drafter.update_context_spans_paged(hidden, spans, self._pool)
         else:
             self._drafter.update_context_spans(hidden, spans, self._arena)
@@ -1092,6 +1136,12 @@ class DSparkProposer:
                 )
             if self._pool is not None:
                 if layer_index == 0:
+                    # Rebind against the scheduler's current pages: its table for a
+                    # request may have grown since the last ingest bound it.
+                    for plan, length in zip(plans, lengths, strict=True):
+                        self._pool.bind(
+                            plan.req_id, self._committed_pages(plan.context), length
+                        )
                     paged_batch = self._pool.plan(
                         list(zip([plan.req_id for plan in plans], lengths, strict=True))
                     )

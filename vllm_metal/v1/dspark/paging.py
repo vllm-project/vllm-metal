@@ -1,7 +1,6 @@
 """Where the drafter's context lives, and how much of it there is.
 
-Pure policy: which backend a configuration selects, the pool's page size, and how many
-pages a pool needs. It holds no Metal handles so the memory planner can ask these
+Pure policy: which backend a configuration selects, and the pool's page size. It holds no Metal handles so the memory planner can ask these
 questions before any shader is loaded, and so the planner and the proposer answer them
 from one place instead of each carrying its own copy of the rule.
 """
@@ -29,32 +28,37 @@ __all__ = [
     "KERNEL_HEAD_SIZES",
     "PAGED_BLOCK_SIZE",
     "paged_context_enabled",
-    "pool_blocks",
+    "require_prefix_caching_off",
 ]
 
 
 def paged_context_enabled(config: DSparkConfig) -> bool:
     """Whether this drafter's context will live in the paged pool.
 
-    Asked by the memory planner before the proposer exists, and by the proposer when it
-    builds the context. Both must agree: a planner that sized for one backend while the
-    proposer built the other would reserve the wrong thing.
+    Asked once, by the memory planner: its answer is recorded as ``DSparkMemoryPlan.paged``
+    and the proposer follows that rather than asking again, so the backend the planner
+    sized for and the one the proposer builds cannot differ.
     """
     return bool(envs.VLLM_METAL_DSPARK_PAGED_CONTEXT) and (
         config.attn_head_dim in KERNEL_HEAD_SIZES
     )
 
 
-def pool_blocks(max_contexts: int, max_context_tokens: int, draft_block: int) -> int:
-    """Pages for a pool that can still house the arena's worst case.
+def require_prefix_caching_off(enable_prefix_caching: bool) -> None:
+    """Refuse a scheduler-owned drafter context under target prefix caching.
 
-    The arena reserved `max_contexts * max_context_tokens` up front because every slot
-    was sized for the whole model length. The pool holds the same worst case but hands
-    pages out as contexts grow, so a server that never reaches that length never touches
-    most of them and one request's unused tail is available to another. The extra page is
-    the padding sink that ragged block tables point at.
+    The drafter's committed group is scheduler-hashed on token ids, like every group.
+    A target prefix-cache hit skips the target forward for the matched positions, so no
+    hidden states exist to build the drafter's K/V there -- yet the scheduler marks
+    those pages computed, uniformly for every group. A separate draft model has no
+    such hole because it forwards its own token ids. Until the drafter can recompute
+    a hit prefix or opt its group out of hashing, the two cannot be combined, and that
+    is said at startup rather than discovered as stale draft KV.
     """
-    per_context = (
-        max_context_tokens + draft_block + PAGED_BLOCK_SIZE - 1
-    ) // PAGED_BLOCK_SIZE
-    return max_contexts * per_context + 1
+    if enable_prefix_caching:
+        raise ValueError(
+            "VLLM_METAL_DSPARK_PAGED_CONTEXT keeps the drafter's context in a "
+            "scheduler-owned KV-cache group, which target prefix caching would mark "
+            "computed at positions the target never forwarded; pass "
+            "--no-enable-prefix-caching, or leave the paged context off"
+        )

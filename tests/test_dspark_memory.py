@@ -15,7 +15,6 @@ from tests.test_v1_worker import TestPagedAttentionPlanDiagnostics as PlanDiagno
 from vllm_metal.v1.dspark.loader import load_drafter
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import ContextArena, CtxCache
-from vllm_metal.v1.dspark.paging import PAGED_BLOCK_SIZE
 
 
 def test_append_reuses_chunks_and_rollback_hides_old_suffix(monkeypatch):
@@ -308,14 +307,25 @@ class TestTheMemoryPlanSizesForTheBackendItWillGet:
         saved = arena.planning_reserve_bytes - paged.planning_reserve_bytes
         assert saved == 16 * 4096 * 20480  # 1.34 GB returned to the target KV cache
 
-    def test_the_pool_still_houses_the_arena_worst_case(self, monkeypatch):
+    def test_a_scheduler_owned_context_reserves_no_context_bytes_here(
+        self, monkeypatch
+    ):
+        """The scheduler sizes the committed context out of the KV budget.
+
+        With the context a KV-cache group (``cache_policy._draft_layer_specs``), the
+        drafter's own plan carries none of it: reserving it here as well would take the
+        same bytes out of the target's cache twice. Only the arena is the plan's to hold.
+        """
         arena, paged = self._plans(monkeypatch)
-        assert paged.paged_blocks > 0
-        assert arena.paged_blocks == 0
-        # whole pages plus the sink: never short, and never more than one page per
-        # context over
-        slack = paged.context_bytes - arena.context_bytes
-        assert -paged.kv_bytes_per_token * paged.block_size <= slack
-        assert slack <= (paged.max_contexts + 1) * PAGED_BLOCK_SIZE * (
-            paged.kv_bytes_per_token
+        assert paged.paged is True
+        assert arena.paged is False
+        assert paged.context_bytes == 0
+        assert arena.context_bytes > 0
+        # what the drafter asks to hold at load differs by exactly the arena and its
+        # transient copy -- both of which a scheduler-owned context does not have
+        second_arena = (
+            arena.max_contexts * arena.max_context_tokens * arena.kv_bytes_per_token
+        )
+        assert arena.reserve_bytes - paged.reserve_bytes == (
+            arena.context_bytes + second_arena
         )

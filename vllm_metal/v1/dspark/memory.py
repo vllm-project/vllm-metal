@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import DSparkConfig
-from .paging import PAGED_BLOCK_SIZE, paged_context_enabled, pool_blocks
+from .paging import paged_context_enabled
 
 MAX_CONTEXTS = 32
 CONTEXT_ALIGNMENT = 256
@@ -30,13 +30,15 @@ class DSparkMemoryPlan:
     # Scratch positions per context slot for the drafted block's own K/V
     # (the arena stores them right after the committed context).
     block_size: int = 0
-    # Pages when the context lives in the paged pool; zero when it lives in the arena.
-    paged_blocks: int = 0
+    # True when the context is a scheduler-owned KV-cache group: the scheduler
+    # sizes and allocates it out of the KV budget, so the drafter reserves none of
+    # it here. False when it lives in the private per-request arena.
+    paged: bool = False
 
     @property
     def context_bytes(self) -> int:
-        if self.paged_blocks:
-            return self.paged_blocks * PAGED_BLOCK_SIZE * self.kv_bytes_per_token
+        if self.paged:
+            return 0
         return (
             self.max_contexts
             * (self.max_context_tokens + self.block_size)
@@ -90,10 +92,9 @@ class DSparkMemoryPlan:
         kv_bytes = 2 * config.num_hidden_layers * kv_width * itemsize
         block = config.block_size
         paged = paged_context_enabled(config)
-        blocks = pool_blocks(rows, length, block) if paged else 0
-        context = (
-            blocks * PAGED_BLOCK_SIZE * kv_bytes if paged else rows * length * kv_bytes
-        )
+        # A scheduler-owned context is sized by the scheduler from the KV budget
+        # (cache_policy._draft_layer_specs); the arena is reserved here, whole.
+        context = 0 if paged else rows * length * kv_bytes
         # Captured layer outputs and their concatenation can coexist. Use FP32
         # sizing even for a two-byte target, including target/draft dtype casts.
         capture = 2 * tokens * len(config.target_layer_ids) * config.hidden_size * 4
@@ -145,5 +146,5 @@ class DSparkMemoryPlan:
             + proposals
             + KERNEL_RESERVE_BYTES,
             block,
-            blocks,
+            paged,
         )

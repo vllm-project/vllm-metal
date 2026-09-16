@@ -67,6 +67,23 @@ class ProposeContext:
     finished_req_ids: set[str]
 
 
+@runtime_checkable
+class CommittedKVGroupConsumer(Protocol):
+    """A drafter whose committed KV lives in a scheduler-owned KV-cache group.
+
+    ``ModelCachePolicy._draft_layer_specs`` registers one ``FullAttentionSpec`` per
+    drafter layer from the runner's ``DraftDims``; the scheduler then sizes, hashes,
+    admits and evicts that group exactly as it does the target's. Which group index
+    it landed in is only known once ``kv_cache_config`` exists, so it is handed over
+    afterwards. Any drafter with a per-token, per-layer KV can consume one -- a
+    separate full draft model or a block drafter fed target hidden states alike.
+    """
+
+    def adopt_committed_group(self, group_index: int) -> None:
+        """Record which scheduler KV-cache group owns this drafter's committed KV."""
+        ...
+
+
 class MetalProposer(Protocol):
     """Uniform drafting seam."""
 

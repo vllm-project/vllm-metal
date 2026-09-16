@@ -404,7 +404,9 @@ class MetalModelRunner:
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
         # A DSpark drafter travels under the draft_model label (see
-        # contracts.present_dspark_as_draft_model) but owns no scheduler KV group.
+        # contracts.present_dspark_as_draft_model); its dims come from its own
+        # config once the drafter is loaded (``_load_dspark_drafter``), not from
+        # the draft_model_config accessors a separate full model resolves through.
         if spec is not None and spec.uses_draft_model() and not is_dspark_config(spec):
             from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
 
@@ -717,6 +719,21 @@ class MetalModelRunner:
                 "or --max-num-batched-tokens, or raise --gpu-memory-utilization."
             )
         self._dspark_memory_plan = plan
+        if plan.paged:
+            from vllm_metal.v1.dspark.paging import require_prefix_caching_off
+
+            require_prefix_caching_off(self.cache_config.enable_prefix_caching)
+            # The drafter's committed context is a scheduler-owned KV-cache group
+            # (cache_policy._draft_layer_specs), sized and allocated like the
+            # target's; only its draft-block scratch stays proposer-local.
+            from vllm_metal.v1.draft_model_proposer import DraftDims
+
+            self._draft_dims = DraftDims(
+                num_layers=config.num_hidden_layers,
+                num_kv_heads=config.n_kv_heads,
+                head_dim=config.attn_head_dim,
+                lookahead_positions=config.block_size,
+            )
         proposer = DSparkProposer(
             drafter=model,
             config=config,
@@ -1142,10 +1159,19 @@ class MetalModelRunner:
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif is_dspark_config(spec):
-            # DSpark has no autoregressive KV group. Its weights and bounded
-            # context/workspace reservation must exist BEFORE target KV sizing.
+            # DSpark's weights and its capture/workspace reservation must exist
+            # BEFORE target KV sizing. Its committed context, when paged, is a
+            # scheduler-owned group sized to `num_blocks`; the physical cache is
+            # built here, once that count exists, plus the proposer-local scratch
+            # tail for the draft block (see draft_scratch_reserve_blocks).
             if not isinstance(self._drafter, DSparkProposer):
                 raise RuntimeError("DSpark must be loaded before target KV allocation")
+            if self._draft_dims is not None:
+                self._drafter.attach_context_cache(
+                    committed_blocks=num_blocks,
+                    scratch_blocks=self.draft_scratch_reserve_blocks(),
+                    block_size=block_size,
+                )
         elif spec.uses_draft_model():
             # `num_blocks` is the scheduler-visible committed-KV capacity for
             # the draft group (see cache_policy._draft_layer_specs); the

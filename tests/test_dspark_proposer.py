@@ -1069,34 +1069,45 @@ def test_a_lapse_entered_under_load_waits_for_the_load_to_drop(monkeypatch):
     assert proposer._lapsed is False
 
 
-class TestPagedIngestSurvivesAnExhaustedPool:
-    """A full context pool degrades to target-only; it does not abort the ingest.
+class TestPagedIngestSurvivesAnExhaustedScratchTail:
+    """An exhausted scratch tail degrades to target-only; it does not abort the ingest.
 
     `_flush_span_writes` used to grow the pool inside its own loop with nothing to
     catch `PagedContextFullError`, so a pool that emptied on the third row raised
     through the engine step with the first two rows already grown and neither their
-    span written nor their context committed. The pool cannot run out while it is
-    sized for the worst case, which is exactly why the path was never exercised.
+    span written nor their context committed. Committed pages are the scheduler's and
+    cannot run out here; the proposer-local scratch tail can, when its sizing and the
+    scheduler's admission disagree, and that is the path this exercises.
     """
 
     def _exhausted_pool(self, proposer):
         from vllm_metal.v1.dspark.paged_context import DSparkPagedContext
 
-        # One block, which is the padding sink, so nothing at all can be handed out.
+        # One scratch page, which is the padding sink, so no scratch can be handed
+        # out; the rows below bring no scheduler pages either.
         return DSparkPagedContext(
             num_layers=1,
             kv_heads=1,
             head_dim=64,
             block_size=16,
-            num_blocks=1,
+            committed_blocks=1,
+            scratch_blocks=1,
             draft_block=proposer._config.block_size,
             dtype=mx.float32,
         )
 
+    @staticmethod
+    def _rows_without_scheduler_pages(records):
+        # RequestState.block_ids is indexed by KV-cache group; group 0 holds nothing.
+        for record in records:
+            record.owner.block_ids = [[]]
+
     def test_every_row_falls_back_instead_of_raising(self):
         proposer = _proposer()
         proposer._pool = self._exhausted_pool(proposer)
+        proposer.adopt_committed_group(0)
         records = [_RequestContext(owner=_state([1, 2, 3])) for _ in range(3)]
+        self._rows_without_scheduler_pages(records)
         pending = [
             _SpanWrite(
                 req_id=f"r{i}",
@@ -1110,17 +1121,17 @@ class TestPagedIngestSurvivesAnExhaustedPool:
         ]
         # Must return, not raise: the engine step cannot recover from an exception here.
         proposer._flush_span_writes(mx.zeros((3, 1)), pending)
-        assert [r.disabled_reason for r in records] == [
-            "context capacity exhausted"
-        ] * 3
+        assert [r.disabled_reason for r in records] == ["draft scratch exhausted"] * 3
         assert all(r.covered_end == 0 for r in records)
 
     def test_the_pool_is_left_whole_when_a_batch_is_refused(self):
         proposer = _proposer()
         pool = self._exhausted_pool(proposer)
         proposer._pool = pool
-        free_before = pool.free_blocks
+        proposer.adopt_committed_group(0)
+        free_before = pool.free_scratch_blocks
         record = _RequestContext(owner=_state([1, 2, 3]))
+        self._rows_without_scheduler_pages([record])
         proposer._flush_span_writes(
             mx.zeros((1, 1)),
             [
@@ -1134,7 +1145,7 @@ class TestPagedIngestSurvivesAnExhaustedPool:
                 )
             ],
         )
-        assert pool.free_blocks == free_before
+        assert pool.free_scratch_blocks == free_before
         assert pool.table_for("r") == []
 
 
@@ -1144,7 +1155,9 @@ class TestTheProposerBuildsTheBackendThePlannerReservedFor:
     `cache_policy` subtracts the plan's reserve from the target model's KV cache before
     the proposer exists. If the proposer then chose its backend independently, a planner
     that sized for the arena could be paired with a pool, or the reverse, and the target
-    cache would be wrong in whichever direction. The plan's `paged_blocks` IS the choice.
+    cache would be wrong in whichever direction. The plan's `paged` IS the choice, and
+    a paged context's physical cache is not the proposer's to size at all: the scheduler
+    sizes the committed group, and `install_drafter` attaches the cache once it has.
     """
 
     def _build(self, monkeypatch, *, env_at_plan: bool, env_at_build: bool):
@@ -1180,8 +1193,11 @@ class TestTheProposerBuildsTheBackendThePlannerReservedFor:
             plan, proposer = self._build(
                 monkeypatch, env_at_plan=enabled, env_at_build=enabled
             )
-            assert bool(plan.paged_blocks) is enabled
-            assert (proposer._pool is not None) is enabled
+            assert plan.paged is enabled
+            assert proposer._paged is enabled
+            # a paged context builds no private arena; an arena context builds no pool
+            assert (len(proposer._arena) == 0) is enabled
+            assert proposer._pool is None  # attached later, by install_drafter
 
     def test_the_env_flipping_after_planning_does_not_change_the_backend(
         self, monkeypatch
@@ -1189,10 +1205,58 @@ class TestTheProposerBuildsTheBackendThePlannerReservedFor:
         # The plan reserved for the arena. Whatever the environment says now, building a
         # pool here would use memory the target model was already given.
         plan, proposer = self._build(monkeypatch, env_at_plan=False, env_at_build=True)
-        assert plan.paged_blocks == 0
+        assert plan.paged is False
+        assert proposer._paged is False
         assert proposer._pool is None
 
-    def test_the_pool_gets_exactly_the_pages_the_plan_reserved(self, monkeypatch):
+    def test_the_cache_is_sized_by_the_scheduler_when_attached(self, monkeypatch):
         plan, proposer = self._build(monkeypatch, env_at_plan=True, env_at_build=True)
+        assert plan.context_bytes == 0  # the scheduler's budget carries it
+        proposer.attach_context_cache(
+            committed_blocks=40, scratch_blocks=3, block_size=16
+        )
         assert proposer._pool is not None
-        assert proposer._pool.total_blocks == plan.paged_blocks
+        assert proposer._pool.committed_blocks == 40
+        assert proposer._pool.scratch_blocks == 3 + 1  # plus the padding sink
+        assert proposer._pool.total_blocks == 44
+        with pytest.raises(RuntimeError):
+            proposer.attach_context_cache(
+                committed_blocks=40, scratch_blocks=3, block_size=16
+            )
+
+    def test_an_arena_context_refuses_a_scheduler_cache(self, monkeypatch):
+        _, proposer = self._build(monkeypatch, env_at_plan=False, env_at_build=False)
+        with pytest.raises(RuntimeError):
+            proposer.attach_context_cache(
+                committed_blocks=40, scratch_blocks=3, block_size=16
+            )
+
+
+class TestTheDrafterAdvertisesItsCommittedGroup:
+    """`cache_policy._adopt_draft_scheduler_group` hands the group index to whichever
+    drafter says it consumes one, by protocol rather than by class -- so a DSpark
+    drafter is served the same way a separate draft model is, and a drafter that
+    holds no committed group (n-gram, MTP) is refused loudly instead of silently
+    never being told."""
+
+    def test_a_dspark_proposer_consumes_a_committed_group(self):
+        from vllm_metal.v1.proposer import CommittedKVGroupConsumer
+
+        proposer = _proposer()
+        assert isinstance(proposer, CommittedKVGroupConsumer)
+        proposer.adopt_committed_group(3)
+        assert proposer._committed_group_index == 3
+
+    def test_a_drafter_without_the_method_is_not_a_consumer(self):
+        from vllm_metal.v1.proposer import CommittedKVGroupConsumer
+
+        class Ngramish:
+            capture_layer_ids = None
+
+            def propose(self, ctx):
+                return None
+
+            def release_requests(self, req_ids):
+                pass
+
+        assert not isinstance(Ngramish(), CommittedKVGroupConsumer)

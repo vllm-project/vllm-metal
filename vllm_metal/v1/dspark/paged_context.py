@@ -22,12 +22,20 @@ bidirectional semantics, with no kernel change. ``tools/dspark_paged_probe.py`` 
 this against a dense reference and against the naive length-``block`` packing, which is
 causal and differs by six orders of magnitude.
 
-Two consequences follow from using the kernel rather than a per-row Python loop:
+Who owns the blocks. The committed context is a scheduler-owned KV-cache group:
+``cache_policy._draft_layer_specs`` registers one ``FullAttentionSpec`` per drafter
+layer, so the scheduler sizes it from the KV budget, allocates it per request and
+evicts it, exactly as it does the target's own groups -- the same arrangement
+``draft_model_proposer`` uses for a separate draft model. A request's committed pages
+arrive as ``RequestState.block_ids[group]`` and are never grown or freed here. Only the
+draft block's scratch positions -- written past a request's committed length and never
+verified, so no scheduler group is ever "ahead" of them -- come from a small
+proposer-local tail the scheduler never assigns, sized by
+``cache_policy.draft_scratch_reserve_blocks``. One scratch block is the padding sink a
+ragged ingest points its padded columns at.
 
-- One ``paged_attention_primitive`` dispatch per layer covers the whole drafting batch,
-  instead of one ``scaled_dot_product_attention`` call per row per layer.
-- Blocks are allocated as a context grows, so a server no longer reserves
-  ``slots x max_model_len`` of drafter context up front.
+One ``paged_attention_primitive`` dispatch per layer covers the whole drafting batch,
+instead of one ``scaled_dot_product_attention`` call per row per layer.
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.metal import get_ops
 
 from .paging import KERNEL_HEAD_SIZES
@@ -51,10 +60,13 @@ __all__ = [
 
 
 class PagedContextFullError(RuntimeError):
-    """The drafter's block pool cannot satisfy an allocation.
+    """The proposer-local scratch tail cannot house a request's draft block.
 
-    Raised rather than silently evicting: the proposer's caller turns this into
-    target-only generation for the request, which is the documented fallback.
+    The committed context is the scheduler's to allocate and cannot run out here; the
+    scratch tail is sized for every active request drafting at once, so this is
+    reachable only when that sizing and the scheduler's admission disagree. Raised
+    rather than silently evicting: the caller turns it into target-only generation for
+    the request, which is the documented fallback.
     """
 
 
@@ -89,11 +101,15 @@ class DSparkPagedContext:
         "_free",
         "_head_dim",
         "_kv_heads",
-        "_num_blocks",
         "_sink",
         "_tables",
         "key_caches",
         "value_caches",
+        "_cache",
+        "_committed_blocks",
+        "_scratch_blocks",
+        "_total_blocks",
+        "_scratch",
     )
 
     def __init__(
@@ -103,15 +119,25 @@ class DSparkPagedContext:
         kv_heads: int,
         head_dim: int,
         block_size: int,
-        num_blocks: int,
+        committed_blocks: int,
+        scratch_blocks: int,
         draft_block: int,
         dtype: mx.Dtype,
     ) -> None:
         if (
-            min(num_layers, kv_heads, head_dim, block_size, num_blocks, draft_block)
+            min(
+                num_layers,
+                kv_heads,
+                head_dim,
+                block_size,
+                committed_blocks,
+                draft_block,
+            )
             <= 0
         ):
             raise ValueError("DSparkPagedContext needs positive geometry")
+        if scratch_blocks < 1:
+            raise ValueError("the scratch tail needs at least one block for the sink")
         if block_size not in (8, 16, 32):
             raise ValueError(
                 f"paged attention supports block sizes 8, 16 and 32, not {block_size}"
@@ -121,34 +147,56 @@ class DSparkPagedContext:
                 f"paged attention is not instantiated for head size {head_dim}; "
                 f"supported: {', '.join(str(h) for h in KERNEL_HEAD_SIZES)}"
             )
-        shape = (num_blocks, block_size, kv_heads, head_dim)
-        self.key_caches = [mx.zeros(shape, dtype=dtype) for _ in range(num_layers)]
-        self.value_caches = [mx.zeros(shape, dtype=dtype) for _ in range(num_layers)]
+        # The same paged cache class the draft-model proposer's runtime allocates
+        # (``SDPAPagedAttentionRuntime.initialize``): scheduler-visible committed
+        # pages first, then the proposer-local scratch tail the scheduler never
+        # assigns. ``write`` rebinds entries in place, so share the cache's lists.
+        self._cache = MetalPagedKVCache(
+            num_layers=num_layers,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            num_blocks=committed_blocks + scratch_blocks,
+            block_size=block_size,
+            dtype=dtype,
+        )
+        self.key_caches = self._cache.key_caches
+        self.value_caches = self._cache.value_caches
         self._block_size = block_size
         self._draft_block = draft_block
         self._kv_heads = kv_heads
         self._head_dim = head_dim
-        self._num_blocks = num_blocks
-        # Block 0 is a sink: a ragged ingest pads its rows to the widest span, and
-        # those padded positions need a destination that no request can read back.
-        self._sink = 0
-        self._free = list(reversed(range(1, num_blocks)))
+        self._committed_blocks = committed_blocks
+        self._scratch_blocks = scratch_blocks
+        self._total_blocks = committed_blocks + scratch_blocks
+        # The last scratch block is the sink: a ragged ingest pads its rows to the
+        # widest span, and those padded positions need a destination that no request
+        # can read back. It cannot be block 0 any more -- that page is the scheduler's.
+        self._sink = self._total_blocks - 1
+        self._free = list(reversed(range(committed_blocks, self._sink)))
+        # Per request: the scheduler's committed pages followed by this request's
+        # scratch pages, in context order; and the scratch pages alone, to hand back.
         self._tables: dict[str, list[int]] = {}
+        self._scratch: dict[str, list[int]] = {}
 
     # ---- pool accounting -------------------------------------------------
 
     @property
-    def free_blocks(self) -> int:
+    def free_scratch_blocks(self) -> int:
         return len(self._free)
 
     @property
-    def total_blocks(self) -> int:
-        return self._num_blocks
+    def committed_blocks(self) -> int:
+        """Scheduler-owned pages: ids ``[0, committed_blocks)``."""
+        return self._committed_blocks
 
     @property
-    def usable_blocks(self) -> int:
-        """Blocks requests can hold: the pool less the sink."""
-        return self._num_blocks - 1
+    def scratch_blocks(self) -> int:
+        """Proposer-local pages after them, one of which is the sink."""
+        return self._scratch_blocks
+
+    @property
+    def total_blocks(self) -> int:
+        return self._total_blocks
 
     def bytes_reserved(self) -> int:
         cache = self.key_caches[0]
@@ -160,7 +208,7 @@ class DSparkPagedContext:
         if not table:
             return 0
         cache = self.key_caches[0]
-        per_block = cache.size // self._num_blocks * cache.dtype.size
+        per_block = cache.size // self._total_blocks * cache.dtype.size
         return 2 * len(self.key_caches) * len(table) * per_block
 
     def pages_for(self, context_length: int) -> int:
@@ -170,66 +218,79 @@ class DSparkPagedContext:
 
     # ---- per-request block tables ---------------------------------------
 
-    def reserve(self, req_id: str, context_length: int) -> None:
-        """Grow ``req_id``'s block table so it covers ``context_length`` plus the block.
+    def bind(
+        self, req_id: str, committed_block_ids: list[int], context_length: int
+    ) -> None:
+        """Address ``req_id`` for this step: the scheduler's pages plus scratch.
 
-        Allocates only the pages the length actually needs. Raises
-        :class:`PagedContextFullError` when the pool is exhausted, leaving the request's
-        existing blocks untouched so the caller can fall back to target-only.
+        ``committed_block_ids`` is the request's row of the scheduler's block table for
+        the drafter's group, taken as given: never grown or freed here. The tail beyond
+        it -- what ``context_length`` plus the draft block needs and the scheduler did
+        not allocate -- is drawn from the local scratch pool, grown or shrunk to exactly
+        this step's need, mirroring ``DraftModelProposer._ensure_blocks``.
+
+        Raises :class:`PagedContextFullError` when the scratch tail cannot supply the
+        shortfall, leaving the request's binding unchanged so the caller can fall back
+        to target-only.
         """
         needed = self.pages_for(context_length)
-        table = self._tables.setdefault(req_id, [])
-        if needed <= len(table):
-            return
-        short = needed - len(table)
+        scratch_needed = max(0, needed - len(committed_block_ids))
+        scratch = self._scratch.setdefault(req_id, [])
+        if len(scratch) > scratch_needed:
+            self._free.extend(scratch[scratch_needed:])
+            del scratch[scratch_needed:]
+        short = scratch_needed - len(scratch)
         if short > len(self._free):
             raise PagedContextFullError(
-                f"DSpark context pool exhausted: {req_id} needs {short} more blocks, "
-                f"{len(self._free)} free of {self._num_blocks}"
+                f"DSpark scratch tail exhausted: {req_id} needs {short} more block(s), "
+                f"{len(self._free)} free of {self._scratch_blocks - 1}"
             )
         for _ in range(short):
-            table.append(self._free.pop())
+            scratch.append(self._free.pop())
+        if not scratch:
+            self._scratch.pop(req_id, None)
+        self._tables[req_id] = list(committed_block_ids) + scratch
 
-    def reserve_many(self, rows: list[tuple[str, int]]) -> list[str]:
-        """Grow every row's block table, or grow none of the rows that cannot fit.
+    def bind_many(self, rows: list[tuple[str, list[int], int]]) -> list[str]:
+        """Bind every row, or leave unbound exactly the rows scratch cannot house.
 
-        ``rows`` is ``(req_id, context_length)`` per row. Returns the request ids the
-        pool could not house, in the order given; every other row is grown.
+        ``rows`` is ``(req_id, committed_block_ids, context_length)`` per row. Returns
+        the request ids that did not fit, in the order given; every other row is bound.
 
-        Growing row by row is what a caller must not do: the pool can empty partway
-        through, leaving the earlier rows grown while the batch that was built around
-        all of them is abandoned, so their pages are held by a context whose span was
-        never written and never committed. This plans the whole batch against the free
-        list before it touches a single table, and grants in arrival order so a large
-        latecomer cannot starve the rows already being served.
+        Binding row by row is what a caller must not do: scratch can empty partway
+        through, leaving earlier rows bound while the batch built around all of them is
+        abandoned. This plans every row's shortfall against the free list before it
+        touches a single binding, and grants in arrival order so a large latecomer
+        cannot starve rows already being served.
         """
-        wanted: list[tuple[str, int]] = []
-        for req_id, context_length in rows:
-            short = self.pages_for(context_length) - len(self._tables.get(req_id, []))
-            if short > 0:
-                wanted.append((req_id, short))
+        shortfalls: list[tuple[str, list[int], int, int]] = []
+        for req_id, committed, context_length in rows:
+            needed = max(0, self.pages_for(context_length) - len(committed))
+            held = len(self._scratch.get(req_id, ()))
+            shortfalls.append((req_id, committed, context_length, needed - held))
         available = len(self._free)
-        granted: list[tuple[str, int]] = []
         rejected: list[str] = []
-        for req_id, short in wanted:
-            if short <= available:
-                granted.append((req_id, short))
-                available -= short
-            else:
+        for req_id, _, _, short in shortfalls:
+            if short > available:
                 rejected.append(req_id)
-        for req_id, short in granted:
-            table = self._tables.setdefault(req_id, [])
-            for _ in range(short):
-                table.append(self._free.pop())
+                continue
+            available -= max(0, short)
+        for req_id, committed, context_length, _ in shortfalls:
+            if req_id not in rejected:
+                self.bind(req_id, committed, context_length)
         return rejected
 
-    def release(self, req_id: str) -> int:
-        """Return ``req_id``'s blocks to the pool. Returns how many were freed."""
-        table = self._tables.pop(req_id, None)
-        if not table:
+    def unbind(self, req_id: str) -> int:
+        """Drop ``req_id``'s binding and return its scratch pages. Returns how many.
+
+        The committed pages are the scheduler's to reclaim; only scratch comes back.
+        """
+        self._tables.pop(req_id, None)
+        scratch = self._scratch.pop(req_id, None)
+        if not scratch:
             return 0
-        self._free.extend(reversed(table))
-        return len(table)
+        self._free.extend(reversed(scratch))
+        return len(scratch)
 
     def holds(self, req_id: str) -> bool:
         return req_id in self._tables
@@ -249,13 +310,13 @@ class DSparkPagedContext:
         """
         table = self._tables.get(req_id)
         if table is None:
-            raise KeyError(f"no draft context blocks reserved for {req_id}")
+            raise KeyError(f"no draft context bound for {req_id}")
         slots = []
         for position in positions:
             page, offset = divmod(position, self._block_size)
             if page >= len(table):
                 raise PagedContextFullError(
-                    f"position {position} of {req_id} is past its reserved blocks"
+                    f"position {position} of {req_id} is past its bound pages"
                 )
             slots.append(table[page] * self._block_size + offset)
         # int64: reshape_and_cache reads 64-bit slots (attention/impls/sdpa.py:212)
@@ -275,7 +336,7 @@ class DSparkPagedContext:
         for _, start_pos, count, req_id in spans:
             table = self._tables.get(req_id)
             if table is None:
-                raise KeyError(f"no draft context blocks reserved for {req_id}")
+                raise KeyError(f"no draft context bound for {req_id}")
             for column in range(width):
                 if column >= count:
                     slots.append(sink)
@@ -283,7 +344,7 @@ class DSparkPagedContext:
                 page, offset = divmod(start_pos + column, self._block_size)
                 if page >= len(table):
                     raise PagedContextFullError(
-                        f"position {start_pos + column} of {req_id} is past its blocks"
+                        f"position {start_pos + column} of {req_id} is past its pages"
                     )
                 slots.append(table[page] * self._block_size + offset)
         return mx.array(slots, dtype=mx.int64)
@@ -472,7 +533,11 @@ class PagedCtxCache:
         end = self._length + count
         if end > self.capacity:
             raise ValueError("DSpark context append exceeds reserved capacity")
-        self._pool.reserve(self._req_id, end)
+        if self._pool.pages_for(end) > len(self._pool.table_for(self._req_id)):
+            raise PagedContextFullError(
+                f"{self._req_id}: appending to {end} outruns its bound pages; the "
+                "proposer binds the scheduler's pages before it writes"
+            )
         slots = self._pool.slot_mapping_for(self._req_id, range(self._length, end))
         self._pool.write(
             self._layer,
