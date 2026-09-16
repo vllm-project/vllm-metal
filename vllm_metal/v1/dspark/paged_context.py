@@ -38,7 +38,12 @@ import mlx.core as mx
 
 from vllm_metal.metal import get_ops
 
-__all__ = ["DSparkPagedContext", "DraftBatch", "PagedContextFullError"]
+__all__ = [
+    "DSparkPagedContext",
+    "DraftBatch",
+    "PagedContextFullError",
+    "PagedLayerBatch",
+]
 
 
 class PagedContextFullError(RuntimeError):
@@ -268,3 +273,43 @@ class DSparkPagedContext:
             window_seqlen_q=1,  # per-token decode: one query row per threadgroup
         )
         return out
+
+
+class PagedLayerBatch:
+    """One layer's view of a drafting step, shaped like :class:`ArenaBatch`.
+
+    ``DSparkAttention.attend`` drives the context through two calls, ``write_block``
+    then ``attend``, and works in ``[rows, heads, block, head_dim]``. The paged pool
+    works in packed varlen ``[rows * block, heads, head_dim]``, so this adapter owns the
+    transposes and leaves the attention module unchanged apart from accepting it.
+    """
+
+    __slots__ = ("_batch", "_layer", "_pool")
+
+    def __init__(self, pool: DSparkPagedContext, layer: int, batch: DraftBatch) -> None:
+        self._pool = pool
+        self._layer = layer
+        self._batch = batch
+
+    @staticmethod
+    def _pack(tensor: mx.array) -> mx.array:
+        """[rows, heads, block, dim] -> [rows * block, heads, dim], row-major."""
+        rows, heads, block, dim = tensor.shape
+        return mx.contiguous(
+            tensor.transpose(0, 2, 1, 3).reshape(rows * block, heads, dim)
+        )
+
+    def write_block(self, k_blk: mx.array, v_blk: mx.array) -> None:
+        """Place each row's draft-block K/V at the scratch positions after its context."""
+        self._pool.write(
+            self._layer,
+            self._pack(k_blk),
+            self._pack(v_blk),
+            self._batch.slot_mapping,
+        )
+
+    def attend(self, q: mx.array, scale: float) -> mx.array:
+        """One paged dispatch for every row and block position of this layer."""
+        rows, heads, block, dim = q.shape
+        out = self._pool.attend(self._layer, self._pack(q), self._batch, scale)
+        return out.reshape(rows, block, heads, dim).transpose(0, 2, 1, 3)

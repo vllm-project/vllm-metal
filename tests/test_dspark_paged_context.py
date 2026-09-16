@@ -208,3 +208,77 @@ class TestDraftBatchAddressing:
         batch = pool.plan([("a", 20)])
         expected = pool.slot_mapping_for("a", range(20, 27)).tolist()
         assert batch.slot_mapping.tolist() == expected
+
+
+class TestPagedLayerBatchMatchesArenaBatch:
+    """The adapter must be a drop-in for ArenaBatch through DSparkAttention.attend.
+
+    Same drafter layer, same weights, same inputs: the only difference is where the
+    context lives. Outputs must agree, or the rework changes the model.
+    """
+
+    @staticmethod
+    def _shapes(rows, ctx_lengths, seed):
+        rng = np.random.default_rng(seed)
+        hidden = rng.normal(size=(rows, DRAFT_BLOCK, 64)).astype(np.float32)
+        return mx.array(hidden), ctx_lengths
+
+    def test_matches_arena_batch_output(self):
+        from vllm_metal.v1.dspark.model import ArenaBatch, ContextArena
+        from vllm_metal.v1.dspark.paged_context import PagedLayerBatch
+
+        rng = np.random.default_rng(11)
+        ctx_lengths = [37, 129]
+        rows = len(ctx_lengths)
+        scale = HEAD_DIM**-0.5
+
+        # identical context K/V laid into both an arena and a paged pool
+        arena = ContextArena(
+            slots=4,
+            kv_heads=KV_HEADS,
+            capacity=256,
+            block_size=DRAFT_BLOCK,
+            head_dim=HEAD_DIM,
+            dtype=mx.float32,
+        )
+        pool = make(num_blocks=128, layers=1)
+        slots = []
+        for index, length in enumerate(ctx_lengths):
+            req = f"r{index}"
+            pool.reserve(req, length)
+            slot = arena.acquire()
+            slots.append(slot)
+            keys = rng.normal(size=(length, KV_HEADS, HEAD_DIM)).astype(np.float32)
+            values = rng.normal(size=(length, KV_HEADS, HEAD_DIM)).astype(np.float32)
+            pool.write(
+                0,
+                mx.array(keys),
+                mx.array(values),
+                pool.slot_mapping_for(req, range(length)),
+            )
+            arena.keys[slot, :, :length] = mx.array(keys.transpose(1, 0, 2))
+            arena.values[slot, :, :length] = mx.array(values.transpose(1, 0, 2))
+
+        q = mx.array(
+            rng.normal(size=(rows, N_HEADS, DRAFT_BLOCK, HEAD_DIM)).astype(np.float32)
+        )
+        k_blk = mx.array(
+            rng.normal(size=(rows, KV_HEADS, DRAFT_BLOCK, HEAD_DIM)).astype(np.float32)
+        )
+        v_blk = mx.array(
+            rng.normal(size=(rows, KV_HEADS, DRAFT_BLOCK, HEAD_DIM)).astype(np.float32)
+        )
+
+        arena_batch = ArenaBatch(arena, slots, list(ctx_lengths))
+        arena_batch.write_block(k_blk, v_blk)
+        expected = np.array(arena_batch.attend(q, scale))
+
+        paged = PagedLayerBatch(
+            pool, 0, pool.plan([(f"r{i}", n) for i, n in enumerate(ctx_lengths)])
+        )
+        paged.write_block(k_blk, v_blk)
+        got = np.array(paged.attend(q, scale))
+
+        assert got.shape == expected.shape == (rows, N_HEADS, DRAFT_BLOCK, HEAD_DIM)
+        assert np.abs(got).sum() > 0  # not vacuously zero on both sides
+        assert np.abs(got - expected).max() < 2e-3

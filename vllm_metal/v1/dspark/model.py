@@ -11,6 +11,8 @@ checkpoints so weights load 1:1.
 
 from __future__ import annotations
 
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.models.rope_utils import initialize_rope
@@ -370,6 +372,20 @@ class ArenaBatch:
         return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=0)
 
 
+@runtime_checkable
+class BlockContextBatch(Protocol):
+    """One layer's drafting batch: place the block's K/V, then attend each row.
+
+    Satisfied by :class:`ArenaBatch` and by
+    :class:`vllm_metal.v1.dspark.paged_context.PagedLayerBatch`, which back the same
+    two calls with a private arena and with vllm-metal's paged pool respectively.
+    """
+
+    def write_block(self, k_blk: mx.array, v_blk: mx.array) -> None: ...
+
+    def attend(self, q: mx.array, scale: float) -> mx.array: ...
+
+
 class DSparkAttention(nn.Module):
     """Cross-attention: Q from the draft block, K/V from [target_context, block]."""
 
@@ -462,9 +478,9 @@ class DSparkAttention(nn.Module):
 
         k_blk, v_blk = self._kv(hidden)
         k_blk = self.rope(k_blk, offset=block_offset)
-        if isinstance(cache, ArenaBatch):
-            # Block keys go to the scratch positions after each row's context
-            # (see ContextArena); every row then attends to its own slot.
+        if isinstance(cache, BlockContextBatch):
+            # Block keys go to the scratch positions after each row's context; every
+            # row then attends exactly its own context and the whole block.
             cache.write_block(k_blk, v_blk)
             out = cache.attend(q, self.scale)
         else:
