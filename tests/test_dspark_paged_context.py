@@ -36,28 +36,37 @@ class TestBlockAccounting:
         assert pool.pages_for(9) == 1
         assert pool.pages_for(10) == 2
 
+    def test_the_sink_block_is_reserved_and_never_handed_out(self):
+        pool = make(num_blocks=8)
+        # one block absorbs the padding of ragged ingests
+        assert pool.total_blocks == 8
+        assert pool.usable_blocks == 7
+        assert pool.free_blocks == 7
+
     def test_reserve_allocates_only_what_the_length_needs(self):
         pool = make(num_blocks=8)
+        start = pool.free_blocks
         pool.reserve("a", 1)
-        assert pool.free_blocks == 7
+        assert pool.free_blocks == start - 1
         # growing within the same page allocates nothing more
         pool.reserve("a", 8)
-        assert pool.free_blocks == 7
+        assert pool.free_blocks == start - 1
         pool.reserve("a", 100)
-        assert pool.free_blocks == 8 - pool.pages_for(100)
+        assert pool.free_blocks == start - pool.pages_for(100)
 
     def test_release_returns_every_block(self):
         pool = make(num_blocks=8)
+        start = pool.free_blocks
         pool.reserve("a", 40)
-        assert pool.free_blocks < 8
+        assert pool.free_blocks < start
         assert pool.release("a") > 0
-        assert pool.free_blocks == 8
+        assert pool.free_blocks == start
         assert not pool.holds("a")
 
     def test_release_of_an_unknown_request_is_a_no_op(self):
         pool = make(num_blocks=4)
         assert pool.release("ghost") == 0
-        assert pool.free_blocks == 4
+        assert pool.free_blocks == pool.usable_blocks
 
     def test_exhaustion_raises_and_keeps_existing_blocks(self):
         pool = make(num_blocks=2)
@@ -308,3 +317,35 @@ class TestLapseExitIsReachable:
     def test_a_lapse_entered_under_load_still_needs_a_real_drop(self):
         assert self._dropped(active=8, entry=8) is False
         assert self._dropped(active=7, entry=8) is True
+
+
+class TestRaggedIngestAddressing:
+    """A ragged ingest pads to the widest span; the padding must not corrupt a context."""
+
+    def test_padding_is_addressed_to_the_sink(self):
+        pool = make(num_blocks=32)
+        pool.reserve("a", 40)
+        pool.reserve("b", 40)
+        # a writes 3 positions from 10, b writes 1 from 20; width is 3
+        spans = [(0, 10, 3, "a"), (3, 20, 1, "b")]
+        slots = [int(x) for x in pool.span_slot_mapping(spans, width=3).tolist()]
+        assert len(slots) == 6
+        sink = 0  # block 0 * block_size
+        assert slots[0:3] == [
+            int(x) for x in pool.slot_mapping_for("a", range(10, 13)).tolist()
+        ]
+        # b contributed one real position and two padded ones
+        assert slots[3] == int(pool.slot_mapping_for("b", [20]).tolist()[0])
+        assert slots[4] == sink and slots[5] == sink
+
+    def test_a_real_position_never_lands_on_the_sink(self):
+        pool = make(num_blocks=32)
+        pool.reserve("a", 64)
+        spans = [(0, 0, 40, "a")]
+        slots = [int(x) for x in pool.span_slot_mapping(spans, width=40).tolist()]
+        assert 0 not in slots  # the sink slot is block 0 offset 0
+
+    def test_an_unreserved_request_is_refused(self):
+        pool = make(num_blocks=8)
+        with pytest.raises(KeyError):
+            pool.span_slot_mapping([(0, 0, 1, "nobody")], width=1)

@@ -86,6 +86,7 @@ class DSparkPagedContext:
         "_head_dim",
         "_kv_heads",
         "_num_blocks",
+        "_sink",
         "_tables",
         "key_caches",
         "value_caches",
@@ -119,7 +120,10 @@ class DSparkPagedContext:
         self._kv_heads = kv_heads
         self._head_dim = head_dim
         self._num_blocks = num_blocks
-        self._free = list(reversed(range(num_blocks)))
+        # Block 0 is a sink: a ragged ingest pads its rows to the widest span, and
+        # those padded positions need a destination that no request can read back.
+        self._sink = 0
+        self._free = list(reversed(range(1, num_blocks)))
         self._tables: dict[str, list[int]] = {}
 
     # ---- pool accounting -------------------------------------------------
@@ -131,6 +135,11 @@ class DSparkPagedContext:
     @property
     def total_blocks(self) -> int:
         return self._num_blocks
+
+    @property
+    def usable_blocks(self) -> int:
+        """Blocks requests can hold: the pool less the sink."""
+        return self._num_blocks - 1
 
     def bytes_reserved(self) -> int:
         cache = self.key_caches[0]
@@ -192,6 +201,33 @@ class DSparkPagedContext:
                 )
             slots.append(table[page] * self._block_size + offset)
         # int64: reshape_and_cache reads 64-bit slots (attention/impls/sdpa.py:212)
+        return mx.array(slots, dtype=mx.int64)
+
+    def span_slot_mapping(
+        self, spans: list[tuple[int, int, int, str]], width: int
+    ) -> mx.array:
+        """Slots for a padded ``[rows, width]`` ingest grid, flattened row-major.
+
+        ``spans`` are ``(start_row, start_pos, count, req_id)``. A row shorter than
+        ``width`` is padded by the caller repeating its last feature; those columns are
+        addressed to the sink block, so the padding is written and never read.
+        """
+        sink = self._sink * self._block_size
+        slots: list[int] = []
+        for _, start_pos, count, req_id in spans:
+            table = self._tables.get(req_id)
+            if table is None:
+                raise KeyError(f"no draft context blocks reserved for {req_id}")
+            for column in range(width):
+                if column >= count:
+                    slots.append(sink)
+                    continue
+                page, offset = divmod(start_pos + column, self._block_size)
+                if page >= len(table):
+                    raise PagedContextFullError(
+                        f"position {start_pos + column} of {req_id} is past its blocks"
+                    )
+                slots.append(table[page] * self._block_size + offset)
         return mx.array(slots, dtype=mx.int64)
 
     # ---- write and read, through vllm-metal's own primitives -------------
