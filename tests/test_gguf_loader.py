@@ -68,8 +68,8 @@ def _dense_tensor_specs(config: dict, *, has_qk_norm: bool, with_bias: bool) -> 
     """Return ``{gguf_name: (kind, shape)}`` for a dense decoder GGUF.
 
     ``kind`` is ``"q"`` (quantized weight) or ``"f"`` (F32 plain weight/bias).
-    Tests may inject ``"q6_k"`` zero blocks for unsupported-qtype coverage;
-    gguf-py can dequantize Q6_K but does not implement its quantizer.
+    Tests may inject ``"q4_k"``/``"q6_k"`` zero blocks for qtype-rejection
+    coverage; gguf-py can dequantize K-quants but not quantize them.
     """
     d = _dims(config)
     specs: dict[str, tuple[str, tuple[int, ...]]] = {
@@ -113,15 +113,16 @@ def _write_gguf(
     for name, (kind, shape) in {**specs, **(inject or {})}.items():
         data = rng.standard_normal(shape).astype(np.float32)
         qtype = (quant_overrides or {}).get(name)
-        if kind == "q6_k":
-            block_size, type_size = gguf.GGML_QUANT_SIZES[QT.Q6_K]
+        if kind in ("q4_k", "q6_k"):
+            raw_qtype = QT.Q4_K if kind == "q4_k" else QT.Q6_K
+            block_size, type_size = gguf.GGML_QUANT_SIZES[raw_qtype]
             assert shape[-1] % block_size == 0
             packed_shape = (
                 *shape[:-1],
                 shape[-1] // block_size * type_size,
             )
             raw = np.zeros(packed_shape, dtype=np.uint8)
-            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=QT.Q6_K)
+            writer.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=raw_qtype)
         elif kind == "q" or qtype is not None:
             raw_dtype = qtype or quant_type
             quant_input = data.reshape(1, -1) if data.ndim == 1 else data
@@ -964,3 +965,22 @@ def test_loads_plain_typed_checkpoint_without_wrappers(tmp_path, plain_type):
     assert "GGUFEmbedding" not in hist
     assert "GGUFLinear" not in hist
     _assert_forward_vocab_shape(model)
+
+
+def test_rejects_q4k_weight_at_preflight(tmp_path):
+    # The Q4_K repack is tensor-side only; the loader stays closed until the
+    # routing PR (#761).
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path,
+        "qwen3",
+        has_qk_norm=True,
+        inject={"blk.0.ffn_gate.weight": ("q4_k", (128, 256))},
+    )
+
+    with pytest.raises(GGUFLoadError) as excinfo:
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+    assert str(excinfo.value) == (
+        "Unsupported qtype Q4_K on mapped weight 'blk.0.ffn_gate.weight'; "
+        "only Q8_0/Q4_0/Q4_1 (and plain F32/F16/BF16) are supported."
+    )
