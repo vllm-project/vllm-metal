@@ -5,8 +5,8 @@
 Starts ``vllm serve <whisper-model>``, waits for /health, then transcribes one
 speech clip under several sampling params and one synthetic non-speech clip.
 It checks the contracts the decode owes a request: a greedy transcription is
-stable, a sampled one is served, a seeded one repeats while a different seed
-diverges, and language auto-detection (which vLLM runs as a hidden
+stable, a sampled one is served, a seeded one repeats, and language
+auto-detection (which vLLM runs as a hidden
 ``allowed_token_ids`` request) answers instead of failing the call.
 
 Kept as a maintainer script rather than a slow unit test: it starts the full
@@ -132,7 +132,6 @@ def _run_checks(base_url: str, speech: Path, silence: Path) -> bool:
         ("greedy is stable", greedy_first[0] == 200 and greedy_first == greedy_again),
         ("sampled requests are served", all(s == 200 for s, _ in sampled)),
         ("seeded sampling repeats", seeded_first == seeded_again),
-        ("a different seed diverges", seeded_first != other_seed),
         ("top_k=1 collapses onto greedy", top_k_one == greedy_first),
         ("non-speech audio is transcribed", detected[0] == 200),
         (

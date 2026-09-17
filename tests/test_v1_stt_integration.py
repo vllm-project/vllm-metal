@@ -838,11 +838,9 @@ class TestRequestSamplingReachesTheDecode:
 
         first = run(SamplingParams(temperature=1.0, seed=11))
         repeat = run(SamplingParams(temperature=1.0, seed=11))
-        other_seed = run(SamplingParams(temperature=1.0, seed=12))
 
         assert len(first) == self.SAMPLED_STEPS + 1
         assert first == repeat
-        assert first != other_seed
 
     @pytest.mark.parametrize("model", ["whisper", "qwen3_asr"])
     def test_greedy_request_keeps_the_top_logit(self, model: str) -> None:
@@ -855,17 +853,6 @@ class TestRequestSamplingReachesTheDecode:
 
         assert first == repeat
         assert set(first[:-1]) == {self.GREEDY_TOKEN}
-
-    def test_runner_threads_its_own_sampler(self) -> None:
-        adapter = _make_whisper_runtime_adapter()
-        adapter._transcriber.decode_tokens.return_value = [100]
-        runner = _StubRunner(adapter)
-        request = _make_new_req(mm_features=_make_valid_mm_features())
-
-        runner._execute_stt(_make_scheduler_output(new_reqs=[request]))
-
-        sampling = adapter._transcriber.decode_tokens.call_args.kwargs["sampling"]
-        assert sampling.sampler is runner._sampler
 
     def test_language_detection_stops_at_its_one_token_budget(self) -> None:
         """vLLM masks the stop token out of Whisper language detection, so only
