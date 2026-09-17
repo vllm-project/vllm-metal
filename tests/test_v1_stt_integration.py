@@ -564,6 +564,7 @@ def _make_qwen3_runtime_adapter():
     )
     mock_transcriber = MagicMock()
     mock_transcriber.tokenizer = mock_tokenizer
+    mock_transcriber.asr_text_token_id = 151674
     # Return token stream: <lang> <asr_text> hello world <|im_end|>
     mock_transcriber.decode_tokens = MagicMock(
         return_value=[100, 151674, 200, 300, 151645]
@@ -880,22 +881,28 @@ class TestRequestSamplingReachesTheDecode:
 
         assert transcript == [language_token, WHISPER_EOT]
 
-    def test_request_budget_does_not_shorten_a_qwen3_asr_transcript(self) -> None:
-        """Qwen3-ASR decodes a protocol envelope the adapter unwraps, so a budget
-        on the raw stream would cut transcript instead of overhead."""
+    @pytest.mark.parametrize(
+        ("max_tokens", "expected"), [(1, [200]), (2, [200, 300]), (8, [200, 300])]
+    )
+    def test_qwen3_asr_budget_counts_transcript_not_envelope(
+        self, max_tokens: int, expected: list[int]
+    ) -> None:
+        """Qwen3-ASR decodes an envelope the adapter unwraps, so the request's
+        budget has to be spent on transcript rather than on the tags."""
         asr_text, im_end, language = 151674, 151645, 100
-        spoken = [200, 300]
         adapter = _make_qwen3_runtime_adapter()
         tokenizer = adapter.transcriber.tokenizer
         tokenizer.eos_token_id = im_end
-        script = _script([language, asr_text, *spoken, im_end], QWEN3_ASR_VOCAB_SIZE)
+        script = _script([language, asr_text, 200, 300, im_end], QWEN3_ASR_VOCAB_SIZE)
         adapter.model.prefill.side_effect = script
         adapter.model.decode_step.side_effect = script
         adapter._transcriber = Qwen3ASRTranscriber(adapter.model, tokenizer=tokenizer)
 
-        transcript = self._run(adapter, SamplingParams(temperature=0.0, max_tokens=1))
+        transcript = self._run(
+            adapter, SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        )
 
-        assert transcript == [*spoken, QWEN3_ASR_EOS]
+        assert transcript == [*expected, QWEN3_ASR_EOS]
 
     def test_decode_with_no_request_keeps_the_model_budget(self) -> None:
         """``WhisperTranscriber.transcribe`` decodes without a request behind it."""

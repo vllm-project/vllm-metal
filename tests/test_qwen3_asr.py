@@ -484,7 +484,10 @@ class TestGreedyDecodeStopping:
         model.prefill.return_value = (logits[0], None)
         model.decode_step.side_effect = [(row, None) for row in logits[1:]]
         transcriber = Qwen3ASRTranscriber(
-            model, tokenizer=SimpleNamespace(eos_token_id=3)
+            model,
+            tokenizer=SimpleNamespace(
+                eos_token_id=3, encode=lambda *_args, **_kwargs: [8]
+            ),
         )
 
         tokens = transcriber.decode_tokens(

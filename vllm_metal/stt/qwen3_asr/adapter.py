@@ -16,7 +16,6 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
     def __init__(self, model: Qwen3ASRModel, model_path: str) -> None:
         super().__init__(model, model_path)
         self._transcriber: Qwen3ASRTranscriber | None = None
-        self._asr_text_token_id: int | None = None
         self._im_end_token_id: int | None = None
 
     @property
@@ -69,15 +68,11 @@ class Qwen3ASRRuntimeAdapter(STTRuntimeAdapter):
 
     def _extract_asr_text_tokens(self, tokens: list[int]) -> list[int]:
         """Extract tokens between <asr_text> and <|im_end|>."""
-        if self._asr_text_token_id is None:
-            tokenizer = self.transcriber.tokenizer
-            self._asr_text_token_id = tokenizer.encode(
-                "<asr_text>", add_special_tokens=False
-            )[0]
-            self._im_end_token_id = tokenizer.encode(
+        asr_text_token = self.transcriber.asr_text_token_id
+        if self._im_end_token_id is None:
+            self._im_end_token_id = self.transcriber.tokenizer.encode(
                 "<|im_end|>", add_special_tokens=False
             )[0]
-        asr_text_token = self._asr_text_token_id
         im_end_token = self._im_end_token_id
 
         start = -1
