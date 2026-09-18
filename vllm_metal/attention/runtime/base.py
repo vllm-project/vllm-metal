@@ -69,6 +69,10 @@ class PagedAttentionRuntimeBase:
         """Apply scheduler copy-on-write operations to the primary cache."""
         self._require_initialized("copy_blocks").copy_blocks(block_copies)
 
+    def zero_blocks(self, block_ids: Sequence[int]) -> None:
+        """Dense KV pages need no zeroing; hybrid state overrides this hook."""
+        del block_ids
+
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""
         return False

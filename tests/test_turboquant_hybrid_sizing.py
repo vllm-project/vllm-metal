@@ -344,22 +344,19 @@ class TestTurboQuantHybridAlignment:
             for index, group in enumerate(groups)
             if any(name.endswith(".self_attn") for name in group.layer_names)
         )
-        backend = runner.build_paged_attention_runtime(
-            block_size=cache_config.block_size
-        )
-        backend.initialize(num_blocks=2)
-        runner.install_paged_attention_runtime(
-            backend,
-            block_size=cache_config.block_size,
-        )
+        from vllm.v1.attention.backends.utils import record_kv_cache_layout
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 
-        runner.initialize_kv_cache(
-            KVCacheConfig(
-                num_blocks=2,
-                kv_cache_tensors=[],
-                kv_cache_groups=groups,
-            )
+        from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+
+        record_kv_cache_layout(cache_config, "LBNHC")
+        cache_config.num_gpu_blocks_override = 2
+        config = get_kv_cache_config_from_groups(vllm_config, groups, 1 << 26)
+        config.kv_cache_layout = "LBNHC"
+        monkeypatch.setattr(
+            HybridPagedAttentionRuntime, "patch_model", lambda self, model: 0
         )
+        runner.initialize_kv_cache(config)
 
         assert runner._paged_scheduler_group_indices == (expected_group,)
         assert runner._paged_group_block_sizes == (cache_config.block_size,)

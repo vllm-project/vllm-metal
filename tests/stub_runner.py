@@ -34,6 +34,68 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 
+def initialize_hybrid_runtime(
+    runtime,
+    num_blocks,
+    *,
+    block_size=4,
+    num_kv_heads=1,
+    head_dim=4,
+    mamba_cache_mode="none",
+):
+    """Build the test runtime from vLLM's real grouping and placement functions."""
+    from dataclasses import replace
+
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+
+    plan = runtime._hybrid_plan
+    attention = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_dim,
+        dtype=MLX_TO_TORCH_DTYPE[runtime._dtype],
+    )
+    state = plan.state_cache_spec(
+        mamba_block_size=block_size if mamba_cache_mode == "align" else 4096,
+        page_size_padded=None,
+        mamba_cache_mode=mamba_cache_mode,
+    )
+    page = max(attention.page_size_bytes, state.page_size_bytes)
+    page = (page + 15) // 16 * 16
+    attention, state = (
+        replace(attention, page_size_padded=page),
+        replace(state, page_size_padded=page),
+    )
+    specs = {f"layers.{i}.self_attn": attention for i in plan.layers.attention_indices}
+    specs.update(
+        {
+            f"layers.{i}.{plan.family.layer_name}": state
+            for i in plan.layers.state_indices
+        }
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        cache_config=make_cache_config(
+            block_size=block_size, num_gpu_blocks_override=num_blocks
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        model_config=SimpleNamespace(is_deepseek_v4=False),
+    )
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, num_blocks * page * len(specs)
+    )
+    cache.kv_cache_layout = "LBNHC"
+    runtime.initialize_from_config(cache)
+    return cache
+
+
 def make_cache_config(**kwargs: Any) -> CacheConfig:
     """Build a real ``CacheConfig`` with Metal's KV cache layout already resolved."""
     cache_config = CacheConfig(**kwargs)
@@ -322,3 +384,36 @@ def make_nemotron_hybrid_plan(
         len(pattern),
         state_dtypes,
     )
+
+
+def make_state_cache(
+    *,
+    num_layers,
+    max_seqs,
+    conv_kernel_dim,
+    conv_dim,
+    num_v_heads=None,
+    value_head_dim=None,
+    key_head_dim=None,
+    dtype=mx.float16,
+    recurrent_dtype=mx.float32,
+):
+    from vllm_metal.attention.caches.state_cache import PagedStateCache
+
+    states = [
+        [
+            mx.zeros((max_seqs, conv_kernel_dim - 1, conv_dim), dtype=dtype)
+            for _ in range(num_layers)
+        ]
+    ]
+    if num_v_heads is not None:
+        states.append(
+            [
+                mx.zeros(
+                    (max_seqs, num_v_heads, value_head_dim, key_head_dim),
+                    dtype=recurrent_dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+    return PagedStateCache(states)

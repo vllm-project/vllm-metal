@@ -1,27 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-request recurrent state cache for GDN linear attention layers.
-
-Unlike ``MetalPagedKVCache`` which stores per-token KV that grows with
-sequence length, GDN linear attention uses fixed-size recurrent state
-per request: a convolution buffer and a hidden state matrix.
-
-Layout per linear layer:
-  - conv_state:      [allocated_seqs, conv_kernel - 1, conv_dim]
-  - recurrent_state: [allocated_seqs, num_v_heads, value_head_dim, key_head_dim]
-
-Each request occupies one slot (indexed by request position in the batch).
-State is managed by the GDN wrapper, not by the scheduler's block system.
-``max_seqs`` remains the scheduler-visible hard cap; ``allocated_seqs`` grows
-on request admission and never exceeds that cap.
-
-Pending state handoff:
-  - At most one compact pending conv or recurrent update may exist per linear
-    layer.
-  - Lazy decode may consume that compact update directly only when the active
-    slot order exactly matches the pending slot order.
-  - Slot-order mismatches, fallback execution, new prefill work, or slot release
-    must scatter the pending update into the stable state pool first.
-"""
+"""Operator-state views and deferred MLX updates over scheduler-owned pages."""
 
 from __future__ import annotations
 
@@ -54,143 +32,31 @@ class GDNDecodeStateView:
     uses_compact_state: bool
 
 
-class GDNPagedStateCache:
-    """Per-layer MLX arrays for GDN linear attention recurrent state."""
+class PagedStateCache:
+    """Bind state components; allocation and block lifetime belong to vLLM."""
 
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        max_seqs: int,
-        conv_kernel_dim: int,
-        conv_dim: int,
-        num_v_heads: int,
-        value_head_dim: int,
-        key_head_dim: int,
-        initial_seqs: int | None = None,
-        dtype: mx.Dtype = mx.float16,
-        recurrent_dtype: mx.Dtype = mx.float32,
-    ) -> None:
-        if dtype not in (mx.float16, mx.bfloat16, mx.float32):
-            raise ValueError(f"Unsupported dtype for GDN state cache: {dtype}")
-        if max_seqs < 0:
-            raise ValueError("max_seqs must be non-negative")
-        if initial_seqs is None:
-            initial_seqs = max_seqs
-        if initial_seqs < 0 or initial_seqs > max_seqs:
-            raise ValueError(
-                "initial_seqs must be between 0 and max_seqs "
-                f"(got {initial_seqs}, max_seqs={max_seqs})"
-            )
-
-        self.num_layers = num_layers
-        self.max_seqs = max_seqs
-        self.allocated_seqs = initial_seqs
-        self.conv_kernel_dim = conv_kernel_dim
-        self.conv_dim = conv_dim
-        self.num_v_heads = num_v_heads
-        self.value_head_dim = value_head_dim
-        self.key_head_dim = key_head_dim
-        self.dtype = dtype
-        self.recurrent_dtype = recurrent_dtype
-
-        self.conv_states: list[mx.array] = [
-            mx.zeros(self._conv_shape(initial_seqs), dtype=dtype)
-            for _ in range(num_layers)
-        ]
-        self.recurrent_states: list[mx.array] = [
-            mx.zeros(self._recurrent_shape(initial_seqs), dtype=recurrent_dtype)
-            for _ in range(num_layers)
-        ]
-        self.pending_conv_states: list[mx.array | None] = [
-            None for _ in range(num_layers)
-        ]
-        self.pending_conv_slot_ids: list[list[int] | None] = [
-            None for _ in range(num_layers)
-        ]
-        self.pending_recurrent_states: list[mx.array | None] = [
-            None for _ in range(num_layers)
-        ]
-        self.pending_recurrent_slot_ids: list[list[int] | None] = [
-            None for _ in range(num_layers)
-        ]
-        # Scheduler layout, adopted via ``set_layer_layout``; until then every
-        # layer is its own pool (none mode keeps this identity layout).
-        self._layer_group_ordinals: list[int] = [0] * num_layers
-        self._pool_siblings: list[list[int]] = [[i] for i in range(num_layers)]
-        self._canonical_layers: list[int] = list(range(num_layers))
-        self._eval_state_arrays()
-
-    def _conv_shape(self, num_seqs: int) -> tuple[int, int, int]:
-        return (num_seqs, self.conv_kernel_dim - 1, self.conv_dim)
-
-    def _recurrent_shape(self, num_seqs: int) -> tuple[int, int, int, int]:
-        return (
-            num_seqs,
-            self.num_v_heads,
-            self.value_head_dim,
-            self.key_head_dim,
-        )
-
-    def _eval_state_arrays(self) -> None:
-        arrays = [
-            array
-            for layer_idx in self._canonical_layers
-            for array in (self.conv_states[layer_idx], self.recurrent_states[layer_idx])
-        ]
-        if arrays:
-            mx.eval(*arrays)
-
-    @property
-    def num_state_pools(self) -> int:
-        """Number of distinct physical state pools under the adopted layout."""
-        return len(self._canonical_layers)
+    def __init__(self, states, group_ordinals=None):
+        if len(states) not in (1, 2):
+            raise ValueError("state cache requires conv and optional recurrent views")
+        self.conv_states = states[0]
+        self.recurrent_states = states[1] if len(states) > 1 else []
+        self.num_layers = len(self.conv_states)
+        self.max_seqs = self.conv_states[0].shape[0]
+        self.conv_dim = self.conv_states[0].shape[2]
+        self.dtype = self.conv_states[0].dtype
+        self._layer_group_ordinals = group_ordinals or [0] * self.num_layers
+        self.pending_conv_states = [None] * self.num_layers
+        self.pending_conv_slot_ids = [None] * self.num_layers
+        self.pending_recurrent_states = [None] * self.num_layers
+        self.pending_recurrent_slot_ids = [None] * self.num_layers
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""
-        for sibling in self._pool_siblings[layer_idx]:
-            self.conv_states[sibling] = array
+        self.conv_states[layer_idx] = array
 
     def store_recurrent_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated recurrent pool, keeping siblings aliased."""
-        for sibling in self._pool_siblings[layer_idx]:
-            self.recurrent_states[sibling] = array
-
-    def ensure_capacity(self, num_seqs: int) -> None:
-        """Grow stable state pools so slots ``[0, num_seqs)`` are valid."""
-        if num_seqs < 0:
-            raise ValueError("num_seqs must be non-negative")
-        if num_seqs > self.max_seqs:
-            raise RuntimeError(
-                "GDN state cache requested more slots than max_num_seqs "
-                f"({num_seqs} > {self.max_seqs})"
-            )
-        if num_seqs <= self.allocated_seqs:
-            return
-
-        self.apply_pending_states()
-        old_allocated = self.allocated_seqs
-
-        for layer_idx in self._canonical_layers:
-            old_conv = self.conv_states[layer_idx]
-            conv = mx.zeros(self._conv_shape(num_seqs), dtype=self.dtype)
-            if old_allocated:
-                conv[:old_allocated] = old_conv
-
-            old_recurrent = self.recurrent_states[layer_idx]
-            recurrent = mx.zeros(
-                self._recurrent_shape(num_seqs), dtype=self.recurrent_dtype
-            )
-            if old_allocated:
-                recurrent[:old_allocated] = old_recurrent
-
-            # Materialize now so each old pool is released as it is copied.
-            # The memory plan reserves one old physical pool for this overlap.
-            mx.eval(conv, recurrent)
-            self.store_conv_state(layer_idx, conv)
-            self.store_recurrent_state(layer_idx, recurrent)
-
-        self.allocated_seqs = num_seqs
+        self.recurrent_states[layer_idx] = array
 
     def require_mixer_dtype(self, mixer_dtype: mx.Dtype, *, layer_idx: int) -> None:
         """Reject a conv pool whose dtype differs from the mixer feeding it."""
@@ -224,63 +90,6 @@ class GDNPagedStateCache:
         """Validate slots against both the scheduler cap and allocated rows."""
         if any(slot < 0 or slot >= self.max_seqs for slot in slot_ids):
             raise RuntimeError("state cache received out-of-range slot mapping")
-        if any(slot >= self.allocated_seqs for slot in slot_ids):
-            raise RuntimeError(
-                "state cache received slot mapping beyond allocated state cache"
-            )
-
-    def reset_slot(self, slot: int) -> None:
-        """Clear state for one allocated slot before it is reused."""
-        self.require_allocated_slots([slot])
-        self.apply_pending_states()
-        self.zero_slots([slot], self._canonical_layers)
-
-    def set_layer_layout(
-        self, group_ordinals: list[int], pool_ordinals: list[int]
-    ) -> None:
-        """Adopt the scheduler's layer layout: group + physical pool per layer.
-
-        ``group_ordinals[cache_idx]`` selects the block-table row addressing a
-        layer's slabs; ``pool_ordinals[cache_idx]`` names its physical pool
-        (vLLM's ``kv_cache_tensors`` byte addresses: one pool per within-group
-        position).  Layers sharing a pool must belong to different groups —
-        their groups then own disjoint block ids, so slab rows never collide.
-        Must be called before any state is written (pool arrays are rebuilt).
-        """
-        if not (len(group_ordinals) == len(pool_ordinals) == self.num_layers):
-            raise ValueError(
-                f"expected one group and one pool ordinal per linear layer "
-                f"({self.num_layers}), got {len(group_ordinals)}/"
-                f"{len(pool_ordinals)}"
-            )
-        pool_members: dict[int, list[int]] = {}
-        for layer_idx, pool in enumerate(pool_ordinals):
-            pool_members.setdefault(pool, []).append(layer_idx)
-        for pool, members in pool_members.items():
-            groups = [group_ordinals[i] for i in members]
-            if len(set(groups)) != len(groups):
-                raise ValueError(
-                    f"state pool {pool} is shared by two layers of the same "
-                    f"mamba cache group (layers {members}); their slab rows "
-                    "would collide"
-                )
-        if any(
-            self.pending_conv_states[i] is not None
-            or self.pending_recurrent_states[i] is not None
-            for i in range(self.num_layers)
-        ):
-            raise RuntimeError("set_layer_layout() called with pending state")
-
-        self._layer_group_ordinals = list(group_ordinals)
-        self._pool_siblings = [pool_members[pool] for pool in pool_ordinals]
-        self._canonical_layers = sorted(members[0] for members in pool_members.values())
-        # Rebuild storage so pool siblings alias one array.  Pre-adopt state
-        # is all zeros, so aliasing to the canonical member's array is exact.
-        for members in pool_members.values():
-            canonical = members[0]
-            for layer_idx in members:
-                self.conv_states[layer_idx] = self.conv_states[canonical]
-                self.recurrent_states[layer_idx] = self.recurrent_states[canonical]
 
     def layer_group_ordinal(self, cache_idx: int) -> int:
         """Return the mamba-cache-group ordinal for one linear layer."""
@@ -303,6 +112,7 @@ class GDNPagedStateCache:
             return
         self.require_allocated_slots(src_ids)
         self.require_allocated_slots(dst_ids)
+        self.apply_pending_states([*src_ids, *dst_ids])
         src = mx.array(src_ids, dtype=mx.int32)
         dst = mx.array(dst_ids, dtype=mx.int32)
         for layer_idx in layer_indices:
@@ -310,20 +120,10 @@ class GDNPagedStateCache:
             # Reading the sources into their own array keeps the copy atomic
             # when one pair's destination is another pair's source.
             self.write_conv_rows(layer_idx, self.conv_states[layer_idx][src], dst)
-            self.write_recurrent_rows(
-                layer_idx, self.recurrent_states[layer_idx][src], dst
-            )
-
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler copy-on-write operations to every physical pool."""
-        if not block_copies:
-            return
-
-        src_ids, dst_ids = zip(*block_copies, strict=True)
-        self.apply_pending_states()
-        high_water = max(*src_ids, *dst_ids) + 1
-        self.ensure_capacity(high_water)
-        self.copy_slots(list(src_ids), list(dst_ids), self._canonical_layers)
+            if self.recurrent_states:
+                self.write_recurrent_rows(
+                    layer_idx, self.recurrent_states[layer_idx][src], dst
+                )
 
     def zero_slots(self, slot_ids: list[int], layer_indices: list[int]) -> None:
         """Zero state slabs for the given layers (batched, lazy).
@@ -335,20 +135,15 @@ class GDNPagedStateCache:
         if not slot_ids or not layer_indices:
             return
         self.require_allocated_slots(slot_ids)
+        self.apply_pending_states(slot_ids)
         ids = mx.array(slot_ids, dtype=mx.int32)
-        # Every layer's pool has the same per-slab shape, so build one zeros
-        # block per pool and reuse it across layers.
-        conv_zeros = mx.zeros(
-            (len(slot_ids),) + self.conv_states[0].shape[1:],
-            dtype=self.conv_states[0].dtype,
-        )
-        recurrent_zeros = mx.zeros(
-            (len(slot_ids),) + self.recurrent_states[0].shape[1:],
-            dtype=self.recurrent_states[0].dtype,
-        )
         for layer_idx in layer_indices:
-            self.write_conv_rows(layer_idx, conv_zeros, ids)
-            self.write_recurrent_rows(layer_idx, recurrent_zeros, ids)
+            for states in (self.conv_states, self.recurrent_states):
+                if states:
+                    pool = states[layer_idx]
+                    states[layer_idx] = _native_row_scatter()(
+                        pool, pool, ids, zero=True
+                    )
 
     def set_pending_conv_state(
         self, layer_idx: int, slot_ids: list[int], state_updates: mx.array
@@ -466,15 +261,10 @@ class GDNPagedStateCache:
         return self.pending_recurrent_states[layer_idx] is not None
 
     def updated_state_arrays(self) -> list[mx.array]:
-        """Return the GDN state arrays to submit after a forward.
-
-        One entry per physical pool plus any pending compact updates — with
-        shared pools a stable array carries several layers' state, so it is
-        submitted even when one of its layers also has a pending update.
-        """
-        arrays = [self.conv_states[i] for i in self._canonical_layers]
+        """Return state views and deferred updates needed by this forward."""
+        arrays = list(self.conv_states)
         arrays.extend(p for p in self.pending_conv_states if p is not None)
-        arrays.extend(self.recurrent_states[i] for i in self._canonical_layers)
+        arrays.extend(self.recurrent_states)
         arrays.extend(p for p in self.pending_recurrent_states if p is not None)
         return arrays
 
@@ -536,7 +326,15 @@ class GDNPagedStateCache:
         for layer_idx in range(self.num_layers):
             self.apply_pending_recurrent_state(layer_idx)
 
-    def apply_pending_states(self) -> None:
-        """Scatter all deferred conv and recurrent updates into stable pools."""
-        self.apply_pending_conv_states()
-        self.apply_pending_recurrent_states()
+    def apply_pending_states(self, slot_ids: Sequence[int] | None = None) -> None:
+        """Flush pending components touching these slots, or all when omitted."""
+        slots = None if slot_ids is None else set(slot_ids)
+        for layer_idx in range(self.num_layers):
+            if slots is None or slots.intersection(
+                self.pending_conv_slot_ids[layer_idx] or ()
+            ):
+                self.apply_pending_conv_state(layer_idx)
+            if slots is None or slots.intersection(
+                self.pending_recurrent_slot_ids[layer_idx] or ()
+            ):
+                self.apply_pending_recurrent_state(layer_idx)

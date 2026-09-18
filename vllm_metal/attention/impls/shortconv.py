@@ -11,7 +11,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import get_context
 
 
@@ -33,14 +33,14 @@ class ShortConvPagedWrapper(nn.Module):
         inner: nn.Module,
         layer_idx: int,
         cache_idx: int,
-        state_cache: ShortConvStateCache,
+        state_cache: PagedStateCache,
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
         self.rebind_state_cache(state_cache, cache_idx=cache_idx)
 
     def rebind_state_cache(
-        self, state_cache: ShortConvStateCache, *, cache_idx: int
+        self, state_cache: PagedStateCache, *, cache_idx: int
     ) -> None:
         object.__setattr__(self, "_state_cache", state_cache)
         object.__setattr__(self, "_cache_idx", cache_idx)

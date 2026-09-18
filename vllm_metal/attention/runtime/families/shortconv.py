@@ -6,11 +6,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import mlx.core as mx
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
 from vllm_metal.attention.impls.shortconv import ShortConvPagedWrapper, is_shortconv
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
@@ -19,29 +17,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     HybridLayerPlan,
     HybridRuntimePlan,
     StateFamilySpec,
-    StateGeometry,
 )
-
-
-def _create_shortconv_state_cache(
-    *,
-    geometry: StateGeometry,
-    num_layers: int,
-    max_seqs: int,
-    initial_seqs: int,
-    dtypes: tuple[mx.Dtype, ...],
-) -> ShortConvStateCache:
-    if not isinstance(geometry, ConvStateGeometry):
-        raise TypeError("ShortConv state cache requires convolution-only geometry")
-    return ShortConvStateCache(
-        num_layers=num_layers,
-        max_seqs=max_seqs,
-        conv_kernel_dim=geometry.conv_kernel_dim,
-        conv_dim=geometry.conv_dim,
-        initial_seqs=initial_seqs,
-        dtype=dtypes[0],
-    )
-
 
 SHORTCONV_MODEL_TYPES = frozenset({"lfm2", "lfm2_moe"})
 
@@ -52,7 +28,6 @@ SHORTCONV_FAMILY = StateFamilySpec(
     mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
     supported_cache_modes=("none", "align"),
     layer_name="conv",
-    create_state_cache=_create_shortconv_state_cache,
 )
 
 

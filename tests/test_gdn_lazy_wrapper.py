@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 import vllm_metal.attention.impls.linear as attention_linear
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from tests.stub_runner import make_state_cache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import (
     PagedAttentionContext,
     clear_context,
@@ -95,9 +96,8 @@ def _make_state_cache(
     num_v_heads: int = 1,
     value_head_dim: int = 4,
     key_head_dim: int = 32,
-    initial_seqs: int | None = None,
-) -> GDNPagedStateCache:
-    return GDNPagedStateCache(
+) -> PagedStateCache:
+    return make_state_cache(
         num_layers=1,
         max_seqs=max_seqs,
         conv_kernel_dim=conv_kernel_dim,
@@ -105,7 +105,6 @@ def _make_state_cache(
         num_v_heads=num_v_heads,
         value_head_dim=value_head_dim,
         key_head_dim=key_head_dim,
-        initial_seqs=initial_seqs,
         dtype=mx.float32,
     )
 
@@ -1044,12 +1043,11 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         finally:
             clear_context()
 
-    def test_rejects_unallocated_gdn_slots(self) -> None:
+    def test_rejects_scheduler_ids_outside_the_allocation(self) -> None:
         # Arrange
         inner = _TinyGDNInner()
         cache = _make_state_cache(
             max_seqs=3,
-            initial_seqs=1,
             conv_kernel_dim=inner.conv_kernel_size,
             conv_dim=inner.conv_dim,
             num_v_heads=inner.num_v_heads,
@@ -1063,13 +1061,13 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             PagedAttentionContext(
                 slot_mapping=[0, 1],
                 cu_seqlens=[0, 1, 2],
-                state_slot_mapping=[0, 1],
+                state_slot_mapping=[0, cache.max_seqs],
             )
         )
 
         # Act / Assert
         try:
-            with pytest.raises(RuntimeError, match="beyond allocated state cache"):
+            with pytest.raises(RuntimeError, match="out-of-range slot mapping"):
                 wrapper(mx.ones((1, 2, inner.conv_dim), dtype=mx.float32))
         finally:
             clear_context()

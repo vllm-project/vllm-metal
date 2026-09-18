@@ -14,7 +14,8 @@ import pytest
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.lfm2 import ModelArgs, ShortConv
 
-from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
+from tests.stub_runner import make_state_cache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import (
     PagedAttentionContext,
     clear_context,
@@ -68,13 +69,12 @@ def _make_module() -> ShortConv:
 def _make_wrapper(
     module: ShortConv,
     state_dtype: mx.Dtype = mx.float32,
-) -> tuple[ShortConvPagedWrapper, ShortConvStateCache]:
-    state_cache = ShortConvStateCache(
+) -> tuple[ShortConvPagedWrapper, PagedStateCache]:
+    state_cache = make_state_cache(
         num_layers=1,
         max_seqs=MAX_SEQS,
         conv_kernel_dim=L_CACHE,
         conv_dim=HIDDEN,
-        initial_seqs=MAX_SEQS,
         dtype=state_dtype,
     )
     wrapper = ShortConvPagedWrapper(

@@ -376,6 +376,7 @@ def _scheduler_output(
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=None,
         kv_cache_block_copies=None,
+        new_block_ids_to_zero=None,
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         finished_req_ids=set(),

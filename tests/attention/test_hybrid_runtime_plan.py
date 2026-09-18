@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.stub_runner import (
     NEMOTRON_H_TINY_ARGS,
+    initialize_hybrid_runtime,
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
 )
@@ -119,10 +120,6 @@ def _make_nemotron_runtime() -> HybridPagedAttentionRuntime:
         hybrid_plan=make_nemotron_hybrid_plan(
             "M-*M", state_dtypes=(torch.float32, torch.float32)
         ),
-        max_num_seqs=2,
-        num_kv_heads=2,
-        head_dim=8,
-        block_size=4,
         dtype=mx.float32,
     )
 
@@ -130,10 +127,6 @@ def _make_nemotron_runtime() -> HybridPagedAttentionRuntime:
 def _make_runtime(state_dtypes=STATE_DTYPES) -> HybridPagedAttentionRuntime:
     return HybridPagedAttentionRuntime(
         hybrid_plan=_make_tiny_plan(state_dtypes),
-        max_num_seqs=2,
-        num_kv_heads=1,
-        head_dim=4,
-        block_size=4,
         dtype=mx.float32,
     )
 
@@ -395,10 +388,6 @@ class TestRuntimeUsesThePlan:
         with pytest.raises(NotImplementedError) as excinfo:
             HybridPagedAttentionRuntime(
                 hybrid_plan=_make_tiny_plan(),
-                max_num_seqs=2,
-                num_kv_heads=1,
-                head_dim=4,
-                block_size=4,
                 dtype=mx.float32,
                 mamba_cache_mode="all",
             )
@@ -407,25 +396,20 @@ class TestRuntimeUsesThePlan:
     def test_state_cache_is_sized_from_the_plan_geometry(self) -> None:
         runtime = _make_runtime((torch.float32, torch.bfloat16))
 
-        runtime.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime, 2)
 
         state_cache = runtime.state_cache
-        state_cache.ensure_capacity(1)
-        state_cache.ensure_capacity(2)
         assert state_cache.conv_states[0].dtype == mx.float32
         assert state_cache.recurrent_states[0].dtype == mx.bfloat16
         assert state_cache.num_layers == 2
-        assert state_cache.conv_kernel_dim == 2
-        assert state_cache.conv_dim == 4
-        assert state_cache.num_v_heads == 1
-        assert state_cache.value_head_dim == 4
-        assert state_cache.key_head_dim == 32
+        assert state_cache.conv_states[0].shape == (2, 1, 4)
+        assert state_cache.recurrent_states[0].shape == (2, 1, 4, 32)
 
 
 class TestHybridPatchModel:
     def test_installs_family_wrappers_at_plan_cache_indices(self) -> None:
         runtime = _make_runtime()
-        runtime.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime, 2)
         model = _FakeModel("sasa")
 
         patched = runtime.patch_model(model)
@@ -448,12 +432,12 @@ class TestHybridPatchModel:
 
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
         runtime_a = _make_runtime()
-        runtime_a.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime_a, 2)
         model = _FakeModel("sasa")
         runtime_a.patch_model(model)
         wrapper_before = model.layers[0].linear_attn
         runtime_b = _make_runtime()
-        runtime_b.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime_b, 2)
 
         patched = runtime_b.patch_model(model)
 
@@ -468,7 +452,7 @@ class TestHybridPatchModel:
             ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
         )
         runtime = _make_nemotron_runtime()
-        runtime.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime, 2, num_kv_heads=2, head_dim=8)
 
         patched = runtime.patch_model(model)
 
@@ -486,11 +470,11 @@ class TestHybridPatchModel:
             ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
         )
         runtime_a = _make_nemotron_runtime()
-        runtime_a.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime_a, 2, num_kv_heads=2, head_dim=8)
         runtime_a.patch_model(model)
         wrapper_before = model.layers[3].mixer
         runtime_b = _make_nemotron_runtime()
-        runtime_b.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime_b, 2, num_kv_heads=2, head_dim=8)
 
         patched = runtime_b.patch_model(model)
 
@@ -504,13 +488,9 @@ class TestHybridPatchModel:
             hybrid_plan=make_nemotron_hybrid_plan(
                 "M-*M", state_dtypes=(torch.bfloat16, torch.float32)
             ),
-            max_num_seqs=2,
-            num_kv_heads=2,
-            head_dim=8,
-            block_size=4,
             dtype=mx.bfloat16,
         )
-        runtime.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime, 2, num_kv_heads=2, head_dim=8)
         model = Model(
             ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
         )
@@ -526,7 +506,7 @@ class TestHybridPatchModel:
 
     def test_unclassifiable_layer_rejects_with_the_family_label(self) -> None:
         runtime = _make_runtime()
-        runtime.initialize(num_blocks=2)
+        initialize_hybrid_runtime(runtime, 2)
 
         class _Mystery(nn.Module):
             pass

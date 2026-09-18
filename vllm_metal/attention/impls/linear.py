@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
@@ -115,7 +115,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         inner: nn.Module,
         layer_idx: int,
         cache_idx: int,
-        state_cache: GDNPagedStateCache,
+        state_cache: PagedStateCache,
     ) -> None:
         super().__init__()
         object.__setattr__(self, "_inner", inner)
@@ -126,7 +126,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_gdn_lazy_policy", _GDNLazyPolicy.from_module(inner))
 
     def rebind_state_cache(
-        self, state_cache: GDNPagedStateCache, *, cache_idx: int
+        self, state_cache: PagedStateCache, *, cache_idx: int
     ) -> None:
         """Refresh pooled state refs in place (cached model reuse)."""
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)

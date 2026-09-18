@@ -10,7 +10,6 @@ import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper, is_mamba2_mixer
-from vllm_metal.attention.runtime.families.gdn import create_gdn_state_cache
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -29,7 +28,6 @@ GRANITE_FAMILY = StateFamilySpec(
     mamba_type=MambaAttentionBackendEnum.MAMBA2,
     supported_cache_modes=("none",),
     layer_name="mamba",
-    create_state_cache=create_gdn_state_cache,
 )
 
 

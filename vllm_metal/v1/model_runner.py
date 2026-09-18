@@ -815,18 +815,6 @@ class MetalModelRunner:
         """
         return self._cache_policy.get_cache_block_size_bytes()
 
-    def linear_cache_bytes_per_slot(self) -> int:
-        """Bytes for one request's linear attention state across all GDN layers."""
-        return self._cache_policy.linear_cache_bytes_per_slot()
-
-    def hybrid_align_state_bytes_per_block(self) -> int:
-        """Per-pool-block linear-state bytes under align-mode prefix caching."""
-        return self._cache_policy.hybrid_align_state_bytes_per_block()
-
-    def hybrid_align_growth_bytes_per_block(self) -> int:
-        """One old physical state pool retained during align-cache growth."""
-        return self._cache_policy.hybrid_align_growth_bytes_per_block()
-
     def draft_scratch_reserve_blocks(self) -> int:
         """Blocks reserved for the draft model's speculative lookahead tail."""
         return self._cache_policy.draft_scratch_reserve_blocks()
@@ -1135,6 +1123,8 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            if runtime is not None and scheduler_output.new_block_ids_to_zero:
+                runtime.zero_blocks(scheduler_output.new_block_ids_to_zero)
             if runtime is not None and scheduler_output.kv_cache_block_copies:
                 # vLLM has already rewritten request block tables to the CoW
                 # destinations. Populate those physical blocks before the

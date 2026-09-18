@@ -129,3 +129,42 @@ def test_attention_rejects_heads_outer_layouts(layout):
     storage = KVCacheStorage(config)
     with pytest.raises(ValueError, match=f"token-major.*{layout}"):
         MetalPagedKVCache.from_upstream(storage, ["a0", "a1"])
+
+
+def test_budget_above_buffer_limit_can_plan_and_initialize_shared_cache(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    from tests.stub_runner import make_cache_config
+    from vllm_metal.v1.cache_policy import WorkerCachePlanner
+
+    groups = make_storage().config.kv_cache_groups
+    buffer_limit = 16_384
+    config = SimpleNamespace(cache_config=make_cache_config(gpu_memory_utilization=0.5))
+    runner = SimpleNamespace(
+        is_hybrid=True,
+        scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
+        profile_run=lambda: 0,
+        draft_scratch_reserve_bytes=lambda: 0,
+    )
+    planner = WorkerCachePlanner(
+        SimpleNamespace(model_runner=runner, vllm_config=config)
+    )
+    monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {
+            "max_recommended_working_set_size": 4 * buffer_limit,
+            "max_buffer_length": buffer_limit,
+        },
+    )
+
+    budget = planner.determine_available_memory()
+    planned = get_kv_cache_config_from_groups(config, groups, budget)
+    storage = KVCacheStorage(planned)
+
+    assert budget == buffer_limit
+    assert 0 < storage.nbytes <= buffer_limit
+    assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks

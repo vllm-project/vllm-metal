@@ -11,7 +11,6 @@ import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper, is_mamba2_mixer
-from vllm_metal.attention.runtime.families.gdn import create_gdn_state_cache
 from vllm_metal.attention.runtime.hybrid_plan import (
     ATTENTION_LAYER,
     STATE_LAYER,
@@ -120,7 +119,6 @@ NEMOTRON_H_FAMILY = StateFamilySpec(
     supported_cache_modes=("none",),
     layer_name="mixer",
     # Mamba-2 keeps the same conv tail and (heads, head_dim, state) pool as GDN.
-    create_state_cache=create_gdn_state_cache,
 )
 
 
