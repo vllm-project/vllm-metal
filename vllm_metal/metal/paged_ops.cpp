@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1278,7 +1279,11 @@ class GDNStateScatterPrimitive : public Primitive {
       dense_row &= pool.shape(axis) == 1 || pool.strides()[axis] == inner_stride;
       inner_stride *= pool.shape(axis);
     }
-    bool vec4 = dense_row && (row_elems % 4) == 0 && (pool.strides()[0] % 4) == 0;
+    // Row sizes alone do not guarantee aligned vector access to sliced views.
+    const size_t vector_bytes = 4 * pool.itemsize();
+    bool vec4 = dense_row && (row_elems % 4) == 0 && (pool.strides()[0] % 4) == 0
+        && reinterpret_cast<uintptr_t>(pool.data<char>()) % vector_bytes == 0
+        && (zero_ || reinterpret_cast<uintptr_t>(src.data<char>()) % vector_bytes == 0);
     int lanes = vec4 ? row_elems / 4 : row_elems;
 
     auto s = stream();

@@ -1846,6 +1846,27 @@ class TestNativeGDNStateScatter:
         mx.eval(out)
         np.testing.assert_array_equal(np.array(pool[2]), 1.0)
 
+    @pytest.mark.parametrize("dtype", [mx.uint8, mx.int8, mx.float16, mx.float32])
+    @pytest.mark.parametrize(("dst_offset", "src_offset"), [(1, 0), (0, 1), (3, 1)])
+    @pytest.mark.parametrize("zero", [False, True])
+    def test_unaligned_views_preserve_bytes_outside_the_write(
+        self, dtype, dst_offset, src_offset, zero
+    ) -> None:
+        ops = _get_native_ops_or_skip()
+        backing = mx.full((80,), 99, dtype=dtype)
+        source = mx.arange(16).astype(dtype)
+        pool = ops.cache_view(backing, (4, 8), (16, 1), dst_offset)
+        rows = ops.cache_view(source, (1, 8), (8, 1), src_offset)
+
+        updated = ops.gdn_state_scatter(pool, rows, mx.array([2]), zero=zero)
+        mx.eval(updated)
+
+        expected = np.full(80, 99, dtype=np.float32)
+        expected[32 + dst_offset : 40 + dst_offset] = (
+            0 if zero else np.arange(src_offset, src_offset + 8)
+        )
+        np.testing.assert_array_equal(np.array(backing.astype(mx.float32)), expected)
+
     def test_empty_update_leaves_the_pool_alone(self) -> None:
         scatter = self._scatter_fn()
         pool = mx.ones((4, 2, 2), dtype=mx.float32)
