@@ -21,8 +21,13 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import (
+    make_gdn_hybrid_plan,
+    make_nemotron_hybrid_plan,
+    make_stub_runner,
+)
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.attention.state import RequestStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
@@ -2444,7 +2449,7 @@ class TestDummyForwardOutputsPPRouting:
 
 
 class TestPipelineGateSpecDecodeDerivation:
-    """Runner-side gate derivation: spec decode disables the pipeline."""
+    """Runner-side capability derivation for the decode pipeline."""
 
     @pytest.fixture(autouse=True)
     def _enable_pipeline(self, monkeypatch) -> None:
@@ -2555,6 +2560,42 @@ class TestPipelineGateSpecDecodeDerivation:
         # Assert
         assert decision.eligible is True
         assert decision.reason == "eligible"
+
+    @pytest.mark.parametrize(
+        ("hybrid_plan", "expected_eligible", "expected_reason"),
+        [
+            (
+                make_gdn_hybrid_plan(
+                    2,
+                    [1],
+                    conv_kernel_dim=4,
+                    conv_dim=64,
+                    num_v_heads=1,
+                    value_head_dim=64,
+                    key_head_dim=64,
+                ),
+                False,
+                "hybrid model without lazy GDN kernels",
+            ),
+            (make_nemotron_hybrid_plan("M*"), True, "eligible"),
+        ],
+    )
+    def test_gdn_lazy_kernel_flag_only_blocks_gdn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        hybrid_plan: HybridRuntimePlan,
+        expected_eligible: bool,
+        expected_reason: str,
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
+        runner = self._runner(drafter=None)
+        runner.model_config.is_hybrid = True
+        runner.hybrid_runtime_plan = hybrid_plan
+
+        decision = runner._evaluate_pipeline_gate(self._scheduler_output({}))
+
+        assert decision.eligible is expected_eligible
+        assert decision.reason == expected_reason
 
     @pytest.mark.parametrize("backend", ["mp", "ray", "external_launcher", None])
     def test_non_uniproc_executor_backend_disables_pipeline(self, backend) -> None:
