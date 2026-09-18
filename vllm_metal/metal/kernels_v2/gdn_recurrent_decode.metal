@@ -13,7 +13,8 @@ if (req_idx >= (uint)num_requests || dv_idx >= (uint)Dv) return;
 
 // State: [MAX_SEQS, Hv, Dv, Dk]
 auto slot_idx = (uint)slot_mapping[req_idx];
-int state_base = ((slot_idx * Hv + hv_idx) * Dv + dv_idx) * Dk;
+int64_t state_base = int64_t(slot_idx) * state_in_strides[0]
+    + (hv_idx * Dv + dv_idx) * Dk;
 int state_out_base = ((req_idx * Hv + hv_idx) * Dv + dv_idx) * Dk;
 
 // Load state into registers

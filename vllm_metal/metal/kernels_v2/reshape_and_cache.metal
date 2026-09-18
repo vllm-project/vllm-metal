@@ -54,6 +54,9 @@ template <typename KV_T, typename CACHE_T>
     device const int &num_heads [[buffer(9)]],
     device const int &head_size [[buffer(10)]],
     device const int &block_size [[buffer(11)]],
+    constant int64_t &cache_block_stride [[buffer(12)]],
+    constant int64_t &cache_token_stride [[buffer(13)]],
+    constant int64_t &cache_head_stride [[buffer(14)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
@@ -77,9 +80,9 @@ template <typename KV_T, typename CACHE_T>
 
     // Target index: [block_idx, block_offset, head_idx, head_offset]
     const int64_t tgt_idx =
-        block_idx * block_size * num_heads * head_size +
-        block_offset * num_heads * head_size +
-        head_idx * head_size +
+        block_idx * cache_block_stride +
+        block_offset * cache_token_stride +
+        head_idx * cache_head_stride +
         head_offset;
 
     if (rac_use_fp8_scales) {
@@ -113,6 +116,9 @@ template <typename KV_T, typename CACHE_T>
       device const int &num_heads [[buffer(9)]],                               \
       device const int &head_size [[buffer(10)]],                              \
       device const int &block_size [[buffer(11)]],                             \
+      constant int64_t &cache_block_stride [[buffer(12)]],                     \
+      constant int64_t &cache_token_stride [[buffer(13)]],                     \
+      constant int64_t &cache_head_stride [[buffer(14)]],                      \
       uint gid [[threadgroup_position_in_grid]],                               \
       uint tid [[thread_position_in_threadgroup]],                             \
       uint threads_per_threadgroup [[threads_per_threadgroup]]);

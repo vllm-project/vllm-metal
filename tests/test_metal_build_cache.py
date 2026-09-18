@@ -16,6 +16,7 @@ from vllm_metal.metal import build
 @dataclass
 class _Paths:
     src: Path
+    patch: Path
     bld: Path
     consts: Path
     nb_src: Path
@@ -27,6 +28,7 @@ class _Paths:
 @pytest.fixture
 def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "paged_ops.cpp"
+    patch = tmp_path / "mlx_patch.cpp"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
     nb_src = tmp_path / "nb_combined.cpp"
@@ -34,11 +36,13 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     hsh = tmp_path / "_paged_ops.so.sha256"
 
     src.write_bytes(b"// source v1")
+    patch.write_bytes(b"// patch v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
 
     monkeypatch.setattr(build, "_SRC", src)
+    monkeypatch.setattr(build, "_MLX_PATCH", patch)
     monkeypatch.setattr(build, "_BUILD", bld)
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
@@ -55,7 +59,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, bld, consts, nb_src, out, hsh, spec)
+    return _Paths(src, patch, bld, consts, nb_src, out, hsh, spec)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -91,9 +95,10 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     assert build.needs_rebuild() is True
 
 
-def test_hash_changes_with_source_bytes(patched):
+@pytest.mark.parametrize("source_name", ["src", "patch"])
+def test_hash_changes_with_source_bytes(patched, source_name):
     h1 = build._input_hash(patched.spec)
-    patched.src.write_bytes(b"// source v2")
+    getattr(patched, source_name).write_bytes(b"// source v2")
     assert build._input_hash(patched.spec) != h1
 
 
