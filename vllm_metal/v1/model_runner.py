@@ -1354,7 +1354,9 @@ class MetalModelRunner:
             is_pooling=self._is_pooling,
             pp_active=self.pp is not None and self.pp.size > 1,
             hybrid_without_lazy_gdn=(
-                self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
+                self.hybrid_runtime_plan is not None
+                and self.hybrid_runtime_plan.family.label == "gdn"
+                and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
             spec_decode_configured=(
                 self.vllm_config.speculative_config is not None
