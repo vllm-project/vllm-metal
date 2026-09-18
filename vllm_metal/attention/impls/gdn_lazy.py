@@ -216,12 +216,25 @@ class GDNLazyKernels:
                 return None
         except AttributeError:
             return None
-        return mx.fast.metal_kernel(
+        kernel = mx.fast.metal_kernel(
             name=name,
             input_names=input_names,
             output_names=output_names,
             source=source,
+            ensure_row_contiguous=False,
         )
+
+        def run(*, inputs, **kwargs):
+            inputs = [
+                mx.contiguous(value)
+                if isinstance(value, mx.array)
+                and key not in ("state_in", "conv_state_in")
+                else value
+                for key, value in zip(input_names, inputs, strict=True)
+            ]
+            return kernel(inputs=inputs, **kwargs)
+
+        return run
 
     def try_conv_decode(
         self,

@@ -863,6 +863,10 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     [[buffer(26), function_constant(use_turboquant)]], // [num_blocks, block_size, num_kv_heads, head_size/32]
     const device float *v_centroids
     [[buffer(27), function_constant(use_turboquant)]], // [2^v_bits] Lloyd-Max centroids for V
+    constant int64_t &scale_block_stride
+    [[buffer(28), function_constant(use_turboquant)]],
+    constant int64_t &scale_head_stride
+    [[buffer(29), function_constant(use_turboquant)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1085,9 +1089,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             constexpr int SCALE_GROUP_SIZE = 32;
             constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
             const int64_t k_scale_base_offset =
-                physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-                physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
-                kv_head_idx * SCALE_GROUPS;
+                physical_block_number * scale_block_stride +
+                physical_block_offset * (num_kv_heads * scale_head_stride) +
+                kv_head_idx * scale_head_stride;
             tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
                 k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
                 k_scale_base_offset, vec_idx, k_bits);
@@ -1102,9 +1106,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           constexpr int SCALE_GROUP_SIZE = 32;
           constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
           const int64_t k_scale_base_offset =
-              physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-              physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
-              kv_head_idx * SCALE_GROUPS;
+              physical_block_number * scale_block_stride +
+              physical_block_offset * (num_kv_heads * scale_head_stride) +
+              kv_head_idx * scale_head_stride;
           tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
               k_vecs[j], k_ptr, key_scale_cache, key_zero_cache,
               k_scale_base_offset, vec_idx, k_bits);
@@ -1202,9 +1206,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         constexpr int SCALE_GROUP_SIZE = 32;
         constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
         const int64_t v_scale_base_offset =
-            physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-            tok * (num_kv_heads * SCALE_GROUPS) +
-            kv_head_idx * SCALE_GROUPS;
+            physical_block_number * scale_block_stride +
+            tok * (num_kv_heads * scale_head_stride) +
+            kv_head_idx * scale_head_stride;
         tq_load_and_accumulate_v<HEAD_SIZE, NUM_SIMD_LANES>(
             v_accs, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
             v_centroids, v_bits);
@@ -1516,9 +1520,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             constexpr int SCALE_GROUP_SIZE = 32;
             constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
             const int64_t k_scale_base_offset =
-                physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-                physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
-                kv_head_idx * SCALE_GROUPS;
+                physical_block_number * scale_block_stride +
+                physical_block_offset * (num_kv_heads * scale_head_stride) +
+                kv_head_idx * scale_head_stride;
             tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
                 k_vec_j, k_ptr, key_scale_cache, key_zero_cache,
                 k_scale_base_offset, vec_idx, k_bits);
@@ -1533,9 +1537,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           constexpr int SCALE_GROUP_SIZE = 32;
           constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
           const int64_t k_scale_base_offset =
-              physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-              physical_block_offset * (num_kv_heads * SCALE_GROUPS) +
-              kv_head_idx * SCALE_GROUPS;
+              physical_block_number * scale_block_stride +
+              physical_block_offset * (num_kv_heads * scale_head_stride) +
+              kv_head_idx * scale_head_stride;
           tq_load_k_vec<T, K_CACHE_T, VEC_SIZE>(
               k_vec_j, k_ptr, key_scale_cache, key_zero_cache,
               k_scale_base_offset, vec_idx, k_bits);
@@ -1695,9 +1699,9 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         constexpr int SCALE_GROUP_SIZE = 32;
         constexpr int SCALE_GROUPS = HEAD_SIZE / SCALE_GROUP_SIZE;
         const int64_t v_scale_base_offset =
-            physical_block_number * (int64_t)(BLOCK_SIZE * num_kv_heads * SCALE_GROUPS) +
-            tok * (num_kv_heads * SCALE_GROUPS) +
-            kv_head_idx * SCALE_GROUPS;
+            physical_block_number * scale_block_stride +
+            tok * (num_kv_heads * scale_head_stride) +
+            kv_head_idx * scale_head_stride;
 #pragma unroll
         for (int r = 0; r < rows_per_tg; r++) {
           if (r >= num_rows) break;
@@ -2194,6 +2198,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       [[buffer(26), function_constant(use_turboquant)]],                       \
       const device float *v_centroids                                          \
       [[buffer(27), function_constant(use_turboquant)]],                       \
+      constant int64_t &scale_block_stride                                    \
+      [[buffer(28), function_constant(use_turboquant)]],                       \
+      constant int64_t &scale_head_stride                                     \
+      [[buffer(29), function_constant(use_turboquant)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \

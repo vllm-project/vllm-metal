@@ -26,6 +26,8 @@
 namespace nb = nanobind;
 using namespace mlx::core;
 
+void register_mlx_patch(nb::module_& m);
+
 #ifndef VLLM_METAL_PARTITION_SIZE
 #define VLLM_METAL_PARTITION_SIZE 512
 #endif
@@ -607,6 +609,10 @@ static void dispatch_paged_attention_v2_online(
     enc.set_bytes(v_head_stride_i,  25);
     enc.set_input_array(*key_zero_cache, 26);
     enc.set_input_array(*v_centroids, 27);
+    int64_t scale_block_stride = key_scale_cache->strides()[0];
+    enc.set_bytes(scale_block_stride, 28);
+    int64_t scale_head_stride = key_scale_cache->strides()[2];
+    enc.set_bytes(scale_head_stride, 29);
   };
 
   // Sink logits (slot 18); bound only when the kernel was specialized with
@@ -1033,6 +1039,18 @@ class TQEncodePrimitive : public Primitive {
     enc.set_input_array(v_centroids,        8);
     enc.set_bytes(num_kv_heads_i,           9);
     enc.set_bytes(block_size_i,             10);
+    int64_t k_block_stride = inputs[2].strides()[0];
+    int64_t v_block_stride = inputs[3].strides()[0];
+    int64_t scale_block_stride = inputs[4].strides()[0];
+    enc.set_bytes(k_block_stride, 11);
+    enc.set_bytes(v_block_stride, 12);
+    enc.set_bytes(scale_block_stride, 13);
+    int64_t k_head_stride = inputs[2].strides()[2];
+    int64_t v_head_stride = inputs[3].strides()[2];
+    int64_t scale_head_stride = inputs[4].strides()[2];
+    enc.set_bytes(k_head_stride, 14);
+    enc.set_bytes(v_head_stride, 15);
+    enc.set_bytes(scale_head_stride, 16);
 
     enc.dispatch_threadgroups(
         MTL::Size::Make(num_tokens, num_kv_heads, 1),
@@ -1176,6 +1194,12 @@ class ReshapeAndCachePrimitive : public Primitive {
     enc.set_bytes(num_heads_i,    9);
     enc.set_bytes(head_size_i,    10);
     enc.set_bytes(block_size_i,   11);
+    int64_t cache_block_stride = inputs[2].strides()[0];
+    int64_t cache_token_stride = inputs[2].strides()[1];
+    int64_t cache_head_stride = inputs[2].strides()[2];
+    enc.set_bytes(cache_block_stride, 12);
+    enc.set_bytes(cache_token_stride, 13);
+    enc.set_bytes(cache_head_stride, 14);
 
     int tg = std::min(num_kv_heads * head_size, 256);
     enc.dispatch_threadgroups(
@@ -1223,7 +1247,8 @@ void init_gdn_library(const std::string& src) {
 
 class GDNStateScatterPrimitive : public Primitive {
  public:
-  explicit GDNStateScatterPrimitive(Stream stream) : Primitive(stream) {}
+  explicit GDNStateScatterPrimitive(Stream stream, bool zero = false)
+      : Primitive(stream), zero_(zero) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDNStateScatterPrimitive only supports GPU");
@@ -1247,7 +1272,13 @@ class GDNStateScatterPrimitive : public Primitive {
 
     // Four elements per thread when the row divides evenly, which every GDN
     // state layout does; the scalar kernel is the general fallback.
-    bool vec4 = (row_elems % 4) == 0;
+    bool dense_row = true;
+    size_t inner_stride = 1;
+    for (int axis = pool.ndim() - 1; axis > 0; --axis) {
+      dense_row &= pool.shape(axis) == 1 || pool.strides()[axis] == inner_stride;
+      inner_stride *= pool.shape(axis);
+    }
+    bool vec4 = dense_row && (row_elems % 4) == 0 && (pool.strides()[0] % 4) == 0;
     int lanes = vec4 ? row_elems / 4 : row_elems;
 
     auto s = stream();
@@ -1264,6 +1295,15 @@ class GDNStateScatterPrimitive : public Primitive {
     enc.set_input_array(src,         1);
     enc.set_input_array(dst_ids,     2);
     enc.set_bytes(lanes,             3);
+    int64_t row_stride = pool.strides()[0] / (vec4 ? 4 : 1);
+    enc.set_bytes(row_stride,        4);
+    enc.set_bytes(zero_,             8);
+    if (!vec4) {
+      enc.set_vector_bytes(pool.shape(), 5);
+      enc.set_vector_bytes(pool.strides(), 6);
+      int ndim = dense_row ? 0 : pool.ndim();
+      enc.set_bytes(ndim, 7);
+    }
 
     // 2D thread grid: x walks the row, y selects the update row. One
     // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
@@ -1282,19 +1322,22 @@ class GDNStateScatterPrimitive : public Primitive {
   const char* name() const override { return "GDNStateScatter"; }
 
   bool is_equivalent(const Primitive& other) const override {
-    return dynamic_cast<const GDNStateScatterPrimitive*>(&other) != nullptr;
+    auto* rhs = dynamic_cast<const GDNStateScatterPrimitive*>(&other);
+    return rhs && rhs->zero_ == zero_;
   }
+ private:
+  bool zero_;
 };
 
 static array gdn_state_scatter_primitive_fn(
-    const array& pool, const array& src, const array& dst_ids) {
+    const array& pool, const array& src, const array& dst_ids, bool zero = false) {
   if (pool.ndim() < 2) {
     throw std::runtime_error(
         "gdn_state_scatter: pool must be [num_slots, ...]");
   }
   if (pool.dtype() != float16 &&
       pool.dtype() != bfloat16 &&
-      pool.dtype() != float32) {
+        pool.dtype() != float32 && pool.dtype() != uint8 && pool.dtype() != int8) {
     throw std::runtime_error(
         "gdn_state_scatter: pool dtype must be float16, bfloat16 or float32");
   }
@@ -1314,21 +1357,19 @@ static array gdn_state_scatter_primitive_fn(
     throw std::runtime_error(
         "gdn_state_scatter: src row shape does not match pool row shape");
   }
-  if (static_cast<size_t>(src.shape(0)) != dst_ids.size()) {
+  if (!zero && static_cast<size_t>(src.shape(0)) != dst_ids.size()) {
     throw std::runtime_error(
         "gdn_state_scatter: one dst id per src row required");
   }
-  // The Metal kernel flattens all three inputs. Make strided views contiguous
-  // inside the MLX graph. The returned handle aliases this materialized pool,
-  // so callers must rebind it even when the input pool was already contiguous.
-  auto contiguous_pool = contiguous(pool);
-  auto contiguous_src = contiguous(src);
+  // State components have dense inner rows but a padded physical page stride.
+  // Never materialize the destination: that would break shared cache storage.
+  auto contiguous_src = zero ? pool : contiguous(src);
   auto contiguous_ids = contiguous(dst_ids);
   auto prim = std::make_shared<GDNStateScatterPrimitive>(
-      default_stream(Device::gpu));
+      default_stream(Device::gpu), zero);
   return array::make_arrays(
       {pool.shape()}, {pool.dtype()}, prim,
-      {contiguous_pool, contiguous_src, contiguous_ids})[0];
+      {pool, contiguous_src, contiguous_ids})[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,6 +1636,8 @@ void gdn_linear_attention_impl(
   enc.set_bytes(Hv, 11);
   enc.set_bytes(Dk, 12);
   enc.set_bytes(Dv, 13);
+  int64_t state_stride = state_pool.strides()[0];
+  enc.set_bytes(state_stride, 14);
 
   // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
   enc.dispatch_threadgroups(
@@ -1616,6 +1659,7 @@ void gdn_linear_attention_impl(
 // ---------------------------------------------------------------------------
 
 NB_MODULE(_paged_ops, m) {
+  register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
@@ -1749,7 +1793,7 @@ NB_MODULE(_paged_ops, m) {
         "[num_blocks, block_size, num_kv_heads, head_size].");
 
   m.def("gdn_state_scatter",
-        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h) {
+        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h, bool zero) {
           // inst_ptr<array> on a non-array is undefined behaviour, so check
           // before dereferencing: a wrong type must raise, not crash.
           nb::object mx_array_cls =
@@ -1764,7 +1808,7 @@ NB_MODULE(_paged_ops, m) {
           auto result = gdn_state_scatter_primitive_fn(
               *nb::inst_ptr<array>(pool_h),
               *nb::inst_ptr<array>(src_h),
-              *nb::inst_ptr<array>(ids_h));
+              *nb::inst_ptr<array>(ids_h), zero);
 
           // Same placeholder dance as tq_encode / reshape_and_cache: mint an
           // mx.core.array and overwrite_descriptor to bypass cross-module
@@ -1776,11 +1820,11 @@ NB_MODULE(_paged_ops, m) {
           nb::inst_ptr<array>(out)->overwrite_descriptor(result);
           return out;
         },
-        nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"),
+        nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"), nb::arg("zero") = false,
         "In-place row scatter into a slot-indexed GDN state pool. Writes "
         "src[i] into pool[dst_ids[i]] without MLX's whole-pool copy preamble; "
-        "strided inputs are materialized first, and the returned array aliases "
-        "the resulting pool buffer, so the caller MUST rebind its pool "
+        "source rows and indices are made contiguous; destination strides and "
+        "backing storage are preserved, so the caller MUST rebind its pool "
         "reference. dst_ids must be distinct int32 slots; src is "
         "[n, *pool.shape[1:]] with pool's dtype.");
 

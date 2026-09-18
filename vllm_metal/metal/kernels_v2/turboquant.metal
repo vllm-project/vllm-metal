@@ -532,6 +532,12 @@ template <typename T, int HEAD_SIZE>
     const device float*   __restrict__ v_centroids        [[buffer(8)]],
     const constant int&   num_kv_heads                    [[buffer(9)]],
     const constant int&   block_size                      [[buffer(10)]],
+    constant int64_t& k_block_stride [[buffer(11)]],
+    constant int64_t& v_block_stride [[buffer(12)]],
+    constant int64_t& scale_block_stride [[buffer(13)]],
+    constant int64_t& k_head_stride [[buffer(14)]],
+    constant int64_t& v_head_stride [[buffer(15)]],
+    constant int64_t& scale_head_stride [[buffer(16)]],
     uint3 tgid  [[threadgroup_position_in_grid]],
     uint3 tid3  [[thread_position_in_threadgroup]],
     uint  sid   [[simdgroup_index_in_threadgroup]],
@@ -594,10 +600,10 @@ template <typename T, int HEAD_SIZE>
 
     // -------- Cache destination bases --------
     const int64_t token_base =
-        (int64_t(block_idx) * block_size + block_off) * num_kv_heads;
-    const int64_t kc_base     = (token_base + kvh) * k_packed;
-    const int64_t vc_base     = (token_base + kvh) * v_packed;
-    const int64_t scale_base  = (token_base + kvh) * scale_groups;
+        int64_t(block_off) * num_kv_heads;
+    const int64_t kc_base     = int64_t(block_idx) * k_block_stride + (token_base + kvh) * k_head_stride;
+    const int64_t vc_base     = int64_t(block_idx) * v_block_stride + (token_base + kvh) * v_head_stride;
+    const int64_t scale_base  = int64_t(block_idx) * scale_block_stride + (token_base + kvh) * scale_head_stride;
 
     // ======================================================================
     // K encode: asymmetric uniform, signed or unsigned.  All arithmetic
@@ -708,6 +714,12 @@ template <typename T, int HEAD_SIZE>
       const device float*   __restrict__ v_centroids        [[buffer(8)]],     \
       const constant int&   num_kv_heads                    [[buffer(9)]],     \
       const constant int&   block_size                      [[buffer(10)]],    \
+      constant int64_t& k_block_stride [[buffer(11)]],                         \
+      constant int64_t& v_block_stride [[buffer(12)]],                         \
+      constant int64_t& scale_block_stride [[buffer(13)]],                     \
+      constant int64_t& k_head_stride [[buffer(14)]],                          \
+      constant int64_t& v_head_stride [[buffer(15)]],                          \
+      constant int64_t& scale_head_stride [[buffer(16)]],                      \
       uint3 tgid  [[threadgroup_position_in_grid]],                            \
       uint3 tid3  [[thread_position_in_threadgroup]],                          \
       uint  sid   [[simdgroup_index_in_threadgroup]],                          \
