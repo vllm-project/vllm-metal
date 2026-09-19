@@ -410,10 +410,14 @@ RAY_ADDRESS=auto VLLM_HOST_IP=192.168.1.145 \
 ```
 
 The context and batching limits are the initial correctness-test settings, as
-under PP. `VLLM_METAL_EXPERT_PARTITION` is optional here: 128 experts divide
-evenly across two ranks (64/64). Set `VLLM_METAL_EXPERT_PARTITION="56,72"` to
-give one Mac more experts — one positive integer per rank, in rank order,
-summing to the model's routed-expert count — in both Ray node environments.
+under PP. `VLLM_METAL_EXPERT_PARTITION` partitions the 128 routed experts —
+one positive integer per rank, in rank order, summing to the model's
+routed-expert count — and must match in both Ray node environments. An even
+64/64 split does **not** fit a 48GB Mac at full expert width: the working set
+lands at the wired-limit ceiling and decode degrades into minutes-long steps
+(the model "hangs" without erroring). The neighboring `inference-ui` launcher
+therefore defaults experts mode to `56,72` — fewer experts on the smaller Mac,
+the analog of PP's `14,22` layer split; export the variable to override.
 
 - The router is replicated on both ranks. After the attention `all_sum`, both
   ranks hold identical activations, so both derive the same top-4 experts and
