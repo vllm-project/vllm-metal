@@ -930,12 +930,50 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   const int num_blocks_per_partition =
       USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
+  // Sliding window: keys before row 0's window start are masked for every
+  // row of this threadgroup (window-mode rows sit at later positions), so
+  // the blocks that hold only such keys are skipped instead of read and
+  // masked.  Without this a decode step on a Gemma 4 sliding layer read the
+  // whole context: 32x the KV it needs at 32K, on 25 of 30 layers.
+  int first_block_idx = 0;
+  if (sliding_window >= 0) {
+    const int window_start = effective_context_len - sliding_window;
+    if (window_start > 0) first_block_idx = window_start / BLOCK_SIZE;
+  }
+
   // [start_block_idx, end_block_idx) is the range of blocks to process.
-  const int start_block_idx =
+  const int partition_block_idx =
       USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
+  const int start_block_idx = MAX(partition_block_idx, first_block_idx);
   const int end_block_idx =
-      MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
+      MIN(partition_block_idx + num_blocks_per_partition, num_context_blocks);
   const int num_blocks = end_block_idx - start_block_idx;
+
+  if (USE_PARTITIONING && num_blocks <= 0) {
+    // Every key of this partition lies left of the window.  Write the same
+    // partial the masked loop produced for it (max 0, sum 0, zero output:
+    // the reduce gives it zero merge weight) and leave.
+    // num_heads / head_idx are declared further down; the same values.
+    const int nh = threadgroups_per_grid.x;
+    const int hi = threadgroup_position_in_grid.x;
+    const int rows = WINDOW_MODE ? num_rows : 1;
+    for (int r = 0; r < rows; r++) {
+      const int out_row = q_token_idx + r;
+      if (thread_idx == 0 && use_partitioning) {
+        max_logits[out_row * nh * max_num_partitions +
+                   hi * max_num_partitions + partition_idx] = 0.f;
+        exp_sums[out_row * nh * max_num_partitions +
+                 hi * max_num_partitions + partition_idx] = 0.f;
+      }
+      device T *out_ptr =
+          out + out_row * nh * max_num_partitions * HEAD_SIZE +
+          hi * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
+      for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+        out_ptr[d] = T(0);
+      }
+    }
+    return;
+  }
 
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   const int start_token_idx = start_block_idx * BLOCK_SIZE;
