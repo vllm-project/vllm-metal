@@ -378,7 +378,8 @@ smaller Mac than an uneven pipeline split; size the cache budget accordingly.
 
 The neighboring `inference-ui` project exposes a Pipeline-default selector with
 an explicit Apply action. It reloads backend children while retaining the UI and
-saved chats. Both modes have been exercised on the two-Mac GPT-OSS 120B checkpoint.
+saved chats. The Pipeline and Tensor modes have been exercised on the two-Mac
+GPT-OSS 120B checkpoint.
 
 ## GPT-OSS expert parallelism
 

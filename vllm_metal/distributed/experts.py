@@ -40,6 +40,7 @@ def apply_expert_shard(model, tp) -> None:
     before weight evaluation, on the same lazy lifecycle as apply_tensor_shard.
     Accepts either a TensorGroup or a bare mlx group.
     """
+    import mlx.core as mx
     from mlx.nn.layers.distributed import shard_linear
 
     group = getattr(tp, "group", tp)
@@ -54,6 +55,30 @@ def apply_expert_shard(model, tp) -> None:
     counts = expert_partition(group.size(), args.num_local_experts)
     start = sum(counts[: group.rank()])
     end = start + counts[group.rank()]
+
+    # Guard: ranks must agree on a contiguous partition covering every expert.
+    # Skipped for non-distributed groups (single-process and unit-test fakes).
+    if mx.distributed.is_available() and isinstance(group, mx.distributed.Group):
+        bounds = mx.distributed.all_gather(
+            mx.array([start, end], dtype=mx.int32), group=group, stream=mx.cpu
+        )
+        mx.eval(bounds)
+        flat = bounds.tolist()
+        expected_start = 0
+        for rank in range(tp.size()):
+            rank_start, rank_end = flat[2 * rank], flat[2 * rank + 1]
+            if rank_start != expected_start or rank_end <= rank_start:
+                raise ValueError(
+                    "Expert partitions disagree across ranks (check "
+                    "VLLM_METAL_EXPERT_PARTITION on every Mac); rank "
+                    f"{rank} owns [{rank_start}, {rank_end})."
+                )
+            expected_start = rank_end
+        if expected_start != args.num_local_experts:
+            raise ValueError(
+                "Expert partitions do not cover all "
+                f"{args.num_local_experts} experts; total ends at {expected_start}."
+            )
 
     for layer in model.layers:
         attn = layer.self_attn
