@@ -81,3 +81,40 @@ def apply_expert_shard(model, tp) -> None:
                 proj.biases = quant_biases[start:end]
         layer.mlp.sharding_group = group
         layer.mlp.expert_partition = (start, end)
+    install_expert_routing()
+
+
+def install_expert_routing() -> None:
+    """Route the replicated GPT-OSS router through rank-local experts.
+
+    Both ranks see identical activations (post-o_proj all_sum), so the global
+    top-k and softmax weights are identical; each rank zeroes the slots it
+    does not own and points them at a dummy local expert, and the existing
+    sharding_group all_sum sums the complementary partials — exact in exact
+    arithmetic. Dummy slots keep shapes static; their zero weight cancels
+    both expert output and bias.
+    """
+    import mlx.core as mx
+    from mlx_lm.models import gpt_oss as mlx_gpt_oss
+
+    if getattr(mlx_gpt_oss.MLPBlock, "_ep_routing_installed", False):
+        return
+    original = mlx_gpt_oss.MLPBlock.__call__
+
+    def ep_call(self, x):
+        if getattr(self, "expert_partition", None) is None:
+            return original(self, x)
+        start, end = self.expert_partition
+        g = self.router(x)
+        scores, indices = mlx_gpt_oss.mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
+        expert_weights = mx.softmax(scores, axis=-1, precise=True)
+        mask = (indices < start) | (indices >= end)
+        local = mx.where(mask, mx.zeros_like(indices), indices - start)
+        expert_weights = mx.where(mask, mx.zeros_like(expert_weights), expert_weights)
+        out = self.experts(x, local)
+        out = out * mx.expand_dims(expert_weights, axis=-1)
+        y = out.sum(axis=-2)
+        return mx.distributed.all_sum(y, group=self.sharding_group)
+
+    mlx_gpt_oss.MLPBlock.__call__ = ep_call
+    mlx_gpt_oss.MLPBlock._ep_routing_installed = True

@@ -148,3 +148,96 @@ def test_expert_shard_slices_experts_by_count_not_width(
             assert layer.mlp.router.weight.shape[0] == 4  # router stays full
             assert layer.mlp.sharding_group is not None
             assert layer.mlp.expert_partition == (start, start + expected)
+
+
+def _run_ep_forward(monkeypatch, shard0, shard1, tokens):
+    """One forward per rank, driven in lockstep on a shared activation.
+
+    Real ranks hold identical activations because every collective (attention
+    o_proj and masked MoE partial) all_sums both ranks' values. The fake
+    pairs each consecutive rank-0/rank-1 collective the same way, so rank 1's
+    every collective returns partial0 + partial1 and its logits are the
+    combined output. Sequential per-model forwards cannot emulate this:
+    collectives fire per layer, so the first rank's later layers would run on
+    unsynchronized activations."""
+    pending = []
+
+    def fake_all_sum(value, *, group=None, stream=None):
+        pending.append(value)
+        if len(pending) < 2:
+            return value
+        total = pending[0] + pending[1]
+        pending.clear()
+        mx.eval(total)
+        return total
+
+    monkeypatch.setattr(mx.distributed, "all_sum", fake_all_sum)
+    from mlx_lm.models.base import create_attention_mask
+
+    ids = mx.array(tokens, dtype=mx.int32)
+    x = shard0.model.embed_tokens(ids)
+    full_mask = create_attention_mask(x, None)
+    swa_mask = create_attention_mask(x, None, window_size=shard0.model.window_size)
+    for layer0, layer1, layer_type in zip(
+        shard0.model.layers, shard1.model.layers, shard0.model.layer_types, strict=True
+    ):
+        mask = full_mask if layer_type == "full_attention" else swa_mask
+        residual = x
+        h = layer0.input_layernorm(x)
+        layer0.self_attn(h, mask)  # rank 0 partial, superseded by rank 1's combine
+        x = residual + layer1.self_attn(h, mask)
+        residual = x
+        h = layer0.post_attention_layernorm(x)
+        layer0.mlp(h)  # rank 0 partial, superseded by rank 1's combine
+        x = residual + layer1.mlp(h)
+    logits = shard0.lm_head(shard0.model.norm(x))
+    mx.eval(logits)
+    return logits
+
+
+@pytest.mark.parametrize("quantized", [False, True], ids=["float32", "mxfp4-q8"])
+def test_expert_forward_matches_unsplit_reference(monkeypatch, quantized):
+    """Both ranks' masked partials, summed by all_sum, equal the unsplit MoE."""
+    from vllm_metal.distributed.experts import apply_expert_shard
+
+    tokens = [[1, 7, 11, 23, 42, 3, 9, 17, 5, 8, 2, 13]]  # 12 tokens x top-2 = 24 pairs
+    with mx.stream(mx.cpu):
+        reference = _ep_model(quantized=quantized)
+        expected = reference(mx.array(tokens, dtype=mx.int32))
+        mx.eval(expected)
+        from copy import deepcopy
+
+        shard0 = deepcopy(reference)
+        shard1 = deepcopy(reference)
+    monkeypatch.setenv("VLLM_METAL_EXPERT_PARTITION", "2,2")
+    apply_expert_shard(shard0, _Group(0, 2))
+    apply_expert_shard(shard1, _Group(1, 2))
+    combined = _run_ep_forward(monkeypatch, shard0, shard1, tokens)
+    tolerance = 1e-4 if not quantized else 5e-2
+    assert float(mx.max(mx.abs(combined - expected)).item()) <= tolerance
+
+
+def test_expert_routing_sorted_path_and_full_coverage(monkeypatch):
+    """Indices.size >= 64 exercises SwitchGLU's sorted path; a partition that
+    covers all experts on one rank must reproduce the reference exactly."""
+    from vllm_metal.distributed import experts as experts_mod
+    from vllm_metal.distributed.experts import apply_expert_shard
+
+    with mx.stream(mx.cpu):
+        reference = _ep_model()
+        from copy import deepcopy
+
+        full = deepcopy(reference)
+    with monkeypatch.context() as m:
+        m.setattr(experts_mod, "expert_partition", lambda ws, ne: [4, 0])
+        apply_expert_shard(full, _Group(0, 2))
+    assert full.layers[0].mlp.expert_partition == (0, 4)
+    monkeypatch.setattr(
+        mx.distributed, "all_sum", lambda value, *, group=None, stream=None: value
+    )
+    x = mx.random.normal((1, 32, 64))  # 32 tokens x top-2 = 64 pairs -> do_sort fires
+    with mx.stream(mx.cpu):
+        got = full.layers[0].mlp(x)
+        expected = reference.layers[0].mlp(x)
+        mx.eval(got, expected)
+    assert float(mx.max(mx.abs(got - expected)).item()) <= 1e-4
