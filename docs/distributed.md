@@ -371,13 +371,73 @@ Each tensor forward is evaluated before submitting the next prefill chunk, keepi
 cross-rank collectives ordered and preventing overlapping GPU/CPU fence cycles.
 
 Initial scope: two Macs, GPT-OSS MLX safetensors, DP=1, no combined PP, no LoRA,
-no speculative decoding, no asynchronous scheduling or expert parallelism.
+no speculative decoding, no asynchronous scheduling. Expert parallelism is this
+same topology plus `--enable-expert-parallel` — see the next section.
 Unsupported configurations fail at admission. TP can require more memory on the
 smaller Mac than an uneven pipeline split; size the cache budget accordingly.
 
 The neighboring `inference-ui` project exposes a Pipeline-default selector with
 an explicit Apply action. It reloads backend children while retaining the UI and
 saved chats. Both modes have been exercised on the two-Mac GPT-OSS 120B checkpoint.
+
+## GPT-OSS expert parallelism
+
+Expert parallelism (EP) is the third two-Mac GPT-OSS mode. Attention is sharded
+exactly as in [tensor parallelism](#gpt-oss-tensor-parallelism), but the 128
+routed experts per layer are split **by count** — each rank holds whole experts
+instead of a width-slice of every expert — so the Mac with more free memory can
+carry more of them. It reuses the tensor-mode requirements: the Ray executor,
+synchronous scheduling, and the explicit JACCL `tensor_transport` (no TCP
+fallback). Add `--enable-expert-parallel` to the tensor-mode serve command:
+
+```bash
+unset GLOO_SOCKET_IFNAME
+RAY_ADDRESS=auto VLLM_HOST_IP=192.168.1.145 \
+  vllm serve "$HOME/.exo/models/mlx-community--gpt-oss-120b-MXFP4-Q8" \
+    --served-model-name gpt-oss \
+    --distributed-executor-backend ray \
+    --tensor-parallel-size 2 --pipeline-parallel-size 1 \
+    --enable-expert-parallel \
+    --no-async-scheduling --dtype bfloat16 \
+    --reasoning-parser openai_gptoss \
+    --gpu-memory-utilization 0.93 \
+    --max-model-len 1024 --max-num-seqs 1 --max-num-batched-tokens 128 \
+    --additional-config '{"tensor_transport": {"backend": "jaccl",
+      "coordinator_port": 59451,
+      "device_matrix": [[null, ["rdma_en1", "rdma_en2"]],
+                        [["rdma_en2", "rdma_en1"], null]]}}'
+```
+
+The context and batching limits are the initial correctness-test settings, as
+under PP. `VLLM_METAL_EXPERT_PARTITION` is optional here: 128 experts divide
+evenly across two ranks (64/64). Set `VLLM_METAL_EXPERT_PARTITION="56,72"` to
+give one Mac more experts — one positive integer per rank, in rank order,
+summing to the model's routed-expert count — in both Ray node environments.
+
+- The router is replicated on both ranks. After the attention `all_sum`, both
+  ranks hold identical activations, so both derive the same top-4 experts and
+  the same softmax weights.
+- Each rank zeroes the slots it does not own — weight zero, dummy local expert
+  index to keep shapes static — runs only its local experts, and the per-layer
+  `all_sum` sums the two complementary partials. The combine is exact in exact
+  arithmetic. MXFP4 quantization groups never cross expert rows, so slicing
+  whole experts along the expert axis leaves every quantization group intact.
+
+**Limitations.**
+
+- **Same restrictions as tensor mode.** Two Macs, GPT-OSS, TP=2, PP=1, DP=1,
+  Ray executor, synchronous scheduling, MLX safetensors; LoRA, speculative
+  decoding, GGUF/AWQ, and multimodal fail at admission.
+- **Expert FLOPs are not halved.** The dummy slots keep shapes static, so each
+  rank runs about four expert GEMMs per token (roughly two real plus two
+  zeroed) — about twice the per-rank expert FLOPs of a perfect dispatch.
+  Filtering non-local pairs before the expert GEMMs is a deferred optimization.
+
+Validated by unit tests (tiny-model EP parity against the unsplit reference in
+float32 and MXFP4/Q8, sorted and unsorted SwitchGLU paths, exact within
+tolerance) and the two-Mac smoke
+(`tools/jaccl_pp_smoke.py --model gpt-oss --expert-parallel`); 120B serving
+validation is pending.
 
 ## Data parallelism
 

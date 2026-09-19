@@ -19,6 +19,7 @@
 | `VLLM_METAL_SPEC_INGEST_CHUNK` | `1024` | Maximum number of cold draft-model KV-ingest tokens processed per forward ([issue #482](https://github.com/vllm-project/vllm-metal/issues/482)). Chunking bounds each dispatch stall and the peak logits allocation; a multiple of the KV block size is recommended. Set to `0` to restore single-forward ingest. |
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
+| `VLLM_METAL_EXPERT_PARTITION` | None | Per-rank routed-expert counts for GPT-OSS expert parallelism (`--enable-expert-parallel`): comma-separated positive integers, one per rank in rank order, summing to the model's expert count (128 for GPT-OSS). Unset, the experts split evenly and startup errors if the count does not divide by the world size; set e.g. `"56,72"` for an uneven two-rank split. See [Distributed](distributed.md#gpt-oss-expert-parallelism). |
 
 ## Pipeline Transport
 
