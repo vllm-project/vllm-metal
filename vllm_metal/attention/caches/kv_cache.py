@@ -104,12 +104,12 @@ class MetalPagedKVCache:
                 key, value = kv.split((spec.head_size, spec.head_size_v), dim=-1)
             keys.append(key)
             values.append(value)
-        cache.key_caches = storage.views(keys)
-        cache.value_caches = storage.views(values)
+        cache.key_caches = storage.views(keys, names)
+        cache.value_caches = storage.views(values, names)
         if turboquant:
-            cache.key_scale_caches = storage.views(key_scales)
-            cache.value_scale_caches = storage.views(value_scales)
-            cache.key_zero_caches = storage.views(zeros)
+            cache.key_scale_caches = storage.views(key_scales, names)
+            cache.value_scale_caches = storage.views(value_scales, names)
+            cache.key_zero_caches = storage.views(zeros, names)
         else:
             cache.dtype = cache.key_caches[0].dtype
         cache._storage = storage

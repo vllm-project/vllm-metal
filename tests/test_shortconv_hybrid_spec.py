@@ -199,4 +199,8 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
         assert cache.layer_group_ordinal(indices[0]) != cache.layer_group_ordinal(
             indices[1]
         )
+    # Shared pools dedupe to one region per shared address; the stub's
+    # attention pages coincide with the conv addresses, so the deduped
+    # regions still cover exactly the upstream tensor span.
+    assert len(runtime.storage._region_storages) == 2
     assert runtime.storage.nbytes == scheduler_cache.kv_cache_tensors[0].size

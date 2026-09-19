@@ -9,6 +9,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCacheTensor,
     MambaSpec,
 )
@@ -64,7 +65,10 @@ def test_strided_state_writes_share_upstream_backing():
     assert torch.all(page[:16].view(torch.float16) == 7)
     assert torch.all(page[16:528].view(torch.float32) == 9)
     assert not storage.tensors["s0"].any()
-    assert storage.nbytes == 16384
+    # The state spec pads to the attention page size, so each attention layer
+    # region also carries its state sibling: two shared regions total.
+    block_stride = storage.config.kv_cache_tensors[0].block_stride
+    assert storage.nbytes == 2 * storage.config.num_blocks * block_stride
 
 
 def test_engine_can_limit_usable_blocks_without_resizing_the_backing():
@@ -72,9 +76,37 @@ def test_engine_can_limit_usable_blocks_without_resizing_the_backing():
 
     planned = make_storage(num_blocks=5).config
     storage = KVCacheStorage(replace(planned, num_blocks=3))
-    assert storage.nbytes == planned.kv_cache_tensors[0].size
+    # Per-region backing is sized by the engine-effective block count; the
+    # padded state pages share their attention layer's region.
+    block_stride = planned.kv_cache_tensors[0].block_stride
+    assert storage.nbytes == 2 * 3 * block_stride
     conv, recurrent = storage.state_views(["s0", "s1"])
     assert conv[0].shape[0] == recurrent[1].shape[0] == 3
+
+
+def test_layer_compact_layout_backs_every_layer_region_separately():
+    storage = make_storage()
+    # Two layer addresses (the padded state pages share the attention
+    # layer's region); each region is its own zeroed Metal buffer.
+    assert len(storage._region_storages) == 2
+    assert storage._region_by_name["a0"] != storage._region_by_name["a1"]
+    assert storage._region_by_name["a0"] == storage._region_by_name["s0"]
+    block_stride = storage.config.kv_cache_tensors[0].block_stride
+    assert storage.nbytes == 2 * storage.config.num_blocks * block_stride
+    for raw in storage._region_storages:
+        assert raw.numel() == storage.config.num_blocks * block_stride
+
+
+def test_views_bind_to_their_own_region_anchor():
+    storage = make_storage()
+    keys = storage.views([storage.tensors["a0"], storage.tensors["a1"]], ["a0", "a1"])
+    assert keys.regions == [
+        storage._region_by_name["a0"],
+        storage._region_by_name["a1"],
+    ]
+    conv, recurrent = storage.state_views(["s0", "s1"])
+    assert conv.regions == [storage._region_by_name["s0"], storage._region_by_name["s1"]]
+    assert recurrent.regions == conv.regions
 
 
 def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):
@@ -104,7 +136,7 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     storage = make_storage()
     tensor = storage.tensors["a0"].transpose(1, 2)
     key, value = tensor.split(32, dim=-1)
-    keys, values = storage.views([key]), storage.views([value])
+    keys, values = storage.views([key], ["a0"]), storage.views([value], ["a0"])
     new_k, new_v = get_ops().reshape_and_cache(
         mx.full((1, 1, 32), 3, dtype=mx.float16),
         mx.full((1, 1, 32), 5, dtype=mx.float16),
@@ -131,16 +163,12 @@ def test_attention_rejects_heads_outer_layouts(layout):
         MetalPagedKVCache.from_upstream(storage, ["a0", "a1"])
 
 
-def test_budget_above_buffer_limit_can_plan_and_initialize_shared_cache(monkeypatch):
+def _budget_planner(monkeypatch, layout: str, buffer_limit: int):
     from types import SimpleNamespace
-
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 
     from tests.stub_runner import make_cache_config
     from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
-    groups = make_storage().config.kv_cache_groups
-    buffer_limit = 16_384
     config = SimpleNamespace(cache_config=make_cache_config(gpu_memory_utilization=0.5))
     runner = SimpleNamespace(
         is_hybrid=True,
@@ -153,6 +181,11 @@ def test_budget_above_buffer_limit_can_plan_and_initialize_shared_cache(monkeypa
     )
     monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
     monkeypatch.setattr(
+        config.cache_config,
+        "get_resolved_kv_cache_layout",
+        lambda: KVCacheLayout[layout],
+    )
+    monkeypatch.setattr(
         mx,
         "device_info",
         lambda: {
@@ -160,11 +193,44 @@ def test_budget_above_buffer_limit_can_plan_and_initialize_shared_cache(monkeypa
             "max_buffer_length": buffer_limit,
         },
     )
+    return planner
+
+
+def test_budget_above_buffer_limit_splits_into_per_region_buffers(monkeypatch):
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    groups = make_storage().config.kv_cache_groups
+    buffer_limit = 16_384
+    planner = _budget_planner(monkeypatch, "LBNHC", buffer_limit)
 
     budget = planner.determine_available_memory()
-    planned = get_kv_cache_config_from_groups(config, groups, budget)
+    planned = get_kv_cache_config_from_groups(planner._worker.vllm_config, groups, budget)
     storage = KVCacheStorage(planned)
+
+    # Layer-compact layouts split the backing per layer region, so the budget
+    # is not capped at Metal's single-buffer limit.
+    assert budget == 2 * buffer_limit
+    assert 0 < storage.nbytes
+    assert all(
+        raw.numel() <= buffer_limit for raw in storage._region_storages
+    )
+    assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
+
+
+def test_budget_above_buffer_limit_still_caps_block_outermost_layouts(monkeypatch):
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    groups = make_storage().config.kv_cache_groups
+    buffer_limit = 16_384
+    planner = _budget_planner(monkeypatch, "BLNHC", buffer_limit)
+
+    budget = planner.determine_available_memory()
+    planned = get_kv_cache_config_from_groups(planner._worker.vllm_config, groups, budget)
+    from dataclasses import replace
+
+    storage = KVCacheStorage(replace(planned, kv_cache_layout="BLNHC"))
 
     assert budget == buffer_limit
     assert 0 < storage.nbytes <= buffer_limit
+    assert len(storage._region_storages) == 1
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks

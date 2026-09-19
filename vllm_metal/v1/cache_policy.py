@@ -11,6 +11,8 @@ import mlx.core as mx
 import torch
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+
+import vllm_metal.envs as envs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -981,17 +983,8 @@ class WorkerCachePlanner:
                 overhead=overhead,
             )
             budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
-            if self._worker.model_runner.is_hybrid:
-                # Hybrid KV and state share one Metal buffer.
-                buffer_limit = int(mx.device_info()["max_buffer_length"])
-                if budget > buffer_limit:
-                    logger.warning(
-                        "Reducing hybrid KV cache budget from %.2f GB to %.2f GB "
-                        "to fit Metal's single-buffer limit (max_buffer_length).",
-                        budget / 1e9,
-                        buffer_limit / 1e9,
-                    )
-                budget = min(budget, buffer_limit)
+            if self._worker.model_runner.is_hybrid and not self._layer_compact_layout:
+                budget = self._cap_hybrid_budget_at_buffer_limit(budget)
             logger.info(
                 "Mixed attention layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
@@ -1015,6 +1008,43 @@ class WorkerCachePlanner:
     ) -> int:
         """Return cache bytes after model weights and execution overhead."""
         return int(metal_limit * fraction) - model_memory - overhead
+
+    @property
+    def _layer_compact_layout(self) -> bool:
+        """Whether the resolved layout lets the hybrid backing split per layer."""
+        layout = self._worker.vllm_config.cache_config.get_resolved_kv_cache_layout()
+        return layout.is_layer_compact
+
+    def _cap_hybrid_budget_at_buffer_limit(self, budget: int) -> int:
+        """Cap the hybrid cache budget at Metal's single-buffer limit.
+
+        Block-outermost layouts interleave every group inside one block, so
+        the hybrid KV and state backing must be one Metal allocation and fits
+        ``max_buffer_length`` only. Layer-compact layouts split the backing
+        per layer region instead (see ``KVCacheStorage``) and skip this cap.
+        The reduction is announced with both sizes in the capacity log;
+        ``VLLM_METAL_HYBRID_BUFFER_CAP=error`` turns it into a startup
+        failure for operators who need the full requested capacity.
+        """
+        buffer_limit = int(mx.device_info()["max_buffer_length"])
+        if budget <= buffer_limit:
+            return budget
+        requested = budget
+        budget = buffer_limit
+        message = (
+            "Block-outermost layout backs hybrid KV and state with one Metal "
+            f"allocation capped at max_buffer_length: requested "
+            f"{requested / 1e9:.2f} GB of cache, "
+            f"reporting {budget / 1e9:.2f} GB ({(requested - budget) / 1e9:.2f} GB "
+            "short of the request; scheduler block counts are derived from the "
+            "capped budget). Lower --gpu-memory-utilization to make the request "
+            "fit the device limit, or set VLLM_METAL_HYBRID_BUFFER_CAP=error to "
+            "fail startup instead of serving with reduced capacity."
+        )
+        if envs.VLLM_METAL_HYBRID_BUFFER_CAP == "error":
+            raise ValueError(message)
+        logger.warning("%s", message)
+        return budget
 
     def _paged_attention_plan(
         self, *, overhead: int, require_min_blocks: bool = True

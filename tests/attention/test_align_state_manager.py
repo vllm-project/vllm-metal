@@ -163,8 +163,11 @@ class TestHybridAlignRuntime:
         runtime = self._make_runtime()
         config = initialize_hybrid_runtime(runtime, 8, mamba_cache_mode="align")
         assert runtime.state_cache.conv_states[0].shape[0] == config.num_blocks
+        # The stub overlays attention and state tensors on the same addresses;
+        # region dedupe preserves that sharing, so the backing equals the
+        # upstream tensor size.
         assert runtime.storage.nbytes == config.kv_cache_tensors[0].size
-        # One allocation supplies attention and state, with no extra state budget.
+        assert len(runtime.storage._region_storages) == 2
         assert runtime.kv_cache._storage is runtime.storage
 
     def test_initialize_wires_state_manager_delegation(self) -> None:
