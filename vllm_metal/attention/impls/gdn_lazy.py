@@ -211,10 +211,7 @@ class GDNLazyKernels:
         output_names: list[str],
         source: str,
     ) -> Any | None:
-        try:
-            if not mx.metal.is_available():
-                return None
-        except AttributeError:
+        if not mx.metal.is_available():
             return None
         kernel = mx.fast.metal_kernel(
             name=name,

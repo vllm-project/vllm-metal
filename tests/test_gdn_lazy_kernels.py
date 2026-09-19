@@ -1855,8 +1855,8 @@ class TestNativeGDNStateScatter:
         ops = _get_native_ops_or_skip()
         backing = mx.full((80,), 99, dtype=dtype)
         source = mx.arange(16).astype(dtype)
-        pool = ops.cache_view(backing, (4, 8), (16, 1), dst_offset)
-        rows = ops.cache_view(source, (1, 8), (8, 1), src_offset)
+        pool = ops.as_strided(backing, (4, 8), (16, 1), offset=dst_offset)
+        rows = ops.as_strided(source, (1, 8), (8, 1), offset=src_offset)
 
         updated = ops.gdn_state_scatter(pool, rows, mx.array([2]), zero=zero)
         mx.eval(updated)

@@ -44,9 +44,9 @@ template <typename T>
   pool[dst + offset] = zero ? T(0) : src[row * row_elems + i];
 }
 
-// Same, four elements per thread. Selected by the host when row_elems is a
-// multiple of 4 -- true for every GDN state layout in practice (a conv row is
-// (kernel-1)*conv_dim, a recurrent row is heads*d_v*d_k).
+// Same scatter, four elements per thread. The host selects this kernel for
+// dense rows whose lengths, row strides, and source/destination pointers meet
+// vec<T, 4> alignment requirements; other supported views use the scalar kernel.
 template <typename T>
 [[kernel]] void gdn_state_scatter_rows_vec4(
     device T *pool [[buffer(0)]], const device T *src [[buffer(1)]],

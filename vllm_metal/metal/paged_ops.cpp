@@ -1271,8 +1271,9 @@ class GDNStateScatterPrimitive : public Primitive {
     }
     int row_elems = static_cast<int>(pool.size() / pool.shape(0));
 
-    // Four elements per thread when the row divides evenly, which every GDN
-    // state layout does; the scalar kernel is the general fallback.
+    // Both GPU kernels scatter the same rows. Select four elements per thread
+    // for dense, vector-aligned rows, or one element per thread for other views.
+    // This selection happens before launch.
     bool dense_row = true;
     size_t inner_stride = 1;
     for (int axis = pool.ndim() - 1; axis > 0; --axis) {
