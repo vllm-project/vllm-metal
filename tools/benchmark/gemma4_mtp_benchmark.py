@@ -103,10 +103,7 @@ def environment_metadata() -> dict[str, Any]:
         "transformers": _package_version("transformers"),
         "env": {
             name: os.environ.get(name)
-            for name in (
-                "VLLM_METAL_MEMORY_FRACTION",
-                "VLLM_ENABLE_V1_MULTIPROCESSING",
-            )
+            for name in ("VLLM_ENABLE_V1_MULTIPROCESSING",)
             if os.environ.get(name) is not None
         },
     }

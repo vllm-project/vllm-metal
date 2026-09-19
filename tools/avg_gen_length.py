@@ -8,16 +8,16 @@ Usage:
         --repo-type dataset --local-dir . ShareGPT_V3_unfiltered_cleaned_split.json
 
     # Batch size 1 (sequential):
-    VLLM_METAL_MEMORY_FRACTION=0.7 \
-        python tools/avg_gen_length.py --max-num-seqs 1
+    python tools/avg_gen_length.py --max-num-seqs 1 \
+        --gpu-memory-utilization 0.7
 
     # Batch size 8:
-    VLLM_METAL_MEMORY_FRACTION=0.7 \
-        python tools/avg_gen_length.py --max-num-seqs 8
+    python tools/avg_gen_length.py --max-num-seqs 8 \
+        --gpu-memory-utilization 0.7
 
     # Compare both in one run (reloads model for each):
-    VLLM_METAL_MEMORY_FRACTION=0.7 \
-        python tools/avg_gen_length.py --max-num-seqs 1 8
+    python tools/avg_gen_length.py --max-num-seqs 1 8 \
+        --gpu-memory-utilization 0.7
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ def run_offline(
     max_tokens: int,
     max_model_len: int,
     max_num_seqs: int,
+    gpu_memory_utilization: float,
     seed: int,
 ) -> list[int]:
     """Run offline inference, return list of completion token counts."""
@@ -62,6 +63,7 @@ def run_offline(
         model=model,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
     sampling_params = SamplingParams(temperature=0, seed=seed, max_tokens=max_tokens)
 
@@ -109,6 +111,7 @@ def main() -> None:
         help="Max concurrent sequences (batch sizes) to test",
     )
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -120,7 +123,13 @@ def main() -> None:
     for mns in args.max_num_seqs:
         print(f"\nRunning with max_num_seqs={mns} ...")
         counts = run_offline(
-            args.model, prompts, args.max_tokens, args.max_model_len, mns, args.seed
+            args.model,
+            prompts,
+            args.max_tokens,
+            args.max_model_len,
+            mns,
+            args.gpu_memory_utilization,
+            args.seed,
         )
         results[mns] = counts
 

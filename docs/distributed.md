@@ -159,7 +159,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 ## Limitations
 
 - **Checkpoint loading.** PP lazily slices MLX-LM safetensors; AWQ and GGUF are rejected because their loaders materialize the full model before slicing.
-- **Co-located stages oversubscribe the KV budget.** Each stage applies `VLLM_METAL_MEMORY_FRACTION` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
+- **Co-located stages oversubscribe the KV budget.** Each stage applies `--gpu-memory-utilization` to the whole device independently; neither knows the other exists, so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
 - **Model support.** YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
@@ -174,8 +174,9 @@ Dense DP needs no cross-device collective — vLLM runs each replica as a fully 
 
 ```bash
 # Mac A (head): one full replica per Mac, Ray DP backend, internal LB.
-RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_MEMORY_FRACTION=0.5 \
+RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 \
   vllm serve mlx-community/Qwen3-8B-4bit \
+    --gpu-memory-utilization 0.5 \
     --max-model-len 8192 \
     --data-parallel-size 2 \
     --data-parallel-backend ray \

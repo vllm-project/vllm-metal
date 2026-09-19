@@ -76,9 +76,9 @@ cache-on by toggling `--enable-prefix-caching` / `--no-enable-prefix-caching`.
 **1. Start the server:**
 
 ```bash
-# Adjust MEMORY_FRACTION based on available RAM (lower if OOM).
-VLLM_METAL_MEMORY_FRACTION=0.7 \
-  vllm serve Qwen/Qwen3-0.6B \
+# Adjust --gpu-memory-utilization based on available RAM (lower if OOM).
+vllm serve Qwen/Qwen3-0.6B \
+    --gpu-memory-utilization 0.7 \
     --port 8000 --max-model-len 2048 --max-num-seqs 8 \
     --enable-prefix-caching
 ```
@@ -113,10 +113,10 @@ assistant. Run one mode per process so model state does not leak between runs:
 ```bash
 source .venv-vllm-metal/bin/activate
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export VLLM_METAL_MEMORY_FRACTION=0.5
 
 python -m tools.benchmark.gemma4_mtp_benchmark \
   --model /path/to/gemma-4-E2B-it \
+  --gpu-memory-utilization 0.5 \
   --batch-size 4 --max-tokens 64 --repeats 1 --warmup 0 \
   --ignore-eos --max-model-len 1024 --max-num-batched-tokens 512 \
   --label e2b-baseline-bs4-64 \
@@ -125,6 +125,7 @@ python -m tools.benchmark.gemma4_mtp_benchmark \
 python -m tools.benchmark.gemma4_mtp_benchmark \
   --model /path/to/gemma-4-E2B-it \
   --assistant-model /path/to/gemma-4-E2B-it-assistant-bf16 \
+  --gpu-memory-utilization 0.5 \
   --num-speculative-tokens 3 \
   --batch-size 4 --max-tokens 64 --repeats 1 --warmup 0 \
   --ignore-eos --max-model-len 1024 --max-num-batched-tokens 512 \

@@ -46,8 +46,8 @@ Benchmark the intended batch shape before changing it.
 export TARGET=/path/to/gemma-4-E2B-it
 export ASSISTANT=/path/to/gemma-4-E2B-it-assistant-bf16
 
-VLLM_METAL_MEMORY_FRACTION=0.5 \
-  vllm serve "$TARGET" \
+vllm serve "$TARGET" \
+    --gpu-memory-utilization 0.5 \
     --max-model-len 1024 \
     --max-num-batched-tokens 1024 \
     --max-num-seqs 4 \
@@ -68,8 +68,8 @@ Its committed KV cache shares the Metal KV memory budget with the target.
 ### Example
 
 ```bash
-VLLM_METAL_MEMORY_FRACTION=0.55 \
-  vllm serve Qwen/Qwen3-8B \
+vllm serve Qwen/Qwen3-8B \
+    --gpu-memory-utilization 0.55 \
     --max-model-len 2048 \
     --no-async-scheduling \
     --speculative-config '{"method":"draft_model","model":"Qwen/Qwen3-0.6B","num_speculative_tokens":3}'
@@ -82,8 +82,8 @@ for configuration details. This example sets `K=3` for one scheduled request
 and `K=0` for two:
 
 ```bash
-VLLM_METAL_MEMORY_FRACTION=0.55 \
-  vllm serve Qwen/Qwen3-8B \
+vllm serve Qwen/Qwen3-8B \
+    --gpu-memory-utilization 0.55 \
     --max-model-len 2048 \
     --max-num-seqs 2 \
     --no-async-scheduling \
