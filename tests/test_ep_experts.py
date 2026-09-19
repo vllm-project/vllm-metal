@@ -195,12 +195,25 @@ def _run_ep_forward(monkeypatch, shard0, shard1, tokens):
     return logits
 
 
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        [1, 7, 11, 23, 42, 3, 9, 17, 5, 8, 2, 13],  # 12 tokens x top-2 = 24 pairs
+        list(range(1, 33)),  # 32 tokens x top-2 = 64 pairs -> SwitchGLU sorts
+    ],
+    ids=["unsorted24", "sorted64"],
+)
 @pytest.mark.parametrize("quantized", [False, True], ids=["float32", "mxfp4-q8"])
-def test_expert_forward_matches_unsplit_reference(monkeypatch, quantized):
-    """Both ranks' masked partials, summed by all_sum, equal the unsplit MoE."""
+def test_expert_forward_matches_unsplit_reference(monkeypatch, tokens, quantized):
+    """Both ranks' masked partials, summed by all_sum, equal the unsplit MoE.
+
+    24 pairs stay below SwitchGLU's 64-slot sort threshold; 64 pairs take the
+    _gather_sort/sorted-gather path with remapped local indices, dummy-0
+    slots, and masking active on both ranks — production GPT-OSS (top-4)
+    sorts from 16 tokens up."""
     from vllm_metal.distributed.experts import apply_expert_shard
 
-    tokens = [[1, 7, 11, 23, 42, 3, 9, 17, 5, 8, 2, 13]]  # 12 tokens x top-2 = 24 pairs
+    tokens = [tokens]
     with mx.stream(mx.cpu):
         reference = _ep_model(quantized=quantized)
         expected = reference(mx.array(tokens, dtype=mx.int32))
@@ -218,8 +231,10 @@ def test_expert_forward_matches_unsplit_reference(monkeypatch, quantized):
 
 
 def test_expert_routing_sorted_path_and_full_coverage(monkeypatch):
-    """Indices.size >= 64 exercises SwitchGLU's sorted path; a partition that
-    covers all experts on one rank must reproduce the reference exactly."""
+    """Pin the sorted machinery under full coverage: 64 index pairs fire
+    _gather_sort, but partition (0, 4) leaves the weights unsliced — no
+    masking is active, so the output must match the reference exactly.
+    Masking under the sorted path is covered by the sorted64 case above."""
     from vllm_metal.distributed import experts as experts_mod
     from vllm_metal.distributed.experts import apply_expert_shard
 
