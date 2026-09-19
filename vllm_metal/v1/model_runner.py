@@ -323,6 +323,33 @@ class _PagedForwardState(NamedTuple):
     intermediate_only: bool = False
 
 
+def _apply_tensor_parallel_shards(runner: "MetalModelRunner") -> None:
+    """Shard weights per TP mode; both modes halve attention, so KV follows."""
+    if getattr(runner.tp, "expert_parallel", False):
+        from vllm_metal.distributed.experts import apply_expert_shard
+
+        apply_expert_shard(runner.model, runner.tp)
+        mode = "expert"
+    else:
+        from vllm_metal.distributed.tensor import apply_tensor_shard
+
+        apply_tensor_shard(runner.model, runner.tp)
+        mode = "tensor"
+    runner.num_kv_heads //= runner.tp.size
+    if runner.kv_heads_per_layer is not None:
+        runner.kv_heads_per_layer = [
+            n // runner.tp.size for n in runner.kv_heads_per_layer
+        ]
+    logger.info(
+        "%s shard rank=%d/%d layers=%d local_kv_heads=%d",
+        mode.capitalize(),
+        runner.tp.rank,
+        runner.tp.size,
+        runner.num_layers,
+        runner.num_kv_heads,
+    )
+
+
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
@@ -598,21 +625,7 @@ class MetalModelRunner:
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
         if self.tp is not None:
-            from vllm_metal.distributed.tensor import apply_tensor_shard
-
-            apply_tensor_shard(self.model, self.tp)
-            self.num_kv_heads //= self.tp.size
-            if self.kv_heads_per_layer is not None:
-                self.kv_heads_per_layer = [
-                    n // self.tp.size for n in self.kv_heads_per_layer
-                ]
-            logger.info(
-                "Tensor shard rank=%d/%d layers=%d local_kv_heads=%d",
-                self.tp.rank,
-                self.tp.size,
-                self.num_layers,
-                self.num_kv_heads,
-            )
+            _apply_tensor_parallel_shards(self)
         # Wraps modules in place, so it runs after the split prunes
         # non-owned layers (load -> split -> install; ordering test pins it).
         self._model_lifecycle.install_decode_dispatch()

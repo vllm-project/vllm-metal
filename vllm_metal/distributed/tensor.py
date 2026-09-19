@@ -56,10 +56,15 @@ class TensorGroup:
         self.group = group
         self.rank = group.rank()
         self.size = group.size()
+        self.expert_parallel = False
 
     @classmethod
     def bootstrap(cls, rank: int, peer_ips: list[str], config: Any) -> TensorGroup:
-        return cls(tensor_transport(config).bootstrap_jaccl(rank, peer_ips))
+        self = cls(tensor_transport(config).bootstrap_jaccl(rank, peer_ips))
+        self.expert_parallel = bool(
+            getattr(config.parallel_config, "enable_expert_parallel", False)
+        )
+        return self
 
     def synchronize_tokens(self, token_ids: list[int]) -> list[int]:
         """Broadcast rank-zero samples before any rank advances request state.

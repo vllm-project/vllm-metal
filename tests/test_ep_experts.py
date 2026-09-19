@@ -256,3 +256,64 @@ def test_expert_routing_sorted_path_and_full_coverage(monkeypatch):
         expected = reference.layers[0].mlp(x)
         mx.eval(got, expected)
     assert float(mx.max(mx.abs(got - expected)).item()) <= 1e-4
+
+
+def test_bootstrap_records_expert_parallel(monkeypatch):
+    from vllm_metal.distributed.tensor import TensorGroup
+    from vllm_metal.distributed.transport import PipelineTransportConfig
+
+    monkeypatch.setattr(
+        PipelineTransportConfig,
+        "bootstrap_jaccl",
+        classmethod(lambda cls, rank, peer_ips: _Group(rank, 2)),
+    )
+    cfg = _config()
+    assert TensorGroup.bootstrap(0, ["a", "b"], cfg).expert_parallel is False
+    cfg = _config()
+    cfg.parallel_config.enable_expert_parallel = True
+    assert TensorGroup.bootstrap(0, ["a", "b"], cfg).expert_parallel is True
+
+
+def test_runner_applies_expert_shard_when_flagged(monkeypatch):
+    import vllm_metal.v1.model_runner as runner_mod
+
+    calls = []
+
+    class _FakeExperts:
+        def apply_expert_shard(self, model, tp):
+            calls.append("ep")
+
+    class _FakeTensor:
+        def apply_tensor_shard(self, model, tp):
+            calls.append("tp")
+
+    import sys
+    import types
+
+    fake_experts = _FakeExperts()
+    fake_tensor = _FakeTensor()
+    runner_mod_experts = types.ModuleType("vllm_metal.distributed.experts")
+    runner_mod_experts.apply_expert_shard = fake_experts.apply_expert_shard
+    runner_mod_tensor = types.ModuleType("vllm_metal.distributed.tensor")
+    runner_mod_tensor.apply_tensor_shard = fake_tensor.apply_tensor_shard
+    monkeypatch.setitem(
+        sys.modules, "vllm_metal.distributed.experts", runner_mod_experts
+    )
+    monkeypatch.setitem(sys.modules, "vllm_metal.distributed.tensor", runner_mod_tensor)
+
+    tp = types.SimpleNamespace(rank=0, size=2, expert_parallel=True)
+    runner = types.SimpleNamespace(
+        tp=tp,
+        model=object(),
+        num_kv_heads=8,
+        num_layers=4,
+        kv_heads_per_layer=[8, 8],
+    )
+    # Extracted branch under test (see Step 3): a module-level helper keeps
+    # this testable without building a full MetalModelRunner.
+    runner_mod._apply_tensor_parallel_shards(runner)
+    assert calls == ["ep"]
+    runner.tp.expert_parallel = False
+    runner_mod._apply_tensor_parallel_shards(runner)
+    assert calls == ["ep", "tp"]
+    assert runner.num_kv_heads == 2 and runner.kv_heads_per_layer == [2, 2]
