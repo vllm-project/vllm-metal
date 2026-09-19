@@ -199,29 +199,22 @@ class SamplingBatch:
     ) -> bool:
         """Whether MLX categorical sampling matches *sampling_params_list*.
 
-        Requests must use plain temperature/top-k/top-p/min-p sampling with
-        one shared mask. Seeded requests stay on the torch path.
+        Requests must use plain temperature/top-k/top-p/min-p sampling; the
+        mask is built per row, so rows may mix greedy (temperature 0) with
+        random sampling and differ in top-k/top-p/min-p. Seeded requests
+        stay on the torch path.
         """
         if not sampling_params_list:
             return False
-        shared_top_k = len({sp.top_k for sp in sampling_params_list}) == 1
-        shared_top_p = len({sp.top_p for sp in sampling_params_list}) == 1
-        shared_min_p = len({sp.min_p for sp in sampling_params_list}) == 1
-        return (
-            shared_top_k
-            and shared_top_p
-            and shared_min_p
-            and all(
-                sp.temperature >= GREEDY_TEMPERATURE_EPS
-                and sp.seed is None
-                and sp.frequency_penalty == 0.0
-                and sp.presence_penalty == 0.0
-                and sp.repetition_penalty == 1.0
-                and sp.num_logprobs is None
-                and not sp.allowed_token_ids
-                and not sp.bad_words_token_ids
-                for sp in sampling_params_list
-            )
+        return all(
+            sp.seed is None
+            and sp.frequency_penalty == 0.0
+            and sp.presence_penalty == 0.0
+            and sp.repetition_penalty == 1.0
+            and sp.num_logprobs is None
+            and not sp.allowed_token_ids
+            and not sp.bad_words_token_ids
+            for sp in sampling_params_list
         )
 
     @classmethod
@@ -266,35 +259,72 @@ class SamplingBatch:
         top_p: float,
         min_p: float = 0.0,
     ) -> mx.array:
-        """Mask temperature-scaled logits to the native candidate set."""
+        """Mask temperature-scaled logits to the native candidate set.
+
+        Batch-wide scalar form of :meth:`_sorted_candidate_logits`, scattered
+        back into vocab order (used by the mask-parity tests).
+        """
+        rows = int(scaled_logits.shape[0])
+        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+            scaled_logits, [top_k] * rows, [top_p] * rows, [min_p] * rows
+        )
+        return mx.put_along_axis(
+            mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
+            sorted_idx,
+            sorted_desc,
+            axis=-1,
+        )
+
+    @staticmethod
+    def _sorted_candidate_logits(
+        scaled_logits: mx.array,
+        top_k: Sequence[int],
+        top_p: Sequence[float],
+        min_p: Sequence[float],
+    ) -> tuple[mx.array, mx.array]:
+        """Per-row top-k/min-p/top-p masking in descending-sorted order.
+
+        ``top_k``/``top_p``/``min_p`` hold one host value per row
+        (``top_k <= 0`` means no top-k), so the graph stays lazy: nothing
+        here evaluates an array. Returns ``(sorted_logits, sorted_token_ids)``:
+        every row's candidate logits in descending order with masked positions
+        at ``-inf``, and the vocab ids at those positions. When every row has a
+        top-k, only the ``max(top_k)`` largest logits per row are partitioned
+        out and sorted; the rest of the vocab is never a candidate, so this is
+        exact except for ties straddling that boundary.
+        """
         vocab_size = int(scaled_logits.shape[-1])
-        if 0 < top_k < vocab_size:
-            # Top-k can run before min-p: it preserves probability ratios
-            # among survivors and removes only tokens top-k would drop anyway.
-            kth_largest = mx.min(
-                mx.topk(scaled_logits, k=top_k, axis=-1), axis=-1, keepdims=True
-            )
-            scaled_logits = mx.where(
-                scaled_logits < kth_largest, -mx.inf, scaled_logits
-            )
-        if top_p < 1.0 or min_p > 0.0:
-            order_desc = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
-            sorted_desc = mx.take_along_axis(scaled_logits, order_desc, axis=-1)
-            if min_p > 0.0:
-                sorted_probs = mx.softmax(sorted_desc, axis=-1)
-                keep = sorted_probs >= min_p * sorted_probs[..., :1]
-                sorted_desc = mx.where(keep, sorted_desc, -mx.inf)
-            if top_p < 1.0:
-                sorted_probs = mx.softmax(sorted_desc, axis=-1)
-                leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
-                sorted_desc = mx.where(leading_mass < top_p, sorted_desc, -mx.inf)
-            scaled_logits = mx.put_along_axis(
-                mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
-                order_desc,
-                sorted_desc,
-                axis=-1,
-            )
-        return scaled_logits
+        effective_k = [k if 0 < k < vocab_size else vocab_size for k in top_k]
+        k_max = max(effective_k)
+        if k_max < vocab_size:
+            cand_idx = mx.argpartition(-scaled_logits, kth=k_max - 1, axis=-1)[
+                ..., :k_max
+            ]
+            cand = mx.take_along_axis(scaled_logits, cand_idx, axis=-1)
+            order = mx.argsort(-cand, axis=-1)
+            sorted_desc = mx.take_along_axis(cand, order, axis=-1)
+            sorted_idx = mx.take_along_axis(cand_idx, order, axis=-1)
+        else:
+            sorted_idx = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
+            sorted_desc = mx.take_along_axis(scaled_logits, sorted_idx, axis=-1)
+
+        if any(k < vocab_size for k in effective_k):
+            # Value threshold (not rank) so boundary ties survive like vLLM's
+            # top-k mask keeps every logit >= the k-th largest.
+            kth_pos = mx.array([k - 1 for k in effective_k], dtype=mx.int32)[:, None]
+            kth_value = mx.take_along_axis(sorted_desc, kth_pos, axis=-1)
+            sorted_desc = mx.where(sorted_desc < kth_value, -mx.inf, sorted_desc)
+        if any(p > 0.0 for p in min_p):
+            min_p_col = mx.array(min_p, dtype=mx.float32)[:, None]
+            sorted_probs = mx.softmax(sorted_desc, axis=-1)
+            keep = sorted_probs >= min_p_col * sorted_probs[..., :1]
+            sorted_desc = mx.where(keep, sorted_desc, -mx.inf)
+        if any(p < 1.0 for p in top_p):
+            top_p_col = mx.array(top_p, dtype=mx.float32)[:, None]
+            sorted_probs = mx.softmax(sorted_desc, axis=-1)
+            leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
+            sorted_desc = mx.where(leading_mass < top_p_col, sorted_desc, -mx.inf)
+        return sorted_desc, sorted_idx
 
     @classmethod
     def _native_random_tokens(
@@ -303,18 +333,36 @@ class SamplingBatch:
         sampling_params_list: Sequence[SamplingParams],
         key: mx.array,
     ) -> mx.array:
-        """Lazy temperature/top-k/top-p/min-p token ids, one per row."""
-        temperatures = mx.array(
-            [sp.temperature for sp in sampling_params_list], dtype=mx.float32
+        """Lazy per-row temperature/top-k/top-p/min-p token ids.
+
+        Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) become a
+        top-1 candidate set at unit temperature, so they resolve to the argmax
+        inside the same categorical draw as the random rows.
+        """
+        temperatures: list[float] = []
+        top_k: list[int] = []
+        top_p: list[float] = []
+        min_p: list[float] = []
+        for sp in sampling_params_list:
+            if sp.temperature < GREEDY_TEMPERATURE_EPS:
+                temperatures.append(1.0)
+                top_k.append(1)
+                top_p.append(1.0)
+                min_p.append(0.0)
+            else:
+                temperatures.append(sp.temperature)
+                top_k.append(sp.top_k)
+                top_p.append(sp.top_p)
+                min_p.append(sp.min_p)
+        scaled = (
+            logits_2d.astype(mx.float32)
+            / mx.array(temperatures, dtype=mx.float32)[:, None]
         )
-        scaled = logits_2d.astype(mx.float32) / temperatures[:, None]
-        masked = cls._top_k_top_p_masked_logits(
-            scaled,
-            sampling_params_list[0].top_k,
-            sampling_params_list[0].top_p,
-            min_p=sampling_params_list[0].min_p,
+        sorted_desc, sorted_idx = cls._sorted_candidate_logits(
+            scaled, top_k, top_p, min_p
         )
-        return mx.random.categorical(masked, axis=-1, key=key)
+        position = mx.random.categorical(sorted_desc, axis=-1, key=key)
+        return mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:
