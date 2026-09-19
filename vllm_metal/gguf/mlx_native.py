@@ -294,16 +294,13 @@ class GGUFMLXQuantizedTensor:
         """Pack per-row integer codes into MLX's packed ``uint32`` layout.
 
         Element ``i`` occupies flat bits ``[i*bits, (i+1)*bits)``,
-        little-endian within and across ``uint32`` words.
+        little-endian: ``32 // bits`` codes pack directly into each word.
         """
-        rows, cols = codes.shape
-        total_bits = cols * bits
-        bit_matrix = (
-            (codes[..., None].astype(np.uint32) >> np.arange(bits, dtype=np.uint32)) & 1
-        ).astype(np.uint64)
-        words = bit_matrix.reshape(rows, total_bits // 32, 32)
-        weights = np.uint64(1) << np.arange(32, dtype=np.uint64)
-        return (words * weights).sum(axis=-1).astype(np.uint32)
+        rows = codes.shape[0]
+        codes_per_word = 32 // bits
+        grouped = codes.reshape(rows, -1, codes_per_word)
+        shifts = np.arange(codes_per_word, dtype=np.uint32) * bits
+        return np.bitwise_or.reduce(grouped << shifts, axis=-1)
 
     @property
     def bits(self) -> int:
