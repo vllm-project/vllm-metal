@@ -44,17 +44,11 @@ def _run_real_gemma4_paged_path(
     *,
     skip_fast_prefill_hook: bool = False,
 ) -> tuple[dict[str, list[int]], bool]:
-    memory_fraction = os.environ.get(
-        "GEMMA4_FAST_PREFILL_MEMORY_FRACTION",
-        os.environ.get("VLLM_METAL_MEMORY_FRACTION", "0.5"),
+    gpu_memory_utilization = float(
+        os.environ.get("GEMMA4_FAST_PREFILL_MEMORY_FRACTION", "0.5")
     )
     env = os.environ.copy()
-    env.update(
-        {
-            "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-            "VLLM_METAL_MEMORY_FRACTION": memory_fraction,
-        }
-    )
+    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     script = f"""
 import json
@@ -80,6 +74,7 @@ with fast_prefill_hook:
         max_model_len={_REAL_GEMMA4_MAX_MODEL_LEN},
         max_num_seqs={len(_REAL_GEMMA4_PROMPTS)},
         enable_prefix_caching=False,
+        gpu_memory_utilization={gpu_memory_utilization!r},
     )
 runner = llm.llm_engine.model_executor.driver_worker.model_runner
 model = runner.model

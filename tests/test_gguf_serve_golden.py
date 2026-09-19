@@ -20,7 +20,6 @@ These load the GGUF directly through ``GGUFModelLoader``; the full
 model paths are set); kept OUT of the deterministic unit files (real
 checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
 
-    VLLM_METAL_MEMORY_FRACTION=0.5 \\
     VLLM_METAL_TEST_GGUF_SERVE_PATH=<...Qwen3-0.6B-Q8_0.gguf> \\
     VLLM_METAL_TEST_GGUF_TOKENIZER_PATH=<...Qwen3-0.6B dir> \\
     VLLM_METAL_TEST_GGUF_DENSE_PATH=<...Qwen3-0.6B dir> \\

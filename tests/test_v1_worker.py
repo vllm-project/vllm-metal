@@ -275,7 +275,6 @@ class TestPagedAttentionPlanDiagnostics:
 
         message = str(exc_info.value)
         assert "increase --gpu-memory-utilization (currently 0.15)" in message
-        assert "VLLM_METAL_MEMORY_FRACTION" not in message
 
     def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
         runner = SimpleNamespace(

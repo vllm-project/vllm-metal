@@ -129,12 +129,12 @@ def test_awq_e2e_paged_runner_smoke():
     try:
         with monkeypatch_ctx as mp:
             mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-            mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
             llm = LLM(
                 model=_AWQ_REPO,
                 max_model_len=512,
                 max_num_seqs=1,
+                gpu_memory_utilization=0.3,
             )
             sp = SamplingParams(temperature=0, max_tokens=16)
             outputs = llm.generate(["The capital of France is"], sp)
