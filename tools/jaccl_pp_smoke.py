@@ -9,7 +9,9 @@ Run once on each Mac with the same rank-ordered peer IPs and transport config:
 No model downloads: parity uses a small, seeded Qwen3 model by default.
 Use --model gpt-oss for alternating attention and routed experts. With that
 model, VLLM_PP_LAYER_PARTITION=3,5 tests an asymmetric split at an odd layer.
-This checks correctness, not performance or vLLM's Ray serving path.
+Add --expert-parallel to keep every layer on both Macs and split the routed
+experts instead of the pipeline stages. This checks correctness, not
+performance or vLLM's Ray serving path.
 """
 
 from __future__ import annotations
@@ -42,7 +44,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peer-ips", required=True, help="rank-ordered IPv4s: IP0,IP1")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--model", choices=("qwen3", "gpt-oss"), default="qwen3")
-    return parser.parse_args()
+    parser.add_argument(
+        "--expert-parallel",
+        action="store_true",
+        help="split routed experts across ranks instead of pipeline stages",
+    )
+    args = parser.parse_args()
+    if args.expert_parallel and args.model != "gpt-oss":
+        parser.error("--expert-parallel requires --model gpt-oss")
+    return args
 
 
 def load_config(args: argparse.Namespace) -> tuple[list[str], PipelineTransportConfig]:
@@ -265,6 +275,54 @@ def check_model_parity(pp: PipelineGroup, summary: dict, model_name: str) -> Non
         record["steps"].append(details)
 
 
+def check_expert_parity(
+    peer_ips: list[str], config: PipelineTransportConfig, rank: int, summary: dict
+) -> None:
+    """Tiny GPT-OSS under expert parallelism: both ranks compare to reference."""
+    from gpt_oss_smoke_model import parity_batches, tiny_model
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_metal.distributed.experts import apply_expert_shard
+    from vllm_metal.distributed.tensor import TensorGroup
+
+    # mx.distributed.init returns the process-wide JACCL group, so this reuses
+    # the connection the collective/activation checks already formed.
+    tg = TensorGroup(config.bootstrap_jaccl(rank, peer_ips))
+    batches = parity_batches()
+    reference = []
+    full = tiny_model()
+    ref_cache = make_prompt_cache(full)
+    for _, batch in batches:
+        logits = full(batch, cache=ref_cache)
+        mx.eval(logits)
+        reference.append(logits)
+    model = tiny_model()
+    apply_expert_shard(model, tg)
+    cache = make_prompt_cache(model)
+    record = {"steps": [], "tolerance": PARITY_TOLERANCE}
+    summary["tiny_gpt_oss_expert"] = record
+    for step, (label, batch) in enumerate(batches):
+        output = model(batch, cache=cache)
+        # Collectives inside the sharded forward are lazy: evaluate before
+        # comparing so both ranks contribute their expert partials.
+        mx.eval(output)
+        expected = reference[step]
+        difference = float(mx.max(mx.abs(output - expected)).item())
+        argmax_equal = bool(
+            mx.all(mx.argmax(output, axis=-1) == mx.argmax(expected, axis=-1)).item()
+        )
+        error = (
+            None
+            if difference <= PARITY_TOLERANCE and argmax_equal
+            else f"logits differ: max_abs_diff={difference}, {argmax_equal=}"
+        )
+        agree_check(tg, error, label)
+        summary["checks_passed"] += 1
+        record["steps"].append(
+            {"phase": label, "max_abs_diff": difference, "argmax_equal": argmax_equal}
+        )
+
+
 def versions() -> dict[str, str]:
     result = {"python": platform.python_version(), "macos": platform.mac_ver()[0]}
     for package in ("mlx", "mlx-lm", "vllm", "vllm-metal"):
@@ -299,11 +357,18 @@ def main() -> int:
         )
         check_all_sum(pp, summary)
         check_activations(pp, summary)
-        print(
-            f"Rank {pp.rank}: transfers passed; checking tiny {args.model} parity",
-            flush=True,
-        )
-        check_model_parity(pp, summary, args.model)
+        if args.expert_parallel:
+            print(
+                f"Rank {pp.rank}: transfers passed; checking expert-parallel parity",
+                flush=True,
+            )
+            check_expert_parity(peers, config, args.rank, summary)
+        else:
+            print(
+                f"Rank {pp.rank}: transfers passed; checking tiny {args.model} parity",
+                flush=True,
+            )
+            check_model_parity(pp, summary, args.model)
         summary["passed"] = True
     except Exception as exc:
         summary["error"] = f"{type(exc).__name__}: {exc}"
