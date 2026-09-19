@@ -3,8 +3,20 @@
     "backend": "jaccl",
     "coordinator_port": 59451,
     "device_matrix": [
-      [null, ["rdma_en1", "rdma_en2"]],
-      [["rdma_en2", "rdma_en1"], null]
+      [
+        null,
+        [
+          "rdma_en1",
+          "rdma_en2"
+        ]
+      ],
+      [
+        [
+          "rdma_en1",
+          "rdma_en2"
+        ],
+        null
+      ]
     ]
   }
 }

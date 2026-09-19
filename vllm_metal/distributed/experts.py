@@ -57,28 +57,43 @@ def apply_expert_shard(model, tp) -> None:
     end = start + counts[group.rank()]
 
     # Guard: ranks must agree on a contiguous partition covering every expert.
+    # all_sum, not all_gather: this mlx/JACCL build delivers all_gather zeros
+    # peer-to-peer on two rails (never exercised by the smoke or TP); all_sum
+    # is the reduction the smoke proves in both directions. The peer's [start,
+    # end] decodes as total minus mine; the squared terms catch a zeroed peer.
     # Skipped for non-distributed groups (single-process and unit-test fakes).
     if mx.distributed.is_available() and isinstance(group, mx.distributed.Group):
-        bounds = mx.distributed.all_gather(
-            mx.array([start, end], dtype=mx.int32), group=group, stream=mx.cpu
+        mine = mx.array(
+            [start, end, start * start, end * end], dtype=mx.int32
         )
-        mx.eval(bounds)
-        flat = bounds.tolist()
-        expected_start = 0
-        for rank in range(group.size()):
-            rank_start, rank_end = flat[2 * rank], flat[2 * rank + 1]
-            if rank_start != expected_start or rank_end <= rank_start:
-                raise ValueError(
-                    "Expert partitions disagree across ranks (check "
-                    "VLLM_METAL_EXPERT_PARTITION on every Mac); rank "
-                    f"{rank} owns [{rank_start}, {rank_end})."
-                )
-            expected_start = rank_end
-        if expected_start != args.num_local_experts:
+        total = mx.distributed.all_sum(mine, group=group, stream=mx.cpu)
+        mx.eval(total)
+        ts, te, ts_sq, te_sq = (int(v) for v in total.tolist())
+        peer_start, peer_end = ts - start, te - end
+        if (
+            peer_start * peer_start != ts_sq - start * start
+            or peer_end * peer_end != te_sq - end * end
+            or peer_end <= peer_start
+        ):
             raise ValueError(
-                "Expert partitions do not cover all "
-                f"{args.num_local_experts} experts; total ends at {expected_start}."
+                "Expert partitions disagree across ranks (check "
+                "VLLM_METAL_EXPERT_PARTITION on every Mac); peer decoded as "
+                f"[{peer_start}, {peer_end})."
             )
+        if group.rank() == 0:
+            if start != 0 or peer_start != end or peer_end != args.num_local_experts:
+                raise ValueError(
+                    "Expert partitions must be contiguous in rank order "
+                    f"(rank 0 owns [{start}, {end}), peer [{peer_start}, "
+                    f"{peer_end})); check VLLM_METAL_EXPERT_PARTITION."
+                )
+        else:
+            if end != args.num_local_experts or peer_end != start or peer_start != 0:
+                raise ValueError(
+                    "Expert partitions must be contiguous in rank order "
+                    f"(rank 1 owns [{start}, {end}), peer [{peer_start}, "
+                    f"{peer_end})); check VLLM_METAL_EXPERT_PARTITION."
+                )
 
     for layer in model.layers:
         attn = layer.self_attn

@@ -151,19 +151,22 @@ def test_expert_shard_slices_experts_by_count_not_width(
 
 
 def test_expert_shard_rejects_cross_rank_partition_disagreement(monkeypatch):
-    """The all_gather guard must fail loudly when ranks disagree, instead of
-    silently serving experts owned by neither rank. The outer fake mirrors
-    TensorGroup's production call shape: int `.size` attribute (no method)
-    plus a raw `.group` whose `rank()`/`size()` are methods."""
+    """The agreement guard must fail loudly when a peer reports a zeroed or
+    overlapping partition (all_gather delivers zeros on this mlx/JACCL build,
+    so the guard rides all_sum). The outer fake mirrors TensorGroup's
+    production call shape: int `.size` attribute plus a raw `.group` whose
+    `rank()`/`size()` are methods."""
     from types import SimpleNamespace
 
     from vllm_metal.distributed.experts import apply_expert_shard
 
     monkeypatch.setattr(mx.distributed, "Group", _Group)
+    # Rank 1 owns [2, 4); the peer's chunk arrived zeroed ([0, 0)) exactly as
+    # observed on real rails: total = mine + peer = [2, 4, 4, 16].
     monkeypatch.setattr(
         mx.distributed,
-        "all_gather",
-        lambda value, *, group=None, stream=None: mx.array([0, 2, 0, 2]),
+        "all_sum",
+        lambda value, *, group=None, stream=None: mx.array([2, 4, 4, 16]),
     )
     monkeypatch.setenv("VLLM_METAL_EXPERT_PARTITION", "2,2")
     tp = SimpleNamespace(size=2, group=_Group(1, 2))
@@ -171,6 +174,27 @@ def test_expert_shard_rejects_cross_rank_partition_disagreement(monkeypatch):
         model = _ep_model()
         with pytest.raises(ValueError, match="VLLM_METAL_EXPERT_PARTITION"):
             apply_expert_shard(model, tp)
+
+
+def test_expert_shard_accepts_contiguous_partition(monkeypatch):
+    """The all_sum agreement path admits the valid split: rank 0 [0,2) +
+    rank 1 [2,4) decodes consistently and slices through."""
+    from types import SimpleNamespace
+
+    from vllm_metal.distributed.experts import apply_expert_shard
+
+    monkeypatch.setattr(mx.distributed, "Group", _Group)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, *, group=None, stream=None: mx.array([2, 6, 4, 20]),
+    )
+    monkeypatch.setenv("VLLM_METAL_EXPERT_PARTITION", "2,2")
+    tp = SimpleNamespace(size=2, group=_Group(1, 2))
+    with mx.stream(mx.cpu):
+        model = _ep_model()
+        apply_expert_shard(model, tp)
+        assert model.layers[0].mlp.expert_partition == (2, 4)
 
 
 def _run_ep_forward(monkeypatch, shard0, shard1, tokens):
