@@ -10,7 +10,12 @@ from mlx_lm.models.base import scaled_dot_product_attention
 
 from vllm_metal import envs
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.context import get_context
+from vllm_metal.attention.context import (
+    get_context,
+    memoized_block_table_arrays,
+    memoized_context_lens,
+    memoized_cu_seqlens,
+)
 from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
@@ -172,8 +177,9 @@ class MLAPagedAttentionWrapper(nn.Module):
         padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
         block_tables_mx = mx.array(padded, dtype=mx.int32)
 
-        context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
-        cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
+        # Fixed per forward pass and reused across layers — memoized.
+        context_lens_mx = memoized_context_lens(ctx)
+        cu_seqlens_q_mx = memoized_cu_seqlens(ctx, ctx.cu_seqlens)
 
         out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
@@ -424,8 +430,9 @@ class MLAPagedAttentionWrapper(nn.Module):
             )
             return inner.o_proj(final)
 
-        # Pre-convert block tables once to avoid a new mx.array allocation per request
-        block_tables_mx = [mx.array(bt, dtype=mx.int32) for bt in ctx.block_tables]
+        # Pre-convert block tables once per forward instead of per request per
+        # layer — the tables are fixed for the duration of the pass (memoized).
+        block_tables_mx = memoized_block_table_arrays(ctx, ctx.block_tables)
 
         outputs = []
         for req_idx, ctx_len in enumerate(ctx.context_lens):

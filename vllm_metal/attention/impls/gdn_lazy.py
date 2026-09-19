@@ -71,6 +71,11 @@ class GDNRecurrentPrefillRequest(GDNRecurrentRequest):
     cu_seqlens: list[int]
     compute_dtype: mx.Dtype | None = None
     defer_state_scatter: bool = False
+    # Precomputed int32 copies of ``cu_seqlens`` / ``slot_ids``.  Serving
+    # callers memoize these per forward pass (the same values feed every GDN
+    # layer); when None the kernel path converts the lists itself.
+    cu_seqlens_arr: mx.array | None = None
+    slot_ids_arr: mx.array | None = None
 
 
 class GDNLazyKernels:
@@ -290,6 +295,8 @@ class GDNLazyKernels:
         cache_idx: int,
         slot_ids: list[int],
         cu_seqlens: list[int],
+        slot_ids_arr: mx.array | None = None,
+        cu_seqlens_arr: mx.array | None = None,
     ) -> mx.array | None:
         """Run the lazy GDN conv prefill-containing fast path, or return None."""
         num_requests = len(slot_ids)
@@ -314,8 +321,18 @@ class GDNLazyKernels:
         conv_state_in = state_cache.conv_states[cache_idx]
         output_dtype = mx.result_type(mixed_qkv, conv_state_in, inner.conv1d.weight)
         mixed_qkv_2d = mixed_qkv.reshape(total_tokens, conv_dim)
-        slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
-        cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
+        # Memoized by the serving caller (same arrays every layer); convert
+        # only when no precomputed copy was supplied.
+        slot_ids_arr = (
+            slot_ids_arr
+            if slot_ids_arr is not None
+            else mx.array(slot_ids, dtype=mx.int32)
+        )
+        cu_seqlens_arr = (
+            cu_seqlens_arr
+            if cu_seqlens_arr is not None
+            else mx.array(cu_seqlens, dtype=mx.int32)
+        )
 
         state_updates_shape = (num_requests, state_len, conv_dim)
         grid_size = (total_tokens + num_requests * state_len) * conv_dim
@@ -455,8 +472,18 @@ class GDNLazyKernels:
         if state_cache.has_pending_recurrent_state(request.cache_idx):
             state_cache.apply_pending_recurrent_state(request.cache_idx)
         state_in = state_cache.recurrent_states[request.cache_idx]
-        slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
-        cu_seqlens_arr = mx.array(request.cu_seqlens, dtype=mx.int32)
+        # Memoized by the serving caller (same arrays every layer); convert
+        # only when no precomputed copy was supplied.
+        slot_ids_arr = (
+            request.slot_ids_arr
+            if request.slot_ids_arr is not None
+            else mx.array(request.slot_ids, dtype=mx.int32)
+        )
+        cu_seqlens_arr = (
+            request.cu_seqlens_arr
+            if request.cu_seqlens_arr is not None
+            else mx.array(request.cu_seqlens, dtype=mx.int32)
+        )
         kernel_dtype = request.compute_dtype or request.output_dtype
         state_dtype = state_in.dtype
 

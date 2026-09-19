@@ -16,7 +16,12 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
-from vllm_metal.attention.context import PagedAttentionContext, get_context
+from vllm_metal.attention.context import (
+    PagedAttentionContext,
+    get_context,
+    memoized_cu_seqlens,
+    memoized_slot_ids,
+)
 from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
     GDNRecurrentDecodeRequest,
@@ -47,6 +52,11 @@ class _GDNForwardState:
     total_tokens: int
     slot_ids: list[int]
     num_decode_requests: int
+    # Memoized kernel-format copies of ``cu_seqlens`` / ``slot_ids``, built on
+    # first use per forward pass and shared across every GDN layer in the step
+    # (None in tests that construct the state directly).
+    cu_seqlens_arr: mx.array | None = None
+    slot_ids_arr: mx.array | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +182,8 @@ class GDNPagedAttentionWrapper(nn.Module):
             total_tokens=x.shape[1],
             slot_ids=slot_ids,
             num_decode_requests=ctx.num_decode_requests,
+            cu_seqlens_arr=memoized_cu_seqlens(ctx, cu_seqlens),
+            slot_ids_arr=memoized_slot_ids(ctx, slot_ids),
         )
 
     def _project_inputs(
@@ -222,7 +234,14 @@ class GDNPagedAttentionWrapper(nn.Module):
                 return conv_packed
         elif self._should_try_conv_prefill_containing_lazy(state):
             conv_packed = self._gdn_lazy.try_conv_prefill(
-                mixed_qkv, inner, state_cache, cache_idx, slot_ids, state.cu_seqlens
+                mixed_qkv,
+                inner,
+                state_cache,
+                cache_idx,
+                slot_ids,
+                state.cu_seqlens,
+                state.slot_ids_arr,
+                state.cu_seqlens_arr,
             )
             if conv_packed is not None:
                 return conv_packed
@@ -336,6 +355,8 @@ class GDNPagedAttentionWrapper(nn.Module):
                 cu_seqlens=state.cu_seqlens,
                 compute_dtype=self._recurrent_prefill_compute_dtype(),
                 defer_state_scatter=self._should_defer_recurrent_prefill_state(state),
+                cu_seqlens_arr=state.cu_seqlens_arr,
+                slot_ids_arr=state.slot_ids_arr,
             )
             y_flat = self._gdn_lazy.try_recurrent_prefill(request)
             if y_flat is not None:
@@ -430,9 +451,17 @@ class GDNPagedAttentionWrapper(nn.Module):
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(kernel_dtype))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(kernel_dtype))
 
-        cu_seqlens_arr = mx.array(state.cu_seqlens, dtype=mx.int32)
+        cu_seqlens_arr = (
+            state.cu_seqlens_arr
+            if state.cu_seqlens_arr is not None
+            else mx.array(state.cu_seqlens, dtype=mx.int32)
+        )
         # Stable request → slot mapping from model_runner's allocator.
-        slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
+        slot_mapping = (
+            state.slot_ids_arr
+            if state.slot_ids_arr is not None
+            else mx.array(state.slot_ids, dtype=mx.int32)
+        )
 
         y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
 

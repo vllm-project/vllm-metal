@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,13 @@ class PagedAttentionContext:
     kernel_metadata_cache: dict[tuple[int | None, int], Any] = field(
         default_factory=dict
     )
+    # Per-forward memo for shared kernel-format conversions (slot mappings,
+    # cu_seqlens, context lens, block tables, state slot ids).  Same lifetime
+    # rule: entries are built on the first layer that needs them and die with
+    # the forward, so they can never go stale.  Helpers:
+    # ``memoized_slot_mapping`` / ``memoized_cu_seqlens`` / ``memoized_slot_ids``
+    # / ``memoized_context_lens`` / ``memoized_block_table_arrays`` below.
+    array_memo: dict[tuple[Any, ...], Any] = field(default_factory=dict)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -110,6 +118,92 @@ def get_context() -> PagedAttentionContext | None:
 
 def clear_context() -> None:
     _thread_local.paged_ctx = None
+
+
+# ---------------------------------------------------------------------------
+# Memoized kernel-format conversions
+# ---------------------------------------------------------------------------
+
+# Memo key for the plain (group-zero) conversions below.
+_DEFAULT_MEMO_KEY = ("default",)
+
+
+def memoized_slot_mapping(ctx: PagedAttentionContext) -> mx.array:
+    """``ctx.slot_mapping`` as one int64 array, built once per forward.
+
+    Several attention or state wrappers consume the same mapping on every
+    layer of a step; converting the Python list is O(tokens) work per layer,
+    so the first layer builds the array and the rest reuse it.
+    """
+    memo = ctx.array_memo
+    arr = memo.get(_DEFAULT_MEMO_KEY + ("slot_mapping",))
+    if arr is None:
+        arr = mx.array(ctx.slot_mapping, dtype=mx.int64)
+        memo[_DEFAULT_MEMO_KEY + ("slot_mapping",)] = arr
+    return arr
+
+
+def memoized_cu_seqlens(
+    ctx: PagedAttentionContext,
+    cu_seqlens: list[int],
+) -> mx.array:
+    """``cu_seqlens`` boundaries as one int32 array, built once per forward.
+
+    Keyed by list identity: attention and GDN/state wrappers carry their own
+    (equivalent) boundary lists, and one array object per source keeps each
+    consumer's memo independent of list construction.
+    """
+    memo = ctx.array_memo
+    arr = memo.get(("cu_seqlens", id(cu_seqlens)))
+    if arr is None:
+        arr = mx.array(cu_seqlens, dtype=mx.int32)
+        memo[("cu_seqlens", id(cu_seqlens))] = arr
+    return arr
+
+
+def memoized_slot_ids(ctx: PagedAttentionContext, slot_ids: list[int]) -> mx.array:
+    """Request→state-slot ids as one int32 array, built once per forward.
+
+    The state manager derives ``slot_ids`` from the context on every layer;
+    the resulting lists hold equal values within one forward, so the memo is
+    keyed by value — the first layer's conversion is reused by the rest.
+    """
+    memo = ctx.array_memo
+    key = ("slot_ids", tuple(slot_ids))
+    arr = memo.get(key)
+    if arr is None:
+        arr = mx.array(slot_ids, dtype=mx.int32)
+        memo[key] = arr
+    return arr
+
+
+def memoized_context_lens(ctx: PagedAttentionContext) -> mx.array:
+    """``ctx.context_lens`` as one uint32 array, built once per forward."""
+    memo = ctx.array_memo
+    arr = memo.get(("context_lens",))
+    if arr is None:
+        arr = mx.array(ctx.context_lens, dtype=mx.uint32)
+        memo[("context_lens",)] = arr
+    return arr
+
+
+def memoized_block_table_arrays(
+    ctx: PagedAttentionContext,
+    block_tables: list[list[int]],
+) -> list[mx.array]:
+    """Per-request block tables as int32 arrays, built once per forward.
+
+    Keyed by list identity: the context's tables are fixed for the forward,
+    and the per-request fallback path re-converts the same lists on every
+    layer.
+    """
+    memo = ctx.array_memo
+    key = ("block_table_arrays", id(block_tables))
+    arrays = memo.get(key)
+    if arrays is None:
+        arrays = [mx.array(bt, dtype=mx.int32) for bt in block_tables]
+        memo[key] = arrays
+    return arrays
 
 
 # ---------------------------------------------------------------------------
