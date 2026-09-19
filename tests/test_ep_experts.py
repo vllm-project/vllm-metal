@@ -152,7 +152,11 @@ def test_expert_shard_slices_experts_by_count_not_width(
 
 def test_expert_shard_rejects_cross_rank_partition_disagreement(monkeypatch):
     """The all_gather guard must fail loudly when ranks disagree, instead of
-    silently serving experts owned by neither rank."""
+    silently serving experts owned by neither rank. The outer fake mirrors
+    TensorGroup's production call shape: int `.size` attribute (no method)
+    plus a raw `.group` whose `rank()`/`size()` are methods."""
+    from types import SimpleNamespace
+
     from vllm_metal.distributed.experts import apply_expert_shard
 
     monkeypatch.setattr(mx.distributed, "Group", _Group)
@@ -162,10 +166,11 @@ def test_expert_shard_rejects_cross_rank_partition_disagreement(monkeypatch):
         lambda value, *, group=None, stream=None: mx.array([0, 2, 0, 2]),
     )
     monkeypatch.setenv("VLLM_METAL_EXPERT_PARTITION", "2,2")
+    tp = SimpleNamespace(size=2, group=_Group(1, 2))
     with mx.stream(mx.cpu):
         model = _ep_model()
         with pytest.raises(ValueError, match="VLLM_METAL_EXPERT_PARTITION"):
-            apply_expert_shard(model, _Group(1, 2))
+            apply_expert_shard(model, tp)
 
 
 def _run_ep_forward(monkeypatch, shard0, shard1, tokens):

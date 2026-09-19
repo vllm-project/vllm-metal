@@ -65,7 +65,7 @@ def apply_expert_shard(model, tp) -> None:
         mx.eval(bounds)
         flat = bounds.tolist()
         expected_start = 0
-        for rank in range(tp.size()):
+        for rank in range(group.size()):
             rank_start, rank_end = flat[2 * rank], flat[2 * rank + 1]
             if rank_start != expected_start or rank_end <= rank_start:
                 raise ValueError(
