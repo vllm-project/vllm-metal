@@ -48,6 +48,50 @@ def _isolate_mb_buffer_default(monkeypatch):
         os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
 
 
+class TestJacclConfiguration:
+    @staticmethod
+    def config(transport, pp_size=2):
+        config = TestMetalPlatform()._platform_config(
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=pp_size, distributed_executor_backend="mp"
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+        )
+        config.additional_config = {"pipeline_transport": transport}
+        return config
+
+    def test_rejects_unknown_transport_at_configuration(self):
+        config = self.config({"backend": "jacl"})
+        with pytest.raises(ValueError, match="backend"):
+            MetalPlatform.check_and_update_config(config)
+
+    def test_rejects_missing_devices_before_starting_workers(self):
+        config = self.config({"backend": "jaccl"})
+        with pytest.raises(ValueError, match="device_matrix"):
+            MetalPlatform.check_and_update_config(config)
+
+    def test_jaccl_ignores_tcp_ring_port(self, monkeypatch):
+        config = self.config(
+            {
+                "backend": "jaccl",
+                "device_matrix": [[None, "rdma_en1"], ["rdma_en2", None]],
+            }
+        )
+        monkeypatch.setenv("VLLM_METAL_RING_BASE_PORT", "65535")
+        MetalPlatform.check_and_update_config(config)
+
+    def test_jaccl_rejects_context_parallelism(self):
+        config = self.config(
+            {
+                "backend": "jaccl",
+                "device_matrix": [[None, "rdma_en1"], ["rdma_en2", None]],
+            }
+        )
+        config.parallel_config.prefill_context_parallel_size = 2
+        with pytest.raises(NotImplementedError, match="context parallelism"):
+            MetalPlatform.check_and_update_config(config)
+
+
 class TestMetalPlatform:
     """Tests for MetalPlatform class."""
 
@@ -214,7 +258,7 @@ class TestMetalPlatform:
             model_config=None,
         )
         with pytest.raises(
-            NotImplementedError, match="alone or combined with pipeline"
+            NotImplementedError, match="combined parallelism is not supported"
         ):
             MetalPlatform.check_and_update_config(vllm_config)
 

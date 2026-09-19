@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline-parallel primitives for vLLM Metal (Phase 0: single node, N stages).
+"""Pipeline model stages and MLX transports for vLLM Metal.
 
 Convention (N-general, validated at 2 stages):
   - rank 0           = FIRST stage  (embeds the input tokens)
@@ -31,6 +31,7 @@ from mlx.utils import tree_flatten
 from vllm.distributed.utils import get_pp_indices
 
 import vllm_metal.envs as envs
+from vllm_metal.distributed.transport import PipelineTransportConfig
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +71,22 @@ class PipelineGroup:
     is BOTH the first and the last stage (straight-through, no comms).
     """
 
-    def __init__(self, group: Group) -> None:
+    def __init__(self, group: Group, backend: str = "ring") -> None:
         self.group = group
+        self.backend = backend
         self.rank: int = group.rank()
         self.size: int = group.size()
         self.is_first: bool = self.rank == 0
         self.is_last: bool = self.rank == self.size - 1
+
+    @classmethod
+    def bootstrap(
+        cls, rank: int, peer_ips: list[str], transport: PipelineTransportConfig
+    ) -> PipelineGroup:
+        """Initialize the explicitly configured activation transport."""
+        if transport.backend == "jaccl":
+            return cls(transport.bootstrap_jaccl(rank, peer_ips), backend="jaccl")
+        return cls.bootstrap_ring(rank, peer_ips)
 
     @classmethod
     def bootstrap_ring(cls, rank: int, peer_ips: list[str]) -> PipelineGroup:
@@ -161,8 +172,8 @@ def is_non_last_stage(pp: PipelineGroup | None) -> bool:
 def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int] | None:
     """Slice ``model`` in place to the stage owned by ``pp``.
 
-    Phase 0 = load-then-slice: every rank loads the full weights, then drops the
-    layers (and, off the last stage, the final norm) it does not own.
+    The loader keeps weights lazy; each rank drops non-owned layers before
+    evaluation. Only the final stage retains the final norm.
 
     - Fails LOUD if ``model.model.layers`` is not a sliceable ``list``.
     - Slices ``backbone.layers`` to this rank's contiguous range.
@@ -194,10 +205,51 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
         )
     backbone.layers = layers[start:end]
 
+    if getattr(model, "model_type", None) == "gpt_oss":
+        # GPT-OSS also uses these types to create its native per-layer caches.
+        # Keep args.layer_types global for the runner's separate metadata slice.
+        backbone.layer_types = backbone.layer_types[start:end]
+
     if not pp.is_last:
         backbone.norm = nn.Identity()
 
     return start, end
+
+
+def _gpt_oss_stage_hidden(
+    backbone: Any,
+    input_ids: mx.array,
+    input_embeddings: mx.array | None,
+    cache: Any,
+) -> mx.array:
+    """Run native GPT-OSS blocks with masks derived from this stage's caches.
+
+    The upstream backbone assumes that both attention types exist and indexes
+    their caches using global layer positions. An uneven slice may start with
+    full attention, or contain only one type. Build only the masks we own, before
+    any block advances its cache, while retaining native RoPE and sink attention.
+    """
+    from mlx_lm.models.base import create_attention_mask
+
+    h = (
+        backbone.embed_tokens(input_ids)
+        if input_embeddings is None
+        else input_embeddings
+    )
+    if cache is None:
+        cache = [None] * len(backbone.layers)
+
+    masks = {}
+    for layer_type, entry in zip(backbone.layer_types, cache, strict=True):
+        if layer_type not in masks:
+            window = backbone.window_size if layer_type == "sliding_attention" else None
+            masks[layer_type] = create_attention_mask(h, entry, window_size=window)
+
+    for layer, entry, layer_type in zip(
+        backbone.layers, cache, backbone.layer_types, strict=True
+    ):
+        h = layer(h, masks[layer_type], entry)
+    return backbone.norm(h)
 
 
 def pipeline_recv(
@@ -210,12 +262,22 @@ def pipeline_recv(
 
     The wire carries the compact 2D ``(n_tokens, hidden)`` activation; this adds
     the batch axis back so the result feeds straight into the model forward as
-    ``input_embeddings``. Lazy: the transfer only happens on ``mx.eval`` of the
-    returned array. The declared ``(shape, dtype)`` MUST exactly match the
-    sender's wire array — a mismatch deadlocks (the ring backend does not
-    validate across peers).
+    ``input_embeddings``. TCP ring stays lazy. JACCL completes the CPU-stream
+    receive before returning, so the downstream GPU does not wait on a remote
+    stage inside a Metal command buffer. The declared ``(shape, dtype)`` MUST
+    exactly match the sender's wire array — a mismatch deadlocks (the ring
+    backend does not validate across peers).
     """
-    wire = mx.distributed.recv((n_tokens, hidden), dtype, pp.rank - 1, group=pp.group)
+    stream = mx.cpu if pp.backend == "jaccl" else None
+    wire = mx.distributed.recv(
+        (n_tokens, hidden), dtype, pp.rank - 1, group=pp.group, stream=stream
+    )
+    if pp.backend == "jaccl":
+        # A lazy CPU receive in the GPU forward graph still inserts a Metal
+        # fence wait. Cold upstream prefill can exceed its watchdog deadline.
+        # Wait on the host before building that graph, using the same received
+        # activation buffer; sends remain asynchronously submitted by the runner.
+        mx.eval(wire)
     return wire[None]
 
 
@@ -234,7 +296,8 @@ def pipeline_send(h: mx.array, pp: PipelineGroup) -> mx.array:
             f"pipeline_send expects a (1, n_tokens, hidden) hidden state, "
             f"got shape {tuple(h.shape)}"
         )
-    return mx.distributed.send(h[0], pp.rank + 1, group=pp.group)
+    stream = mx.cpu if pp.backend == "jaccl" else None
+    return mx.distributed.send(h[0], pp.rank + 1, group=pp.group, stream=stream)
 
 
 class PipelinedModel:
@@ -305,13 +368,22 @@ class PipelinedModel:
     def _stage_forward(
         self, input_ids: mx.array, h_in: mx.array | None, *, cache: Any = None
     ) -> mx.array:
-        if self._pp.is_last:
+        if getattr(self._model, "model_type", None) == "gpt_oss":
+            if self._pp.size == 1:
+                return self._model(input_ids, cache=cache)
+            # GPT-OSS's outer Model accepts no input_embeddings argument. Its
+            # stage adapter preserves the backbone's native masking and blocks.
+            h_out = _gpt_oss_stage_hidden(self._model.model, input_ids, h_in, cache)
+            if self._pp.is_last:
+                return self._model.lm_head(h_out)
+        elif self._pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
+        else:
+            h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.
         # The downstream stage receives at the wire dtype (pipeline_recv); a
         # mismatch deadlocks the ring, which does not validate across peers.
-        h_out = self._model.model(input_ids, cache=cache, input_embeddings=h_in)
         if h_out.dtype != self._wire_dtype:
             raise TypeError(
                 f"PP stage produced hidden {h_out.dtype}, but the wire dtype "

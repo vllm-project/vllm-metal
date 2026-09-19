@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import gc
+import os
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -30,11 +32,14 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.config import get_config
 from vllm_metal.distributed import PipelineGroup
+from vllm_metal.distributed.gloo import bind_gloo_to_ipv4
+from vllm_metal.distributed.transport import PipelineTransportConfig
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
 if TYPE_CHECKING:
+    from vllm_metal.distributed.tensor import TensorGroup
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
     from vllm_metal.v1.model_runner import MetalModelRunner
 
@@ -49,19 +54,28 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize distributed environment for Metal worker."""
     parallel_config = vllm_config.parallel_config
-
-    init_distributed_environment(
-        parallel_config.world_size,
-        rank,
-        distributed_init_method,
-        local_rank,
-        backend="gloo",  # Use gloo for CPU-based distributed
+    control_ip = os.environ.get("VLLM_HOST_IP")
+    binding = (
+        bind_gloo_to_ipv4(control_ip)
+        if parallel_config.world_size > 1 and control_ip
+        else nullcontext()
     )
+    # Gloo otherwise resolves the Mac's hostname independently of Ray. Network
+    # service changes can make that resolve to loopback or a different link.
+    # Bind all world/device/CPU groups to the explicitly configured control IP.
+    with binding:
+        init_distributed_environment(
+            parallel_config.world_size,
+            rank,
+            distributed_init_method,
+            local_rank,
+            backend="gloo",
+        )
 
-    ensure_model_parallel_initialized(
-        parallel_config.tensor_parallel_size,
-        parallel_config.pipeline_parallel_size,
-    )
+        ensure_model_parallel_initialized(
+            parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size,
+        )
 
 
 class MetalWorker(WorkerBase):
@@ -115,9 +129,15 @@ class MetalWorker(WorkerBase):
         # init_device only when pipeline_parallel_size > 1; stays None on the
         # default single-stage path (no group object, no behavior change).
         self.pp: PipelineGroup | None = None
+        self.tp: TensorGroup | None = None
 
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
+        logger.info(
+            "Worker rank %d MLX_METAL_FAST_SYNCH=%s",
+            self.rank,
+            os.environ.get("MLX_METAL_FAST_SYNCH", "0 (MLX default)"),
+        )
         device_type = (
             mx.DeviceType.gpu
             if self.metal_config.mlx_device == "gpu"
@@ -142,17 +162,21 @@ class MetalWorker(WorkerBase):
             self.local_rank,
         )
 
-        # Pipeline parallelism: bring up the mx.distributed ring (the activation
+        # Pipeline parallelism: bring up the selected MLX transport (the activation
         # data plane, separate from gloo) and wrap it in a PipelineGroup. With
         # TP forced to 1, the global rank IS the pipeline stage index, so we use
         # self.rank directly. Gated on pipeline_parallel_size > 1 so the default
         # single-stage path creates no group and is byte-for-byte unchanged.
+        self.tp = None
         pp_size = self.parallel_config.pipeline_parallel_size
         if pp_size > 1:
+            transport = PipelineTransportConfig.from_additional_config(
+                self.vllm_config.additional_config, pp_size
+            )
             # PP+STT is rejected at config time (platform.check_and_update_config,
             # with the other PP guards), so only generation models reach here.
             # Discover every stage's node IP over the gloo control plane (already
-            # initialized above) so the MLX ring spans real hosts — the same path
+            # initialized above) so the transport spans real hosts — the same path
             # works single- or multi-node. peer_ips[r] is the IP of global rank r;
             # with TP forced to 1 the global rank is the pipeline-stage index.
             import torch.distributed as dist
@@ -160,13 +184,31 @@ class MetalWorker(WorkerBase):
 
             peer_ips: list[str] = [""] * self.parallel_config.world_size
             dist.all_gather_object(peer_ips, get_ip())
-            self.pp = PipelineGroup.bootstrap_ring(self.rank, peer_ips)
+            logger.info("Pipeline rank-to-IP mapping: %s", dict(enumerate(peer_ips)))
+            self.pp = PipelineGroup.bootstrap(self.rank, peer_ips, transport)
             logger.info(
-                "Pipeline stage %d/%d (is_first=%s, is_last=%s)",
+                "Pipeline stage %d/%d (is_first=%s, is_last=%s, backend=%s)",
                 self.pp.rank,
                 self.pp.size,
                 self.pp.is_first,
                 self.pp.is_last,
+                self.pp.backend,
+            )
+
+        if self.parallel_config.tensor_parallel_size > 1:
+            import torch.distributed as dist
+            from vllm.utils.network_utils import get_ip
+
+            from vllm_metal.distributed.tensor import TensorGroup
+
+            peer_ips = [""] * self.parallel_config.world_size
+            dist.all_gather_object(peer_ips, get_ip())
+            self.tp = TensorGroup.bootstrap(self.rank, peer_ips, self.vllm_config)
+            logger.info(
+                "Tensor rank %d/%d backend=jaccl peers=%s",
+                self.tp.rank,
+                self.tp.size,
+                peer_ips,
             )
 
         # Set random seed
@@ -197,6 +239,7 @@ class MetalWorker(WorkerBase):
             # Hand the pipeline group to the runner so its forward path can pipe
             # activations stage-to-stage. None on the default single-stage path.
             self.model_runner.pp = self.pp
+            self.model_runner.tp = self.tp
 
     def load_model(self) -> None:
         """Load the model onto the Metal device."""

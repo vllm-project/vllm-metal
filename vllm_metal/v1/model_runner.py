@@ -118,6 +118,8 @@ from vllm_metal.v1.spec_decode import (
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
+    from vllm_metal.distributed.tensor import TensorGroup
+
     # Kept out of the runtime import graph: draft_model_proposer.py pulls in
     # mlx_lm's model loader at module scope, which should only load when
     # draft_model speculative decoding is actually configured (see the lazy
@@ -412,6 +414,8 @@ class MetalModelRunner:
         # both to this stage's local slice under pipeline parallelism).
         self.num_layers: int = 0
         self.num_kv_cache_layers: int = 0
+        # Scheduler cache names remain global while runtime arrays are local.
+        self._pp_layer_start: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -431,6 +435,7 @@ class MetalModelRunner:
         # > 1). None means single-stage: the forward and sampling paths run
         # exactly as before, with no cross-stage send/recv.
         self.pp: PipelineGroup | None = None
+        self.tp: TensorGroup | None = None
         # PP-aware forward wrapper for this stage, built in apply_pipeline_split
         # when pp.size > 1; stays None on the single-stage path.
         self._pp_model: PipelinedModel | None = None
@@ -592,6 +597,22 @@ class MetalModelRunner:
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
+        if self.tp is not None:
+            from vllm_metal.distributed.tensor import apply_tensor_shard
+
+            apply_tensor_shard(self.model, self.tp)
+            self.num_kv_heads //= self.tp.size
+            if self.kv_heads_per_layer is not None:
+                self.kv_heads_per_layer = [
+                    n // self.tp.size for n in self.kv_heads_per_layer
+                ]
+            logger.info(
+                "Tensor shard rank=%d/%d layers=%d local_kv_heads=%d",
+                self.tp.rank,
+                self.tp.size,
+                self.num_layers,
+                self.num_kv_heads,
+            )
         # Wraps modules in place, so it runs after the split prunes
         # non-owned layers (load -> split -> install; ordering test pins it).
         self._model_lifecycle.install_decode_dispatch()
@@ -619,6 +640,7 @@ class MetalModelRunner:
         # other forward branches that never request selection.
         self._selective_logits_supported = (
             self.pp is None
+            and self.tp is None
             and not self._is_vlm
             and not self._lora.enabled
             and self._model_adapter.supports_selective_logits(self._forward_model)
@@ -661,8 +683,8 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated path (uniform SDPA attention, e.g. Qwen3) is supported under
-        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
+        Uniform SDPA and GPT-OSS's alternating sliding/full attention are
+        supported. Fail loud on YOCO / hybrid / MLA models whose
         KV-cache layer accounting does not map cleanly onto a contiguous layer
         slice yet.
         """
@@ -678,14 +700,18 @@ class MetalModelRunner:
         )
         if unsupported:
             raise NotImplementedError(
-                "Pipeline parallelism on Metal is validated only for uniform-"
-                "attention generation on the paged path (e.g. Qwen3 with "
-                "paged attention); YOCO / hybrid / MLA / "
+                "Pipeline parallelism on Metal supports uniform attention and "
+                "GPT-OSS generation on the paged path; YOCO / hybrid / MLA / "
                 "pooling / VLM (multimodal) configs are not "
                 "supported under PP yet."
             )
 
-        self._model_adapter.apply_pipeline_split(self.model, pp)
+        span = self._model_adapter.apply_pipeline_split(self.model, pp)
+        assert span is not None  # Multi-stage splits always return a layer span.
+        start, end = span
+        self._pp_layer_start = start
+        if self.sliding_window_per_layer is not None:
+            self.sliding_window_per_layer = self.sliding_window_per_layer[start:end]
         # Mirror the sliced backbone's local layer count onto the runner so
         # offset_caches and KV-cache sizing cover only this stage's layers.
         local_num_layers = len(self._forward_model.model.layers)
@@ -706,7 +732,13 @@ class MetalModelRunner:
         runtime = self._paged_attention_runtime
         if runtime is not None:
             runtime.extend_forward_eval_outputs(eval_outputs)
-        mx.async_eval(*eval_outputs)
+        if self.tp is not None:
+            # A prefill-only chunk returns without sampling/evaluating logits.
+            # Finish its collectives before either rank queues the next chunk;
+            # overlapping distributed graphs can form cross-rank fence cycles.
+            mx.eval(*eval_outputs)
+        else:
+            mx.async_eval(*eval_outputs)
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
@@ -1348,7 +1380,7 @@ class MetalModelRunner:
             and adapter.requires_explicit_positions
         )
         capabilities = RunnerCapabilities(
-            pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
+            pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE and self.tp is None,
             use_async_scheduling=self.use_async_scheduling,
             paged_runtime_active=self._paged_attention_runtime is not None,
             is_pooling=self._is_pooling,
@@ -1594,6 +1626,16 @@ class MetalModelRunner:
             self._sampler,
             vocab_size=vocab_size,
         )
+
+        if self.tp is not None:
+            # Every rank must advance with the same sampled tokens, including
+            # non-greedy requests. vLLM consumes the output from TP rank zero.
+            n_decode = len(decode_token_ids)
+            selected = self.tp.synchronize_tokens(
+                [ids[0] for ids in decode_token_ids] + prefill_result.token_ids
+            )
+            decode_token_ids = [[token] for token in selected[:n_decode]]
+            prefill_result.token_ids[:] = selected[n_decode:]
 
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):

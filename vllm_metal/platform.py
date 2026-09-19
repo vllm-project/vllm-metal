@@ -397,6 +397,20 @@ class MetalPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        from vllm_metal.distributed.transport import PipelineTransportConfig
+
+        pipeline_transport = PipelineTransportConfig.from_additional_config(
+            vllm_config.additional_config, parallel_config.pipeline_parallel_size
+        )
+        if pipeline_transport.backend == "jaccl" and (
+            parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "JACCL pipeline transport does not support context parallelism; "
+                "each global rank must identify exactly one pipeline stage."
+            )
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
         add = vllm_config.additional_config
@@ -592,7 +606,10 @@ class MetalPlatform(Platform):
         # mx.distributed data plane (point-to-point send/recv), wired in the
         # model runner (see MetalModelRunner._start_paged_forward). The control
         # plane stays on vLLM's gloo group; the two transports coexist.
-        if parallel_config.pipeline_parallel_size > 1:
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and pipeline_transport.backend == "ring"
+        ):
             base_port = envs.VLLM_METAL_RING_BASE_PORT
             max_port = base_port + parallel_config.pipeline_parallel_size - 1
             if max_port > 65535:
@@ -604,21 +621,10 @@ class MetalPlatform(Platform):
                     f"{max_port}"
                 )
 
-        # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
-        # GPU per node cannot shard a TP>1 model, and there is no cross-device
-        # collective wired in (mx.distributed). Only TP=1 is validated. Reject
-        # at config time rather than hang on Ray placement-group creation (one
-        # "mlx" resource per node) or silently misbehave. This is executor-
-        # agnostic: uni/mp are equally unable to run TP>1 on one device. This
-        # guard also rejects PP+TP — which must STAY rejected when TP support
-        # lands: PipelineGroup relies on global_rank == pipeline stage index,
-        # which only holds while world_size = PP * TP has TP == 1.
         if parallel_config.tensor_parallel_size > 1:
-            raise NotImplementedError(
-                "Metal/MLX does not support tensor parallelism yet "
-                "(tensor_parallel_size > 1), alone or combined with pipeline "
-                "parallelism; only TP=1 is validated."
-            )
+            from vllm_metal.distributed.tensor import validate_tensor_config
+
+            validate_tensor_config(vllm_config)
 
         # Data parallelism (dense models, one full replica per Mac via the Ray DP
         # backend). DP replicas are independent engines, not part of a single

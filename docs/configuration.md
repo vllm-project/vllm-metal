@@ -20,6 +20,19 @@
 | `VLLM_METAL_VISIBLE_DEVICES` | — | Set automatically by the Ray executor per worker (the device-control var); not user-configurable. See [Distributed](distributed.md). |
 | `VLLM_METAL_RING_BASE_PORT` | `32323` | Base TCP port for the MLX ring data plane under pipeline parallelism; stage *r* binds `base + r` (so the default is `32323`/`32324` for two stages). Set the **same** value on every node to move the ring off a busy port — e.g. when an `mlx.launch` job, a restart still in `TIME_WAIT`, or another PP job holds the default. See [Distributed](distributed.md#pipeline-parallelism). |
 
+## Pipeline Transport
+
+`--additional-config` accepts a `pipeline_transport` object:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `backend` | `"ring"` | `"ring"` for TCP or `"jaccl"` for strict RDMA |
+| `device_matrix` | required for JACCL | Rank-ordered MLX device matrix; strings or ordered lists for multiple rails |
+| `coordinator_port` | `59451` | JACCL TCP coordinator port on pipeline rank 0's discovered IPv4 address |
+
+JACCL-only options are rejected under `ring`; `VLLM_METAL_RING_BASE_PORT`
+applies only to TCP ring. See the [JACCL setup and validation](distributed.md#jaccl-rdma-pipeline-transport).
+
 ## MLX Command-Buffer Defaults
 
 On macOS the plugin defaults `MLX_MAX_OPS_PER_BUFFER` to `2000` via

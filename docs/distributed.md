@@ -1,9 +1,9 @@
 # Distributed Inference with Ray
 
 !!! note
-    For normal single-Mac serving you don't need any of this — use the default in-process executor. The Ray executor and pipeline parallelism below are for **multi-Mac** serving (running one model across several Macs). Single-node serving, the pipeline-parallel forward, and a two-Mac end-to-end run (Qwen3-0.6B over Thunderbolt) are validated; multi-Mac serving is still new — **verify it for your own models and setup before relying on it.**
+    For normal single-Mac serving you don't need any of this — use the default in-process executor. The Ray executor and distributed modes below are for **multi-Mac** serving (running one model across several Macs). Single-node serving, the pipeline-parallel forward, and a two-Mac end-to-end run (Qwen3-0.6B over Thunderbolt) are validated; multi-Mac serving is still new — **verify it for your own models and setup before relying on it.**
 
-vllm-metal can run under vLLM's **Ray distributed executor**, placing each Apple-Silicon worker as a Ray actor. This is the groundwork for multi-Mac serving; today the **single-node** path (one Mac, `--tensor-parallel-size 1`) is supported and validated. **Pipeline parallelism** — splitting a model across stages — is numerically validated on a single node (see [Pipeline parallelism](#pipeline-parallelism)) and has served a model end-to-end across two Macs over Thunderbolt (see [Limitations](#limitations)).
+vllm-metal can run under vLLM's **Ray distributed executor**, placing each Apple-Silicon worker as a Ray actor. The single-node path remains the default. Multi-Mac modes include [pipeline parallelism](#pipeline-parallelism), with numerical and hardware validation, and the scoped [GPT-OSS TP2 path](#gpt-oss-tensor-parallelism).
 
 Apple GPUs are not a Ray-recognized accelerator type (unlike CUDA or TPU), so each node advertises a **custom Ray resource named `mlx`**, and vLLM's executor places one worker per `mlx` unit.
 
@@ -134,8 +134,9 @@ boundary, so it tolerates a Thunderbolt / Ethernet link between machines.
 **Design.** The mlx_lm model files are untouched. vLLM's executor (Ray, or the
 `mp` executor for a single node) owns the *control plane* — spawning one ranked
 worker per stage. The *data plane* — the cross-stage activation hand-off — runs
-over MLX's own `mx.distributed` **ring** backend (point-to-point `send` / `recv`),
-not Ray. Rank 0 is the first stage (it embeds the tokens); rank `N-1` is the last
+over MLX's own `mx.distributed` backend (point-to-point `send` / `recv`),
+not Ray. The default is TCP **ring**; [JACCL](#jaccl-rdma-pipeline-transport)
+selects Thunderbolt RDMA explicitly. Rank 0 is the first stage (it embeds the tokens); rank `N-1` is the last
 (final norm, head, sampling). Each stage owns a contiguous layer slice and only
 the last stage produces logits. Tensor parallelism must be 1, so the global rank
 equals the pipeline-stage index.
@@ -156,13 +157,227 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 # → PARITY PASS max_abs_diff=0.000e+00   (validated on Qwen3-0.6B / 1.7B / 4B)
 ```
 
+## JACCL RDMA pipeline transport
+
+Select JACCL through `--additional-config`. vLLM sends this configuration to
+every worker, including Ray workers on other Macs; shell variables on the
+driver alone are not the transport configuration.
+
+The included `tools/jaccl_two_rails.json` describes two Macs with these cables:
+
+| Rank 0 device | Rank 1 device |
+| --- | --- |
+| `rdma_en1` | `rdma_en2` |
+| `rdma_en2` | `rdma_en1` |
+
+Edit the matrix to match your actual discovery results. Row `r`, column `p`
+lists **rank r's local devices connected to rank p**, in matching lane order.
+The diagonal is `null`; one lane can be a string, multiple lanes a list.
+Do not sort interface names independently on each Mac.
+
+Start a Ray cluster as above, with one `mlx` resource per Mac and a reachable
+IPv4 `VLLM_HOST_IP` on each node. Ray needs connectivity in **both directions**;
+an address that only works for a connection initiated by the other Mac is not
+enough. These control addresses can be LAN addresses: the device matrix still
+selects Thunderbolt RDMA for activations. Set `VLLM_HOST_IP` on the driver as
+well as in each node's `ray start` environment. Then run on the driver:
+
+```bash
+RAY_ADDRESS=auto vllm serve Qwen/Qwen3-0.6B \
+  --distributed-executor-backend ray \
+  --pipeline-parallel-size 2 \
+  --tensor-parallel-size 1 \
+  --no-async-scheduling \
+  --additional-config "$(cat tools/jaccl_two_rails.json)"
+```
+
+Requirements and behavior:
+
+- RDMA must already be enabled, with a JACCL-capable MLX build. Each connected
+  Thunderbolt interface must have its own IPv4 address / IPv4-mapped GID.
+- Leave `GLOO_SOCKET_IFNAME` unset when starting both Ray nodes. On our Macs,
+  forcing `en0` selected scoped link-local IPv6 addresses and stalled gloo peer
+  setup. Multi-worker initialization now binds Gloo world and CPU subgroups
+  to the explicit IPv4 `VLLM_HOST_IP`, avoiding macOS hostname changes when
+  a bridge or network service is disabled.
+- Export `MLX_METAL_FAST_SYNCH=1` **before starting both Ray nodes and the API
+  driver**. MLX caches the fence selection; changing the variable requires new
+  workers. The local UI launcher sets it on all three process launches. Setting
+  it only on an API driver attached to existing Ray nodes is insufficient.
+  This accelerates CPU/GPU fence synchronization; JACCL still uses CPU streams
+  and receives finish on the host before downstream GPU work starts.
+- Rank 0's discovered IPv4 address plus `coordinator_port` (default `59451`)
+  forms the coordinator endpoint. Allow that TCP port between workers.
+  Ray, gloo, and the coordinator use TCP for control; activations use RDMA.
+- Initialization explicitly uses `backend="jaccl", strict=True`. Failure
+  stops startup; it does **not** retry the TCP ring backend.
+- JACCL receives finish on the CPU before the downstream GPU forward is
+  submitted. This keeps a slow upstream stage from holding a Metal command
+  buffer at a cross-stream fence long enough to hit the GPU watchdog. The
+  activation buffer and transfer count stay the same; sends remain asynchronous.
+- JACCL's *ring topology* enables its point-to-point/multi-rail implementation.
+  This is separate from MLX's TCP backend named `ring`.
+- Matrix shape, reciprocal lane counts, and a closed ring of 1–4 lanes per
+  edge are checked before native initialization. More than two stages need
+  the closing physical link from the last stage back to the first.
+- Logs show pipeline rank-to-IP placement and each rank's device row. Match
+  the matrix to that placement. Ray normally places rank 0 on the driver;
+  remote rank order is not necessarily IP order and can change after restart.
+- JACCL currently requires one pipeline stage per Mac and context parallel
+  sizes of 1. Existing tensor-parallel and model restrictions still apply.
+  GPT-OSS setup and validation are described below.
+- Bootstrap uses temporary device files and restores environment variables
+  afterwards. Restart worker processes to change transports or topology;
+  MLX caches initialized groups within a process.
+
+### macOS: Ray joins, then disappears with `No route to host`
+
+A worker can register with the head while the head cannot make the reverse
+connection needed for health checks. Check TCP from the **same environment that
+starts Ray**, using a known listening port on the peer:
+
+```bash
+python -c 'import socket; socket.create_connection(("192.168.1.137", 22), timeout=3).close(); print("connected")'
+nc -zv 192.168.1.137 22
+```
+
+Replace the address and port with your peer's. If `nc` succeeds while Python
+immediately fails, investigate process permissions. In our reproduction,
+Apple's Network framework reported `unsatisfiedReason=localNetworkDenied`.
+After the user changed permissions, the same Python connection succeeded.
+
+Open **System Settings → Privacy & Security → Local Network** and check the app
+that launched the processes, such as an editor containing the terminal. macOS
+attributes helper-process network access to the responsible app; see Apple's
+[local network privacy documentation](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+Restart the test workers and verify both directions before retrying inference.
+
+### Validate the transport without downloading a model
+
+Run `tools/jaccl_pp_smoke.py` on both Macs with the same config and ordered
+peer IPs. Rank 0 runs on the first IP, rank 1 on the second:
+
+```bash
+python tools/jaccl_pp_smoke.py --rank 0 \
+  --peer-ips 10.0.0.1,10.0.0.2 --config tools/jaccl_two_rails.json
+# On the second Mac, use the identical command with --rank 1.
+```
+
+This checks reductions, changed activation payloads in both directions, and
+tiny Qwen3 pipeline logits against an unsplit reference, including cached
+decode. Forward sends use `mx.async_eval`, matching the serving worker's
+submission path. It is a correctness check; its output is not an inference
+speed claim.
+
+For GPT-OSS, use `--model gpt-oss` and set `VLLM_PP_LAYER_PARTITION=3,5` on
+both commands. This uses an eight-layer tiny model with real routed experts,
+alternating attention, and an eight-token sliding window. It checks chunked
+prefill and cached decode across window boundaries, with 71 checks per rank.
+
+### GPT-OSS pipeline parallelism
+
+GPT-OSS uses alternating sliding-window and full-attention layers. Each stage
+keeps the attention settings and KV caches for its own layers. Scheduler cache
+names retain global layer numbers, so uneven splits cannot alias caches from
+different stages. The model forward uses native GPT-OSS blocks and attention
+sinks. Communication stays one activation handoff per stage boundary per
+forward step; KV caches remain local.
+
+The existing `mlx-community/gpt-oss-120b-MXFP4-Q8` checkpoint was validated on
+48 GB and 64 GB Macs with 14 and 22 layers, respectively. After starting Ray as
+above, use this driver command (replace the control IP and model path):
+
+```bash
+unset GLOO_SOCKET_IFNAME
+RAY_ADDRESS=auto VLLM_HOST_IP=192.168.1.145 VLLM_PP_LAYER_PARTITION=14,22 \
+  vllm serve "$HOME/.exo/models/mlx-community--gpt-oss-120b-MXFP4-Q8" \
+    --served-model-name gpt-oss \
+    --distributed-executor-backend ray \
+    --pipeline-parallel-size 2 --tensor-parallel-size 1 \
+    --no-async-scheduling --dtype bfloat16 \
+    --reasoning-parser openai_gptoss \
+    --gpu-memory-utilization 0.75 \
+    --max-model-len 1024 --max-num-seqs 1 --max-num-batched-tokens 128 \
+    --additional-config "$(cat tools/jaccl_two_rails.json)"
+```
+
+Both Macs need the same checkpoint and code. Set the same partition in both
+Ray node environments too when launching workers independently. The context
+and batching limits above are the initial correctness-test settings, not the
+model's maximum. Keep TurboQuant disabled: quantized KV with attention sinks
+is currently unsupported. Native MXFP4/Q8 **weight** quantization is supported.
+
+### Validation recorded on 2026-09-17
+
+Two M4 Max Macs (48 GB and 64 GB), macOS 27.0, MLX 0.32.1, MLX-LM
+0.32.0, and vLLM 0.29.0 were tested with the included two-rail matrix:
+
+- 65 checks passed on each rank: 20 reductions, 40 activation round trips
+  (256 bytes and 4 MiB), and five tiny Qwen3 forward steps.
+- Both synchronous and asynchronous forward submission passed. Prefill and
+  four cached decode steps matched the unsplit model exactly (maximum absolute
+  logit difference `0.0`).
+- The non-slow test suite passed: 2,227 passed, five skipped, 24 deselected.
+- Full Ray/API serving passed with Qwen3-0.6B, 14 layers per stage, and both
+  workers reporting `backend=jaccl`. Ray 2.58.0 used LAN IPv4 control addresses;
+  JACCL used the two Thunderbolt rails in the matrix.
+- Three completion requests succeeded: a five-token prompt, a 1,031-token
+  prompt with 512-token chunked prefill, and the repeated long prompt. Each
+  generated 32 tokens; both long-prompt responses were identical at temperature
+  zero. This verifies startup and generation, not sustained performance.
+- GPT-OSS native-cache parity passed over both rails with a 3/5 split: all
+  prefill/decode logits matched exactly as the sliding window advanced.
+  Float32 and mixed MXFP4/Q8 unit tests also cover one-layer and odd splits.
+- A six-layer BF16 GPT-OSS checkpoint served through vLLM with a 1/5 split.
+  Both short and chunked-prefill requests produced exactly the same 12 greedy
+  token IDs as native, unsplit MLX. This exercises the paged-cache path too.
+- The existing GPT-OSS 120B MXFP4-Q8 checkpoint served three chat requests with
+  a 14/22 split. Arithmetic returned `42`; a 439-token prompt crossing the
+  128-token prefill chunk size returned the correct answer, and its repeat
+  returned identical text. The test used a 1,024-token context limit.
+- The initial Ray health-check failure was isolated to macOS local-network
+  denial and cleared after a user permission change. A separate gloo startup
+  stall was reproduced with `GLOO_SOCKET_IFNAME=en0` and resolved by leaving it
+  unset. No Ray or gloo source changes were needed.
+
 ## Limitations
 
 - **Checkpoint loading.** PP lazily slices MLX-LM safetensors; AWQ and GGUF are rejected because their loaders materialize the full model before slicing.
-- **Co-located stages oversubscribe the KV budget.** Each stage applies `VLLM_METAL_MEMORY_FRACTION` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
+- **Co-located stages oversubscribe the KV budget.** Each stage applies `--gpu-memory-utilization` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
-- **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
-- **Model support.** YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA are rejected; other shapes (sliding-window, MoE) are untested.
+- **PP requires TP=1.** Combined PP+TP remains rejected. GPT-OSS TP2 is supported separately as described below.
+- **Model support.** Uniform-attention models and GPT-OSS's alternating sliding/full attention are supported under PP. YOCO / hybrid / MLA / pooling / VLM / speculative decoding / LoRA remain rejected. GPT-OSS validation does not establish support for every sliding-window or MoE architecture.
+
+## GPT-OSS tensor parallelism
+
+The local two-Mac integration also supports GPT-OSS with `--tensor-parallel-size 2`
+and `--pipeline-parallel-size 1`, using the Ray executor and synchronous scheduling.
+Set `tensor_transport` in `--additional-config` to the same explicit JACCL options
+and device matrix used by `pipeline_transport`. There is no TCP fallback.
+
+```json
+{"tensor_transport": {"backend": "jaccl", "coordinator_port": 59451,
+ "device_matrix": [[null, ["rdma_en1", "rdma_en2"]],
+                   [["rdma_en2", "rdma_en1"], null]]}}
+```
+
+Each worker lazily loads then applies MLX-LM's GPT-OSS `Model.shard`: every layer
+remains present, with local attention/KV heads and expert projection dimensions.
+The runner sizes paged KV caches for local heads. Both workers execute the same
+scheduled batches; rank zero's chosen token IDs are synchronized over JACCL before
+request state advances, including non-greedy sampling. vLLM reads rank zero's output.
+Local-only decode-pipelining and selective-logit probes are disabled under TP.
+Each tensor forward is evaluated before submitting the next prefill chunk, keeping
+cross-rank collectives ordered and preventing overlapping GPU/CPU fence cycles.
+
+Initial scope: two Macs, GPT-OSS MLX safetensors, DP=1, no combined PP, no LoRA,
+no speculative decoding, no asynchronous scheduling or expert parallelism.
+Unsupported configurations fail at admission. TP can require more memory on the
+smaller Mac than an uneven pipeline split; size the cache budget accordingly.
+
+The neighboring `inference-ui` project exposes a Pipeline-default selector with
+an explicit Apply action. It reloads backend children while retaining the UI and
+saved chats. Both modes have been exercised on the two-Mac GPT-OSS 120B checkpoint.
 
 ## Data parallelism
 

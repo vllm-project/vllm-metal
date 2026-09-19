@@ -392,10 +392,12 @@ class ModelCachePolicy:
                         state_spec
                     )
                 elif hybrid_plan.layers.is_attention_layer(layer_idx):
-                    specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                    specs[self._attention_layer_name(layer_idx)] = attention_spec(
+                        layer_idx
+                    )
         else:
             for layer_idx in range(num_spec_layers):
-                specs[f"layers.{layer_idx}.self_attn"] = attention_spec(layer_idx)
+                specs[self._attention_layer_name(layer_idx)] = attention_spec(layer_idx)
 
         specs.update(
             self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
@@ -640,7 +642,7 @@ class ModelCachePolicy:
         group_indices = self._scheduler_group_indices_for_layers(
             kv_cache_config,
             tuple(
-                f"layers.{layer_idx}.self_attn"
+                self._attention_layer_name(layer_idx)
                 for layer_idx in layer_plan.attention_indices
             ),
         )
@@ -791,7 +793,14 @@ class ModelCachePolicy:
 
     def _attention_layer_names(self) -> tuple[str, ...]:
         num_layers, _ = self._cache_layer_mapping()
-        return tuple(f"layers.{layer_idx}.self_attn" for layer_idx in range(num_layers))
+        return tuple(self._attention_layer_name(index) for index in range(num_layers))
+
+    def _attention_layer_name(self, local_index: int) -> str:
+        # vLLM merges every worker's specs by name before projecting cache groups
+        # back onto each stage. Keep names globally unique while all metadata and
+        # physical cache arrays continue to use contiguous stage-local indices.
+        global_index = self._runner._pp_layer_start + local_index
+        return f"layers.{global_index}.self_attn"
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the byte size of one cache block.

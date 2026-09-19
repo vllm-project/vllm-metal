@@ -40,6 +40,74 @@ class _FakeGroup:
         return self._size
 
 
+class TestPipelineTransportSelection:
+    def test_default_transport_keeps_ring_bootstrap(self, monkeypatch):
+        from vllm_metal.distributed.transport import PipelineTransportConfig
+
+        expected = PipelineGroup(_FakeGroup(1, 2))
+        calls = []
+
+        def bootstrap(rank, peer_ips):
+            calls.append((rank, peer_ips))
+            return expected
+
+        monkeypatch.setattr(PipelineGroup, "bootstrap_ring", bootstrap)
+        peers = ["10.0.0.1", "10.0.0.2"]
+        config = PipelineTransportConfig.from_additional_config({}, 2)
+        assert PipelineGroup.bootstrap(1, peers, config) is expected
+        assert calls == [(1, peers)]
+
+    def test_jaccl_uses_selected_transport_and_cpu_stream(self, monkeypatch):
+        from vllm_metal.distributed.pipeline import pipeline_recv, pipeline_send
+        from vllm_metal.distributed.transport import PipelineTransportConfig
+
+        config = PipelineTransportConfig.from_additional_config(
+            {
+                "pipeline_transport": {
+                    "backend": "jaccl",
+                    "device_matrix": [
+                        [None, ["rdma_en1", "rdma_en2"]],
+                        [["rdma_en2", "rdma_en1"], None],
+                    ],
+                }
+            },
+            2,
+        )
+        group = _FakeGroup(0, 2)
+        calls = []
+
+        def bootstrap(self, rank, peer_ips):
+            calls.append((rank, peer_ips))
+            return group
+
+        monkeypatch.setattr(PipelineTransportConfig, "bootstrap_jaccl", bootstrap)
+        pp = PipelineGroup.bootstrap(0, ["10.0.0.1", "10.0.0.2"], config)
+        assert pp.group is group
+        assert pp.backend == "jaccl"
+        assert calls == [(0, ["10.0.0.1", "10.0.0.2"])]
+
+        transfers = []
+        payload = mx.ones((1, 4, 8))
+
+        def send(array, peer, *, group, stream):
+            transfers.append(("send", peer, group, stream, array.shape))
+            return array
+
+        def recv(shape, dtype, peer, *, group, stream):
+            transfers.append(("recv", peer, group, stream, shape))
+            return mx.ones(shape, dtype=dtype)
+
+        monkeypatch.setattr(mx.distributed, "send", send)
+        monkeypatch.setattr(mx.distributed, "recv", recv)
+        pipeline_send(payload, pp)
+        receiving = PipelineGroup(_FakeGroup(1, 2), backend="jaccl")
+        assert pipeline_recv(receiving, 4, 8, mx.float32).shape == (1, 4, 8)
+        assert transfers == [
+            ("send", 1, group, mx.cpu, (4, 8)),
+            ("recv", 0, receiving.group, mx.cpu, (4, 8)),
+        ]
+
+
 def _pp(rank: int, size: int) -> PipelineGroup:
     return PipelineGroup(_FakeGroup(rank, size))
 

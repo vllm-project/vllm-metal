@@ -119,6 +119,60 @@ def _make_worker(model_runner: object) -> MetalWorker:
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should honor model runner memory-reporting modes."""
 
+    def test_pipeline_workers_receive_serialized_transport_config(self, monkeypatch):
+        from vllm_metal.v1 import worker as worker_module
+
+        worker = _make_worker(None)
+        worker.model_config = SimpleNamespace(model="org/model", revision=None, seed=0)
+        worker.vllm_config.model_config = worker.model_config
+        worker.vllm_config.additional_config = {
+            "pipeline_transport": {
+                "backend": "jaccl",
+                "device_matrix": [[None, "rdma_en1"], ["rdma_en2", None]],
+                "coordinator_port": 6001,
+            }
+        }
+        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=2, tensor_parallel_size=1, world_size=2)
+        worker.rank, worker.local_rank = 1, 0
+        worker.distributed_init_method = "unused"
+        monkeypatch.setattr(worker_module, "set_wired_limit", lambda: None)
+        monkeypatch.setattr(
+            worker_module, "init_worker_distributed_environment", lambda *_: None
+        )
+        monkeypatch.setattr(
+            "vllm_metal.utils.get_model_download_path", lambda *_, **__: "org/model"
+        )
+        monkeypatch.setattr(
+            "vllm_metal.stt.detection.is_stt_model", lambda *_, **__: False
+        )
+        monkeypatch.setattr("vllm.utils.network_utils.get_ip", lambda: "10.0.0.2")
+        monkeypatch.setattr(
+            "torch.distributed.all_gather_object",
+            lambda peers, ip: peers.__setitem__(slice(None), ["10.0.0.1", ip]),
+        )
+        runner = SimpleNamespace()
+        monkeypatch.setattr(mr, "MetalModelRunner", lambda **_: runner)
+        pp = SimpleNamespace(
+            rank=1, size=2, is_first=False, is_last=True, backend="jaccl"
+        )
+        bootstrap = MagicMock(return_value=pp)
+        monkeypatch.setattr(
+            worker_module.PipelineGroup, "bootstrap", bootstrap, raising=False
+        )
+        monkeypatch.setattr(
+            worker_module.PipelineGroup,
+            "bootstrap_ring",
+            MagicMock(side_effect=AssertionError("worker ignored JACCL configuration")),
+        )
+
+        worker.init_device()
+
+        args = bootstrap.call_args.args
+        assert args[:2] == (1, ["10.0.0.1", "10.0.0.2"])
+        assert args[2].backend == "jaccl"
+        assert args[2].coordinator_port == 6001
+        assert worker.pp is runner.pp is pp
+
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
     def test_init_device_preserves_stt_revision(self, monkeypatch, revision) -> None:
         from vllm_metal.v1 import worker as worker_module
@@ -130,7 +184,7 @@ class TestWorkerRunnerBoundaryDelegation:
         )
         worker.vllm_config.model_config = worker.model_config
         worker.vllm_config.scheduler_config = SimpleNamespace()
-        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1, tensor_parallel_size=1)
         worker.rank = worker.local_rank = 0
         worker.distributed_init_method = "unused"
         monkeypatch.setattr(worker_module, "set_wired_limit", lambda: None)

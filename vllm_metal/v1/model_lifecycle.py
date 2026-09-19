@@ -109,7 +109,9 @@ class GenerationLoadRequest:
         # the generic MLX loaders stay lazy until the stage-owned weights are known.
         # The custom GGUF and AWQ loaders cannot honor this contract.
         pp = runner.pp
-        lazy_weights = pp is not None and pp.size > 1
+        lazy_weights = (pp is not None and pp.size > 1) or getattr(
+            runner, "tp", None
+        ) is not None
 
         return cls(
             model_name=(
@@ -503,8 +505,16 @@ class ModelLifecycle:
         )
 
     def _reject_pipeline_parallel_with_per_layer_metadata(self) -> None:
-        """Reject PP until per-layer metadata is stage-sliced."""
-        # PP layer indices are stage-local; these metadata lists are still global.
+        """Keep unvalidated layouts out of PP; GPT-OSS windows are stage-sliced."""
+        runner = self._runner
+        if (
+            runner.model_args.get("model_type") == "gpt_oss"
+            and runner.kv_heads_per_layer is None
+            and runner.head_dim_per_layer is None
+        ):
+            # GPT-OSS has uniform KV shapes and alternating attention windows.
+            # The runner slices those windows with the owned transformer layers.
+            return
         if (
             self._runner.pp is not None
             and self._runner.pp.size > 1
@@ -579,6 +589,13 @@ class ModelLifecycle:
                 model_values = self._config_to_mapping(config_values["text_config"])
             else:
                 model_values = config_values
+
+        if model_values.get("model_type") == "gpt_oss" and not model_values.get(
+            "layer_types"
+        ):
+            # MLX-LM resolves an omitted layout on the constructed backbone.
+            # Cache planning must use the same layout as its attention blocks.
+            model_values["layer_types"] = list(model.model.layer_types)
 
         text_config = model_values.get("text_config")
         if text_config is None:

@@ -101,6 +101,8 @@ def make_stub_runner(
         "_execute_model_state": None,
         "_selective_logits_supported": False,
         "pp": None,
+        "tp": None,
+        "_pp_layer_start": 0,
         "_pp_model": None,
         "_model_adapter": DefaultModelAdapter(),
         "_spec_decode_controller": SpeculativeDecodeController(),
