@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 import torch
+from mlx_lm.models.olmo3 import ModelArgs as Olmo3Args
+from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
@@ -23,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     SlidingWindowSpec,
 )
+from vllm.v1.request import Request
 
 from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runner
 from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
@@ -37,6 +42,7 @@ from vllm_metal.config import (
     MetalConfig,
 )
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 def vllm_config_for_kv_grouping() -> VllmConfig:
@@ -44,6 +50,108 @@ def vllm_config_for_kv_grouping() -> VllmConfig:
     # The engine core resolves the layout before grouping; mirror that here.
     record_kv_cache_layout(vllm_config.cache_config, KV_CACHE_LAYOUT)
     return vllm_config
+
+
+@pytest.mark.parametrize("disable_hybrid_manager", [False, True])
+def test_uniform_olmo3_geometry_uses_window_groups(
+    monkeypatch, disable_hybrid_manager: bool
+) -> None:
+    args = asdict(
+        Olmo3Args(
+            model_type="olmo3",
+            hidden_size=128,
+            num_hidden_layers=8,
+            intermediate_size=256,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            max_position_embeddings=512,
+            sliding_window=64,
+            rope_theta=500000,
+        )
+    )
+    adapter = DefaultModelAdapter()
+    assert (
+        adapter.build_per_layer_kv_shapes(
+            args, num_layers=8, num_kv_heads=2, head_dim=64
+        )
+        is None
+    )
+    config = vllm_config_for_kv_grouping()
+    config.model_config = SimpleNamespace(
+        max_model_len=512,
+        original_max_model_len=512,
+    )
+    config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hybrid_manager
+    config.scheduler_config.max_num_batched_tokens = 16
+    config.cache_config.block_size = 16
+    runner = make_stub_runner(
+        model_args=args,
+        num_layers=8,
+        num_kv_cache_layers=8,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_cache_dtype=mx.bfloat16,
+        vllm_config=config,
+        cache_config=config.cache_config,
+        scheduler_config=config.scheduler_config,
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=object()) for _ in range(8)]
+        ),
+        sliding_window_per_layer=adapter.build_sliding_window_per_layer(args, 8),
+    )
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config", lambda: MetalConfig(mlx_device="gpu")
+    )
+    specs = runner.get_kv_cache_spec()
+    if disable_hybrid_manager:
+        assert all(type(spec) is FullAttentionSpec for spec in specs.values())
+        assert runner.scheduler_memory_reporting_mode() == "paged_attention_capacity"
+        return
+
+    assert sum(type(spec) is SlidingWindowSpec for spec in specs.values()) == 6
+    assert sum(type(spec) is FullAttentionSpec for spec in specs.values()) == 2
+    assert runner.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
+    budget = runner.get_cache_block_size_bytes() * 64
+    grouped = get_kv_cache_configs(config, [specs], [budget])[0]
+    assert runner.paged_attention_runtime is None
+    runner.initialize_kv_cache(grouped)
+    backend = runner.paged_attention_runtime
+    assert isinstance(backend, SDPAPagedAttentionRuntime)
+    assert len(grouped.kv_cache_groups) == 4
+    assert len({backend.kv_cache.group_index_for_layer(i) for i in range(8)}) == 4
+    assert backend.kv_cache.sliding_window_per_layer == [64, 64, 64, -1] * 2
+    assert grouped.kv_cache_tensors[0].size <= budget
+    assert all(
+        isinstance(layer.self_attn, SDPAPagedAttentionWrapper)
+        for layer in runner.model.layers
+    )
+    manager = KVCacheManager(
+        grouped,
+        max_model_len=512,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        max_in_flight_tokens=16,
+        enable_caching=False,
+    )
+    free_before = manager.block_pool.get_num_free_blocks()
+    request = Request("windowed", list(range(512)), SamplingParams(max_tokens=1), None)
+    for _ in range(32):
+        assert manager.allocate_slots(request, 16) is not None
+        request.num_computed_tokens += 16
+    for group, blocks in zip(
+        grouped.kv_cache_groups,
+        manager.get_blocks(request.request_id).blocks,
+        strict=True,
+    ):
+        resident = sum(not block.is_null for block in blocks)
+        if isinstance(group.kv_cache_spec, SlidingWindowSpec):
+            assert resident <= 5  # window plus the boundary block
+        else:
+            assert resident == 32
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == free_before
 
 
 def config_from_vllm_groups(

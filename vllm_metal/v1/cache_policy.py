@@ -323,14 +323,12 @@ class ModelCachePolicy:
 
     def _uses_deferred_layout(self) -> bool:
         """Return whether vLLM's grouped attention config must own allocation."""
-        kv_heads = self._runner.kv_heads_per_layer
-        head_dims = self._runner.head_dim_per_layer
         sliding_windows = self._runner.sliding_window_per_layer
         vllm_config = self._runner.vllm_config
         return (
-            kv_heads is not None
-            and head_dims is not None
-            and sliding_windows is not None
+            # Mixed attention windows need grouped allocation even when all
+            # layers have the same head geometry (for example, OLMo 3).
+            sliding_windows is not None
             and self._runner._yoco_cache_mapping is None
             and not self._runner.is_hybrid
             and not self._runner.is_mla
