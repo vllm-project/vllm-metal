@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
+    VLLM_METAL_EXPERT_PARTITION: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
@@ -124,6 +125,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_RING_BASE_PORT": lambda: int(
         os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
     ),
+    # Expert-parallel partition across ranks, e.g. "56,72" for two Macs with
+    # 128 routed experts. Default: even split (validated to divide evenly).
+    "VLLM_METAL_EXPERT_PARTITION": lambda: os.getenv("VLLM_METAL_EXPERT_PARTITION"),
 }
 
 
