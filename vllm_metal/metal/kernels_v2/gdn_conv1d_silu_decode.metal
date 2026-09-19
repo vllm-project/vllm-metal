@@ -11,7 +11,7 @@ if (req_idx >= (uint)num_requests) return;
 
 constexpr int state_len = KERNEL_SIZE - 1;
 uint slot = (uint)slot_mapping[req_idx];
-int state_base = slot * state_len * CONV_DIM + c;
+int64_t state_base = int64_t(slot) * conv_state_in_strides[0] + c;
 int state_out_base = req_idx * state_len * CONV_DIM + c;
 int weight_base = c * KERNEL_SIZE;
 

@@ -17,6 +17,7 @@ template <typename T>
     constant int &Hv                        [[buffer(11)]],
     constant int &Dk                        [[buffer(12)]],
     constant int &Dv                        [[buffer(13)]],
+    constant int64_t &state_stride [[buffer(14)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_simdgroup]])
 {
@@ -38,7 +39,7 @@ template <typename T>
     // State pool slot for this request: [max_seqs, Hv, Dv, Dk]
     const int slot = slot_mapping[req_idx];
     device T *state_ptr = state_pool
-        + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
+        + int64_t(slot) * state_stride + (hv_idx * Dv + dv_idx) * Dk;
 
     // n_per_t = Dk / 32 elements per thread (supports Dk up to 256)
     const int n_per_t = Dk / 32;
@@ -117,7 +118,7 @@ template <typename T>
       device type*,                                                \
       constant int&, constant int&, constant int&,                 \
       constant int&, constant int&,                                \
-      uint3, uint);
+      constant int64_t&, uint3, uint);
 
 instantiate_gdn(float);
 instantiate_gdn(half);

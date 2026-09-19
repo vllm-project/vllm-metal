@@ -23,11 +23,25 @@ template <typename T>
     device T *pool [[buffer(0)]], const device T *src [[buffer(1)]],
     const device int *dst_ids [[buffer(2)]],
     device const int &row_elems [[buffer(3)]],
+    constant int64_t &row_stride [[buffer(4)]],
+    constant int *shape [[buffer(5)]],
+    constant size_t *strides [[buffer(6)]],
+    constant int &ndim [[buffer(7)]],
+    constant bool &zero [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
   const int64_t row = int64_t(gid.y);
-  const int64_t dst = int64_t(dst_ids[gid.y]) * row_elems;
-  pool[dst + i] = src[row * row_elems + i];
+  const int64_t dst = int64_t(dst_ids[gid.y]) * row_stride;
+  int64_t offset = i;
+  if (ndim > 0) {
+    int index = i;
+    offset = 0;
+    for (int axis = ndim - 1; axis > 0; --axis) {
+      offset += (index % shape[axis]) * strides[axis];
+      index /= shape[axis];
+    }
+  }
+  pool[dst + offset] = zero ? T(0) : src[row * row_elems + i];
 }
 
 // Same, four elements per thread. Selected by the host when row_elems is a
@@ -38,11 +52,14 @@ template <typename T>
     device T *pool [[buffer(0)]], const device T *src [[buffer(1)]],
     const device int *dst_ids [[buffer(2)]],
     device const int &row_vec4s [[buffer(3)]],
+    constant int64_t &row_stride [[buffer(4)]],
+    constant bool &zero [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
   const int64_t row = int64_t(gid.y);
-  const int64_t dst = int64_t(dst_ids[gid.y]) * row_vec4s;
+  const int64_t dst = int64_t(dst_ids[gid.y]) * row_stride;
   reinterpret_cast<device vec<T, 4> *>(pool)[dst + i] =
+      zero ? vec<T, 4>(0) :
       reinterpret_cast<const device vec<T, 4> *>(src)[row * row_vec4s + i];
 }
 
@@ -50,12 +67,15 @@ template <typename T>
   template [[host_name("gdn_state_scatter_rows_" #type)]] [[kernel]] void \
   gdn_state_scatter_rows<type>(                                           \
       device type *, const device type *, const device int *,             \
-      device const int &, uint2);                                         \
+      device const int &, constant int64_t &, constant int *,              \
+      constant size_t *, constant int &, constant bool &, uint2);          \
   template [[host_name("gdn_state_scatter_rows_vec4_" #type)]] [[kernel]] \
   void gdn_state_scatter_rows_vec4<type>(                                 \
       device type *, const device type *, const device int *,             \
-      device const int &, uint2);
+      device const int &, constant int64_t &, constant bool &, uint2);
 
 instantiate_gdn_state_scatter_rows(float);
 instantiate_gdn_state_scatter_rows(bfloat16_t);
 instantiate_gdn_state_scatter_rows(half);
+instantiate_gdn_state_scatter_rows(uchar);
+instantiate_gdn_state_scatter_rows(char);

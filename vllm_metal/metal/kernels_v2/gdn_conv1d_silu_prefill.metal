@@ -27,7 +27,7 @@ if (tid < output_threads) {
     int seq_start = cu_seqlens[req_idx];
     int local_t = (int)token_idx - seq_start;
     uint slot = (uint)slot_mapping[req_idx];
-    int state_base = slot * state_len * CONV_DIM + c;
+    int64_t state_base = int64_t(slot) * conv_state_in_strides[0] + c;
     int weight_base = c * KERNEL_SIZE;
 
     float acc = 0.0f;
@@ -58,7 +58,7 @@ int seq_start = cu_seqlens[req_idx];
 int seq_end = cu_seqlens[req_idx + 1];
 int seq_len = seq_end - seq_start;
 uint slot = (uint)slot_mapping[req_idx];
-int state_base = slot * state_len * CONV_DIM + c;
+int64_t state_base = int64_t(slot) * conv_state_in_strides[0] + c;
 int state_out_base = (req_idx * state_len + state_pos) * CONV_DIM + c;
 
 int conv_pos = seq_len + (int)state_pos;
