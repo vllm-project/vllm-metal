@@ -1501,7 +1501,6 @@ class TestLazyRecurrentPrefill:
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v))
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv))
-        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
         mx.eval(
             q_flat,
             k_flat,
@@ -1509,9 +1508,8 @@ class TestLazyRecurrentPrefill:
             g_flat,
             beta_flat,
             cache_cpp.recurrent_states[0],
-            cpp_out,
         )
-        _get_native_ops_or_skip().gdn_linear_attention(
+        cpp_out, cpp_state = _get_native_ops_or_skip().gdn_linear_attention(
             q_flat,
             k_flat,
             v_flat,
@@ -1520,13 +1518,12 @@ class TestLazyRecurrentPrefill:
             cache_cpp.recurrent_states[0],
             mx.array(cu_seqlens, dtype=mx.int32),
             mx.array(slot_ids, dtype=mx.int32),
-            cpp_out,
             n_hk,
             n_hv,
             d_k,
             d_v,
         )
-        mx.synchronize()
+        cache_cpp.store_recurrent_state(0, cpp_state)
         mx.eval(
             lazy_out,
             cpp_out,
@@ -1594,7 +1591,6 @@ class TestLazyRecurrentPrefill:
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(mx.float32))
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(mx.float32))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(mx.float32))
-        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
         mx.eval(
             q_flat,
             k_flat,
@@ -1602,9 +1598,8 @@ class TestLazyRecurrentPrefill:
             g_flat,
             beta_flat,
             cache_cpp.recurrent_states[0],
-            cpp_out,
         )
-        _get_native_ops_or_skip().gdn_linear_attention(
+        cpp_out, cpp_state = _get_native_ops_or_skip().gdn_linear_attention(
             q_flat,
             k_flat,
             v_flat,
@@ -1613,13 +1608,12 @@ class TestLazyRecurrentPrefill:
             cache_cpp.recurrent_states[0],
             mx.array(cu_seqlens, dtype=mx.int32),
             mx.array(slot_ids, dtype=mx.int32),
-            cpp_out,
             n_hk,
             n_hv,
             d_k,
             d_v,
         )
-        mx.synchronize()
+        cache_cpp.store_recurrent_state(0, cpp_state)
         lazy_cmp = lazy_out.astype(mx.float32)
         cpp_cmp = cpp_out.astype(mx.bfloat16).astype(mx.float32)
         mx.eval(

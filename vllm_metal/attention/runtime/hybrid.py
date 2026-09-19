@@ -31,6 +31,24 @@ from vllm_metal.attention.state import AlignStateManager
 logger = init_logger(__name__)
 
 
+def _declared_state_shapes(cache: Any) -> tuple[tuple[int, ...], ...] | None:
+    """Return the loaded model's declared per-request state shapes, or None.
+
+    Multi-array caches (e.g. mlx-lm ``ArraysCache``) expose their components
+    through a ``.cache`` sequence whose entries gain a leading batch axis once
+    the layer has run; ``None`` entries are slots the layer never filled.
+    Caches without that sequence (a plain KV cache) declare no state arrays.
+    """
+    components = getattr(cache, "cache", None)
+    if components is None:
+        return None
+    return tuple(
+        tuple(int(dim) for dim in state.shape[1:])
+        for state in components
+        if state is not None
+    )
+
+
 class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     """Execute attention and state layers through their registered wrappers."""
 
@@ -56,6 +74,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._state_manager: AlignStateManager | None = None
         self._scheduler_group_indices: tuple[int, ...] = ()
         self._group_block_sizes: tuple[int, ...] = ()
+        self._geometry_validated = False
 
     def initialize_from_config(self, config: KVCacheConfig) -> None:
         """Use the upstream allocation for both KV and recurrent state."""
@@ -121,6 +140,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")
+        self._validate_declared_state_geometry(model)
         state_cache = self.state_cache
         layer_plan = self._hybrid_plan.layers
         state_family = self._hybrid_plan.family
@@ -164,6 +184,77 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     @property
     def kv_cache(self) -> MetalPagedKVCache:
         return self._require_initialized("kv_cache")
+
+    def _validate_declared_state_geometry(self, model: Any) -> None:
+        """Cross-check the plan's state geometry against the loaded model.
+
+        The plan derives state shapes and dtypes from model config fields, and
+        they now size the engine's shared cache allocation and parameterize the
+        strided views into it. The cache the loaded model itself declares (its
+        ``make_cache`` shapes after one token) is what generation actually
+        feeds, and nothing else consults it — so config-level drift would
+        otherwise surface as wrong numerics instead of an error. Skipped for
+        models that declare no cache: the plan is the only authority there.
+        """
+        if self._geometry_validated:
+            return
+        make_cache = getattr(model, "make_cache", None)
+        if make_cache is None:
+            logger.debug(
+                "%s state geometry check skipped: the loaded model declares "
+                "no cache",
+                self._hybrid_plan.family.label,
+            )
+            return
+        caches = make_cache()
+        plan = self._hybrid_plan
+        # mlx-lm models declare one cache per cache-bearing layer in layer
+        # order; pure-MLP blocks are skipped (nemotron_h) or don't exist
+        # (qwen3_next). The plan's owned layers (state + attention) are
+        # exactly the cache-bearing set, so zip them in order.
+        owned_indices = sorted(
+            [*plan.layers.attention_indices, *plan.layers.state_indices]
+        )
+        if len(caches) != len(owned_indices):
+            raise ValueError(
+                f"The loaded model declares {len(caches)} layer caches but "
+                f"the {plan.family.label} hybrid plan owns {len(owned_indices)} "
+                "cache-bearing layers; the plan and the model disagree on "
+                "topology."
+            )
+        state_caches = {
+            layer_idx: caches[owned_indices.index(layer_idx)]
+            for layer_idx in plan.layers.state_indices
+        }
+        try:
+            mx.eval(model(mx.array([[0]], dtype=mx.int32), cache=caches))
+        except Exception as exc:
+            raise RuntimeError(
+                "Probing the loaded model's declared cache geometry failed; "
+                "the hybrid runtime cross-checks the plan against it at "
+                "startup. The same call serves every request, so this is a "
+                "model/runtime mismatch, not a probe artifact."
+            ) from exc
+        geometry = plan.geometry
+        for layer_idx in plan.layers.state_indices:
+            declared = _declared_state_shapes(state_caches[layer_idx])
+            if declared == geometry.state_shapes:
+                continue
+            declared_text = (
+                "no state arrays (a plain KV cache)"
+                if declared is None
+                else str(declared)
+            )
+            raise ValueError(
+                f"{self._hybrid_plan.family.label} state geometry drift on "
+                f"layers.{layer_idx}: the loaded model declares per-request "
+                f"state shapes {declared_text}, but the hybrid plan resolved "
+                f"{geometry.state_shapes}. The plan sizes the shared cache "
+                "allocation and its views, so serving would read and write "
+                "wrong offsets. Align the plan and the model config before "
+                "starting."
+            )
+        self._geometry_validated = True
 
     @property
     def state_cache(self) -> PagedStateCache:

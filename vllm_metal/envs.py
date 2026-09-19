@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
+    VLLM_METAL_HYBRID_BUFFER_CAP: str = "warn"
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
@@ -111,6 +112,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tools (clang++). Default off — release wheels ship the .so prebuilt.
     "VLLM_METAL_BUILD_FROM_SOURCE": lambda: (
         os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
+    ),
+    # How the hybrid cache planner reacts when the requested KV+state budget
+    # exceeds Metal's single-buffer limit (max_buffer_length). The whole hybrid
+    # backing is one Metal allocation, so the budget is capped to fit it and
+    # the real capacity shrinks below the requested --gpu-memory-utilization.
+    # "warn" (default) logs the requested vs. capped sizes; "error" fails
+    # startup instead of silently reducing capacity.
+    "VLLM_METAL_HYBRID_BUFFER_CAP": lambda: os.getenv(
+        "VLLM_METAL_HYBRID_BUFFER_CAP", "warn"
     ),
     # Per-worker visible-device list set by vLLM's Ray executor (the
     # CUDA_VISIBLE_DEVICES analog for Metal; see MetalPlatform.device_control_env_var).

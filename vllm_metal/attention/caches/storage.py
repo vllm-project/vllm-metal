@@ -21,7 +21,17 @@ from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 
 class CacheViews(Sequence[mx.array]):
-    """Layer views following the latest native write to their shared backing."""
+    """Layer views following the latest native write to their shared backing.
+
+    Ordering between native writes and later readers is carried entirely by
+    the dependency chain, not by evaluation order: ``__setitem__`` records
+    every write (native scatter, rebinding) into the storage's depends chain,
+    and each ``__getitem__`` rebuilds its view from that chain's current head.
+    A scheduler zero issued after a pending-state flush therefore reads a view
+    that already depends on the flushed write — this construction is what
+    keeps flush-then-zero, CoW copies, and decode reads ordered without any
+    explicit synchronization.
+    """
 
     def __init__(self, storage: KVCacheStorage, tensors: Sequence[torch.Tensor]):
         self.storage = storage

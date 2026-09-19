@@ -11,6 +11,8 @@ import mlx.core as mx
 import torch
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+
+import vllm_metal.envs as envs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -982,16 +984,7 @@ class WorkerCachePlanner:
             )
             budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
             if self._worker.model_runner.is_hybrid:
-                # Hybrid KV and state share one Metal buffer.
-                buffer_limit = int(mx.device_info()["max_buffer_length"])
-                if budget > buffer_limit:
-                    logger.warning(
-                        "Reducing hybrid KV cache budget from %.2f GB to %.2f GB "
-                        "to fit Metal's single-buffer limit (max_buffer_length).",
-                        budget / 1e9,
-                        buffer_limit / 1e9,
-                    )
-                budget = min(budget, buffer_limit)
+                budget = self._cap_hybrid_budget_at_buffer_limit(budget)
             logger.info(
                 "Mixed attention layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
@@ -1015,6 +1008,36 @@ class WorkerCachePlanner:
     ) -> int:
         """Return cache bytes after model weights and execution overhead."""
         return int(metal_limit * fraction) - model_memory - overhead
+
+    def _cap_hybrid_budget_at_buffer_limit(self, budget: int) -> int:
+        """Cap the hybrid cache budget at Metal's single-buffer limit.
+
+        The hybrid KV and state backing is one Metal allocation, so it must
+        fit ``max_buffer_length`` even when the requested
+        ``--gpu-memory-utilization`` would fund more. That cap silently
+        shrinks real capacity on hosts where the request exceeds the limit,
+        so the reduction is announced with both sizes in the capacity log;
+        ``VLLM_METAL_HYBRID_BUFFER_CAP=error`` turns it into a startup
+        failure for operators who need the full requested capacity.
+        """
+        buffer_limit = int(mx.device_info()["max_buffer_length"])
+        if budget <= buffer_limit:
+            return budget
+        requested = budget
+        budget = buffer_limit
+        message = (
+            "Hybrid KV and state share one Metal allocation capped at "
+            f"max_buffer_length: requested {requested / 1e9:.2f} GB of cache, "
+            f"reporting {budget / 1e9:.2f} GB ({(requested - budget) / 1e9:.2f} GB "
+            "short of the request; scheduler block counts are derived from the "
+            "capped budget). Lower --gpu-memory-utilization to make the request "
+            "fit the device limit, or set VLLM_METAL_HYBRID_BUFFER_CAP=error to "
+            "fail startup instead of serving with reduced capacity."
+        )
+        if envs.VLLM_METAL_HYBRID_BUFFER_CAP == "error":
+            raise ValueError(message)
+        logger.warning("%s", message)
+        return budget
 
     def _paged_attention_plan(
         self, *, overhead: int, require_min_blocks: bool = True

@@ -1589,75 +1589,94 @@ static array mla_paged_attention_primitive_fn(
       {q_nope, q_pe, latent_cache, block_tables, context_lens, cu_seqlens_q});
 }
 
-void gdn_linear_attention_impl(
-    nb::handle q_h, nb::handle k_h, nb::handle v_h,
-    nb::handle g_h, nb::handle beta_h,
-    nb::handle state_pool_h,
-    nb::handle cu_seqlens_h, nb::handle slot_mapping_h,
-    nb::handle y_h,
-    int Hk, int Hv, int Dk, int Dv
-) {
-  auto& q           = *nb::inst_ptr<array>(q_h);
-  auto& k           = *nb::inst_ptr<array>(k_h);
-  auto& v           = *nb::inst_ptr<array>(v_h);
-  auto& g           = *nb::inst_ptr<array>(g_h);
-  auto& beta        = *nb::inst_ptr<array>(beta_h);
-  auto& state_pool  = *nb::inst_ptr<array>(state_pool_h);
-  auto& cu_seqlens  = *nb::inst_ptr<array>(cu_seqlens_h);
-  auto& slot_mapping = *nb::inst_ptr<array>(slot_mapping_h);
-  auto& y           = *nb::inst_ptr<array>(y_h);
+class GDNLinearAttentionPrimitive : public Primitive {
+ public:
+  GDNLinearAttentionPrimitive(Stream stream, int Hk, int Hv, int Dk, int Dv)
+      : Primitive(stream), Hk_(Hk), Hv_(Hv), Dk_(Dk), Dv_(Dv) {}
 
-  int num_requests = static_cast<int>(cu_seqlens.shape(0)) - 1;
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("GDNLinearAttentionPrimitive only supports GPU");
+  }
 
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // Each recurrence owns its output; only persistent state aliases an input.
+    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+    outputs[1].copy_shared_buffer(inputs[5]);
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+    const auto& v = inputs[2];
+    const auto& g = inputs[3];
+    const auto& beta = inputs[4];
+    const auto& cu_seqlens = inputs[6];
+    const auto& slot_mapping = inputs[7];
+    auto& y = outputs[0];
+    auto& state_pool = outputs[1];
+    int num_requests = static_cast<int>(cu_seqlens.shape(0)) - 1;
+    auto s = stream();
+    auto& d = metal::device(Device::gpu);
+
+    auto dt = dtype_to_metal(q.dtype());
+    std::string kname = "gdn_linear_attention_" + dt;
+    auto* lib = d.get_library("gdn_kern");
+    auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+
+    enc.set_input_array(q, 0);
+    enc.set_input_array(k, 1);
+    enc.set_input_array(v, 2);
+    enc.set_input_array(g, 3);
+    enc.set_input_array(beta, 4);
+    enc.set_output_array(state_pool, 5);
+    enc.set_input_array(cu_seqlens, 6);
+    enc.set_input_array(slot_mapping, 7);
+    enc.set_output_array(y, 8);
+
+    enc.set_bytes(num_requests, 9);
+    enc.set_bytes(Hk_, 10);
+    enc.set_bytes(Hv_, 11);
+    enc.set_bytes(Dk_, 12);
+    enc.set_bytes(Dv_, 13);
+    int64_t state_stride = state_pool.strides()[0];
+    enc.set_bytes(state_stride, 14);
+
+    // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(Dv_, 1, num_requests * Hv_),
+        MTL::Size::Make(32, 1, 1));
+  }
+
+  const char* name() const override { return "GDNLinearAttention"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    auto* rhs = dynamic_cast<const GDNLinearAttentionPrimitive*>(&other);
+    return rhs && rhs->Hk_ == Hk_ && rhs->Hv_ == Hv_
+        && rhs->Dk_ == Dk_ && rhs->Dv_ == Dv_;
+  }
+
+ private:
+  int Hk_, Hv_, Dk_, Dv_;
+};
+
+static std::vector<array> gdn_linear_attention_primitive_fn(
+    const array& q, const array& k, const array& v,
+    const array& g, const array& beta, const array& state_pool,
+    const array& cu_seqlens, const array& slot_mapping,
+    int Hk, int Hv, int Dk, int Dv) {
   if (Dk > 256) {
     throw std::runtime_error(
         "GDN kernel supports Dk <= 256 (state[8] * 32 threads). "
         "Got Dk=" + std::to_string(Dk));
   }
-
-  auto s = default_stream(Device::gpu);
-  auto& d = metal::device(Device::gpu);
-
-  auto dt = dtype_to_metal(q.dtype());
-  std::string kname = "gdn_linear_attention_" + dt;
-  auto* lib = d.get_library("gdn_kern");
-  auto* kernel = d.get_kernel(kname, lib, kname, {});
-
-  auto& enc = metal::get_command_encoder(s);
-  enc.set_compute_pipeline_state(kernel);
-
-  enc.set_input_array(q, 0);
-  enc.set_input_array(k, 1);
-  enc.set_input_array(v, 2);
-  enc.set_input_array(g, 3);
-  enc.set_input_array(beta, 4);
-  enc.set_output_array(state_pool, 5);
-  enc.set_input_array(cu_seqlens, 6);
-  enc.set_input_array(slot_mapping, 7);
-  enc.set_output_array(y, 8);
-
-  enc.set_bytes(num_requests, 9);
-  enc.set_bytes(Hk, 10);
-  enc.set_bytes(Hv, 11);
-  enc.set_bytes(Dk, 12);
-  enc.set_bytes(Dv, 13);
-  int64_t state_stride = state_pool.strides()[0];
-  enc.set_bytes(state_stride, 14);
-
-  // Grid: (Dv, 1, num_requests * Hv)  Threadgroup: (32, 1, 1)
-  enc.dispatch_threadgroups(
-      MTL::Size::Make(Dv, 1, num_requests * Hv),
-      MTL::Size::Make(32, 1, 1));
-
-  enc.add_temporary(q);
-  enc.add_temporary(k);
-  enc.add_temporary(v);
-  enc.add_temporary(g);
-  enc.add_temporary(beta);
-  enc.add_temporary(state_pool);
-  enc.add_temporary(cu_seqlens);
-  enc.add_temporary(slot_mapping);
-  enc.add_temporary(y);
+  auto prim = std::make_shared<GDNLinearAttentionPrimitive>(
+      default_stream(Device::gpu), Hk, Hv, Dk, Dv);
+  return array::make_arrays(
+      {{q.shape(0), Hv, Dv}, state_pool.shape()},
+      {q.dtype(), state_pool.dtype()}, prim,
+      {q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping});
 }
 // ---------------------------------------------------------------------------
 // nanobind module
@@ -1902,13 +1921,33 @@ NB_MODULE(_paged_ops, m) {
         "sinks); it joins the softmax denominator without contributing a "
         "value row, and is rejected together with TurboQuant.");
 
-  m.def("gdn_linear_attention", &gdn_linear_attention_impl,
+  m.def("gdn_linear_attention",
+        [](nb::handle q, nb::handle k, nb::handle v,
+           nb::handle g, nb::handle beta, nb::handle state_pool,
+           nb::handle cu_seqlens, nb::handle slot_mapping,
+           int Hk, int Hv, int Dk, int Dv) {
+          auto results = gdn_linear_attention_primitive_fn(
+              *nb::inst_ptr<array>(q), *nb::inst_ptr<array>(k),
+              *nb::inst_ptr<array>(v), *nb::inst_ptr<array>(g),
+              *nb::inst_ptr<array>(beta), *nb::inst_ptr<array>(state_pool),
+              *nb::inst_ptr<array>(cu_seqlens),
+              *nb::inst_ptr<array>(slot_mapping),
+              Hk, Hv, Dk, Dv);
+          auto arr_cls = nb::module_::import_("mlx.core").attr("array");
+          nb::object out_y = arr_cls(nb::int_(0));
+          nb::object out_state = arr_cls(nb::int_(0));
+          nb::inst_ptr<array>(out_y)->overwrite_descriptor(results[0]);
+          nb::inst_ptr<array>(out_state)->overwrite_descriptor(results[1]);
+          return nb::make_tuple(out_y, out_state);
+        },
         nb::arg("q"), nb::arg("k"), nb::arg("v"),
         nb::arg("g"), nb::arg("beta"),
         nb::arg("state_pool"), nb::arg("cu_seqlens"),
-        nb::arg("slot_mapping"), nb::arg("y"),
+        nb::arg("slot_mapping"),
         nb::arg("Hk"), nb::arg("Hv"), nb::arg("Dk"), nb::arg("Dv"),
-        "GDN linear attention with in-place paged state management.");
+        "Lazy GDN recurrence returning (y, updated_state_pool). Only the "
+        "state output aliases its input. Callers must use both returned "
+        "handles so output reads and state reuse depend on the native writes.");
 
   m.def("init_mla_library", &init_mla_library,
         nb::arg("src"),

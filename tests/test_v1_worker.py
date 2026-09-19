@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -214,6 +215,55 @@ class TestWorkerRunnerBoundaryDelegation:
         )
 
         assert planner.determine_available_memory() == expected
+
+    def _budget_capped_runner(self) -> WorkerCachePlanner:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
+            profile_run=lambda: 0,
+            draft_scratch_reserve_bytes=lambda: 0,
+        )
+        planner = WorkerCachePlanner(_make_worker(runner))
+        planner._metal_limit_bytes = lambda: 16_380_000_000
+        planner._memory_fraction = lambda: 1.0
+        planner.get_model_memory_usage = lambda: 0
+        return planner
+
+    def test_capped_budget_announces_requested_and_capped_sizes(
+        self, monkeypatch, caplog
+    ) -> None:
+        planner = self._budget_capped_runner()
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.mx.device_info",
+            lambda: {"max_buffer_length": 8_190_000_000},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="vllm_metal.v1.cache_policy"):
+            assert planner.determine_available_memory() == 8_190_000_000
+
+        record = next(r for r in caplog.records if "max_buffer_length" in r.message)
+        assert "16.38 GB" in record.message and "8.19 GB" in record.message
+
+    def test_capped_budget_fails_startup_in_error_mode(self, monkeypatch) -> None:
+        planner = self._budget_capped_runner()
+        monkeypatch.setenv("VLLM_METAL_HYBRID_BUFFER_CAP", "error")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.mx.device_info",
+            lambda: {"max_buffer_length": 8_192},
+        )
+
+        with pytest.raises(ValueError, match="max_buffer_length"):
+            planner.determine_available_memory()
+
+    def test_error_mode_keeps_uncapped_budget(self, monkeypatch) -> None:
+        planner = self._budget_capped_runner()
+        monkeypatch.setenv("VLLM_METAL_HYBRID_BUFFER_CAP", "error")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.mx.device_info",
+            lambda: {"max_buffer_length": 1 << 40},
+        )
+
+        assert planner.determine_available_memory() == 16_380_000_000
 
 
 class TestPagedAttentionPlanDiagnostics:

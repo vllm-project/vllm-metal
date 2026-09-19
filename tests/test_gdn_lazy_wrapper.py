@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 
@@ -1081,13 +1082,15 @@ class TestGDNPagedAttentionWrapperLazyKernels:
                 self.called = False
                 self.args: tuple[Any, ...] | None = None
 
-            def gdn_linear_attention(self, *args: Any) -> None:
+            def gdn_linear_attention(self, *args: Any) -> tuple[mx.array, mx.array]:
                 self.called = True
                 self.args = args
                 state_pool = args[5]
-                y_flat = args[8]
-                state_pool[:] = 7
-                y_flat[:] = 0
+                q, hv, dv = args[0], args[9], args[11]
+                return (
+                    mx.zeros((q.shape[0], hv, dv), dtype=q.dtype),
+                    mx.full_like(state_pool, 7),
+                )
 
         def fail_make_kernel(*_: Any) -> None:
             raise AssertionError(
@@ -1147,3 +1150,81 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             np.full(cache.recurrent_states[0].shape, 7, dtype=np.float32),
         )
         assert out.shape == (1, 2, inner.num_v_heads * inner.head_v_dim)
+
+    def test_native_fallback_full_wrapper_matches_lazy_recurrence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class ProjectedGDN(_TinyGDNInner):
+            def __init__(self):
+                super().__init__()
+                self.in_proj_qkv = nn.Linear(8, self.conv_dim, bias=False)
+                self.in_proj_z = nn.Linear(8, self.head_v_dim, bias=False)
+                self.in_proj_a = nn.Linear(8, 1, bias=False)
+                self.in_proj_b = nn.Linear(8, 1, bias=False)
+                self.conv1d = nn.Conv1d(
+                    self.conv_dim, self.conv_dim, 2, groups=self.conv_dim, bias=False
+                )
+                self.rms_norm = nn.RMSNorm(self.head_v_dim)
+                self.out_proj = nn.Linear(self.head_v_dim, 8, bias=False)
+
+            def norm(self, out, z):
+                return self.rms_norm(out) * nn.silu(z)
+
+        if not mx.metal.is_available():
+            pytest.skip("MLX Metal is not available")
+        attention_linear.get_ops()
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
+        inner = ProjectedGDN()
+        caches = [
+            _make_state_cache(
+                conv_kernel_dim=inner.conv_kernel_size,
+                conv_dim=inner.conv_dim,
+                num_v_heads=inner.num_v_heads,
+                value_head_dim=inner.head_v_dim,
+                key_head_dim=inner.head_k_dim,
+            )
+            for _ in range(2)
+        ]
+        native, lazy = [
+            GDNPagedAttentionWrapper(inner, layer_idx=0, cache_idx=0, state_cache=cache)
+            for cache in caches
+        ]
+        object.__setattr__(lazy, "_gdn_lazy", GDNLazyKernels(enabled=True))
+        assert not native._gdn_lazy.enabled
+        outputs = []
+        for slots, segment_length in (([2, 0], 2), ([0, 2], 1), ([2, 0], 1)):
+            total_tokens = 2 * segment_length
+            set_context(
+                PagedAttentionContext(
+                    slot_mapping=list(range(total_tokens)),
+                    cu_seqlens=[0, segment_length, total_tokens],
+                    state_slot_mapping=slots,
+                    num_decode_requests=2 if segment_length == 1 else 0,
+                )
+            )
+            try:
+                x = mx.random.normal((1, total_tokens, 8))
+                with monkeypatch.context() as guard:
+
+                    def no_host_wait(*args, **kwargs):
+                        pytest.fail("native fallback must remain in the lazy graph")
+
+                    guard.setattr(mx, "eval", no_host_wait)
+                    guard.setattr(mx, "synchronize", no_host_wait)
+                    actual = native(x)
+                outputs.append((actual, lazy(x)))
+            finally:
+                clear_context()
+        for cache in caches:
+            cache.apply_pending_states()
+        mx.eval(
+            *[out for pair in outputs for out in pair],
+            *[array for cache in caches for array in cache.updated_state_arrays()],
+        )
+        for actual, expected in outputs:
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-5)
+        np.testing.assert_allclose(
+            np.array(caches[0].recurrent_states[0]),
+            np.array(caches[1].recurrent_states[0]),
+            atol=1e-5,
+        )

@@ -89,6 +89,76 @@ def test_granite_plan_matches_mlx_lm_state_and_upstream_spec() -> None:
     assert spec.mamba_type == MambaAttentionBackendEnum.MAMBA2
 
 
+def test_geometry_check_accepts_the_declared_cache() -> None:
+    args = _model_args()
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+    model = Model(args)
+
+    runtime._validate_declared_state_geometry(model)
+
+    assert runtime._geometry_validated
+
+
+def test_geometry_check_skips_models_that_declare_no_cache() -> None:
+    args = _model_args()
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+
+    class NoCacheModel:
+        layers: list = []
+
+    runtime._validate_declared_state_geometry(NoCacheModel())
+
+    assert not runtime._geometry_validated
+
+
+def test_geometry_check_rejects_shape_drift() -> None:
+    args = _model_args()
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+    drifted_args = _model_args(mamba_d_state=args.mamba_d_state + 8)
+
+    with pytest.raises(ValueError, match="state geometry drift"):
+        runtime._validate_declared_state_geometry(Model(drifted_args))
+
+
+def test_geometry_check_revalidates_after_a_failed_attempt() -> None:
+    args = _model_args()
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+    drifted_args = _model_args(mamba_d_state=args.mamba_d_state + 8)
+
+    with pytest.raises(ValueError, match="state geometry drift"):
+        runtime._validate_declared_state_geometry(Model(drifted_args))
+    assert not runtime._geometry_validated
+
+    runtime._validate_declared_state_geometry(Model(args))
+    assert runtime._geometry_validated
+
+
+def test_geometry_check_rejects_layer_count_drift() -> None:
+    args = _model_args(
+        num_hidden_layers=5,
+        layer_types=["mamba", "attention", "mamba", "attention", "mamba"],
+    )
+    plan = build_hybrid_runtime_plan(
+        asdict(args), args.num_hidden_layers, (torch.bfloat16, torch.float32)
+    )
+    runtime = HybridPagedAttentionRuntime(hybrid_plan=plan, dtype=mx.float32)
+
+    with pytest.raises(ValueError, match="layer caches"):
+        runtime._validate_declared_state_geometry(Model(_model_args()))
+
+
 @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
 @pytest.mark.parametrize("rope", [False, True], ids=["nope", "rope"])
 def test_granite_paged_requests_match_mlx_lm_through_slot_reuse(moe, rope) -> None:

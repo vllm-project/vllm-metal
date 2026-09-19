@@ -538,7 +538,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state.target_hidden_states is None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
 
-    def test_start_paged_forward_applies_cow_before_step_context(
+    def test_start_paged_forward_applies_zero_and_cow_before_step_context(
         self, monkeypatch
     ) -> None:
         runtime = Mock()
@@ -560,6 +560,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         req_state = self._make_state([1, 6])
         req_state.block_ids = [[0, 1]]
         scheduler_output = self._make_scheduler_output({"r0": 1}, {})
+        scheduler_output.new_block_ids_to_zero = [6]
         scheduler_output.kv_cache_block_copies = [(2, 6)]
 
         runner._start_paged_forward(
@@ -569,8 +570,10 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             scheduler_output=scheduler_output,
         )
 
+        runtime.zero_blocks.assert_called_once_with([6])
         runtime.copy_blocks.assert_called_once_with([(2, 6)])
         method_order = [call[0] for call in runtime.mock_calls]
+        assert method_order.index("zero_blocks") < method_order.index("copy_blocks")
         assert method_order.index("copy_blocks") < method_order.index(
             "populate_step_context"
         )
