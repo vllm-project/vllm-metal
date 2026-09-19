@@ -255,8 +255,7 @@ class MetalStructuredOutputApplier:
         # Both tensors are compact CPU batches with matching row order.
         xgr.apply_token_bitmask_inplace(rows_torch, rows_bitmask)
 
-        # rows_torch is CPU float32 (from torch.from_numpy), so torch_to_mlx goes
-        # through numpy — all xgrammar mutations are captured before the copy.
+        # xgrammar has finished writing these local rows; MLX can share them.
         rows_mlx = torch_to_mlx(rows_torch).astype(
             original_dtype
         )  # (n_constrained, vocab)

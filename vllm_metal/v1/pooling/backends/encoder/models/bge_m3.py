@@ -108,7 +108,7 @@ class BgeM3Pooler:
         if request.pooling_params.use_activation is not False:
             scores = mx.maximum(scores, mx.zeros_like(scores))
 
-        tensor = mlx_to_torch(mx.contiguous(scores), device="cpu")
+        tensor = mlx_to_torch(scores, device="cpu")
         tensor = tensor.detach().clone().squeeze(-1)
         start = 1 if request.token_ids[0] == self.bos_token_id else 0
         end = (
