@@ -65,8 +65,20 @@ class PagedAttentionRuntimeBase:
         """Return scheduler groups holding per-request state (mamba) blocks."""
         return self._state_group_indices
 
-    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler copy-on-write operations to the primary cache."""
+    def copy_blocks(
+        self,
+        block_copies: Sequence[tuple[int, int]],
+        *,
+        kv_block_ids: set[int] | None = None,
+    ) -> None:
+        """Apply scheduler copy-on-write operations to the primary cache.
+
+        ``kv_block_ids`` carries this step's full-attention group ids so
+        state-backed runtimes can retire role-flipped slots before the CoW
+        allocation grows their pools; runtimes without secondary state
+        ignore it.
+        """
+        del kv_block_ids
         self._require_initialized("copy_blocks").copy_blocks(block_copies)
 
     def needs_step_context(self) -> bool:
@@ -80,9 +92,10 @@ class PagedAttentionRuntimeBase:
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]] | None = None,
         step_positions: list[tuple[int, int]] | None = None,
+        kv_block_ids: set[int] | None = None,
     ) -> None:
         """Attach runtime-specific metadata to one forward-pass context."""
-        del req_ids, ctx, state_block_ids, step_positions
+        del req_ids, ctx, state_block_ids, step_positions, kv_block_ids
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         """Append runtime-owned side-effect arrays that must be eval'd."""

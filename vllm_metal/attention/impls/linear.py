@@ -465,6 +465,11 @@ class GDNPagedAttentionWrapper(nn.Module):
             d_v,
         )
         mx.eval(y_flat, recurrent_pool)
+        # The native fallback encodes in-place writes into already materialized
+        # buffers outside the MLX graph. Their available status does not change,
+        # so eval() above does not wait for those writes. Complete them before
+        # the output cast/norm or a later state update can consume the buffers.
+        mx.synchronize()
         return y_flat.astype(state.x.dtype)
 
     def _project_output(

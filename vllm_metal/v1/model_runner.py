@@ -51,6 +51,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -63,6 +64,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.state_budget import StateCacheStep
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import (
     PENDING_TOKEN_PLACEHOLDER,
@@ -1135,11 +1137,33 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            # Full-attention group ids the scheduled requests hold, for the
+            # align state manager's slot retirement. Collected before CoW so
+            # retirement can free this step's role-flipped slots *before*
+            # CoW allocation grows the pool to cover them (capacity never
+            # shrinks; growing first would strand the freed slots).
+            step_kv_block_ids: set[int] | None = None
+            if self._paged_state_group_indices:
+                step_kv_block_ids = {
+                    block_id
+                    for tables, _, _ in decode_info
+                    for row in tables
+                    for block_id in row
+                }
+                step_kv_block_ids.update(
+                    block_id
+                    for tables, _, _ in prefill_info
+                    for row in tables
+                    for block_id in row
+                )
             if runtime is not None and scheduler_output.kv_cache_block_copies:
                 # vLLM has already rewritten request block tables to the CoW
                 # destinations. Populate those physical blocks before the
                 # hybrid state manager reads the rewritten tables.
-                runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
+                runtime.copy_blocks(
+                    scheduler_output.kv_cache_block_copies,
+                    kv_block_ids=step_kv_block_ids,
+                )
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
@@ -1172,6 +1196,7 @@ class MetalModelRunner:
                     ctx=ctx,
                     state_block_ids=step_state_ids,
                     step_positions=step_positions,
+                    kv_block_ids=step_kv_block_ids,
                 )
 
             # ---- forward (lazy graph + async submit) ----
@@ -2514,6 +2539,25 @@ class MetalModelRunner:
             if materialize_runtime_state:
                 runtime.materialize_pending_state()
 
+    def _prepare_state_cache_step(self, scheduler_output: SchedulerOutput) -> None:
+        runtime = self._paged_attention_runtime
+        if not (
+            isinstance(runtime, HybridPagedAttentionRuntime)
+            and runtime.state_slot_capacity is not None
+        ):
+            return
+        state_step = getattr(scheduler_output, "metal_state_cache", None)
+        if not isinstance(state_step, StateCacheStep):
+            raise RuntimeError(
+                "bounded GDN state pool requires scheduler state catalog"
+            )
+        # Retirement drains state writes and fences the GPU before slot reuse.
+        # Keep the independent pending token buffer in the decode pipeline:
+        # resolving it here would fill the single cached-output slot early and
+        # force this step onto a different sampling path. Normal submit/resolve
+        # ordering still owns token delivery; it never reads retired GDN rows.
+        runtime.prepare_state_cache_step(state_step)
+
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
@@ -2532,6 +2576,10 @@ class MetalModelRunner:
         # an ineligible step must resolve the pending deferred sample first so
         # the synchronous path never observes a pending token placeholder.
         self._decode_pipeline.begin_step(self._evaluate_pipeline_gate(scheduler_output))
+
+        # Consume catalogs even when this output schedules no tokens. A
+        # cleanup-only step must release slots before the next admission.
+        self._prepare_state_cache_step(scheduler_output)
 
         self._free_encoder_outputs(scheduler_output.free_encoder_mm_hashes)
         evicted_req_ids = self._finished_req_ids(scheduler_output)
