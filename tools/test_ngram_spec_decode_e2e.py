@@ -21,14 +21,13 @@ no draft model, no second cache). Run on its own:
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from vllm import LLM, SamplingParams
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
 NUM_SPECULATIVE_TOKENS = 3
+GPU_MEMORY_UTILIZATION = 0.6
 PROMPT_LOOKUP_MIN = 2
 PROMPT_LOOKUP_MAX = 3
 
@@ -85,13 +84,10 @@ def _set_env():
     0.6 (not 0.2 like the draft-model e2e test) so the KV budget stays positive
     on an 8 GB M1: there the metal limit is ~5.7 GB, and after the ~1.2 GB model
     plus ~0.5 GB forward overhead, 0.2 leaves a negative KV budget. N-gram needs
-    only one model (no draft), so 0.6 fits comfortably. Override the env var for
-    larger machines.
+    only one model (no draft), so 0.6 fits comfortably.
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        if os.environ.get("VLLM_METAL_MEMORY_FRACTION") is None:
-            mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.6")
         yield
 
 
@@ -104,6 +100,7 @@ def sd_engine():
         max_num_seqs=1,
         enable_prefix_caching=False,
         async_scheduling=False,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         speculative_config={
             "method": "ngram",
             "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,

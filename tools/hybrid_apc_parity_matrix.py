@@ -54,6 +54,7 @@ import sys
 import time
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
+GPU_MEMORY_UTILIZATION = 0.5
 
 CORPUS_A = (
     "The vLLM Metal backend executes transformer inference on Apple "
@@ -78,11 +79,7 @@ SUFFIXES = (
 
 
 def _child_env() -> None:
-    for key, val in (
-        ("VLLM_ENABLE_V1_MULTIPROCESSING", "0"),
-        ("VLLM_METAL_MEMORY_FRACTION", "0.5"),
-    ):
-        os.environ.setdefault(key, val)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 def build_cases(tok, block_size: int, shared_corpus: bool, quick: bool = False):
@@ -145,6 +142,7 @@ def run_child(model, enable_prefix_caching, mnbt, shared_corpus, quick, queue):
             "max_model_len": 2048,
             "max_num_seqs": 4,
             "enable_prefix_caching": enable_prefix_caching,
+            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             # profile_run builds a single (1, max_num_batched_tokens) dummy
             # sequence. Without a cap the LLM-class default (8192) makes that
             # dummy four times longer than max_model_len, and its full-vocab

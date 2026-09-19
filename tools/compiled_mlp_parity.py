@@ -25,6 +25,7 @@ import os
 import sys
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
+GPU_MEMORY_UTILIZATION = 0.5
 
 PROMPTS = (
     "Write a short essay about the history of computing.",
@@ -35,11 +36,7 @@ PROMPTS = (
 
 def _child_env(enabled: bool) -> None:
     os.environ["VLLM_METAL_COMPILED_MLP"] = "1" if enabled else "0"
-    for key, val in (
-        ("VLLM_ENABLE_V1_MULTIPROCESSING", "0"),
-        ("VLLM_METAL_MEMORY_FRACTION", "0.5"),
-    ):
-        os.environ.setdefault(key, val)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 def run_child(model: str, enabled: bool, quick: bool, queue) -> None:
@@ -60,7 +57,12 @@ def run_child(model: str, enabled: bool, quick: bool, queue) -> None:
 
     cm.CompiledMLPBlock.dispatch_compiled = spy
     try:
-        llm = LLM(model=model, max_model_len=2048, max_num_seqs=4)
+        llm = LLM(
+            model=model,
+            max_model_len=2048,
+            max_num_seqs=4,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+        )
         prompts = PROMPTS[:1] if quick else PROMPTS
         sp = SamplingParams(temperature=0, max_tokens=64)
         results = {}

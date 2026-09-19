@@ -35,6 +35,7 @@ import sys
 
 MODEL_DEFAULT = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-0.8B")
 CHUNK_MNBT = 256
+GPU_MEMORY_UTILIZATION = 0.5
 
 CORPUS = (
     "The vLLM Metal backend executes transformer inference on Apple "
@@ -51,11 +52,7 @@ SUFFIXES = (
 
 
 def _child_env() -> None:
-    for key, val in (
-        ("VLLM_ENABLE_V1_MULTIPROCESSING", "0"),
-        ("VLLM_METAL_MEMORY_FRACTION", "0.5"),
-    ):
-        os.environ.setdefault(key, val)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 def build_prompts(tok, quick: bool) -> list[tuple[str, list[int]]]:
@@ -100,6 +97,7 @@ def run_child(model: str, engaged: bool, quick: bool, queue) -> None:
             max_num_batched_tokens=CHUNK_MNBT,
             enable_chunked_prefill=True,
             enable_prefix_caching=False,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         )
         tok = llm.get_tokenizer()
         prompts = build_prompts(tok, quick)

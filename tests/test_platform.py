@@ -1523,7 +1523,6 @@ class TestMetalPlatform:
         enters with the unset default and resolves to "uni" in the same
         call)."""
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1546,7 +1545,6 @@ class TestMetalPlatform:
         self, monkeypatch
     ) -> None:
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1569,7 +1567,6 @@ class TestMetalPlatform:
 
     def test_check_and_update_config_keeps_manual_mb_export(self, monkeypatch) -> None:
         monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "64")
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1593,7 +1590,6 @@ class TestMetalPlatform:
         """#585 shape: a later engine above the batched-token bound removes
         the plugin's own earlier default instead of inheriting it."""
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,

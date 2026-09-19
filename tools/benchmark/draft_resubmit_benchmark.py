@@ -29,8 +29,8 @@ length, read directly from internal proposer state.
 Notes on methodology:
 
 - Requires ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` so the monkeypatch reaches
-  the engine; the script sets it if unset. Set ``VLLM_METAL_MEMORY_FRACTION``
-  as needed for the machine (0.4 is a reasonable default).
+  the engine; the script sets it if unset. Set ``--gpu-memory-utilization``
+  as needed for the machine (0.4 is the default).
 - The warm 1-token generate heats the *target* prefix cache only on trees
   where ``propose()`` is skipped for prefill-only steps. On the
   scheduler-managed tree the runner calls ``propose()`` every step, so the
@@ -41,8 +41,8 @@ Notes on methodology:
   prefer the plan columns and wall/tpot for conclusions.
 - The reference run executes in its own subprocess: an in-process
   ``del llm`` / ``gc.collect()`` does not release Metal memory
-  (``mx.clear_cache()`` neither, and ``gpu_memory_utilization`` has no
-  effect on this backend), so the reference's KV would still be resident
+  (``mx.clear_cache()`` does not either), so the reference's KV would still
+  be resident
   when the spec run profiles its budget. The subprocess exit releases
   everything. Pass ``--skip-lossless`` to skip it if memory is tight.
 
@@ -51,8 +51,8 @@ Output: one JSON object with ``reference`` (or ``null``) and ``spec_runs``
 
 Usage:
 
-    VLLM_METAL_MEMORY_FRACTION=0.4 \\
-        python tools/benchmark/draft_resubmit_benchmark.py --prefix 8192
+    python tools/benchmark/draft_resubmit_benchmark.py --prefix 8192 \\
+        --gpu-memory-utilization 0.4
 """
 
 from __future__ import annotations
@@ -154,6 +154,7 @@ def _run_reference(args, prompt: str) -> dict | None:
         max_num_seqs=1,
         enable_prefix_caching=True,
         async_scheduling=False,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
     sp = SamplingParams(temperature=0, max_tokens=args.gen)
     t0 = time.perf_counter()
@@ -177,7 +178,7 @@ def _run_reference_subprocess(args) -> dict:
     The reference's Metal allocations (weights + KV) are only guaranteed
     released once its process exits; in-process teardown of the ``LLM``
     object does not free them before the spec run profiles its KV budget,
-    so on tight ``VLLM_METAL_MEMORY_FRACTION`` values the spec run would
+    so with a tight KV budget the spec run would
     see a reduced or negative ``kv_budget`` and fail.
     """
     cmd = [
@@ -190,6 +191,8 @@ def _run_reference_subprocess(args) -> dict:
         str(args.prefix),
         "--gen",
         str(args.gen),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
     ]
     # stderr passes through so the child's progress markers stay visible.
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
@@ -212,6 +215,7 @@ def _run_spec(args, prompt: str, reference_ids: list[int] | None) -> list[dict]:
         max_num_seqs=1,
         enable_prefix_caching=True,
         async_scheduling=False,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         speculative_config={
             "method": "draft_model",
             "model": args.model,
@@ -272,6 +276,7 @@ def main() -> None:
     ap.add_argument("--prefix", type=int, default=8192)
     ap.add_argument("--gen", type=int, default=96)
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     ap.add_argument("--num-speculative-tokens", type=int, default=3)
     ap.add_argument("--skip-warm", action="store_true")
     ap.add_argument(

@@ -426,7 +426,6 @@ def test_prompt_logprobs_end_to_end_paged():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.3")
 
         llm = LLM(
             model="Qwen/Qwen3-0.6B",
@@ -434,6 +433,7 @@ def test_prompt_logprobs_end_to_end_paged():
             max_num_seqs=2,
             max_num_batched_tokens=16,
             enable_chunked_prefill=True,
+            gpu_memory_utilization=0.3,
         )
         prompt = (
             "The three most important properties of a distributed cache "

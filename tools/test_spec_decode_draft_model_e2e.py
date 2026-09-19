@@ -37,6 +37,7 @@ from vllm import LLM, SamplingParams
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MAX_TOKENS = 10
 NUM_SPECULATIVE_TOKENS = 3
+GPU_MEMORY_UTILIZATION = 0.2
 
 PROMPTS = [
     "The capital of France is",
@@ -100,8 +101,6 @@ def _set_env():
     """Force the paged path (spec-decode verify requires it) with headroom."""
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        if os.environ.get("VLLM_METAL_MEMORY_FRACTION") is None:
-            mp.setenv("VLLM_METAL_MEMORY_FRACTION", "0.2")
         yield
 
 
@@ -114,6 +113,7 @@ def sd_engine():
         max_num_seqs=1,
         enable_prefix_caching=False,
         async_scheduling=False,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         speculative_config={
             "method": "draft_model",
             "model": MODEL_NAME,

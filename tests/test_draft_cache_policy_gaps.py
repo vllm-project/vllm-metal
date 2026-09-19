@@ -39,7 +39,7 @@ from tests.test_draft_model_proposer import (
 )
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
-DEFAULT_PAGED_MEMORY_FRACTION = "0.2"
+GPU_MEMORY_UTILIZATION = 0.2
 
 K = 3
 GEN = 8
@@ -53,11 +53,6 @@ SKIP_PROMPT = (
     "The engineer examined the trace carefully, noting where the latency "
     "spiked and which subsystem held the lock the longest before yielding. "
 )
-
-
-def _setenv_default(key: str, default: str) -> None:
-    if os.environ.get(key) is None:
-        os.environ[key] = default
 
 
 def _install_plan_logger(dmp, plans: list) -> None:
@@ -94,8 +89,7 @@ def _install_plan_logger(dmp, plans: list) -> None:
 
 def _run_policy_e2e() -> None:
     """Body of the e2e test -- runs in a spawned child process."""
-    _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     from vllm import LLM, SamplingParams
 
@@ -110,6 +104,7 @@ def _run_policy_e2e() -> None:
         max_num_seqs=1,
         enable_prefix_caching=True,
         async_scheduling=False,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         speculative_config={
             "method": "draft_model",
             "model": MODEL_NAME,
@@ -199,8 +194,7 @@ def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
     prompt (>16 tokens), so a chunk of 16 splits the cold ingest into
     multiple forwards while a chunk of 0 keeps the single-forward behavior.
     """
-    _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ["VLLM_METAL_SPEC_INGEST_CHUNK"] = chunk
 
     from vllm import LLM, SamplingParams
@@ -216,6 +210,7 @@ def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
         max_num_seqs=1,
         enable_prefix_caching=True,
         async_scheduling=False,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         speculative_config={
             "method": "draft_model",
             "model": MODEL_NAME,

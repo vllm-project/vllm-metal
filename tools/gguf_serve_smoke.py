@@ -10,8 +10,8 @@ rather than a skipped slow unit test.
 
 Run one vLLM process at a time; set the memory fraction for this machine:
 
-    VLLM_METAL_MEMORY_FRACTION=0.5 python tools/gguf_serve_smoke.py \\
-        /path/Qwen3-0.6B-Q8_0.gguf --tokenizer /path/Qwen3-0.6B
+    python tools/gguf_serve_smoke.py /path/Qwen3-0.6B-Q8_0.gguf \\
+        --tokenizer /path/Qwen3-0.6B --gpu-memory-utilization 0.5
 """
 
 from __future__ import annotations
@@ -69,6 +69,7 @@ def main() -> int:
     )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--max-tokens", type=int, default=24)
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
     parser.add_argument("--expect", default=_DEFAULT_EXPECT)
@@ -86,6 +87,8 @@ def main() -> int:
             str(args.port),
             "--max-model-len",
             str(args.max_model_len),
+            "--gpu-memory-utilization",
+            str(args.gpu_memory_utilization),
         ]
     )
     try:

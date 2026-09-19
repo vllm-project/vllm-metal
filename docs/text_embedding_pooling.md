@@ -77,7 +77,6 @@ print(len(outputs), len(outputs[0].outputs.embedding))
 
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-VLLM_METAL_MEMORY_FRACTION=auto \
 vllm serve mlx-community/Qwen3-Embedding-0.6B-8bit \
   --runner pooling \
   --max-model-len 512
@@ -152,7 +151,6 @@ print(outputs[0].outputs.score)
 
 ```bash
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-VLLM_METAL_MEMORY_FRACTION=auto \
 vllm serve mku64/Qwen3-Reranker-0.6B-mlx-8Bit \
   --revision ba80418a47fa1c4368a6c2287b0e449904063576 \
   --runner pooling \

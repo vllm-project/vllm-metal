@@ -49,6 +49,7 @@ TEST_CASES: tuple[tuple[str, int, bool], ...] = (
     ("Qwen/Qwen3.5-0.8B", 8, True),
     ("Qwen/Qwen3.5-0.8B", 16, True),
 )
+GPU_MEMORY_UTILIZATION = 0.8
 
 
 def _check(actual: int, requested: int, text: str, hybrid: bool) -> tuple[bool, str]:
@@ -71,6 +72,7 @@ def _run_one(model: str, block_size: int, hybrid: bool) -> int:
         max_model_len=512,
         max_num_batched_tokens=64,
         enforce_eager=True,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
     )
     actual = llm.llm_engine.vllm_config.cache_config.block_size
     out = llm.generate(["Hello"], SamplingParams(max_tokens=3, temperature=0))
@@ -92,7 +94,6 @@ def main() -> int:
 
     env = os.environ.copy()
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
-    env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.8")
 
     failures: list[tuple[str, int]] = []
     for model, bs, hybrid in TEST_CASES:

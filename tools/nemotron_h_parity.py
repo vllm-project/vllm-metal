@@ -53,6 +53,7 @@ PROMPTS = [
     "Water boils at a temperature of",
 ]
 CHUNK_MNBT = 256
+GPU_MEMORY_UTILIZATION = 0.5
 
 
 def _to_numpy(array) -> np.ndarray:
@@ -64,7 +65,6 @@ def _to_numpy(array) -> np.ndarray:
 
 def _child_env() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    os.environ["VLLM_METAL_MEMORY_FRACTION"] = "0.5"
 
 
 def _divergence(m, tokenizer, prompt: str, mlx_tokens, other_tokens) -> dict | None:
@@ -188,6 +188,7 @@ def run_vllm_child(
         enable_prefix_caching=False,
         max_num_batched_tokens=CHUNK_MNBT,
         disable_log_stats=True,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
     )
     sp = SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True)
     tokens = {o.prompt: list(o.outputs[0].token_ids) for o in llm.generate(PROMPTS, sp)}
