@@ -26,7 +26,6 @@ def validate_tensor_config(config: Any) -> None:
         or parallel.pipeline_parallel_size != 1
         or getattr(parallel, "data_parallel_size", 1) != 1
         or parallel.distributed_executor_backend != "ray"
-        or getattr(parallel, "enable_expert_parallel", False)
         or model is None
         or getattr(getattr(model, "hf_config", None), "model_type", None) != "gpt_oss"
     )
