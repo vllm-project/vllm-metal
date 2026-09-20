@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from typing import cast
+
+logger = logging.getLogger(__name__)
 
 
 def expert_partition(world_size: int, num_experts: int) -> list[int]:
@@ -43,6 +47,9 @@ def apply_expert_shard(model, tp) -> None:
     import mlx.core as mx
     from mlx.nn.layers.distributed import shard_linear
 
+    from vllm_metal import envs
+    from vllm_metal.distributed.expert_decode import supports_experts
+
     group = getattr(tp, "group", tp)
     if getattr(model, "model_type", None) != "gpt_oss" or group.size() != 2:
         raise NotImplementedError("Expert sharding supports GPT-OSS on two Macs.")
@@ -63,12 +70,10 @@ def apply_expert_shard(model, tp) -> None:
     # end] decodes as total minus mine; the squared terms catch a zeroed peer.
     # Skipped for non-distributed groups (single-process and unit-test fakes).
     if mx.distributed.is_available() and isinstance(group, mx.distributed.Group):
-        mine = mx.array(
-            [start, end, start * start, end * end], dtype=mx.int32
-        )
+        mine = mx.array([start, end, start * start, end * end], dtype=mx.int32)
         total = mx.distributed.all_sum(mine, group=group, stream=mx.cpu)
         mx.eval(total)
-        ts, te, ts_sq, te_sq = (int(v) for v in total.tolist())
+        ts, te, ts_sq, te_sq = (int(v) for v in cast(list[int], total.tolist()))
         peer_start, peer_end = ts - start, te - end
         if (
             peer_start * peer_start != ts_sq - start * start
@@ -111,17 +116,28 @@ def apply_expert_shard(model, tp) -> None:
 
         experts = layer.mlp.experts
         for proj in (experts.gate_proj, experts.up_proj, experts.down_proj):
-            proj.weight = proj.weight[start:end]
+            # Axis-zero slices can retain the full checkpoint allocation.
+            # Materialize owned storage, as MLX's tensor sharder does.
+            proj.weight = mx.contiguous(proj.weight[start:end])
             if "scales" in proj:
-                proj.scales = proj.scales[start:end]
+                proj.scales = mx.contiguous(proj.scales[start:end])
             if "bias" in proj:
-                proj.bias = proj.bias[start:end]
+                proj.bias = mx.contiguous(proj.bias[start:end])
             quant_biases = proj.get("biases")
             if quant_biases is not None:
-                proj.biases = quant_biases[start:end]
+                proj.biases = mx.contiguous(quant_biases[start:end])
         layer.mlp.sharding_group = group
         layer.mlp.expert_partition = (start, end)
+        layer.mlp.expert_gpu_decode = (
+            envs.VLLM_METAL_EP_GPU_DECODE and supports_experts(experts)
+        )
     install_expert_routing()
+    logger.info(
+        "Expert GPU decode: rank=%d enabled_layers=%d/%d",
+        group.rank(),
+        sum(layer.mlp.expert_gpu_decode for layer in model.layers),
+        len(model.layers),
+    )
 
 
 def install_expert_routing() -> None:
@@ -137,6 +153,8 @@ def install_expert_routing() -> None:
     import mlx.core as mx
     from mlx_lm.models import gpt_oss as mlx_gpt_oss
 
+    from vllm_metal.distributed.expert_decode import decode_local_experts
+
     if getattr(mlx_gpt_oss.MLPBlock, "_ep_routing_installed", False):
         return
     original = mlx_gpt_oss.MLPBlock.__call__
@@ -151,7 +169,14 @@ def install_expert_routing() -> None:
         mask = (indices < start) | (indices >= end)
         local = mx.where(mask, mx.zeros_like(indices), indices - start)
         expert_weights = mx.where(mask, mx.zeros_like(expert_weights), expert_weights)
-        out = self.experts(x, local)
+        if (
+            getattr(self, "expert_gpu_decode", False)
+            and indices.size == self.num_experts_per_tok
+            and x.dtype in (mx.float16, mx.bfloat16)
+        ):
+            out = decode_local_experts(self.experts, x, indices, start, end)
+        else:
+            out = self.experts(x, local)
         out = out * mx.expand_dims(expert_weights, axis=-1)
         y = out.sum(axis=-2)
         return mx.distributed.all_sum(y, group=self.sharding_group)

@@ -1,0 +1,20 @@
+{
+  "pipeline_transport": {
+    "backend": "jaccl",
+    "coordinator_port": 59451,
+    "device_matrix": [
+      [
+        null,
+        [
+          "rdma_en1"
+        ]
+      ],
+      [
+        [
+          "rdma_en2"
+        ],
+        null
+      ]
+    ]
+  }
+}

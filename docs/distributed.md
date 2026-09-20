@@ -412,12 +412,12 @@ RAY_ADDRESS=auto VLLM_HOST_IP=192.168.1.145 \
 The context and batching limits are the initial correctness-test settings, as
 under PP. `VLLM_METAL_EXPERT_PARTITION` partitions the 128 routed experts —
 one positive integer per rank, in rank order, summing to the model's
-routed-expert count — and must match in both Ray node environments. An even
-64/64 split does **not** fit a 48GB Mac at full expert width: the working set
-lands at the wired-limit ceiling and decode degrades into minutes-long steps
-(the model "hangs" without erroring). The neighboring `inference-ui` launcher
-therefore defaults experts mode to `56,72` — fewer experts on the smaller Mac,
-the analog of PP's `14,22` layer split; export the variable to override.
+routed-expert count — and must match in both Ray node environments. The
+neighboring `inference-ui` launcher defaults to `56,72` to give the smaller
+48GB Mac more headroom. Expert weight slices are materialized with
+`mx.contiguous`: an axis-zero view alone can retain the entire unsharded
+allocation. Earlier minutes-long stalls were caused by that retained storage;
+they do not establish that an even partition cannot fit.
 
 - The router is replicated on both ranks. After the attention `all_sum`, both
   ranks hold identical activations, so both derive the same top-4 experts and
@@ -433,16 +433,25 @@ the analog of PP's `14,22` layer split; export the variable to override.
 - **Same restrictions as tensor mode.** Two Macs, GPT-OSS, TP=2, PP=1, DP=1,
   Ray executor, synchronous scheduling, MLX safetensors; LoRA, speculative
   decoding, GGUF/AWQ, and multimodal fail at admission.
-- **Expert FLOPs are not halved.** The dummy slots keep shapes static, so each
-  rank runs about four expert GEMMs per token (roughly two real plus two
-  zeroed) — about twice the per-rank expert FLOPs of a perfect dispatch.
-  Filtering non-local pairs before the expert GEMMs is a deferred optimization.
+- **Single-token MXFP4 decode skips unowned slots on the GPU.** The masked
+  projection kernel checks ownership before reading the expert weights and
+  adds each owned expert's bias in the same kernel. It
+  supports group-size-32 MXFP4 with float16/bfloat16 activations. Shapes stay
+  static and routing never calls `.tolist()` or synchronizes with the CPU.
+  Set `VLLM_METAL_EP_GPU_DECODE=0` on both nodes to use the native MLX fallback
+  for comparisons. The neighboring launcher forwards this switch to both Macs.
+- **Prefill and multi-token batches still compute dummy slots.** Other
+  quantizers also use the native fallback. This optimization does not reduce
+  collective counts or change attention/KV-cache handling. Expert imbalance
+  between ranks can still limit performance.
 
 Validated by unit tests (tiny-model EP parity against the unsplit reference in
 float32 and MXFP4/Q8, sorted and unsorted SwitchGLU paths, exact within
 tolerance) and the two-Mac smoke
-(`tools/jaccl_pp_smoke.py --model gpt-oss --expert-parallel`); 120B serving
-validation is pending.
+(`tools/jaccl_pp_smoke.py --model gpt-oss --expert-parallel`). GPT-OSS 120B
+serving and a two-turn contextual chat were validated on the two-Mac setup.
+The masked GPU kernel has separate projection/parity tests and fixed-context
+serving measurements; these are not a full model-quality evaluation.
 
 ## Data parallelism
 

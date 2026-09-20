@@ -245,10 +245,11 @@ def _run_ep_forward(monkeypatch, shard0, shard1, tokens):
 @pytest.mark.parametrize(
     "tokens",
     [
+        [1],  # Single-token decode exercises the masked MXFP4 GPU path.
         [1, 7, 11, 23, 42, 3, 9, 17, 5, 8, 2, 13],  # 12 tokens x top-2 = 24 pairs
         list(range(1, 33)),  # 32 tokens x top-2 = 64 pairs -> SwitchGLU sorts
     ],
-    ids=["unsorted24", "sorted64"],
+    ids=["decode", "unsorted24", "sorted64"],
 )
 @pytest.mark.parametrize("quantized", [False, True], ids=["float32", "mxfp4-q8"])
 def test_expert_forward_matches_unsplit_reference(monkeypatch, tokens, quantized):
@@ -364,3 +365,34 @@ def test_runner_applies_expert_shard_when_flagged(monkeypatch):
     runner_mod._apply_tensor_parallel_shards(runner)
     assert calls == ["ep", "tp"]
     assert runner.num_kv_heads == 2 and runner.kv_heads_per_layer == [2, 2]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_expert_shard_releases_unowned_weight_storage(monkeypatch, rank, quantized):
+    """A contiguous expert slice must not retain the full checkpoint buffer."""
+    import gc
+
+    from mlx.utils import tree_flatten
+
+    from vllm_metal.distributed.experts import apply_expert_shard
+
+    monkeypatch.setenv("VLLM_METAL_EXPERT_PARTITION", "2,2")
+    gc.collect()
+    mx.synchronize()
+    baseline = mx.get_active_memory()
+    model = _ep_model(quantized=quantized)
+    # Make retained storage dominate allocator rounding. This checks storage
+    # ownership; forward geometry is exercised by the parity tests above.
+    proj = model.layers[0].mlp.experts.gate_proj
+    proj.weight = mx.ones((4, 1024, 1024), dtype=proj.weight.dtype)
+    mx.eval(model.parameters())
+    apply_expert_shard(model, _Group(rank, 2))
+    mx.eval(model.parameters())
+    gc.collect()
+    logical_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    retained_bytes = mx.get_active_memory() - baseline
+    assert retained_bytes <= logical_bytes + 1024 * 1024, (
+        f"Rank {rank} retained {retained_bytes} bytes for {logical_bytes} "
+        "bytes of owned weights; an expert slice still holds unowned storage"
+    )

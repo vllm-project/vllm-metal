@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
     VLLM_METAL_EXPERT_PARTITION: str | None = None
+    VLLM_METAL_EP_GPU_DECODE: bool = True
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
@@ -128,6 +129,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Expert-parallel partition across ranks, e.g. "56,72" for two Macs with
     # 128 routed experts. Default: even split (validated to divide evenly).
     "VLLM_METAL_EXPERT_PARTITION": lambda: os.getenv("VLLM_METAL_EXPERT_PARTITION"),
+    # Skip unowned MXFP4 expert projections on single-token decode.
+    "VLLM_METAL_EP_GPU_DECODE": lambda: (
+        os.getenv("VLLM_METAL_EP_GPU_DECODE", "1") == "1"
+    ),
 }
 
 
