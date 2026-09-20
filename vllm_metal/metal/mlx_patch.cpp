@@ -20,13 +20,19 @@
 // Flattening fails when the total element count exceeds INT32_MAX, even if
 // every original dimension fits. The internal AsStrided primitive avoids that
 // flatten, but the released wheel does not export its vtable for extensions.
+// For example, a recorded Qwen3.5-0.8B shared cache uses 5.24 GiB. Its BF16
+// backing shape (5046, 557056) has 2810904576 elements: both axes fit int32,
+// but flattening the backing does not.
+//
 // This primitive shares the input buffer directly and retains its lazy
 // dependency. It consumes valid cache-layout descriptors supplied by vLLM:
 // row-contiguous backing, positive dimensions, and nonnegative strides.
 // Callers are responsible for in-bounds addresses and non-overlapping writes.
 //
-// Remove this helper and its build entry when released MLX provides the same
-// view operation without flattening or copying the backing.
+// Upstream plan: contribute the no-flatten view path to MLX's public as_strided,
+// with a regression test for backing larger than INT32_MAX elements. Preserve
+// buffer aliasing and lazy dependencies. Once that fix ships in the MLX version
+// we depend on, use mx.as_strided and remove this helper and its build entry.
 // See mlx/ops.cpp:as_strided and mlx/backend/common/common.cpp:AsStrided::eval
 // in https://github.com/ml-explore/mlx/tree/v0.32.1.
 
