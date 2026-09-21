@@ -275,56 +275,67 @@ def test_embedding_empty_ids(tmp_path, qtype):
     assert out.dtype == mx.float16
 
 
-# --- Q4_K raw-block repack (#761) ---------------------------------------------
+# --- K-quant raw-block repack (#761) -------------------------------------------
+
+RAW_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
 
 
-def _build_q4k_blocks(rows: int, cols: int, seed: int = 0) -> np.ndarray:
-    """Construct valid random Q4_K superblocks field-by-field.
+def _build_kquant_blocks(rows: int, cols: int, qtype, seed: int = 0) -> np.ndarray:
+    """Construct valid random Q4_K/Q5_K superblocks field-by-field.
 
-    gguf-py has no K-quant quantizer, so tests build the raw 144-byte blocks
-    directly; ``gguf.quants.dequantize`` stays the authoritative oracle for
-    what they mean.
+    gguf-py has no K-quant quantizer, so tests build the raw blocks directly;
+    ``gguf.quants.dequantize`` stays the authoritative oracle for what they
+    mean.
     """
+    five_bit = qtype == GGMLQuantizationType.Q5_K
     rng = np.random.default_rng(seed)
     n = rows * (cols // 256)
     d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
     dmin = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
     sub_scales = rng.integers(0, 64, (n, 8), dtype=np.uint8)
     sub_mins = rng.integers(0, 64, (n, 8), dtype=np.uint8)
-    codes = rng.integers(0, 16, (n, 8, 32), dtype=np.uint8)
+    codes = rng.integers(0, 32 if five_bit else 16, (n, 8, 32), dtype=np.uint8)
     packed = np.zeros((n, 12), np.uint8)
     packed[:, 0:4] = (sub_scales[:, 0:4] & 0x3F) | ((sub_scales[:, 4:8] & 0x30) << 2)
     packed[:, 4:8] = (sub_mins[:, 0:4] & 0x3F) | ((sub_mins[:, 4:8] & 0x30) << 2)
     packed[:, 8:12] = (sub_scales[:, 4:8] & 0x0F) | ((sub_mins[:, 4:8] & 0x0F) << 4)
-    nibbles = (codes[:, 0::2, :] | (codes[:, 1::2, :] << 4)).reshape(n, 128)
-    blocks = np.concatenate(
-        [d.view(np.uint8), dmin.view(np.uint8), packed, nibbles], axis=1
-    )
-    return blocks.reshape(rows, -1)
+    low = codes & 0x0F
+    nibbles = (low[:, 0::2, :] | (low[:, 1::2, :] << 4)).reshape(n, 128)
+    parts = [d.view(np.uint8), dmin.view(np.uint8), packed]
+    if five_bit:
+        qh = np.zeros((n, 32), np.uint8)
+        for group in range(8):
+            qh |= (codes[:, group, :] >> 4) << group
+        parts.append(qh)
+    parts.append(nibbles)
+    return np.concatenate(parts, axis=1).reshape(rows, -1)
 
 
-def _make_q4k_tensor(rows: int = 8, cols: int = 512) -> tuple:
-    raw = _build_q4k_blocks(rows, cols)
-    qt = GGUFMLXQuantizedTensor.from_raw_blocks(
-        raw, (rows, cols), GGMLQuantizationType.Q4_K
-    )
-    oracle = gguf.quants.dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float32)
+def _make_kquant_tensor(qtype, rows: int = 8, cols: int = 512) -> tuple:
+    raw = _build_kquant_blocks(rows, cols, qtype)
+    qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (rows, cols), qtype)
+    oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
 
 
-def test_q4k_contract_matches_logical_shape():
-    qt, _ = _make_q4k_tensor(rows=8, cols=512)
+@pytest.mark.parametrize(
+    ("qtype", "bits"),
+    [(GGMLQuantizationType.Q4_K, 4), (GGMLQuantizationType.Q5_K, 5)],
+)
+def test_kquant_contract_matches_logical_shape(qtype, bits):
+    qt, _ = _make_kquant_tensor(qtype, rows=8, cols=512)
 
-    assert qt.qweight_type == GGMLQuantizationType.Q4_K
+    assert qt.qweight_type == qtype
     assert qt.logical_shape == (8, 512)
-    assert qt.bits == 4
+    assert qt.bits == bits
     assert qt.group_size == 32
     assert qt.scales.dtype == mx.float32
     assert qt.biases.dtype == mx.float32
 
 
-def test_q4k_dequantize_matches_oracle_bit_exact():
-    qt, oracle = _make_q4k_tensor()
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_kquant_dequantize_matches_oracle_bit_exact(qtype):
+    qt, oracle = _make_kquant_tensor(qtype)
 
     deq = mx.dequantize(
         qt.qweight, qt.scales, qt.biases, group_size=qt.group_size, bits=qt.bits
@@ -334,8 +345,9 @@ def test_q4k_dequantize_matches_oracle_bit_exact():
     assert np.array_equal(np.array(deq), oracle)
 
 
-def test_q4k_matmul_matches_dense_oracle_f32():
-    qt, oracle = _make_q4k_tensor()
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_kquant_matmul_matches_dense_oracle_f32(qtype):
+    qt, oracle = _make_kquant_tensor(qtype)
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
@@ -351,10 +363,11 @@ def test_q4k_matmul_matches_dense_oracle_f32():
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_q4k_matmul_output_dtype_follows_x(dtype):
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_kquant_matmul_output_dtype_follows_x(qtype, dtype):
     # The fp32-scales arm promotes differently than fp16 scales; the x-dtype
     # contract must hold on it too.
-    qt, _ = _make_q4k_tensor()
+    qt, _ = _make_kquant_tensor(qtype)
     x = mx.random.normal((4, qt.in_features)).astype(dtype)
 
     out = qt.matmul(x)
@@ -363,8 +376,9 @@ def test_q4k_matmul_output_dtype_follows_x(dtype):
     assert out.shape == (4, qt.out_features)
 
 
-def test_q4k_embedding_matches_oracle_rows_exactly():
-    qt, oracle = _make_q4k_tensor()
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_kquant_embedding_matches_oracle_rows_exactly(qtype):
+    qt, oracle = _make_kquant_tensor(qtype)
     ids = mx.array([0, 3, 7], dtype=mx.int32)
 
     out = qt.embedding(ids, output_dtype=mx.float32)
@@ -374,32 +388,34 @@ def test_q4k_embedding_matches_oracle_rows_exactly():
     assert np.array_equal(np.array(out), oracle[np.array([0, 3, 7])])
 
 
-def test_q4k_requires_float32_scales():
-    qt, _ = _make_q4k_tensor()
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_kquant_requires_float32_scales(qtype):
+    qt, _ = _make_kquant_tensor(qtype)
 
     with pytest.raises(ValueError, match="scales must be float32"):
         GGUFMLXQuantizedTensor(
             qweight=qt.qweight,
             scales=qt.scales.astype(mx.float16),
             biases=qt.biases.astype(mx.float16),
-            qweight_type=GGMLQuantizationType.Q4_K,
+            qweight_type=qtype,
         )
 
 
 def test_from_raw_blocks_rejects_native_qtype():
-    raw = _build_q4k_blocks(8, 512)
+    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="not repacked from raw blocks"):
         GGUFMLXQuantizedTensor.from_raw_blocks(raw, (8, 512), GGMLQuantizationType.Q8_0)
 
 
-def test_from_mx_load_rejects_raw_block_qtype():
+@pytest.mark.parametrize("qtype", RAW_QTYPES)
+def test_from_mx_load_rejects_raw_block_qtype(qtype):
     with pytest.raises(ValueError, match="build it with from_raw_blocks"):
-        GGUFMLXQuantizedTensor.from_mx_load({}, "w.weight", GGMLQuantizationType.Q4_K)
+        GGUFMLXQuantizedTensor.from_mx_load({}, "w.weight", qtype)
 
 
 def test_from_raw_blocks_rejects_truncated_payload():
-    raw = _build_q4k_blocks(8, 512)
+    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="logical shape .* needs"):
         GGUFMLXQuantizedTensor.from_raw_blocks(
@@ -408,14 +424,14 @@ def test_from_raw_blocks_rejects_truncated_payload():
 
 
 def test_from_raw_blocks_rejects_non_superblock_width():
-    raw = _build_q4k_blocks(8, 512)
+    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="not a multiple of the 256-element"):
         GGUFMLXQuantizedTensor.from_raw_blocks(raw, (8, 500), GGMLQuantizationType.Q4_K)
 
 
 def test_from_raw_blocks_rejects_non_uint8_payload():
-    raw = _build_q4k_blocks(8, 512)
+    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="raw block data must be uint8"):
         GGUFMLXQuantizedTensor.from_raw_blocks(
