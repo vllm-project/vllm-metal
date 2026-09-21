@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
 import pytest
@@ -24,15 +25,14 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheLayout,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
 from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runner
-from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
+from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
@@ -41,6 +41,7 @@ from vllm_metal.config import (
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
 )
+from vllm_metal.metal import get_ops
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
@@ -112,6 +113,7 @@ def test_uniform_olmo3_geometry_uses_window_groups(monkeypatch) -> None:
     assert runner.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
     budget = runner.get_cache_block_size_bytes() * 64
     grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     assert runner.paged_attention_runtime is None
     runner.initialize_kv_cache(grouped)
     backend = runner.paged_attention_runtime
@@ -134,7 +136,7 @@ def test_uniform_olmo3_respects_disabled_hybrid_manager(monkeypatch) -> None:
     specs = runner.get_kv_cache_spec()
 
     assert all(type(spec) is FullAttentionSpec for spec in specs.values())
-    assert runner.scheduler_memory_reporting_mode() == "paged_attention_capacity"
+    assert runner.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
 
 
 def test_uniform_olmo3_window_groups_release_old_blocks(monkeypatch) -> None:
@@ -145,6 +147,7 @@ def test_uniform_olmo3_window_groups_release_old_blocks(monkeypatch) -> None:
     specs = runner.get_kv_cache_spec()
     budget = runner.get_cache_block_size_bytes() * 64
     grouped = get_kv_cache_configs(runner.vllm_config, [specs], [budget])[0]
+    grouped.kv_cache_layout = runner.cache_config.kv_cache_layout
     manager = KVCacheManager(
         grouped,
         max_model_len=512,
@@ -182,9 +185,10 @@ def config_from_vllm_groups(
     else:
         group_size = max(len(group.layer_names) for group in groups)
         available = groups[0].kv_cache_spec.page_size_bytes * num_blocks * group_size
-    return get_kv_cache_config_from_groups(
-        vllm_config or vllm_config_for_kv_grouping(), groups, available
-    )
+    engine_config = vllm_config or vllm_config_for_kv_grouping()
+    config = get_kv_cache_config_from_groups(engine_config, groups, available)
+    config.kv_cache_layout = engine_config.cache_config.kv_cache_layout
+    return config
 
 
 def merged_full_attention_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
@@ -466,7 +470,7 @@ class TestCachePolicyPerLayerBytes:
             runner.get_kv_cache_spec()
 
 
-class TestAttentionKVCacheLayout:
+class TestUpstreamAttentionStorage:
     """vLLM-managed standard attention cache layout contracts."""
 
     def gemma4_mixed_runner(
@@ -523,31 +527,29 @@ class TestAttentionKVCacheLayout:
         assert len(groups) == 2
         return config_from_vllm_groups(groups, 3, vllm_config), names
 
-    def test_translates_upstream_slots_and_groups(self) -> None:
+    def test_binds_upstream_regions_and_groups(self) -> None:
         config, names = self._mixed_attention_config()
+        storage = KVCacheStorage(config)
+        cache = MetalPagedKVCache.from_upstream(storage, names, dtype=mx.bfloat16)
 
-        layout = AttentionKVCacheLayout.from_config(config, names)
+        assert len(storage.buffers) == 2
+        assert [cache.group_index_for_layer(i) for i in range(4)] == [0, 1, 0, 1]
+        assert [cache.block_size_for_layer(i) for i in range(4)] == [32, 16, 32, 16]
+        assert cache.sliding_window_per_layer == [-1, 1024, -1, 1024]
+        assert storage.nbytes == config.kv_cache_tensors[0].size
+        assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
 
-        assert layout.group_block_sizes == (32, 16)
-        assert layout.slot_layers == ((0, 1), (2, 3))
-        assert [layer.slot_index for layer in layout.layers] == [0, 0, 1, 1]
-        assert [layer.group_index for layer in layout.layers] == [0, 1, 0, 1]
-        assert [layer.sliding_window for layer in layout.layers] == [-1, 1024, -1, 1024]
-        # Every tensor describes the same backing allocation the slots partition.
-        assert layout.total_bytes == config.kv_cache_tensors[0].size
-
-    def test_allocates_shared_slots_from_layout(self) -> None:
+    def test_attention_views_keep_upstream_shapes(self) -> None:
         config, names = self._mixed_attention_config()
-        layout = AttentionKVCacheLayout.from_config(config, names)
-
-        cache = MetalPagedKVCache.from_layout(layout, mx.bfloat16)
-
+        cache = MetalPagedKVCache.from_upstream(KVCacheStorage(config), names)
         assert cache.key_caches[0].shape == (3, 32, 4, 512)
         assert cache.key_caches[1].shape == (3, 16, 16, 256)
         assert cache.group_index_for_layer(1) == 1
         assert cache.block_size_for_layer(1) == 16
 
-    def test_cache_policy_adopts_engine_layout(self, monkeypatch) -> None:
+    def test_cache_policy_binds_engine_layout_without_preallocation(
+        self, monkeypatch
+    ) -> None:
         config, _ = self._mixed_attention_config()
         runner = make_stub_runner(
             num_layers=4,
@@ -564,35 +566,28 @@ class TestAttentionKVCacheLayout:
             block_size=32,
             dtype=mx.bfloat16,
         )
-        backend.initialize(num_blocks=config.num_blocks)
-        runner.install_paged_attention_runtime(backend, block_size=32)
-
-        patched: dict[str, object] = {}
-
-        def patch_model(model):
-            patched["model"] = model
-            return 4
-
+        monkeypatch.setattr(
+            runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
+        )
+        patch_model = Mock(return_value=4)
+        fast_prefill = Mock()
         monkeypatch.setattr(backend, "patch_model", patch_model)
         monkeypatch.setattr(
-            "vllm_metal.v1.cache_policy.get_config",
-            lambda: MetalConfig(
-                mlx_device="gpu",
-                turboquant=False,
-            ),
+            "vllm_metal.v1.cache_policy.try_enable_gemma4_yoco_fast_prefill",
+            fast_prefill,
         )
-
+        assert runner.paged_attention_runtime is None
         runner.initialize_kv_cache(config)
-
-        assert patched["model"] is runner.model
+        patch_model.assert_called_once_with(runner.model)
+        fast_prefill.assert_called_once_with(
+            runner.model, runner.model_args, num_paged_layers=4
+        )
         assert backend.kv_cache.group_index_for_layer(1) == 1
         assert backend.kv_cache.block_size_for_layer(1) == 16
         assert runner._paged_scheduler_group_indices == (0, 1)
         assert runner._paged_group_block_sizes == (32, 16)
 
-    def test_cache_policy_keeps_merged_single_group_on_existing_runtime(
-        self, monkeypatch
-    ) -> None:
+    def test_cache_policy_binds_merged_single_group(self, monkeypatch) -> None:
         config, _ = merged_full_attention_config()
         runner = make_stub_runner(
             num_layers=4,
@@ -604,35 +599,13 @@ class TestAttentionKVCacheLayout:
             kv_heads_per_layer=[16, 16, 4, 4],
             head_dim_per_layer=[256, 256, 512, 512],
         )
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=4,
-            num_kv_heads=16,
-            head_dim=256,
-            block_size=16,
-            dtype=mx.bfloat16,
-            kv_heads_per_layer=[16, 16, 4, 4],
-            head_dim_per_layer=[256, 256, 512, 512],
-        )
-        backend.initialize(num_blocks=config.num_blocks)
-        original_cache = backend.kv_cache
-        runner.install_paged_attention_runtime(backend, block_size=16)
-
+        backend = runner.build_paged_attention_runtime(block_size=16)
         monkeypatch.setattr(
-            "vllm_metal.v1.cache_policy.get_config",
-            lambda: MetalConfig(
-                mlx_device="gpu",
-                turboquant=False,
-            ),
+            runner._cache_policy, "_build_sdpa_backend", lambda **_: backend
         )
-        monkeypatch.setattr(
-            backend,
-            "adopt_layout",
-            lambda layout: pytest.fail("single scheduler group should not reallocate"),
-        )
-
+        monkeypatch.setattr(backend, "patch_model", lambda _: 4)
         runner.initialize_kv_cache(config)
-
-        assert backend.kv_cache is original_cache
+        assert backend.kv_cache.key_caches[2].shape == (3, 16, 4, 512)
         assert runner._paged_scheduler_group_indices == (0,)
         assert runner._paged_group_block_sizes == (16,)
 
@@ -686,6 +659,7 @@ class TestAttentionKVCacheLayout:
 
         specs = runner.get_kv_cache_spec()
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
         assert runner.paged_attention_runtime is None
         assert available // dense_block_bytes == reported_dense_blocks
@@ -713,7 +687,9 @@ class TestAttentionKVCacheLayout:
             for layer in runner.model.layers
         )
 
-    def test_disabled_hybrid_manager_stays_on_dense_path(self, monkeypatch) -> None:
+    def test_disabled_hybrid_manager_keeps_full_attention_specs(
+        self, monkeypatch
+    ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=60,
             sliding_kv_heads=16,
@@ -747,6 +723,7 @@ class TestAttentionKVCacheLayout:
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config.kv_cache_layout = runner.cache_config.kv_cache_layout
         runner.initialize_kv_cache(config)
 
         assert all(type(spec) is FullAttentionSpec for spec in specs.values())
@@ -754,11 +731,11 @@ class TestAttentionKVCacheLayout:
         assert runner.paged_attention_runtime is not None
         assert runner.paged_attention_runtime.num_blocks() == config.num_blocks
 
-    def test_block_override_uses_existing_capacity_guard(self, monkeypatch) -> None:
+    def test_block_override_uses_engine_block_count(self, monkeypatch) -> None:
         runner = self.gemma4_mixed_runner(
-            num_layers=60,
-            sliding_kv_heads=16,
-            full_kv_heads=4,
+            num_layers=6,
+            sliding_kv_heads=2,
+            full_kv_heads=1,
             num_gpu_blocks_override=100,
         )
         metal_config = MetalConfig(
@@ -788,32 +765,26 @@ class TestAttentionKVCacheLayout:
         available = planner.determine_available_memory()
         specs = runner.get_kv_cache_spec()
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
+        config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
         assert config.num_blocks == 100
-        with pytest.raises(ValueError, match="Engine KV cache config requests 100"):
-            runner.initialize_kv_cache(config)
+        runner.initialize_kv_cache(config)
+        assert runner.paged_attention_runtime.num_blocks() == 100
 
-    def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
+    def test_native_write_preserves_upstream_aliases(self) -> None:
         config, names = self._mixed_attention_config()
-        cache = MetalPagedKVCache.from_layout(
-            AttentionKVCacheLayout.from_config(config, names), mx.bfloat16
+        storage = KVCacheStorage(config)
+        cache = MetalPagedKVCache.from_upstream(storage, names)
+        assert (
+            storage.tensors[names[0]].data_ptr() == storage.tensors[names[1]].data_ptr()
         )
-
-        new_key = cache.key_caches[1] + mx.array(1, dtype=mx.bfloat16)
-        new_value = cache.value_caches[1] + mx.array(2, dtype=mx.bfloat16)
-
-        cache.replace_layer_cache(1, new_key, new_value)
-
-        assert mx.all(cache.key_caches[1].reshape(-1) == new_key.reshape(-1)).item()
-        assert mx.all(cache.value_caches[1].reshape(-1) == new_value.reshape(-1)).item()
-        assert mx.all(cache.key_caches[0].reshape(-1) == new_key.reshape(-1)).item()
-        assert mx.all(cache.value_caches[0].reshape(-1) == new_value.reshape(-1)).item()
-
-    def test_rejects_block_outermost_upstream_tensors(self) -> None:
-        """vLLM's block-outermost layout interleaves layers inside each block."""
-        vllm_config = VllmConfig()
-        record_kv_cache_layout(vllm_config.cache_config, KVCacheLayout.BLHNC.name)
-        config, names = self._mixed_attention_config(vllm_config)
-
-        with pytest.raises(NotImplementedError, match="layer-outermost"):
-            AttentionKVCacheLayout.from_config(config, names)
+        keys, values = get_ops().reshape_and_cache(
+            mx.ones((16, 16, 256), dtype=mx.bfloat16),
+            mx.full((16, 16, 256), 2, dtype=mx.bfloat16),
+            cache.key_caches[1],
+            cache.value_caches[1],
+            mx.arange(16, dtype=mx.int64),
+        )
+        cache.replace_layer_cache(1, keys, values)
+        mx.eval(*storage.buffers)
+        assert cache.key_caches[0][0, 0, 0].tolist() == [1.0] * 256 + [2.0] * 256

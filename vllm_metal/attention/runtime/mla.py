@@ -36,6 +36,9 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._cache = None
 
     def initialize(self, num_blocks: int) -> None:
+        # TODO: Bind latent views to KVCacheStorage with writes that preserve
+        # sharing. Then remove this initializer and MLAPagedLatentCache's
+        # per-layer allocation.
         self._cache = MLAPagedLatentCache(
             num_layers=self._num_layers,
             latent_dim=self._latent_dim,

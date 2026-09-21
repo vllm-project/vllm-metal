@@ -20,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -245,7 +244,7 @@ class ModelCachePolicy:
             and not pooling_backend.capabilities.uses_kv_cache
         ):
             return "pooling_no_kv"
-        if self._uses_deferred_layout():
+        if self._uses_upstream_storage():
             return "paged_attention_layout_budget"
         return "paged_attention_capacity"
 
@@ -259,8 +258,13 @@ class ModelCachePolicy:
             )
         return plan
 
-    def _uses_deferred_layout(self) -> bool:
-        """Return whether vLLM's grouped attention config must own allocation."""
+    def _uses_upstream_storage(self) -> bool:
+        return self._runner.is_hybrid or (
+            not self._runner.is_mla and self._runner._draft_dims is None
+        )
+
+    def _uses_grouped_attention(self) -> bool:
+        """Return whether the scheduler keeps distinct attention-window groups."""
         if self._runner.is_hybrid:
             return True
         sliding_windows = self._runner.sliding_window_per_layer
@@ -306,7 +310,7 @@ class ModelCachePolicy:
         if self._runner._yoco_cache_mapping is not None:
             num_spec_layers, _ = self._runner._yoco_cache_mapping
         specs: dict[str, KVCacheSpec] = {}
-        use_deferred_layout = self._uses_deferred_layout()
+        use_grouped_attention = self._uses_grouped_attention()
 
         def attention_spec(layer_idx: int) -> KVCacheSpec:
             return self._attention_layer_spec(
@@ -317,7 +321,7 @@ class ModelCachePolicy:
                 torch_dtype=torch_dtype,
                 use_turboquant=use_turboquant,
                 config=config,
-                use_deferred_layout=use_deferred_layout,
+                use_grouped_attention=use_grouped_attention,
             )
 
         if self._runner.is_hybrid:
@@ -361,7 +365,7 @@ class ModelCachePolicy:
         torch_dtype: torch.dtype,
         use_turboquant: bool,
         config: MetalConfig,
-        use_deferred_layout: bool,
+        use_grouped_attention: bool,
     ) -> KVCacheSpec:
         """Build the scheduler-visible spec for one attention layer."""
         if use_turboquant:
@@ -385,7 +389,7 @@ class ModelCachePolicy:
                 head_size=head_dim,
                 dtype=torch_dtype,
             )
-        if use_deferred_layout:
+        if use_grouped_attention:
             return self._build_attention_spec(
                 layer_idx=layer_idx,
                 block_size=block_size,
@@ -451,8 +455,8 @@ class ModelCachePolicy:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Bind layout-driven caches from the final engine configuration.
 
-        Count-initialized runtimes validate their capacity and adopt the engine's
-        groups; hybrid runtimes allocate the engine's shared backing here.
+        Count-initialized speculative/MLA runtimes adopt the engine's groups;
+        other runtimes bind the engine's shared backing here.
         """
         self._adopt_draft_scheduler_group(kv_cache_config)
         runtime = self._runner.paged_attention_runtime
@@ -469,12 +473,12 @@ class ModelCachePolicy:
             logger.info("Encoder pooling: no KV cache initialized.")
             return
 
-        if self._uses_deferred_layout():
+        if self._uses_upstream_storage():
             if runtime is not None:
                 raise RuntimeError(
-                    "deferred layout path must not preallocate paged KV cache"
+                    "upstream storage must be initialized after cache planning"
                 )
-            self._initialize_deferred_layout(kv_cache_config)
+            self._initialize_upstream_storage(kv_cache_config)
             logger.info(
                 "KV cache config received: %d grouped blocks "
                 "(MLX layout initialized from vLLM config)",
@@ -498,7 +502,8 @@ class ModelCachePolicy:
             kv_cache_config.num_blocks,
         )
 
-    def _initialize_deferred_layout(self, kv_cache_config: KVCacheConfig) -> None:
+    def _initialize_upstream_storage(self, kv_cache_config: KVCacheConfig) -> None:
+        self.validate_paged_attention_support()
         if self._runner.is_hybrid:
             runtime = self._build_hybrid_backend()
             runtime.initialize_from_config(kv_cache_config)
@@ -512,13 +517,21 @@ class ModelCachePolicy:
             )
             return
         model_layer_names = self._attention_layer_names()
-        layout = AttentionKVCacheLayout.from_config(kv_cache_config, model_layer_names)
-        runtime = self._build_sdpa_backend(block_size=layout.group_block_sizes[0])
-        runtime.adopt_layout(layout)
-        runtime.patch_model(self._runner.model)
-        self._runner.install_paged_attention_runtime(
-            runtime,
-            block_size=layout.group_block_sizes[0],
+        runtime = self._build_sdpa_backend(
+            block_size=self._runner.cache_config.block_size
+        )
+        runtime.initialize_from_config(kv_cache_config, model_layer_names)
+        n_patched = runtime.patch_model(self._runner.model)
+        block_size = runtime.kv_group_block_sizes()[0]
+        self.install_gemma4_mtp_kv_sharing(runtime, block_size=block_size)
+        self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
+        self._runner.install_drafter(
+            num_blocks=kv_cache_config.num_blocks, block_size=block_size
+        )
+        try_enable_gemma4_yoco_fast_prefill(
+            self._runner.model,
+            self._runner.model_args,
+            num_paged_layers=n_patched,
         )
 
     def _adopt_scheduler_groups(
@@ -526,45 +539,13 @@ class ModelCachePolicy:
         runtime: PagedAttentionRuntime,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        if self._runner.is_mla:
-            return
-        self._adopt_layout(runtime, kv_cache_config)
-
-    def _adopt_layout(
-        self,
-        runtime: PagedAttentionRuntime,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        if not isinstance(runtime, SDPAPagedAttentionRuntime):
-            raise RuntimeError(
-                "attention cache config requires SDPAPagedAttentionRuntime"
+        if isinstance(runtime, SDPAPagedAttentionRuntime):
+            runtime.adopt_scheduler_groups(
+                kv_cache_config, self._attention_layer_names()
             )
-
-        model_layer_names = self._attention_layer_names()
-        group_indices = self._scheduler_group_indices_for_layers(
-            kv_cache_config,
-            model_layer_names,
-        )
-        if get_config().turboquant:
-            if group_indices != (0,):
-                raise NotImplementedError(
-                    "TurboQuant attention layout currently supports one scheduler KV group"
-                )
-            return
-        if len(group_indices) == 1:
-            return
-
-        layout = AttentionKVCacheLayout.from_config(kv_cache_config, model_layer_names)
-        runtime.adopt_layout(layout)
-        runtime.patch_model(self._runner.model)
-        self.install_gemma4_mtp_kv_sharing(
-            runtime,
-            block_size=layout.group_block_sizes[0],
-        )
-        self._runner.install_paged_attention_runtime(
-            runtime,
-            block_size=layout.group_block_sizes[0],
-        )
+            self._runner.install_paged_attention_runtime(
+                runtime, block_size=runtime.kv_group_block_sizes()[0]
+            )
 
     def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
         """Tell the drafter which scheduler KV group owns its committed KV.
@@ -576,7 +557,7 @@ class ModelCachePolicy:
         ``kv_cache_config.kv_cache_groups`` exists, and resolves which group
         the synthetic ``draft_layers.*`` names from
         ``ModelCachePolicy._draft_layer_specs`` landed in -- mirroring
-        ``_adopt_layout``'s resolution for the target. No-op without a
+        ``_adopt_scheduler_groups``'s resolution for the target. No-op without a
         draft model configured.
         """
         draft_dims = self._runner._draft_dims
@@ -805,8 +786,8 @@ class ModelCachePolicy:
 
         When the runner has per-layer shape lists, extract the first
         ``num_cache_layers`` entries (which correspond to the unique
-        layers for YOCO models).  Otherwise replicate the scalar values
-        for backward-compat uniform allocation.
+        layers for YOCO models). Otherwise use the model's uniform shape
+        for every cache layer.
         """
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
@@ -980,7 +961,7 @@ class WorkerCachePlanner:
             )
             budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
             logger.info(
-                "Mixed attention layout: reporting %.2f GB KV budget; "
+                "Upstream cache layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
                 budget / 1e9,
             )
