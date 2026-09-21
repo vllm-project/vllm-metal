@@ -72,6 +72,13 @@ def set_wired_limit() -> None:
 
     See: https://github.com/ml-explore/mlx-lm/pull/652
     """
+    from vllm_metal import envs
+
+    if envs.VLLM_METAL_DISABLE_WIRED_LIMIT:
+        logger.info(
+            "Metal wired-limit override disabled by VLLM_METAL_DISABLE_WIRED_LIMIT=1"
+        )
+        return
     try:
         import mlx.core as mx
 

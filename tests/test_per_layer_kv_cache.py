@@ -643,12 +643,19 @@ class TestAttentionKVCacheLayout:
             (30, 8, 2),
         ),
     )
+    @pytest.mark.parametrize(
+        ("explicit_blocks", "utilization", "reported_dense_blocks"),
+        [(None, 0.5, 3), (3, 0.5, 3), (6, 0.5, 6), (3, 0.1, 3)],
+    )
     def test_cache_policy_initializes_gemma4_grouped_layout_from_budget(
         self,
         monkeypatch,
         num_layers: int,
         sliding_kv_heads: int,
         full_kv_heads: int,
+        explicit_blocks: int | None,
+        utilization: float,
+        reported_dense_blocks: int,
     ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=num_layers,
@@ -665,8 +672,12 @@ class TestAttentionKVCacheLayout:
         )
         # vLLM 0.29.0 reserves the null block before its capacity check, so two
         # dense blocks no longer serve one max_model_len request.
-        reported_dense_blocks = 3
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        runner.cache_config.gpu_memory_utilization = utilization
+        if explicit_blocks is not None:
+            runner.cache_config.kv_cache_memory_bytes = (
+                dense_block_bytes * explicit_blocks
+            )
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -679,7 +690,7 @@ class TestAttentionKVCacheLayout:
         monkeypatch.setattr(
             planner,
             "_metal_limit_bytes",
-            lambda: dense_block_bytes * reported_dense_blocks,
+            lambda: dense_block_bytes * 6,
         )
 
         available = planner.determine_available_memory()
@@ -713,7 +724,10 @@ class TestAttentionKVCacheLayout:
             for layer in runner.model.layers
         )
 
-    def test_disabled_hybrid_manager_stays_on_dense_path(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("explicit_blocks", [None, 32])
+    def test_disabled_hybrid_manager_stays_on_dense_path(
+        self, monkeypatch, explicit_blocks
+    ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=60,
             sliding_kv_heads=16,
@@ -729,6 +743,11 @@ class TestAttentionKVCacheLayout:
             lambda: metal_config,
         )
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        if explicit_blocks is not None:
+            runner.cache_config.gpu_memory_utilization = 0.5
+            runner.cache_config.kv_cache_memory_bytes = (
+                dense_block_bytes * explicit_blocks
+            )
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -745,6 +764,8 @@ class TestAttentionKVCacheLayout:
         )
 
         available = planner.determine_available_memory()
+        expected_blocks = explicit_blocks or PAGED_ATTENTION_MIN_BLOCKS
+        assert available == dense_block_bytes * expected_blocks
         specs = runner.get_kv_cache_spec()
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
         runner.initialize_kv_cache(config)

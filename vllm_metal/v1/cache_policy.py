@@ -224,16 +224,26 @@ class _PagedAttentionPlan:
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+    explicit_kv_budget: int | None
 
     def format_breakdown(self) -> str:
-        parts = [
-            f"metal_limit={self.metal_limit / 1e9:.2f}GB",
-            f"fraction={self.fraction}",
-            f"usable_metal={self.usable_metal / 1e9:.2f}GB",
-            f"model_memory={self.model_memory / 1e9:.2f}GB",
-            f"overhead={self.overhead / 1e9:.2f}GB",
-        ]
-        if self.hybrid_gdn_reservation.enabled:
+        parts = [f"metal_limit={self.metal_limit / 1e9:.2f}GB"]
+        if self.explicit_kv_budget is None:
+            parts.extend(
+                [
+                    f"fraction={self.fraction}",
+                    f"usable_metal={self.usable_metal / 1e9:.2f}GB",
+                ]
+            )
+        else:
+            parts.append(f"kv_cache_memory_bytes={self.explicit_kv_budget}")
+        parts.extend(
+            [
+                f"model_memory={self.model_memory / 1e9:.2f}GB",
+                f"overhead={self.overhead / 1e9:.2f}GB",
+            ]
+        )
+        if self.hybrid_gdn_reservation.enabled and self.explicit_kv_budget is None:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
         if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
@@ -241,6 +251,12 @@ class _PagedAttentionPlan:
         return ", ".join(parts)
 
     def format_mitigations(self) -> str:
+        if self.explicit_kv_budget is not None:
+            return (
+                "Mitigations: increase --kv-cache-memory-bytes "
+                f"(currently {self.explicit_kv_budget}) or unset it "
+                "to use automatic sizing."
+            )
         mitigations = [
             f"increase --gpu-memory-utilization (currently {self.fraction})",
             "use a smaller or more quantized model",
@@ -852,12 +868,12 @@ class ModelCachePolicy:
         return self._runner.scheduler_config.max_num_seqs * extra_per_req
 
     def draft_scratch_reserve_bytes(self) -> int:
-        """Bytes held out of the KV budget for the draft's scratch tail.
+        """Bytes required outside the paged pool for the draft's scratch tail.
 
-        Subtracted before dividing by the (target + draft) combined
-        per-block cost, so ``num_blocks`` leaves this much headroom in the
-        draft's own physical pool without it being scheduler-visible or
-        counted against the target's budget.
+        Automatic sizing subtracts these before dividing by the (target +
+        draft) combined per-block cost. With an explicit KV budget the caller
+        must leave this additional headroom for the draft's physical pool;
+        scratch blocks are not scheduler-visible.
         """
         return (
             self.draft_scratch_reserve_blocks() * self._draft_cache_block_size_bytes()
@@ -1213,7 +1229,23 @@ class WorkerCachePlanner:
         )
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        explicit_kv_budget = self._worker.vllm_config.cache_config.kv_cache_memory_bytes
+        if explicit_kv_budget is None:
+            kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+            logger.info(
+                "Paged attention: using --gpu-memory-utilization=%.2f",
+                fraction,
+            )
+        else:
+            # Match vLLM's manual KV sizing: utilization and non-KV reservations
+            # only determine the automatic budget. The caller must leave room
+            # for allocations outside the paged pool when choosing this value.
+            kv_budget = explicit_kv_budget
+            logger.info(
+                "Paged attention: using --kv-cache-memory-bytes=%d; "
+                "ignoring --gpu-memory-utilization",
+                explicit_kv_budget,
+            )
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1226,6 +1258,7 @@ class WorkerCachePlanner:
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            explicit_kv_budget=explicit_kv_budget,
         )
         self._validate_paged_attention_plan(
             plan,
@@ -1237,6 +1270,11 @@ class WorkerCachePlanner:
         self, plan: _PagedAttentionPlan, *, require_min_blocks: bool
     ) -> None:
         if plan.kv_budget <= 0:
+            if plan.explicit_kv_budget is not None:
+                raise ValueError(
+                    "Paged attention: --kv-cache-memory-bytes must be positive "
+                    f"(got {plan.explicit_kv_budget})."
+                )
             raise ValueError(
                 "Paged attention: not enough Metal memory for KV cache. "
                 f"{plan.format_breakdown()}. {plan.format_mitigations()}"
@@ -1293,12 +1331,7 @@ class WorkerCachePlanner:
 
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction from ``--gpu-memory-utilization``."""
-        fraction = self._worker.vllm_config.cache_config.gpu_memory_utilization
-        logger.info(
-            "Paged attention: using --gpu-memory-utilization=%.2f",
-            fraction,
-        )
-        return fraction
+        return self._worker.vllm_config.cache_config.gpu_memory_utilization
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()

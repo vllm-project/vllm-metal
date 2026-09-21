@@ -49,9 +49,21 @@ model pairing, and memory considerations.
 
 ## KV Cache Memory Settings
 
-The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
-flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
+`--kv-cache-memory-bytes` sets the paged cache budget directly and overrides
+`--gpu-memory-utilization`, following vLLM's behavior. The allocation is rounded
+down to whole cache blocks. Leave additional memory for model weights,
+activations, and any hybrid state or draft scratch space held outside the
+paged pool.
+
+When explicit bytes are unset, automatic sizing uses `--gpu-memory-utilization`
+(`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`, and accounts for
+model memory, activation overhead, hybrid state, and draft scratch space. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
+
+By default, startup raises MLX's wired-memory limit to the device's recommended
+working-set size. Set `VLLM_METAL_DISABLE_WIRED_LIMIT=1` to preserve the existing
+MLX limit instead. This controls memory pinning independently of either cache
+budget setting.
 
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,

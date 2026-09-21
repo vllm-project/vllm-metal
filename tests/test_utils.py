@@ -38,6 +38,7 @@ def test_local_model_path_is_preserved(tmp_path):
 
 def test_set_wired_limit_uses_pinned_mlx_api(monkeypatch) -> None:
     calls: list[int] = []
+    monkeypatch.delenv("VLLM_METAL_DISABLE_WIRED_LIMIT", raising=False)
 
     monkeypatch.setattr(
         mx.metal,
@@ -49,3 +50,16 @@ def test_set_wired_limit_uses_pinned_mlx_api(monkeypatch) -> None:
     set_wired_limit()
 
     assert calls == [123]
+
+
+def test_disabled_wired_limit_does_not_inspect_or_change_device(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_METAL_DISABLE_WIRED_LIMIT", "1")
+    device_info = Mock(side_effect=AssertionError("must not inspect device"))
+    set_limit = Mock(side_effect=AssertionError("must preserve existing limit"))
+    monkeypatch.setattr(mx.metal, "device_info", device_info)
+    monkeypatch.setattr(mx, "set_wired_limit", set_limit)
+
+    set_wired_limit()
+
+    device_info.assert_not_called()
+    set_limit.assert_not_called()

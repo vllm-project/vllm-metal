@@ -111,7 +111,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(mlx_device="gpu")
-    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
+    worker.cache_config = SimpleNamespace(
+        block_size=16, gpu_memory_utilization=0.92, kv_cache_memory_bytes=None
+    )
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -196,6 +198,77 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize("gpu_memory_utilization", [0.1, 0.5])
+    @pytest.mark.parametrize(
+        ("explicit_budget", "expected_blocks"),
+        [(1_000_000_007, 100), (6_000_000_007, 600)],
+    )
+    def test_explicit_kv_budget_overrides_utilization(
+        self,
+        monkeypatch,
+        caplog,
+        gpu_memory_utilization,
+        explicit_budget,
+        expected_blocks,
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=100_000_000),
+        )
+        planner = self._make_planner(
+            runner,
+            gpu_memory_utilization=gpu_memory_utilization,
+            per_block_bytes=10_000_000,
+        )
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit_budget
+        monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: 10_000_000_000)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 1_000_000_000)
+        monkeypatch.setattr("vllm_metal.v1.cache_policy.logger.propagate", True)
+
+        with caplog.at_level("INFO", logger="vllm_metal.v1.cache_policy"):
+            plan = planner._paged_attention_plan(overhead=500_000_000)
+
+        # At 0.5 utilization the automatic budget is 3.2068 GB, between the
+        # explicit values; at 0.1 it is negative. Neither may limit manual sizing.
+        assert plan.kv_budget == explicit_budget
+        assert plan.num_blocks == expected_blocks
+        assert plan.num_blocks * plan.per_block_bytes == explicit_budget - 7
+        assert plan.hybrid_gdn_reservation.total_bytes == 193_200_000
+        assert f"kv_cache_memory_bytes={explicit_budget}" in plan.format_breakdown()
+        assert "fraction=" not in plan.format_breakdown()
+        assert "ignoring --gpu-memory-utilization" in caplog.text
+        assert "using --gpu-memory-utilization" not in caplog.text
+
+    @pytest.mark.parametrize("explicit_budget", [-1, 0, 1])
+    def test_invalid_or_too_small_explicit_budget_names_explicit_setting(
+        self, monkeypatch, explicit_budget
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(
+            runner, gpu_memory_utilization=0.5, per_block_bytes=10_000_000
+        )
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit_budget
+        monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: 10_000_000_000)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 1_000_000_000)
+
+        with pytest.raises(ValueError) as exc_info:
+            planner._paged_attention_plan(overhead=500_000_000)
+
+        message = str(exc_info.value)
+        assert "--kv-cache-memory-bytes" in message
+        assert "increase --gpu-memory-utilization" not in message
+        if explicit_budget <= 0:
+            assert "must be positive" in message
+        else:
+            assert "computed num_blocks too low" in message
+            assert "increase --kv-cache-memory-bytes" in message
+
     def _make_planner(
         self,
         model_runner: object,
@@ -276,13 +349,19 @@ class TestPagedAttentionPlanDiagnostics:
         message = str(exc_info.value)
         assert "increase --gpu-memory-utilization (currently 0.15)" in message
 
-    def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        ("draft_scratch_bytes", "expected_budget", "expected_blocks"),
+        [(0, 3_306_800_000, 33), (100_000_000, 3_206_800_000, 32)],
+    )
+    def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(
+        self, monkeypatch, draft_scratch_bytes, expected_budget, expected_blocks
+    ) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+            draft_scratch_reserve_bytes=MagicMock(return_value=draft_scratch_bytes),
         )
         planner = self._make_planner(
             runner,
@@ -307,8 +386,8 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.hybrid_gdn_reservation.reserved_slots == 3
         assert plan.hybrid_gdn_reservation.max_num_seqs == 256
         assert plan.hybrid_gdn_reservation.total_bytes == 193_200_000
-        assert plan.kv_budget == 3_306_800_000
-        assert plan.num_blocks == 33
+        assert plan.kv_budget == expected_budget
+        assert plan.num_blocks == expected_blocks
         breakdown = plan.format_breakdown()
         assert "hybrid_gdn_state=lazy" in breakdown
         assert "kv_budget_before_hybrid=3.50GB" in breakdown
@@ -348,8 +427,12 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.hybrid_gdn_reservation.total_bytes == 64_400_000
         assert plan.num_blocks == 34
 
+    @pytest.mark.parametrize(
+        ("explicit_budget", "expected_budget", "expected_blocks"),
+        [(None, 8_000, 10), (6_400, 6_400, 8), (9_600, 9_600, 12)],
+    )
     def test_align_plan_budgets_one_old_physical_pool_for_growth(
-        self, monkeypatch
+        self, monkeypatch, explicit_budget, expected_budget, expected_blocks
     ) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
@@ -365,6 +448,7 @@ class TestPagedAttentionPlanDiagnostics:
             gpu_memory_utilization=1.0,
             per_block_bytes=100,
         )
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit_budget
         monkeypatch.setattr(
             WorkerCachePlanner,
             "_metal_limit_bytes",
@@ -383,8 +467,8 @@ class TestPagedAttentionPlanDiagnostics:
 
         assert plan.per_block_bytes == 800
         assert plan.hybrid_gdn_reservation.total_bytes == 0
-        assert plan.kv_budget == 8_000
-        assert plan.num_blocks == 10
+        assert plan.kv_budget == expected_budget
+        assert plan.num_blocks == expected_blocks
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_DISABLE_WIRED_LIMIT: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -35,6 +36,10 @@ if TYPE_CHECKING:
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Keep MLX's existing wired-memory limit instead of raising it at startup.
+    "VLLM_METAL_DISABLE_WIRED_LIMIT": lambda: (
+        os.getenv("VLLM_METAL_DISABLE_WIRED_LIMIT", "0") == "1"
+    ),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Multimodal serving mode:
