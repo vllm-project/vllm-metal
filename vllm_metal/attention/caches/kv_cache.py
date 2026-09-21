@@ -1,18 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-backed paged KV cache for native Metal paged attention.
+"""Key/value views consumed by native Metal paged attention.
 
-Stores per-layer key/value caches as MLX arrays.  KV is written via
-MLX-native scatter (Python, donation-friendly) and read by the v2
-paged-attention kernels:
-
-- key_cache:   [num_blocks, block_size, num_kv_heads, head_dim]
-- value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-
-Both caches use the same token-contiguous layout where each token's
-KV vector is stored contiguously.  This simplifies indexing and is
-compatible with variable-length / FlashInfer-style paged attention.
-
-Block allocation is managed externally by the scheduler's KV cache manager.
+Hybrid models bind vLLM's shared allocation through ``from_upstream``.
+The count-based constructor also serves standalone attention and draft caches.
+Native writes return aliased handles whose dependencies are retained by the
+cache owner. Scheduler block tables determine which pages each request uses.
 """
 
 from __future__ import annotations
@@ -20,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import mlx.core as mx
+import torch
 from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
@@ -44,6 +37,77 @@ class MetalPagedKVCache:
     compat for MLA, Hybrid, and uniform attention models).
     """
 
+    @classmethod
+    def from_upstream(cls, storage, names, *, dtype=mx.float16):
+        """Bind attention views from vLLM's resolved cache layout."""
+        specs = [storage.specs[name] for name in names]
+        turboquant = hasattr(specs[0], "k_quant")
+        cache = cls(
+            num_layers=len(names),
+            num_kv_heads=specs[0].num_kv_heads,
+            head_dim=specs[0].head_size,
+            num_blocks=storage.config.num_blocks,
+            block_size=specs[0].block_size,
+            dtype=dtype,
+            turboquant=turboquant,
+            k_quant=specs[0].k_quant if turboquant else None,
+            v_quant=specs[0].v_quant if turboquant else None,
+            _allocate=False,
+        )
+        cache.kv_heads_per_layer = [s.num_kv_heads for s in specs]
+        cache.head_dim_per_layer = [s.head_size for s in specs]
+        cache.sliding_window_per_layer = [
+            getattr(s, "sliding_window", None) or -1 for s in specs
+        ]
+        groups = [
+            group
+            for group in storage.config.kv_cache_groups
+            if any(name in names for name in group.layer_names)
+        ]
+        cache._upstream_group_indices = [
+            next(i for i, group in enumerate(groups) if name in group.layer_names)
+            for name in names
+        ]
+        cache._upstream_block_sizes = [spec.block_size for spec in specs]
+        keys, values, key_scales, value_scales, zeros = [], [], [], [], []
+        for name, spec in zip(names, specs, strict=True):
+            kv = storage.tensors[name].transpose(1, 2)
+            if turboquant:
+                # K, V and all scales occupy the upstream content dimension.
+                offset = 0
+                components = []
+                for width, dtype in (
+                    (
+                        cache.k_packed_dim,
+                        torch.int8 if cache.k_size == mx.int8 else torch.uint8,
+                    ),
+                    (cache.v_packed_dim, torch.uint8),
+                    (spec.head_size // BLOCK_SIZE, torch.float16),
+                    (spec.head_size // BLOCK_SIZE, torch.float16),
+                    (spec.head_size // BLOCK_SIZE, torch.float16),
+                ):
+                    size = width * dtype.itemsize
+                    components.append(kv[..., offset : offset + size].view(dtype))
+                    offset += size
+                key, value, ks, vs, zp = components
+                key_scales.append(ks)
+                value_scales.append(vs)
+                zeros.append(zp)
+            else:
+                key, value = kv.split((spec.head_size, spec.head_size_v), dim=-1)
+            keys.append(key)
+            values.append(value)
+        cache.key_caches = storage.views(keys)
+        cache.value_caches = storage.views(values)
+        if turboquant:
+            cache.key_scale_caches = storage.views(key_scales)
+            cache.value_scale_caches = storage.views(value_scales)
+            cache.key_zero_caches = storage.views(zeros)
+        else:
+            cache.dtype = cache.key_caches[0].dtype
+        cache._storage = storage
+        return cache
+
     def __init__(
         self,
         num_layers: int,
@@ -60,6 +124,7 @@ class MetalPagedKVCache:
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
         layout: AttentionKVCacheLayout | None = None,
+        _allocate: bool = True,
     ) -> None:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -152,6 +217,8 @@ class MetalPagedKVCache:
         self.key_zero_caches: list[mx.array] = []  # asymmetric K zero_point
         self._key_slots: list[mx.array] = []
         self._value_slots: list[mx.array] = []
+        if not _allocate:
+            return
         if not turboquant:
             if layout is None:
                 self._allocate_dense_caches(dtype)
@@ -297,10 +364,14 @@ class MetalPagedKVCache:
 
     def group_index_for_layer(self, layer_idx: int) -> int:
         """Return the vLLM cache-group index for ``layer_idx``."""
+        if hasattr(self, "_storage"):
+            return self._upstream_group_indices[layer_idx]
         return 0 if self._layout is None else self._layout.layers[layer_idx].group_index
 
     def block_size_for_layer(self, layer_idx: int) -> int:
         """Return the vLLM page size for ``layer_idx``."""
+        if hasattr(self, "_storage"):
+            return self._upstream_block_sizes[layer_idx]
         return (
             self.block_size
             if self._layout is None
@@ -326,6 +397,9 @@ class MetalPagedKVCache:
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler copy-on-write operations to physical KV blocks."""
+        if hasattr(self, "_storage"):
+            self._storage.copy_blocks(block_copies)
+            return
         if not block_copies:
             return
 
