@@ -19,7 +19,6 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tests.stub_runner import make_cache_config, make_stub_runner
-from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
 
@@ -117,14 +116,6 @@ def _runner(model, *, mode="align", cache_dtype="auto"):
     return runner
 
 
-def _runtime(runner):
-    runtime = runner.build_paged_attention_runtime(block_size=BLOCK_SIZE)
-    assert isinstance(runtime, HybridPagedAttentionRuntime)
-    runtime.initialize(NUM_BLOCKS)
-    runner.install_paged_attention_runtime(runtime, block_size=BLOCK_SIZE)
-    return runtime
-
-
 @pytest.mark.parametrize("mode", ["none", "align"])
 def test_scheduler_spec_bills_only_the_convolution_tail(lfm_model, mode):
     runner = _runner(lfm_model, mode=mode)
@@ -147,14 +138,12 @@ def test_scheduler_spec_bills_only_the_convolution_tail(lfm_model, mode):
         spec = specs[f"layers.{index}.self_attn"]
         assert isinstance(spec, FullAttentionSpec)
         assert spec.page_size_bytes == 2048
-    assert runner.linear_cache_bytes_per_slot() == 4 * 256
     assert runner.get_cache_block_size_bytes() == 2 * 2048
 
 
 def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_model):
     """Round-trip real vLLM grouping, including its aliased physical layout."""
     runner = _runner(lfm_model, cache_dtype="float32")
-    runtime = _runtime(runner)
     engine_config = SimpleNamespace(
         cache_config=runner.cache_config,
         scheduler_config=runner.scheduler_config,
@@ -167,8 +156,10 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
         groups,
         available_memory=NUM_BLOCKS * runner.get_cache_block_size_bytes(),
     )
+    scheduler_cache.kv_cache_layout = engine_config.cache_config.kv_cache_layout
     assert scheduler_cache.num_blocks == NUM_BLOCKS
     runner.initialize_kv_cache(scheduler_cache)
+    runtime = runner.paged_attention_runtime
 
     expected_state_groups = tuple(
         i
@@ -187,10 +178,8 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
     assert runner._paged_state_group_indices == expected_state_groups
 
     cache = runtime.state_cache
-    assert cache.allocated_seqs == 0
-    cache.ensure_capacity(NUM_BLOCKS)
+    assert cache.conv_states[0].shape[0] == NUM_BLOCKS
     assert cache.conv_states[0].dtype == mx.float32
-    assert cache.num_state_pools == 2
     # Groups overlay one allocation: conv layers whose regions start at the same
     # byte address share a physical pool but belong to different groups.
     indices_by_address: dict[int, list[int]] = {}
@@ -204,13 +193,11 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
     assert len(indices_by_address) == 2
     for indices in indices_by_address.values():
         assert len(indices) == 2
-        assert cache.conv_states[indices[0]] is cache.conv_states[indices[1]]
+        assert (
+            cache.conv_states.descriptors[indices[0]]
+            == cache.conv_states.descriptors[indices[1]]
+        )
         assert cache.layer_group_ordinal(indices[0]) != cache.layer_group_ordinal(
             indices[1]
         )
-    assert (
-        sum(array.nbytes for array in cache.updated_state_arrays())
-        == NUM_BLOCKS * 2 * 512
-    )
-    assert runner._cache_policy.hybrid_align_state_bytes_per_block() == 2 * 512
-    assert runner._cache_policy.hybrid_align_growth_bytes_per_block() == 512
+    assert runtime.storage.nbytes == scheduler_cache.kv_cache_tensors[0].size

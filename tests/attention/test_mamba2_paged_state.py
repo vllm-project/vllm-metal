@@ -11,8 +11,8 @@ import pytest
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.nemotron_h import ModelArgs, NemotronHMamba2Mixer
 
-from tests.stub_runner import NEMOTRON_H_TINY_ARGS
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_state_cache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import (
     PagedAttentionContext,
     clear_context,
@@ -39,8 +39,8 @@ def _make_mixer(**overrides: object) -> NemotronHMamba2Mixer:
 
 def _make_cache(
     mixer: NemotronHMamba2Mixer, dtype: mx.Dtype, num_layers: int = 1
-) -> GDNPagedStateCache:
-    return GDNPagedStateCache(
+) -> PagedStateCache:
+    return make_state_cache(
         num_layers=num_layers,
         max_seqs=3,
         conv_kernel_dim=mixer.conv_kernel_size,
@@ -48,7 +48,6 @@ def _make_cache(
         num_v_heads=mixer.num_heads,
         value_head_dim=mixer.head_dim,
         key_head_dim=mixer.ssm_state_size,
-        initial_seqs=3,
         dtype=dtype,
     )
 
@@ -86,7 +85,7 @@ def _set_step(cu_seqlens: list[int], slots: list[int], num_decode: int) -> None:
 
 
 def _pool_rows(
-    cache: GDNPagedStateCache, slot: int, cache_idx: int = 0
+    cache: PagedStateCache, slot: int, cache_idx: int = 0
 ) -> tuple[mx.array, mx.array]:
     return cache.conv_states[cache_idx][slot], cache.recurrent_states[cache_idx][slot]
 

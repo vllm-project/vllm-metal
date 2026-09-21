@@ -24,12 +24,12 @@ import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import (
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
+    make_state_cache,
     make_stub_runner,
 )
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
-from vllm_metal.attention.state import RequestStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
@@ -38,30 +38,54 @@ from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 
 class HybridRuntimeStub:
-    def __init__(self, state_cache: GDNPagedStateCache) -> None:
-        self._state_manager = RequestStateManager(state_cache)
+    """Runner-boundary double; block IDs stand in for the scheduler's allocations."""
 
-    def needs_step_context(self) -> bool:
-        return True
+    def __init__(self, state_cache):
+        self.cache = state_cache
+        self.request_slots = {}
+        self._free = []
+        self.needs_materialize = False
+        self.state_manager = self
 
     @property
-    def state_manager(self) -> RequestStateManager:
-        return self._state_manager
+    def free_slots(self):
+        return tuple(self._free)
 
-    def populate_step_context(
-        self, *, req_ids: list[str], ctx, state_block_ids=None, step_positions=None
-    ) -> None:
-        del state_block_ids, step_positions
-        self._state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+    def assign_step_slots(self, req_ids):
+        new = list(
+            dict.fromkeys(req for req in req_ids if req not in self.request_slots)
+        )
+        if len(self.request_slots) + len(new) > self.cache.max_seqs:
+            raise RuntimeError("more slots than max_num_seqs")
+        for req in new:
+            slot = self._free.pop() if self._free else len(self.request_slots)
+            self.cache.apply_pending_states()
+            self.cache.zero_slots([slot], list(range(self.cache.num_layers)))
+            self.request_slots[req] = slot
+        self.needs_materialize |= bool(new)
+        return [self.request_slots[req] for req in req_ids]
 
-    def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
-        self._state_manager.extend_forward_eval_outputs(outputs)
+    def needs_step_context(self):
+        return True
 
-    def release_requests(self, req_ids: set[str]) -> None:
-        self._state_manager.release_requests(req_ids)
+    def populate_step_context(self, *, req_ids, ctx, **kwargs):
+        ctx.state_slot_mapping = self.assign_step_slots(req_ids)
 
-    def materialize_pending_state(self) -> None:
-        self._state_manager.materialize_pending_state()
+    def extend_forward_eval_outputs(self, outputs):
+        outputs.extend(self.cache.updated_state_arrays())
+
+    def release_requests(self, req_ids):
+        for req in req_ids:
+            if req in self.request_slots:
+                self._free.append(self.request_slots.pop(req))
+                self.cache.apply_pending_states()
+                self.needs_materialize = True
+
+    def materialize_pending_state(self):
+        if self.needs_materialize:
+            self.cache.apply_pending_states()
+            mx.eval(*self.cache.updated_state_arrays())
+            self.needs_materialize = False
 
 
 class ForwardOutputRuntimeStub:
@@ -558,7 +582,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
 
     def test_start_paged_forward_clears_context_on_gdn_slot_error(self) -> None:
-        state_cache = GDNPagedStateCache(
+        state_cache = make_state_cache(
             num_layers=1,
             max_seqs=1,
             conv_kernel_dim=2,
@@ -566,7 +590,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
         backend = HybridRuntimeStub(state_cache)
@@ -1436,7 +1459,7 @@ class TestV1MetalModelRunnerExecuteModel:
         assert runner._execute_model_state is None
 
     def test_missing_cached_request_materializes_released_gdn_state(self) -> None:
-        cache = GDNPagedStateCache(
+        cache = make_state_cache(
             num_layers=1,
             max_seqs=2,
             conv_kernel_dim=2,
@@ -1444,7 +1467,6 @@ class TestV1MetalModelRunnerExecuteModel:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
         runtime = HybridRuntimeStub(cache)
@@ -1539,8 +1561,8 @@ class TestV1MetalModelRunnerExecuteModel:
 
 
 class TestV1MetalModelRunnerGDNSubmit:
-    def make_gdn_cache(self) -> GDNPagedStateCache:
-        return GDNPagedStateCache(
+    def make_gdn_cache(self) -> PagedStateCache:
+        return make_state_cache(
             num_layers=1,
             max_seqs=2,
             conv_kernel_dim=2,
@@ -1548,7 +1570,6 @@ class TestV1MetalModelRunnerGDNSubmit:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
 
@@ -1570,7 +1591,6 @@ class TestV1MetalModelRunnerGDNSubmit:
         cache = self.make_gdn_cache()
         pending_conv = mx.full((1, 1, 4), 7, dtype=mx.float32)
         pending_recurrent = mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
-        cache.ensure_capacity(2)
         cache.set_pending_conv_state(0, [1], pending_conv)
         cache.set_pending_recurrent_state(0, [1], pending_recurrent)
         backend = HybridRuntimeStub(cache)
@@ -1746,8 +1766,8 @@ class TestV1MetalModelRunnerGDNSubmit:
 class TestV1MetalModelRunnerGDNLifecycle:
     def _make_runner(
         self,
-    ) -> tuple[mr.MetalModelRunner, HybridRuntimeStub, GDNPagedStateCache]:
-        cache = GDNPagedStateCache(
+    ) -> tuple[mr.MetalModelRunner, HybridRuntimeStub, PagedStateCache]:
+        cache = make_state_cache(
             num_layers=1,
             max_seqs=2,
             conv_kernel_dim=2,
@@ -1755,7 +1775,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
         runtime = HybridRuntimeStub(cache)
@@ -1847,7 +1866,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
     def test_start_paged_forward_assigns_hybrid_slots_in_batch_order(
         self, monkeypatch
     ) -> None:
-        cache = GDNPagedStateCache(
+        cache = make_state_cache(
             num_layers=1,
             max_seqs=4,
             conv_kernel_dim=2,
@@ -1855,7 +1874,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
         runtime = HybridRuntimeStub(cache)
@@ -1915,7 +1933,7 @@ class TestV1MetalModelRunnerGDNLifecycle:
         }
 
     def test_sample_tokens_materializes_reused_slot_state(self, monkeypatch) -> None:
-        cache = GDNPagedStateCache(
+        cache = make_state_cache(
             num_layers=1,
             max_seqs=2,
             conv_kernel_dim=2,
@@ -1923,7 +1941,6 @@ class TestV1MetalModelRunnerGDNLifecycle:
             num_v_heads=1,
             value_head_dim=4,
             key_head_dim=32,
-            initial_seqs=0,
             dtype=mx.float32,
         )
         runtime = HybridRuntimeStub(cache)

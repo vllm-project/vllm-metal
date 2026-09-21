@@ -23,13 +23,13 @@ if TYPE_CHECKING:
 class PagedAttentionRuntimeBase:
     """Common lifecycle for paged attention runtimes.
 
-    Subclasses allocate their primary paged cache onto ``self._cache`` in
-    ``initialize()``.  The primary cache must expose ``num_blocks``.  Secondary
+    Subclasses bind their primary paged cache to ``self._cache`` during storage
+    initialization. The primary cache must expose ``num_blocks``. Secondary
     caches (e.g. the hybrid state cache) remain the subclass's concern.
     """
 
-    # Primary paged cache; ``None`` until ``initialize()`` runs.  Subclasses set
-    # it to their concrete cache type in ``__init__`` / ``initialize``.  The
+    # Primary paged cache; ``None`` until storage initialization. Subclasses
+    # assign their concrete cache type when binding or allocating storage. The
     # class-level default ensures the guard below raises a clear RuntimeError
     # (not AttributeError) even for instances built via ``__new__``.
     _cache: Any = None
@@ -68,6 +68,10 @@ class PagedAttentionRuntimeBase:
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler copy-on-write operations to the primary cache."""
         self._require_initialized("copy_blocks").copy_blocks(block_copies)
+
+    def zero_blocks(self, block_ids: Sequence[int]) -> None:
+        """Dense KV pages need no zeroing; hybrid state overrides this hook."""
+        del block_ids
 
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""

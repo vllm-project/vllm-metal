@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 
 # mlx_lm's single-token ssm_update kernel covers this many state columns per
@@ -53,7 +53,7 @@ class _SlotArraysCache:
     lengths = None
 
     def __init__(
-        self, state_cache: GDNPagedStateCache, cache_idx: int, slot_ids: mx.array
+        self, state_cache: PagedStateCache, cache_idx: int, slot_ids: mx.array
     ) -> None:
         self._state_cache = state_cache
         self._cache_idx = cache_idx
@@ -93,7 +93,7 @@ class Mamba2PagedStateWrapper(nn.Module):
         inner: nn.Module,
         layer_idx: int,
         cache_idx: int,
-        state_cache: GDNPagedStateCache,
+        state_cache: PagedStateCache,
     ) -> None:
         super().__init__()
         self._validate_ssm_state_size(inner, layer_idx)
@@ -104,7 +104,7 @@ class Mamba2PagedStateWrapper(nn.Module):
         object.__setattr__(self, "_mamba2_state_cache", state_cache)
 
     def rebind_state_cache(
-        self, state_cache: GDNPagedStateCache, *, cache_idx: int
+        self, state_cache: PagedStateCache, *, cache_idx: int
     ) -> None:
         """Refresh pooled state refs in place (cached model reuse)."""
         object.__setattr__(self, "_mamba2_cache_idx", cache_idx)

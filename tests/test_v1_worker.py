@@ -7,7 +7,6 @@ import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import mlx.core as mx
 import pytest
 import torch
 
@@ -25,10 +24,8 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
-from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
-from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
     WorkerCachePlanner,
 )
@@ -210,49 +207,6 @@ class TestPagedAttentionPlanDiagnostics:
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
-    def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
-        runner = SimpleNamespace(
-            is_hybrid=True,
-            scheduler_memory_reporting_mode=MagicMock(
-                return_value="paged_attention_capacity"
-            ),
-            profile_run=MagicMock(return_value=3_900_000_000),
-            validate_paged_attention_support=MagicMock(),
-            scheduler_config=SimpleNamespace(max_num_seqs=2),
-            cache_config=SimpleNamespace(mamba_cache_mode="none"),
-            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
-        )
-        worker = _make_worker(runner)
-        worker.cache_config.gpu_memory_utilization = 0.5
-        worker.get_cache_block_size_bytes = MagicMock(return_value=1)
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "_metal_limit_bytes",
-            lambda self: 10_000_000_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "get_model_memory_usage",
-            lambda self: 1_000_000_000,
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            MetalWorker.determine_available_memory(worker)
-
-        message = str(exc_info.value)
-        assert "kv_budget_before_hybrid=0.10GB" in message
-        assert "hybrid_gdn_state=lazy" in message
-        assert (
-            "growth_peak_reserve=0.19GB, 64.4MB/seq * peak_slots=3/max_num_seqs=2"
-        ) in message
-        assert "kv_budget=-0.09GB" in message
-        assert "lower --max-num-seqs" in message
-        assert "increase --gpu-memory-utilization (currently 0.5)" in message
-        runner.scheduler_memory_reporting_mode.assert_called_once_with()
-        runner.profile_run.assert_called_once_with()
-        runner.validate_paged_attention_support.assert_called_once_with()
-
     def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
@@ -275,116 +229,6 @@ class TestPagedAttentionPlanDiagnostics:
 
         message = str(exc_info.value)
         assert "increase --gpu-memory-utilization (currently 0.15)" in message
-
-    def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
-        runner = SimpleNamespace(
-            is_hybrid=True,
-            scheduler_config=SimpleNamespace(max_num_seqs=256),
-            cache_config=SimpleNamespace(mamba_cache_mode="none"),
-            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
-        )
-        planner = self._make_planner(
-            runner,
-            gpu_memory_utilization=0.5,
-            per_block_bytes=100_000_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "_metal_limit_bytes",
-            lambda self: 10_000_000_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "get_model_memory_usage",
-            lambda self: 1_000_000_000,
-        )
-
-        plan = planner._paged_attention_plan(overhead=500_000_000)
-
-        assert plan.base_kv_budget == 3_500_000_000
-        assert plan.hybrid_gdn_reservation.bytes_per_slot == 64_400_000
-        assert plan.hybrid_gdn_reservation.reserved_slots == 3
-        assert plan.hybrid_gdn_reservation.max_num_seqs == 256
-        assert plan.hybrid_gdn_reservation.total_bytes == 193_200_000
-        assert plan.kv_budget == 3_306_800_000
-        assert plan.num_blocks == 33
-        breakdown = plan.format_breakdown()
-        assert "hybrid_gdn_state=lazy" in breakdown
-        assert "kv_budget_before_hybrid=3.50GB" in breakdown
-        assert (
-            "growth_peak_reserve=0.19GB, 64.4MB/seq * peak_slots=3/max_num_seqs=256"
-        ) in breakdown
-
-    def test_hybrid_plan_reserves_one_peak_slot_for_single_sequence(
-        self, monkeypatch
-    ) -> None:
-        runner = SimpleNamespace(
-            is_hybrid=True,
-            scheduler_config=SimpleNamespace(max_num_seqs=1),
-            cache_config=SimpleNamespace(mamba_cache_mode="none"),
-            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
-        )
-        planner = self._make_planner(
-            runner,
-            gpu_memory_utilization=0.5,
-            per_block_bytes=100_000_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "_metal_limit_bytes",
-            lambda self: 10_000_000_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "get_model_memory_usage",
-            lambda self: 1_000_000_000,
-        )
-
-        plan = planner._paged_attention_plan(overhead=500_000_000)
-
-        assert plan.hybrid_gdn_reservation.reserved_slots == 1
-        assert plan.hybrid_gdn_reservation.total_bytes == 64_400_000
-        assert plan.num_blocks == 34
-
-    def test_align_plan_budgets_one_old_physical_pool_for_growth(
-        self, monkeypatch
-    ) -> None:
-        runner = SimpleNamespace(
-            is_hybrid=True,
-            cache_config=SimpleNamespace(mamba_cache_mode="align"),
-            # Six striped pools: 600 steady bytes per block plus one 100-byte
-            # old pool retained during growth.
-            hybrid_align_state_bytes_per_block=MagicMock(return_value=600),
-            hybrid_align_growth_bytes_per_block=MagicMock(return_value=100),
-            draft_scratch_reserve_bytes=MagicMock(return_value=0),
-        )
-        planner = self._make_planner(
-            runner,
-            gpu_memory_utilization=1.0,
-            per_block_bytes=100,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "_metal_limit_bytes",
-            lambda self: 10_000,
-        )
-        monkeypatch.setattr(
-            WorkerCachePlanner,
-            "get_model_memory_usage",
-            lambda self: 1_000,
-        )
-
-        plan = planner._paged_attention_plan(
-            overhead=1_000,
-            require_min_blocks=False,
-        )
-
-        assert plan.per_block_bytes == 800
-        assert plan.hybrid_gdn_reservation.total_bytes == 0
-        assert plan.kv_budget == 8_000
-        assert plan.num_blocks == 10
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
@@ -430,47 +274,10 @@ class TestPagedAttentionPlanDiagnostics:
         assert fraction == gpu_mem_util
 
 
-class TestAlignStateSizing:
-    @staticmethod
-    def _make_align_runner() -> mr.MetalModelRunner:
-        """Qwen-shaped 24-layer GDN plan: 18 state layers striped over 6 SDPA."""
-        return make_stub_runner(
-            is_hybrid=True,
-            kv_cache_dtype=mx.float16,
-            hybrid_runtime_plan=build_gdn_hybrid_plan(
-                {
-                    "full_attention_interval": 4,
-                    "linear_num_key_heads": 1,
-                    "linear_num_value_heads": 1,
-                    "linear_key_head_dim": 1,
-                    "linear_value_head_dim": 1,
-                    "linear_conv_kernel_dim": 2,
-                },
-                24,
-                (torch.float16, torch.float32),
-            ),
-        )
-
-    def test_align_state_bytes_per_block_stripes_pools(self) -> None:
-        runner = self._make_align_runner()
-        # Hand-written: conv (2-1)*3 fp16 values = 6 B plus 1*1*1 fp32 = 4 B
-        # per layer, one pool per SDPA layer -> 10 B * 6 pools.
-        expected = 60
-
-        assert runner.hybrid_align_state_bytes_per_block() == expected
-
-    def test_align_growth_bytes_retain_one_pool(self) -> None:
-        runner = self._make_align_runner()
-        # Hand-written: one old pool holds one layer's 10 B.
-        expected = 10
-
-        assert runner.hybrid_align_growth_bytes_per_block() == expected
-
-
 class TestHybridPlanGuard:
     def test_hybrid_sizing_without_plan_rejects(self) -> None:
         # The typed config says hybrid; the stub leaves the plan at None.
         runner = make_stub_runner(is_hybrid=True)
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
-            runner.linear_cache_bytes_per_slot()
+            runner.build_paged_attention_runtime(block_size=16)

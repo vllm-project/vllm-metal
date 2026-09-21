@@ -21,7 +21,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
-from vllm_metal.attention.caches.placement import layer_addresses
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -51,22 +50,6 @@ if TYPE_CHECKING:
     from vllm_metal.v1.worker import MetalWorker
 
 logger = init_logger(__name__)
-
-
-def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int:
-    """Physical GDN state pools under align mode, as the memory plan sees it.
-
-    Striping yields mamba groups the size of the attention group and one
-    pool per within-group position, hence ``num_sdpa_layers`` pools; layouts
-    that do not divide evenly fall back to one pool per layer so the plan
-    never under-budgets.  Validated against the adopted layout at install.
-    """
-    if num_sdpa_layers > 0 and num_linear_layers % num_sdpa_layers == 0:
-        return num_sdpa_layers
-    return num_linear_layers
-
-
-HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -193,25 +176,6 @@ def _build_turboquant_attention_spec(
 
 
 @dataclass(frozen=True)
-class _HybridGDNReservation:
-    bytes_per_slot: int = 0
-    reserved_slots: int = 0
-    max_num_seqs: int = 0
-
-    @property
-    def total_bytes(self) -> int:
-        return self.bytes_per_slot * self.reserved_slots
-
-    @property
-    def enabled(self) -> bool:
-        return self.total_bytes > 0
-
-    @property
-    def is_hybrid(self) -> bool:
-        return self.bytes_per_slot > 0 and self.max_num_seqs > 0
-
-
-@dataclass(frozen=True)
 class _PagedAttentionPlan:
     block_size: int
     fraction: float
@@ -221,7 +185,6 @@ class _PagedAttentionPlan:
     overhead: int
     per_block_bytes: int
     base_kv_budget: int
-    hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
 
@@ -233,10 +196,6 @@ class _PagedAttentionPlan:
             f"model_memory={self.model_memory / 1e9:.2f}GB",
             f"overhead={self.overhead / 1e9:.2f}GB",
         ]
-        if self.hybrid_gdn_reservation.enabled:
-            parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
-        if self.hybrid_gdn_reservation.is_hybrid:
-            parts.append(self._hybrid_gdn_detail())
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
 
@@ -245,28 +204,7 @@ class _PagedAttentionPlan:
             f"increase --gpu-memory-utilization (currently {self.fraction})",
             "use a smaller or more quantized model",
         ]
-        reservation = self.hybrid_gdn_reservation
-        if reservation.enabled and reservation.max_num_seqs > 1:
-            seq_mitigation = (
-                "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
-            )
-            if self.base_kv_budget > 0:
-                mitigations.insert(0, seq_mitigation)
-            else:
-                mitigations.append(seq_mitigation)
         return "Mitigations: " + "; ".join(mitigations) + "."
-
-    def _hybrid_gdn_detail(self) -> str:
-        reservation = self.hybrid_gdn_reservation
-        if not reservation.is_hybrid:
-            return ""
-        return (
-            "hybrid_gdn_state=lazy "
-            f"(growth_peak_reserve={reservation.total_bytes / 1e9:.2f}GB, "
-            f"{reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
-            f"peak_slots={reservation.reserved_slots}/"
-            f"max_num_seqs={reservation.max_num_seqs})"
-        )
 
 
 class ModelCachePolicy:
@@ -323,6 +261,8 @@ class ModelCachePolicy:
 
     def _uses_deferred_layout(self) -> bool:
         """Return whether vLLM's grouped attention config must own allocation."""
+        if self._runner.is_hybrid:
+            return True
         sliding_windows = self._runner.sliding_window_per_layer
         vllm_config = self._runner.vllm_config
         return (
@@ -330,7 +270,6 @@ class ModelCachePolicy:
             # layers have the same head geometry (for example, OLMo 3).
             sliding_windows is not None
             and self._runner._yoco_cache_mapping is None
-            and not self._runner.is_hybrid
             and not self._runner.is_mla
             and not self._use_turboquant(get_config())
             and self._runner.vllm_config.speculative_config is None
@@ -510,15 +449,10 @@ class ModelCachePolicy:
         )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        """Accept engine KV cache config for API compatibility.
+        """Bind layout-driven caches from the final engine configuration.
 
-        MLX owns the paged pool, which was already allocated from the
-        profiled capacity in ``setup_paged_attention``.  The engine's block
-        count normally round-trips back to that same number, but
-        ``--num-gpu-blocks-override`` replaces it after the fact, so verify
-        the engine is not planning against more blocks than exist.  The full
-        upstream config is also the source of truth for scheduler KV groups, so
-        adopt its grouping before serving.
+        Count-initialized runtimes validate their capacity and adopt the engine's
+        groups; hybrid runtimes allocate the engine's shared backing here.
         """
         self._adopt_draft_scheduler_group(kv_cache_config)
         runtime = self._runner.paged_attention_runtime
@@ -565,6 +499,18 @@ class ModelCachePolicy:
         )
 
     def _initialize_deferred_layout(self, kv_cache_config: KVCacheConfig) -> None:
+        if self._runner.is_hybrid:
+            runtime = self._build_hybrid_backend()
+            runtime.initialize_from_config(kv_cache_config)
+            runtime.patch_model(self._runner.model)
+            self._runner.install_paged_attention_runtime(
+                runtime, block_size=self._runner.cache_config.block_size
+            )
+            self._runner.install_drafter(
+                num_blocks=kv_cache_config.num_blocks,
+                block_size=self._runner.cache_config.block_size,
+            )
+            return
         model_layer_names = self._attention_layer_names()
         layout = AttentionKVCacheLayout.from_config(kv_cache_config, model_layer_names)
         runtime = self._build_sdpa_backend(block_size=layout.group_block_sizes[0])
@@ -581,9 +527,6 @@ class ModelCachePolicy:
         kv_cache_config: KVCacheConfig,
     ) -> None:
         if self._runner.is_mla:
-            return
-        if self._runner.is_hybrid:
-            self._adopt_hybrid_scheduler_group(runtime, kv_cache_config)
             return
         self._adopt_layout(runtime, kv_cache_config)
 
@@ -622,111 +565,6 @@ class ModelCachePolicy:
             runtime,
             block_size=layout.group_block_sizes[0],
         )
-
-    def _adopt_hybrid_scheduler_group(
-        self,
-        runtime: PagedAttentionRuntime,
-        kv_cache_config: KVCacheConfig,
-    ) -> None:
-        if not isinstance(runtime, HybridPagedAttentionRuntime):
-            raise RuntimeError(
-                "hybrid cache config requires HybridPagedAttentionRuntime"
-            )
-
-        hybrid_plan = self._hybrid_plan()
-        layer_plan = hybrid_plan.layers
-        group_indices = self._scheduler_group_indices_for_layers(
-            kv_cache_config,
-            tuple(
-                f"layers.{layer_idx}.self_attn"
-                for layer_idx in layer_plan.attention_indices
-            ),
-        )
-        if len(group_indices) != 1:
-            raise NotImplementedError(
-                "hybrid paged attention requires all SDPA layers to share one "
-                "scheduler KV group"
-            )
-        group_index = group_indices[0]
-        block_size = kv_cache_config.kv_cache_groups[
-            group_index
-        ].kv_cache_spec.block_size
-        # Align mode keys hybrid state slabs by scheduler block id.  The engine
-        # stripes same-spec state layers across several mamba cache groups
-        # (each group hands every request one block-table row), so the runtime
-        # needs all those groups plus each state layer's group ordinal.  None
-        # mode keeps a private per-request slot pool and ignores the
-        # scheduler's mamba groups.
-        state_group_indices: tuple[int, ...] = ()
-        layer_group_ordinals: list[int] | None = None
-        layer_pool_ordinals: list[int] | None = None
-        if self._runner.cache_config.mamba_cache_mode == "align":
-            cache_idx_by_name = {
-                f"layers.{layer_idx}.{hybrid_plan.family.layer_name}": cache_idx
-                for cache_idx, layer_idx in enumerate(layer_plan.state_indices)
-            }
-            mamba_group_ids = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ]
-            state_group_indices = tuple(mamba_group_ids)
-            layer_group_ordinals = [-1] * len(cache_idx_by_name)
-            for ordinal, mamba_group_id in enumerate(mamba_group_ids):
-                group = kv_cache_config.kv_cache_groups[mamba_group_id]
-                for layer_name in group.layer_names:
-                    cache_idx = cache_idx_by_name.get(layer_name)
-                    if cache_idx is None:
-                        raise RuntimeError(
-                            f"mamba cache group {mamba_group_id} holds "
-                            f"{layer_name!r}, which is not one of the "
-                            "runner's hybrid state layers"
-                        )
-                    layer_group_ordinals[cache_idx] = ordinal
-            if -1 in layer_group_ordinals:
-                raise RuntimeError(
-                    "scheduler mamba cache groups do not cover every hybrid state layer"
-                )
-            # State layers whose regions share a KV address share one pool
-            # (see ``layer_addresses``).
-            layer_pool_ordinals = [-1] * len(cache_idx_by_name)
-            pool_by_address: dict[int, int] = {}
-            for tensor in kv_cache_config.kv_cache_tensors:
-                for name, address in layer_addresses(tensor):
-                    cache_idx = cache_idx_by_name.get(name)
-                    if cache_idx is None:
-                        continue
-                    if layer_pool_ordinals[cache_idx] != -1:
-                        raise RuntimeError(
-                            "a hybrid state layer appears in two "
-                            "kv_cache_tensors; cannot derive state pools"
-                        )
-                    layer_pool_ordinals[cache_idx] = pool_by_address.setdefault(
-                        address, len(pool_by_address)
-                    )
-            pools_used = len(pool_by_address)
-            if -1 in layer_pool_ordinals:
-                raise RuntimeError(
-                    "kv_cache_tensors do not cover every hybrid state "
-                    "layer; cannot derive state pools"
-                )
-            budgeted = _align_state_pool_count(
-                len(cache_idx_by_name), layer_plan.num_attention
-            )
-            if pools_used > budgeted:
-                raise RuntimeError(
-                    f"engine layout needs {pools_used} hybrid state pools but "
-                    f"the memory plan budgeted {budgeted}; refusing to "
-                    "exceed the paged memory budget"
-                )
-        runtime.adopt_scheduler_group(
-            group_index,
-            block_size,
-            state_group_indices=state_group_indices,
-            layer_group_ordinals=layer_group_ordinals,
-            layer_pool_ordinals=layer_pool_ordinals,
-        )
-        self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
     def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
         """Tell the drafter which scheduler KV group owns its committed KV.
@@ -877,31 +715,13 @@ class ModelCachePolicy:
         specs = self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
         return sum(spec.page_size_bytes for spec in specs.values())
 
-    def linear_cache_bytes_per_slot(self) -> int:
-        """Return bytes for one request's linear-attention state."""
-        if not self._runner.is_hybrid:
-            raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
-        hybrid_plan = self._hybrid_plan()
-        return hybrid_plan.layers.num_state * hybrid_plan.state_bytes_per_layer()
-
-    def hybrid_align_state_bytes_per_block(self) -> int:
-        """Per-pool-block linear-state bytes under align-mode prefix caching."""
-        hybrid_plan = self._hybrid_plan()
-        layer_plan = hybrid_plan.layers
-        pools = _align_state_pool_count(layer_plan.num_state, layer_plan.num_attention)
-        return hybrid_plan.state_bytes_per_layer() * pools
-
-    def hybrid_align_growth_bytes_per_block(self) -> int:
-        """One old physical state pool retained during align-cache growth."""
-        return self._hybrid_plan().state_bytes_per_layer()
-
     def build_paged_attention_runtime(
         self, *, block_size: int
     ) -> PagedAttentionRuntime:
         """Create the paged-attention backend for the loaded model."""
         self._require_supported_per_layer_shapes()
         if self._runner.is_hybrid:
-            return self._build_hybrid_backend(block_size)
+            return self._build_hybrid_backend()
         if self._runner.is_mla:
             return self._build_mla_backend(block_size)
         return self._build_sdpa_backend(block_size)
@@ -931,19 +751,11 @@ class ModelCachePolicy:
             group_block_sizes=backend.kv_group_block_sizes(),
         )
 
-    def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
-        config = get_config()
+    def _build_hybrid_backend(self) -> HybridPagedAttentionRuntime:
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
-            max_num_seqs=self._runner.scheduler_config.max_num_seqs,
-            num_kv_heads=self._runner.num_kv_heads,
-            head_dim=self._runner.head_dim,
-            block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
-            turboquant=config.turboquant,
-            k_quant=config.k_quant if config.turboquant else None,
-            v_quant=config.v_quant if config.turboquant else None,
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
@@ -1160,16 +972,19 @@ class WorkerCachePlanner:
 
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
-            plan = self._paged_attention_plan(
+            budget = self.base_kv_budget_bytes(
+                metal_limit=self._metal_limit_bytes(),
+                fraction=self._memory_fraction(),
+                model_memory=self.get_model_memory_usage(),
                 overhead=overhead,
-                require_min_blocks=False,
             )
+            budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
             logger.info(
                 "Mixed attention layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
-                plan.kv_budget / 1e9,
+                budget / 1e9,
             )
-            return plan.kv_budget
+            return budget
 
         if mode == "pooling_no_kv":
             self._worker.model_runner.profile_run()
@@ -1185,7 +1000,7 @@ class WorkerCachePlanner:
         fraction: float,
         overhead: int,
     ) -> int:
-        """Return Metal-memory budget before hybrid GDN reservation."""
+        """Return cache bytes after model weights and execution overhead."""
         return int(metal_limit * fraction) - model_memory - overhead
 
     def _paged_attention_plan(
@@ -1196,14 +1011,6 @@ class WorkerCachePlanner:
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
-        # Align-mode hybrid caching addresses GDN state by scheduler block id:
-        # any pool block can become a mamba state slab, so every planned block
-        # carries the linear-state bytes alongside its SDPA pages (the pool is
-        # fungible; the per-request reservation below stays zero instead).
-        # Growing the lazy state cache holds one old physical pool while its
-        # replacement materializes, so budget that one-pool overlap too.
-        per_block_bytes += self._hybrid_align_state_bytes_per_block()
-        per_block_bytes += self._hybrid_align_growth_bytes_per_block()
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
@@ -1211,9 +1018,8 @@ class WorkerCachePlanner:
             fraction,
             overhead,
         )
-        reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        kv_budget = base_kv_budget - draft_scratch_bytes
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1223,7 +1029,6 @@ class WorkerCachePlanner:
             overhead=overhead,
             per_block_bytes=per_block_bytes,
             base_kv_budget=base_kv_budget,
-            hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
         )
@@ -1250,46 +1055,6 @@ class WorkerCachePlanner:
                 f"per_block_bytes={plan.per_block_bytes}. "
                 f"{plan.format_mitigations()}"
             )
-
-    def _hybrid_align_state_bytes_per_block(self) -> int:
-        """Per-pool-block linear-state bytes under align-mode prefix caching."""
-        runner = self._worker.model_runner
-        if not runner.is_hybrid:
-            return 0
-        if runner.cache_config.mamba_cache_mode != "align":
-            return 0
-        return runner.hybrid_align_state_bytes_per_block()
-
-    def _hybrid_align_growth_bytes_per_block(self) -> int:
-        """One old physical state pool retained during align-cache growth."""
-        runner = self._worker.model_runner
-        if not runner.is_hybrid:
-            return 0
-        if runner.cache_config.mamba_cache_mode != "align":
-            return 0
-        return runner.hybrid_align_growth_bytes_per_block()
-
-    def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
-        """Return lazy GDN headroom reserved outside the paged KV pool."""
-        runner = self._worker.model_runner
-        if not runner.is_hybrid:
-            return _HybridGDNReservation()
-        if runner.cache_config.mamba_cache_mode == "align":
-            # Align mode folds the state pool into per-block sizing above.
-            return _HybridGDNReservation()
-        max_num_seqs = runner.scheduler_config.max_num_seqs
-        if max_num_seqs <= 0:
-            return _HybridGDNReservation()
-        cushion_slots = min(max_num_seqs, HYBRID_GDN_GROWTH_CUSHION_SLOTS)
-        return _HybridGDNReservation(
-            bytes_per_slot=runner.linear_cache_bytes_per_slot(),
-            # ``ensure_capacity`` grows by allocating a larger state pool and
-            # copying the old pool into it. Reserve a bounded growth cushion
-            # instead of the full scheduler cap so large max_num_seqs values
-            # still benefit from lazy GDN allocation.
-            reserved_slots=(2 * cushion_slots) - 1,
-            max_num_seqs=max_num_seqs,
-        )
 
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction from ``--gpu-memory-utilization``."""

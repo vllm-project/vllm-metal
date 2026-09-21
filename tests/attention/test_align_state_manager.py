@@ -4,8 +4,12 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from tests.stub_runner import make_gdn_hybrid_plan
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from tests.stub_runner import (
+    initialize_hybrid_runtime,
+    make_gdn_hybrid_plan,
+    make_state_cache,
+)
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.state import AlignStateManager
@@ -17,9 +21,8 @@ def _make_cache(
     *,
     num_layers: int = 2,
     num_blocks: int = 8,
-    initial_blocks: int | None = None,
-) -> GDNPagedStateCache:
-    return GDNPagedStateCache(
+) -> PagedStateCache:
+    return make_state_cache(
         num_layers=num_layers,
         max_seqs=num_blocks,
         conv_kernel_dim=2,
@@ -27,12 +30,11 @@ def _make_cache(
         num_v_heads=1,
         value_head_dim=4,
         key_head_dim=32,
-        initial_seqs=num_blocks if initial_blocks is None else initial_blocks,
         dtype=mx.float32,
     )
 
 
-def _fill_slab(cache: GDNPagedStateCache, layer: int, slab: int, value: float) -> None:
+def _fill_slab(cache: PagedStateCache, layer: int, slab: int, value: float) -> None:
     conv = cache.conv_states[layer]
     conv[slab] = value
     cache.store_conv_state(layer, conv)
@@ -42,7 +44,7 @@ def _fill_slab(cache: GDNPagedStateCache, layer: int, slab: int, value: float) -
     mx.eval(cache.conv_states[layer], cache.recurrent_states[layer])
 
 
-def _slab(cache: GDNPagedStateCache, layer: int, slab: int) -> tuple:
+def _slab(cache: PagedStateCache, layer: int, slab: int) -> tuple:
     mx.eval(cache.conv_states[layer], cache.recurrent_states[layer])
     return (
         np.array(cache.conv_states[layer][slab]),
@@ -75,6 +77,47 @@ class TestAlignStateManager:
         conv, rec = _slab(cache, 0, 3)
         assert np.all(conv == 0) and np.all(rec == 0)
 
+    def test_none_mode_keeps_compact_updates_between_decode_steps(self) -> None:
+        cache = _make_cache()
+        manager = AlignStateManager(cache, 4096, mamba_cache_mode="none")
+        self._populate(manager, ["a"], [[[3]]], [(0, 1)])
+        cache.set_pending_recurrent_state(
+            0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+        )
+
+        manager.materialize_pending_state()
+        self._populate(manager, ["a"], [[[3]]], [(1, 1)])
+
+        view = cache.recurrent_state_for_decode(0, [3])
+        assert view.uses_compact_state
+        np.testing.assert_array_equal(np.array(view.state), 9)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][3]), 0)
+
+        manager.release_requests({"a"})
+        manager.materialize_pending_state()
+        assert not cache.has_pending_recurrent_state(0)
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0][3]), 9)
+
+    def test_state_motion_flushes_only_intersecting_pending_updates(self) -> None:
+        cache = _make_cache()
+        for layer, slot, value in [(0, 3, 7), (1, 6, 9)]:
+            cache.set_pending_conv_state(
+                layer, [slot], mx.full((1, 1, 4), value, dtype=mx.float32)
+            )
+        cache.copy_slots([3], [4], [0])
+        assert cache.has_pending_conv_state(1)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][4]), 7)
+
+        cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 11, dtype=mx.float32))
+        cache.zero_slots([3], [0])
+        assert not cache.has_pending_conv_state(0)
+        assert cache.has_pending_conv_state(1)
+        cache.apply_pending_states()
+        mx.eval(*cache.updated_state_arrays())
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][3]), 0)
+        np.testing.assert_array_equal(np.array(cache.conv_states[0][4]), 7)
+        np.testing.assert_array_equal(np.array(cache.conv_states[1][6]), 9)
+
     def test_boundary_crossing_copies_forward_and_keeps_checkpoint(self) -> None:
         cache = _make_cache()
         manager = AlignStateManager(cache, BLOCK)
@@ -99,41 +142,6 @@ class TestAlignStateManager:
         conv_src, _ = _slab(cache, 0, 2)
         np.testing.assert_array_equal(conv_src, 5.0)
 
-    def test_striped_groups_share_one_pool_without_colliding(self) -> None:
-        # Two layers from different groups sharing one physical pool, the
-        # layout vLLM's aliased kv_cache_tensors produce: each group's motion
-        # must touch only its own block rows of the shared array.
-        cache = _make_cache(num_layers=2)
-        cache.set_layer_layout([0, 1], [0, 0])
-        assert cache.num_state_pools == 1
-        manager = AlignStateManager(cache, BLOCK)
-        _fill_slab(cache, 0, 2, 5.0)
-        _fill_slab(cache, 1, 3, 8.0)
-
-        # One request; group 0 crosses 2→6, group 1 crosses 3→7.
-        ctx = self._populate(manager, ["req-A"], [[[2, 6], [3, 7]]], [(4, 1)])
-
-        assert ctx.state_group_slot_mappings == ([6], [7])
-        conv, _ = _slab(cache, 0, 6)
-        np.testing.assert_array_equal(conv, 5.0)  # group 0 moved its rows
-        conv, _ = _slab(cache, 1, 7)
-        np.testing.assert_array_equal(conv, 8.0)  # group 1 moved its rows
-        conv, _ = _slab(cache, 0, 3)  # group 1's checkpoint intact in the pool
-        np.testing.assert_array_equal(conv, 8.0)
-
-    def test_pool_materializes_lazily_by_high_water_block_id(self) -> None:
-        cache = _make_cache(num_blocks=8, initial_blocks=2)
-        manager = AlignStateManager(cache, BLOCK)
-
-        # Fresh request lands in block 5, beyond the initially materialized
-        # slabs; the pool grows to cover it (geometric, capped at max_seqs).
-        ctx = self._populate(manager, ["req-A"], [[[5]]], [(0, 2)])
-
-        assert ctx.state_group_slot_mappings == ([5],)
-        assert cache.allocated_seqs == 6
-        conv, rec = _slab(cache, 0, 5)
-        assert np.all(conv == 0) and np.all(rec == 0)
-
 
 class TestHybridAlignRuntime:
     def _make_runtime(self) -> HybridPagedAttentionRuntime:
@@ -147,31 +155,72 @@ class TestHybridAlignRuntime:
                 value_head_dim=4,
                 key_head_dim=32,
             ),
-            max_num_seqs=2,
-            num_kv_heads=1,
-            head_dim=4,
-            block_size=BLOCK,
             dtype=mx.float32,
             mamba_cache_mode="align",
         )
 
-    def test_adopts_shared_layout_before_materializing_state(self) -> None:
+    def test_storage_matches_upstream_allocation(self) -> None:
         runtime = self._make_runtime()
-        runtime.initialize(num_blocks=8)
+        config = initialize_hybrid_runtime(runtime, 8, mamba_cache_mode="align")
+        assert runtime.state_cache.conv_states[0].shape[0] == config.num_blocks
+        assert runtime.storage.nbytes == config.kv_cache_tensors[0].size
+        # One allocation supplies attention and state, with no extra state budget.
+        assert runtime.kv_cache._storage is runtime.storage
 
-        assert runtime.state_cache.allocated_seqs == 0
-        runtime.adopt_scheduler_group(
+    def test_initialize_wires_state_manager_delegation(self) -> None:
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=make_gdn_hybrid_plan(
+                2,
+                range(1, 2, 2),
+                conv_kernel_dim=2,
+                conv_dim=4,
+                num_v_heads=1,
+                value_head_dim=4,
+                key_head_dim=32,
+            ),
+            dtype=mx.float32,
+        )
+        initialize_hybrid_runtime(runtime, 2)
+
+        ctx = PagedAttentionContext(slot_mapping=[])
+        runtime.populate_step_context(
+            req_ids=["req-A"],
+            ctx=ctx,
+            state_block_ids=[[[1]]],
+            step_positions=[(0, 1)],
+        )
+
+        assert ctx.state_group_slot_mappings == ([1],)
+
+        cache = runtime.state_cache
+        slot = ctx.state_group_slot_mappings[0][0]
+        cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
+        cache.set_pending_recurrent_state(
             0,
-            BLOCK,
-            state_group_indices=(1, 2),
-            layer_group_ordinals=[0, 1],
-            layer_pool_ordinals=[0, 0],
+            [slot],
+            mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
         )
-        runtime.state_cache.ensure_capacity(2)
 
-        assert runtime.state_cache.num_state_pools == 1
-        assert runtime.state_cache.conv_states[0] is runtime.state_cache.conv_states[1]
-        assert (
-            runtime.state_cache.recurrent_states[0]
-            is runtime.state_cache.recurrent_states[1]
-        )
+        runtime.release_requests({"req-A"})
+        runtime.materialize_pending_state()
+
+        assert not cache.has_pending_conv_state(0)
+        assert not cache.has_pending_recurrent_state(0)
+        assert runtime.state_manager.needs_materialize is False
+
+
+def test_scheduler_copy_and_zero_preserve_unrelated_compact_updates():
+    runtime = TestHybridAlignRuntime()._make_runtime()
+    initialize_hybrid_runtime(runtime, 8, mamba_cache_mode="align")
+    cache = runtime.state_cache
+    cache.set_pending_recurrent_state(
+        0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+    )
+
+    runtime.zero_blocks([1])
+    runtime.copy_blocks([(1, 2)])
+    assert cache.has_pending_recurrent_state(0)
+    runtime.copy_blocks([(3, 4)])
+    assert not cache.has_pending_recurrent_state(0)
+    mx.eval(*runtime.storage.buffers)
+    np.testing.assert_array_equal(np.array(cache.recurrent_states[0][4]), 9)

@@ -108,3 +108,56 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     assert torch.all(key[2, 3] == 3)
     assert torch.all(value[2, 3] == 5)
     assert torch.all(key[2, 2] == 0)
+
+
+def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    from tests.stub_runner import make_cache_config
+    from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+    from vllm_metal.v1.cache_policy import WorkerCachePlanner
+
+    groups = make_storage().config.kv_cache_groups
+    buffer_limit = 16_384
+    imported = []
+
+    def import_region(tensor):
+        assert tensor.nbytes <= buffer_limit
+        imported.append(tensor)
+        return torch_to_mlx(tensor)
+
+    monkeypatch.setattr(
+        "vllm_metal.attention.caches.storage.torch_to_mlx", import_region
+    )
+    config = SimpleNamespace(cache_config=make_cache_config(gpu_memory_utilization=0.5))
+    runner = SimpleNamespace(
+        is_hybrid=True,
+        scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
+        profile_run=lambda: 0,
+        draft_scratch_reserve_bytes=lambda: 0,
+    )
+    planner = WorkerCachePlanner(
+        SimpleNamespace(model_runner=runner, vllm_config=config)
+    )
+    monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {
+            "max_recommended_working_set_size": 4 * buffer_limit,
+            "max_buffer_length": buffer_limit,
+        },
+    )
+
+    budget = planner.determine_available_memory()
+    planned = get_kv_cache_config_from_groups(config, groups, budget)
+    planned.kv_cache_layout = config.cache_config.kv_cache_layout
+    storage = KVCacheStorage(planned)
+
+    assert storage.nbytes == budget == 2 * buffer_limit
+    assert len(imported) == len(storage.buffers) == 2
+    assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 1
+    assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
+    assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks

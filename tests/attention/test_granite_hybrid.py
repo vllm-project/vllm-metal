@@ -14,6 +14,7 @@ from mlx_lm.models.granitemoehybrid import Model, ModelArgs
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from tests.stub_runner import initialize_hybrid_runtime
 from vllm_metal.attention.context import (
     OffsetCache,
     PagedAttentionContext,
@@ -105,17 +106,20 @@ def test_granite_paged_requests_match_mlx_lm_through_slot_reuse(moe, rope) -> No
     plan = build_hybrid_runtime_plan(asdict(args), 4, (torch.float32, torch.float32))
     runtime = HybridPagedAttentionRuntime(
         hybrid_plan=plan,
-        max_num_seqs=2,
-        num_kv_heads=args.num_key_value_heads,
-        head_dim=args.hidden_size // args.num_attention_heads,
-        block_size=16,
         dtype=mx.float32,
     )
-    runtime.initialize(num_blocks=6)
+    initialize_hybrid_runtime(
+        runtime,
+        6,
+        block_size=16,
+        num_kv_heads=args.num_key_value_heads,
+        head_dim=args.hidden_size // args.num_attention_heads,
+    )
     assert runtime.patch_model(paged) == 4
     caches = {req: reference.make_cache() for req in ("a", "b", "c")}
     offsets = dict.fromkeys(caches, 0)
     blocks = {"a": [0, 1], "b": [2, 3], "c": [0, 1]}
+    state_blocks = {"a": 4, "b": 5, "c": 4}
     next_tokens = {}
 
     def step(requests, segments, num_decode=0):
@@ -138,7 +142,15 @@ def test_granite_paged_requests_match_mlx_lm_through_slot_reuse(moe, rope) -> No
             cu_seqlens=cu_seqlens,
             num_decode_requests=num_decode,
         )
-        runtime.populate_step_context(req_ids=requests, ctx=ctx)
+        runtime.populate_step_context(
+            req_ids=requests,
+            ctx=ctx,
+            state_block_ids=[[[state_blocks[req]]] for req in requests],
+            step_positions=[
+                (offsets[req], len(tokens))
+                for req, tokens in zip(requests, segments, strict=True)
+            ],
+        )
         set_context(ctx)
         try:
             actual = paged(
@@ -165,13 +177,10 @@ def test_granite_paged_requests_match_mlx_lm_through_slot_reuse(moe, rope) -> No
     # A resident decode precedes another request's continued prefill.
     step(["b", "a"], [[next_tokens["b"]], list(range(7, 24))], num_decode=1)
     step(["a", "b"], [[next_tokens["a"]], [next_tokens["b"]]], num_decode=2)
-    old_slot = runtime.state_manager.request_slots["a"]
     runtime.release_requests({"a"})
     runtime.materialize_pending_state()
     step(["b", "c"], [[next_tokens["b"]], [13, 14, 15, 16]], num_decode=1)
-    assert runtime.state_manager.request_slots["c"] == old_slot
     for _ in range(4):
         step(["c", "b"], [[next_tokens["c"]], [next_tokens["b"]]], num_decode=2)
     runtime.release_requests({"b", "c"})
     runtime.materialize_pending_state()
-    assert runtime.state_manager.request_slots == {}
