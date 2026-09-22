@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models import cohere2, gemma3_text
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 import vllm_metal.envs as envs
 from vllm_metal.config import reset_config
@@ -1165,3 +1167,77 @@ class TestBuildSlidingWindowPerLayer:
         adapter = DefaultModelAdapter()
         result = adapter.build_sliding_window_per_layer(args, num_layers=4)
         assert result is None
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            (
+                lambda: cohere2.Model(
+                    cohere2.ModelArgs(
+                        model_type="cohere2",
+                        hidden_size=8,
+                        head_dim=4,
+                        num_hidden_layers=8,
+                        intermediate_size=16,
+                        num_attention_heads=2,
+                        num_key_value_heads=1,
+                        vocab_size=32,
+                        sliding_window=4096,
+                        sliding_window_pattern=4,
+                    )
+                ),
+                [4096, 4096, 4096, -1] * 2,
+            ),
+            (
+                lambda: gemma3_text.Model(
+                    gemma3_text.ModelArgs(
+                        model_type="gemma3_text",
+                        hidden_size=8,
+                        num_hidden_layers=12,
+                        intermediate_size=16,
+                        num_attention_heads=2,
+                        num_key_value_heads=1,
+                        head_dim=4,
+                        rms_norm_eps=1e-6,
+                        vocab_size=32,
+                        sliding_window=512,
+                        sliding_window_pattern=6,
+                    )
+                ),
+                [512] * 5 + [-1] + [512] * 5 + [-1],
+            ),
+        ],
+        ids=["cohere2", "gemma3"],
+    )
+    def test_model_cache_factory_drives_windows(self, build, expected) -> None:
+        """Models that keep only a pattern get their layout from ``make_cache``."""
+        model = build()
+        args = vars(model.args)
+        assert "layer_types" not in args
+
+        result = DefaultModelAdapter().build_sliding_window_per_layer(
+            args, num_layers=model.args.num_hidden_layers, model=model
+        )
+
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "caches",
+        [
+            [RotatingKVCache(max_size=1024), KVCache()],
+            [RotatingKVCache(max_size=1024, keep=4)] * 4,
+        ],
+        ids=["kv_sharing_owners_only", "sink_cache"],
+    )
+    def test_unusable_cache_factory_falls_back_to_layer_types(self, caches) -> None:
+        model = SimpleNamespace(make_cache=lambda: caches)
+        args = {
+            "layer_types": ["sliding_attention", "full_attention"] * 2,
+            "sliding_window": 1024,
+        }
+
+        result = DefaultModelAdapter().build_sliding_window_per_layer(
+            args, num_layers=4, model=model
+        )
+
+        assert result == [1024, -1, 1024, -1]

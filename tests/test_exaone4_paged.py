@@ -2,7 +2,7 @@
 """Paged-attention regressions for EXAONE 4.0."""
 
 import mlx.core as mx
-from mlx_lm.models.exaone4 import Attention, ModelArgs
+from mlx_lm.models.exaone4 import Attention, Model, ModelArgs
 
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv
@@ -29,12 +29,12 @@ def _model_args(*, num_hidden_layers: int = 4) -> ModelArgs:
     )
 
 
-def test_string_pattern_drives_per_layer_sliding_window_policy() -> None:
-    """EXAONE's retained MLX pattern must drive Metal cache geometry."""
+def test_cache_factory_drives_per_layer_sliding_window_policy() -> None:
+    """EXAONE's own cache layout must drive Metal cache geometry."""
     args = _model_args(num_hidden_layers=8)
 
     sliding_windows = DefaultModelAdapter().build_sliding_window_per_layer(
-        vars(args), args.num_hidden_layers
+        vars(args), args.num_hidden_layers, model=Model(args)
     )
 
     assert sliding_windows == [4_096, 4_096, 4_096, -1] * 2

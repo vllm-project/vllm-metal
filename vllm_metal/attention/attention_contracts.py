@@ -53,4 +53,7 @@ def attention_contract_for(module: object) -> AttentionContract:
     if type(module).__module__ == "mlx_lm.models.granitemoehybrid":
         # Granite selects RoPE or position-free attention from the checkpoint.
         return AttentionContract(use_rope=module.rope is not None)
+    if type(module).__module__ == "mlx_lm.models.cohere2":
+        # Cohere2 rotates only its sliding-window layers; global layers are NoPE.
+        return AttentionContract(use_rope=module.use_sliding_window)
     return _ATTENTION_CONTRACTS.get(type(module).__module__, DEFAULT_ATTENTION_CONTRACT)

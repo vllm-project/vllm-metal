@@ -203,7 +203,7 @@ class ModelAdapter(Protocol):
         """Return per-layer ``(kv_heads, head_dim)`` lists, or None for uniform."""
 
     def build_sliding_window_per_layer(
-        self, args: dict[str, Any], num_layers: int
+        self, args: dict[str, Any], num_layers: int, *, model: Any = None
     ) -> list[int] | None:
         """Return per-layer sliding window sizes, or None for no enforcement."""
 
@@ -756,31 +756,55 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return kv_heads_per_layer, head_dim_per_layer
 
     def build_sliding_window_per_layer(
-        self, args: dict[str, Any], num_layers: int
+        self, args: dict[str, Any], num_layers: int, *, model: Any = None
     ) -> list[int] | None:
         """Return model-authoritative per-layer sliding window sizes.
 
-        Explicit ``layer_types`` identify sliding and full layers directly.
-        mlx-lm filters that field out of EXAONE's ``ModelArgs``, so for EXAONE
-        derive the same cyclic layout its model constructor uses from the
-        retained ``sliding_window_pattern``. Full-attention layers use ``-1``.
-        Models without either authoritative layout or ``sliding_window`` return
+        mlx-lm's ``make_cache`` already decides which layers rotate and by how
+        much (``RotatingKVCache`` versus ``KVCache``), so read it from the
+        loaded ``model``. Models that share KV between layers build caches for
+        the owning layers only; their explicit ``layer_types`` cover every
+        layer and are used instead. Full-attention layers use ``-1``. Models
+        without a ``sliding_window``, or without either source, return
         ``None``, keeping window enforcement disabled everywhere.
         """
         sliding_window = args.get("sliding_window")
         if not sliding_window:
             return None
 
+        windows = self._sliding_windows_from_cache_factory(model, num_layers)
+        if windows is not None:
+            return windows
+
         layer_types = args.get("layer_types")
-        if layer_types is None and args.get("model_type") == "exaone4":
-            pattern = args.get("sliding_window_pattern")
-            if isinstance(pattern, str):
-                from vllm_metal.compat import _exaone4_layer_types_from_pattern
-
-                layer_types = _exaone4_layer_types_from_pattern(pattern, num_layers)
-
         if layer_types is None or len(layer_types) != num_layers:
             return None
 
         sw = int(sliding_window)
         return [sw if lt == "sliding_attention" else -1 for lt in layer_types]
+
+    def _sliding_windows_from_cache_factory(
+        self, model: Any, num_layers: int
+    ) -> list[int] | None:
+        """Per-layer windows from the model's own cache factory, else ``None``."""
+        make_cache = (
+            getattr(self.text_model(model), "make_cache", None)
+            if model is not None
+            else None
+        )
+        if make_cache is None:
+            return None
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        caches = make_cache()
+        if len(caches) != num_layers:
+            return None
+        windows: list[int] = []
+        for cache in caches:
+            if isinstance(cache, RotatingKVCache) and cache.keep == 0:
+                windows.append(int(cache.max_size))
+            elif isinstance(cache, KVCache):
+                windows.append(-1)
+            else:
+                return None
+        return windows

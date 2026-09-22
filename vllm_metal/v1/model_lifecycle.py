@@ -498,7 +498,7 @@ class ModelLifecycle:
 
         self._runner.sliding_window_per_layer = (
             self._model_adapter.build_sliding_window_per_layer(
-                args, self._runner.num_layers
+                args, self._runner.num_layers, model=self._runner.model
             )
         )
 
