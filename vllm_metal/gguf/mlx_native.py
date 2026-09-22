@@ -292,8 +292,8 @@ class GGUFMLXQuantizedTensor:
         codes = GGUFMLXQuantizedTensor._split_nibble_chunks(blocks[:, 48:176])
         qh = blocks[:, 16:48]
         group_bits = np.arange(8, dtype=np.uint8)[None, :, None]
-        # Stays uint8 end to end: the in-place OR casts per buffer chunk, so no
-        # full-size uint32 temporary materializes (#773 memory bar).
+        # codes is already uint32; the high-bit plane stays uint8 and is merged
+        # in place, avoiding another full-size uint32 temporary (#773).
         codes |= ((qh[:, None, :] >> group_bits) & np.uint8(1)) << np.uint8(4)
         return codes, scales, biases
 
