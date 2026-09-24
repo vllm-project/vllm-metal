@@ -412,7 +412,17 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
-        # Set worker class for Metal
+        # Set worker class for Metal. The ggml backend brings its own worker and
+        # config policy (text-only, no prefix caching for recurrent state).
+        if envs.VLLM_METAL_BACKEND == "ggml":
+            from vllm_metal.ggml.policy import apply_ggml_config_policy
+
+            apply_ggml_config_policy(vllm_config)
+        elif envs.VLLM_METAL_BACKEND != "mlx":
+            raise ValueError(
+                f"Unknown VLLM_METAL_BACKEND={envs.VLLM_METAL_BACKEND!r} "
+                "(expected 'mlx' or 'ggml')"
+            )
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
@@ -960,6 +970,12 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
 
         if not model_config:
+            return
+
+        if envs.VLLM_METAL_BACKEND == "ggml":
+            from vllm_metal.ggml.policy import update_block_size
+
+            update_block_size(vllm_config)
             return
 
         # For hybrid models with paged attention, log a warning explaining the

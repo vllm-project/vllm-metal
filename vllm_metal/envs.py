@@ -33,8 +33,34 @@ if TYPE_CHECKING:
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
+    VLLM_METAL_BACKEND: str = "mlx"
+    VLLM_METAL_GGML_DEVICE: str = "metal"
+    VLLM_METAL_GGML_ATTN_BUDGET_MB: int = 512
+    VLLM_METAL_GGML_PROFILE: bool = False
+    VLLM_METAL_GGML_VERBOSE: bool = False
+    VLLM_METAL_GGML_ALLOW_CPU_FALLBACK: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Model-execution backend: "mlx" (default) or "ggml" (Rust + ggml Metal
+    # engine from rust/ggml-engine; see vllm_metal/ggml).
+    "VLLM_METAL_BACKEND": lambda: os.getenv("VLLM_METAL_BACKEND", "mlx").lower(),
+    # ggml backend device: "metal" (default) or "cpu" (debugging only; the
+    # Homebrew ggml CPU backend's libomp conflicts with PyTorch's in-process).
+    "VLLM_METAL_GGML_DEVICE": lambda: os.getenv("VLLM_METAL_GGML_DEVICE", "metal"),
+    # Per-graph byte budget for attention temporaries (gathered K/V + masks);
+    # larger steps are split into several graphs. Reserved from the KV budget.
+    "VLLM_METAL_GGML_ATTN_BUDGET_MB": lambda: int(
+        os.getenv("VLLM_METAL_GGML_ATTN_BUDGET_MB", "512")
+    ),
+    # Log per-step engine phase timings (read by the Rust engine too).
+    "VLLM_METAL_GGML_PROFILE": lambda: os.getenv("VLLM_METAL_GGML_PROFILE", "0") == "1",
+    # Forward ggml's info/debug logs (read by the Rust engine).
+    "VLLM_METAL_GGML_VERBOSE": lambda: os.getenv("VLLM_METAL_GGML_VERBOSE", "0") == "1",
+    # Allow ops the Metal backend cannot run to fall back to the ggml CPU
+    # backend (read by the Rust engine). Off by default: see the libomp note.
+    "VLLM_METAL_GGML_ALLOW_CPU_FALLBACK": lambda: (
+        os.getenv("VLLM_METAL_GGML_ALLOW_CPU_FALLBACK", "0") == "1"
+    ),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
     # Multimodal serving mode:

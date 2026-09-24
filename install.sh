@@ -272,6 +272,7 @@ EOF
     uv pip install -e .
     ensure_metal_toolchain
     build_native_artifacts
+    build_ggml_engine
   else
     local release_data selected release_tag wheel_url vllm_release_tag
     release_data=$(fetch_release "$repo_owner" "$repo_name" "$channel")

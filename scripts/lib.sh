@@ -155,6 +155,22 @@ build_native_artifacts() {
   python -m vllm_metal.metal.build
 }
 
+# Build the optional Rust/ggml engine (VLLM_METAL_BACKEND=ggml) into
+# vllm_metal/ggml/. Best effort: skipped when cargo or Homebrew ggml is absent,
+# since the default MLX backend does not need it.
+build_ggml_engine() {
+  section "Building ggml engine (optional)"
+  if ! command -v cargo &> /dev/null; then
+    echo "cargo not found; skipping (install Rust to enable VLLM_METAL_BACKEND=ggml)"
+    return 0
+  fi
+  if ! command -v brew &> /dev/null || [ ! -f "$(brew --prefix ggml)/include/ggml.h" ]; then
+    echo "ggml not found; skipping (run 'brew install ggml' to enable VLLM_METAL_BACKEND=ggml)"
+    return 0
+  fi
+  python -m vllm_metal.ggml.build
+}
+
 # Fail unless the freshly built wheel actually bundles the prebuilt native
 # artifacts: the _paged_ops*.so extension, three required metallibs, and NAX.
 # setup.py's package data is what pulls these (gitignored)
