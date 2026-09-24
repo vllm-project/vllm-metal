@@ -128,15 +128,29 @@ def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch):
     )
 
 
+# B=4 is the last qmv batch and B=5 the first GEMM batch, so the low-precision
+# oracle comparison covers both matmul paths.
+@pytest.mark.parametrize("batch", [4, 5])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_matmul_output_dtype_follows_x(dtype):
-    qt, _ = _make_q6k_tensor()
-    x = mx.random.normal((4, qt.in_features)).astype(dtype)
+def test_matmul_low_precision_matches_dense_oracle(dtype, batch):
+    qt, oracle = _make_q6k_tensor()
+    x = mx.random.normal((batch, qt.in_features)).astype(dtype)
 
     out = qt.matmul(x)
+    expected = mx.matmul(x.astype(mx.float32), mx.array(oracle).T, stream=mx.cpu)
+    mx.eval(out, expected)
 
     assert out.dtype == dtype
-    assert out.shape == (4, qt.out_features)
+    assert out.shape == (batch, qt.out_features)
+    # The comparison is bounded by the input precision (bf16 measured ~2e-3
+    # vs the f32 CPU reference, f16 ~3e-4).
+    ref_max = float(mx.max(mx.abs(expected)))
+    np.testing.assert_allclose(
+        np.array(out.astype(mx.float32)),
+        np.array(expected),
+        rtol=0,
+        atol=ref_max * 4e-3,
+    )
 
 
 def test_matmul_preserves_leading_shape():
