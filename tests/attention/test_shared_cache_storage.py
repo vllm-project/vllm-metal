@@ -189,7 +189,11 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
         draft_scratch_reserve_bytes=lambda: 0,
     )
     planner = WorkerCachePlanner(
-        SimpleNamespace(model_runner=runner, vllm_config=config)
+        SimpleNamespace(
+            model_runner=runner,
+            vllm_config=config,
+            get_cache_block_size_bytes=lambda: 1,
+        )
     )
     monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
     monkeypatch.setattr(

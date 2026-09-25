@@ -953,13 +953,10 @@ class WorkerCachePlanner:
 
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
-            budget = self.base_kv_budget_bytes(
-                metal_limit=self._metal_limit_bytes(),
-                fraction=self._memory_fraction(),
-                model_memory=self.get_model_memory_usage(),
-                overhead=overhead,
+            plan = self._paged_attention_plan(
+                overhead=overhead, require_min_blocks=False
             )
-            budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
+            budget = plan.kv_budget
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",

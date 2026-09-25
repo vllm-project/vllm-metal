@@ -191,6 +191,87 @@ class TestWorkerRunnerBoundaryDelegation:
         setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
+    def _make_layout_budget_worker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        gpu_memory_utilization: float,
+        metal_limit: int = 10_000_000_000,
+        model_memory: int = 2_000_000_000,
+        overhead: int = 100_000_000,
+    ) -> MetalWorker:
+        model_runner = SimpleNamespace(
+            scheduler_memory_reporting_mode=MagicMock(
+                return_value="paged_attention_layout_budget"
+            ),
+            profile_run=MagicMock(return_value=overhead),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        worker = _make_worker(model_runner)
+        worker.cache_config.gpu_memory_utilization = gpu_memory_utilization
+        worker.get_cache_block_size_bytes = MagicMock(return_value=1)
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: metal_limit
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: model_memory
+        )
+        return worker
+
+    def test_determine_available_memory_layout_budget_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.5
+        )
+
+        available = MetalWorker.determine_available_memory(worker)
+
+        # 10 GB * 0.5 - 2 GB weights - 0.1 GB overhead.
+        assert available == 2_900_000_000
+        worker.model_runner.profile_run.assert_called_once_with()
+
+    def test_layout_budget_oom_reports_breakdown_and_mitigations(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A budget that cannot fit fails on Metal's own diagnostics.
+
+        The upstream-storage path used to hand a negative budget straight
+        to vLLM, whose generic error names none of the terms below.
+        """
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.15
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            MetalWorker.determine_available_memory(worker)
+
+        message = str(exc_info.value)
+        assert "not enough Metal memory for KV cache" in message
+        assert "fraction=0.15" in message
+        assert "model_memory=2.00GB" in message
+        assert "overhead=0.10GB" in message
+        assert "kv_budget=-0.60GB" in message
+        assert "increase --gpu-memory-utilization (currently 0.15)" in message
+
+    def test_layout_budget_skips_dense_block_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A small positive budget is reported, not rejected, on this path.
+
+        The per-block size here is the dense estimate; vLLM chooses the real
+        layout afterwards and a few dense blocks of budget can still yield a
+        valid grouped layout (see the Gemma4 grouped-layout tests).
+        """
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.5
+        )
+        # 2.9 GB budget / 1 GB dense blocks = 2 blocks, under the 16-block
+        # floor the capacity path enforces.
+        worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000_000)
+
+        assert MetalWorker.determine_available_memory(worker) == 2_900_000_000
+
 
 class TestPagedAttentionPlanDiagnostics:
     def _make_planner(
