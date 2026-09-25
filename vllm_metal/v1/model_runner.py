@@ -63,6 +63,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import (
     PENDING_TOKEN_PLACEHOLDER,
@@ -164,7 +165,7 @@ class RequestState:
     mrope_position_delta: int | None = None
     # Scheduler-reconciled prefix-cache-hit boundary (the same value used to
     # resume the target's own paged prefill, see `_add_new_requests`).
-    # DraftModelProposer reuses this as the committed-KV group's ingest
+    # DraftModelProposer reuses this as the draft cache's ingest
     # boundary instead of self-tracking it, so a cache hit shared across
     # requests skips re-ingest for the draft's KV too (#482).
     num_computed_tokens: int = 0
@@ -334,6 +335,7 @@ class _PagedForwardState(NamedTuple):
     # forward was available (skip-sampling is decoupled from skip-projection
     # so unsupported models cannot advance seeded RNG on a discarded token).
     intermediate_only: bool = False
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 class MetalModelRunner:
@@ -386,6 +388,8 @@ class MetalModelRunner:
         self._pooling_backend: ExecutablePoolingBackend | None = None
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
+        self._eagle3_model: Any | None = None
+        self._target_aux_capture: AuxHiddenStateCapture | None = None
         self._drafter: MetalProposer | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
@@ -393,7 +397,7 @@ class MetalModelRunner:
         # The draft's MLX weights load later, in `install_drafter`.
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
-        if spec is not None and spec.uses_draft_model():
+        if spec is not None and (spec.uses_draft_model() or spec.method == "eagle3"):
             from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
 
             self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
@@ -753,6 +757,7 @@ class MetalModelRunner:
             cache=cache,
             collect_hidden_states=collect_hidden_states,
             logits_indices=logits_indices,
+            aux_capture=self._target_aux_capture,
         )
 
     def _paged_logits_layout(
@@ -831,14 +836,6 @@ class MetalModelRunner:
             Block size in bytes
         """
         return self._cache_policy.get_cache_block_size_bytes()
-
-    def draft_scratch_reserve_blocks(self) -> int:
-        """Blocks reserved for the draft model's speculative lookahead tail."""
-        return self._cache_policy.draft_scratch_reserve_blocks()
-
-    def draft_scratch_reserve_bytes(self) -> int:
-        """Bytes held out of the KV budget for the draft's scratch tail."""
-        return self._cache_policy.draft_scratch_reserve_bytes()
 
     def profile_run(self) -> int:
         """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
@@ -970,19 +967,33 @@ class MetalModelRunner:
     def install_drafter(self, *, num_blocks: int, block_size: int) -> None:
         """Construct the polymorphic drafter once the paged cache is ready.
 
-        One factory for both speculative methods, keyed on the speculative
-        method. Gemma4 MTP uses the in-model assistant loaded in
-        ``ModelLifecycle`` (read lazily by the proposer); draft-model SD loads
-        its own model + a paged cache sized to the target's ``num_blocks`` —
-        which is why this runs after the paged backend exists. A configured but
-        unsupported method fails loud rather than silently degrading to plain
-        decode (which would look like a drafter that never accepts anything).
+        EAGLE3 binds the target runtime's shared storage after the engine
+        finalizes its cache config. Gemma4 MTP uses the in-model assistant;
+        ordinary draft-model speculation still loads its model and allocates
+        a count-based cache here.
         """
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "eagle3":
+            from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+            from vllm_metal.v1.eagle3_proposer import Eagle3Proposer
+
+            runtime = self.paged_attention_runtime
+            if not isinstance(runtime, SDPAPagedAttentionRuntime):
+                raise RuntimeError(
+                    "EAGLE3 requires initialized shared attention storage"
+                )
+            if self._eagle3_model is None:
+                raise RuntimeError("EAGLE3 head was not loaded before cache allocation")
+            self._drafter = Eagle3Proposer(
+                model=self._eagle3_model,
+                controller=self._spec_decode_controller,
+                storage=runtime.cache_storage,
+                max_model_len=spec.draft_model_config.max_model_len,
+            )
         elif spec.uses_draft_model():
             allow_deferred_zero_k_ingest = (
                 not self.vllm_config.cache_config.enable_prefix_caching
@@ -990,21 +1001,14 @@ class MetalModelRunner:
 
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
-            # `num_blocks` is the scheduler-visible committed-KV capacity for
-            # the draft group (see cache_policy._draft_layer_specs); the
-            # physical backend needs `scratch_reserve_blocks` on top of that
-            # for the speculative lookahead tail, which the scheduler never
-            # sees or assigns (see draft_scratch_reserve_blocks). The KV
-            # budget already reserved this many blocks' worth of bytes off
-            # the top (WorkerCachePlanner._paged_attention_plan), so this is
-            # guaranteed to fit.
+            # The scheduler owns both committed and lookahead draft blocks.
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
                 extract_logits=self._model_adapter.extract_logits,
-                committed_num_blocks=num_blocks,
-                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
+                num_blocks=num_blocks,
+                max_model_len=spec.draft_model_config.max_model_len,
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
                 allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
@@ -1021,7 +1025,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, eagle3, draft_model, ngram)."
             )
 
     def warm_up(self) -> None:
@@ -1149,6 +1153,7 @@ class MetalModelRunner:
         # branches project nothing, so the packed boundaries stand.
         logits_layout = _PagedLogitsLayout(None, cu_seqlens)
         target_hidden_states: mx.array | None = None
+        target_aux_hidden_states: tuple[mx.array, ...] = ()
         pooling_hidden_states: mx.array | None = None
         intermediate_hidden: mx.array | None = None
         intermediate_only = False
@@ -1305,6 +1310,7 @@ class MetalModelRunner:
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
+                    target_aux_hidden_states = target_output.aux_hidden_states
                     del target_output
         finally:
             clear_context()
@@ -1328,6 +1334,7 @@ class MetalModelRunner:
             forward_outputs = [logits]
             if target_hidden_states is not None:
                 forward_outputs.append(target_hidden_states)
+            forward_outputs.extend(target_aux_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
         # `cu_seqlens` keeps describing the packed hidden states, which the
@@ -1340,6 +1347,7 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
             logits_cu_seqlens=logits_layout.cu_seqlens,
@@ -1454,6 +1462,7 @@ class MetalModelRunner:
         scheduler_output = paged_state.scheduler_output
         logits = paged_state.logits
         target_hidden_states = paged_state.target_hidden_states
+        target_aux_hidden_states = paged_state.target_aux_hidden_states
         pooling_hidden_states = paged_state.pooling_hidden_states
         cu_seqlens = paged_state.cu_seqlens
         # Everything indexing `logits` uses these; `cu_seqlens` stays the packed
@@ -1522,6 +1531,7 @@ class MetalModelRunner:
         # eagerly: the Gemma4 MTP drafter (target_hidden_states) or the
         # structured-output bitmask. Otherwise the sampler's own eval pulls the
         # forward through, so a separate wait here is a redundant per-step sync.
+        # EAGLE consumes the submitted auxiliary states through GPU dependencies.
         if target_hidden_states is not None:
             mx.eval(logits, target_hidden_states)
         elif grammar_output is not None:
@@ -1709,6 +1719,7 @@ class MetalModelRunner:
         num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,
@@ -2560,10 +2571,7 @@ class MetalModelRunner:
         if resumed_req_ids:
             invalidated.update(resumed_req_ids)
 
-        # A drafter that pins a bounded per-request resource (draft cache blocks)
-        # releases it on the same events as the runtime's recurrent state: a
-        # waiting or preempted request must not keep holding the resource, and a
-        # resumed request re-acquires it during recompute.
+        # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:
             self._drafter.release_requests(invalidated)
 

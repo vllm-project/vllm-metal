@@ -1,29 +1,74 @@
 # Speculative Decoding
 
-vllm-metal supports three speculative decoding methods on the paged-attention
+vllm-metal implements four speculative decoding methods on the paged-attention
 path. Use vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
 for method behavior and configuration details.
 
-| | MTP | Draft model | N-gram |
-|---|---|---|---|
-| `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
-| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
-| `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Additional model weights | Assistant checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
+| | MTP | EAGLE3 | Draft model | N-gram |
+|---|---|---|---|---|
+| `--speculative-config` method | `mtp` | `eagle3` | `draft_model` | `ngram` |
+| Target models | Gemma4 | Dense Qwen3, Llama, and Gemma4 text | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Draft source | Matching Gemma4 assistant checkpoint | Matching EAGLE3 speculator checkpoint | Separate smaller model | Prompt and output token history |
+| `num_speculative_tokens` | Configurable (2–3 typical) | Linear chain; 1–3 tested | Configurable (3–5 typical) | Configurable (3–5 typical) |
+| Additional model weights | Assistant checkpoint | EAGLE3 head | Draft model | None |
+| Additional KV cache | None; reads target KV | Scheduler-managed draft cache | Second scheduler-managed cache | None |
 
-All three methods currently have these Metal-specific constraints:
+All methods currently have these Metal-specific constraints:
 
 - Only plain greedy requests (`temperature=0`, without penalties, token
   constraints, or sample logprobs) are drafted. Other requests run without
   speculation.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
-- Pipeline parallelism is not supported with speculative decoding.
+- LoRA, pipeline parallelism, and data parallelism cannot be combined with
+  speculative decoding. Tensor parallelism is unsupported by Metal generally.
 - Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
+
+EAGLE3's reduced output vocabulary is mapped to target token IDs before
+verification. It does not require `use_heterogeneous_vocab`.
+
+EAGLE3 and draft-model decoding stop proposing tokens for a request when its
+current target context plus K exceeds the effective draft-model context limit.
+
+Batch-dependent rounding can change greedy winners with any speculative method.
+Exact SD-on/off token identity is not guaranteed.
+
+## EAGLE3
+
+The implementation drafts one linear chain and uses the existing greedy target
+verifier. It does not construct or verify trees. Initial checkpoint pairs are:
+
+| Target | EAGLE3 head |
+|---|---|
+| `Qwen/Qwen3-8B` | `RedHatAI/Qwen3-8B-speculator.eagle3` |
+| `meta-llama/Llama-3.1-8B-Instruct` | `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` |
+| `meta-llama/Llama-3.1-8B-Instruct` | `RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3` |
+| `mlx-community/gemma-4-31b-it-4bit` | `RedHatAI/gemma-4-31B-it-speculator.eagle3` |
+
+These heads use one Llama-style draft layer. The Qwen3 checkpoint was trained
+with thinking disabled; use its target chat template with
+`enable_thinking=false`.
+
+EAGLE3 shares the runtime constraints above with `draft_model`. Its additional
+requirement is a matching trained head and an auxiliary-state capture interface,
+currently implemented for Llama, Qwen3, and Gemma4 text targets.
+
+Gemma4 validation uses the 4-bit target above with the original Red Hat head;
+the full BF16 31B target has not been validated.
+
+```bash
+vllm serve Qwen/Qwen3-8B \
+  --max-model-len 2048 \
+  --enable-prefix-caching \
+  --no-async-scheduling \
+  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3}'
+```
+
+Original EAGLE checkpoints and Red Hat's speculators format are supported.
+Original checkpoints may omit token embeddings; the loader then uses the
+matching target embedding weights.
 
 ## Gemma4 MTP
 

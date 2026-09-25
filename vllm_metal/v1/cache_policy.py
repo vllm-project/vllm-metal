@@ -5,12 +5,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -45,6 +44,8 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
+    from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+    from vllm_metal.v1.eagle3_proposer import Eagle3Proposer
     from vllm_metal.v1.model_runner import MetalModelRunner
     from vllm_metal.v1.worker import MetalWorker
 
@@ -259,8 +260,13 @@ class ModelCachePolicy:
         return plan
 
     def _uses_upstream_storage(self) -> bool:
+        spec = self._runner.vllm_config.speculative_config
         return self._runner.is_hybrid or (
-            not self._runner.is_mla and self._runner._draft_dims is None
+            not self._runner.is_mla
+            and (
+                self._runner._draft_dims is None
+                or (spec is not None and spec.method == "eagle3")
+            )
         )
 
     def _uses_grouped_attention(self) -> bool:
@@ -407,7 +413,7 @@ class ModelCachePolicy:
     def _draft_layer_specs(
         self, *, block_size: int, torch_dtype: torch.dtype
     ) -> dict[str, KVCacheSpec]:
-        """Scheduler-visible spec for the draft model's committed-KV group.
+        """Scheduler-visible spec for the draft model's KV-cache group.
 
         Draft models must be plain transformers (no sliding window / MLA /
         hybrid) -- enforced at startup by ``resolve_draft_dims`` -- so a
@@ -458,7 +464,6 @@ class ModelCachePolicy:
         Count-initialized speculative/MLA runtimes adopt the engine's groups;
         other runtimes bind the engine's shared backing here.
         """
-        self._adopt_draft_scheduler_group(kv_cache_config)
         runtime = self._runner.paged_attention_runtime
         pooling_backend = self._runner._pooling_backend
         if (
@@ -479,6 +484,7 @@ class ModelCachePolicy:
                     "upstream storage must be initialized after cache planning"
                 )
             self._initialize_upstream_storage(kv_cache_config)
+            self._adopt_draft_scheduler_group(kv_cache_config)
             logger.info(
                 "KV cache config received: %d grouped blocks "
                 "(MLX layout initialized from vLLM config)",
@@ -497,6 +503,7 @@ class ModelCachePolicy:
             )
         if runtime is not None:
             self._adopt_scheduler_groups(runtime, kv_cache_config)
+        self._adopt_draft_scheduler_group(kv_cache_config)
         logger.info(
             "KV cache config received: %d blocks (MLX manages cache internally)",
             kv_cache_config.num_blocks,
@@ -548,17 +555,12 @@ class ModelCachePolicy:
             )
 
     def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """Tell the drafter which scheduler KV group owns its committed KV.
+        """Pass the scheduler cache group and final context limit to the drafter.
 
-        The draft model's own physical backend is already built by this
-        point (``install_drafter``, called from ``determine_available_memory``
-        -- before the engine has computed ``kv_cache_config``, so it cannot
-        know its group index at construction time). This runs after, once
-        ``kv_cache_config.kv_cache_groups`` exists, and resolves which group
-        the synthetic ``draft_layers.*`` names from
-        ``ModelCachePolicy._draft_layer_specs`` landed in -- mirroring
-        ``_adopt_scheduler_groups``'s resolution for the target. No-op without a
-        draft model configured.
+        EAGLE3 binds the final shared storage before this call; ordinary
+        draft-model speculation constructs its cache during memory planning.
+        Both resolve their scheduler group by draft layer names, after the
+        engine has finalized placement and the target context limit.
         """
         draft_dims = self._runner._draft_dims
         if draft_dims is None:
@@ -576,15 +578,11 @@ class ModelCachePolicy:
                 "to share one scheduler KV cache group"
             )
 
-        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
-        drafter = self._runner._drafter
-        if not isinstance(drafter, DraftModelProposer):
-            raise RuntimeError(
-                "draft KV-cache spec registered but no DraftModelProposer is "
-                f"installed (got {type(drafter).__name__})"
-            )
-        drafter.adopt_committed_group(group_indices[0])
+        # Only these two proposers register draft-model KV specs.
+        drafter = cast("DraftModelProposer | Eagle3Proposer", self._runner._drafter)
+        drafter.adopt_scheduler_group(
+            group_indices[0], self._runner.model_config.max_model_len
+        )
 
     def _scheduler_group_indices_for_layers(
         self,
@@ -645,41 +643,6 @@ class ModelCachePolicy:
         return (
             self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
             + self._draft_cache_block_size_bytes()
-        )
-
-    def draft_scratch_reserve_blocks(self) -> int:
-        """Blocks reserved for the draft model's speculative lookahead tail.
-
-        The committed portion of the draft's KV is a normal scheduler-owned
-        group (see ``_draft_layer_specs``), so the scheduler owns every block
-        id in ``[0, num_blocks)`` for it. The *speculative* tail -- positions
-        drafted ahead of a request's committed length, not yet verified --
-        has no scheduler concept (no group is ever "ahead" of committed
-        tokens), so it stays a small proposer-local reservation sized to the
-        worst case: every concurrently active request drafting
-        ``num_speculative_tokens`` positions at once. Zero without a draft
-        model. See ``DraftModelProposer``'s split of committed vs. scratch
-        block ids, and ``WorkerCachePlanner.setup_paged_attention`` for how
-        this over-provisions the draft's *physical* backend beyond the
-        scheduler-visible block count.
-        """
-        spec = self._runner.vllm_config.speculative_config
-        if self._runner._draft_dims is None or spec is None:
-            return 0
-        block_size = self._runner.cache_config.block_size
-        extra_per_req = cdiv(spec.num_speculative_tokens, block_size)
-        return self._runner.scheduler_config.max_num_seqs * extra_per_req
-
-    def draft_scratch_reserve_bytes(self) -> int:
-        """Bytes held out of the KV budget for the draft's scratch tail.
-
-        Subtracted before dividing by the (target + draft) combined
-        per-block cost, so ``num_blocks`` leaves this much headroom in the
-        draft's own physical pool without it being scheduler-visible or
-        counted against the target's budget.
-        """
-        return (
-            self.draft_scratch_reserve_blocks() * self._draft_cache_block_size_bytes()
         )
 
     def _draft_cache_block_size_bytes(self) -> int:
@@ -959,7 +922,6 @@ class WorkerCachePlanner:
                 model_memory=self.get_model_memory_usage(),
                 overhead=overhead,
             )
-            budget -= self._worker.model_runner.draft_scratch_reserve_bytes()
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
                 "runtime allocation deferred until vLLM KVCacheConfig",
@@ -999,8 +961,7 @@ class WorkerCachePlanner:
             fraction,
             overhead,
         )
-        draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - draft_scratch_bytes
+        kv_budget = base_kv_budget
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,

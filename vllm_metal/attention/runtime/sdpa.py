@@ -21,7 +21,7 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     """Paged attention runtime for SDPA attention models (MHA, GQA, MQA).
 
     Bind upstream cache storage and patch model layers for native Metal kernels.
-    Model-based speculative decoding still uses count-initialized storage.
+    Ordinary draft-model speculation still uses count-initialized storage.
     """
 
     def __init__(
@@ -58,9 +58,8 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._group_block_sizes = (block_size,)
 
     def initialize(self, num_blocks: int) -> None:
-        # TODO: Move model-based speculation's target and committed draft KV to
-        # initialize_from_config, handling lookahead scratch separately. Then
-        # remove this initializer and MetalPagedKVCache's count-based allocation.
+        # TODO: Move ordinary draft-model speculation to initialize_from_config,
+        # then remove this and MetalPagedKVCache's count-based allocation.
         self._cache = MetalPagedKVCache(
             num_layers=self._num_layers,
             num_kv_heads=self._num_kv_heads,
@@ -135,3 +134,10 @@ class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
     @property
     def kv_cache(self) -> MetalPagedKVCache:
         return self._require_initialized("kv_cache")
+
+    @property
+    def cache_storage(self) -> KVCacheStorage:
+        """Shared owner for target and EAGLE3 cache views."""
+        if self._storage is None:
+            raise RuntimeError("shared cache storage is not initialized")
+        return self._storage

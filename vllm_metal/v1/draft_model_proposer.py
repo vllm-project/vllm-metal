@@ -1,57 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 """Draft-model speculative decoding proposer for the Metal paged path.
 
-A :class:`DraftModelProposer` drafts with a *separate* full model (vLLM
-``method="draft_model"``). Its KV is split into two parts with different
-ownership, matching where cross-request cache *reuse* actually happens
-(#482):
+A :class:`DraftModelProposer` drafts with a separate full model
+(``method="draft_model"``). Its KV-cache group is registered and sized
+alongside the target's groups. The scheduler owns its entire block table,
+including speculative lookahead slots reserved by ``num_lookahead_tokens``.
+Prefix-cache admission, sharing, eviction, and per-request cache-read rules
+therefore apply to the draft cache too.
 
-- The **committed** portion (``[0, committed_len)`` per request) is a real
-  scheduler-owned KV-cache group (``cache_policy.ModelCachePolicy.
-  _draft_layer_specs``), registered and sized exactly like the target's own
-  groups. The scheduler hashes, matches, admits, and evicts it -- so
-  ``cache_salt``, per-request cache-read rules (``skip_reading_prefix_cache``),
-  and the real admission/allocation limit all apply to it automatically,
-  the same way they already apply to the target. This is where content-based
-  reuse across requests lives.
-- The **speculative lookahead** tail (positions drafted ahead of a request's
-  committed length, not yet verified) has no scheduler concept -- no
-  registered group is ever "ahead" of a request's committed tokens -- so it
-  stays a small, proposer-local scratch reservation
-  (``committed_num_blocks + scratch_reserve_blocks``, see
-  ``DraftModelProposer.build`` and ``ModelCachePolicy.
-  draft_scratch_reserve_blocks``). It never claims cross-request reuse, so
-  none of the scheduler-owned group's guarantees are needed there.
-
-**Block-alignment note.** When ``committed_len`` is not a multiple of
-``block_size``, the last committed block is only partially filled with
-scheduler-owned KV.  The lookahead draft steps write their speculative KV
-into the remaining slots of that same scheduler-owned block (and into scratch
-blocks beyond it, if needed).  This is safe because ingest rewrites every
-position in ``[draft_seq_len, committed_len)`` *before* the block can be
-hashed: the scheduler only content-hashes a block once it is fully filled,
-and by that point a future ingest step will have overwritten the speculative
-slots with the correct committed KV.  No stale draft KV can leak into a
-prefix-cache match. K=0 remains eager when prefix caching is enabled.
-Deferred unwritten KV is allowed only when prefix caching is disabled, so it
-cannot be exposed as a cross-request prefix-cache hit.
+Lookahead writes may share a partially filled block with committed KV.
+Ingest replaces rejected speculative slots with committed KV before
+prefix-cache reuse.
+K=0 remains eager with prefix caching. Deferred unwritten KV is allowed
+only when prefix caching is disabled, so it cannot become a shared cache hit.
 
 **Why every active row ingests, not just drafting-eligible ones.** The
 scheduler advances a request's ``num_computed_tokens`` and marks the
-committed group's blocks "cached" based on its own per-step bookkeeping,
+draft cache's blocks "cached" based on its own per-step bookkeeping,
 trusting that whatever it scheduled, the worker actually computed -- for
 *every* registered group, uniformly, every step. But
 ``SpeculativeDecodeController.draft_eligible_requests`` intentionally
 excludes non-greedy requests and intermediate prefill chunks from
 *drafting*. If those rows also skipped *ingest*, the scheduler would believe
-their committed-group blocks hold real KV when they never did, and a later,
+their draft cache blocks hold real KV when they never did, and a later,
 unrelated request whose prompt happens to hash-match that prefix could be
 handed those blocks as a "cache hit" -- silent data corruption, not just a
 missed optimization. So ``propose()`` ingests every decode and prefill row
-(chunked or not, greedy or not) to keep the committed group's physical KV
-genuinely in sync with what the scheduler believes, and only *drafts*
-(produces returned token ids, runs the extra lookahead decode steps) for the
-eligible subset.
+(chunked or not, greedy or not) to keep the draft cache's physical KV
+in sync with the scheduler within the draft model's context limit, and only
+*drafts* (produces returned token ids and runs extra lookahead steps) for the
+eligible subset. Ingest stops at the draft model's context limit; cached
+positions beyond it are never read by this proposer.
 
 Each step: ingest advances every row's committed KV to ``committed_len``,
 then ``num_speculative_tokens - 1`` single-token decode steps run for
@@ -66,11 +45,9 @@ keep their identities), that KV is exactly what the ingest would recompute
 -- so the ingest skips it (``_speculative_kv_valid_through``), shrinking the
 steady-state K+1-token ingest to 2 rows on full acceptance. A position is
 skipped only when its committed token equals the recorded drafted token AND
-the scheduler's committed-group block table still maps the position to the
-same physical block the speculative write landed in (speculative KV that
-crossed into a scratch block is never reused -- the scheduler allocates its
-own block there). The last committed token is always re-ingested: its
-logits are needed to predict this round's first draft token anyway.
+the scheduler's block table still maps the position to the
+same physical block the speculative write landed in. The last committed
+token is always re-ingested: its logits predict this round's first draft token.
 """
 
 from __future__ import annotations
@@ -81,7 +58,6 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal import envs
@@ -94,6 +70,10 @@ from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
+from vllm_metal.v1.proposer import (
+    _DECODE_INGEST_MAX_TOKENS,
+    validate_scheduler_blocks,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -131,13 +111,6 @@ class _DraftPlan:
     is_drafting: bool
 
 
-# Ingests at or below this size are submitted as expanded decode rows instead
-# of a prefill segment (see _ingest_and_draft_first). Covers the steady-state
-# K+1-token ingest for any practical num_speculative_tokens while keeping
-# full-prompt catch-up ingests on the tiled prefill kernel.
-_DECODE_INGEST_MAX_TOKENS = 16
-
-
 class DraftModelProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
@@ -146,8 +119,7 @@ class DraftModelProposer:
         *,
         model: Any,
         block_size: int,
-        committed_num_blocks: int,
-        scratch_reserve_blocks: int,
+        max_model_len: int,
         num_layers: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
@@ -156,6 +128,7 @@ class DraftModelProposer:
     ) -> None:
         self._model = model
         self._block_size = block_size
+        self._max_model_len = max_model_len
         self._controller = controller
         self._extract_logits = extract_logits
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
@@ -186,24 +159,12 @@ class DraftModelProposer:
         # and block table before use, so staleness can only cost performance,
         # never correctness.
         self._spec_kv_writes: dict[str, dict[int, tuple[int, int]]] = {}
-        # Scheduler-owned KV-cache group index for the committed portion.
+        # Scheduler-owned KV-cache group for committed tokens and lookahead.
         # Unknown at construction time -- the physical backend below is
         # built before the scheduler has decided kv_cache_config (see
         # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
-        # later via adopt_committed_group().
-        self._committed_group_index: int | None = None
-        self._committed_num_blocks = committed_num_blocks
-        # The speculative lookahead tail draws from block ids the scheduler
-        # never assigns: [committed_num_blocks, committed_num_blocks +
-        # scratch_reserve_blocks). The physical backend (see `build`) is
-        # over-provisioned to cover this range.
-        self._scratch_free_blocks: list[int] = list(
-            range(
-                committed_num_blocks,
-                committed_num_blocks + scratch_reserve_blocks,
-            )
-        )
-        self._scratch_req_blocks: dict[str, list[int]] = {}
+        # later via adopt_scheduler_group().
+        self._scheduler_group_index: int | None = None
 
     # -- construction --------------------------------------------------------
 
@@ -215,14 +176,13 @@ class DraftModelProposer:
         parallel_config: ParallelConfig,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
-        committed_num_blocks: int,
-        scratch_reserve_blocks: int,
+        num_blocks: int,
+        max_model_len: int,
         block_size: int,
         dtype: mx.Dtype,
         allow_deferred_zero_k_ingest: bool,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config, parallel_config)
-        total_blocks = committed_num_blocks + scratch_reserve_blocks
         backend = SDPAPagedAttentionRuntime(
             num_layers=dims.num_layers,
             num_kv_heads=dims.num_kv_heads,
@@ -230,25 +190,23 @@ class DraftModelProposer:
             block_size=block_size,
             dtype=dtype,
         )
-        backend.initialize(total_blocks)
+        backend.initialize(num_blocks)
         n_patched = backend.patch_model(model)
         logger.info(
             "Draft model loaded for speculative decoding: %s "
             "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "committed_blocks=%d, scratch_blocks=%d)",
+            "num_blocks=%d)",
             speculative_config.draft_model_config.model,
             dims.num_layers,
             dims.num_kv_heads,
             dims.head_dim,
             n_patched,
-            committed_num_blocks,
-            scratch_reserve_blocks,
+            num_blocks,
         )
         return cls(
             model=model,
             block_size=block_size,
-            committed_num_blocks=committed_num_blocks,
-            scratch_reserve_blocks=scratch_reserve_blocks,
+            max_model_len=max_model_len,
             num_layers=dims.num_layers,
             controller=controller,
             extract_logits=extract_logits,
@@ -262,15 +220,19 @@ class DraftModelProposer:
             allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
         )
 
-    def adopt_committed_group(self, group_index: int) -> None:
-        """Record which scheduler KV-cache group owns the committed portion.
+    def adopt_scheduler_group(
+        self, group_index: int, target_max_model_len: int
+    ) -> None:
+        """Adopt the scheduler cache group and final target context limit.
 
         Called from ``ModelCachePolicy._adopt_draft_scheduler_group`` once
         ``kv_cache_config`` exists -- after this proposer is built, since the
         physical backend above is sized before the scheduler has decided
         groups.
         """
-        self._committed_group_index = group_index
+        self._scheduler_group_index = group_index
+        # The engine may auto-fit the target limit after memory profiling.
+        self._max_model_len = min(self._max_model_len, target_max_model_len)
 
     # -- MetalProposer protocol ---------------------------------------------
 
@@ -286,29 +248,22 @@ class DraftModelProposer:
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
-        if self._committed_group_index is None:
+        if self._scheduler_group_index is None:
             raise RuntimeError(
                 "DraftModelProposer.propose() called before "
-                "adopt_committed_group() -- initialize_kv_cache() must run "
+                "adopt_scheduler_group() -- initialize_kv_cache() must run "
                 "before the first speculative decode step"
             )
 
         self._prune_finished(ctx.request_states)
         if num_speculative_tokens <= 0 and self._allow_deferred_zero_k_ingest:
             # Remember where lazy K=0 catch-up must start without running MLX.
-            # No speculative lookahead is needed while K=0, so return its
-            # private tail to the free pool. The speculative-write ledger is
-            # retained and validated before any later reuse.
+            # The speculative-write ledger is retained and validated before
+            # any later reuse. Block ownership remains with the scheduler.
             for req_id, state in ctx.decode_reqs:
                 self._draft_seq_lens.setdefault(req_id, state.num_computed_tokens)
-                blocks = self._scratch_req_blocks.pop(req_id, None)
-                if blocks is not None:
-                    self._scratch_free_blocks.extend(blocks)
             for prefill in ctx.prefill_reqs:
                 self._draft_seq_lens.setdefault(prefill.req_id, prefill.start_pos)
-                blocks = self._scratch_req_blocks.pop(prefill.req_id, None)
-                if blocks is not None:
-                    self._scratch_free_blocks.extend(blocks)
 
             return None
 
@@ -320,7 +275,7 @@ class DraftModelProposer:
         # token per row, used below only for drafting rows.
         first_tokens = self._ingest_and_draft_first(plans, self._offset_caches)
 
-        # The committed group now holds KV through committed_len for every
+        # The draft cache now holds KV through committed_len for every
         # row that ingested this step, drafting or not.
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
@@ -376,23 +331,14 @@ class DraftModelProposer:
         )
 
     def release_requests(self, req_ids: set[str]) -> None:
-        # Only the speculative lookahead tail is proposer-owned; the
-        # committed portion's lifecycle (finish/evict/refcount) belongs to
-        # the scheduler now, like any other KV-cache group. Mirrors
-        # _prune_finished for an explicit lifecycle set.
+        # Physical blocks belong to the scheduler; only validity tracking is local.
         for req_id in req_ids:
-            blocks = self._scratch_req_blocks.pop(req_id, None)
-            if blocks is not None:
-                self._scratch_free_blocks.extend(blocks)
             self._draft_seq_lens.pop(req_id, None)
             self._spec_kv_writes.pop(req_id, None)
 
     # -- internals -----------------------------------------------------------
 
     def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
-        for req_id in list(self._scratch_req_blocks.keys()):
-            if req_id not in request_states:
-                self._scratch_free_blocks.extend(self._scratch_req_blocks.pop(req_id))
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
@@ -409,13 +355,17 @@ class DraftModelProposer:
         # regardless -- see module docstring.
         drafting_req_ids = {
             req_id
-            for req_id, _ in self._controller.draft_eligible_requests(
+            for req_id, state in self._controller.draft_eligible_requests(
                 ctx.decode_reqs,
                 ctx.decode_token_ids,
                 ctx.prefill_reqs,
                 ctx.prefill_result_modes,
                 ctx.request_states,
             )
+            # Apply upstream's input-fit bound per request: K positions beyond
+            # the target's computed suffix (the final token was just sampled).
+            if num_speculative_tokens > 0
+            and len(state.token_ids) - 1 + num_speculative_tokens <= self._max_model_len
         }
         plans: list[_DraftPlan] = []
         for req_id, state in ctx.decode_reqs:
@@ -458,7 +408,7 @@ class DraftModelProposer:
         # token_ids is pre-populated with the whole future prompt and
         # committed_len must come from the scheduled chunk instead (see
         # _make_prefill_plan).
-        committed_len = len(state.token_ids)
+        committed_len = min(len(state.token_ids), self._max_model_len)
         draft_seq_len = self._draft_seq_lens.setdefault(
             req_id, state.num_computed_tokens
         )
@@ -467,8 +417,8 @@ class DraftModelProposer:
             # accepted decode step); skip rather than emit an empty forward.
             return None
         is_drafting = req_id in drafting_req_ids
-        assert self._committed_group_index is not None
-        committed_group_block_ids = state.block_ids[self._committed_group_index]
+        assert self._scheduler_group_index is not None
+        scheduler_block_ids = state.block_ids[self._scheduler_group_index]
         # Skip the leading accepted drafts whose KV the previous round's
         # lookahead steps already wrote (#482 direction 2); the walk stops at
         # the first position whose recorded token or block no longer matches
@@ -479,21 +429,22 @@ class DraftModelProposer:
             self._speculative_kv_valid_through(
                 req_id,
                 state.token_ids,
-                committed_group_block_ids,
+                scheduler_block_ids,
                 draft_seq_len,
                 committed_len,
             ),
             committed_len - 1,
         )
-        block_ids = self._ensure_blocks(
+        validate_scheduler_blocks(
             req_id,
-            committed_group_block_ids=committed_group_block_ids,
+            scheduler_block_ids,
+            self._block_size,
             total_positions=committed_len
-            + (num_speculative_tokens if is_drafting else 0),
+            + (max(num_speculative_tokens - 1, 0) if is_drafting else 0),
         )
         return _DraftPlan(
             req_id=req_id,
-            block_ids=block_ids,
+            block_ids=scheduler_block_ids,
             committed_len=committed_len,
             draft_seq_len=draft_seq_len,
             ingest_tokens=list(state.token_ids[draft_seq_len:committed_len]),
@@ -531,7 +482,8 @@ class DraftModelProposer:
             ingest_tokens = catch_up_token_ids[draft_seq_len:committed_len]
         else:
             chunk_offset = draft_seq_len - prefill.start_pos
-            ingest_tokens = list(prefill.token_ids[chunk_offset:])
+            chunk_end = committed_len - prefill.start_pos
+            ingest_tokens = list(prefill.token_ids[chunk_offset:chunk_end])
 
         expected_ingest_len = committed_len - draft_seq_len
         if len(ingest_tokens) != expected_ingest_len:
@@ -550,10 +502,13 @@ class DraftModelProposer:
         num_speculative_tokens: int,
         drafting_req_ids: set[str],
     ) -> _DraftPlan | None:
-        if not prefill.token_ids:
+        ingest_tokens = prefill.token_ids[
+            : max(0, self._max_model_len - prefill.start_pos)
+        ]
+        if not ingest_tokens:
             return None
         req_id = prefill.req_id
-        committed_len = prefill.start_pos + len(prefill.token_ids)
+        committed_len = prefill.start_pos + len(ingest_tokens)
         draft_seq_len = self._draft_seq_lens.setdefault(req_id, prefill.start_pos)
 
         if draft_seq_len >= committed_len:
@@ -563,12 +518,14 @@ class DraftModelProposer:
         )
 
         is_drafting = result_mode != "intermediate" and req_id in drafting_req_ids
-        assert self._committed_group_index is not None
+        assert self._scheduler_group_index is not None
         # The ingest includes the target's sampled token. Producing K drafts
         # then feeds only K-1 more tokens through the draft model.
-        block_ids = self._ensure_blocks(
+        block_ids = prefill.block_ids[self._scheduler_group_index]
+        validate_scheduler_blocks(
             req_id,
-            committed_group_block_ids=prefill.block_ids[self._committed_group_index],
+            block_ids,
+            self._block_size,
             total_positions=committed_len
             + (max(num_speculative_tokens - 1, 0) if is_drafting else 0),
         )
@@ -582,54 +539,11 @@ class DraftModelProposer:
         )
         return plan
 
-    def _ensure_blocks(
-        self,
-        req_id: str,
-        *,
-        committed_group_block_ids: list[int],
-        total_positions: int,
-    ) -> list[int]:
-        """Scheduler-assigned committed blocks + this request's scratch tail.
-
-        The committed prefix comes straight from the scheduler's own
-        allocation for the draft KV-cache group -- never grown or freed
-        here. Only the tail beyond it (the speculative lookahead, when
-        drafting) is drawn from the local scratch pool, grown or shrunk to
-        exactly what this step needs.
-
-        When ``committed_len`` is not block-aligned, ``total_positions``
-        extends into the last committed block's unfilled tail.  The
-        lookahead draft steps write speculative KV into those slots of a
-        scheduler-owned block.  This is safe: ingest always rewrites the
-        committed range before the scheduler can hash the block (see
-        module docstring, "Block-alignment note").
-        """
-        needed_total = cdiv(total_positions, self._block_size)
-        scratch_needed = max(0, needed_total - len(committed_group_block_ids))
-
-        scratch_blocks = self._scratch_req_blocks.setdefault(req_id, [])
-        if len(scratch_blocks) > scratch_needed:
-            self._scratch_free_blocks.extend(scratch_blocks[scratch_needed:])
-            del scratch_blocks[scratch_needed:]
-        while len(scratch_blocks) < scratch_needed:
-            if not self._scratch_free_blocks:
-                raise RuntimeError(
-                    f"Draft KV scratch pool exhausted: request {req_id!r} "
-                    f"needs {scratch_needed} lookahead block(s) but none are "
-                    "free. Lower --max-num-seqs or raise "
-                    "--gpu-memory-utilization."
-                )
-            scratch_blocks.append(self._scratch_free_blocks.pop())
-        if not scratch_blocks:
-            self._scratch_req_blocks.pop(req_id, None)
-
-        return list(committed_group_block_ids) + scratch_blocks
-
     def _speculative_kv_valid_through(
         self,
         req_id: str,
         token_ids: list[int],
-        committed_group_block_ids: list[int],
+        scheduler_block_ids: list[int],
         draft_seq_len: int,
         committed_len: int,
     ) -> int:
@@ -640,8 +554,8 @@ class DraftModelProposer:
         drafted this request. A position is skippable only when its committed
         token equals the recorded drafted token AND the position still maps
         to the same scheduler-owned committed block the speculative write
-        landed in; anything else (rejected draft, scratch-block write,
-        re-allocated block table, no ledger) stops the walk, because the
+        landed in; anything else (rejected draft, re-allocated block table,
+        no ledger) stops the walk, because the
         ingest forward must be one contiguous range of positions whose KV is
         valid up to its start.
         """
@@ -656,8 +570,8 @@ class DraftModelProposer:
             block_id, drafted_token = write
             block_index = position // self._block_size
             if (
-                block_index >= len(committed_group_block_ids)
-                or committed_group_block_ids[block_index] != block_id
+                block_index >= len(scheduler_block_ids)
+                or scheduler_block_ids[block_index] != block_id
                 or token_ids[position] != drafted_token
             ):
                 break

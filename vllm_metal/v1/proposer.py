@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
+from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import DraftTokenIds
 
 if TYPE_CHECKING:
@@ -29,6 +30,30 @@ if TYPE_CHECKING:
         RequestState,
     )
     from vllm_metal.v1.spec_decode import PagedDecodeSegment
+
+
+# Ingests at or below this size are submitted as expanded decode rows instead
+# of a prefill segment (see _ingest_and_draft_first). Covers the steady-state
+# K+1-token ingest for any practical num_speculative_tokens while keeping
+# full-prompt catch-up ingests on the tiled prefill kernel.
+_DECODE_INGEST_MAX_TOKENS = 16
+
+
+def validate_scheduler_blocks(
+    req_id: str,
+    block_ids: Sequence[int],
+    block_size: int,
+    *,
+    total_positions: int,
+) -> None:
+    """Check capacity without allocating or changing the scheduler's block table."""
+    needed = cdiv(total_positions, block_size)
+    if needed > len(block_ids):
+        raise RuntimeError(
+            f"Draft KV allocation for request {req_id!r} needs "
+            f"{needed} blocks for {total_positions} positions, but the "
+            f"scheduler supplied {len(block_ids)}."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +82,7 @@ class ProposeContext:
     # against absence from request_states (which the new request repopulates
     # under the same id).
     finished_req_ids: set[str]
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 class MetalProposer(Protocol):
