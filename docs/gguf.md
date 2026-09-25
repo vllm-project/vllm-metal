@@ -4,6 +4,19 @@ vllm-metal supports dense decoder GGUF checkpoints through the MLX runtime. A
 GGUF file carries weights only, so it needs a Hugging Face config and tokenizer
 source.
 
+## Installation
+
+GGUF support needs an optional dependency. Install it inside the environment
+created by [Installation](installation.md):
+
+```bash
+source ~/.venv-vllm-metal/bin/activate
+pip install 'vllm-metal[gguf]'
+```
+
+Without it, the engine fails at model load with `ModuleNotFoundError: No module
+named 'gguf'`.
+
 ## Local weights
 
 Use a local `.gguf` file and point `--tokenizer` at the matching config and
