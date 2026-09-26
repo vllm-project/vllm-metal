@@ -18,6 +18,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from huggingface_hub import constants as hf_constants
+from mlx.utils import tree_flatten
 
 gguf = pytest.importorskip("gguf")
 
@@ -218,6 +219,34 @@ def test_loads_dense_model_installs_wrappers(
     ).load()
     _assert_dense_wrapper_histogram(model)
     _assert_forward_vocab_shape(model)
+
+
+@pytest.mark.parametrize("target_dtype", [mx.bfloat16, mx.float16])
+def test_plain_tensors_follow_target_dtype(tmp_path, target_dtype):
+    """Norm weights are F32 in the file but must load at the compute dtype.
+
+    Left as F32 they promote the activations on the first RMSNorm and the
+    whole forward pass runs in float32 whatever ``--dtype`` asked for.
+    """
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    model, _ = GGUFModelLoader(
+        gguf_path,
+        config_dir=cfg_dir,
+        target_dtype=target_dtype,
+    ).load()
+
+    plain = {
+        name: leaf.dtype
+        for name, leaf in tree_flatten(model.parameters())
+        if isinstance(leaf, mx.array) and mx.issubdtype(leaf.dtype, mx.floating)
+    }
+    assert plain, "fixture should expose plain floating parameters"
+    assert any("norm" in name for name in plain)
+    assert {str(dtype) for dtype in plain.values()} == {str(target_dtype)}
+
+    out = model(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert out.dtype == target_dtype
 
 
 def test_loads_cached_remote_model_offline(tmp_path, monkeypatch):

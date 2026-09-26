@@ -231,6 +231,17 @@ class GGUFModelLoader:
             fallback_bytes,
         )
 
+    def _to_target_dtype(self, array: mx.array) -> mx.array:
+        """Cast a plain floating tensor to the compute dtype.
+
+        GGUF stores norm weights (and biases) as F32. Left as-is, the first
+        RMSNorm promotes the activations to float32 and the whole forward
+        pass runs there regardless of ``target_dtype``.
+        """
+        if mx.issubdtype(array.dtype, mx.floating):
+            return array.astype(self._target_dtype)
+        return array
+
     def _partition(
         self,
         reader: Any,
@@ -275,7 +286,7 @@ class GGUFModelLoader:
             permute = adapter.rope_permute_index(name)
 
             if suffix == _BIAS_SUFFIX:
-                bias = arrays[name]
+                bias = self._to_target_dtype(arrays[name])
                 self._validate_plain_shape(model, translated, bias, name)
                 biases[module_path] = bias[permute] if permute is not None else bias
             elif tensor.tensor_type in MLX_NATIVE_GGUF_TYPES:
@@ -287,7 +298,7 @@ class GGUFModelLoader:
                     qt.permute_rows(permute) if permute is not None else qt
                 )
             else:  # plain F32/F16/BF16
-                weight = arrays[name]
+                weight = self._to_target_dtype(arrays[name])
                 self._validate_plain_shape(model, translated, weight, name)
                 plain[translated] = weight[permute] if permute is not None else weight
 
