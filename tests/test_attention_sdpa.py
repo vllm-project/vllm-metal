@@ -669,11 +669,14 @@ class _PagedRoutingOpsSpy:
         _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
-        **_kwargs,
+        num_decode_requests: int = -1,
+        gqa_disabled: bool = False,
     ) -> None:
-        del window_seqlen_q, sinks, _kwargs
+        del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
+        self.calls[-1].num_decode_requests = num_decode_requests
+        self.calls[-1].gqa_disabled = gqa_disabled
 
 
 class TestSDPAForward:
@@ -751,26 +754,13 @@ class TestSDPAForward:
         assert captured["num_kv_heads"] == 2
         assert captured["scale"] == 0.5
 
-    def test_gqa_disable_env_reaches_primitive(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_gqa_policy_reaches_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool
     ) -> None:
-        """``sdpa_forward`` must pass ``VLLM_METAL_DISABLE_GQA_DECODE`` through."""
-        captured: dict[str, bool | None] = {}
-
-        class _FakeOps:
-            def reshape_and_cache(
-                self,
-                _keys,
-                _values,
-                key_cache,
-                value_cache,
-                _slot_mapping,
-            ) -> tuple[mx.array, mx.array]:
-                return key_cache, value_cache
-
-            def paged_attention_primitive(self, *_args, **kwargs) -> None:
-                captured["gqa_disabled"] = kwargs.get("gqa_disabled")
-
+        """The environment escape hatch and scheduler decode count reach native code."""
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        spy = _PagedRoutingOpsSpy()
         inner = _make_inner()
         inner.o_proj = lambda out: out
         cache = MetalPagedKVCache(
@@ -781,22 +771,17 @@ class TestSDPAForward:
             block_size=8,
             dtype=mx.float16,
         )
+        ctx = _make_ctx(_SEQ_LEN)
+        ctx.num_decode_requests = 1
         x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
         zeros = mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM), dtype=mx.float16)
-
-        def _run() -> None:
-            with (
-                patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
-                patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
-            ):
-                sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
-
-        _run()
-        assert captured.get("gqa_disabled") is False
-
-        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
-        _run()
-        assert captured.get("gqa_disabled") is True
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        assert spy.calls[-1].gqa_disabled is disabled
+        assert spy.calls[-1].num_decode_requests == 1
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

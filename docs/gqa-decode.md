@@ -1,8 +1,9 @@
 # GQA decode routing
 
 The paged attention primitive can use `paged_attention_gqa_decode` for a
-limited set of single-request, long-context decode calls. Automatic routing
-is intentionally narrower than the shapes supported by the shader.
+limited set of single-request, long-context decode calls. Four shader
+specializations cover head dimensions 128/256, kernel block size 16 and
+FP16/BF16. The geometry and performance checks below further restrict routing.
 
 ## Automatic eligibility
 
@@ -52,9 +53,13 @@ APIs are no longer used.
 `last_paged_dispatch()` alongside the numerical reference. Positive cases
 must actually report `gqa_decode`; boundary, multi-request, verification,
 feature, and disabled cases must report the appropriate established family.
-`tests/test_attention_sdpa.py` checks that the environment switch reaches
-the primitive, and `tests/test_native_sdpa_decode.py` provides a separate
-numerical comparison.
+References include independent grouped CPU FP32 attention and native MLX SDPA.
+Shared-storage tests cover all four specializations using upstream-allocated
+K/V views, non-contiguous page tables, native writes, prefix-page copying,
+source-page clearing and a subsequent decode write. Dominant attention rows
+make missing writes observable even in a long context.
+`tests/test_attention_sdpa.py` checks that the environment switch and scheduler
+decode count reach the primitive.
 
 `last_paged_dispatch()` records the last family selected in the process. It
 is suitable for serial tests and isolated worker checks; it is not

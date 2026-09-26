@@ -9,8 +9,8 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -45,16 +45,14 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 constexpr int kGqaDecodeMinSeqLen = 32768;
 constexpr int kGqaDecodeMaxSeqLen = 131072;
 
-// Last dispatch family chosen by dispatch_paged_attention_v2_online
-// ("gqa_decode" / "per_token_ps0" / "per_token_ps512" / "window_ps0" /
-// "window_ps512" / "nax_prefill" / "tiled_prefill").  Diagnostic surface
-// for the routing tests: the gate lives below the Python boundary, so the
-// family name is the only faithful record of which kernel ran.
-static std::mutex g_last_dispatch_mu;
-static std::string g_last_dispatch;
-inline void record_paged_dispatch(const std::string& name) {
-  std::lock_guard<std::mutex> lk(g_last_dispatch_mu);
-  g_last_dispatch = name;
+// Process-wide diagnostic for tests; not a per-request trace or routing input.
+enum class PagedDispatch {
+  None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
+  TiledPrefill
+};
+static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
+inline void record_paged_dispatch(PagedDispatch family) {
+  g_last_dispatch.store(family, std::memory_order_relaxed);
 }
 
 // Window mode for spec-decode verification (per-token kernel): query rows
@@ -591,7 +589,7 @@ static void dispatch_paged_attention_v2_online(
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
     if (nax_eligible(query.dtype(), head_size, block_size)) {
-      record_paged_dispatch("nax_prefill");
+      record_paged_dispatch(PagedDispatch::NaxPrefill);
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -600,7 +598,7 @@ static void dispatch_paged_attention_v2_online(
       return;
     }
     if (auto cfg = select_tile_config(head_size)) {
-      record_paged_dispatch("tiled_prefill");
+      record_paged_dispatch(PagedDispatch::TiledPrefill);
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -653,60 +651,7 @@ static void dispatch_paged_attention_v2_online(
   const bool partition = (pure_decode || window_batch)
       && gate_grid < min_decode_grid() && max_num_partitions >= 2;
 
-  std::string kname =
-      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
-
-  bool use_partitioning  = partition;
-  bool use_alibi         = false;
-  bool use_fp8           = false;
-  bool use_sinks         = sinks != nullptr;
-  bool use_tq_fc         = use_turboquant;
-  int  k_bits_i          = k_bits;
-  int  v_bits_i          = v_bits;
-
-  // The hash name is MLX's cache key.  It MUST encode every function-constant
-  // value that varies across calls.  ``kname`` already encodes the partition
-  // suffix (_ps0 vs _ps512), which is 1:1 with use_partitioning.
-  std::string hash_name = kname + "_v2"
-      + "_tq" + (use_tq_fc ? "1" : "0")
-      + "_kb" + std::to_string(k_bits_i)
-      + "_vb" + std::to_string(v_bits_i)
-      + "_wq" + std::to_string(window_q_fc)
-      + "_sk" + (use_sinks ? "1" : "0");
-
   auto* lib = d.get_library("paged_attention_v2_kern");
-  auto* kernel = d.get_kernel(
-      kname, lib, hash_name,
-      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
-       {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
-       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
-       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
-       {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)},
-       {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)},
-       {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
-
-  constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
-  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
-  // per row and stages the sub-window's query rows after them; the layout
-  // must mirror the kernel's shared_mem carve exactly.
-  const int rows_per_tg = window_batch ? kWindowRows : 1;
-  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
-                          * static_cast<int>(sizeof(float));
-  int q_window_bytes = window_batch
-      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
-      : 0;
-  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
-                    * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(
-      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
-  shmem = (shmem + 15) & ~size_t(15);
-
   auto& enc = metal::get_command_encoder(s);
 
   // Split-KV scratch factory shared by the split paths below: partial output
@@ -722,53 +667,8 @@ static void dispatch_paged_attention_v2_online(
     return a;
   };
 
-  // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
-  auto bind_turboquant = [&]() {
-    if (!use_turboquant) return;
-    enc.set_input_array(*key_scale_cache,   22);
-    enc.set_input_array(*value_scale_cache, 23);
-    int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
-    int32_t v_head_stride_i  = static_cast<int32_t>(value_cache.strides()[2]);
-    enc.set_bytes(v_block_stride_i, 24);
-    enc.set_bytes(v_head_stride_i,  25);
-    enc.set_input_array(*key_zero_cache, 26);
-    enc.set_input_array(*v_centroids, 27);
-    int64_t scale_block_stride = key_scale_cache->strides()[0];
-    enc.set_bytes(scale_block_stride, 28);
-    int64_t scale_head_stride = key_scale_cache->strides()[2];
-    enc.set_bytes(scale_head_stride, 29);
-  };
-
-  // Sink logits (slot 18); bound only when the kernel was specialized with
-  // use_sinks, since the argument is declared under that function constant.
-  auto bind_sinks = [&]() {
-    if (!use_sinks) return;
-    enc.set_input_array(*sinks, 18);
-  };
-
-  // ----- GQA-shared flash-decode pass -------------------------------------
-  // Pure decode without TurboQuant/FP8/sinks/softcap/sliding-window.
-  // One threadgroup per (partition, KV head, sequence), with one SIMD
-  // group per query head. Co-locating query heads can improve KV cache
-  // locality; each SIMD group still issues its own loads. Online softmax
-  // stays in registers. Partials use the ps512 contract and standard reduce.
-  //
-  // Scoped to the single-request, long-context case that was measured and
-  // parity-tested (review on #715): num_seqs == 1 and the scheduler
-  // confirms a real decode request (num_decode_requests == 1; callers that
-  // omit it default to -1, which keeps the conservative single-seq gate so
-  // tests/test_spec_window_parity.py stays bitwise).  Multi-request decode
-  // batches stay on the established per-token/split-KV family until the
-  // batched GQA kernel carries its own measurements and tests.
-  // VLLM_METAL_DISABLE_GQA_DECODE forces eligible batches back to the
-  // established kernels (A/B escape hatch for the benchmarking pitfalls
-  // documented in issue #713).
-  //
-  // Default eligibility is narrower than the compiled shader domain. Keep
-  // the measured head geometries, length range and block16 serving layout;
-  // all other shapes use the established family. There is no startup timing
-  // or mutable process-wide threshold in this path.
-  const int gqa_group = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+  // Only measured single-request shapes use the new pass. Keep policy below
+  // the Python boundary so direct primitive callers obey the same scope.
   const bool gqa_single_request =
       num_seqs == 1 && (num_decode_requests == -1 || num_decode_requests == 1);
   const bool gqa_decode =
@@ -777,15 +677,12 @@ static void dispatch_paged_attention_v2_online(
       && (query.dtype() == float16 || query.dtype() == bfloat16)
       && dtype_ok && query.dtype() == value_cache.dtype()
       && !use_turboquant && softcap <= 0.f && sinks == nullptr
-      && sliding_window < 0 && block_size == 16 && num_kv_heads > 0
-      && num_heads % num_kv_heads == 0 && gqa_group >= 1 && gqa_group <= 8
-      && (head_size == 64 || head_size == 96 || head_size == 128 ||
-          head_size == 256)
-      && max_num_partitions >= 2
+      && sliding_window < 0 && block_size == 16
       && gqa_decode_shape_eligible(num_heads, num_kv_heads, head_size,
                                   max_seq_len, detected_gpu_core_count());
   if (gqa_decode) {
-    record_paged_dispatch("gqa_decode");
+    const int gqa_group = num_heads / num_kv_heads;
+    record_paged_dispatch(PagedDispatch::GqaDecode);
     std::string gname =
         "paged_attention_gqa_decode_" + dt + "_hs" + std::to_string(head_size) +
         "_bs" + std::to_string(block_size) + "_ps" +
@@ -840,10 +737,87 @@ static void dispatch_paged_attention_v2_online(
     return;
   }
 
+  std::string kname =
+      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size) +
+      "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
+
+  bool use_partitioning  = partition;
+  bool use_alibi         = false;
+  bool use_fp8           = false;
+  bool use_sinks         = sinks != nullptr;
+  bool use_tq_fc         = use_turboquant;
+  int  k_bits_i          = k_bits;
+  int  v_bits_i          = v_bits;
+
+  // The hash name is MLX's cache key.  It MUST encode every function-constant
+  // value that varies across calls.  ``kname`` already encodes the partition
+  // suffix (_ps0 vs _ps512), which is 1:1 with use_partitioning.
+  std::string hash_name = kname + "_v2"
+      + "_tq" + (use_tq_fc ? "1" : "0")
+      + "_kb" + std::to_string(k_bits_i)
+      + "_vb" + std::to_string(v_bits_i)
+      + "_wq" + std::to_string(window_q_fc)
+      + "_sk" + (use_sinks ? "1" : "0");
+
+  auto* kernel = d.get_kernel(
+      kname, lib, hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_alibi,        MTL::DataType::DataTypeBool, NS::UInteger(20)},
+       {&use_fp8,          MTL::DataType::DataTypeBool, NS::UInteger(30)},
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq_fc,        MTL::DataType::DataTypeBool, NS::UInteger(50)},
+       {&k_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(60)},
+       {&v_bits_i,         MTL::DataType::DataTypeInt,  NS::UInteger(70)},
+       {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
+
+  constexpr int NUM_THREADS    = 256;
+  constexpr int NUM_SIMD_LANES = 32;
+  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
+  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
+  // per row and stages the sub-window's query rows after them; the layout
+  // must mirror the kernel's shared_mem carve exactly.
+  const int rows_per_tg = window_batch ? kWindowRows : 1;
+  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
+                          * static_cast<int>(sizeof(float));
+  int q_window_bytes = window_batch
+      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
+      : 0;
+  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
+                    * static_cast<int>(sizeof(float));
+  size_t shmem = static_cast<size_t>(
+      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
+  shmem = (shmem + 15) & ~size_t(15);
+
+  // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
+  auto bind_turboquant = [&]() {
+    if (!use_turboquant) return;
+    enc.set_input_array(*key_scale_cache,   22);
+    enc.set_input_array(*value_scale_cache, 23);
+    int32_t v_block_stride_i = static_cast<int32_t>(value_cache.strides()[0]);
+    int32_t v_head_stride_i  = static_cast<int32_t>(value_cache.strides()[2]);
+    enc.set_bytes(v_block_stride_i, 24);
+    enc.set_bytes(v_head_stride_i,  25);
+    enc.set_input_array(*key_zero_cache, 26);
+    enc.set_input_array(*v_centroids, 27);
+    int64_t scale_block_stride = key_scale_cache->strides()[0];
+    enc.set_bytes(scale_block_stride, 28);
+    int64_t scale_head_stride = key_scale_cache->strides()[2];
+    enc.set_bytes(scale_head_stride, 29);
+  };
+
+  // Sink logits (slot 18); bound only when the kernel was specialized with
+  // use_sinks, since the argument is declared under that function constant.
+  auto bind_sinks = [&]() {
+    if (!use_sinks) return;
+    enc.set_input_array(*sinks, 18);
+  };
+
   if (!partition) {
     // Single-pass path (grid.z = 1): the original decode/per-token kernel.
     record_paged_dispatch(
-        window_batch ? "window_ps0" : "per_token_ps0");
+        window_batch ? PagedDispatch::Window : PagedDispatch::PerToken);
     enc.set_compute_pipeline_state(kernel);
     enc.set_threadgroup_memory_length(shmem, 0);
     bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
@@ -860,7 +834,7 @@ static void dispatch_paged_attention_v2_online(
 
   // ----- Split-KV path: paged_attention(_ps512) -> paged_attention_v2_reduce.
   record_paged_dispatch(
-      window_batch ? "window_ps512" : "per_token_ps512");
+      window_batch ? PagedDispatch::WindowSplitKv : PagedDispatch::SplitKv);
   array tmp_out = make_temp(
       Shape{total_q_tokens, num_heads, max_num_partitions, head_size},
       query.dtype());
@@ -2142,8 +2116,11 @@ NB_MODULE(_paged_ops, m) {
   m.def(
       "last_paged_dispatch",
       []() {
-        std::lock_guard<std::mutex> lk(g_last_dispatch_mu);
-        return g_last_dispatch;
+        static constexpr const char* names[] = {
+            "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
+            "window_ps512", "nax_prefill", "tiled_prefill"};
+        return names[static_cast<size_t>(
+            g_last_dispatch.load(std::memory_order_relaxed))];
       },
       "Dispatch family chosen by the most recent paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "

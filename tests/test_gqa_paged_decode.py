@@ -220,6 +220,7 @@ def _run_primitive(
     sliding_window: int = -1,
     sink_value: float | None = None,
     turboquant: bool = False,
+    native_reference: bool = False,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -310,7 +311,7 @@ def _run_primitive(
         **quant_kwargs,
     )
     mx.eval(out)
-    if sinks is None:
+    if sinks is None and not native_reference:
         ref = _grouped_paged_reference(
             query=query,
             key_cache=key_ref,
@@ -331,7 +332,7 @@ def _run_primitive(
             flat_k[:max_kv_len].transpose(1, 0, 2)[None],
             flat_v[:max_kv_len].transpose(1, 0, 2)[None],
             scale=scale,
-            sinks=sinks.astype(dtype),
+            sinks=None if sinks is None else sinks.astype(dtype),
         ).reshape(out.shape)
     mx.eval(ref)
     return out, ref
@@ -367,9 +368,142 @@ def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
     n = _eligible_context() + offset
     if n > 131072:
         pytest.skip("Partial-tail case exceeds this device's eligible range")
-    out, ref = _run_primitive([n], dtype, interleaved=interleaved, seed=0)
+    out, ref = _run_primitive(
+        [n],
+        dtype,
+        interleaved=interleaved,
+        seed=0,
+        native_reference=not interleaved,
+    )
     assert _dispatch_family() == "gqa_decode"
     _assert_close(out, ref, dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("q_heads,kv_heads,head", [(32, 8, 128), (24, 4, 256)])
+def test_gqa_reads_upstream_views_after_writes_and_block_copy(
+    dtype, q_heads, kv_heads, head
+):
+    """Exercise every shipped GQA specialization on shared K/V storage.
+
+    A non-contiguous page table survives copy-on-write and a new decode write.
+    No eval separates cache updates from attention: their graph dependencies
+    must make both writes visible through the strided K/V aliases.
+    """
+    import torch
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+    from vllm_metal.attention.caches.storage import KVCacheStorage
+
+    n = _eligible_context(kv_heads) + 1
+    if n + 1 > 131072:
+        pytest.skip("Two decode steps exceed this device's eligible range")
+    pages = _interleaved_table((n + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    num_blocks = max(pages) + 2
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=kv_heads,
+        head_size=head,
+        dtype=torch.float16 if dtype == mx.float16 else torch.bfloat16,
+    )
+    page_bytes = spec.page_size_bytes
+    storage = KVCacheStorage(
+        KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)
+            ],
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=num_blocks * page_bytes,
+                    layers=["attn"],
+                    layer_stride=num_blocks * page_bytes,
+                    block_stride=page_bytes,
+                )
+            ],
+            kv_cache_layout="LBNHC",
+        )
+    )
+    cache = MetalPagedKVCache.from_upstream(storage, ["attn"])
+    # K/V occupy different offsets of the same physical region, not dense arrays.
+    key_desc, value_desc = (
+        cache.key_caches.descriptors[0],
+        cache.value_caches.descriptors[0],
+    )
+    assert key_desc[0] == value_desc[0]
+    assert key_desc[2] == value_desc[2]
+    assert key_desc[2][-2:] == (2 * head, 1)
+    assert value_desc[3] - key_desc[3] == head
+
+    mx.random.seed(719)
+    keys = mx.random.normal((n + 1, kv_heads, head)).astype(dtype)
+    values = mx.random.normal(keys.shape).astype(dtype)
+    # These rows dominate softmax, so losing either the copied page or the
+    # appended write cannot hide inside long-context numerical tolerances.
+    keys[0], keys[n] = 4, 4
+    values[0], values[n] = 1, 3
+    slots = [pages[i // BLOCK_SIZE] * BLOCK_SIZE + i % BLOCK_SIZE for i in range(n)]
+    ops = get_ops()
+    written = ops.reshape_and_cache(
+        keys[:n],
+        values[:n],
+        cache.key_caches[0],
+        cache.value_caches[0],
+        mx.array(slots, dtype=mx.int64),
+    )
+    cache.replace_layer_cache(0, *written)
+    for length in (n, n + 1):
+        if length == n + 1:
+            # Move a cached prefix page, then append into the partial final page.
+            storage.copy_blocks([(pages[0], num_blocks - 1)])
+            storage.zero_blocks([pages[0]])
+            pages[0] = num_blocks - 1
+            slot = pages[n // BLOCK_SIZE] * BLOCK_SIZE + n % BLOCK_SIZE
+            written = ops.reshape_and_cache(
+                keys[n:],
+                values[n:],
+                cache.key_caches[0],
+                cache.value_caches[0],
+                mx.array([slot], dtype=mx.int64),
+            )
+            cache.replace_layer_cache(0, *written)
+        query = mx.ones((1, q_heads, head), dtype=dtype)
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            query,
+            cache.key_caches[0],
+            cache.value_caches[0],
+            kv_heads,
+            head**-0.5,
+            0.0,
+            mx.array([pages], dtype=mx.int32),
+            mx.array([length], dtype=mx.int32),
+            mx.array([0, 1], dtype=mx.int32),
+            BLOCK_SIZE,
+            length,
+            -1,
+            out,
+            num_decode_requests=1,
+        )
+        mx.eval(out)
+        assert _dispatch_family() == "gqa_decode"
+        # Independent logical history; never gather the cache under test.
+        ref = _grouped_paged_reference(
+            query=query,
+            key_cache=keys[None],
+            value_cache=values[None],
+            query_lens=[1],
+            kv_lens=[length],
+            block_tables=np.array([[0]]),
+            scale=head**-0.5,
+        )
+        _assert_close(out, ref, dtype)
 
 
 @pytest.mark.parametrize("num_decode_requests", [-1, 1])
@@ -441,7 +575,7 @@ def test_each_geometry_upper_boundary_dispatch(q, kv, head, n):
         (64, 8, 64, 32768),
         (32, 4, 64, 65536),  # Same old byte proxy/grid as the preceding row.
         (16, 2, 96, 65536),
-        (16, 4, 256, 65536),  # Supported shader, unmeasured default geometry.
+        (16, 4, 256, 65536),  # Unmeasured default geometry.
         (16, 8, 128, 65536),
         (16, 16, 128, 65536),  # MHA.
     ],

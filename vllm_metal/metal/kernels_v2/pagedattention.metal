@@ -2310,9 +2310,7 @@ instantiate_paged_attention_v2(float, char, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, char, uchar, 32);
 instantiate_paged_attention_v2(half, char, uchar, 32);
 
-// GQA-shared flash-decode pass (pure decode, non-TQ): half/bfloat16 caches,
-// head sizes divisible by 32 up to 256, kernel block sizes 8/16/32.  Other
-// configs keep the per-token kernel via the dispatch gate in paged_ops.cpp.
+// Compile only the default dispatch domain: head128/256, block16, FP16/BF16.
 #define instantiate_gqa_decode_inner(type, head_size, block_size,            \
                                      partition_size)                         \
   template [[host_name("paged_attention_gqa_decode_" #type "_hs" #head_size  \
@@ -2339,16 +2337,9 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       uint sg [[simdgroup_index_in_threadgroup]],                            \
       uint lane [[thread_index_in_simdgroup]]);
 
-#define instantiate_gqa_decode_hs(type, block_size, partition_size)          \
-  instantiate_gqa_decode_inner(type, 64, block_size, partition_size);        \
-  instantiate_gqa_decode_inner(type, 96, block_size, partition_size);        \
-  instantiate_gqa_decode_inner(type, 128, block_size, partition_size);       \
-  instantiate_gqa_decode_inner(type, 256, block_size, partition_size);
+#define instantiate_gqa_decode(type, partition_size)                         \
+  instantiate_gqa_decode_inner(type, 128, 16, partition_size);               \
+  instantiate_gqa_decode_inner(type, 256, 16, partition_size);
 
-#define instantiate_gqa_decode_bs(type, partition_size)                      \
-  instantiate_gqa_decode_hs(type, 8, partition_size);                        \
-  instantiate_gqa_decode_hs(type, 16, partition_size);                       \
-  instantiate_gqa_decode_hs(type, 32, partition_size);
-
-instantiate_gqa_decode_bs(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
-instantiate_gqa_decode_bs(half, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
