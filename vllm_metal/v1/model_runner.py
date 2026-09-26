@@ -1020,7 +1020,7 @@ class MetalModelRunner:
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
-                extract_logits=self._model_adapter.extract_logits,
+                model_adapter=self._model_adapter,
                 committed_num_blocks=num_blocks,
                 scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,

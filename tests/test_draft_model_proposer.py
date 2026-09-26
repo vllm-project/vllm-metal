@@ -95,13 +95,40 @@ class _PositionEncodingDraftModel(_StubDraftModel):
         return mx.eye(VOCAB_SIZE)[mx.array(positions) % VOCAB_SIZE][None]
 
 
+class _SelectiveLogitsAdapter:
+    """Adapter stub that records which packed rows reach the output head."""
+
+    def __init__(self) -> None:
+        self.logits_indices: list[list[int]] = []
+
+    def target_forward(
+        self,
+        model,
+        input_ids: mx.array,
+        *,
+        cache,
+        collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
+    ) -> SimpleNamespace:
+        del collect_hidden_states
+        assert logits_indices is not None
+        self.logits_indices.append(logits_indices.tolist())
+        logits = model(input_ids, cache=cache)
+        selected = mx.take(logits[0], logits_indices, axis=0)
+        return SimpleNamespace(logits=selected[None])
+
+
 def _proposer(
     model: _StubDraftModel,
     *,
     committed_num_blocks: int = COMMITTED_NUM_BLOCKS,
     scratch_reserve_blocks: int = SCRATCH_RESERVE_BLOCKS,
     allow_deferred_zero_k_ingest: bool = False,
+    model_adapter=None,
+    selective_logits_supported: bool | None = None,
 ) -> DraftModelProposer:
+    if selective_logits_supported is None:
+        selective_logits_supported = model_adapter is not None
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
@@ -110,6 +137,8 @@ def _proposer(
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
+        model_adapter=model_adapter,
+        selective_logits_supported=selective_logits_supported,
         allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
     )
     proposer.adopt_committed_group(COMMITTED_GROUP_INDEX)
@@ -738,6 +767,68 @@ def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> No
     assert model.input_lens == [32, 15]
     assert drafts is not None
     assert drafts.req_ids == ["r1", "r2"]
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
+
+
+def test_packed_ingest_projects_only_each_plans_last_row() -> None:
+    model = _PositionEncodingDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = _proposer(model, model_adapter=adapter)
+
+    drafts = proposer.propose(
+        _prefills_context([("r1", list(range(7))), ("r2", list(range(8)))])
+    )
+
+    assert adapter.logits_indices == [[7, 16]]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[7], [8]]
+
+
+def test_tiny_ingest_keeps_combined_model_forward() -> None:
+    model = _PositionEncodingDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = _proposer(model, model_adapter=adapter)
+
+    drafts = proposer.propose(_prefills_context([("r1", [0]), ("r2", [0])]))
+
+    assert adapter.logits_indices == []
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[1], [1]]
+
+
+def test_unsupported_large_ingest_keeps_combined_model_forward() -> None:
+    model = _PositionEncodingDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = _proposer(
+        model,
+        model_adapter=adapter,
+        selective_logits_supported=False,
+    )
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
+
+    assert model.input_lens == [21]
+    assert adapter.logits_indices == []
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
+
+
+def test_chunked_ingest_selects_only_large_projection_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
+    model = _PositionEncodingDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = _proposer(model, model_adapter=adapter)
+
+    drafts = proposer.propose(
+        _prefills_context([("r1", list(range(20))), ("r2", list(range(25)))])
+    )
+
+    # The 32-row first round selects two rows. The 15-row tail stays on the
+    # combined model forward because tiny head projections do not benefit.
+    assert adapter.logits_indices == [[15, 31]]
+    assert drafts is not None
     assert drafts.draft_token_ids == [[20 % VOCAB_SIZE], [25 % VOCAB_SIZE]]
 
 

@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
     from vllm.config.speculative import SpeculativeConfig
 
+    from vllm_metal.v1.model_adapter import ModelAdapter
     from vllm_metal.v1.model_runner import PrefillRequest, RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -137,6 +138,12 @@ class _DraftPlan:
 # full-prompt catch-up ingests on the tiled prefill kernel.
 _DECODE_INGEST_MAX_TOKENS = 16
 
+# Splitting the backbone and output head has no measurable advantage for tiny
+# projections; the gather and extra dispatch can cost as much as the rows it
+# removes. Start selecting once the packed ingest reaches one full decode
+# window, where the avoided vocabulary projection is material.
+_SELECTIVE_LOGITS_MIN_ROWS = 16
+
 
 class DraftModelProposer:
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
@@ -151,6 +158,8 @@ class DraftModelProposer:
         num_layers: int,
         controller: SpeculativeDecodeController,
         extract_logits: Callable[[Any], mx.array],
+        model_adapter: ModelAdapter | None = None,
+        selective_logits_supported: bool = False,
         merge_ingest_windows: bool = False,
         allow_deferred_zero_k_ingest: bool = False,
     ) -> None:
@@ -158,6 +167,8 @@ class DraftModelProposer:
         self._block_size = block_size
         self._controller = controller
         self._extract_logits = extract_logits
+        self._model_adapter = model_adapter
+        self._selective_logits_supported = selective_logits_supported
         self._allow_deferred_zero_k_ingest = allow_deferred_zero_k_ingest
         # Structural half of the ingest window gate (see `build`); the
         # operator half (VLLM_METAL_SPEC_VERIFY_WINDOW) is read per call
@@ -214,7 +225,7 @@ class DraftModelProposer:
         speculative_config: SpeculativeConfig,
         parallel_config: ParallelConfig,
         controller: SpeculativeDecodeController,
-        extract_logits: Callable[[Any], mx.array],
+        model_adapter: ModelAdapter,
         committed_num_blocks: int,
         scratch_reserve_blocks: int,
         block_size: int,
@@ -222,6 +233,10 @@ class DraftModelProposer:
         allow_deferred_zero_k_ingest: bool,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config, parallel_config)
+        # The capability probe uses a cacheless forward and must run before
+        # patch_model() installs attention wrappers that require a paged
+        # context. Unsupported model heads retain the full-logits fallback.
+        selective_logits_supported = model_adapter.supports_selective_logits(model)
         total_blocks = committed_num_blocks + scratch_reserve_blocks
         backend = SDPAPagedAttentionRuntime(
             num_layers=dims.num_layers,
@@ -235,7 +250,7 @@ class DraftModelProposer:
         logger.info(
             "Draft model loaded for speculative decoding: %s "
             "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "committed_blocks=%d, scratch_blocks=%d)",
+            "committed_blocks=%d, scratch_blocks=%d, selective_logits=%s)",
             speculative_config.draft_model_config.model,
             dims.num_layers,
             dims.num_kv_heads,
@@ -243,6 +258,7 @@ class DraftModelProposer:
             n_patched,
             committed_num_blocks,
             scratch_reserve_blocks,
+            selective_logits_supported,
         )
         return cls(
             model=model,
@@ -251,7 +267,9 @@ class DraftModelProposer:
             scratch_reserve_blocks=scratch_reserve_blocks,
             num_layers=dims.num_layers,
             controller=controller,
-            extract_logits=extract_logits,
+            extract_logits=model_adapter.extract_logits,
+            model_adapter=model_adapter,
+            selective_logits_supported=selective_logits_supported,
             # Mirror of the runner's `merge_verify_windows` structural
             # conditions, reduced to what can arise here: this proposer
             # patches drafts through `SDPAPagedAttentionRuntime`, so the
@@ -699,13 +717,14 @@ class DraftModelProposer:
                 and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
             )
             try:
-                logits = self._extract_logits(
-                    self._model(input_ids, cache=offset_caches)
+                last = self._project_ingest_rows(
+                    input_ids,
+                    offset_caches,
+                    last_rows,
                 )
             finally:
                 clear_context()
 
-            last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
             return mx.argmax(last, axis=-1)
 
         # Cold ingest: a fresh prefix re-ingests the whole prompt into the
@@ -739,18 +758,45 @@ class DraftModelProposer:
             input_ids = mx.array([round_packed], dtype=mx.int32)
             prepare_unified([], prefill_specs, self._block_size)
             try:
-                logits = self._extract_logits(
-                    self._model(input_ids, cache=offset_caches)
+                selected = self._project_ingest_rows(
+                    input_ids,
+                    offset_caches,
+                    [row for _, row in final_row_indices],
                 )
             finally:
                 clear_context()
-            for plan_index, row in final_row_indices:
-                final_rows[plan_index] = logits[0][row]
+            for selected_index, (plan_index, _) in enumerate(final_row_indices):
+                final_rows[plan_index] = selected[selected_index]
 
         last = mx.stack(
             [final_rows[plan_index] for plan_index in range(len(plans))], axis=0
         )
         return mx.argmax(last, axis=-1)
+
+    def _project_ingest_rows(
+        self,
+        input_ids: mx.array,
+        offset_caches: list[OffsetCache],
+        row_indices: list[int],
+    ) -> mx.array:
+        """Return logits only for ingest rows that predict draft tokens."""
+        indices = mx.array(row_indices, dtype=mx.int32)
+        if (
+            self._selective_logits_supported
+            and input_ids.shape[1] >= _SELECTIVE_LOGITS_MIN_ROWS
+            and len(row_indices) < input_ids.shape[1]
+        ):
+            assert self._model_adapter is not None
+            output = self._model_adapter.target_forward(
+                self._model,
+                input_ids,
+                cache=offset_caches,
+                logits_indices=indices,
+            )
+            return output.logits[0]
+
+        logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
+        return mx.take(logits[0], indices, axis=0)
 
     def _draft_step(
         self,
