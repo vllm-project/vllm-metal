@@ -2,8 +2,8 @@
 """Scoped GQA decode routing, verified after the native primitive executes.
 
 The default optimization covers three measured attention geometries, one
-request, ordinary FP16/BF16 caches, 16-token kernel pages, and bounded long
-contexts. Numerical support for another shape does not authorize its default
+request, ordinary FP16/BF16 caches, 16-token kernel pages, and long contexts.
+Numerical support for another shape does not authorize its default
 use. These tests inspect the actual dispatcher and compare both selected and
 fallback paths against attention references; timing is deliberately excluded.
 """
@@ -79,8 +79,6 @@ def _eligible_context(kv_heads: int = NUM_KV_HEADS, minimum: int = 32768) -> int
     # Expected shape/length decisions are explicit in the boundary tests.
     partitions = (3 * cores + kv_heads - 1) // kv_heads
     n = max(minimum, partitions * 512)
-    if n > 131072:
-        pytest.skip("No context inside the scoped range meets this GPU's grid guard")
     return n
 
 
@@ -108,7 +106,7 @@ def _grouped_paged_reference(
     """FP32 attention without repeating K/V for each grouped query head.
 
     Fold the query-token and GQA-group axes into a matrix row axis. Each KV
-    head then owns one ordinary QK/PV matrix product, so the 128K reference
+    head then owns one ordinary QK/PV matrix product, so the long-context reference
     retains only the unique gathered K/V instead of allocating a copy for
     every query head. This is a high-level full-softmax oracle, independent
     of the paged kernel's partitioning and online softmax implementation.
@@ -345,7 +343,6 @@ def test_gqa_decode_kernel_is_in_default_library() -> None:
         "rebuild with `python -m vllm_metal.metal.build`"
     )
     assert ops.GQA_DECODE_MIN_SEQ_LEN == 32768
-    assert ops.GQA_DECODE_MAX_SEQ_LEN == 131072
 
 
 def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
@@ -366,8 +363,6 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
 @pytest.mark.parametrize("offset,interleaved", [(0, False), (17, True)])
 def test_gqa_decode_matches_reference(dtype, offset, interleaved) -> None:
     n = _eligible_context() + offset
-    if n > 131072:
-        pytest.skip("Partial-tail case exceeds this device's eligible range")
     out, ref = _run_primitive(
         [n],
         dtype,
@@ -402,8 +397,6 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
     from vllm_metal.attention.caches.storage import KVCacheStorage
 
     n = _eligible_context(kv_heads) + 1
-    if n + 1 > 131072:
-        pytest.skip("Two decode steps exceed this device's eligible range")
     pages = _interleaved_table((n + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE)
     num_blocks = max(pages) + 2
     spec = FullAttentionSpec(
@@ -544,24 +537,21 @@ def test_each_geometry_lower_boundary_dispatch(q, kv, head, minimum, offset):
 
 
 @pytest.mark.parametrize("q,kv,head", [(32, 8, 128), (24, 4, 256), (16, 2, 128)])
-@pytest.mark.parametrize("n", [131072, 131073])
-def test_each_geometry_upper_boundary_dispatch(q, kv, head, n):
-    if n == 131072:
-        _require_grid(n, kv)
+@pytest.mark.parametrize("n", [131071, 131072, 131073, 196608, 262144, 262145])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_each_geometry_continues_gqa_beyond_128k(q, kv, head, n, dtype):
+    _require_grid(n, kv)
     out, ref = _run_primitive(
         [n],
-        mx.float16,
-        interleaved=False,
+        dtype,
+        interleaved=True,
         seed=716,
         num_query_heads=q,
         num_kv_heads=kv,
         head_size=head,
     )
-    if n == 131072:
-        assert _dispatch_family() == "gqa_decode"
-    else:
-        _assert_fallback()
-    _assert_close(out, ref, mx.float16)
+    assert _dispatch_family() == "gqa_decode"
+    _assert_close(out, ref, dtype)
 
 
 @pytest.mark.parametrize(
@@ -697,12 +687,13 @@ def test_matching_float32_uses_fallback() -> None:
     _assert_close(out, ref, mx.float32)
 
 
-def test_gqa_disable_flag_forces_established_kernels(monkeypatch) -> None:
+@pytest.mark.parametrize("minimum", [32768, 196609])
+def test_gqa_disable_flag_forces_established_kernels(monkeypatch, minimum) -> None:
     from vllm_metal import envs
 
     monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
     assert envs.VLLM_METAL_DISABLE_GQA_DECODE is False
-    n = _eligible_context()
+    n = _eligible_context(minimum=minimum)
     out_on, ref = _run_primitive([n], mx.bfloat16, interleaved=True, seed=7)
     assert _dispatch_family() == "gqa_decode"
     out_off, _ = _run_primitive(
@@ -744,9 +735,14 @@ def test_gqa_disable_flag_forces_established_kernels(monkeypatch) -> None:
         (32, 8, 128, 131072, 40, True),
         (24, 4, 256, 131072, 40, True),
         (16, 2, 128, 131072, 40, True),
-        (32, 8, 128, 131073, 40, False),
-        (24, 4, 256, 131073, 40, False),
-        (16, 2, 128, 131073, 40, False),
+        (32, 8, 128, 131073, 40, True),
+        (24, 4, 256, 131073, 40, True),
+        (16, 2, 128, 131073, 40, True),
+        (32, 8, 128, 262145, 40, True),
+        (24, 4, 256, 524289, 40, True),
+        (16, 2, 128, 1048576, 40, True),
+        (32, 8, 128, 262145, 0, False),
+        (16, 4, 256, 262145, 40, False),
         (32, 8, 128, 65536, 0, False),
         (32, 8, 128, 65536, -1, False),
         (32, 4, 64, 65536, 40, False),

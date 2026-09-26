@@ -40,10 +40,9 @@ void register_mlx_patch(nb::module_& m);
 
 static std::string v2_paged_attention_source_;
 constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
-// Default routing is limited to the documented, measured long-context range.
+// Default routing is limited to the documented long-context geometries.
 // Numerical shader support is broader than this empirical performance policy.
 constexpr int kGqaDecodeMinSeqLen = 32768;
-constexpr int kGqaDecodeMaxSeqLen = 131072;
 
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
@@ -126,13 +125,13 @@ static int gpu_core_count() {
 // Conservative default scope, based on the measured single-request cases in
 // docs/gqa-decode.md. This is an empirical policy, not a universal cost model:
 // do not infer eligibility for unmeasured geometries from a byte-traffic proxy.
-// The MiniCPM-style 32K gain was small, so its default starts at 64K. All
-// defaults stop at 128K; larger contexts require their own serving evidence.
+// The MiniCPM-style 32K gain was small, so its default starts at 64K.
+// There is no additional GQA context ceiling: model, cache and primitive
+// resource limits still apply as they do to the established attention paths.
 static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
                                      int head_size, int max_seq_len,
                                      int gpu_cores) {
-  if (gpu_cores <= 0 || max_seq_len < kGqaDecodeMinSeqLen ||
-      max_seq_len > kGqaDecodeMaxSeqLen)
+  if (gpu_cores <= 0 || max_seq_len < kGqaDecodeMinSeqLen)
     return false;
   const bool measured_32k =
       (num_heads == 32 && num_kv_heads == 8 && head_size == 128) ||
@@ -1847,7 +1846,6 @@ NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.attr("GQA_DECODE_MIN_SEQ_LEN") = nb::int_(kGqaDecodeMinSeqLen);
-  m.attr("GQA_DECODE_MAX_SEQ_LEN") = nb::int_(kGqaDecodeMaxSeqLen);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
         "Detected GPU core count, or zero when detection is unavailable.");
   m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,

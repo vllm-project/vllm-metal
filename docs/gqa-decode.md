@@ -7,13 +7,18 @@ FP16/BF16. The geometry and performance checks below further restrict routing.
 
 ## Automatic eligibility
 
-The following geometry and KV-length bounds are inclusive:
+The following geometries and inclusive minimum KV lengths are eligible:
 
-| Query heads | KV heads | Head dimension | Minimum KV tokens | Maximum KV tokens |
-|---:|---:|---:|---:|---:|
-| 32 | 8 | 128 | 32,768 | 131,072 |
-| 24 | 4 | 256 | 32,768 | 131,072 |
-| 16 | 2 | 128 | 65,536 | 131,072 |
+| Query heads | KV heads | Head dimension | Minimum KV tokens |
+|---:|---:|---:|---:|
+| 32 | 8 | 128 | 32,768 |
+| 24 | 4 | 256 | 32,768 |
+| 16 | 2 | 128 | 65,536 |
+
+There is no additional GQA-specific maximum context length. The model's
+context limit, cache capacity and the primitive's resource limits still apply.
+An eligible request stays on GQA as its KV length grows beyond 131,072;
+crossing that former policy boundary does not change kernel families.
 
 Every row additionally requires:
 
@@ -28,9 +33,9 @@ Every row additionally requires:
   `ceil(KV tokens / 512) * KV heads >= 3 * detected GPU cores`.
   An unknown GPU core count falls back.
 
-Calls outside these bounds use the established attention family. That
+Calls outside these conditions use the established attention family. That
 includes multi-request batches, even if each request individually matches a
-row, and lengths above the maximum. The 16/2/128 geometry deliberately starts
+row, and lengths below the corresponding minimum. The 16/2/128 geometry starts
 at 64K; small measured gains at 32K were not used to widen automatic routing.
 
 The gate checks geometry rather than model names and does not contain a
@@ -54,6 +59,8 @@ APIs are no longer used.
 must actually report `gqa_decode`; boundary, multi-request, verification,
 feature, and disabled cases must report the appropriate established family.
 References include independent grouped CPU FP32 attention and native MLX SDPA.
+All three geometries and both cache dtypes are checked across the former
+128K boundary, at 192K, and at 256K including a partial final partition.
 Shared-storage tests cover all four specializations using upstream-allocated
 K/V views, non-contiguous page tables, native writes, prefix-page copying,
 source-page clearing and a subsequent decode write. Dominant attention rows
