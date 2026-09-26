@@ -873,6 +873,7 @@ class WorkerCachePlanner:
         """Allocate paged KV cache and patch the loaded model."""
         self._worker.model_runner.validate_paged_attention_support()
         plan = self._paged_attention_plan(overhead=overhead)
+        self._validate_paged_attention_plan(plan, require_min_blocks=True)
         logger.info(
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "
@@ -953,9 +954,12 @@ class WorkerCachePlanner:
 
         if mode == "paged_attention_layout_budget":
             overhead = self._worker.model_runner.profile_run()
-            plan = self._paged_attention_plan(
-                overhead=overhead, require_min_blocks=False
-            )
+            plan = self._paged_attention_plan(overhead=overhead)
+            if self._worker.vllm_config.cache_config.num_gpu_blocks_override is None:
+                self._validate_paged_attention_plan(
+                    plan,
+                    require_min_blocks=False,
+                )
             budget = plan.kv_budget
             logger.info(
                 "Upstream cache layout: reporting %.2f GB KV budget; "
@@ -981,9 +985,8 @@ class WorkerCachePlanner:
         """Return cache bytes after model weights and execution overhead."""
         return int(metal_limit * fraction) - model_memory - overhead
 
-    def _paged_attention_plan(
-        self, *, overhead: int, require_min_blocks: bool = True
-    ) -> _PagedAttentionPlan:
+    def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
+        """Build the memory plan without applying caller-specific validation."""
         block_size = self._worker.vllm_config.cache_config.block_size
         fraction = self._memory_fraction()
         metal_limit = self._metal_limit_bytes()
@@ -998,7 +1001,7 @@ class WorkerCachePlanner:
         )
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
         kv_budget = base_kv_budget - draft_scratch_bytes
-        plan = _PagedAttentionPlan(
+        return _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
             metal_limit=metal_limit,
@@ -1010,11 +1013,6 @@ class WorkerCachePlanner:
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
         )
-        self._validate_paged_attention_plan(
-            plan,
-            require_min_blocks=require_min_blocks,
-        )
-        return plan
 
     def _validate_paged_attention_plan(
         self, plan: _PagedAttentionPlan, *, require_min_blocks: bool

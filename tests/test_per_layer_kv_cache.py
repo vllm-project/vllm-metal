@@ -755,11 +755,14 @@ class TestUpstreamAttentionStorage:
         )
         planner = WorkerCachePlanner(worker)
         monkeypatch.setattr(runner, "profile_run", lambda: 0)
-        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 0)
+        # The explicit block override replaces the profiled budget upstream.
+        monkeypatch.setattr(
+            planner, "get_model_memory_usage", lambda: 2 * dense_block_bytes
+        )
         monkeypatch.setattr(
             planner,
             "_metal_limit_bytes",
-            lambda: dense_block_bytes * PAGED_ATTENTION_MIN_BLOCKS,
+            lambda: dense_block_bytes,
         )
 
         available = planner.determine_available_memory()
@@ -767,6 +770,7 @@ class TestUpstreamAttentionStorage:
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
+        assert available < 0
         assert config.num_blocks == 100
         runner.initialize_kv_cache(config)
         assert runner.paged_attention_runtime.num_blocks() == 100

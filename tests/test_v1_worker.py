@@ -108,7 +108,11 @@ def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(mlx_device="gpu")
-    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
+    worker.cache_config = SimpleNamespace(
+        block_size=16,
+        gpu_memory_utilization=0.92,
+        num_gpu_blocks_override=None,
+    )
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -305,8 +309,9 @@ class TestPagedAttentionPlanDiagnostics:
             lambda self: 2_000_000_000,
         )
 
+        plan = planner._paged_attention_plan(overhead=100_000_000)
         with pytest.raises(ValueError) as exc_info:
-            planner._paged_attention_plan(overhead=100_000_000)
+            planner._validate_paged_attention_plan(plan, require_min_blocks=True)
 
         message = str(exc_info.value)
         assert "increase --gpu-memory-utilization (currently 0.15)" in message
@@ -328,8 +333,9 @@ class TestPagedAttentionPlanDiagnostics:
             lambda self: 2_000_000_000,
         )
 
+        plan = planner._paged_attention_plan(overhead=100_000_000)
         with pytest.raises(ValueError) as exc_info:
-            planner._paged_attention_plan(overhead=100_000_000)
+            planner._validate_paged_attention_plan(plan, require_min_blocks=True)
 
         message = str(exc_info.value)
         assert "hybrid_gdn_state" not in message
