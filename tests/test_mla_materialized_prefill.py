@@ -52,7 +52,7 @@ def _clear_ctx():
     pac.clear_context()
 
 
-def _make(quantize: bool = False):
+def _make(quantize: bool = False, num_blocks: int = 8):
     mx.random.seed(0)
     inner = _AbsorbedInner()
     inner.apply(lambda p: p.astype(mx.float16))
@@ -65,7 +65,7 @@ def _make(quantize: bool = False):
     cache = MLAPagedLatentCache(
         num_layers=1,
         latent_dim=_KVL + _ROPE,
-        num_blocks=8,
+        num_blocks=num_blocks,
         block_size=_BLK,
         dtype=mx.float16,
     )
@@ -118,10 +118,12 @@ def test_materialized_prefill_matches_absorbed_loop(
 
 
 def test_materialized_prefill_gate() -> None:
-    """The gate engages for an absorbed model on pure prefill (past=0) and falls
-    back to the absorbed loop for chunked prefill (past>0)."""
+    """The gate engages for an absorbed model on pure prefill and on
+    continuation chunks with >= ``_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST``
+    new tokens; small chunks with cached context, decode-shaped rows, and
+    pure decode batches fall back to the absorbed loop."""
     inner, _, wrapper = _make()
-    # pure prefill (past=0): ctx_len == num_new → engage
+    # pure prefill (past=0): ctx_len == num_new → engage even when small
     assert wrapper._materialized_prefill_ok(
         inner,
         pac.PagedAttentionContext(
@@ -132,14 +134,128 @@ def test_materialized_prefill_gate() -> None:
             offsets=[0],
         ),
     )
-    # past>0 (ctx_len 4 > num_new 2): chunked prefill → fall back
+    # chunked prefill below the new-token threshold → fall back
+    for num_new in (2, 511):
+        assert not wrapper._materialized_prefill_ok(
+            inner,
+            pac.PagedAttentionContext(
+                slot_mapping=list(range(num_new)),
+                block_tables=[[0]],
+                context_lens=[4 + num_new],
+                cu_seqlens=[0, num_new],
+                offsets=[4],
+            ),
+        )
+    # chunked prefill at the threshold: past>0, num_new==512 → engage
+    assert wrapper._materialized_prefill_ok(
+        inner,
+        pac.PagedAttentionContext(
+            slot_mapping=list(range(512)),
+            block_tables=[[0]],
+            context_lens=[4 + 512],
+            cu_seqlens=[0, 512],
+            offsets=[4],
+        ),
+    )
+    # decode-shaped row (num_new=1, ctx_len>1) mixed with prefill → fall back
     assert not wrapper._materialized_prefill_ok(
         inner,
         pac.PagedAttentionContext(
-            slot_mapping=[0, 1],
-            block_tables=[[0]],
-            context_lens=[4],
-            cu_seqlens=[0, 2],
-            offsets=[2],
+            slot_mapping=[0, 1, 2],
+            block_tables=[[0], [1]],
+            context_lens=[4, 2],
+            cu_seqlens=[0, 1, 3],
+            offsets=[3, 0],
         ),
     )
+    # pure decode → fall back
+    assert not wrapper._materialized_prefill_ok(
+        inner,
+        pac.PagedAttentionContext(
+            slot_mapping=[0],
+            block_tables=[[0]],
+            context_lens=[4],
+            cu_seqlens=[0, 1],
+            offsets=[3],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("quantize", "atol"),
+    [(False, 2e-2), (True, 6e-2)],
+    ids=["dense", "quantized-4bit"],
+)
+def test_chunked_prefill_matches_absorbed_loop(
+    quantize: bool, atol: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed batch: one fresh prefill plus two continuation chunks (past
+    non-block-aligned and block-aligned). Materialized output must match the
+    absorbed kv_lora-space loop."""
+    # The continuation chunks below are smaller than the real 512-token
+    # threshold; drop it so they exercise the materialized path.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
+    )
+    inner, cache, wrapper = _make(quantize=quantize, num_blocks=12)
+
+    def slots(block_ids: list[int], start: int, num: int) -> list[int]:
+        return [
+            block_ids[pos // _BLK] * _BLK + pos % _BLK
+            for pos in range(start, start + num)
+        ]
+
+    # Phase 1: prefill request B (20 tokens → blocks 4,5) and request C
+    # (32 tokens → blocks 6,7) to seed past context in the cache.
+    ctx1 = pac.PagedAttentionContext(
+        slot_mapping=slots([4, 5], 0, 20) + slots([6, 7], 0, 32),
+        block_tables=[[4, 5], [6, 7]],
+        context_lens=[20, 32],
+        cu_seqlens=[0, 20, 52],
+        offsets=[0, 0],
+    )
+    x1 = mx.random.normal((1, 52, _HID)).astype(mx.float16)
+
+    # Phase 2: A fresh 16-token prefill (block 0); B continues past=20
+    # (non-block-aligned: next slots land mid-block in block 5, then block 8);
+    # C continues past=32 (block-aligned, one new token-block: block 9).
+    ctx2 = pac.PagedAttentionContext(
+        slot_mapping=(
+            slots([0], 0, 16) + slots([4, 5, 8], 20, 24) + slots([6, 7, 9], 32, 8)
+        ),
+        block_tables=[[0], [4, 5, 8], [6, 7, 9]],
+        context_lens=[16, 44, 40],
+        cu_seqlens=[0, 16, 40, 48],
+        offsets=[0, 20, 32],
+    )
+    x2 = mx.random.normal((1, 48, _HID)).astype(mx.float16)
+
+    # Under the patched threshold the phase-2 batch engages the materialized
+    # path, so the `mat` arm below really exercises it.
+    assert wrapper._materialized_prefill_ok(inner, ctx2)
+
+    def run() -> mx.array:
+        # Identical cache for both arms: reset, then re-run phase 1.
+        cache.latent_caches[0] = mx.zeros_like(cache.latent_caches[0])
+        pac.set_context(ctx1)
+        mx.eval(wrapper(x1, mask=None, cache=None))
+        pac.clear_context()
+        pac.set_context(ctx2)
+        out = wrapper(x2, mask=None, cache=None)
+        mx.eval(out)
+        pac.clear_context()
+        return out
+
+    # Reference: force the gate off → absorbed kv_lora-space (512-wide MQA) loop.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_materialized_prefill_ok", lambda *a, **k: False
+    )
+    ref = run()
+    monkeypatch.undo()  # restores gate AND threshold — re-patch the threshold
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_MATERIALIZED_MIN_NEW_TOKENS_WITH_PAST", 1
+    )
+    mat = run()
+
+    assert mat.shape == (1, 48, _HID)
+    np.testing.assert_allclose(np.array(mat), np.array(ref), atol=atol, rtol=1e-2)
