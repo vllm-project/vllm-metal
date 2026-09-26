@@ -234,9 +234,12 @@ class ModelAdapter(Protocol):
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
 _TEXT_BACKBONE_OVERRIDE_TYPES: frozenset[str] = frozenset({"gemma4"})
 # Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
-# but vllm-metal only serves them in text-only mode. Their FP8 checkpoints ship
-# `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5 loader does not
-# currently sanitize, while mlx_lm's qwen3_5 text loader handles them.
+# but only the FP8 and adapter-less variants are forced onto the text backbone:
+# FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
+# loader does not currently sanitize, while mlx_lm's qwen3_5 text loader handles
+# them; the MoE / Qwen3.6 wrappers have no multimodal adapter yet. Non-FP8
+# Qwen3.5 dense checkpoints keep the native multimodal path (see
+# `_matches_auto_text_backbone_override`).
 _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",

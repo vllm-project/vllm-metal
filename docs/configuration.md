@@ -37,7 +37,7 @@ wins. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 
-- `auto`: use the text-only compatibility path for checkpoints on the compatibility allowlist, such as Gemma4 and Qwen3.5/Qwen3.6 FP8 conditional-generation wrappers.
+- `auto`: use the text-only compatibility path only for checkpoints on the compatibility allowlist — Gemma4, Qwen3.5/Qwen3.6 **FP8** conditional-generation wrappers (their `*_weight_scale_inv` tensors are not sanitized by the mlx_vlm loader), and architectures without a multimodal adapter (the Qwen3.6 and MoE wrappers). Non-FP8 Qwen3.5 dense checkpoints (official bf16 and MLX-affine quants) keep the native multimodal path.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 
 ## Speculative Decoding
