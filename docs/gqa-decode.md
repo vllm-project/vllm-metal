@@ -61,6 +61,12 @@ make missing writes observable even in a long context.
 `tests/test_attention_sdpa.py` checks that the environment switch and scheduler
 decode count reach the primitive.
 
+Positive route tests need a reported GPU core count and sufficient partition
+grid. They skip on hosts that cannot enable GQA, including some virtual CI
+GPUs; the unknown-core fallback test runs there instead. Unconditional
+feature/dtype/page-size fallback tests do not require core-count detection.
+Validate the positive path on a capable GPU before reporting GQA coverage.
+
 `last_paged_dispatch()` records the last family selected in the process. It
 is suitable for serial tests and isolated worker checks; it is not
 per-request telemetry for concurrent serving. Evaluate the operation before

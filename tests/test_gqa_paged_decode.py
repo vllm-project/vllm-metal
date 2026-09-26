@@ -597,7 +597,7 @@ def test_unselected_shapes_really_use_fallback(q, kv, head, n):
 @pytest.mark.parametrize("block_size", [8, 32])
 def test_unmeasured_kernel_page_sizes_use_fallback(block_size):
     out, ref = _run_primitive(
-        [_eligible_context()],
+        [32768],
         mx.float16,
         interleaved=True,
         seed=718,
@@ -608,8 +608,8 @@ def test_unmeasured_kernel_page_sizes_use_fallback(block_size):
 
 
 @pytest.mark.parametrize("num_decode_requests", [-1, 2])
-def test_two_individually_eligible_requests_stay_off_gqa(num_decode_requests):
-    n = _eligible_context()
+def test_multi_request_decode_stays_off_gqa(num_decode_requests):
+    n = 32768
     out, ref = _run_primitive(
         [n, n + 1],
         mx.float16,
@@ -624,7 +624,7 @@ def test_two_individually_eligible_requests_stay_off_gqa(num_decode_requests):
 @pytest.mark.parametrize("num_decode_requests", [-2, 0, 2])
 def test_scheduler_must_confirm_one_decode_or_omit_count(num_decode_requests):
     out, ref = _run_primitive(
-        [_eligible_context()],
+        [32768],
         mx.float16,
         interleaved=True,
         seed=3,
@@ -636,7 +636,7 @@ def test_scheduler_must_confirm_one_decode_or_omit_count(num_decode_requests):
 
 @pytest.mark.parametrize("query_lens", [[3], [1, 2]])
 def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
-    n = _eligible_context()
+    n = 32768
     out, ref = _run_primitive(
         [n] * len(query_lens),
         mx.float16,
@@ -651,7 +651,7 @@ def test_prefill_and_mixed_batches_stay_off_gqa(query_lens):
 
 def test_spec_window_does_not_switch_kernel_family() -> None:
     out, ref = _run_primitive(
-        [_eligible_context() + 4],
+        [32768 + 4],
         mx.float16,
         interleaved=True,
         seed=9,
@@ -667,7 +667,7 @@ def test_spec_window_does_not_switch_kernel_family() -> None:
 )
 def test_special_attention_features_use_fallback(feature):
     out, ref = _run_primitive(
-        [_eligible_context()],
+        [32768],
         mx.float16,
         interleaved=True,
         seed=10,
@@ -679,7 +679,7 @@ def test_special_attention_features_use_fallback(feature):
 
 def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
     out, ref = _run_primitive(
-        [_eligible_context(kv_heads=2, minimum=65536)],
+        [65536],
         mx.float16,
         interleaved=False,
         seed=12,
@@ -692,9 +692,7 @@ def test_turboquant_uses_fallback_with_dequantized_reference() -> None:
 
 
 def test_matching_float32_uses_fallback() -> None:
-    out, ref = _run_primitive(
-        [_eligible_context()], mx.float32, interleaved=True, seed=11
-    )
+    out, ref = _run_primitive([32768], mx.float32, interleaved=True, seed=11)
     _assert_fallback()
     _assert_close(out, ref, mx.float32)
 
