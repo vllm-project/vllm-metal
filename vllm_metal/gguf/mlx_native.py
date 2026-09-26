@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLX-native quantized GGUF tensors that compute with their packed weights.
 
-MLX's GGUF loader (``mx.load``) repacks Q8_0, Q4_0, and Q4_1 weights into the
+``GGUFMLXQuantizedTensor`` repacks a GGUF tensor's raw block bytes into the
 affine, group-32 representation that ``mx.quantized_matmul`` already consumes:
-a ``uint32`` packed ``qweight`` alongside ``float16`` ``scales`` and
-``biases``. ``GGUFMLXQuantizedTensor`` wraps that triple in an explicit,
-validated contract and exposes :meth:`~GGUFMLXQuantizedTensor.matmul` /
+a ``uint32`` packed ``qweight`` alongside ``scales`` and ``biases``. It wraps
+that triple in an explicit, validated contract and exposes
+:meth:`~GGUFMLXQuantizedTensor.matmul` /
 :meth:`~GGUFMLXQuantizedTensor.embedding`, which run on the packed weights so
 supported weights never get expanded into a dense copy.
 
-Q4_K and Q5_K repack here from raw GGUF block bytes instead (#761): their
-32-element sub-blocks map exactly onto the same affine group-32
-representation, with ``float32`` scales/biases because the fp32 products
-``d*sc`` / ``-dmin*m`` are what reproduce ``gguf.quants.dequantize`` bit for
-bit. K-quants with 16-element sub-groups (Q6_K/Q3_K/Q2_K) cannot repack —
-MLX has no group_size=16 kernels — and stay out of scope for this path.
+Q8_0, Q4_0, and Q4_1 blocks carry one fp16 scale (and Q4_1 one fp16 min) per
+32 weights, so their triple stores ``float16`` scales/biases and is byte for
+byte what MLX's own GGUF repack in ``mx.load`` produces. Q4_K and Q5_K
+sub-blocks are also 32 wide, but their scales are the fp32 products
+``d*sc`` / ``-dmin*m``, so those triples store ``float32`` to reproduce
+``gguf.quants.dequantize`` bit for bit (#761). K-quants with 16-element
+sub-groups (Q6_K/Q3_K/Q2_K) cannot repack, since MLX has no group_size=16
+kernels, and stay out of scope for this path.
 """
 
 from __future__ import annotations
@@ -32,27 +34,26 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
         "Install it with: pip install 'vllm-metal[gguf]'"
     ) from exc
 
-# qtypes MLX repacks into its affine representation via mx.load.
+# qtypes that repack into MLX's affine representation, with their bit widths.
 _BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q8_0: 8,
     GGMLQuantizationType.Q4_0: 4,
     GGMLQuantizationType.Q4_1: 4,
-}
-MLX_NATIVE_GGUF_TYPES = frozenset(_BITS)
-
-# qtypes this module repacks itself from raw GGUF block bytes (#761).
-_RAW_BLOCK_BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q4_K: 4,
     GGMLQuantizationType.Q5_K: 5,
 }
-RAW_REPACK_GGUF_TYPES = frozenset(_RAW_BLOCK_BITS)
-_ALL_BITS: dict[GGMLQuantizationType, int] = {**_BITS, **_RAW_BLOCK_BITS}
+AFFINE_GGUF_TYPES = frozenset(_BITS)
 
-# MLX's GGUF repack always groups these qtypes by 32 in the affine quant mode.
+# K-quant scales are fp32 products; the other qtypes store the file's fp16 scale.
+_FP32_SCALE_TYPES = frozenset({GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K})
+
+# Every affine qtype groups by 32 in MLX's affine quant mode.
 _GROUP_SIZE = 32
 _QUANT_MODE = "affine"
 
-_WEIGHT_SUFFIX = ".weight"
+# Rows repack in chunks of about this many weights so the repack temporaries
+# stay bounded on large embedding tables (#773).
+_REPACK_CHUNK_ELEMENTS = 1 << 24
 
 
 @dataclass(frozen=True, eq=False)
@@ -63,19 +64,18 @@ class GGUFMLXQuantizedTensor:
 
     * ``qweight`` — ``uint32`` packed weights, 2-D, shape :attr:`packed_shape`.
     * ``scales`` / ``biases`` — shape ``(out_features, in_features //
-      group_size)``; ``float16`` for :data:`MLX_NATIVE_GGUF_TYPES` (what
-      ``mx.load`` emits) and ``float32`` for :data:`RAW_REPACK_GGUF_TYPES`
-      (required for bit-exact K-quant repack, #761).
+      group_size)``; ``float32`` for Q4_K/Q5_K (required for a bit-exact
+      K-quant repack, #761) and ``float16`` for Q8_0/Q4_0/Q4_1.
     * ``qweight_type`` — a ``gguf.GGMLQuantizationType`` in
-      :data:`MLX_NATIVE_GGUF_TYPES` or :data:`RAW_REPACK_GGUF_TYPES`.
+      :data:`AFFINE_GGUF_TYPES`.
     * logical weight is ``(out_features, in_features)``; :attr:`group_size` is 32;
       :attr:`bits` is 8 for Q8_0, 5 for Q5_K, 4 for Q4_0/Q4_1/Q4_K.
     * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
       returns ``x``'s dtype; :meth:`embedding` returns an explicit ``output_dtype``.
 
     Construct directly when you already hold the affine arrays (e.g. a row slice
-    of another tensor), via :meth:`from_mx_load` from an ``mx.load`` result, or
-    via :meth:`from_raw_blocks` from a K-quant tensor's raw block bytes.
+    of another tensor), or via :meth:`from_raw_blocks` from a tensor's raw GGUF
+    block bytes.
     """
 
     qweight: mx.array
@@ -85,7 +85,7 @@ class GGUFMLXQuantizedTensor:
 
     def __post_init__(self) -> None:
         # Coerce ints to the enum (rejecting unsupported qtypes), then validate
-        # the arrays, since this is built straight from mx.load() / GGUF file data.
+        # the arrays, since this is built straight from GGUF file data.
         object.__setattr__(
             self, "qweight_type", self._normalize_qtype(self.qweight_type)
         )
@@ -98,9 +98,9 @@ class GGUFMLXQuantizedTensor:
             qweight_type = GGMLQuantizationType(value)
         except ValueError as exc:
             raise ValueError(f"Unknown GGUF quantization type: {value!r}") from exc
-        if qweight_type in _ALL_BITS:
+        if qweight_type in _BITS:
             return qweight_type
-        supported = ", ".join(t.name for t in _ALL_BITS)
+        supported = ", ".join(t.name for t in _BITS)
         raise ValueError(
             f"Unsupported GGUF quantization type for the MLX-native path: "
             f"{qweight_type.name}. Supported qtypes: {supported}."
@@ -108,15 +108,13 @@ class GGUFMLXQuantizedTensor:
 
     def _validate_contract(self) -> None:
         """Validate dtypes and the affine packing shapes against the contract."""
-        bits = _ALL_BITS[self.qweight_type]
+        bits = _BITS[self.qweight_type]
         if self.qweight.dtype != mx.uint32:
             raise ValueError(
                 f"{self.qweight_type.name} qweight must be uint32, "
                 f"got {self.qweight.dtype}"
             )
-        # Per-producer dtype: mx.load emits fp16 scales; the raw-block repack
-        # computes d*sc / -dmin*m in fp32 and fp16 would lose bit-exactness.
-        if self.qweight_type in RAW_REPACK_GGUF_TYPES:
+        if self.qweight_type in _FP32_SCALE_TYPES:
             expected, expected_name = mx.float32, "float32"
         else:
             expected, expected_name = mx.float16, "float16"
@@ -159,58 +157,13 @@ class GGUFMLXQuantizedTensor:
             )
 
     @classmethod
-    def from_mx_load(
-        cls,
-        arrays: dict[str, mx.array],
-        weight_name: str,
-        qweight_type: GGMLQuantizationType,
-    ) -> GGUFMLXQuantizedTensor:
-        """Build from an ``mx.load`` result.
-
-        ``weight_name`` is the original GGUF tensor name (``....weight``); MLX
-        stores the companion scales/biases under the same prefix. ``qweight_type``
-        is supplied by the caller because ``mx.load`` does not expose per-tensor
-        quant types — a loader reads it from ``gguf.GGUFReader``.
-        """
-        qweight_type = cls._normalize_qtype(qweight_type)
-        if qweight_type in RAW_REPACK_GGUF_TYPES:
-            raise ValueError(
-                f"{qweight_type.name} is repacked from raw GGUF blocks, not by "
-                "mx.load; build it with from_raw_blocks."
-            )
-        if not weight_name.endswith(_WEIGHT_SUFFIX):
-            raise ValueError(
-                f"GGUF weight name must end with '{_WEIGHT_SUFFIX}', got "
-                f"{weight_name!r}"
-            )
-        prefix = weight_name[: -len(_WEIGHT_SUFFIX)]
-        scales_name = f"{prefix}.scales"
-        biases_name = f"{prefix}.biases"
-        missing = [
-            n for n in (weight_name, scales_name, biases_name) if n not in arrays
-        ]
-        if missing:
-            raise ValueError(
-                f"{qweight_type.name} tensor {weight_name!r} is missing MLX repack "
-                f"arrays {missing}; MLX did not natively repack this tensor with the "
-                f"current MLX version, so this qtype is not supported by the "
-                f"MLX-native GGUF path"
-            )
-        return cls(
-            qweight=arrays[weight_name],
-            scales=arrays[scales_name],
-            biases=arrays[biases_name],
-            qweight_type=qweight_type,
-        )
-
-    @classmethod
     def from_raw_blocks(
         cls,
         block_data: np.ndarray,
         logical_shape: tuple[int, int],
         qweight_type: GGMLQuantizationType,
     ) -> GGUFMLXQuantizedTensor:
-        """Repack a K-quant tensor's raw GGUF block bytes into the affine triple.
+        """Repack a tensor's raw GGUF block bytes into the affine triple.
 
         ``block_data`` is the tensor's byte payload as stored in the file
         (``uint8``, ``gguf.GGUFReader`` order); ``logical_shape`` is
@@ -219,13 +172,6 @@ class GGUFMLXQuantizedTensor:
         instead of being reshaped into the expected layout.
         """
         qweight_type = cls._normalize_qtype(qweight_type)
-        if qweight_type not in RAW_REPACK_GGUF_TYPES:
-            supported = ", ".join(t.name for t in _RAW_BLOCK_BITS)
-            raise ValueError(
-                f"{qweight_type.name} is not repacked from raw blocks; "
-                f"raw-block qtypes: {supported}. mx.load-native qtypes go "
-                "through from_mx_load."
-            )
         if len(logical_shape) != 2 or any(dim < 1 for dim in logical_shape):
             raise ValueError(
                 f"{qweight_type.name} logical_shape must be 2-D and positive, "
@@ -250,24 +196,78 @@ class GGUFMLXQuantizedTensor:
                 f"bytes; logical shape {logical_shape} needs {expected_bytes}"
             )
 
-        blocks = np.ascontiguousarray(block_data).reshape(-1, block_bytes)
-        if qweight_type is GGMLQuantizationType.Q4_K:
-            codes, scales, biases = cls._parse_q4_k(blocks)
-        else:
-            codes, scales, biases = cls._parse_q5_k(blocks)
-        bits = _RAW_BLOCK_BITS[qweight_type]
+        parse = {
+            GGMLQuantizationType.Q8_0: cls._parse_q8_0,
+            GGMLQuantizationType.Q4_0: cls._parse_q4_0,
+            GGMLQuantizationType.Q4_1: cls._parse_q4_1,
+            GGMLQuantizationType.Q4_K: cls._parse_q4_k,
+            GGMLQuantizationType.Q5_K: cls._parse_q5_k,
+        }[qweight_type]
+        bits = _BITS[qweight_type]
         num_groups = in_features // _GROUP_SIZE
+        scale_dtype = mx.float32 if qweight_type in _FP32_SCALE_TYPES else mx.float16
+        rows = np.ascontiguousarray(block_data).reshape(out_features, -1)
+        qweight = mx.zeros((out_features, num_groups * bits), mx.uint32)
+        scales = mx.zeros((out_features, num_groups), scale_dtype)
+        biases = mx.zeros((out_features, num_groups), scale_dtype)
+        chunk_rows = max(1, _REPACK_CHUNK_ELEMENTS // in_features)
+        for start in range(0, out_features, chunk_rows):
+            stop = min(start + chunk_rows, out_features)
+            codes, chunk_scales, chunk_biases = parse(
+                mx.array(rows[start:stop]).reshape(-1, block_bytes)
+            )
+            qweight[start:stop] = cls._pack_codes_le(
+                codes.reshape(stop - start, in_features), bits
+            )
+            scales[start:stop] = chunk_scales.reshape(stop - start, num_groups)
+            biases[start:stop] = chunk_biases.reshape(stop - start, num_groups)
+            # Evaluating per chunk writes it in place and frees its temporaries.
+            mx.eval(qweight, scales, biases)
         return cls(
-            qweight=mx.array(
-                cls._pack_codes_le(codes.reshape(out_features, in_features), bits)
-            ),
-            scales=mx.array(scales.reshape(out_features, num_groups)),
-            biases=mx.array(biases.reshape(out_features, num_groups)),
+            qweight=qweight,
+            scales=scales,
+            biases=biases,
             qweight_type=qweight_type,
         )
 
     @staticmethod
-    def _parse_q4_k(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _parse_q8_0(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 34-byte Q8_0 blocks (fp16 ``d``, 32 int8 ``q``; ``w = d*q``).
+
+        Flipping the sign bit turns each int8 into the unsigned code ``q+128``,
+        so ``scale = d`` and ``bias = -128*d``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        codes = blocks[:, 2:34] ^ 0x80
+        return codes, d, d * -128
+
+    @staticmethod
+    def _parse_q4_0(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 18-byte Q4_0 blocks (fp16 ``d``, 16 nibble bytes).
+
+        Byte ``j`` holds element ``j`` in its low nibble and element ``j+16``
+        in its high nibble; ``w = d*(q-8)``, so ``scale = d`` and ``bias = -8*d``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        nibbles = blocks[:, 2:18]
+        codes = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
+        return codes, d, d * -8
+
+    @staticmethod
+    def _parse_q4_1(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 20-byte Q4_1 blocks (fp16 ``d``, fp16 ``m``, 16 nibble bytes).
+
+        The nibble order matches Q4_0 and ``w = d*q + m``, so ``scale = d`` and
+        ``bias = m``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        m = blocks[:, 2:4].view(mx.float16)
+        nibbles = blocks[:, 4:20]
+        codes = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
+        return codes, d, m
+
+    @staticmethod
+    def _parse_q4_k(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Split Q4_K superblocks into 4-bit codes and fp32 group-32 affine.
 
         Each 144-byte superblock holds 256 weights: fp16 ``d`` and ``dmin``,
@@ -280,7 +280,7 @@ class GGUFMLXQuantizedTensor:
         return codes, scales, biases
 
     @staticmethod
-    def _parse_q5_k(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _parse_q5_k(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Split Q5_K superblocks into 5-bit codes and fp32 group-32 affine.
 
         A 176-byte superblock is the Q4_K header (``d``, ``dmin``, the 6-bit
@@ -289,70 +289,72 @@ class GGUFMLXQuantizedTensor:
         ``qh[e]`` as its fifth bit.
         """
         scales, biases = GGUFMLXQuantizedTensor._parse_kquant_scale_mins(blocks)
-        codes = GGUFMLXQuantizedTensor._split_nibble_chunks(blocks[:, 48:176])
+        low = GGUFMLXQuantizedTensor._split_nibble_chunks(blocks[:, 48:176])
         qh = blocks[:, 16:48]
-        group_bits = np.arange(8, dtype=np.uint8)[None, :, None]
-        # codes is already uint32; the high-bit plane stays uint8 and is merged
-        # in place, avoiding another full-size uint32 temporary (#773).
-        codes |= ((qh[:, None, :] >> group_bits) & np.uint8(1)) << np.uint8(4)
-        return codes, scales, biases
+        group_bits = mx.arange(8, dtype=mx.uint8)[None, :, None]
+        high = ((qh[:, None, :] >> group_bits) & 1) << 4
+        return low | high, scales, biases
 
     @staticmethod
-    def _parse_kquant_scale_mins(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _parse_kquant_scale_mins(blocks: mx.array) -> tuple[mx.array, mx.array]:
         """Decode the shared K-quant header into fp32 group scales/biases."""
-        n_blocks = blocks.shape[0]
-        d = blocks[:, 0:2].copy().view(np.float16).astype(np.float32)
-        dmin = blocks[:, 2:4].copy().view(np.float16).astype(np.float32)
+        d = blocks[:, 0:2].view(mx.float16).astype(mx.float32)
+        dmin = blocks[:, 2:4].view(mx.float16).astype(mx.float32)
         packed = blocks[:, 4:16]
-        sub_scales = np.empty((n_blocks, 8), np.float32)
-        sub_mins = np.empty((n_blocks, 8), np.float32)
-        sub_scales[:, 0:4] = packed[:, 0:4] & 0x3F
-        sub_mins[:, 0:4] = packed[:, 4:8] & 0x3F
-        sub_scales[:, 4:8] = (packed[:, 8:12] & 0x0F) | ((packed[:, 0:4] >> 6) << 4)
-        sub_mins[:, 4:8] = (packed[:, 8:12] >> 4) | ((packed[:, 4:8] >> 6) << 4)
+        sub_scales = mx.concatenate(
+            [
+                packed[:, 0:4] & 0x3F,
+                (packed[:, 8:12] & 0x0F) | ((packed[:, 0:4] >> 6) << 4),
+            ],
+            axis=1,
+        ).astype(mx.float32)
+        sub_mins = mx.concatenate(
+            [
+                packed[:, 4:8] & 0x3F,
+                (packed[:, 8:12] >> 4) | ((packed[:, 4:8] >> 6) << 4),
+            ],
+            axis=1,
+        ).astype(mx.float32)
         return d * sub_scales, -(dmin * sub_mins)
 
     @staticmethod
-    def _split_nibble_chunks(nibble_bytes: np.ndarray) -> np.ndarray:
+    def _split_nibble_chunks(nibble_bytes: mx.array) -> mx.array:
         """Split 128 nibble bytes into (n, 8, 32) codes; chunk ``j`` of 32
         bytes carries group ``2j`` low and group ``2j+1`` high."""
         n_blocks = nibble_bytes.shape[0]
-        nibbles = nibble_bytes.reshape(n_blocks, 4, 32)
-        codes = np.empty((n_blocks, 8, 32), np.uint32)
-        codes[:, 0::2, :] = nibbles & 0x0F
-        codes[:, 1::2, :] = nibbles >> 4
-        return codes
+        nibbles = nibble_bytes.reshape(n_blocks, 4, 1, 32)
+        halves = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=2)
+        return halves.reshape(n_blocks, 8, 32)
 
     @staticmethod
-    def _pack_codes_le(codes: np.ndarray, bits: int) -> np.ndarray:
+    def _pack_codes_le(codes: mx.array, bits: int) -> mx.array:
         """Pack per-row integer codes into MLX's packed ``uint32`` layout.
 
         Element ``i`` occupies flat bits ``[i*bits, (i+1)*bits)``,
-        little-endian. When ``bits`` divides 32, ``32 // bits`` codes pack
-        directly into each word; otherwise 32 codes fill exactly ``bits``
+        little-endian. For 8- and 4-bit codes that layout is just the packed
+        bytes read as ``uint32``; otherwise 32 codes fill exactly ``bits``
         words and codes straddle word boundaries.
         """
         rows = codes.shape[0]
-        if 32 % bits == 0:
-            codes_per_word = 32 // bits
-            grouped = codes.reshape(rows, -1, codes_per_word)
-            shifts = np.arange(codes_per_word, dtype=np.uint32) * bits
-            return np.bitwise_or.reduce(grouped << shifts, axis=-1)
+        if bits == 8:
+            return codes.view(mx.uint32)
+        if bits == 4:
+            return (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(mx.uint32)
         # uint32 shifts drop the overflowing high bits, which are OR'd into the
-        # next word separately; temporaries stay one (rows, groups) slice each.
-        grouped = codes.reshape(rows, -1, 32)
-        words = np.zeros((rows, grouped.shape[1], bits), np.uint32)
+        # next word separately.
+        grouped = codes.reshape(rows, -1, 32).astype(mx.uint32)
+        words = [mx.zeros(grouped.shape[:2], mx.uint32) for _ in range(bits)]
         for position in range(32):
             word, shift = divmod(position * bits, 32)
-            words[:, :, word] |= grouped[:, :, position] << np.uint32(shift)
+            code = grouped[:, :, position]
+            words[word] = words[word] | (code << shift)
             if shift + bits > 32:
-                spill = grouped[:, :, position] >> np.uint32(32 - shift)
-                words[:, :, word + 1] |= spill
-        return words.reshape(rows, -1)
+                words[word + 1] = words[word + 1] | (code >> (32 - shift))
+        return mx.stack(words, axis=-1).reshape(rows, -1)
 
     @property
     def bits(self) -> int:
-        return _ALL_BITS[self.qweight_type]
+        return _BITS[self.qweight_type]
 
     @property
     def group_size(self) -> int:

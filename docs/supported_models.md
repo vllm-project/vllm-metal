@@ -74,10 +74,8 @@ quantized (Q8_0/Q4_0/Q4_1, not a dense fallback). Scope is dense
 with per-tensor `Q8_0`/`Q4_0`/`Q4_1`; K-quants, fused-QKV, MoE, SSM/hybrid,
 vision, ambiguous remote matches, and sharded remote GGUF files are rejected
 with a clear error. See [GGUF](gguf.md) for serve examples and source
-precedence. The narrow exception is an unused tied `output.weight`: MLX may
-briefly materialize an unsupported qtype such as Q6_K as FP16 before the loader
-discards it. Preflight limits that transient table to 512 MiB. Verified
-end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
+precedence. A tied model's unused `output.weight` is skipped whatever its
+qtype. Verified end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 

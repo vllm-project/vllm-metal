@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the MLX-native GGUF representation and primitives.
 
-Fixtures are written with the upstream ``gguf`` package and read back through
-``mx.load`` so the tests exercise MLX's real GGUF repack, and parity is checked
-against ``gguf.quants.dequantize`` (the upstream reference), never a local
-re-implementation of the packing. K-quant fixtures are built as raw blocks
-field-by-field because gguf-py cannot quantize them; ``gguf.quants.dequantize``
-still defines what those blocks mean.
+Legacy fixtures are quantized with the upstream ``gguf`` package and repacked
+through ``from_raw_blocks``; parity is checked against ``gguf.quants.dequantize``
+(the upstream reference), never a local re-implementation of the packing, and a
+canary pins the legacy repack byte for byte to MLX's own ``mx.load`` repack.
+K-quant fixtures are built as raw blocks field-by-field because gguf-py cannot
+quantize them; ``gguf.quants.dequantize`` still defines what those blocks mean.
 """
 
 from __future__ import annotations
@@ -19,45 +19,41 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
+import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
 from vllm_metal.gguf.mlx_native import (  # noqa: E402
-    MLX_NATIVE_GGUF_TYPES,
+    AFFINE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
 )
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
 
-NATIVE_QTYPES = [
+LEGACY_QTYPES = [
     GGMLQuantizationType.Q8_0,
     GGMLQuantizationType.Q4_0,
     GGMLQuantizationType.Q4_1,
 ]
 
 
-def _write_quantized_gguf(path, weight: np.ndarray, qtype) -> dict[str, mx.array]:
-    """Quantize ``weight`` to ``qtype``, write a 1-tensor GGUF, return mx.load()."""
-    raw = gguf.quants.quantize(weight, qtype)
+def _write_single_tensor_gguf(path, raw: np.ndarray, qtype) -> None:
     writer = gguf.GGUFWriter(str(path), "llama")
     writer.add_tensor("w.weight", raw, raw_shape=raw.shape, raw_dtype=qtype)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    return mx.load(str(path))
 
 
-def _make_tensor(tmp_path, qtype, shape=(64, 128)) -> tuple:
+def _make_tensor(qtype, shape=(64, 128)) -> tuple:
     weight = np.random.default_rng(0).standard_normal(shape).astype(np.float32)
-    arrays = _write_quantized_gguf(tmp_path / f"{qtype.name}.gguf", weight, qtype)
-    qt = GGUFMLXQuantizedTensor.from_mx_load(arrays, "w.weight", qtype)
-    oracle = gguf.quants.dequantize(gguf.quants.quantize(weight, qtype), qtype).astype(
-        np.float32
-    )
+    raw = gguf.quants.quantize(weight, qtype)
+    qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, shape, qtype)
+    oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_contract_matches_logical_shape(tmp_path, qtype):
-    qt, _ = _make_tensor(tmp_path, qtype, shape=(64, 128))
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_contract_matches_logical_shape(qtype):
+    qt, _ = _make_tensor(qtype, shape=(64, 128))
 
     assert qt.qweight_type == qtype
     assert qt.bits == (8 if qtype == GGMLQuantizationType.Q8_0 else 4)
@@ -68,9 +64,9 @@ def test_contract_matches_logical_shape(tmp_path, qtype):
     assert qt.packed_shape == tuple(qt.qweight.shape)
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_matmul_matches_dense_oracle_f32(tmp_path, qtype):
-    qt, oracle = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_matmul_matches_dense_oracle_f32(qtype):
+    qt, oracle = _make_tensor(qtype)
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
@@ -86,9 +82,9 @@ def test_matmul_matches_dense_oracle_f32(tmp_path, qtype):
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_matmul_output_dtype_follows_x(tmp_path, qtype, dtype):
-    qt, _ = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_matmul_output_dtype_follows_x(qtype, dtype):
+    qt, _ = _make_tensor(qtype)
     x = mx.random.normal((4, qt.in_features)).astype(dtype)
 
     out = qt.matmul(x)
@@ -97,9 +93,9 @@ def test_matmul_output_dtype_follows_x(tmp_path, qtype, dtype):
     assert out.shape == (4, qt.out_features)
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_matmul_preserves_leading_shape(tmp_path, qtype):
-    qt, _ = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_matmul_preserves_leading_shape(qtype):
+    qt, _ = _make_tensor(qtype)
     x = mx.random.normal((2, 3, qt.in_features)).astype(mx.float16)
 
     out = qt.matmul(x)
@@ -110,9 +106,9 @@ def test_matmul_preserves_leading_shape(tmp_path, qtype):
     assert mx.array_equal(out.reshape(-1, qt.out_features), flat)
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_matmul_empty_batch(tmp_path, qtype):
-    qt, _ = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_matmul_empty_batch(qtype):
+    qt, _ = _make_tensor(qtype)
 
     out = qt.matmul(mx.zeros((0, qt.in_features), dtype=mx.float16))
 
@@ -120,9 +116,9 @@ def test_matmul_empty_batch(tmp_path, qtype):
     assert out.dtype == mx.float16
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_matches_oracle_rows(tmp_path, qtype):
-    qt, oracle = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_embedding_matches_oracle_rows(qtype):
+    qt, oracle = _make_tensor(qtype)
     ids = mx.array([[0, 5], [63, 0]], dtype=mx.int32)
 
     out = qt.embedding(ids, output_dtype=mx.float32)
@@ -138,11 +134,11 @@ def test_embedding_matches_oracle_rows(tmp_path, qtype):
     )
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_as_linear_matches_matmul(tmp_path, qtype):
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_embedding_as_linear_matches_matmul(qtype):
     # A tied lm_head reuses the embedding table as a linear weight; the same
     # quantized tensor must work through matmul (the PR-2 tied-head path).
-    qt, oracle = _make_tensor(tmp_path, qtype, shape=(100, 64))
+    qt, oracle = _make_tensor(qtype, shape=(100, 64))
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
@@ -155,9 +151,9 @@ def test_embedding_as_linear_matches_matmul(tmp_path, qtype):
     )
 
 
-def test_accepts_int_qweight_type(tmp_path):
+def test_accepts_int_qweight_type():
     # A loader may pass the raw GGML type id; it must normalize to the enum.
-    qt, _ = _make_tensor(tmp_path, GGMLQuantizationType.Q8_0)
+    qt, _ = _make_tensor(GGMLQuantizationType.Q8_0)
     rebuilt = GGUFMLXQuantizedTensor(
         qweight=qt.qweight,
         scales=qt.scales,
@@ -198,18 +194,6 @@ def test_rejects_inconsistent_packed_dim():
         )
 
 
-def test_from_mx_load_rejects_missing_companions(tmp_path):
-    weight = np.random.default_rng(0).standard_normal((32, 64)).astype(np.float32)
-    arrays = _write_quantized_gguf(
-        tmp_path / "q8.gguf", weight, GGMLQuantizationType.Q8_0
-    )
-    del arrays["w.scales"]
-    with pytest.raises(ValueError, match="missing MLX repack arrays"):
-        GGUFMLXQuantizedTensor.from_mx_load(
-            arrays, "w.weight", GGMLQuantizationType.Q8_0
-        )
-
-
 def test_rejects_non_float16_scales():
     with pytest.raises(ValueError, match="scales must be float16"):
         GGUFMLXQuantizedTensor(
@@ -240,35 +224,30 @@ def test_rejects_scales_rows_mismatch():
         )
 
 
-def test_from_mx_load_rejects_non_weight_name(tmp_path):
-    weight = np.random.default_rng(0).standard_normal((32, 64)).astype(np.float32)
-    arrays = _write_quantized_gguf(
-        tmp_path / "q8.gguf", weight, GGMLQuantizationType.Q8_0
-    )
-    with pytest.raises(ValueError, match="must end with '.weight'"):
-        GGUFMLXQuantizedTensor.from_mx_load(arrays, "w", GGMLQuantizationType.Q8_0)
-
-
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_mx_load_layout_is_affine_group32(tmp_path, qtype):
-    # Canary: assert mx.load's raw repack output directly (not via the
-    # constructor) so a future MLX layout/dtype drift surfaces here.
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_legacy_repack_matches_mx_load(tmp_path, qtype):
+    # Canary: the legacy repack stays byte-identical to MLX's own GGUF repack,
+    # so reading legacy files without mx.load changes no installed value.
     weight = np.random.default_rng(0).standard_normal((64, 128)).astype(np.float32)
-    arrays = _write_quantized_gguf(tmp_path / f"{qtype.name}.gguf", weight, qtype)
-    bits = 8 if qtype == GGMLQuantizationType.Q8_0 else 4
+    raw = gguf.quants.quantize(weight, qtype)
+    path = tmp_path / f"{qtype.name}.gguf"
+    _write_single_tensor_gguf(path, raw, qtype)
+    arrays = mx.load(str(path))
 
-    assert arrays["w.weight"].dtype == mx.uint32
-    assert arrays["w.scales"].dtype == mx.float16
-    assert arrays["w.biases"].dtype == mx.float16
-    assert arrays["w.scales"].shape == arrays["w.biases"].shape
-    num_groups = arrays["w.scales"].shape[1]
-    assert num_groups == 128 // 32
-    assert arrays["w.weight"].shape[1] == num_groups * bits
+    qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (64, 128), qtype)
+
+    for ours, theirs in (
+        (qt.qweight, arrays["w.weight"]),
+        (qt.scales, arrays["w.scales"]),
+        (qt.biases, arrays["w.biases"]),
+    ):
+        assert ours.dtype == theirs.dtype
+        assert np.array_equal(np.array(ours), np.array(theirs))
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_embedding_empty_ids(tmp_path, qtype):
-    qt, _ = _make_tensor(tmp_path, qtype)
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_embedding_empty_ids(qtype):
+    qt, _ = _make_tensor(qtype)
 
     out = qt.embedding(mx.zeros((0,), dtype=mx.int32), output_dtype=mx.float16)
     assert out.shape == (0, qt.in_features)
@@ -277,7 +256,7 @@ def test_embedding_empty_ids(tmp_path, qtype):
 
 # --- K-quant raw-block repack (#761) -------------------------------------------
 
-RAW_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
+KQUANT_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
 
 
 def _build_kquant_blocks(rows: int, cols: int, qtype, seed: int = 0) -> np.ndarray:
@@ -333,7 +312,7 @@ def test_kquant_contract_matches_logical_shape(qtype, bits):
     assert qt.biases.dtype == mx.float32
 
 
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
+@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
 def test_kquant_dequantize_matches_oracle_bit_exact(qtype):
     qt, oracle = _make_kquant_tensor(qtype)
 
@@ -345,7 +324,7 @@ def test_kquant_dequantize_matches_oracle_bit_exact(qtype):
     assert np.array_equal(np.array(deq), oracle)
 
 
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
+@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
 def test_kquant_matmul_matches_dense_oracle_f32(qtype):
     qt, oracle = _make_kquant_tensor(qtype)
     x = mx.random.normal((3, qt.in_features)).astype(mx.float32)
@@ -363,7 +342,7 @@ def test_kquant_matmul_matches_dense_oracle_f32(qtype):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
+@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
 def test_kquant_matmul_output_dtype_follows_x(qtype, dtype):
     # The fp32-scales arm promotes differently than fp16 scales; the x-dtype
     # contract must hold on it too.
@@ -376,7 +355,7 @@ def test_kquant_matmul_output_dtype_follows_x(qtype, dtype):
     assert out.shape == (4, qt.out_features)
 
 
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
+@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
 def test_kquant_embedding_matches_oracle_rows_exactly(qtype):
     qt, oracle = _make_kquant_tensor(qtype)
     ids = mx.array([0, 3, 7], dtype=mx.int32)
@@ -388,7 +367,7 @@ def test_kquant_embedding_matches_oracle_rows_exactly(qtype):
     assert np.array_equal(np.array(out), oracle[np.array([0, 3, 7])])
 
 
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
+@pytest.mark.parametrize("qtype", KQUANT_QTYPES)
 def test_kquant_requires_float32_scales(qtype):
     qt, _ = _make_kquant_tensor(qtype)
 
@@ -399,19 +378,6 @@ def test_kquant_requires_float32_scales(qtype):
             biases=qt.biases.astype(mx.float16),
             qweight_type=qtype,
         )
-
-
-def test_from_raw_blocks_rejects_native_qtype():
-    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
-
-    with pytest.raises(ValueError, match="not repacked from raw blocks"):
-        GGUFMLXQuantizedTensor.from_raw_blocks(raw, (8, 512), GGMLQuantizationType.Q8_0)
-
-
-@pytest.mark.parametrize("qtype", RAW_QTYPES)
-def test_from_mx_load_rejects_raw_block_qtype(qtype):
-    with pytest.raises(ValueError, match="build it with from_raw_blocks"):
-        GGUFMLXQuantizedTensor.from_mx_load({}, "w.weight", qtype)
 
 
 def test_from_raw_blocks_rejects_truncated_payload():
@@ -439,13 +405,34 @@ def test_from_raw_blocks_rejects_non_uint8_payload():
         )
 
 
+def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
+    if qtype in KQUANT_QTYPES:
+        return _build_kquant_blocks(rows, cols, qtype)
+    weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
+    return gguf.quants.quantize(weight, qtype)
+
+
+@pytest.mark.parametrize("qtype", [*LEGACY_QTYPES, *KQUANT_QTYPES])
+def test_chunked_repack_matches_single_pass(monkeypatch, qtype):
+    raw = _raw_blocks(qtype, 16, 512)
+    expected = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (16, 512), qtype)
+    # Three rows per chunk leaves a one-row final chunk.
+    monkeypatch.setattr(mlx_native, "_REPACK_CHUNK_ELEMENTS", 3 * 512)
+
+    chunked = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (16, 512), qtype)
+
+    assert mx.array_equal(chunked.qweight, expected.qweight)
+    assert mx.array_equal(chunked.scales, expected.scales)
+    assert mx.array_equal(chunked.biases, expected.biases)
+
+
 # --- Real-file parity (opt-in: needs local GGUF files) ------------------------
 #
 # Set VLLM_METAL_TEST_GGUF_PATHS to a comma-separated list of real .gguf files
 # to run these. They prove the representation and primitives hold on real
-# checkpoints — every MLX-native tensor constructs, with matmul/embedding parity
+# checkpoints — every affine tensor constructs, with matmul/embedding parity
 # vs the gguf-py dequantize oracle and a quantized-vs-dense memory comparison.
-# Each file is checked for whichever native qtypes it contains.
+# Each file is checked for whichever affine qtypes it contains.
 
 _REAL_GGUF_PATHS = [
     p.strip()
@@ -459,25 +446,28 @@ _real_gguf = pytest.mark.skipif(
 _real_param = pytest.mark.parametrize("path", _REAL_GGUF_PATHS)
 
 
-def _native_tensors(path):
-    """Return (mx.load arrays, {name: GGUFReader tensor}) for MLX-native qtypes."""
+def _affine_tensors(path):
+    """Return {name: GGUFReader tensor} for the affine qtypes in ``path``."""
     reader = gguf.GGUFReader(path)
-    arrays = mx.load(path)
-    native = {
-        t.name: t for t in reader.tensors if t.tensor_type in MLX_NATIVE_GGUF_TYPES
-    }
-    return arrays, native
+    return {t.name: t for t in reader.tensors if t.tensor_type in AFFINE_GGUF_TYPES}
+
+
+def _from_reader(tensor) -> GGUFMLXQuantizedTensor:
+    # GGUF stores dims in reverse (ne[0] = in_features); logical is (out, in).
+    logical = tuple(int(d) for d in reversed(tensor.shape))
+    return GGUFMLXQuantizedTensor.from_raw_blocks(
+        tensor.data.reshape(-1), logical, tensor.tensor_type
+    )
 
 
 @pytest.mark.slow
 @_real_gguf
 @_real_param
-def test_real_file_all_native_tensors_construct(path):
-    arrays, native = _native_tensors(path)
-    assert native, "expected MLX-native quantized tensors in the test GGUF"
-    for name, tensor in native.items():
-        qt = GGUFMLXQuantizedTensor.from_mx_load(arrays, name, tensor.tensor_type)
-        # GGUF stores dims in reverse (ne[0] = in_features); logical is (out, in).
+def test_real_file_all_affine_tensors_construct(path):
+    affine = _affine_tensors(path)
+    assert affine, "expected affine quantized tensors in the test GGUF"
+    for tensor in affine.values():
+        qt = _from_reader(tensor)
         in_features, out_features = (int(d) for d in tensor.shape)
         assert qt.logical_shape == (out_features, in_features)
 
@@ -486,13 +476,13 @@ def test_real_file_all_native_tensors_construct(path):
 @_real_gguf
 @_real_param
 def test_real_file_linear_parity_vs_oracle(path):
-    arrays, native = _native_tensors(path)
+    affine = _affine_tensors(path)
     # Any internal projection (not the embedding/output table) is a linear.
     name = next(
-        n for n in native if not n.endswith(("token_embd.weight", "output.weight"))
+        n for n in affine if not n.endswith(("token_embd.weight", "output.weight"))
     )
-    tensor = native[name]
-    qt = GGUFMLXQuantizedTensor.from_mx_load(arrays, name, tensor.tensor_type)
+    tensor = affine[name]
+    qt = _from_reader(tensor)
     oracle = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
 
     x = mx.random.normal((4, qt.in_features)).astype(mx.float32)
@@ -510,10 +500,12 @@ def test_real_file_linear_parity_vs_oracle(path):
 @_real_gguf
 @_real_param
 def test_real_file_embedding_parity_vs_oracle(path):
-    arrays, native = _native_tensors(path)
-    name = next(n for n in native if n.endswith("token_embd.weight"))
-    tensor = native[name]
-    qt = GGUFMLXQuantizedTensor.from_mx_load(arrays, name, tensor.tensor_type)
+    affine = _affine_tensors(path)
+    name = next((n for n in affine if n.endswith("token_embd.weight")), None)
+    if name is None:
+        pytest.skip("token_embd.weight is not an affine qtype in this file")
+    tensor = affine[name]
+    qt = _from_reader(tensor)
     oracle = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
 
     ids = mx.array([0, 100, qt.out_features - 1], dtype=mx.int32)
@@ -531,15 +523,15 @@ def test_real_file_embedding_parity_vs_oracle(path):
 @_real_gguf
 @_real_param
 def test_real_file_memory_below_dense(path):
-    arrays, native = _native_tensors(path)
     quantized = dense_f16 = 0
-    for name, tensor in native.items():
-        qt = GGUFMLXQuantizedTensor.from_mx_load(arrays, name, tensor.tensor_type)
+    for tensor in _affine_tensors(path).values():
+        qt = _from_reader(tensor)
         quantized += qt.qweight.nbytes + qt.scales.nbytes + qt.biases.nbytes
         dense_f16 += qt.out_features * qt.in_features * 2
 
-    # Per weight: Q8_0 ~1.125 bytes, Q4_0/Q4_1 ~0.625 (packed + f16
-    # scale/bias) vs 2 for dense f16, so any native mix stays below 0.6x dense.
+    # Per weight: Q8_0 ~1.125 bytes, Q5_K ~0.875 and Q4_K ~0.75 (fp32
+    # scale/bias), Q4_0/Q4_1 ~0.625 vs 2 for dense f16, so any mix stays
+    # below 0.6x dense.
     assert quantized < dense_f16 * 0.6
 
 
@@ -661,11 +653,11 @@ def test_real_generate_matches_dense():
 # === permute_rows (llama RoPE q/k un-permutation mechanism) ===
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_permute_rows_matches_dequant_then_gather(tmp_path, qtype):
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_permute_rows_matches_dequant_then_gather(qtype):
     # Reordering the packed qweight + scales + biases together must be bit-exact
     # to dequantizing then gathering the same rows.
-    qt, oracle = _make_tensor(tmp_path, qtype, shape=(64, 128))
+    qt, oracle = _make_tensor(qtype, shape=(64, 128))
     index = mx.array(np.random.default_rng(1).permutation(64))
 
     permuted = qt.permute_rows(index)
@@ -678,11 +670,11 @@ def test_permute_rows_matches_dequant_then_gather(tmp_path, qtype):
     assert bool(mx.allclose(got, want, atol=1e-3).item())
 
 
-@pytest.mark.parametrize("qtype", NATIVE_QTYPES)
-def test_permute_rows_round_trips_via_inverse(tmp_path, qtype):
+@pytest.mark.parametrize("qtype", LEGACY_QTYPES)
+def test_permute_rows_round_trips_via_inverse(qtype):
     # The index is not an involution for head_dim > 4, so the inverse is
     # argsort(index), not the index itself.
-    qt, oracle = _make_tensor(tmp_path, qtype, shape=(64, 128))
+    qt, oracle = _make_tensor(qtype, shape=(64, 128))
     index = mx.array(np.random.default_rng(3).permutation(64))
 
     restored = qt.permute_rows(index).permute_rows(mx.argsort(index))
@@ -691,8 +683,8 @@ def test_permute_rows_round_trips_via_inverse(tmp_path, qtype):
     assert bool(mx.allclose(restored.matmul(x), qt.matmul(x), atol=1e-4).item())
 
 
-def test_permute_rows_rejects_non_permutation(tmp_path):
-    qt, _ = _make_tensor(tmp_path, GGMLQuantizationType.Q8_0, shape=(64, 128))
+def test_permute_rows_rejects_non_permutation():
+    qt, _ = _make_tensor(GGMLQuantizationType.Q8_0, shape=(64, 128))
     with pytest.raises(ValueError) as short:
         qt.permute_rows(mx.arange(32))
     assert str(short.value) == (

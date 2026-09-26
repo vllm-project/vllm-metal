@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -19,22 +18,20 @@ except ImportError as exc:
     ) from exc
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model, load_tokenizer
 
 from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
-from vllm_metal.gguf.mlx_native import MLX_NATIVE_GGUF_TYPES, GGUFMLXQuantizedTensor
+from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
 __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 
-logger = logging.getLogger(__name__)
-
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
-_MAX_TIED_OUTPUT_FALLBACK_BYTES = 512 * 1024 * 1024
 _PLAIN_GGUF_TYPES = frozenset(
     {
         gguf.GGMLQuantizationType.F32,
@@ -42,7 +39,14 @@ _PLAIN_GGUF_TYPES = frozenset(
         gguf.GGMLQuantizationType.BF16,
     }
 )
-_ALLOWED_WEIGHT_TYPES = frozenset(MLX_NATIVE_GGUF_TYPES) | _PLAIN_GGUF_TYPES
+_QUANT_GGUF_TYPES = frozenset(
+    {
+        gguf.GGMLQuantizationType.Q8_0,
+        gguf.GGMLQuantizationType.Q4_0,
+        gguf.GGMLQuantizationType.Q4_1,
+    }
+)
+_ALLOWED_WEIGHT_TYPES = _QUANT_GGUF_TYPES | _PLAIN_GGUF_TYPES
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 
 
@@ -167,7 +171,7 @@ class GGUFModelLoader:
         return reader, load_config(self._config_dir)
 
     def _preflight(self, reader: Any) -> None:
-        """Reject out-of-scope tensors / qtypes from the reader, before ``mx.load``."""
+        """Reject out-of-scope tensors / qtypes from the reader, before any load."""
         for tensor in reader.tensors:
             name = tensor.name
             if any(
@@ -198,37 +202,20 @@ class GGUFModelLoader:
                 )
 
     def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:
-        """Validate ``output.weight`` after the live model resolves weight tying."""
+        """Validate ``output.weight`` after the live model resolves weight tying.
+
+        A tied model never reads the redundant table, so its qtype is irrelevant.
+        """
         output = next(
             (tensor for tensor in reader.tensors if tensor.name == "output.weight"),
             None,
         )
-        if output is None or output.tensor_type in _ALLOWED_WEIGHT_TYPES:
+        if output is None or tied or output.tensor_type in _ALLOWED_WEIGHT_TYPES:
             return
-        if not tied:
-            raise GGUFLoadError(
-                f"Unsupported qtype {output.tensor_type.name} on mapped weight "
-                "'output.weight'; only Q8_0/Q4_0/Q4_1 (and plain "
-                "F32/F16/BF16) are supported."
-            )
-
-        # MLX currently converts unsupported GGUF qtypes to FP16 before returning
-        # from mx.load. The tied output is redundant and immediately discarded,
-        # but cap that unavoidable transient allocation so a large vocabulary
-        # cannot cause an unbounded memory spike.
-        fallback_bytes = int(output.n_elements) * 2
-        if fallback_bytes > _MAX_TIED_OUTPUT_FALLBACK_BYTES:
-            raise GGUFLoadError(
-                f"Tied redundant output.weight uses {output.tensor_type.name}, "
-                f"which requires a {fallback_bytes}-byte transient FP16 allocation "
-                f"during mx.load; the safety limit is "
-                f"{_MAX_TIED_OUTPUT_FALLBACK_BYTES} bytes."
-            )
-        logger.info(
-            "MLX will transiently materialize tied output.weight as FP16 before "
-            "discard: qtype=%s, fallback_bytes=%d",
-            output.tensor_type.name,
-            fallback_bytes,
+        raise GGUFLoadError(
+            f"Unsupported qtype {output.tensor_type.name} on mapped weight "
+            "'output.weight'; only Q8_0/Q4_0/Q4_1 (and plain F32/F16/BF16) "
+            "are supported."
         )
 
     def _to_target_dtype(self, array: mx.array) -> mx.array:
@@ -249,13 +236,11 @@ class GGUFModelLoader:
         tied: bool,
         adapter: GGUFModelAdapter,
     ) -> _PartitionedTensors:
-        """Route each GGUF tensor to quant-install / plain-load / bias-side-map."""
-        arrays = cast(dict[str, mx.array], mx.load(str(self._gguf_path)))
-        if tied:
-            skipped_output = arrays.pop("output.weight", None)
-            if skipped_output is not None:
-                del skipped_output
-                mx.clear_cache()
+        """Route each GGUF tensor to quant-install / plain-load / bias-side-map.
+
+        Tensors are read from the reader's memory map, so the file only needs
+        read access.
+        """
         quant: dict[str, GGUFMLXQuantizedTensor] = {}
         plain: dict[str, mx.array] = {}
         biases: dict[str, mx.array] = {}
@@ -286,19 +271,17 @@ class GGUFModelLoader:
             permute = adapter.rope_permute_index(name)
 
             if suffix == _BIAS_SUFFIX:
-                bias = self._to_target_dtype(arrays[name])
+                bias = self._to_target_dtype(self._plain_tensor(tensor))
                 self._validate_plain_shape(model, translated, bias, name)
                 biases[module_path] = bias[permute] if permute is not None else bias
-            elif tensor.tensor_type in MLX_NATIVE_GGUF_TYPES:
-                qt = GGUFMLXQuantizedTensor.from_mx_load(
-                    arrays, name, tensor.tensor_type
-                )
+            elif tensor.tensor_type in _QUANT_GGUF_TYPES:
+                qt = self._quant_tensor(tensor)
                 self._validate_quant_shape(module_path, current, qt, name)
                 quant[module_path] = (
                     qt.permute_rows(permute) if permute is not None else qt
                 )
             else:  # plain F32/F16/BF16
-                weight = self._to_target_dtype(arrays[name])
+                weight = self._to_target_dtype(self._plain_tensor(tensor))
                 self._validate_plain_shape(model, translated, weight, name)
                 plain[translated] = weight[permute] if permute is not None else weight
 
@@ -307,6 +290,31 @@ class GGUFModelLoader:
         for module_path in [path for path in biases if path not in quant]:
             plain[f"{module_path}{_BIAS_SUFFIX}"] = biases.pop(module_path)
         return _PartitionedTensors(quant=quant, plain=plain, biases=biases)
+
+    @staticmethod
+    def _quant_tensor(tensor: Any) -> GGUFMLXQuantizedTensor:
+        """Repack a quantized tensor from the reader's raw block bytes."""
+        return GGUFMLXQuantizedTensor.from_raw_blocks(
+            tensor.data.reshape(-1),
+            GGUFModelLoader._logical_shape(tensor),
+            tensor.tensor_type,
+        )
+
+    @staticmethod
+    def _plain_tensor(tensor: Any) -> mx.array:
+        """Read a plain F32/F16/BF16 tensor in its file dtype."""
+        logical = GGUFModelLoader._logical_shape(tensor)
+        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+            # numpy has no bfloat16, so the raw lanes are reinterpreted in MLX.
+            lanes = mx.array(tensor.data.view(np.uint16).reshape(logical))
+            return lanes.view(mx.bfloat16)
+        return mx.array(tensor.data.reshape(logical))
+
+    @staticmethod
+    def _logical_shape(tensor: Any) -> tuple[int, ...]:
+        # GGUFReader reports ne order (fastest dim first); reverse to the
+        # model's (out, in) layout.
+        return tuple(int(dim) for dim in reversed(tensor.shape))
 
     def _install_quant_modules(
         self,
