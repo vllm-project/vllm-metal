@@ -142,6 +142,52 @@ def test_partitioned_decode_with_window_matches_reference(window, seq_len) -> No
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.parametrize("magnitude", [1.5, 2.0, 4.0])
+def test_partitioned_window_with_strongly_negative_scores(magnitude) -> None:
+    """Partitions the window skips must be neutral in the split-KV reduce.
+
+    A skipped partition once reported a max logit of 0, which the reducer
+    folded into the global max; a head whose in-window scores are all far
+    below 0 then came out attenuated or zero while the reference softmax is a
+    near-uniform average of V (#837).  q = a*ones and k = -a*ones + noise put
+    every in-window scaled score near -8*a*a.
+    """
+    heads, kv_heads, hd = 4, 2, 64
+    seq_len, window = 1500, 96  # three partitions; the window is in the last
+    ops = get_ops()
+    assert heads < ops.min_decode_grid()
+    assert seq_len > 2 * ops.PARTITION_SIZE
+    key_cache, value_cache, table, rows = _cache(
+        1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
+    mx.random.seed(3)
+    query = (mx.ones((1, heads, hd)) * magnitude).astype(DTYPE)
+    key_cache = (
+        -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
+    ).astype(DTYPE)
+    mx.eval(query, key_cache)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, 1],
+        window=window,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        rows[0],
+        q_lo=seq_len - 1,
+        seq_len=seq_len,
+        window=window,
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+
+
 def test_large_decode_batch_with_window_matches_reference() -> None:
     """Many single-token sequences: the grid exceeds the split-KV gate and the
     non-partitioned kernel runs; each sequence has its own context and window
