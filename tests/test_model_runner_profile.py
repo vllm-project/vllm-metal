@@ -108,6 +108,37 @@ class TestProfileRunEncoder:
 
         assert adapter.encode_calls == []
 
+
+class TestProfileRunCacheReadings:
+    def test_cache_is_read_only_after_synchronize(self, monkeypatch) -> None:
+        """Both cache readings must follow a synchronize.
+
+        The evaluated outputs are temporaries whose buffers return to the
+        cache asynchronously; reading before they land under-reports the
+        overhead on some launches and not others (#835).
+        """
+        events: list[str] = []
+
+        def record(name: str, fn):
+            def wrapper(*args, **kwargs):
+                events.append(name)
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        for name in ("synchronize", "clear_cache", "get_cache_memory", "eval"):
+            monkeypatch.setattr(mx, name, record(name, getattr(mx, name)))
+
+        _runner(None).profile_run()
+
+        reads = [i for i, event in enumerate(events) if event == "get_cache_memory"]
+        assert len(reads) == 2
+        for read in reads:
+            preceding = [event for event in events[:read] if event != "clear_cache"]
+            assert preceding and preceding[-1] == "synchronize", events
+        # The second reading follows the dummy forward, not just the clear.
+        assert "eval" in events[reads[0] : reads[1]]
+
     def test_deepstack_residuals_are_profiled(self) -> None:
         deepstack = [mx.ones((4, 8)), mx.ones((4, 8))]
         adapter = _ProfilingAdapter(deepstack=deepstack)

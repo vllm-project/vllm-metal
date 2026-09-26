@@ -851,6 +851,9 @@ class MetalModelRunner:
         warmup_len = self.scheduler_config.max_num_batched_tokens
         if self._uses_encoder_pooling_backend():
             warmup_len = min(warmup_len, self.model_config.max_model_len)
+        # Released buffers return to the cache asynchronously, so settle
+        # before each reading or the result depends on timing (#835).
+        mx.synchronize()
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
@@ -860,6 +863,7 @@ class MetalModelRunner:
         # features one adapter call per step, so one maximal feature is the
         # peak).
         mx.eval(*self._dummy_encoder_outputs())
+        mx.synchronize()
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         return overhead
