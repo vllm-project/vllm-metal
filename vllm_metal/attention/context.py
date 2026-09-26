@@ -19,9 +19,12 @@ from __future__ import annotations
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mlx_lm.models.base import create_causal_mask
+
+if TYPE_CHECKING:
+    from vllm_metal.attention.impls.mla import MLAForwardMetadata
 
 # ---------------------------------------------------------------------------
 # Global context (thread-local)
@@ -98,6 +101,9 @@ class PagedAttentionContext:
     kernel_metadata_cache: dict[tuple[int | None, int], Any] = field(
         default_factory=dict
     )
+    # MLA kernel-format metadata memo (``impls.mla.MLAForwardMetadata``);
+    # same one-forward lifetime as ``kernel_metadata_cache``.
+    mla_metadata: MLAForwardMetadata | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

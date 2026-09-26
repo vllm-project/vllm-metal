@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -10,12 +11,78 @@ from mlx_lm.models.base import scaled_dot_product_attention
 
 from vllm_metal import envs
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
-from vllm_metal.attention.context import get_context
+from vllm_metal.attention.context import PagedAttentionContext, get_context
 from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
 
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
 MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
+
+
+@dataclass(frozen=True, eq=False)
+class MLAKernelMetadata:
+    """Single-pass kernel inputs: padded block tables and lengths."""
+
+    block_tables: mx.array  # [num_seqs, max_blocks] int32, zero-padded
+    context_lens: mx.array  # uint32
+    cu_seqlens_q: mx.array  # int32
+
+
+@dataclass(eq=False)
+class MLAForwardMetadata:
+    """Kernel-format copies of the per-forward MLA metadata.
+
+    The paged context lives exactly one forward pass, so these fields
+    never go stale: the first MLA layer converts the Python lists and
+    every later layer reuses the same arrays. ``eq=False`` for the same
+    reason as ``impls.sdpa._KernelMetadata`` — the generated ``__eq__``
+    would compare mx arrays, which raises on ``bool()``. The
+    path-specific fields are filled lazily on first use because only one
+    attention path runs per forward.
+    """
+
+    slot_mapping: mx.array  # int64, latent-cache scatter
+    block_table_rows: tuple[mx.array, ...] | None = None  # per-request int32, SDPA loop
+    kernel: MLAKernelMetadata | None = None
+
+
+def _mla_metadata(ctx: PagedAttentionContext) -> MLAForwardMetadata:
+    """Per-forward MLA metadata, converted once and reused by all layers."""
+    meta = ctx.mla_metadata
+    if meta is None:
+        meta = MLAForwardMetadata(
+            slot_mapping=mx.array(ctx.slot_mapping, dtype=mx.int64),
+        )
+        ctx.mla_metadata = meta
+    return meta
+
+
+def _block_table_rows(ctx: PagedAttentionContext) -> tuple[mx.array, ...]:
+    """Per-request int32 block tables for the SDPA loop, built once per forward."""
+    meta = _mla_metadata(ctx)
+    if meta.block_table_rows is None:
+        meta.block_table_rows = tuple(
+            mx.array(bt, dtype=mx.int32) for bt in ctx.block_tables
+        )
+    return meta.block_table_rows
+
+
+def _kernel_inputs(ctx: PagedAttentionContext) -> MLAKernelMetadata:
+    """Padded single-pass kernel inputs, built once per forward."""
+    meta = _mla_metadata(ctx)
+    if meta.kernel is None:
+        # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
+        # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
+        # padding entries beyond n_context_blocks are never read.
+        bts = ctx.block_tables
+        max_blocks = max(len(bt) for bt in bts)
+        padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
+        meta.kernel = MLAKernelMetadata(
+            block_tables=mx.array(padded, dtype=mx.int32),
+            context_lens=mx.array(list(ctx.context_lens), dtype=mx.uint32),
+            cu_seqlens_q=mx.array(list(ctx.cu_seqlens), dtype=mx.int32),
+        )
+    return meta.kernel
 
 
 class MLAPagedAttentionWrapper(nn.Module):
@@ -164,24 +231,15 @@ class MLAPagedAttentionWrapper(nn.Module):
             seq_len, inner.num_heads, inner.qk_rope_head_dim
         )
 
-        # Pad block_tables (list[list[int]]) into a 2D [num_seqs, max_blocks]
-        # int32 array. The kernel reads block_table_row[0..n_context_blocks-1];
-        # padding entries beyond n_context_blocks are never read.
-        bts = ctx.block_tables
-        max_blocks = max(len(bt) for bt in bts)
-        padded = [bt + [0] * (max_blocks - len(bt)) for bt in bts]
-        block_tables_mx = mx.array(padded, dtype=mx.int32)
-
-        context_lens_mx = mx.array(list(ctx.context_lens), dtype=mx.uint32)
-        cu_seqlens_q_mx = mx.array(list(ctx.cu_seqlens), dtype=mx.int32)
+        kernel_inputs = _kernel_inputs(ctx)
 
         out_kvr = metal_mla_paged_attention(
             q_nope=q_nope_kernel,
             q_pe=q_pe_kernel,
             latent_cache=latent_cache.latent_caches[layer_idx],
-            block_tables=block_tables_mx,
-            context_lens=context_lens_mx,
-            cu_seqlens_q=cu_seqlens_q_mx,
+            block_tables=kernel_inputs.block_tables,
+            context_lens=kernel_inputs.context_lens,
+            cu_seqlens_q=kernel_inputs.cu_seqlens_q,
             scale=self._attention_scale(),
             heads_per_tg=self._pick_heads_per_tg(inner.num_heads, seq_len),
         )
@@ -392,7 +450,7 @@ class MLAPagedAttentionWrapper(nn.Module):
         flat = latent_cache.latent_caches[layer_idx].reshape(
             -1, latent_cache.latent_dim
         )
-        flat[mx.array(ctx.slot_mapping, dtype=mx.int64)] = latent_flat
+        flat[_mla_metadata(ctx).slot_mapping] = latent_flat
         latent_cache.latent_caches[layer_idx] = flat.reshape(
             latent_cache.num_blocks, latent_cache.block_size, latent_cache.latent_dim
         )
@@ -424,8 +482,9 @@ class MLAPagedAttentionWrapper(nn.Module):
             )
             return inner.o_proj(final)
 
-        # Pre-convert block tables once to avoid a new mx.array allocation per request
-        block_tables_mx = [mx.array(bt, dtype=mx.int32) for bt in ctx.block_tables]
+        # Pre-convert block tables once per forward — reused across layers —
+        # to avoid a new mx.array allocation per request per layer
+        block_tables_mx = _block_table_rows(ctx)
 
         outputs = []
         for req_idx, ctx_len in enumerate(ctx.context_lens):

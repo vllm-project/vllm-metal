@@ -723,3 +723,161 @@ class TestSinglePassRouting:
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
             == expected_g
         )
+
+
+class TestMLAPerForwardMetadata:
+    """The typed ``ctx.mla_metadata`` memo converts each per-forward input
+    once; every MLA layer in the pass must reuse the same mx arrays."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_ctx(self) -> Generator[None, None, None]:
+        pac.clear_context()
+        yield
+        pac.clear_context()
+
+    def test_two_layers_share_one_sdpa_conversion(self) -> None:
+        inner = _MinimalMLAInner()
+        cache = MLAPagedLatentCache(
+            num_layers=2,
+            latent_dim=_KV_RANK + _ROPE_DIM,
+            num_blocks=4,
+            block_size=4,
+            dtype=mx.float16,
+        )
+        wrapper0 = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        wrapper1 = MLAPagedAttentionWrapper(inner, layer_idx=1, latent_cache=cache)
+
+        # Request A: 2 past tokens, decode token at slot 2 in block 0
+        # Request B: 1 past token,  decode token at slot 5 in block 1
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[2, 5],
+            block_tables=[[0], [1]],
+            context_lens=[3, 2],
+            cu_seqlens=[0, 1, 2],
+            offsets=[2, 1],
+        )
+        pac.set_context(ctx)
+
+        x = mx.random.normal((1, 2, _HIDDEN)).astype(mx.float16)
+        mx.eval(wrapper0(x, mask=None, cache=None))
+
+        meta = ctx.mla_metadata
+        assert meta is not None
+        slot = meta.slot_mapping
+        rows = meta.block_table_rows
+
+        mx.eval(wrapper1(x, mask=None, cache=None))
+
+        assert ctx.mla_metadata is meta
+        assert meta.slot_mapping is slot
+        assert meta.block_table_rows is rows
+        assert meta.kernel is None
+
+        assert slot.dtype == mx.int64
+        assert slot.tolist() == [2, 5]
+        assert rows is not None
+        assert [r.tolist() for r in rows] == [[0], [1]]
+        assert all(r.dtype == mx.int32 for r in rows)
+
+        # Both layers scatter-wrote slots 2 (block 0 pos 2) and 5 (block 1 pos 1)
+        for layer_idx in (0, 1):
+            layer_cache = cache.latent_caches[layer_idx]
+            assert bool(mx.any(layer_cache[0, 2, :] != 0))
+            assert bool(mx.any(layer_cache[1, 1, :] != 0))
+
+    def test_two_layers_share_one_kernel_conversion(self, monkeypatch) -> None:
+        calls: list[dict] = []
+
+        def fake_kernel(**kwargs):
+            calls.append(kwargs)
+            return mx.zeros(kwargs["q_nope"].shape, dtype=kwargs["q_nope"].dtype)
+
+        monkeypatch.setattr("vllm_metal.metal.metal_mla_paged_attention", fake_kernel)
+
+        inner = _KernelDimsAbsorbedInner()
+        cache = MLAPagedLatentCache(
+            num_layers=2,
+            latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            num_blocks=4,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        wrapper0 = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        wrapper1 = MLAPagedAttentionWrapper(inner, layer_idx=1, latent_cache=cache)
+
+        # Unequal block-table lengths force zero-padding in the kernel input.
+        ctx = pac.PagedAttentionContext(
+            slot_mapping=[0, 32],
+            block_tables=[[0], [1, 2]],
+            context_lens=[5, 20],
+            cu_seqlens=[0, 1, 2],
+            offsets=[4, 19],
+        )
+        pac.set_context(ctx)
+
+        q_nope = mx.random.normal((1, 8, 2, _KERNEL_NOPE_DIM)).astype(mx.float16)
+        q_pe = mx.random.normal((1, 8, 2, _KERNEL_ROPE_DIM)).astype(mx.float16)
+
+        mx.eval(
+            wrapper0._kernel_fast_path_single_pass(
+                inner, cache, 0, q_nope, q_pe, ctx, seq_len=2
+            )
+        )
+        mx.eval(
+            wrapper1._kernel_fast_path_single_pass(
+                inner, cache, 1, q_nope, q_pe, ctx, seq_len=2
+            )
+        )
+
+        assert len(calls) == 2
+        first, second = calls
+        for key in ("block_tables", "context_lens", "cu_seqlens_q"):
+            assert second[key] is first[key]
+
+        block_tables = first["block_tables"]
+        assert block_tables.dtype == mx.int32
+        assert block_tables.tolist() == [[0, 0], [1, 2]]
+        assert first["context_lens"].dtype == mx.uint32
+        assert first["context_lens"].tolist() == [5, 20]
+        assert first["cu_seqlens_q"].dtype == mx.int32
+        assert first["cu_seqlens_q"].tolist() == [0, 1, 2]
+
+    def test_fresh_context_rebuilds(self) -> None:
+        inner = _MinimalMLAInner()
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=_KV_RANK + _ROPE_DIM,
+            num_blocks=4,
+            block_size=4,
+            dtype=mx.float16,
+        )
+        wrapper = MLAPagedAttentionWrapper(inner, layer_idx=0, latent_cache=cache)
+        x = mx.random.normal((1, 1, _HIDDEN)).astype(mx.float16)
+
+        ctx_a = pac.PagedAttentionContext(
+            slot_mapping=[2],
+            block_tables=[[0]],
+            context_lens=[3],
+            cu_seqlens=[0, 1],
+            offsets=[2],
+        )
+        pac.set_context(ctx_a)
+        mx.eval(wrapper(x, mask=None, cache=None))
+        meta_a = ctx_a.mla_metadata
+        assert meta_a is not None
+
+        ctx_b = pac.PagedAttentionContext(
+            slot_mapping=[7],
+            block_tables=[[1]],
+            context_lens=[2],
+            cu_seqlens=[0, 1],
+            offsets=[1],
+        )
+        pac.set_context(ctx_b)
+        mx.eval(wrapper(x, mask=None, cache=None))
+        meta_b = ctx_b.mla_metadata
+
+        assert meta_b is not None
+        assert meta_b is not meta_a
+        assert meta_b.slot_mapping is not meta_a.slot_mapping
+        assert meta_b.slot_mapping.tolist() == [7]
