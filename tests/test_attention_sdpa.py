@@ -669,10 +669,14 @@ class _PagedRoutingOpsSpy:
         _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
+        num_decode_requests: int = -1,
+        gqa_disabled: bool = False,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
+        self.calls[-1].num_decode_requests = num_decode_requests
+        self.calls[-1].gqa_disabled = gqa_disabled
 
 
 class TestSDPAForward:
@@ -749,6 +753,35 @@ class TestSDPAForward:
         assert values.shape == (1, 2, 2, 4)
         assert captured["num_kv_heads"] == 2
         assert captured["scale"] == 0.5
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_gqa_policy_reaches_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool
+    ) -> None:
+        """The environment escape hatch and scheduler decode count reach native code."""
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        spy = _PagedRoutingOpsSpy()
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        ctx.num_decode_requests = 1
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        zeros = mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM), dtype=mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        assert spy.calls[-1].gqa_disabled is disabled
+        assert spy.calls[-1].num_decode_requests == 1
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""

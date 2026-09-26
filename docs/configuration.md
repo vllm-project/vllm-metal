@@ -6,6 +6,7 @@
 |----------|---------|-------------|
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible single-request decode on the established per-token / split-KV kernels. Automatic GQA routing is limited to the [measured geometries and context bounds](gqa-decode.md), starting at 32K or 64K with 16-token kernel pages. This switch only disables the optimization. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist; `multimodal-native` disables overrides |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
 | `VLLM_METAL_MODELSCOPE_CACHE` | None | Specify the absolute path of the local model |
