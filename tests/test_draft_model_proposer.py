@@ -125,7 +125,10 @@ def _proposer(
     scratch_reserve_blocks: int = SCRATCH_RESERVE_BLOCKS,
     allow_deferred_zero_k_ingest: bool = False,
     model_adapter=None,
+    selective_logits_supported: bool | None = None,
 ) -> DraftModelProposer:
+    if selective_logits_supported is None:
+        selective_logits_supported = model_adapter is not None
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
@@ -135,7 +138,7 @@ def _proposer(
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
         model_adapter=model_adapter,
-        selective_logits_supported=model_adapter is not None,
+        selective_logits_supported=selective_logits_supported,
         allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
     )
     proposer.adopt_committed_group(COMMITTED_GROUP_INDEX)
@@ -791,6 +794,23 @@ def test_tiny_ingest_keeps_combined_model_forward() -> None:
     assert adapter.logits_indices == []
     assert drafts is not None
     assert drafts.draft_token_ids == [[1], [1]]
+
+
+def test_unsupported_large_ingest_keeps_combined_model_forward() -> None:
+    model = _PositionEncodingDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = _proposer(
+        model,
+        model_adapter=adapter,
+        selective_logits_supported=False,
+    )
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
+
+    assert model.input_lens == [21]
+    assert adapter.logits_indices == []
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
 def test_chunked_ingest_selects_only_large_projection_rounds(
