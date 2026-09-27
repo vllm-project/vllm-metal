@@ -649,7 +649,12 @@ class _PagedRoutingOpsSpy:
         value_cache,
         slot_mapping,
     ) -> tuple[mx.array, mx.array]:
-        self.calls.append(SimpleNamespace(slot_mapping=slot_mapping.tolist()))
+        self.calls.append(
+            SimpleNamespace(
+                slot_mapping=slot_mapping.tolist(),
+                cache_block_size=key_cache.shape[1],
+            )
+        )
         return key_cache, value_cache
 
     def paged_attention_primitive(
@@ -753,7 +758,7 @@ class TestSDPAForward:
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
         full = FullAttentionSpec(
-            block_size=32,
+            block_size=64,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
             dtype=torch.float16,
@@ -782,7 +787,7 @@ class TestSDPAForward:
         prepare_grouped(
             [([[3], [8, 9]], 17, 1)],
             [([[4], [10]], 2, 0)],
-            (32, 16),
+            (64, 16),
         )
         ctx = get_context()
         assert ctx is not None
@@ -816,11 +821,13 @@ class TestSDPAForward:
             sdpa_forward(inner, x, ctx, cache, layer_idx=1)
 
         full_call, sliding_call = ops.calls
-        assert full_call.slot_mapping == [3 * 32 + 17, 4 * 32, 4 * 32 + 1]
-        assert full_call.block_tables == [[3], [4]]
+        assert full_call.slot_mapping == [3 * 64 + 17, 4 * 64, 4 * 64 + 1]
+        assert full_call.block_tables == [[6, 7], [8, 9]]
+        assert full_call.cache_block_size == 64
         assert full_call.block_size == 32
         assert sliding_call.slot_mapping == [9 * 16 + 1, 10 * 16, 10 * 16 + 1]
         assert sliding_call.block_tables == [[8, 9], [10, 0]]
+        assert sliding_call.cache_block_size == 16
         assert sliding_call.block_size == 16
 
     def test_kernel_uses_layer_heads_and_registered_default_scale(self) -> None:

@@ -140,8 +140,8 @@ def _build_block_tables(
 
     When ``cache_block_size`` exceeds the kernel's compiled block sizes,
     each vLLM block ``b`` is expanded into ``ratio`` kernel blocks
-    ``[b*ratio, b*ratio+ratio)``.  The cache is reshaped later to
-    match (zero-copy).
+    ``[b*ratio, b*ratio+ratio)``.  The kernel applies the translated
+    token stride when reading dense cache views.
 
     Returns:
         (block_tables, kernel_block_size)
@@ -653,7 +653,7 @@ def sdpa_forward(
     # mamba pages in hybrid models, while the Metal kernel only supports
     # small block sizes (8, 16, 32); _build_block_tables expands each vLLM
     # block into multiple kernel blocks and returns the kernel-compatible
-    # block_size.  The cache is reshaped to match (zero-copy).
+    # block_size.
     meta = _kernel_metadata(
         ctx,
         None if ctx.kv_groups is None else group_index,
@@ -748,12 +748,11 @@ def sdpa_forward(
     # works correctly because eval_gpu skips add_temporary (which would
     # remove buffers from the encoder's fence tracking).
     #
-    # When block-size translation is active (hybrid models), reshape the
-    # cache so the kernel sees kernel_block_size-token blocks.  This is a
-    # zero-copy view over the same physical memory.
+    # TurboQuant caches must expose the kernel block size because their packed
+    # K/V and scale layouts carry separate strides.
     kernel_k_cache = new_k_cache
     kernel_v_cache = new_v_cache
-    if kernel_block_size != cache_block_size:
+    if kernel_block_size != cache_block_size and kv_cache.turboquant:
         # Use the cache's actual last-axis size rather than the logical
         # ``head_dim``.  Under TurboQuant the K/V caches are stored in
         # packed form (``packed_head_dim = packed_dim(head_dim, bits)``)

@@ -251,7 +251,7 @@ static void bind_paged_attn_buffers(
     int num_kv_heads, float softcap,
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
-    int sliding_window) {
+    int block_size, int sliding_window) {
   int num_heads = static_cast<int>(query.shape(1));
   int head_size = static_cast<int>(query.shape(2));
 
@@ -271,9 +271,13 @@ static void bind_paged_attn_buffers(
   int32_t max_blocks_i = static_cast<int32_t>(block_tables.shape(1));
   enc.set_bytes(max_blocks_i, 13);
 
-  int32_t q_stride        = static_cast<int32_t>(num_heads * head_size);
+  int32_t q_stride = static_cast<int32_t>(num_heads * head_size);
   int32_t kv_block_stride = static_cast<int32_t>(key_cache.strides()[0]);
-  int32_t kv_head_stride  = static_cast<int32_t>(key_cache.strides()[2]);
+  // Expanded block IDs address dense sub-blocks within an upstream page.
+  if (static_cast<int>(key_cache.shape(1)) > block_size) {
+    kv_block_stride = static_cast<int32_t>(block_size * key_cache.strides()[1]);
+  }
+  int32_t kv_head_stride = static_cast<int32_t>(key_cache.strides()[2]);
   enc.set_bytes(q_stride,        15);
   enc.set_bytes(kv_block_stride, 16);
   enc.set_bytes(kv_head_stride,  17);
@@ -364,7 +368,7 @@ static void dispatch_paged_attention_nax(
 
   bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
                           num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, sliding_window);
+                          cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
   if (use_sinks) {
     enc.set_input_array(*sinks, 18);
@@ -425,7 +429,7 @@ static void dispatch_paged_attention_tiled(
 
   bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
                           num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, sliding_window);
+                          cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
   if (use_sinks) {
     enc.set_input_array(*sinks, 18);
@@ -629,7 +633,7 @@ static void dispatch_paged_attention_v2_online(
     enc.set_threadgroup_memory_length(shmem, 0);
     bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
                             num_kv_heads, softcap, block_tables, seq_lens,
-                            cu_seqlens_q, sliding_window);
+                            cu_seqlens_q, block_size, sliding_window);
     enc.set_bytes(scale, 9);
     bind_turboquant();
     bind_sinks();
@@ -664,7 +668,7 @@ static void dispatch_paged_attention_v2_online(
   enc.set_threadgroup_memory_length(shmem, 0);
   bind_paged_attn_buffers(enc, tmp_out, query, key_cache, value_cache,
                           num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, sliding_window);
+                          cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
   enc.set_output_array(exp_sums, 0);
   enc.set_output_array(max_logits, 1);

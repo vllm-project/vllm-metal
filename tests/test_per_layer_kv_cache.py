@@ -33,6 +33,7 @@ from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runn
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
@@ -792,3 +793,67 @@ class TestUpstreamAttentionStorage:
         cache.replace_layer_cache(1, keys, values)
         mx.eval(*storage.buffers)
         assert cache.key_caches[0][0, 0, 0].tolist() == [1.0] * 256 + [2.0] * 256
+
+    def test_upstream_full_attention_reads_translated_cache_blocks(self) -> None:
+        cache_block_size = 64
+        head_size = 512
+        groups = [
+            KVCacheGroupSpec(
+                layer_names=["full"],
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=cache_block_size,
+                    num_kv_heads=1,
+                    head_size=head_size,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        ]
+        config = config_from_vllm_groups(groups, 2)
+        cache = MetalPagedKVCache.from_upstream(
+            KVCacheStorage(config), ["full"], dtype=mx.bfloat16
+        )
+
+        seq_len = 40
+        mx.random.seed(0)
+        query = mx.random.normal((seq_len, 1, head_size)).astype(mx.bfloat16)
+        key = mx.random.normal((seq_len, 1, head_size)).astype(mx.bfloat16)
+        value = mx.random.normal((seq_len, 1, head_size)).astype(mx.bfloat16)
+        key_cache, value_cache = get_ops().reshape_and_cache(
+            key,
+            value,
+            cache.key_caches[0],
+            cache.value_caches[0],
+            mx.arange(seq_len, dtype=mx.int64),
+        )
+        block_tables, kernel_block_size = _build_block_tables(
+            [[0]], cache.block_size_for_layer(0)
+        )
+        output = mx.array(0)
+        scale = head_size**-0.5
+        get_ops().paged_attention_primitive(
+            query,
+            key_cache,
+            value_cache,
+            1,
+            scale,
+            0.0,
+            block_tables,
+            mx.array([seq_len], dtype=mx.int32),
+            mx.array([0, seq_len], dtype=mx.int32),
+            kernel_block_size,
+            seq_len,
+            -1,
+            output,
+        )
+        reference = mx.fast.scaled_dot_product_attention(
+            query.transpose(1, 0, 2)[None],
+            key.transpose(1, 0, 2)[None],
+            value.transpose(1, 0, 2)[None],
+            scale=scale,
+            mask="causal",
+        )[0].transpose(1, 0, 2)
+        mx.eval(output, reference)
+
+        assert cache.block_size_for_layer(0) == cache_block_size
+        assert kernel_block_size == 32
+        assert mx.allclose(output, reference, atol=0.03, rtol=0.02).item()
