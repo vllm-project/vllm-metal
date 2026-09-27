@@ -60,7 +60,7 @@ _DEQUANT_SOURCE = """
     uint low4 = (e < 64) ? (lowbyte & 0x0F) : (lowbyte >> 4);
     uint high2 = (qh[e & 31] >> (2 * (e / 32))) & 3;
     int q = int(low4 | (high2 << 4)) - 32;
-    out[elem] = d * float(sc[within / 16]) * float(q);
+    out[elem] = static_cast<T>(d * float(sc[within / 16]) * float(q));
 """
 
 _QMV_SOURCE = """
@@ -276,10 +276,9 @@ class GGUFRawBlockTensor:
         if rows <= _QMV_MAX_BATCH:
             out = self._qmv(flat.astype(mx.float32))
         else:
-            # The kernel emits the GEMM dtype directly (bit-identical to a
-            # float32 round trip), so only one transient copy ever lives.
-            dense_dtype = mx.float32 if x.dtype == mx.float32 else mx.float16
-            dense = self._dequantize_rows(self.qweight, dense_dtype)
+            # Dequantizing straight into x's dtype keeps the GEMM there; a
+            # float16 copy would promote bfloat16 activations to float32.
+            dense = self._dequantize_rows(self.qweight, x.dtype)
             out = mx.matmul(flat, dense.T)
         return out.reshape(*lead, self.out_features).astype(x.dtype)
 
@@ -345,6 +344,7 @@ class GGUFRawBlockTensor:
         n = mx.array([n_elements], dtype=mx.uint32)
         (out,) = _DEQUANT_KERNEL(
             inputs=[packed_rows, n],
+            template=[("T", output_dtype)],
             output_shapes=[(n_elements,)],
             output_dtypes=[output_dtype],
             grid=(n_elements, 1, 1),
