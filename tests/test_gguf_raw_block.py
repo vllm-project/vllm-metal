@@ -93,10 +93,12 @@ def test_dequantize_matches_oracle_bit_exact():
     assert np.array_equal(np.array(out), oracle)
 
 
-def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch):
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("batch", [1, 3, 8])
+def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch):
+    # 17 superblocks give every thread a group and some threads a second one.
+    qt, oracle = _make_q6k_tensor(cols=17 * 256)
     calls = _spy_matmul_paths(monkeypatch)
-    x = mx.random.normal((2, qt.in_features)).astype(mx.float32)
+    x = mx.random.normal((batch, qt.in_features)).astype(mx.float32)
 
     out = qt.matmul(x)
     # M5 GPU matmul may use TF32; keep the reference at full FP32 precision on CPU.
@@ -147,9 +149,9 @@ def test_matmul_gemm_path_dequantizes_in_activation_dtype(monkeypatch, dtype):
     assert dense_dtypes == [dtype]
 
 
-# B=4 is the last qmv batch and B=5 the first GEMM batch, so the low-precision
+# B=8 is the last qmv batch and B=9 the first GEMM batch, so the low-precision
 # oracle comparison covers both matmul paths.
-@pytest.mark.parametrize("batch", [4, 5])
+@pytest.mark.parametrize("batch", [8, 9])
 @pytest.mark.parametrize(
     ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
 )
