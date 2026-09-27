@@ -225,7 +225,7 @@ class TestMetalPlatform:
             (None, None, False),
             ("auto_awq", None, True),
             ("gguf", None, True),
-            ("auto_awq", SimpleNamespace(), False),
+            ("auto_awq", SimpleNamespace(language_model_only=False), False),
         ],
         ids=["safetensors", "text-awq", "text-gguf", "multimodal-awq"],
     )

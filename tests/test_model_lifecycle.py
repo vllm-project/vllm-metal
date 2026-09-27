@@ -55,6 +55,7 @@ def _runner_model_config(**overrides: object) -> object:
     values = {
         "model": "stub-model",
         "hf_config": None,
+        "multimodal_config": None,
         "is_multimodal_model": False,
         "trust_remote_code": False,
         "dtype": torch.float16,
