@@ -31,7 +31,7 @@ BackboneMode = Literal["native", "text_sidecar", "text_only"]
 - ``text_only``: ``multimodal_config`` is cleared and images are refused.
 """
 
-_GEMMA4_MODEL_TYPE = "gemma4"
+_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_unified"})
 # Mode selection probes the checkpoint and builds the HF processor, and a
 # process asks more than once (platform normalization, then the load
 # request).  A server resolves one model, so a few recent keys suffice.
@@ -370,7 +370,6 @@ class ModelAdapter(Protocol):
 
 # Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
-_TEXT_BACKBONE_OVERRIDE_TYPES: frozenset[str] = frozenset({"gemma4"})
 # Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
 # but only the FP8 and adapter-less variants are forced onto the text backbone:
 # FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
@@ -425,7 +424,7 @@ class DefaultModelAdapter(ModelAdapter):
             return False
 
         model_type_from_hf = hf_config.model_type
-        if model_type_from_hf in _TEXT_BACKBONE_OVERRIDE_TYPES:
+        if model_type_from_hf in _GEMMA4_MODEL_TYPES:
             return True
 
         architectures_from_hf = tuple(hf_config.architectures or ())
@@ -482,13 +481,16 @@ class DefaultModelAdapter(ModelAdapter):
     def multimodal_backbone_mode(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None
     ) -> BackboneMode:
+        multimodal_config = model_config.multimodal_config
+        if multimodal_config is not None and multimodal_config.language_model_only:
+            return "text_only"
         hf_config = getattr(model_config, "hf_config", None)
         mode_env = self._multimodal_mode()
         if mode_env == "text-only":
             return "text_only"
         if mode_env == "multimodal-native":
             return "native"
-        if getattr(hf_config, "model_type", None) != _GEMMA4_MODEL_TYPE:
+        if getattr(hf_config, "model_type", None) not in _GEMMA4_MODEL_TYPES:
             return (
                 "text_only" if self.should_force_text_backbone(hf_config) else "native"
             )

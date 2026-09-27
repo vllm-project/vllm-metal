@@ -1292,13 +1292,27 @@ def _sidecar_ready(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestMultimodalBackboneMode:
+    @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
     def test_gemma4_with_everything_present_is_text_sidecar(
-        self, tmp_path: Path, _sidecar_ready
+        self, tmp_path: Path, _sidecar_ready, model_type: str
     ) -> None:
-        mode = DefaultModelAdapter().multimodal_backbone_mode(
-            _gemma4_model_config(tmp_path)
-        )
+        config = _gemma4_model_config(tmp_path)
+        config.hf_config.model_type = model_type
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
         assert mode == "text_sidecar"
+
+    def test_language_model_only_wins_over_native_mode(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        config = _gemma4_model_config(tmp_path)
+        config.multimodal_config.language_model_only = True
+
+        adapter = DefaultModelAdapter()
+        assert adapter.multimodal_backbone_mode(config) == "text_only"
+        adapter.normalize_model_config(config)
+        assert config.multimodal_config is None
 
     def test_text_only_env_forces_text_only(
         self, tmp_path: Path, _sidecar_ready, monkeypatch
