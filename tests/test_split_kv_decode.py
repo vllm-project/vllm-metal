@@ -16,7 +16,9 @@ Sliding-window and TurboQuant batches take the split too: windowed cells
 cover window starts on and off partition boundaries (fully- and
 partially-masked partitions), and TQ cells cover both packing families
 (8-bit direct, 4-bit packed) with the inverse FWHT deferred to the reduce
-pass.
+pass.  The Gemma 4 full-attention cells cover the production bf16 geometry
+(16 query / 1 KV head, head size 512, 32-token blocks, scale 1.0) against a
+float32 reference.
 
 Run with:
     python -m pytest tests/test_split_kv_decode.py -v
@@ -156,14 +158,17 @@ def test_high_occupancy_stays_single_pass() -> None:
 
 
 def _ref_attention_np(
-    query: mx.array, k_rows: np.ndarray, v_rows: np.ndarray
+    query: mx.array,
+    k_rows: np.ndarray,
+    v_rows: np.ndarray,
+    scale: float = HEAD_SIZE**-0.5,
 ) -> np.ndarray:
     """float32 GQA attention over the given K/V rows (T, KV_HEADS, HEAD)."""
     q = np.array(query.astype(mx.float32))[0]
-    rep = NUM_QUERY_HEADS // NUM_KV_HEADS
+    rep = q.shape[0] // k_rows.shape[1]
     k = np.repeat(k_rows, rep, axis=1)
     v = np.repeat(v_rows, rep, axis=1)
-    scores = np.einsum("hd,thd->ht", q, k) * HEAD_SIZE**-0.5
+    scores = np.einsum("hd,thd->ht", q, k) * scale
     p = np.exp(scores - scores.max(axis=1, keepdims=True))
     p /= p.sum(axis=1, keepdims=True)
     return np.einsum("ht,thd->hd", p, v)
@@ -339,3 +344,94 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
         np.array(v_ref.astype(mx.float32))[start:kv_len],
     )
     np.testing.assert_allclose(o, ref, atol=1.5e-2, rtol=2e-2)
+
+
+# Gemma 4 full-attention decode geometry: 16 query heads over a single KV
+# head, head size 512, 32-token blocks, and attention scale 1.0 (the model
+# folds the usual 1/sqrt(head_size) into its q/k norms).
+GEMMA4_NUM_QUERY_HEADS = 16
+GEMMA4_NUM_KV_HEADS = 1
+GEMMA4_HEAD_SIZE = 512
+GEMMA4_BLOCK_SIZE = 32
+GEMMA4_SCALE = 1.0
+
+
+@pytest.mark.parametrize(
+    "kv_lens",
+    [
+        [4096],  # production single-stream decode: 8 partitions
+        [1300],  # odd partition count, not block-aligned at 32-token blocks
+        [700, 8192],  # 2 vs 16 valid partitions in one batch
+    ],
+)
+def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
+    """Partitioned bf16 decode at the Gemma 4 full-attention shape matches a
+    float32 reference over the same bf16-rounded inputs.
+
+    ``ref_paged_attn`` runs its QK and PV einsums in bf16 before casting, and
+    the sharp scale-1.0 softmax over 512-wide dot products turns that rounding
+    into ~0.5 absolute error — far above the kernel's own ~1e-2.  Computing
+    the reference in float32 keeps this cell a kernel check, not a reference
+    precision check."""
+    mx.random.seed(4)
+    ops = get_ops()
+    num_seqs = len(kv_lens)
+    max_kv_len = max(kv_lens)
+    # Engagement premise, as in test_split_decode_vs_reference.
+    assert GEMMA4_NUM_QUERY_HEADS * num_seqs < ops.min_decode_grid()
+    assert max_kv_len > ops.PARTITION_SIZE
+
+    max_blocks_per_seq = -(-max_kv_len // GEMMA4_BLOCK_SIZE)  # ceil division
+    num_blocks = max_blocks_per_seq * num_seqs
+    cache_shape = (
+        num_blocks,
+        GEMMA4_BLOCK_SIZE,
+        GEMMA4_NUM_KV_HEADS,
+        GEMMA4_HEAD_SIZE,
+    )
+    key_cache = mx.random.normal(shape=cache_shape).astype(mx.bfloat16)
+    value_cache = mx.random.normal(shape=cache_shape).astype(mx.bfloat16)
+    query = mx.random.normal(
+        shape=(num_seqs, GEMMA4_NUM_QUERY_HEADS, GEMMA4_HEAD_SIZE)
+    ).astype(mx.bfloat16)
+    # A shuffled block table keeps the paged gather in play.
+    block_tables = mx.random.permutation(num_blocks).astype(mx.int32)
+    block_tables = block_tables.reshape(num_seqs, max_blocks_per_seq)
+    seq_lens = mx.array(kv_lens, dtype=mx.int32)
+    cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
+    mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
+
+    out = mx.array(0)
+    ops.paged_attention_primitive(
+        query,
+        key_cache,
+        value_cache,
+        GEMMA4_NUM_KV_HEADS,
+        GEMMA4_SCALE,
+        0.0,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        GEMMA4_BLOCK_SIZE,
+        max_kv_len,
+        -1,
+        out,
+    )
+    mx.eval(out)
+    o = np.array(out.astype(mx.float32))
+    assert np.isfinite(o).all()
+
+    k_all = np.array(key_cache.astype(mx.float32))
+    v_all = np.array(value_cache.astype(mx.float32))
+    tables = np.array(block_tables)
+    atol, rtol = _TOLERANCES[mx.bfloat16]
+    for i, kv_len in enumerate(kv_lens):
+        blocks = tables[i, : -(-kv_len // GEMMA4_BLOCK_SIZE)]
+        rows = (-1, GEMMA4_NUM_KV_HEADS, GEMMA4_HEAD_SIZE)
+        ref = _ref_attention_np(
+            query[i : i + 1],
+            k_all[blocks].reshape(rows)[:kv_len],
+            v_all[blocks].reshape(rows)[:kv_len],
+            scale=GEMMA4_SCALE,
+        )
+        np.testing.assert_allclose(o[i], ref, atol=atol, rtol=rtol)
