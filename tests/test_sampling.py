@@ -571,7 +571,7 @@ class TestV1SamplingBatch:
                 vocab_size=4,
                 generators={0: torch.Generator().manual_seed(seed)},
             )
-            metadata = batch.make_sampling_metadata(torch.zeros(1, 4))
+            metadata = batch.make_sampling_metadata()
             assert len(list(metadata.logitsprocs.argmax_invariant)) == 1
 
             sampled.add(sample_from_logits(logits, batch, sampler).token_ids[0])
@@ -775,12 +775,9 @@ class TestV1SamplingBatch:
         )
 
         topk_ids = [[2, 3], [0, 2]]
-        metadata = batch.make_sampling_metadata(torch.tensor(raw_logits))
-        assert metadata.max_num_logprobs is None
-        assert metadata.logprob_token_ids == {
-            specific_row: [0, 3],
-            1 - specific_row: topk_ids[1 - specific_row],
-        }
+        metadata = batch.make_sampling_metadata()
+        assert metadata.max_num_logprobs == -1
+        assert metadata.logprob_token_ids is None
 
         result = sample_from_logits(logits, batch, Sampler())
 
@@ -801,22 +798,35 @@ class TestV1SamplingBatch:
             )
         assert result.logprobs.sampled_token_ranks.tolist() == [1, 1]
 
-    def test_mixed_logprob_metadata_requires_logits(self) -> None:
+    @pytest.mark.parametrize(
+        "logprobs_mode", ["processed_logprobs", "processed_logits"]
+    )
+    def test_mixed_topk_logprobs_rank_processed_values(
+        self, logprobs_mode: str
+    ) -> None:
+        # Token 0 has the highest raw logit but is not allowed in row 1, so a
+        # processed mode must not list it among that row's top-k.
+        logits = mx.array(
+            [[0.0, 1.0, 4.0, 2.0], [5.0, 1.0, 3.0, 2.0]], dtype=mx.float32
+        )
         batch = SamplingBatch(
             [
                 SamplingParams(temperature=0.0, logprob_token_ids=[0, 3]),
-                SamplingParams(temperature=0.0, logprobs=2),
+                SamplingParams(
+                    temperature=0.0, logprobs=2, allowed_token_ids=[1, 2, 3]
+                ),
             ],
             [[1, 2], [3, 4]],
             [[], []],
             vocab_size=4,
         )
 
-        with pytest.raises(
-            ValueError,
-            match="Logits are required when a batch mixes top-k and specific-token",
-        ):
-            batch.make_sampling_metadata()
+        result = sample_from_logits(logits, batch, Sampler(logprobs_mode=logprobs_mode))
+
+        assert result.token_ids == [2, 2]
+        assert result.logprobs is not None
+        assert result.logprobs.logprob_token_ids.tolist() == [[2, 0, 3], [2, 2, 3]]
+        assert result.logprobs.sampled_token_ranks.tolist() == [1, 1]
 
     def test_same_row_specific_logprobs_override_topk_without_logits(self) -> None:
         batch = SamplingBatch(
@@ -866,22 +876,22 @@ class TestV1SamplingBatch:
             [[], [], []],
             vocab_size=8,
         )
-        logits = torch.tensor(
+        logits = mx.array(
             [
                 [0.0] * 8,
                 [-1.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 0.0],
                 list(range(8)),
-            ]
+            ],
+            dtype=mx.float32,
         )
 
-        metadata = batch.make_sampling_metadata(logits)
+        result = sample_from_logits(logits, batch, Sampler())
 
-        assert metadata.max_num_logprobs is None
-        assert metadata.logprob_token_ids == {
-            0: [0],
-            1: [5, 7],
-            2: [7, 6, 5, 4, 3],
-        }
+        assert result.logprobs is not None
+        token_ids = result.logprobs.logprob_token_ids
+        assert token_ids[0, 1:2].tolist() == [0]
+        assert token_ids[1, 1:3].tolist() == [5, 7]
+        assert token_ids[2, 1:6].tolist() == [7, 6, 5, 4, 3]
 
     def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
         batch = _ExecutionBatch()
