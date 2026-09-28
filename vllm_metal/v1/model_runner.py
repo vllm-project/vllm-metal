@@ -418,8 +418,9 @@ class MetalModelRunner:
         # one-step prefill has no RequestState during its forward.
         self._mm_bidi_states: dict[str, _MMBidiState] = {}
 
-        # vLLM Sampler for token sampling with temperature, top_k, top_p support
-        self._sampler = Sampler()
+        # vLLM Sampler for token sampling with temperature, top_k, top_p support.
+        # It takes the configured logprobs mode, as vLLM's GPU runner does.
+        self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
 

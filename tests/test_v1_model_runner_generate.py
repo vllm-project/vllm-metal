@@ -200,6 +200,30 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(NotImplementedError, match="custom logits processors"):
             mr.MetalModelRunner(vllm_config)
 
+    @pytest.mark.parametrize(
+        "logprobs_mode",
+        ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
+    )
+    def test_init_passes_logprobs_mode_to_sampler(
+        self, monkeypatch: pytest.MonkeyPatch, logprobs_mode: str
+    ) -> None:
+        # --logprobs-mode must reach the sample-logprobs path, not only prompt logprobs.
+        monkeypatch.setattr(mr, "entry_points", lambda **_: (), raising=False)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                logits_processors=None,
+                runner_type="generate",
+                logprobs_mode=logprobs_mode,
+            ),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        runner = mr.MetalModelRunner(vllm_config)
+
+        assert runner._sampler.logprobs_mode == logprobs_mode
+
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
         runner._dummy_forward_outputs = Mock(
