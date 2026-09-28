@@ -61,7 +61,10 @@ no speculative decoding is configured; otherwise the model stays text-only and
 the reason is logged. A repo id such as the example above only resolves when
 it is already fully cached locally (`hf download <repo>` first) — the sidecar
 never triggers a download itself, and an uncached repo id falls back to
-text-only with a logged reason exactly like a nonexistent local path.
+text-only with a logged reason exactly like a nonexistent local path. Not
+every conversion meets these conditions: `mlx-community/gemma-4-12B-it-4bit`
+ships no vision weights and the `gemma-4-e2b-it-4bit` / `gemma-4-e4b-it-4bit`
+conversions have per-layer inputs, so all three serve text-only.
 
 Image soft tokens attend bidirectionally to each other inside their own image
 block on sliding-window layers, matching HF's
