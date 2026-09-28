@@ -15,6 +15,7 @@ class BinaryDistribution(Distribution):
 setup(
     distclass=BinaryDistribution,
     package_data={
+        "vllm_metal.pytorch_backend": ["*.mm"],
         "vllm_metal.metal": [
             f"_paged_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
             "_paged_ops.mlx-version",

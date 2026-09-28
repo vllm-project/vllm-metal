@@ -151,6 +151,15 @@ class MetalPlatform(Platform):
             return "Apple Silicon (MLX not available)"
 
     @classmethod
+    def get_current_memory_usage(cls, device=None) -> float:
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import torch
+
+            torch.mps.synchronize()
+            return torch.mps.current_allocated_memory()
+        return super().get_current_memory_usage(device)
+
+    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get total memory available for the device.
 
@@ -299,6 +308,30 @@ class MetalPlatform(Platform):
             )
             if enabled
         ]
+        if envs.VLLM_METAL_BACKEND == "mps":
+            unsupported_controls += [
+                name
+                for name, enabled in (
+                    ("temperature", params.temperature != 0),
+                    ("presence_penalty", params.presence_penalty != 0),
+                    ("frequency_penalty", params.frequency_penalty != 0),
+                    ("repetition_penalty", params.repetition_penalty != 1),
+                    ("allowed_token_ids", bool(params.allowed_token_ids)),
+                    ("bad_words", bool(params.bad_words)),
+                )
+                if enabled
+            ]
+            unsupported_controls += [
+                name
+                for name in (
+                    "logprobs",
+                    "logprob_token_ids",
+                    "prompt_logprobs",
+                    "structured_outputs",
+                    "thinking_token_budget",
+                )
+                if getattr(params, name, None) is not None
+            ]
         if unsupported_controls:
             controls = ", ".join(unsupported_controls)
             raise VLLMValidationError(
@@ -451,7 +484,7 @@ class MetalPlatform(Platform):
 
         # Runs before VllmConfig validates the runner choice, so an explicit
         # request fails with the Metal constraint, not upstream's Triton check.
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER and envs.VLLM_METAL_BACKEND != "mps":
             raise NotImplementedError(
                 "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
                 "MetalWorker implements the V1 model runner contract. Unset it "
@@ -501,8 +534,19 @@ class MetalPlatform(Platform):
         logger.debug("Metal config: %s", config)
 
         # Set worker class for Metal
+        backend = envs.VLLM_METAL_BACKEND
+        if backend not in ("mlx", "mps"):
+            raise ValueError("VLLM_METAL_BACKEND must be 'mlx' or 'mps'")
+        if backend == "mps":
+            from vllm_metal.pytorch_backend.worker import configure_mps
+
+            configure_mps(vllm_config)
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
+            parallel_config.worker_cls = (
+                "vllm_metal.pytorch_backend.worker.MPSWorker"
+                if backend == "mps"
+                else "vllm_metal.v1.worker.MetalWorker"
+            )
 
         # Resolve the executor backend. vLLM's ParallelConfig already defaults an
         # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
@@ -1320,6 +1364,8 @@ class MetalPlatform(Platform):
         """Get the attention backend class for Metal."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        if envs.VLLM_METAL_BACKEND == "mps":
+            return "vllm_metal.pytorch_backend.attention.MPSAttentionBackend"
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info(f"Cannot use {selected_backend} backend on Metal/MLX.")
         if attn_selector_config.use_mla:
