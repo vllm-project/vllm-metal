@@ -132,7 +132,7 @@ if TYPE_CHECKING:
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Opt-in proof of concept: vLLM Qwen3 model running on PyTorch MPS.
+    # Opt-in PyTorch MPS execution backend.
     "VLLM_METAL_BACKEND": lambda: os.getenv("VLLM_METAL_BACKEND", "mlx"),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),
