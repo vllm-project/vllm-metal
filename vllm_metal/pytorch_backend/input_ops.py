@@ -136,6 +136,9 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
     offsets, rows = token_rows(cu, positions.numel())
     slots = mapping[rows].long()
     for i, table in enumerate(self.block_tables):
+        if not self._slot_mapping_enabled[i]:
+            out[i, :padded].fill_(-1)
+            continue
         block_size = self.kernel_block_sizes[i]
         physical = table.gpu[slots, (positions // block_size).long()]
         values = physical.long() * block_size + positions % block_size
@@ -150,8 +153,39 @@ def make_block_pointer_tensor(self, tensors):
     return torch.tensor([tensor.data_ptr() for tensor in tensors], dtype=torch.uint64)
 
 
+def preprocess_state(self, input_batch, block_tables, kv_cache_config, computed):
+    """Copy scheduler-owned state on align boundaries; no speculative offsets."""
+    if not self._align_mode or not input_batch.num_reqs:
+        return
+    group_ids, spec = self._get_mamba_group_info(kv_cache_config)
+    slots = input_batch.idx_mapping.long()
+    previous = self._mamba_state_idx_gpu[slots].long()
+    end = computed[slots] + input_batch.query_start_loc.diff()
+    current = ((end + spec.block_size - 1) // spec.block_size - 1).long()
+    moved = (previous >= 0) & (previous != current)
+    layers = self.vllm_config.compilation_config.static_forward_context
+    for group_id in group_ids:
+        table = block_tables[group_id]
+        source = table.gather(1, previous.clamp_min(0)[:, None]).flatten().long()
+        destination = table.gather(1, current[:, None]).flatten().long()
+        for name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+            for state in layers[name].kv_cache:
+                mask = moved.view(-1, *([1] * (state.ndim - 1)))
+                state[destination] = torch.where(
+                    mask, state[source], state[destination]
+                )
+    self._mamba_state_idx_gpu[slots] = current.to(torch.int32)
+
+
+def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
+    # Speculation is rejected at configuration time. The upstream state starts
+    # with the neutral acceptance count (1), including unsampled prefill steps.
+    pass
+
+
 def install():
     from vllm.v1.worker.gpu import block_table, input_batch, model_runner
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
     from vllm.v1.worker.gpu.sample import sampler
 
     for name in (
@@ -170,3 +204,5 @@ def install():
     block_table.BlockTables.apply_staged_writes = apply_block_table_writes
     block_table.BlockTables.compute_slot_mappings = compute_slot_mappings
     block_table.BlockTables._make_ptr_tensor = make_block_pointer_tensor
+    MambaHybridModelState.preprocess_state = preprocess_state
+    MambaHybridModelState.postprocess_state = postprocess_state
