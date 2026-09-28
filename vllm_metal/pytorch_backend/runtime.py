@@ -76,6 +76,7 @@ def staged_write(self):
 
 
 def install():
+    from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.worker.gpu import buffer_utils, model_runner
     from vllm.v1.worker.gpu.sample import sampler
 
@@ -83,6 +84,12 @@ def install():
 
     if getattr(buffer_utils, "_metal_installed", False):
         return
+
+    @ShortConv.register_oot
+    class MPSShortConv(ShortConv):
+        # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
+        forward = ShortConv.forward_native
+
     # MRV2 0.30 uses these CUDA names even with an MPS device. Use native
     # PyTorch objects; partial avoids duplicate Dynamo handler registration.
     torch.cuda.Stream = torch.Stream

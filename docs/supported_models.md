@@ -131,7 +131,7 @@ block-FP8 checkpoint is not supported.
 | Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
-| LFM2 / LFM2.5 | ✅ | | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
+| LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
 | Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
 | Granite 4.0-h-micro | 🔵 | | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
 | Gemma 4 | ✅ | | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-e2b-it-4bit` |
