@@ -25,9 +25,9 @@ checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
     VLLM_METAL_TEST_GGUF_DENSE_PATH=<...Qwen3-0.6B dir> \\
     pytest tests/test_gguf_serve_golden.py -m slow
 
-(Qwen3 Q4_1 uses ``VLLM_METAL_TEST_GGUF_Q41_*``, llama uses
-``VLLM_METAL_TEST_GGUF_LLAMA_*``, and mistral uses
-``VLLM_METAL_TEST_GGUF_MISTRAL_*`` for the same trio.)
+(Qwen3 Q4_1 uses ``VLLM_METAL_TEST_GGUF_Q41_*``, Qwen3 Q4_K_M uses
+``VLLM_METAL_TEST_GGUF_Q4KM_*``, llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*``,
+and mistral uses ``VLLM_METAL_TEST_GGUF_MISTRAL_*`` for the same trio.)
 """
 
 from __future__ import annotations
@@ -127,6 +127,37 @@ _CASES = [
             13,
         ),
         dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
+    # Qwen3-0.6B-Q4_K_M.gguf (unsloth, rev 50968a44): Q4_K linears plus Q6_K
+    # attn_v/ffn_down in some layers and a Q6_K tied embedding. The ids match
+    # the Q8_0 case; dense agreement holds through index 11, diverging at 12.
+    _GoldenCase(
+        label="qwen3-q4_k_m",
+        quantization="Q4_K_M",
+        prompt=_DEFAULT_PROMPT,
+        gguf_env="VLLM_METAL_TEST_GGUF_Q4KM_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_Q4KM_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_Q4KM_DENSE_PATH",
+        golden_ids=(
+            12095,
+            13,
+            576,
+            6722,
+            315,
+            9625,
+            374,
+            1083,
+            279,
+            6722,
+            315,
+            279,
+            5429,
+            315,
+            9625,
+            13,
+        ),
+        dense_agree_prefix=12,
         target_dtype=mx.bfloat16,
     ),
     # Llama-3.2-1B-Instruct-Q8_0.gguf: agreement through index 12, divergence

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX-native local GGUF loader for dense Q8_0/Q4_0/Q4_1 checkpoints."""
+"""Local GGUF loader for dense Q8_0/Q4_0/Q4_1 and Q4_K/Q5_K/Q6_K checkpoints."""
 
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model, load_tokenizer
 
 from vllm_metal.gguf.adapter import GGUFLoadError, GGUFModelAdapter
-from vllm_metal.gguf.mlx_native import GGUFMLXQuantizedTensor
+from vllm_metal.gguf.mlx_native import AFFINE_GGUF_TYPES, GGUFMLXQuantizedTensor
+from vllm_metal.gguf.raw_block import RAW_KERNEL_GGUF_TYPES, GGUFRawBlockTensor
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.gguf.wrappers import GGUFEmbedding, GGUFLinear
 
@@ -39,25 +40,23 @@ _PLAIN_GGUF_TYPES = frozenset(
         gguf.GGMLQuantizationType.BF16,
     }
 )
-_QUANT_GGUF_TYPES = frozenset(
-    {
-        gguf.GGMLQuantizationType.Q8_0,
-        gguf.GGMLQuantizationType.Q4_0,
-        gguf.GGMLQuantizationType.Q4_1,
-    }
-)
+_QUANT_GGUF_TYPES = AFFINE_GGUF_TYPES | RAW_KERNEL_GGUF_TYPES
 _ALLOWED_WEIGHT_TYPES = _QUANT_GGUF_TYPES | _PLAIN_GGUF_TYPES
+_SUPPORTED_QTYPES_NOTE = (
+    "only Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) are supported."
+)
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 
 
 GGUFWrapper = GGUFLinear | GGUFEmbedding
+GGUFQuantTensor = GGUFMLXQuantizedTensor | GGUFRawBlockTensor
 
 
 @dataclass(frozen=True)
 class _PartitionedTensors:
     """GGUF tensors split by how the loader installs them."""
 
-    quant: dict[str, GGUFMLXQuantizedTensor]
+    quant: dict[str, GGUFQuantTensor]
     plain: dict[str, mx.array]
     biases: dict[str, mx.array]
 
@@ -74,7 +73,8 @@ class GGUFModelLoader:
     """Load a dense GGUF checkpoint into its mlx-lm model.
 
     Args:
-        gguf_path: Path to a local ``.gguf`` file (dense, Q8_0/Q4_0/Q4_1).
+        gguf_path: Path to a local ``.gguf`` file (dense; Q8_0/Q4_0/Q4_1 or
+            K-quant Q4_K/Q5_K/Q6_K).
         config_dir: Companion HF config source that defines the mlx-lm skeleton.
         tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.
@@ -189,8 +189,7 @@ class GGUFModelLoader:
             ):
                 raise GGUFLoadError(
                     f"Unsupported qtype {tensor.tensor_type.name} on mapped weight "
-                    f"{name!r}; only Q8_0/Q4_0/Q4_1 (and plain F32/F16/BF16) "
-                    "are supported."
+                    f"{name!r}; {_SUPPORTED_QTYPES_NOTE}"
                 )
             if (
                 name.endswith(_BIAS_SUFFIX)
@@ -214,8 +213,7 @@ class GGUFModelLoader:
             return
         raise GGUFLoadError(
             f"Unsupported qtype {output.tensor_type.name} on mapped weight "
-            "'output.weight'; only Q8_0/Q4_0/Q4_1 (and plain F32/F16/BF16) "
-            "are supported."
+            f"'output.weight'; {_SUPPORTED_QTYPES_NOTE}"
         )
 
     def _to_target_dtype(self, array: mx.array) -> mx.array:
@@ -241,7 +239,7 @@ class GGUFModelLoader:
         Tensors are read from the reader's memory map, so the file only needs
         read access.
         """
-        quant: dict[str, GGUFMLXQuantizedTensor] = {}
+        quant: dict[str, GGUFQuantTensor] = {}
         plain: dict[str, mx.array] = {}
         biases: dict[str, mx.array] = {}
         for tensor in reader.tensors:
@@ -292,13 +290,15 @@ class GGUFModelLoader:
         return _PartitionedTensors(quant=quant, plain=plain, biases=biases)
 
     @staticmethod
-    def _quant_tensor(tensor: Any) -> GGUFMLXQuantizedTensor:
-        """Repack a quantized tensor from the reader's raw block bytes."""
-        return GGUFMLXQuantizedTensor.from_raw_blocks(
-            tensor.data.reshape(-1),
-            GGUFModelLoader._logical_shape(tensor),
-            tensor.tensor_type,
-        )
+    def _quant_tensor(tensor: Any) -> GGUFQuantTensor:
+        """Build a quantized tensor from the reader's raw block bytes."""
+        data = tensor.data.reshape(-1)
+        logical = GGUFModelLoader._logical_shape(tensor)
+        if tensor.tensor_type in AFFINE_GGUF_TYPES:
+            return GGUFMLXQuantizedTensor.from_raw_blocks(
+                data, logical, tensor.tensor_type
+            )
+        return GGUFRawBlockTensor.from_raw_blocks(data, logical, tensor.tensor_type)
 
     @staticmethod
     def _plain_tensor(tensor: Any) -> mx.array:
@@ -319,7 +319,7 @@ class GGUFModelLoader:
     def _install_quant_modules(
         self,
         model: nn.Module,
-        quant: dict[str, GGUFMLXQuantizedTensor],
+        quant: dict[str, GGUFQuantTensor],
         biases: dict[str, mx.array],
     ) -> list[_InstalledWrapper]:
         """Replace each quantized module with a GGUF wrapper on the live tree."""
@@ -403,7 +403,7 @@ class GGUFModelLoader:
         self,
         module_path: str,
         module: Any,
-        qt: GGUFMLXQuantizedTensor,
+        qt: GGUFQuantTensor,
         name: str,
     ) -> None:
         weight = module.weight

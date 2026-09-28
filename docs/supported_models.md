@@ -103,16 +103,20 @@ vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). A
 `.gguf` carries weights only, so it pairs with a companion config dir
 (`--tokenizer`) and needs the `gguf` extra; remote `repo_id:quant` references
-download one matching unsharded `.gguf` file. The weights stay MLX-native
-quantized (Q8_0/Q4_0/Q4_1, not a dense fallback). Scope is dense
-`qwen2`/`qwen3`/`llama`/`mistral` (mistral converts under the llama GGUF arch)
-with per-tensor `Q8_0`/`Q4_0`/`Q4_1`; K-quants, fused-QKV, MoE, SSM/hybrid,
-vision, ambiguous remote matches, and sharded remote GGUF files are rejected
-with a clear error. See [GGUF](gguf.md) for serve examples and source
-precedence. A tied model's unused `output.weight` is skipped whatever its
-qtype. Verified end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
+download one matching unsharded `.gguf` file. The weights stay quantized
+(Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K, not a dense fallback), and one file may mix
+them the way llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L do;
+remote reference tags cover only Q8_0/Q4_0/Q4_1 and the plain types. Scope is
+dense `qwen2`/`qwen3`/`llama`/`mistral` (mistral converts under the llama GGUF
+arch); Q5_0/Q5_1, Q2_K/Q3_K, IQ quants, fused-QKV, MoE, SSM/hybrid, vision,
+ambiguous remote matches, and sharded remote GGUF files are rejected with a
+clear error. See [GGUF](gguf.md) for serve examples and source precedence. A
+tied model's unused `output.weight` is skipped whatever its qtype. Verified
+end-to-end on Qwen3-0.6B Q4_K_M, Q5_K_M, Q4_K_L, and Q4_1, on
+Llama-3.2-1B-Instruct and Mistral-7B-Instruct-v0.3 Q4_K_M, and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
-([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
+([#415](https://github.com/vllm-project/vllm-metal/issues/415),
+[#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
 | Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
 | --- | --- | --- | --- | --- |

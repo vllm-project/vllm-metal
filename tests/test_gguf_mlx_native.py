@@ -20,6 +20,7 @@ import pytest
 gguf = pytest.importorskip("gguf")
 
 import vllm_metal.gguf.mlx_native as mlx_native  # noqa: E402
+from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
 from vllm_metal.gguf.mlx_native import (  # noqa: E402
     AFFINE_GGUF_TYPES,
     GGUFMLXQuantizedTensor,
@@ -259,39 +260,8 @@ def test_embedding_empty_ids(qtype):
 KQUANT_QTYPES = [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K]
 
 
-def _build_kquant_blocks(rows: int, cols: int, qtype, seed: int = 0) -> np.ndarray:
-    """Construct valid random Q4_K/Q5_K superblocks field-by-field.
-
-    gguf-py has no K-quant quantizer, so tests build the raw blocks directly;
-    ``gguf.quants.dequantize`` stays the authoritative oracle for what they
-    mean.
-    """
-    five_bit = qtype == GGMLQuantizationType.Q5_K
-    rng = np.random.default_rng(seed)
-    n = rows * (cols // 256)
-    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
-    dmin = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
-    sub_scales = rng.integers(0, 64, (n, 8), dtype=np.uint8)
-    sub_mins = rng.integers(0, 64, (n, 8), dtype=np.uint8)
-    codes = rng.integers(0, 32 if five_bit else 16, (n, 8, 32), dtype=np.uint8)
-    packed = np.zeros((n, 12), np.uint8)
-    packed[:, 0:4] = (sub_scales[:, 0:4] & 0x3F) | ((sub_scales[:, 4:8] & 0x30) << 2)
-    packed[:, 4:8] = (sub_mins[:, 0:4] & 0x3F) | ((sub_mins[:, 4:8] & 0x30) << 2)
-    packed[:, 8:12] = (sub_scales[:, 4:8] & 0x0F) | ((sub_mins[:, 4:8] & 0x0F) << 4)
-    low = codes & 0x0F
-    nibbles = (low[:, 0::2, :] | (low[:, 1::2, :] << 4)).reshape(n, 128)
-    parts = [d.view(np.uint8), dmin.view(np.uint8), packed]
-    if five_bit:
-        qh = np.zeros((n, 32), np.uint8)
-        for group in range(8):
-            qh |= (codes[:, group, :] >> 4) << group
-        parts.append(qh)
-    parts.append(nibbles)
-    return np.concatenate(parts, axis=1).reshape(rows, -1)
-
-
 def _make_kquant_tensor(qtype, rows: int = 8, cols: int = 512) -> tuple:
-    raw = _build_kquant_blocks(rows, cols, qtype)
+    raw = build_kquant_blocks(rows, cols, qtype)
     qt = GGUFMLXQuantizedTensor.from_raw_blocks(raw, (rows, cols), qtype)
     oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
@@ -381,7 +351,7 @@ def test_kquant_requires_float32_scales(qtype):
 
 
 def test_from_raw_blocks_rejects_truncated_payload():
-    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
+    raw = build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="logical shape .* needs"):
         GGUFMLXQuantizedTensor.from_raw_blocks(
@@ -390,14 +360,14 @@ def test_from_raw_blocks_rejects_truncated_payload():
 
 
 def test_from_raw_blocks_rejects_non_superblock_width():
-    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
+    raw = build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="not a multiple of the 256-element"):
         GGUFMLXQuantizedTensor.from_raw_blocks(raw, (8, 500), GGMLQuantizationType.Q4_K)
 
 
 def test_from_raw_blocks_rejects_non_uint8_payload():
-    raw = _build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
+    raw = build_kquant_blocks(8, 512, GGMLQuantizationType.Q4_K)
 
     with pytest.raises(ValueError, match="raw block data must be uint8"):
         GGUFMLXQuantizedTensor.from_raw_blocks(
@@ -407,7 +377,7 @@ def test_from_raw_blocks_rejects_non_uint8_payload():
 
 def _raw_blocks(qtype, rows: int, cols: int) -> np.ndarray:
     if qtype in KQUANT_QTYPES:
-        return _build_kquant_blocks(rows, cols, qtype)
+        return build_kquant_blocks(rows, cols, qtype)
     weight = np.random.default_rng(0).standard_normal((rows, cols)).astype(np.float32)
     return gguf.quants.quantize(weight, qtype)
 

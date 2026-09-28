@@ -14,6 +14,7 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
+from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
@@ -38,33 +39,8 @@ def _spy_matmul_paths(monkeypatch) -> dict:
     return calls
 
 
-def _build_q6k_blocks(rows: int, cols: int, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    n = rows * (cols // 256)
-    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
-    sub_scales = rng.integers(-128, 128, (n, 16), dtype=np.int8)
-    codes = rng.integers(0, 64, (n, 256), dtype=np.uint8)
-    low = codes & 0x0F
-    high = codes >> 4
-    ql = np.zeros((n, 128), np.uint8)
-    for c in (0, 1):
-        ql[:, c * 64 : (c + 1) * 64] = low[:, c * 128 : c * 128 + 64] | (
-            low[:, c * 128 + 64 : c * 128 + 128] << 4
-        )
-    qh = np.zeros((n, 64), np.uint8)
-    for c in (0, 1):
-        for s in range(4):
-            qh[:, c * 32 : (c + 1) * 32] |= high[
-                :, c * 128 + s * 32 : c * 128 + (s + 1) * 32
-            ] << (2 * s)
-    blocks = np.concatenate(
-        [ql, qh, sub_scales.view(np.uint8), d.view(np.uint8)], axis=1
-    )
-    return blocks.reshape(rows, -1)
-
-
 def _make_q6k_tensor(rows: int = 16, cols: int = 512) -> tuple:
-    raw = _build_q6k_blocks(rows, cols)
+    raw = build_kquant_blocks(rows, cols, GGMLQuantizationType.Q6_K)
     qt = GGUFRawBlockTensor.from_raw_blocks(
         raw, (rows, cols), GGMLQuantizationType.Q6_K
     )
@@ -236,7 +212,7 @@ def test_permute_rows_rejects_bad_index():
 
 
 def test_rejects_non_raw_kernel_qtype():
-    raw = _build_q6k_blocks(16, 512)
+    raw = build_kquant_blocks(16, 512, GGMLQuantizationType.Q6_K)
 
     with pytest.raises(ValueError, match="Raw-kernel qtypes: Q6_K"):
         GGUFRawBlockTensor.from_raw_blocks(raw, (16, 512), GGMLQuantizationType.Q4_K)
@@ -259,7 +235,7 @@ def test_rejects_non_superblock_row_width():
 
 
 def test_from_raw_blocks_rejects_truncated_payload():
-    raw = _build_q6k_blocks(16, 512)
+    raw = build_kquant_blocks(16, 512, GGMLQuantizationType.Q6_K)
 
     with pytest.raises(ValueError, match="logical shape .* needs"):
         GGUFRawBlockTensor.from_raw_blocks(
@@ -268,14 +244,14 @@ def test_from_raw_blocks_rejects_truncated_payload():
 
 
 def test_from_raw_blocks_rejects_non_superblock_width():
-    raw = _build_q6k_blocks(16, 512)
+    raw = build_kquant_blocks(16, 512, GGMLQuantizationType.Q6_K)
 
     with pytest.raises(ValueError, match="not a multiple of the 256-element"):
         GGUFRawBlockTensor.from_raw_blocks(raw, (16, 500), GGMLQuantizationType.Q6_K)
 
 
 def test_from_raw_blocks_rejects_non_uint8_payload():
-    raw = _build_q6k_blocks(16, 512)
+    raw = build_kquant_blocks(16, 512, GGMLQuantizationType.Q6_K)
 
     with pytest.raises(ValueError, match="raw block data must be uint8"):
         GGUFRawBlockTensor.from_raw_blocks(
