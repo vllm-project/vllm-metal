@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -485,21 +485,34 @@ class SamplingBatch:
         ]
         return token_ids_by_row, topk_requests
 
+    @property
+    def mixes_topk_and_specific_logprobs(self) -> bool:
+        """Whether rows asking for top-k logprobs share the batch with rows
+        asking for specific token IDs.
+
+        Such a batch needs :meth:`gather_mixed_logprobs` after sampling.
+        """
+        token_ids_by_row, topk_requests = self._split_logprob_requests()
+        return bool(token_ids_by_row) and any(
+            num_logprobs > 0 for _, num_logprobs in topk_requests
+        )
+
     def _make_logprob_args(self) -> tuple[int | None, dict[int, list[int]] | None]:
         """Build mutually exclusive logprob arguments for vLLM's sampler.
 
         vLLM's compatibility sampler treats any ``logprob_token_ids`` mapping
-        as a batch-wide override of ``max_num_logprobs``. When a batch mixes
-        both request types, ask for the full-vocab logprobs (``-1``) instead;
-        :meth:`gather_mixed_logprobs` then picks each row's token IDs from
-        them, so top-k rows rank the values ``--logprobs-mode`` selects.
+        as a batch-wide override of ``max_num_logprobs``. A batch that
+        :attr:`mixes_topk_and_specific_logprobs` asks for the full-vocab
+        logprobs (``-1``) instead; :meth:`gather_mixed_logprobs` then picks
+        each row's token IDs from them, so top-k rows rank the values
+        ``--logprobs-mode`` selects.
         """
         max_num_logprobs = self.max_num_logprobs
+        if self.mixes_topk_and_specific_logprobs:
+            return -1, None
         token_ids_by_row, topk_requests = self._split_logprob_requests()
         if not token_ids_by_row:
             return max_num_logprobs, None
-        if any(num_logprobs > 0 for _, num_logprobs in topk_requests):
-            return -1, None
         for i, _ in topk_requests:
             token_ids_by_row[i] = []
         return None, token_ids_by_row
@@ -507,14 +520,20 @@ class SamplingBatch:
     def gather_mixed_logprobs(
         self,
         sampler: Sampler,
-        logprobs: torch.Tensor,
-        sampled: torch.Tensor,
+        output: SamplerOutput,
     ) -> LogprobsTensors:
         """Gather per-row logprobs for a batch that mixes both request types.
 
-        ``logprobs`` is the full-vocab tensor the sampler returned for
-        ``max_num_logprobs=-1``: raw or processed, per its logprobs mode.
+        ``output`` comes from sampling with ``max_num_logprobs=-1``, so its
+        logprobs are the full-vocab tensor: raw or processed, per the
+        sampler's logprobs mode.
         """
+        if output.logprobs_tensors is None:
+            raise RuntimeError(
+                "Sampler returned no logprobs for a mixed logprobs batch."
+            )
+        logprobs = output.logprobs_tensors.logprobs
+        sampled = output.sampled_token_ids[:, 0]
         token_ids_by_row, topk_requests = self._split_logprob_requests()
         max_topk = max(num_logprobs for _, num_logprobs in topk_requests)
         topk_token_ids = torch.topk(logprobs, max_topk, dim=-1).indices
@@ -523,7 +542,10 @@ class SamplingBatch:
         tensors = sampler.gather_specific_token_logprobs(
             logprobs, token_ids_by_row, sampled.long()
         )
-        assert tensors is not None
+        if tensors is None:
+            raise RuntimeError(
+                "Sampler gathered no logprobs for a mixed logprobs batch."
+            )
         return tensors
 
     def _make_logitsprocs(self) -> LogitsProcessors:
@@ -632,15 +654,13 @@ def sample_from_logits(
     )
     metadata = batch.make_sampling_metadata()
     output = sampler.forward(logits_torch, metadata)
-    sampled = output.sampled_token_ids[:, 0]
-    logprobs_tensors = output.logprobs_tensors
-    if metadata.max_num_logprobs == -1:
-        assert logprobs_tensors is not None
-        logprobs_tensors = batch.gather_mixed_logprobs(
-            sampler, logprobs_tensors.logprobs, sampled
-        )
+    logprobs_tensors = (
+        batch.gather_mixed_logprobs(sampler, output)
+        if batch.mixes_topk_and_specific_logprobs
+        else output.logprobs_tensors
+    )
     logprobs = logprobs_tensors.tolists() if logprobs_tensors is not None else None
-    return _SamplingResult(sampled.tolist(), logprobs)
+    return _SamplingResult(output.sampled_token_ids[:, 0].tolist(), logprobs)
 
 
 def sample_decode_tokens(

@@ -775,6 +775,7 @@ class TestV1SamplingBatch:
         )
 
         topk_ids = [[2, 3], [0, 2]]
+        assert batch.mixes_topk_and_specific_logprobs
         metadata = batch.make_sampling_metadata()
         assert metadata.max_num_logprobs == -1
         assert metadata.logprob_token_ids is None
@@ -860,6 +861,7 @@ class TestV1SamplingBatch:
             vocab_size=4,
         )
 
+        assert not batch.mixes_topk_and_specific_logprobs
         metadata = batch.make_sampling_metadata()
 
         assert metadata.max_num_logprobs is None
