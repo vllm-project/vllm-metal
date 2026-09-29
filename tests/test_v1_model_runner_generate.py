@@ -2570,6 +2570,86 @@ class _FullPathMustNotRun:
         raise AssertionError("full-model dummy path must not run on a PP stage")
 
 
+class TestProfileLogitsIndices:
+    """``_profile_logits_indices`` names the rows a maximal step can sample."""
+
+    def _runner(
+        self,
+        *,
+        selective: bool = True,
+        max_num_seqs: int = 8,
+        num_speculative_tokens: int | None = None,
+    ) -> mr.MetalModelRunner:
+        speculative = (
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        )
+        return make_stub_runner(
+            _selective_logits_supported=selective,
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8192, max_num_seqs=max_num_seqs
+            ),
+            vllm_config=SimpleNamespace(
+                speculative_config=speculative,
+                lora_config=None,
+                load_config=SimpleNamespace(download_dir=None, ignore_patterns=[]),
+                parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
+            ),
+        )
+
+    def _ids(self, rows: int) -> mx.array:
+        return mx.zeros((1, rows), dtype=mx.int32)
+
+    def test_no_selection_keeps_every_row(self) -> None:
+        # Multimodal, pipeline parallel and LoRA models cannot select rows, and
+        # neither can a model whose adapter rejects it: all keep the full-head
+        # projection the profile used before.
+        runner = self._runner(selective=False)
+        assert runner._profile_logits_indices(self._ids(64)) is None
+
+    @pytest.mark.parametrize("rows", [1, 7, 8])
+    def test_batch_no_larger_than_the_sampled_rows_keeps_every_row(
+        self, rows: int
+    ) -> None:
+        # A step can sample at most ``max_num_seqs`` rows, so a batch that size
+        # or smaller already is the selective set — no gather, no indices.
+        runner = self._runner(max_num_seqs=8)
+        assert runner._profile_logits_indices(self._ids(rows)) is None
+
+    def test_selects_the_last_rows_a_step_can_sample(self) -> None:
+        runner = self._runner(max_num_seqs=8)
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.dtype == mx.int32
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_one_row_over_the_bound_selects_that_row(self) -> None:
+        # The tight boundary: one request that samples a single row leaves
+        # exactly the rows outside it.
+        runner = self._runner(max_num_seqs=1)
+        indices = runner._profile_logits_indices(self._ids(2))
+        assert indices is not None
+        assert indices.tolist() == [1]
+
+    def test_speculative_tokens_widen_the_sampled_rows(self) -> None:
+        # A verification window reads ``1 + num_speculative_tokens`` rows per
+        # request, so the reserve has to cover that many.
+        runner = self._runner(max_num_seqs=2, num_speculative_tokens=3)
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_indices_stay_inside_the_batch(self) -> None:
+        rows = 10
+        runner = self._runner(max_num_seqs=3)
+        indices = runner._profile_logits_indices(self._ids(rows))
+        assert indices is not None
+        assert len(indices) == 3
+        assert int(mx.min(indices)) >= 0
+        assert int(mx.max(indices)) < rows
+
+
 class TestDummyForwardOutputsPPRouting:
     class _Group:
         def __init__(self, rank: int, size: int) -> None:
