@@ -63,3 +63,15 @@ Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
 for dense allocation.
+
+The KV pool is allocated lazily. vLLM's allocator zero-fills the backing store,
+which on unified memory commits every page of the pool at startup; vllm-metal
+requests the same layout without the fill whenever vLLM does not require it
+(uniform-precision attention caches — `KVCacheConfig.needs_kv_cache_zeroing`
+covers Mamba state and mixed-precision caches, which keep the zero fill). Pages
+are then committed only as blocks are used, so `--gpu-memory-utilization` sizes
+the *capacity* the engine may reach rather than the resident footprint it pays
+for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
+request only occupies the blocks it writes. A slot a request never writes never
+reaches an output — the attention kernels mask every position past the sequence
+length — so the missing zero fill does not change results.
