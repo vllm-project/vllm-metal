@@ -42,8 +42,10 @@ _PLAIN_GGUF_TYPES = frozenset(
 )
 _QUANT_GGUF_TYPES = AFFINE_GGUF_TYPES | RAW_KERNEL_GGUF_TYPES
 _ALLOWED_WEIGHT_TYPES = _QUANT_GGUF_TYPES | _PLAIN_GGUF_TYPES
+_PLAIN_QTYPE_NAMES = "/".join(t.name for t in sorted(_PLAIN_GGUF_TYPES))
 _SUPPORTED_QTYPES_NOTE = (
-    "only Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) are supported."
+    f"only {'/'.join(t.name for t in sorted(_QUANT_GGUF_TYPES))} "
+    f"(and plain {_PLAIN_QTYPE_NAMES}) are supported."
 )
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 
@@ -197,7 +199,7 @@ class GGUFModelLoader:
             ):
                 raise GGUFLoadError(
                     f"Unsupported qtype {tensor.tensor_type.name} on bias {name!r}; "
-                    "additive biases must be plain F32/F16/BF16."
+                    f"additive biases must be plain {_PLAIN_QTYPE_NAMES}."
                 )
 
     def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:

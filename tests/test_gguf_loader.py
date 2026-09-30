@@ -1001,7 +1001,7 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
 
     assert str(excinfo.value) == (
         "Unsupported qtype Q3_K on mapped weight 'blk.0.ffn_gate.weight'; "
-        "only Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) are "
+        "only Q4_0/Q4_1/Q8_0/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) are "
         "supported."
     )
 
