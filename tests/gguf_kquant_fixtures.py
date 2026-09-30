@@ -22,7 +22,9 @@ def build_kquant_blocks(
     raise ValueError(f"no K-quant block builder for {qtype.name}")
 
 
-def _build_q45k(rows: int, cols: int, qtype, seed: int) -> np.ndarray:
+def _build_q45k(
+    rows: int, cols: int, qtype: gguf.GGMLQuantizationType, seed: int
+) -> np.ndarray:
     five_bit = qtype == QT.Q5_K
     rng = np.random.default_rng(seed)
     n = rows * (cols // 256)
