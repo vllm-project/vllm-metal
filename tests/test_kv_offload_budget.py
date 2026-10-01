@@ -16,6 +16,7 @@ import pytest
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from vllm_metal.config import MetalConfig  # noqa: E402
+from vllm_metal.utils import CommitProbe  # noqa: E402
 from vllm_metal.v1.cache_policy import WorkerCachePlanner  # noqa: E402
 from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 
@@ -112,3 +113,33 @@ def test_pool_larger_than_budget_fails_with_the_mitigation() -> None:
     planner = _planner(_offload("MetalOffloadingConnector", pool=4 * _GB))
     with pytest.raises(ValueError, match="lower --kv-offloading-size"):
         planner.determine_available_memory()
+
+
+def test_offload_pool_is_held_back_from_the_paging_cap(monkeypatch) -> None:
+    """A paging machine offers the KV pool free memory less the offload pool.
+
+    The offload host pool is pageable, but it is the same RAM: a cap that spent
+    it on KV would put the offload pool back into swap.
+    """
+    free = 3 * _GB
+    pool = _GB
+    planner = _planner(_offload("MetalOffloadingConnector", pool=pool))
+    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.probe_commit",
+        lambda nbytes: CommitProbe(
+            probed_bytes=nbytes,
+            swap_out_before=0,
+            swap_out_after=nbytes,  # paged the whole sample: no headroom
+            available_before=free,
+            available_after=free,
+            seconds=0.0,
+        ),
+    )
+
+    plan = planner._paged_attention_plan(overhead=_GB)
+
+    # Without the carve-out the cap would be free less the reserve (1.93GB),
+    # which is below the 2GB plan but above this.
+    assert plan.kv_offload_pool == pool
+    assert plan.kv_budget == free - (1 << 30) - pool

@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
+    VLLM_METAL_KV_COMMIT_PROBE: bool = True
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
@@ -240,6 +241,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maximum=65535,
         note=" (the user-port range)",
     ),
+    # Startup commit probe for the lazily allocated KV pool (default on).
+    # The pool is not backed until a request writes a block, so a pool the
+    # machine cannot hold is otherwise discovered mid-generation, as a swap
+    # storm or a jetsam kill. The planner forces a bounded sample of the
+    # planned pool resident at startup, drops it again, and reports what the
+    # machine had free; if the kernel had to page memory out to back the
+    # sample, the pool is sized down to what is free. Set to "0" to skip the
+    # touch (no sample, no sizing change).
+    "VLLM_METAL_KV_COMMIT_PROBE": _bool("VLLM_METAL_KV_COMMIT_PROBE", True),
 }
 
 
