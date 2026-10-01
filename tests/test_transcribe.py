@@ -9,13 +9,14 @@ from types import SimpleNamespace
 from typing import cast
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from transformers import WhisperFeatureExtractor, WhisperTokenizer
 from vllm.config import SpeechToTextConfig
 
 from vllm_metal.stt.audio import N_SAMPLES, SAMPLE_RATE
-from vllm_metal.stt.loader import load_model
+from vllm_metal.stt.loader import _load_and_init_model, load_model
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel, WhisperTranscriber
 from vllm_metal.stt.whisper.transcriber import (
     DEFAULT_SEGMENT_DURATION,
@@ -168,6 +169,44 @@ class TestTokenizerFallback:
         )
 
         assert len(transcriber.tokenizer) == n_vocab
+
+
+class _RenamingModel(nn.Module):
+    """A one-layer model whose checkpoint carries the ``model.`` prefix."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(64, 64, bias=False)
+
+    def sanitize(self, weights: dict) -> dict:
+        return {k.removeprefix("model."): v for k, v in weights.items()}
+
+
+def _write_quantized_checkpoint(path: Path, prefix: str) -> dict[str, mx.array]:
+    dense = mx.random.normal((64, 64)).astype(mx.float16)
+    weight, scales, biases = mx.quantize(dense, group_size=64, bits=4)
+    tensors = {"weight": weight, "scales": scales, "biases": biases}
+    mx.save_safetensors(
+        str(path / "model.safetensors"),
+        {f"{prefix}proj.{name}": value for name, value in tensors.items()},
+    )
+    return tensors
+
+
+class TestLoadAndInitModel:
+    _QUANT = {"quantization": {"group_size": 64, "bits": 4}}
+
+    def test_quantizes_modules_by_their_sanitized_names(self, tmp_path: Path) -> None:
+        # nn.quantize hands the predicate module paths; the checkpoint keys
+        # carry the prefix sanitize strips, so the match must run after it.
+        saved = _write_quantized_checkpoint(tmp_path, "model.")
+        model = _RenamingModel()
+
+        _load_and_init_model(model, tmp_path, self._QUANT)
+
+        assert isinstance(model.proj, nn.QuantizedLinear)
+        for name, value in saved.items():
+            assert mx.array_equal(getattr(model.proj, name), value)
 
 
 class TestLoadModel:

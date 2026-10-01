@@ -93,8 +93,8 @@ def resolve_model_path(model_path: str | Path, *, revision: str | None = None) -
 
 
 def _load_and_init_model(model, model_path: Path, config_dict: dict):
-    """Shared loader: quantize, sanitize, load weights, and eval."""
-    weights = _load_weights(model_path)
+    """Shared loader: sanitize, quantize, load weights, and eval."""
+    weights = model.sanitize(_load_weights(model_path))
 
     quantization = config_dict.get("quantization")
     if quantization is not None:
@@ -104,7 +104,6 @@ def _load_and_init_model(model, model_path: Path, config_dict: dict):
 
         nn.quantize(model, **quantization, class_predicate=class_predicate)
 
-    weights = model.sanitize(weights)
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model
