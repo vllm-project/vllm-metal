@@ -120,8 +120,11 @@ class GGUFModelLoader:
         )
         self._preflight(reader)
 
-        # Build the mlx-lm skeleton through the public upstream loader path.
-        model, _ = load_model(self._config_dir, strict=False, model_config=config)
+        # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter, so
+        # its own weights are never materialized.
+        model, _ = load_model(
+            self._config_dir, lazy=True, strict=False, model_config=config
+        )
         tied = bool(getattr(model.args, "tie_word_embeddings", False))
         self._preflight_deferred_output(reader, tied=tied)
 

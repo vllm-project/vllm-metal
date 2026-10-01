@@ -844,6 +844,24 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
         ).load()
 
 
+def test_builds_the_skeleton_lazily(tmp_path, monkeypatch):
+    # The GGUF replaces every skeleton parameter, so the skeleton's own weights
+    # (random init, or dense safetensors in config_dir) must never be evaluated.
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    real_load_model = gguf_loader.load_model
+    lazy_flags = []
+
+    def spy_load_model(*args, **kwargs):
+        lazy_flags.append(kwargs.get("lazy"))
+        return real_load_model(*args, **kwargs)
+
+    monkeypatch.setattr(gguf_loader, "load_model", spy_load_model)
+
+    GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+    assert lazy_flags == [True]
+
+
 def test_rejects_unsupported_untied_output(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
