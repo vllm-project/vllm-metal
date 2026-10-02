@@ -77,3 +77,36 @@ for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
 request only occupies the blocks it writes. A slot a request never writes never
 reaches an output — the attention kernels mask every position past the sequence
 length — so the missing zero fill does not change results.
+
+Unified memory means the pool is not a reservation either way. Nothing pins it:
+`mx.set_wired_limit()` covers MLX-allocated buffers, not this torch allocation
+that MLX imports in place, so the kernel may compress or swap any of its pages
+as soon as something else wants the RAM — zeros from the fill or KV from a
+request alike. The fill decides when the pages become resident, not whether the
+OS can take them back. Resident KV is bounded by the blocks in use, so a run
+that fills the pool peaks at the footprint the eager fill would have committed,
+and a run that leaves blocks idle never pays for them. The difference is when
+the pages are asked for: the fill paid up front, before the first request, while
+a lazy pool faults them in during serving — a long prefill can demand hundreds
+of megabytes at once, at the moment the MLX working set is also at its peak.
+Faulting a page in under pressure is satisfied from the compressor or swap — it
+costs latency, it does not raise an allocation error — and a machine that
+exhausts both ends the process the same way it would end a startup zero-fill.
+`--gpu-memory-utilization` therefore bounds cache capacity rather than
+admission: two processes sized against the same free memory will both claim it,
+where the eager fill's resident pages at least showed up as used.
+
+Because of that, the planner checks the plan against the machine before serving:
+`VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
+planned pool resident at startup — `min(capacity, 512 MiB)`, one write per VM
+page — and reads back how much memory was free and how much the kernel had to
+push to swap to make room. The sample lives in its own mapping and is dropped as
+soon as the probe returns, so it leaves nothing resident behind — the touch
+itself is transient, which a process's peak-RSS counter will see but steady
+state will not. If the kernel had to page memory out to back the sample, the
+machine has no headroom to give and the pool is sized down to what is free, less
+a reserve of `max(1 GiB, 1/16 of the recommended working set)`, with a warning.
+If free memory is merely below the plan, the pool keeps its capacity and the
+shortfall is logged: a plan is a cap, and only the blocks requests actually write
+are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to skip the touch and trust
+`--gpu-memory-utilization` alone.

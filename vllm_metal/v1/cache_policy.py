@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+import vllm_metal.envs as envs
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -46,6 +47,7 @@ from vllm_metal.config import (
 )
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
+from vllm_metal.utils import CommitProbe, probe_commit
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
@@ -208,6 +210,46 @@ class _PagedAttentionPlan:
             "use a smaller or more quantized model",
         ]
         return "Mitigations: " + "; ".join(mitigations) + "."
+
+
+# The commit probe (``vllm_metal.utils.probe_commit``) touches a bounded sample
+# of the pool: enough to make the machine fault pages in and to notice it paging
+# out to swap, small enough that the pages it forces resident (and then drops)
+# never amount to the multi-GB pool the lazy allocation exists to avoid.
+KV_COMMIT_SAMPLE_BYTES = 512 << 20
+
+# Free memory the pool has to leave for everything else on the machine. Scaled
+# off Metal's recommended working set, with a floor so a small machine keeps a
+# small margin.
+KV_COMMIT_RESERVE_FLOOR_BYTES = 1 << 30
+
+# Swap the kernel may write before the probe calls it pressure. A touch can
+# stir a few MB of background paging out of other processes; a real shortfall
+# moves a noticeable part of the sample.
+KV_COMMIT_SWAP_TOLERANCE_DIVISOR = 8
+
+
+def kv_pool_bytes_after_probe(
+    plan_bytes: int,
+    probe: CommitProbe,
+    *,
+    reserve_bytes: int,
+    swap_tolerance_bytes: int,
+) -> int:
+    """Pool bytes to allocate after a commit probe.
+
+    The probe answers two different questions and only one of them is a reason
+    to give capacity back. If the kernel had to page memory out to fault the
+    sample in, the machine has no headroom *now*: a pool it cannot back is
+    served from swap, so size it to what is free, less ``reserve_bytes``. If it
+    merely had less free memory than the plan asks for, that is reported rather
+    than acted on -- the plan is a cap, not a commitment. The lazy pool backs
+    blocks as requests use them, and giving back capacity an idle pool never
+    needed is the regression the lazy allocation exists to avoid.
+    """
+    if probe.swap_growth <= swap_tolerance_bytes:
+        return plan_bytes
+    return min(plan_bytes, max(0, probe.available_before - reserve_bytes))
 
 
 class ModelCachePolicy:
@@ -1044,16 +1086,86 @@ class WorkerCachePlanner:
             fraction,
             overhead,
         )
-        return _PagedAttentionPlan(
-            block_size=block_size,
-            fraction=fraction,
-            metal_limit=metal_limit,
-            usable_metal=usable_metal,
-            model_memory=model_memory,
-            overhead=overhead,
-            per_block_bytes=per_block_bytes,
-            kv_budget=kv_budget,
-            num_blocks=max(0, kv_budget // per_block_bytes),
+        return self._probe_committed_pool(
+            _PagedAttentionPlan(
+                block_size=block_size,
+                fraction=fraction,
+                metal_limit=metal_limit,
+                usable_metal=usable_metal,
+                model_memory=model_memory,
+                overhead=overhead,
+                per_block_bytes=per_block_bytes,
+                kv_budget=kv_budget,
+                num_blocks=max(0, kv_budget // per_block_bytes),
+            )
+        )
+
+    def _probe_committed_pool(self, plan: _PagedAttentionPlan) -> _PagedAttentionPlan:
+        """Check the plan against the machine before serving starts.
+
+        The budget follows ``--gpu-memory-utilization`` against Metal's
+        recommended working set, which knows nothing about what else is using
+        the machine, and the pool is allocated lazily, so a plan the machine
+        cannot hold stays invisible until a request writes a block -- by which
+        point it is a swap storm or a jetsam kill mid-generation. Forcing a
+        sample resident here makes the machine answer at load time, where the
+        answer is still cheap to act on, and it costs no RSS because
+        ``probe_commit`` drops the sample again.
+
+        Only paging is acted on. Free memory below the plan is reported: the
+        pool backs blocks as requests use them, so an idle pool never needs the
+        capacity the plan allows, and shrinking to whatever happens to be free
+        today would hand back the capacity the lazy allocation exists to keep.
+        """
+        if not envs.VLLM_METAL_KV_COMMIT_PROBE or plan.kv_budget <= 0:
+            return plan
+
+        probe = probe_commit(min(plan.kv_budget, KV_COMMIT_SAMPLE_BYTES))
+        reserve_bytes = max(
+            KV_COMMIT_RESERVE_FLOOR_BYTES,
+            plan.metal_limit // 16,
+        )
+        logger.info(
+            "KV commit probe: %s; holding back %.2f GB for the rest of the machine",
+            probe.describe(),
+            reserve_bytes / 1e9,
+        )
+
+        fit = kv_pool_bytes_after_probe(
+            plan.kv_budget,
+            probe,
+            reserve_bytes=reserve_bytes,
+            swap_tolerance_bytes=(
+                probe.probed_bytes // KV_COMMIT_SWAP_TOLERANCE_DIVISOR
+            ),
+        )
+        if fit >= plan.kv_budget:
+            if plan.kv_budget > probe.available_before:
+                logger.warning(
+                    "KV commit probe: the pool (%.2f GB) is larger than this "
+                    "machine's free memory (%.2f GB). An idle pool does not "
+                    "need those blocks; blocks a request writes will page. %s",
+                    plan.kv_budget / 1e9,
+                    probe.available_before / 1e9,
+                    probe.describe(),
+                )
+            return plan
+
+        num_blocks = fit // plan.per_block_bytes
+        logger.warning(
+            "Paged attention: KV cache sized down from %.2f GB to %.2f GB "
+            "(%d blocks): the machine paged memory out to back a sample, so it "
+            "cannot hold what --gpu-memory-utilization=%.2f asks for. %s",
+            plan.kv_budget / 1e9,
+            num_blocks * plan.per_block_bytes / 1e9,
+            num_blocks,
+            plan.fraction,
+            probe.describe(),
+        )
+        return replace(
+            plan,
+            kv_budget=num_blocks * plan.per_block_bytes,
+            num_blocks=num_blocks,
         )
 
     def _validate_paged_attention_plan(

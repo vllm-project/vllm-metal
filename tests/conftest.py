@@ -87,3 +87,17 @@ def _seed_random_generators() -> None:
     if mlx_seed is None:
         return
     mlx_seed(seed)
+
+
+@pytest.fixture(autouse=True)
+def _no_kv_commit_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit tests off the host's memory.
+
+    The planner's commit probe (``VLLM_METAL_KV_COMMIT_PROBE``) sizes the KV
+    pool against what the machine has free right now, so leaving it on would
+    make budget assertions depend on whatever else is running on the test box.
+    Tests that mean to exercise it set the variable themselves and stub
+    ``vllm_metal.v1.cache_policy.probe_commit``.
+    """
+
+    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
