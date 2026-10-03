@@ -19,6 +19,7 @@ from vllm_metal.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -131,6 +132,25 @@ class MetalPlatform(Platform):
     # Set once this process has initialized Ray with the job-level worker hook, so
     # the DP registration is idempotent across repeated check_and_update_config calls.
     _dp_ray_hook_registered: bool = False
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        super().import_ir_kernels()
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        if envs.VLLM_METAL_BACKEND != "mps":
+            return super().get_default_ir_op_priority(vllm_config)
+
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        return IrOpPriorityConfig.with_default(
+            ["native"], rms_norm=["torch_mps", "native"]
+        )
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
