@@ -591,3 +591,54 @@ def test_batched_decode_matches_absorbed_loop(
 
     assert out.shape == (1, n_rows, _HID)
     np.testing.assert_allclose(np.array(out), np.array(ref), atol=atol, rtol=1e-2)
+
+
+@pytest.mark.parametrize("quantize", [False, True], ids=["dense", "quantized-4bit"])
+def test_absorbed_attention_folds_query_heads(
+    quantize: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The query heads share one latent K/V head, so SDPA gets one head with
+    nheads * q_len query rows (a per-head layout rereads K and V per head) and
+    the result matches the per-head layout, with a request axis and a causal
+    mask."""
+    import vllm_metal.attention.impls.mla as mla_mod
+
+    inner, _, wrapper = _make(quantize=quantize)
+    b, q_len, ctx = 3, 2, 24
+    rq_nope = mx.random.normal((b, _H, q_len, _NOPE)).astype(mx.float16)
+    rq_pe = mx.random.normal((b, _H, q_len, _ROPE)).astype(mx.float16)
+    all_kv_norm = mx.random.normal((b, ctx, _KVL)).astype(mx.float16)
+    k_pe = mx.random.normal((b, 1, ctx, _ROPE)).astype(mx.float16)
+    rows = mx.arange(q_len).reshape(-1, 1)
+    causal_mask = (mx.arange(ctx) <= ctx - q_len + rows).reshape(1, 1, q_len, ctx)
+
+    queries: list[tuple[int, ...]] = []
+    real_sdpa = mla_mod.scaled_dot_product_attention
+
+    def sdpa_spy(q, k, v, **kwargs):
+        queries.append(tuple(q.shape))
+        return real_sdpa(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mla_mod, "scaled_dot_product_attention", sdpa_spy)
+    out = wrapper._apply_absorbed_mla_attention(
+        rq_nope=rq_nope,
+        rq_pe=rq_pe,
+        all_kv_norm=all_kv_norm,
+        k_pe=k_pe,
+        causal_mask=causal_mask,
+    )
+    assert queries == [(b, 1, _H * q_len, _KVL)]
+
+    pe = mx.where(
+        causal_mask,
+        (rq_pe * inner.scale) @ k_pe.swapaxes(-1, -2),
+        mx.finfo(mx.float16).min,
+    )
+    kv = all_kv_norm[:, None]
+    ref = inner.unembed_out(
+        mx.fast.scaled_dot_product_attention(
+            inner.embed_q(rq_nope), kv, kv, scale=inner.scale, mask=pe
+        )
+    )
+    assert out.shape == ref.shape == (b, _H, q_len, _VD)
+    np.testing.assert_allclose(np.array(out), np.array(ref), atol=1e-2, rtol=1e-2)

@@ -761,11 +761,17 @@ class MLAPagedAttentionWrapper(nn.Module):
     ) -> mx.array:
         inner = self._inner
         scale = self._attention_scale()
+        # A matmul broadcast over the query heads rereads K once per head when
+        # b > 1, and MLX's SDPA takes that path for head dims past 256. The
+        # heads share one latent head, so fold them into the query axis.
+        b, h, q_len, _ = rq_pe.shape
 
         # PE branch: q_pe · k_pe contributes an additive score bias.
         # Passing this as the `mask` to scaled_dot_product_attention adds it
         # to the nope scores before softmax, matching the original model exactly.
-        pe_scores = (rq_pe * scale) @ k_pe.swapaxes(-1, -2)
+        pe_scores = (
+            (rq_pe * scale).reshape(b, 1, h * q_len, -1) @ k_pe.swapaxes(-1, -2)
+        ).reshape(b, h, q_len, -1)
         if causal_mask is not None:
             fill = mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype)
             pe_scores = mx.where(causal_mask, pe_scores, fill)
@@ -779,8 +785,13 @@ class MLAPagedAttentionWrapper(nn.Module):
         kv = all_kv_norm.reshape(-1, 1, ctx_len, inner.kv_lora_rank)
 
         out = scaled_dot_product_attention(
-            rq_nope_proj, kv, kv, cache=None, scale=scale, mask=pe_scores
-        )
+            rq_nope_proj.reshape(b, 1, h * q_len, -1),
+            kv,
+            kv,
+            cache=None,
+            scale=scale,
+            mask=pe_scores.reshape(b, 1, h * q_len, ctx_len),
+        ).reshape(b, h, q_len, -1)
         return inner.unembed_out(out)  # recover v_head_dim from kv_lora_rank
 
     def _apply_kv_b_proj_attention(
