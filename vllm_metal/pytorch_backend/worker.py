@@ -86,7 +86,7 @@ class MPSWorker(MetalWorker):
         if not torch.backends.mps.is_available():
             raise RuntimeError("The experimental backend requires PyTorch MPS")
         configure_mps(self.vllm_config)
-        self.device = torch.device("mps")
+        self.device = torch.device("mps:0")
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,

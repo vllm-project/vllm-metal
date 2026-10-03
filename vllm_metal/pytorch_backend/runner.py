@@ -11,7 +11,7 @@ from vllm_metal.pytorch_backend.runtime import install
 class MPSModelRunner(GPUModelRunner):
     def __init__(self, vllm_config):
         install()
-        super().__init__(vllm_config, torch.device("mps"))
+        super().__init__(vllm_config, torch.device("mps:0"))
 
     def load_model(self, *args, **kwargs):
         self.vllm_config.load_config.device = "mps"
