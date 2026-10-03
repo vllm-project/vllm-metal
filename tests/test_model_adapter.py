@@ -1369,7 +1369,11 @@ class TestMultimodalBackboneMode:
             ({"quantization": "gguf"}, None, "safetensors"),
             ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
             ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
-            ({"per_layer_inputs": 256}, None, "per-layer inputs"),
+            (
+                {"per_layer_inputs": 256, "model": "mlx-community/not-local"},
+                None,
+                "hidden_size_per_layer_input=256",
+            ),
         ],
     )
     def test_fallback_reasons(
