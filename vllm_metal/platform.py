@@ -529,10 +529,14 @@ class MetalPlatform(Platform):
                     "--additional-config '{\"turboquant\": true}'."
                 )
 
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method == "dspark":
+            from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
+
+            enable_dspark_for_metal_runner()
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.
-        speculative_config = vllm_config.speculative_config
         if (
             speculative_config is not None
             and speculative_config.use_heterogeneous_vocab
@@ -561,7 +565,7 @@ class MetalPlatform(Platform):
                 "1 + num_speculative_tokens, or leave it unset."
             )
 
-        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
+        # Metal proposers hand drafts back
         # to the scheduler synchronously via take_draft_token_ids(), so async
         # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
         # async scheduling for draft-model SD (vllm#48341); restore the working
@@ -1045,7 +1049,7 @@ class MetalPlatform(Platform):
         # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
         # models (matching the kernel sweet spot), and Phase 2
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
-        # layer (``_pick_kernel_block_size``) validates the final
+        # layer (``pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
         cache_config = vllm_config.cache_config
         user_block_size = (

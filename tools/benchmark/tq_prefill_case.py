@@ -12,6 +12,7 @@ from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
@@ -56,7 +57,7 @@ class AttentionCase:
             self.inner, self.x, self.ctx, self.inner.n_heads, self.inner.n_kv_heads
         )
         q = mx.contiguous(q[0].transpose(1, 0, 2).astype(c.dtype))
-        table, kb = sdpa._build_block_tables(self.ctx.block_tables, c.block_size)
+        table, kb = build_block_tables(self.ctx.block_tables, c.block_size)
 
         def kernel_view(array):
             return array.reshape(-1, kb, c.num_kv_heads, array.shape[-1])

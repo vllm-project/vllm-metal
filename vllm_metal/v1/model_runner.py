@@ -682,12 +682,14 @@ class MetalModelRunner:
             self._model_lifecycle.install_pooling_backend()
 
         spec = self.vllm_config.speculative_config
-        if spec is not None and spec.method == "dflash":
+        if spec is not None and spec.method in ("dflash", "dspark"):
             from vllm_metal.v1.dflash_proposer import DFlashProposer
+            from vllm_metal.v1.dspark_proposer import DSparkProposer
 
             # Load before memory profiling so draft weights count against the
             # same device budget. Cache views bind after scheduler planning.
-            self._drafter = DFlashProposer.build(self)
+            proposer = DFlashProposer if spec.method == "dflash" else DSparkProposer
+            self._drafter = proposer.build(self)
             self._aux_capture = self._drafter.target_capture(self._forward_model)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -1107,14 +1109,16 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
-        elif spec.method == "dflash":
-            from vllm_metal.v1.dflash_proposer import DFlashProposer
+        elif spec.method in ("dflash", "dspark"):
+            from vllm_metal.v1.block_draft_proposer import BlockDraftProposer
 
             if (
-                not isinstance(self._drafter, DFlashProposer)
+                not isinstance(self._drafter, BlockDraftProposer)
                 or self._drafter.cache is None
             ):
-                raise RuntimeError("DFlash was not loaded and bound to scheduler KV")
+                raise RuntimeError(
+                    f"{spec.method} was not loaded and bound to scheduler KV"
+                )
         elif spec.uses_draft_model():
             allow_deferred_zero_k_ingest = (
                 not self.vllm_config.cache_config.enable_prefix_caching
@@ -1147,7 +1151,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram, dflash)."
+                "(supported: Gemma4 MTP, draft_model, ngram, dflash, dspark)."
             )
 
     def get_draft_model_stats(self) -> dict[str, int] | None:

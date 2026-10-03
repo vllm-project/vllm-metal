@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qualified checkpoint: exact greedy parity, pressure, cancellation, and limits.
 
-Run explicitly with ``pytest -m slow tests/test_dflash_serving_e2e.py``.
+Run explicitly with ``pytest -m slow tests/test_block_draft_serving_e2e.py``.
 """
 
 import json
@@ -10,14 +10,20 @@ import os
 
 import pytest
 
+DRAFT_MODELS = {
+    "dflash": "z-lab/Qwen3-4B-DFlash-b16",
+    "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
+}
+DRAFT_WIDTHS = {"dflash": 3, "dspark": 7}
+
 
 def _spawn_env(verify_window):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_METAL_SPEC_VERIFY_WINDOW"] = "1" if verify_window else "0"
 
 
-def _dflash_llm(**overrides):
-    """LLM with the shared DFlash test configuration, tuned by *overrides*."""
+def _block_draft_llm(**overrides):
+    """LLM with the shared block-draft test configuration, tuned by *overrides*."""
     from vllm import LLM
 
     return LLM(
@@ -45,12 +51,12 @@ def _serve(mode, baseline_path, verify_window):
         None
         if mode == "target"
         else {
-            "method": "dflash",
-            "model": "z-lab/Qwen3-4B-DFlash-b16",
-            "num_speculative_tokens": 3,
+            "method": mode,
+            "model": DRAFT_MODELS[mode],
+            "num_speculative_tokens": DRAFT_WIDTHS[mode],
         }
     )
-    llm = _dflash_llm(speculative_config=spec)
+    llm = _block_draft_llm(speculative_config=spec)
     engine = llm.llm_engine
     runner = engine.model_executor.driver_worker.model_runner
     scheduler = engine.engine_core.engine_core.scheduler
@@ -58,7 +64,14 @@ def _serve(mode, baseline_path, verify_window):
     prompts = [
         tokenizer.encode("Explain how a computer works. " * 20)[:n]
         for n in (13, 15, 16, 63)
-    ] + [tokenizer.encode("Describe why plants grow. " * 20)[:61]]
+    ] + [
+        tokenizer.encode("Describe why plants grow. " * 20)[:61],
+        tokenizer.encode("Explain how a computer works. " * 20)[:33],
+    ]
+    # Preserve the original boundary/pressure budgets. The extra 33-token
+    # prompt supplies the 16-token fallback below; longer continuations can
+    # hit the existing BF16 target batch-shape near ties (also on upstream).
+    budgets = [32, 32, 32, 48, 48, 16]
     sampling = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
     eos_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Reply with just the word OK."}],
@@ -97,7 +110,7 @@ def _serve(mode, baseline_path, verify_window):
                                 prompt,
                                 SamplingParams(
                                     temperature=0,
-                                    max_tokens=32 if i < 3 else 48,
+                                    max_tokens=budgets[i],
                                     ignore_eos=True,
                                 ),
                             )
@@ -145,18 +158,22 @@ def _serve(mode, baseline_path, verify_window):
         actual = [
             generate(
                 prompt,
-                SamplingParams(
-                    temperature=0, max_tokens=32 if i < 3 else 48, ignore_eos=True
-                ),
+                SamplingParams(temperature=0, max_tokens=budgets[i], ignore_eos=True),
             )
             for i, prompt in enumerate(prompts)
         ]
-        assert actual == baseline
+        baseline_path.with_name(f"{mode}-actual.json").write_text(json.dumps(actual))
+        assert actual == baseline, [
+            (i, j, a, b)
+            for i, (observed, expected) in enumerate(zip(actual, baseline, strict=True))
+            for j, (a, b) in enumerate(zip(observed, expected, strict=True))
+            if a != b
+        ][:3]
         free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
         for i in (3, 4):
             engine.add_request(str(i), {"prompt_token_ids": prompts[i]}, sampling)
         pressured = drain()
-        assert [pressured[str(i)] for i in (3, 4)] == baseline[3:]
+        assert [pressured[str(i)] for i in (3, 4)] == baseline[3:5]
         assert all(value > 0 for value in stats.values()), stats
         assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
 
@@ -185,7 +202,7 @@ def _serve(mode, baseline_path, verify_window):
         limited = generate(limit_prompt)
         assert len(limited) == 3
         assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
-        print("DFlash lifecycle:", stats, flush=True)
+        print(f"{mode} lifecycle:", stats, flush=True)
         drafted = stats["drafted"]
         constrained = (
             llm.generate(
@@ -252,8 +269,10 @@ def _serve(mode, baseline_path, verify_window):
         for temperature in (0, 0.7):
             mixed.update(decode_prefill=False, spec_plain=False)
             drafted = stats["drafted"]
+            # The 33-token fallback spans two prefill chunks, then decodes
+            # while the greedy request is still live even with K=7 drafting.
             results = llm.generate(
-                [{"prompt_token_ids": prompts[i]} for i in (0, 3)],
+                [{"prompt_token_ids": prompts[i]} for i in (0, 5)],
                 [
                     SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                     SamplingParams(
@@ -276,7 +295,7 @@ def _serve(mode, baseline_path, verify_window):
                 )
             )
             if temperature == 0:
-                assert list(fallback.token_ids) == baseline[3][:16]
+                assert list(fallback.token_ids) == baseline[5][:16]
             assert all(mixed.values()), mixed
             assert stats["drafted"] > drafted
             assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
@@ -285,10 +304,11 @@ def _serve(mode, baseline_path, verify_window):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
 @pytest.mark.parametrize("verify_window", [False, True])
-def test_dflash_serving_parity_and_lifecycle(
-    tmp_path, run_in_spawn_process, verify_window
+def test_block_draft_serving_parity_and_lifecycle(
+    tmp_path, run_in_spawn_process, verify_window, method
 ):
     baseline = tmp_path / "target.json"
     run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
-    run_in_spawn_process(_serve, "dflash", baseline, verify_window, label="dflash")
+    run_in_spawn_process(_serve, method, baseline, verify_window, label=method)

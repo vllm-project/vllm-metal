@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for hybrid block-size translation in Metal paged attention.
 
-Verifies that _pick_kernel_block_size and _build_block_tables correctly
+Verifies that pick_kernel_block_size and build_block_tables correctly
 translate large vLLM block sizes (e.g. 544 for hybrid models) into
 kernel-compatible block sizes (8, 16, 32).
 """
@@ -13,55 +13,52 @@ from pathlib import Path
 
 import pytest
 
+from vllm_metal.attention.block_tables import build_block_tables, pick_kernel_block_size
 from vllm_metal.attention.context import (
     clear_context,
     get_context,
     prepare_grouped,
     prepare_unified,
 )
-from vllm_metal.attention.impls.sdpa import (
-    _build_block_tables,
-    _kernel_metadata,
-    _pick_kernel_block_size,
-)
+from vllm_metal.attention.impls.sdpa import _kernel_metadata
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES, MLA_KERNEL_BLOCK_SIZES
 
 
 class TestPickKernelBlockSize:
-    """Tests for _pick_kernel_block_size."""
+    """Tests for pick_kernel_block_size."""
 
     def test_returns_exact_match(self):
         for bs in KERNEL_BLOCK_SIZES:
-            assert _pick_kernel_block_size(bs) == bs
+            assert pick_kernel_block_size(bs) == bs
 
     def test_picks_largest_divisor(self):
         # 544 % 32 == 0, so should pick 32 (not 16 or 8)
-        assert _pick_kernel_block_size(544) == 32
+        assert pick_kernel_block_size(544) == 32
 
     def test_picks_16_when_32_does_not_divide(self):
         # 48 % 32 != 0, but 48 % 16 == 0
-        assert _pick_kernel_block_size(48) == 16
+        assert pick_kernel_block_size(48) == 16
 
     def test_picks_8_as_fallback(self):
         # 24 % 32 != 0, 24 % 16 != 0, but 24 % 8 == 0
-        assert _pick_kernel_block_size(24) == 8
+        assert pick_kernel_block_size(24) == 8
 
     def test_raises_on_indivisible(self):
         with pytest.raises(ValueError, match="not divisible"):
-            _pick_kernel_block_size(7)
+            pick_kernel_block_size(7)
 
 
 class TestBuildBlockTables:
-    """Tests for _build_block_tables."""
+    """Tests for build_block_tables."""
 
     def test_no_translation_for_supported_sizes(self):
-        bt, kbs = _build_block_tables([[0, 1], [2]], 16)
+        bt, kbs = build_block_tables([[0, 1], [2]], 16)
         assert kbs == 16
         assert bt.tolist() == [[0, 1], [2, 0]]
 
     def test_translation_single_block(self):
         # 544 -> 32, ratio=17
-        bt, kbs = _build_block_tables([[0], [1]], 544)
+        bt, kbs = build_block_tables([[0], [1]], 544)
         assert kbs == 32
         ratio = 544 // 32  # 17
         # block 0 -> [0, 1, ..., 16]
@@ -70,7 +67,7 @@ class TestBuildBlockTables:
         assert bt[1].tolist() == list(range(ratio, 2 * ratio))
 
     def test_translation_multi_block(self):
-        bt, kbs = _build_block_tables([[0, 2]], 544)
+        bt, kbs = build_block_tables([[0, 2]], 544)
         ratio = 544 // 32
         expected = list(range(0, ratio)) + list(range(2 * ratio, 3 * ratio))
         assert bt[0].tolist() == expected
@@ -79,7 +76,7 @@ class TestBuildBlockTables:
         # Unequal block table lengths — shorter rows are zero-padded before
         # expansion, so padding block_id=0 expands to [0, 1, …, ratio-1].
         # The kernel never reads these entries (bounded by context_len).
-        bt, kbs = _build_block_tables([[0, 1], [2]], 544)
+        bt, kbs = build_block_tables([[0, 1], [2]], 544)
         ratio = 544 // 32
         assert bt.shape[0] == 2
         assert bt.shape[1] == 2 * ratio
@@ -89,17 +86,17 @@ class TestBuildBlockTables:
         assert row1[ratio:] == list(range(0, ratio))
 
     def test_output_shape(self):
-        bt, kbs = _build_block_tables([[0, 1, 2]], 544)
+        bt, kbs = build_block_tables([[0, 1, 2]], 544)
         ratio = 544 // 32
         assert bt.shape == (1, 3 * ratio)
 
     def test_empty_block_tables(self):
-        bt, kbs = _build_block_tables([], 16)
+        bt, kbs = build_block_tables([], 16)
         assert bt.shape == (0, 0)
         assert kbs == 16
 
     def test_empty_block_tables_hybrid(self):
-        bt, kbs = _build_block_tables([], 544)
+        bt, kbs = build_block_tables([], 544)
         assert bt.shape == (0, 0)
         assert kbs == 544
 
@@ -131,7 +128,7 @@ class TestKernelMetadataMemo:
     def test_matches_direct_conversion(self):
         ctx = self._fresh_ctx([0, 1, 2], 40, 4)
         meta = _kernel_metadata(ctx, 0, ctx.slot_mapping, ctx.block_tables, 16)
-        direct_bt, direct_bs = _build_block_tables(ctx.block_tables, 16)
+        direct_bt, direct_bs = build_block_tables(ctx.block_tables, 16)
         assert meta.block_tables.tolist() == direct_bt.tolist()
         assert meta.block_size == direct_bs
         assert meta.slot_mapping.tolist() == ctx.slot_mapping

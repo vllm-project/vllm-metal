@@ -118,7 +118,7 @@ class MetalProposer(Protocol):
 
         ``{}`` for proposers that draft over the target's own KV or hold no
         KV at all — n-gram, draft-model, and in-model MTP all qualify; only a
-        proposer with dedicated scheduler-visible layers (DFlash) reports
+        proposer with dedicated scheduler-visible layers (DFlash/DSpark) reports
         specs and is then bound via :meth:`bind_cache`.
         """
         ...

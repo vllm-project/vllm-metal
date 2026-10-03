@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare native MLX, target-only serving, and actual DFlash verification.
+"""Compare native MLX, target-only serving, and actual block-draft verification.
 
 Unlike requesting sample logprobs, observing target rows inside the runner
 keeps greedy drafting enabled. This diagnostic is not a performance benchmark.
@@ -10,6 +10,7 @@ Each engine runs in a separate process to release Metal allocations.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -31,7 +32,7 @@ def run_engine(args):
         None
         if args.worker == "target"
         else {
-            "method": "dflash",
+            "method": args.method,
             "model": args.draft,
             "num_speculative_tokens": args.num_draft_tokens,
             "num_speculative_tokens_per_batch_size": args.draft_schedule,
@@ -139,11 +140,11 @@ def run_engine(args):
             path = args.output_dir / f"{args.worker}-b{batch_size}.json"
             path.write_text(json.dumps({"outputs": outputs, "stats": stats}))
             if (
-                args.worker == "dflash"
+                args.worker == args.method
                 and args.schedule_lookup[batch_size] > 0
                 and not stats["drafted"]
             ):
-                raise AssertionError("Parity run did not exercise DFlash drafting")
+                raise AssertionError("Parity run did not exercise block drafting")
     finally:
         llm.llm_engine.engine_core.shutdown()
 
@@ -151,7 +152,8 @@ def run_engine(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", default="mlx-community/Qwen3-4B-4bit")
-    parser.add_argument("--draft", default="z-lab/Qwen3-4B-DFlash-b16")
+    parser.add_argument("--method", choices=["dflash", "dspark"], default="dflash")
+    parser.add_argument("--draft")
     parser.add_argument("--num-draft-tokens", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2])
@@ -162,9 +164,18 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--worker", choices=["native", "target", "dflash"], help=argparse.SUPPRESS
+        "--worker",
+        choices=["native", "target", "dflash", "dspark"],
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
+    if args.draft is None:
+        args.draft = {
+            "dflash": "z-lab/Qwen3-4B-DFlash-b16",
+            "dspark": "deepseek-ai/dspark_qwen3_4b_block7",
+        }[args.method]
+    if args.worker not in (None, "native", "target", args.method):
+        parser.error("Draft worker must match --method")
     if (
         min(args.batch_size) < 1
         or args.num_draft_tokens < 1
@@ -192,11 +203,23 @@ def main():
         run_engine(args)
         return
     args.output_dir.mkdir(parents=True, exist_ok=False)
+    root = Path(__file__).resolve().parents[1]
+    sources = sorted(
+        p
+        for directory in (root / "vllm_metal", root / "tools")
+        for p in directory.rglob("*")
+        if p.suffix in (".py", ".metal", ".cpp", ".h")
+    )
     (args.output_dir / "metadata.json").write_text(
         json.dumps(
             {
+                "source_sha256": {
+                    str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in sources
+                },
                 "target": args.target,
                 "draft": args.draft,
+                "method": args.method,
                 "num_draft_tokens": args.num_draft_tokens,
                 "max_tokens": args.max_tokens,
                 "batch_sizes": args.batch_size,
@@ -209,7 +232,7 @@ def main():
             indent=2,
         )
     )
-    for worker in ("native", "target", "dflash"):
+    for worker in ("native", "target", args.method):
         with (args.output_dir / f"{worker}.log").open("w") as log:
             subprocess.run(
                 [
@@ -227,7 +250,7 @@ def main():
             )
     reference = json.loads((args.output_dir / "native.json").read_text())
     passed = True
-    for worker in ("target", "dflash"):
+    for worker in ("target", args.method):
         for batch_size in args.batch_size:
             result = json.loads(
                 (args.output_dir / f"{worker}-b{batch_size}.json").read_text()

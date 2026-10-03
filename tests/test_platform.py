@@ -814,7 +814,9 @@ class TestMetalPlatform:
         """
         vllm_config = self._dp_vllm_config()
         vllm_config.parallel_config.data_parallel_size = 1
-        vllm_config.speculative_config = SimpleNamespace(use_heterogeneous_vocab=True)
+        vllm_config.speculative_config = SimpleNamespace(
+            method="draft_model", use_heterogeneous_vocab=True
+        )
 
         with pytest.raises(NotImplementedError, match="heterogeneous draft vocabulary"):
             MetalPlatform.check_and_update_config(vllm_config)
@@ -1219,6 +1221,7 @@ class TestMetalPlatform:
         """
         vllm_config = self._platform_config(
             speculative_config=SimpleNamespace(
+                method="draft_model",
                 use_heterogeneous_vocab=False,
                 num_speculative_tokens=3,
             ),
@@ -1273,6 +1276,7 @@ class TestMetalPlatform:
                     mamba_ssm_cache_dtype="float32",
                 ),
                 speculative_config=SimpleNamespace(
+                    method="draft_model",
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
                 ),
@@ -1312,7 +1316,9 @@ class TestMetalPlatform:
                     mamba_ssm_cache_dtype="float32",
                 ),
                 speculative_config=SimpleNamespace(
-                    use_heterogeneous_vocab=False, num_speculative_tokens=2
+                    method="draft_model",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=2,
                 ),
             )
             assert vllm_config.cache_config.user_specified_mamba_block_size is True

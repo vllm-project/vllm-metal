@@ -496,9 +496,9 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
         KVCacheTensor,
     )
 
+    from vllm_metal.attention.block_tables import build_block_tables
     from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
     from vllm_metal.attention.caches.storage import KVCacheStorage
-    from vllm_metal.attention.impls.sdpa import _build_block_tables
 
     n = 2 * max(block_size, test_partition) + 1
     pages = _interleaved_table((n + 1 + block_size - 1) // block_size)
@@ -571,7 +571,7 @@ def test_gqa_reads_upstream_views_after_writes_and_block_copy(
             )
             cache.replace_layer_cache(0, *written)
         query = mx.ones((1, q_heads, head), dtype=dtype)
-        kernel_tables, kernel_block_size = _build_block_tables([pages], block_size)
+        kernel_tables, kernel_block_size = build_block_tables([pages], block_size)
         if block_size == 1056:
             assert kernel_block_size == 32
         # Production keeps dense K/V in scheduler-page views. Translated

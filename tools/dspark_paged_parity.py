@@ -28,9 +28,9 @@ from vllm.v1.kv_cache_interface import (
 
 from tools.attention_bench_utils import native_source_hashes, package_versions
 from tools.dspark_parity import capture_samples, check_tokens
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.v1.block_draft_paged import BlockDraftPagedCache
 from vllm_metal.v1.dflash import DFlashTargetCapture
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
@@ -47,7 +47,7 @@ NATIVE_SOURCES = (
     capture_samples,
     KVCacheStorage.__init__,
     MetalPagedKVCache.__init__,
-    _build_block_tables,
+    build_block_tables,
     validate_scheduler_blocks,
 )
 

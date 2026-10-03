@@ -30,10 +30,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runner
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
@@ -825,7 +825,7 @@ class TestUpstreamAttentionStorage:
             cache.value_caches[0],
             mx.arange(seq_len, dtype=mx.int64),
         )
-        block_tables, kernel_block_size = _build_block_tables(
+        block_tables, kernel_block_size = build_block_tables(
             [[0]], cache.block_size_for_layer(0)
         )
         output = mx.array(0)

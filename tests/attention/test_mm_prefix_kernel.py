@@ -7,10 +7,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import mm_prefix_path
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
 
 BLOCK = 16
@@ -516,7 +516,7 @@ def test_hybrid_block_size_translation() -> None:
     cache64_k = mx.random.normal((8, 64, KV_HEADS, 64)).astype(DTYPE)
     cache64_v = mx.random.normal((8, 64, KV_HEADS, 64)).astype(DTYPE)
     query = mx.random.normal((n, HEADS, 64)).astype(DTYPE)
-    tables, kernel_bs = _build_block_tables([vllm_table], 64)
+    tables, kernel_bs = build_block_tables([vllm_table], 64)
     k_view = cache64_k.reshape(-1, kernel_bs, KV_HEADS, 64)
     v_view = cache64_v.reshape(-1, kernel_bs, KV_HEADS, 64)
     mx.eval(cache64_k, cache64_v, query, tables, k_view, v_view)

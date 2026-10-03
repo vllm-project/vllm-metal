@@ -42,6 +42,7 @@ from vllm_metal.attention.attention_contracts import (
     AttentionContract,
     QKNormPlacement,
 )
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant_materialize import (
     materialize_turboquant_pages,
@@ -62,7 +63,6 @@ from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
 from vllm_metal.metal import get_ops, paged_attention_capabilities
-from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 logger = init_logger(__name__)
 
@@ -131,57 +131,6 @@ def is_sdpa(module: nn.Module) -> bool:
 # === Block-size translation helpers ===
 
 
-def _pick_kernel_block_size(cache_block_size: int) -> int:
-    """Pick the largest kernel-supported block size that divides evenly."""
-    for kbs in KERNEL_BLOCK_SIZES:
-        if cache_block_size % kbs == 0:
-            return kbs
-    raise ValueError(
-        f"Cache block_size={cache_block_size} is not divisible by any "
-        f"supported kernel block size {KERNEL_BLOCK_SIZES}. "
-        "Adjust --block-size (must be a multiple of 8)."
-    )
-
-
-def _build_block_tables(
-    raw_block_tables: list[list[int]],
-    cache_block_size: int,
-) -> tuple[mx.array, int]:
-    """Build kernel-compatible block tables, translating if necessary.
-
-    When ``cache_block_size`` exceeds the kernel's compiled block sizes,
-    each vLLM block ``b`` is expanded into ``ratio`` kernel blocks
-    ``[b*ratio, b*ratio+ratio)``.  The kernel applies the translated
-    token stride when reading dense cache views.
-
-    Returns:
-        (block_tables, kernel_block_size)
-    """
-    if not raw_block_tables:
-        return mx.zeros((0, 0), dtype=mx.int32), cache_block_size
-
-    if cache_block_size in KERNEL_BLOCK_SIZES:
-        # Fast path — no translation needed.
-        max_blocks = max(len(bt) for bt in raw_block_tables)
-        padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
-        return mx.array(padded, dtype=mx.int32), cache_block_size
-
-    # Hybrid path — translate large block_size to a kernel-compatible one.
-    # Vectorized: each vLLM block b → [b*ratio, b*ratio+1, …, b*ratio+ratio-1].
-    kernel_bs = _pick_kernel_block_size(cache_block_size)
-    ratio = cache_block_size // kernel_bs
-
-    max_blocks = max(len(bt) for bt in raw_block_tables)
-    padded = [bt + [0] * (max_blocks - len(bt)) for bt in raw_block_tables]
-    bt_arr = mx.array(padded, dtype=mx.int32)  # [num_seqs, max_blocks]
-    offsets = mx.arange(ratio, dtype=mx.int32)  # [ratio]
-    # [num_seqs, max_blocks, 1] * ratio + [1, 1, ratio] → [num_seqs, max_blocks, ratio]
-    expanded = (bt_arr[:, :, None] * ratio + offsets[None, None, :]).reshape(
-        bt_arr.shape[0], -1
-    )
-    return expanded, kernel_bs
-
-
 @dataclass(eq=False)
 class _KernelMetadata:
     """Kernel-format copies and mutable routing memo for one forward/group.
@@ -223,7 +172,7 @@ def _kernel_metadata(
     key = (group_index, cache_block_size)
     meta = ctx.kernel_metadata_cache.get(key)
     if meta is None:
-        block_tables, kernel_block_size = _build_block_tables(
+        block_tables, kernel_block_size = build_block_tables(
             raw_block_tables, cache_block_size
         )
         meta = _KernelMetadata(
@@ -700,7 +649,7 @@ def sdpa_forward(
     # _kernel_metadata).  Includes the hybrid block-size translation:
     # vLLM may inflate block_size (e.g. 544) to align attention pages with
     # mamba pages in hybrid models, while the Metal kernel only supports
-    # small block sizes (8, 16, 32); _build_block_tables expands each vLLM
+    # small block sizes (8, 16, 32); build_block_tables expands each vLLM
     # block into multiple kernel blocks and returns the kernel-compatible
     # block_size.
     meta = _kernel_metadata(

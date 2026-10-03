@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import (
     apply_bidirectional_segments,
@@ -17,7 +18,6 @@ from vllm_metal.attention.impls.bidi_prefill import (
     gather_kv,
     slot_indices,
 )
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
 
 BLOCK = 16
@@ -268,7 +268,7 @@ def test_ranges_outside_the_queries_leave_the_output_untouched() -> None:
 def test_gather_follows_hybrid_block_size_translation() -> None:
     """vLLM block 64 → kernel block 32: slots must index the reshaped view."""
     cache64 = mx.random.normal((8, 64, KV_HEADS, HD)).astype(DTYPE)
-    tables, kernel_bs = _build_block_tables([[3, 5]], 64)
+    tables, kernel_bs = build_block_tables([[3, 5]], 64)
     view = cache64.reshape(-1, kernel_bs, KV_HEADS, HD)
     got = gather_kv(view, slot_indices(tables[0], kernel_bs, 10, 100), HD)
     expected = mx.stack([cache64[[3, 5][p // 64], p % 64] for p in range(10, 100)])

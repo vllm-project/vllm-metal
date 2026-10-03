@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Qwen3 DSpark checkpoint forward, before scheduler/serving integration.
+"""Qwen3 DSpark checkpoint forward and checkpoint-owned prediction heads.
 
 Adapted from deepseek-ai/DeepSpec (deepspec/modeling/dspark/qwen3/modeling.py,
 markov_head.py, and common.py) at 005e03b81cec38b7da6399833d609ee89a2587f2.

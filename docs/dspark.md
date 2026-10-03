@@ -1,15 +1,96 @@
-# DSpark checkpoint and paged drafting
+# DSpark experimental serving
 
-This is the DSpark model-forward stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
-It implements the Qwen3 DSpark Markov and confidence heads on the shared
-full-context DFlash backbone, with a cache binding for scheduler-owned DSpark KV.
-Serving integration, confidence-based planning, and sampled verification remain
-subsequent work.
-This module does not enable `--speculative-config '{"method":"dspark", ...}'`.
+DSpark greedy serving is an experimental stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
+It uses the shared DFlash target-capture and committed-feature lifecycle with
+scheduler-owned draft KV. DSpark's own embeddings and Markov head propose tokens;
+the target verifies every proposal. Confidence-based planning, sampled
+verification, prefix reuse, and asynchronous scheduling remain subsequent work.
 
 `vllm_metal/v1/dspark.py` adapts the [MIT-licensed DeepSpec implementation](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE).
 It retains DeepSpec's copyright and full MIT permission notice, following the
 existing DFlash module's approach to third-party attribution.
+
+## Serve the trained pair
+
+```bash
+vllm serve mlx-community/Qwen3-4B-4bit \
+    --revision 4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25 \
+    --max-model-len 2048 \
+    --no-enable-prefix-caching \
+    --no-async-scheduling \
+    --speculative-config '{
+      "method": "dspark",
+      "model": "deepseek-ai/dspark_qwen3_4b_block7",
+      "revision": "3457dff1417cb84927f6098a5fcb7cee85c934b7",
+      "num_speculative_tokens": 7
+    }'
+```
+
+Send plain greedy requests (`temperature=0`). Requests with sampling, penalties,
+grammar constraints, or sample logprobs use the target without drafting.
+The first stage requires a single-device Qwen3 text target without LoRA or
+TurboQuant, native cache blocks of 8/16/32, and matching target/draft activation
+precision. Draft weights load before memory profiling and share the device
+budget with target weights, activations, and scheduler-owned KV.
+Draft quantization and an explicit draft-cache precision that differs from the
+target activation precision are rejected.
+
+Widths 1 through the checkpoint's trained width are supported. The optional
+`num_speculative_tokens_per_batch_size` schedule can use zero to pause drafting;
+verified target features still commit during a pause. A K-token proposal writes
+exactly K draft slots (anchor plus K-1 masks), including at the context boundary.
+Drafting stops when the selected span would exceed the effective target/draft
+context limit. Cancellation and preemption discard logical feature coverage;
+recomputation overwrites reused pages before drafting resumes.
+
+`enable_adaptive_verification`, non-greedy `draft_sample_method`, nonstandard
+`rejection_sample_method`, and `dspark_draft_topk` are rejected rather than ignored.
+The vLLM 0.30 compatibility bridge exempts only `MetalWorker` from the GPU V1
+runner's DSpark prohibition; all other upstream runner checks remain active.
+
+## Serving validation
+
+The shared lifecycle tests exercise both DFlash and DSpark, in both target
+verification layouts. They require exact output IDs against target-only serving,
+actual drafting and rejection, chunked prefill, context/page boundaries, mixed
+greedy/fallback batches, preemption/recomputation, cancellation and request-ID
+reuse, stop/EOS handling, and scheduler-driven width changes through zero.
+
+```bash
+pytest -m slow tests/test_block_draft_serving_e2e.py tests/test_block_draft_schedule_e2e.py
+python -m tools.dflash_serving_parity \
+    --method dspark --num-draft-tokens 7 \
+    --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
+    --batch-size 1 2 --max-tokens 32 --output-dir /path/to/new-serving-results
+```
+
+The shared parity tool compares native mlx-lm, target-only serving, and DSpark
+serving. It records actual verification counts and reports `EXACT`, `TOP_K_MATCH`,
+and failures separately; top-k agreement is not exact sequence equivalence.
+These are correctness checks, not throughput or latency measurements.
+
+For the pinned pair above on Apple M5 Max, with vLLM 0.30.0, MLX 0.32.1,
+and mlx-lm 0.32.0, the shared 40-prompt corpus (32 output tokens, K=7) reports:
+
+| Mode | Batch size | EXACT vs native | TOP_K_MATCH | FAIL |
+| --- | --- | --- | --- | --- |
+| Target only | 1 | 27 | 13 | 0 |
+| Target only | 2 | 27 | 13 | 0 |
+| DSpark | 1 | 24 | 16 | 0 |
+| DSpark | 2 | 28 | 12 | 0 |
+
+`TOP_K_MATCH` checks the first divergent choice; it does not validate the rest of
+the divergent continuation. DSpark matches same-batch target-only sequences
+exactly on 29/40 prompts at batch 1 and 32/40 at batch 2. It verifies 3,395/3,297
+draft tokens and accepts 830/842, respectively. Thus drafting is exercised, but
+**bitwise serving losslessness is not established**. The exact lifecycle cases
+above and the wider corpus's near-tie behavior are both part of qualification.
+
+The reduced-precision **draft-forward** qualification failures below remain
+unresolved. Different draft candidates can change acceptance and performance;
+they do not bypass target verification. Serving output checks and checkpoint
+candidate equivalence are separate requirements, and the experimental integration
+does not establish complete DSpark qualification or a speedup.
 
 ## Forward contract
 
@@ -79,8 +160,9 @@ substantial host/unified memory; FP32 uses more memory than the stored BF16 weig
 (`atol=0.25`, `rtol=0.02`) and the same exact-token requirement. It currently
 **fails** the qualified pair at batch 1, context 17, K=3: the reference's first
 divergent choice ties at 18.25, while MLX produces 18.5 versus 18.25. That choice
-changes subsequent Markov corrections. BF16 token equivalence, FP16 checkpoint
-qualification, and serving losslessness therefore remain unestablished.
+changes subsequent Markov corrections. BF16 token equivalence and FP16 checkpoint
+qualification therefore remain unestablished. Serving output is checked separately
+through target verification.
 
 Small independent CPU-math tests cover block attention, Markov recurrence,
 confidence predecessor alignment, optional heads, malformed checkpoints, and
@@ -133,9 +215,9 @@ It records all 42 cases, source hashes, tensor errors, and exact-token checks,
 and exits unsuccessfully if any gate fails. On the qualified pair, FP16 matches
 all 231 proposal IDs, but six one-token-prefix cases exceed the strict final-logit
 bound (`atol=0.015`, `rtol=0.02`; maximum absolute error 0.04004).
-The bound is retained and these cases remain failures. This cache binding does
+The bound is retained and these cases remain failures. This cache diagnostic does
 not establish reduced-precision checkpoint equivalence or serving losslessness;
-those remain gates for the serving adapter.
+use the separate serving checks above to assess target-verified output.
 
 `--dtype bfloat16` passes 41 of the 42 native comparisons, but fails at batch 2,
 context 1, K=7: the dense path ties at 16.75, while paged attention produces

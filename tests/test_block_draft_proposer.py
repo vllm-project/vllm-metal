@@ -11,23 +11,47 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 from tests.test_dflash_paged import make_cache
+from tests.test_dspark_paged import make_cache as make_dspark_cache
 from vllm_metal.v1.dflash_proposer import DFlashProposer
+from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 
-def _setup():
-    model, embed, cache = make_cache()
-    proposer = DFlashProposer(
-        model,
-        num_draft_tokens=3,
-        embed=embed,
-        project=embed.as_linear,
-        controller=SpeculativeDecodeController(),
-    )
+@pytest.fixture(params=["dflash", "dspark"])
+def proposer(request):
+    if request.param == "dspark":
+        model, cache = make_dspark_cache()
+        proposer = DSparkProposer(
+            model, num_draft_tokens=3, controller=SpeculativeDecodeController()
+        )
+    else:
+        model, embed, cache = make_cache()
+        proposer = DFlashProposer(
+            model,
+            num_draft_tokens=3,
+            embed=embed,
+            project=embed.as_linear,
+            controller=SpeculativeDecodeController(),
+        )
     proposer.bind_cache(cache.storage, group_index=1, max_model_len=64)
     return proposer
+
+
+def _dense_tokens(proposer, anchors, features, width):
+    if isinstance(proposer, DSparkProposer):
+        return proposer.draft_model.draft(anchors, features, num_draft_tokens=width)[0]
+    return mx.argmax(
+        proposer.model.draft_logits(
+            anchors,
+            features,
+            num_draft_tokens=width,
+            embed=proposer.embed,
+            project=proposer.project,
+        ),
+        axis=-1,
+    )
 
 
 def _features(count):
@@ -65,8 +89,7 @@ def _prefill(state, features, start, final):
 
 
 @pytest.mark.parametrize("accepted", [0, 1, 3])
-def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted):
-    proposer = _setup()
+def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, proposer):
     state = RequestState(
         token_ids=[1] * 15 + [2],
         prompt_len=15,
@@ -111,14 +134,8 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted):
         mx.concatenate([a, b, c[: accepted + 1]])[None]
         for a, b, c in zip(first, second, feature, strict=True)
     ]
-    expected = proposer.model.draft_logits(
-        mx.array([4]),
-        features,
-        num_draft_tokens=3,
-        embed=proposer.embed,
-        project=proposer.project,
-    )
-    assert actual.draft_token_ids == mx.argmax(expected, -1).tolist()
+    expected = _dense_tokens(proposer, mx.array([4]), features, 3)
+    assert actual.draft_token_ids == expected.tolist()
     assert proposer._valid_ends == {"r": 16 + accepted}
     # Assert the committed KV itself, not just argmax IDs: random residual
     # logits can retain an argmax even if rejected feature rows leak in.
@@ -150,8 +167,7 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted):
 @pytest.mark.parametrize(
     "kind", ["sampled", "logprobs", "grammar", "zero_k", "context_limit"]
 )
-def test_non_drafting_rows_still_commit_features(kind):
-    proposer = _setup()
+def test_non_drafting_rows_still_commit_features(kind, proposer):
     params = SamplingParams(
         temperature=0.7 if kind == "sampled" else 0,
         logprobs=1 if kind == "logprobs" else None,
@@ -174,8 +190,7 @@ def test_non_drafting_rows_still_commit_features(kind):
     assert proposer._valid_ends == {"r": 15}
 
 
-def test_missing_and_discontinuous_features_fail_before_drafting():
-    proposer = _setup()
+def test_missing_and_discontinuous_features_fail_before_drafting(proposer):
     state = RequestState(
         token_ids=[1, 2],
         prompt_len=1,
@@ -189,11 +204,20 @@ def test_missing_and_discontinuous_features_fail_before_drafting():
         proposer.propose(_prefill(state, _features(1), 1, True))
 
 
+@pytest.mark.parametrize("proposer_cls", [DFlashProposer, DSparkProposer])
 @pytest.mark.parametrize("restriction", ["prefix", "lora", "tp", "block_size"])
-def test_unsupported_configuration_fails_before_loading(restriction):
+def test_unsupported_configuration_fails_before_loading(restriction, proposer_cls):
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
-            draft_model_config=object(), num_speculative_tokens_per_batch_size=None
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(), quantization=None
+            ),
+            enable_adaptive_verification=False,
+            draft_sample_method="greedy",
+            rejection_sample_method="standard",
+            dspark_draft_topk=None,
+            quantization=None,
+            kv_cache_dtype=None,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False, block_size=16),
         lora_config=None,
@@ -217,11 +241,12 @@ def test_unsupported_configuration_fails_before_loading(restriction):
     else:
         config.cache_config.block_size = 64
     with pytest.raises(NotImplementedError):
-        DFlashProposer.build(runner)
+        proposer_cls.build(runner)
 
 
-def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(monkeypatch):
-    proposer = _setup()
+def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(
+    monkeypatch, proposer
+):
     state = RequestState(
         token_ids=[1] * 15 + [2],
         prompt_len=15,
@@ -296,23 +321,16 @@ def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(monkeyp
         if width == 0:
             assert result is None
         else:
-            expected = proposer.model.draft_logits(
-                mx.array([4]),
-                full_features,
-                num_draft_tokens=width,
-                embed=proposer.embed,
-                project=proposer.project,
-            )
-            assert result.draft_token_ids == mx.argmax(expected, -1).tolist()
+            expected = _dense_tokens(proposer, mx.array([4]), full_features, width)
+            assert result.draft_token_ids == expected.tolist()
     assert compiled_widths == [3, 1]
     # Rebinding storage must discard closures over the previous allocation.
     proposer.bind_cache(proposer.cache.storage, group_index=1, max_model_len=64)
     assert not proposer._drafts and not proposer._valid_ends
 
 
-@pytest.mark.parametrize("width", [-1, 4])
-def test_invalid_width_fails_before_committing_features(width):
-    proposer = _setup()
+@pytest.mark.parametrize("width", [-1, 4, True, 1.5])
+def test_invalid_width_fails_before_committing_features(width, proposer):
     state = RequestState(
         token_ids=[1, 2],
         prompt_len=1,
@@ -329,8 +347,7 @@ def test_invalid_width_fails_before_committing_features(width):
 
 
 @pytest.mark.parametrize("width", [1, 3])
-def test_context_limit_uses_selected_width(width):
-    proposer = _setup()
+def test_context_limit_uses_selected_width(width, proposer):
     proposer.cache.max_model_len = 17
     state = RequestState(
         token_ids=[1] * 15 + [2],

@@ -8,9 +8,9 @@ from typing import TypeVar
 
 import mlx.core as mx
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
 from vllm_metal.v1.dflash import DFlashModel
 from vllm_metal.v1.proposer import validate_scheduler_blocks
@@ -237,7 +237,7 @@ class BlockDraftPagedCache:
                 tables.append(table + [0] * (table_width - len(table)))
                 offsets.append(length)
                 ranges.extend([(length, length + width - 1)] * width)
-            block_tables, kernel_block_size = _build_block_tables(
+            block_tables, kernel_block_size = build_block_tables(
                 tables, self.block_size
             )
             if kernel_block_size != self.block_size:
