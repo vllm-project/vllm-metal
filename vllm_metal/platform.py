@@ -149,7 +149,9 @@ class MetalPlatform(Platform):
         from vllm.config.kernel import IrOpPriorityConfig
 
         return IrOpPriorityConfig.with_default(
-            ["native"], rms_norm=["torch_mps", "native"]
+            ["native"],
+            rms_norm=["torch_mps", "native"],
+            fused_add_rms_norm=["torch_mps", "native"],
         )
 
     @classmethod
