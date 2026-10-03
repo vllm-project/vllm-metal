@@ -2236,10 +2236,6 @@ NB_MODULE(_paged_ops, m) {
         "True when paged_attention_primitive accepts mm_prefix_ranges "
         "(Gemma 4 vision image-block attention in the tiled prefill kernel).");
 
-  m.def("supports_decode_routing_metadata", []() { return true; },
-        "True when paged_attention_primitive accepts mixed-batch decode "
-        "routing metadata.");
-
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
            nb::handle key_cache_h, nb::handle value_cache_h,

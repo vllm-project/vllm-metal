@@ -42,11 +42,18 @@ def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
 
     Callers cache this for a forward, rather than probing every layer. Kernel
     availability is distinct from automatic routing and disable support. The
-    structured query is part of the required extension ABI; an artifact too
-    old to export it is unsupported and fails here rather than degrading
-    silently.
+    structured query is part of the required extension ABI; unstamped
+    artifacts that predate it still load, so a missing binding raises a
+    rebuild error rather than a bare AttributeError.
     """
-    values = ops.paged_attention_capabilities()
+    try:
+        values = ops.paged_attention_capabilities()
+    except AttributeError as exc:
+        raise RuntimeError(
+            "The loaded native extension does not export "
+            "paged_attention_capabilities; rebuild the vllm-metal native "
+            "extension."
+        ) from exc
     return {
         key: bool(values.get(key, False))
         for key in ("gqa_decode", "gqa_disable", "decode_routing_metadata")
