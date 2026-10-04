@@ -15,27 +15,27 @@ from vllm_metal.v1.draft_checkpoint import load_draft_weights
 
 
 @pytest.mark.parametrize(
-    "actual,expected,check",
+    "actual,expected",
     [
-        # Non-finite, empty, mismatched or out-of-tolerance inputs are rejected.
-        ([[float("nan")]], [[float("nan")]], "error"),
-        ([[float("inf")]], [[float("inf")]], "error"),
-        ([], [], "error"),
-        ([[1.0, 2.0]], [[1.0]], "error"),
-        ([[1.0]], [[1.1]], "error"),
-        # Exact and tolerated matches report their difference.
-        ([[1.0]], [[1.0]], {"exact": True, "max_abs_error": 0.0}),
-        ([[1.0001]], [[1.0]], {"exact": False, "max_abs_error": 1e-4}),
+        ([[float("nan")]], [[float("nan")]]),
+        ([[float("inf")]], [[float("inf")]]),
+        ([], []),
+        ([[1.0, 2.0]], [[1.0]]),
+        ([[1.0]], [[1.1]]),
     ],
 )
-def test_compare(actual, expected, check):
-    if check == "error":
-        with pytest.raises((AssertionError, ValueError)):
-            compare(mx.array(actual), mx.array(expected))
-        return
-    result = compare(mx.array(actual), mx.array(expected))
-    assert result["exact"] is check["exact"]
-    assert result["max_abs_error"] == pytest.approx(check["max_abs_error"], rel=0.05)
+def test_compare_rejects_invalid_evidence(actual, expected):
+    with pytest.raises((AssertionError, ValueError)):
+        compare(mx.array(actual), mx.array(expected))
+
+
+def test_compare_distinguishes_exact_and_tolerated_matches():
+    exact = compare(mx.array([[1.0]]), mx.array([[1.0]]))
+    tolerated = compare(mx.array([[1.0001]]), mx.array([[1.0]]))
+
+    assert exact == {"exact": True, "max_abs_error": 0.0}
+    assert tolerated["exact"] is False
+    assert tolerated["max_abs_error"] == pytest.approx(1e-4, rel=0.05)
 
 
 @pytest.mark.parametrize(
