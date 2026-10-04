@@ -1374,6 +1374,9 @@ class TestMultimodalBackboneMode:
                 None,
                 "hidden_size_per_layer_input=256",
             ),
+            # A fully cached/local checkpoint passes every checkpoint
+            # condition, so the per-layer reason must still win.
+            ({"per_layer_inputs": 256}, None, "hidden_size_per_layer_input=256"),
         ],
     )
     def test_fallback_reasons(
