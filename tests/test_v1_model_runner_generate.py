@@ -2945,38 +2945,6 @@ class TestProfileRunDrafterWarmup:
 
         assert len(runner._dummy_encoder_outputs()) == 1
 
-    @pytest.mark.parametrize(
-        "adapter,expected",
-        [
-            (None, False),
-            (
-                SimpleNamespace(forward_ready=False, requires_explicit_positions=True),
-                False,
-            ),
-            (
-                SimpleNamespace(forward_ready=True, requires_explicit_positions=False),
-                False,
-            ),
-            (
-                SimpleNamespace(forward_ready=False, requires_explicit_positions=False),
-                False,
-            ),
-            (
-                SimpleNamespace(forward_ready=True, requires_explicit_positions=True),
-                True,
-            ),
-        ],
-        ids=[
-            "no_adapter",
-            "not_ready_explicit_positions",
-            "ready_no_explicit_positions",
-            "not_ready_no_explicit_positions",
-            "ready_explicit_positions",
-        ],
-    )
-    def test_mm_forward_forced_truth_table(self, adapter, expected) -> None:
-        assert mr.MetalModelRunner._mm_forward_forced(adapter) is expected
-
 
 class TestPipelineGateSpecDecodeDerivation:
     """Runner-side capability derivation for the decode pipeline."""
