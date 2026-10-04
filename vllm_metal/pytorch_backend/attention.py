@@ -22,6 +22,7 @@ class MPSAttentionMetadata(AttentionMetadata):
     seq_lens: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seq_len: int
+    window_seqlen_q: int = 1
 
 
 class MPSAttentionBackend(AttentionBackend):
@@ -56,12 +57,22 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
 
     def build(self, common_prefix_len, common_attn_metadata, **kwargs):
         m = common_attn_metadata
+        # MRv2 supplies these flags on CPU. As on MLX, any true prefill keeps
+        # the batch on the prefill route; only decode/verification uses windows.
+        window_seqlen_q = 1
+        if (
+            m.max_query_len > 1
+            and m.is_prefilling is not None
+            and not m.is_prefilling.any()
+        ):
+            window_seqlen_q = m.max_query_len
         return MPSAttentionMetadata(
             m.slot_mapping,
             m.block_table_tensor,
             m.seq_lens,
             m.query_start_loc,
             m.max_seq_len,
+            window_seqlen_q,
         )
 
 
@@ -133,5 +144,6 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             self.scale,
             self.sliding_window,
             self.logits_soft_cap,
+            m.window_seqlen_q,
         )
         return output

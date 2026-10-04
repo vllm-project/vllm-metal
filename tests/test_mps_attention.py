@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MPS-stream dispatch parity, including interleaved KV and split decode."""
+"""MPS-stream dispatch parity, including KV layout, split decode and verification."""
 
 from pathlib import Path
 
@@ -23,20 +23,34 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 @pytest.mark.parametrize(
-    "force_tiled,counts,starts",
+    "force_tiled,counts,starts,prefilling",
     [
-        (False, [39, 1], [17, 700]),
-        (True, [39, 1], [17, 700]),
-        (False, [1, 1], [17, 700]),
-        (False, [1, 1], [17, 40]),
+        (False, [39, 1], [17, 700], [True, False]),
+        (True, [39, 1], [17, 700], [True, False]),
+        (False, [1, 1], [17, 700], None),
+        (False, [1, 1], [17, 40], [False, False]),
+        (False, [3, 4], [511, 700], [False, False]),
+        (False, [5, 1], [17, 700], [False, False]),
+        (False, [2, 2], [17, 40], [False, False]),
+        (False, [2, 2], [17, 40], [True, False]),
     ],
 )
 def test_mps_paged_attention(
-    dtype, head_size, block_size, window, softcap, force_tiled, counts, starts
+    dtype,
+    head_size,
+    block_size,
+    window,
+    softcap,
+    force_tiled,
+    counts,
+    starts,
+    prefilling,
 ):
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
     from vllm_metal.pytorch_backend.attention import (
         MPSAttentionImpl,
-        MPSAttentionMetadata,
+        MPSAttentionMetadataBuilder,
     )
 
     torch.manual_seed(8)
@@ -97,16 +111,27 @@ def test_mps_paged_attention(
             blocks[p // block_size] * block_size + p % block_size
             for p in range(start, start + count)
         )
-    metadata = MPSAttentionMetadata(
-        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device="mps"),
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor(cu, dtype=torch.int32, device="mps"),
+        query_start_loc_cpu=torch.tensor(cu, dtype=torch.int32),
+        num_reqs=len(counts),
+        num_actual_tokens=total,
+        max_query_len=max(counts),
         seq_lens=torch.tensor(
             [s + c for s, c in zip(starts, counts, strict=True)],
             dtype=torch.int32,
             device="mps",
         ),
         max_seq_len=max(s + c for s, c in zip(starts, counts, strict=True)),
-        block_tables=torch.tensor(table, dtype=torch.int32, device="mps"),
+        block_table_tensor=torch.tensor(table, dtype=torch.int32, device="mps"),
         slot_mapping=torch.tensor(slots, dtype=torch.int64, device="mps"),
+        is_prefilling=torch.tensor(prefilling) if prefilling is not None else None,
+    )
+    metadata = MPSAttentionMetadataBuilder(None, [], None, torch.device("mps")).build(
+        0, common
+    )
+    assert metadata.window_seqlen_q == (
+        max(counts) if prefilling == [False, False] else 1
     )
     gpu_qkv = qkv.to("mps")
     gpu_q, gpu_k, gpu_v = gpu_qkv.split([16, 8, 8], dim=1)

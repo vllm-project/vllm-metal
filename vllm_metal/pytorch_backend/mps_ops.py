@@ -12,6 +12,7 @@ def get_mps_ops():
     from torch.utils.cpp_extension import load
 
     from vllm_metal.metal import get_ops
+    from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE, PA_WINDOW_ROWS
 
     # Reuse the existing artifact validation/build policy and hardware gate.
     metal_ops = get_ops()
@@ -19,7 +20,11 @@ def get_mps_ops():
     module = load(
         name="vllm_metal_mps_ops",
         sources=[str(root / "mps_ops.mm")],
-        extra_cflags=["-O3"],
+        extra_cflags=[
+            "-O3",
+            f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
+            f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
+        ],
         extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
     )
     registry = subprocess.check_output(

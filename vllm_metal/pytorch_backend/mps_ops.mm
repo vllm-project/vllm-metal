@@ -15,18 +15,20 @@ class PagedAttention {
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines_;
   int min_decode_grid_;
 
-  id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false) {
-    auto it = pipelines_.find(name);
+  id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
+                                      int window_q = 0) {
+    const auto key = name + "_wq" + std::to_string(window_q);
+    auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
     auto constants = [[MTLFunctionConstantValues alloc] init];
     bool no = false;
     for (NSUInteger i : {20, 30, 40, 50, 100, 120})
       [constants setConstantValue:&no type:MTLDataTypeBool atIndex:i];
     [constants setConstantValue:&split type:MTLDataTypeBool atIndex:10];
-    int zero = 0, kbits = 8, vbits = 3;
+    int kbits = 8, vbits = 3;
     [constants setConstantValue:&kbits type:MTLDataTypeInt atIndex:60];
     [constants setConstantValue:&vbits type:MTLDataTypeInt atIndex:70];
-    [constants setConstantValue:&zero type:MTLDataTypeInt atIndex:110];
+    [constants setConstantValue:&window_q type:MTLDataTypeInt atIndex:110];
     auto lib = name.find("paged_attention_nax_") == 0 ? nax_library_ : library_;
     NSError* error = nil;
     auto fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]
@@ -38,7 +40,7 @@ class PagedAttention {
         newComputePipelineStateWithFunction:fn error:&error];
     [fn release];
     TORCH_CHECK(pso, "MPS attention pipeline: ", error.localizedDescription.UTF8String);
-    pipelines_[name] = pso;
+    pipelines_[key] = pso;
     return pso;
   }
 
@@ -79,7 +81,7 @@ class PagedAttention {
                const Tensor& kc, const Tensor& vc, const Tensor& slots,
                const Tensor& blocks, const Tensor& lens, const Tensor& cu,
                const Tensor& out, int max_seq_len, double scale,
-               int sliding_window, double softcap) {
+               int sliding_window, double softcap, int window_seqlen_q) {
     for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
@@ -113,7 +115,12 @@ class PagedAttention {
                 slots.numel() == tokens && blocks.dim() == 2 && blocks.size(0) == seqs &&
                 cu.numel() == seqs + 1 && heads % kv_heads == 0,
                 "Inconsistent attention shapes/strides");
-    const bool prefill = tokens > seqs;
+    // Reuse the same short verification-window shader mode as the MLX launcher.
+    const bool window = tokens > seqs && window_seqlen_q > 1 &&
+        head_size <= VLLM_METAL_PA_WINDOW_MAX_HEAD;
+    const int window_q = window ?
+        (window_seqlen_q + VLLM_METAL_PA_WINDOW_ROWS - 1) / VLLM_METAL_PA_WINDOW_ROWS : 0;
+    const bool prefill = tokens > seqs && !window;
     const bool nax = prefill && nax_library_ != nil;
     const bool split = !prefill && heads * tokens < min_decode_grid_ && parts >= 2;
     const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
@@ -128,7 +135,7 @@ class PagedAttention {
         prefill ? "paged_attention_tiled_" + dt + hs + bs + tile_name :
         "paged_attention_" + dt + "_cache_" + dt + "_" + dt +
             hs + bs + "_nt256_nsl32_ps" + (split ? "512" : "0");
-    auto attn = pipeline(name, split);
+    auto attn = pipeline(name, split, window_q);
     id<MTLComputePipelineState> reduce = nil;
     Tensor tmp, sums, maxes;
     if (split) {
@@ -164,13 +171,17 @@ class PagedAttention {
         scalar<int>(enc, 16, kc.stride(0)); scalar<int>(enc, 17, kc.stride(2));
         buffer(enc, 19, cu); scalar<int>(enc, 20, seqs);
         scalar<int>(enc, 21, sliding_window);
-        int grid_y = tokens, threads = 256;
+        int grid_y = window ? seqs * window_q : tokens, threads = 256;
         if (prefill) {
           grid_y = tokens / (nax ? 64 : tile) + seqs;
           threads = nax ? 128 : tile * 4;
           if (!nax) [enc setThreadgroupMemoryLength:3 * tile * (head_size + 8) * 2 atIndex:0];
         } else {
-          [enc setThreadgroupMemoryLength:(16 + 8 * head_size) * 4 atIndex:0];
+          const int rows = window ? VLLM_METAL_PA_WINDOW_ROWS : 1;
+          const int scores = 8 * rows * block_size * 4 +
+              (window ? rows * head_size * q.element_size() : 0);
+          const int merge = (16 + 8 * head_size) * 4;
+          [enc setThreadgroupMemoryLength:((std::max(scores, merge) + 15) & ~15) atIndex:0];
         }
         if (split) { buffer(enc, 0, sums); buffer(enc, 1, maxes); }
         [enc dispatchThreadgroups:MTLSizeMake(heads, grid_y, split ? parts : 1)
