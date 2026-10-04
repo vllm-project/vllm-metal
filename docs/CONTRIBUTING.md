@@ -55,7 +55,7 @@ Model parity runs separately through [scheduled and requested CI](tools.md#sched
 ## Pull requests
 
 - **Model changes:** run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
-- **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results.
+- **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results, following the [macOS benchmarking guide](benchmarking-macos.md) for workload, machine-state and dispatch controls.
 
 Sign off each commit to certify agreement with the [Developer Certificate of
 Origin](https://developercertificate.org/), then push to your fork:

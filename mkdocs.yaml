@@ -76,4 +76,5 @@ nav:
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
   - Tools: tools.md
+  - Benchmarking on macOS: benchmarking-macos.md
   - Contributing: CONTRIBUTING.md

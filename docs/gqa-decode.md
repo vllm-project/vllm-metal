@@ -206,7 +206,7 @@ runtime versions, hardware, warmup, KV lengths, repetitions, and background
 GPU activity; compare enabled and disabled arms with actual worker-side
 dispatch checks. Separate primitive timing from HTTP decode throughput,
 and keep noisy measurements visible. The
-[macOS benchmarking discussion](https://github.com/vllm-project/vllm-metal/issues/713)
+[macOS benchmarking guide](benchmarking-macos.md)
 explains why in-process engine measurements and short probes are not
 interchangeable with serving results.
 
