@@ -90,6 +90,7 @@ def serving(
     gpu_memory_utilization: float,
     log_path: Path,
     env: dict,
+    extra_args: tuple[str, ...] = (),
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -117,6 +118,7 @@ def serving(
                 "--no-enable-prefix-caching",
                 "--generation-config",
                 "vllm",
+                *extra_args,
             ],
             stdout=log,
             stderr=subprocess.STDOUT,

@@ -19,6 +19,32 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
+## MLX versus PyTorch MPS performance
+
+Run the same serving workload on both backends:
+
+```bash
+curl -L https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/sonnet.txt -o sonnet.txt
+python tools/benchmark_mps.py --model Qwen/Qwen3-0.6B --output-dir .cache/qwen-mps
+```
+
+The tool reuses `vllm bench serve` and starts four fresh servers in
+MLX/MPS/MPS/MLX order. Defaults match the MPS stack's serving comparison:
+Sonnet 1024/128, 100 requests, 10 requests/s, concurrency 32, four warmup requests,
+2,340 cache blocks of 16 tokens, prefix caching off, and async scheduling on both.
+Use `--help` to change the model or workload. Avoid other GPU work during the run.
+
+Both servers use one resolved checkpoint and its actual FP16/BF16 weight dtype;
+uniform unquantized safetensors are required because MLX preserves stored weight
+precision. Generation is greedy and ignores EOS. Incomplete requests or unequal
+input/output token counts fail the comparison.
+
+`summary.md` reports two-run means for output tok/s, TTFT, TPOT, and preemptions.
+Raw benchmark JSON, server/client logs, metrics, and `config.json` record the
+checkpoint, commands/settings, dataset hash, hardware, versions, and source commit.
+Results are local artifacts; there is no CI timing threshold. This measures speed,
+not model correctness; MPS currently does not support the parity tool's top-K mode.
+
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
