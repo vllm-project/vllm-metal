@@ -200,8 +200,6 @@ class DraftModelProposer(NoOwnKVProposer):
         # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
         # later via adopt_scheduler_group().
         self._scheduler_group_index: int | None = None
-        # Draft dimensions are resolved by ``build`` and used once cache
-        # capacity is known.
         self._dims: DraftDims | None = None
         self._draft_model_name: str | None = None
 

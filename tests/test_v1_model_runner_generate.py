@@ -2865,8 +2865,6 @@ class TestDummyForwardOutputsPPRouting:
 
 
 class TestProfileRunDrafterWarmup:
-    """``profile_run`` must warm the drafter's buffers in the measured peak."""
-
     @pytest.mark.parametrize(
         ("captures_target", "expected_retained"),
         [(False, True), (True, False)],

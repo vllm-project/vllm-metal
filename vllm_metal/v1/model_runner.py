@@ -78,6 +78,11 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.draft_model_proposer import (
+    DraftDims,
+    DraftModelProposer,
+    resolve_draft_dims,
+)
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -122,12 +127,6 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 if TYPE_CHECKING:
     from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-
-    # Kept out of the runtime import graph: draft_model_proposer.py pulls in
-    # mlx_lm's model loader at module scope, which should only load when
-    # draft_model speculative decoding is actually configured (see the lazy
-    # runtime import in __init__ and in load_model).
-    from vllm_metal.v1.draft_model_proposer import DraftDims
 
 logger = init_logger(__name__)
 
@@ -407,16 +406,11 @@ class MetalModelRunner:
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
         self._aux_capture: AuxHiddenStateCapture | None = None
-        # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
-        # can size a scheduler-visible KV-cache group for the draft model
-        # before `determine_available_memory()`/`get_kv_cache_spec()` run.
-        # The draft's MLX weights load in `load_model`; the paged cache
-        # binds later in `install_drafter`.
+        # Cache planning needs the draft shape before weights load.
+        # The paged cache binds after planning.
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
         if spec is not None and spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
-
             self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
         self.encoder_cache: EncoderCache | None = None
 
@@ -691,9 +685,6 @@ class MetalModelRunner:
             self._drafter = DFlashProposer.build(self)
             self._aux_capture = self._drafter.target_capture(self._forward_model)
         elif spec is not None and spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
-            # Profile draft weights before KV planning; bind its cache later.
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
@@ -1131,8 +1122,6 @@ class MetalModelRunner:
             ):
                 raise RuntimeError("DFlash was not loaded and bound to scheduler KV")
         elif spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
             drafter = cast(DraftModelProposer, self._drafter)
             drafter.bind_paged_cache(
                 num_blocks=num_blocks,

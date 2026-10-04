@@ -35,8 +35,6 @@ PROMPT_LEN = 20
 
 
 class _CachelessDraftModel:
-    """Draft stub that accepts a cacheless warmup forward."""
-
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[int, ...], object]] = []
 
