@@ -10,6 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx_lm.models import gemma4
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
@@ -18,6 +19,7 @@ from vllm_metal.multimodal.gemma4 import (
     Gemma4VisionEncodeResult,
     Gemma4VisionSidecar,
 )
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 HIDDEN = 8  # text hidden size of the fake backbone
 TOWER_DIM = 4  # fake vision hidden size
@@ -343,16 +345,62 @@ class TestCallLm:
         assert call["cache"] is cache
         assert out.logits.shape == (1, 2, 16)
 
-    def test_deepstack_is_refused(self) -> None:
+    @pytest.mark.parametrize("method", ["call_lm", "call_lm_hidden_states"])
+    def test_deepstack_is_refused(self, method: str) -> None:
         adapter, _ = _adapter()
         with pytest.raises(RuntimeError, match="deepstack"):
-            adapter.call_lm(
+            getattr(adapter, method)(
                 mx.array([[1]], dtype=mx.int32),
                 mx.zeros((1, 1, HIDDEN)),
                 [],
                 mx.zeros((3, 1, 1), dtype=mx.int32),
                 deepstack_visual_embeds=[mx.zeros((1, HIDDEN))],
             )
+
+    def test_hidden_states_reproduce_call_lm_logits_through_the_runner_head(
+        self,
+    ) -> None:
+        # Per-layer inputs, KV sharing and softcapping, as on E2B/E4B.
+        model = gemma4.Model(
+            gemma4.ModelArgs(
+                vocab_size=64,
+                text_config={
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 16,
+                    "num_global_key_value_heads": 1,
+                    "num_kv_shared_layers": 2,
+                    "hidden_size_per_layer_input": 8,
+                    "vocab_size_per_layer_input": 64,
+                    "sliding_window": 4,
+                    "layer_types": ["sliding_attention", "full_attention"] * 2,
+                    "use_double_wide_mlp": False,
+                },
+            )
+        )
+        mx.eval(model.parameters())
+        adapter = Gemma4MultimodalAdapter.from_loaded(
+            model, _sidecar(), bidirectional_attention=None
+        )
+        ids = mx.array([[5, 9, 9, 9, 7, 3]], dtype=mx.int32)
+        mask = ids == 9
+        embeds = mx.where(mask[..., None], 0.25, adapter.embed_tokens(ids))
+        args = (ids, embeds, None, mx.zeros((3, 1, 6), dtype=mx.int32))
+
+        logits = adapter.call_lm(*args, visual_pos_masks=mask)
+        hidden = adapter.call_lm_hidden_states(*args, visual_pos_masks=mask)
+        head = DefaultModelAdapter()
+        rows = mx.array([1, 5], dtype=mx.int32)
+
+        assert mx.array_equal(head.project_logits(model, hidden), logits).item()
+        assert mx.allclose(
+            head.project_logits(model, hidden, logits_indices=rows)[0],
+            logits[0, rows],
+        ).item()
 
 
 class TestProfileFeatures:

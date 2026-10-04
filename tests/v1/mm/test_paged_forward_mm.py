@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1066,3 +1067,80 @@ class TestSegmentPositionsOptOut:
         assert isinstance(positions, list)
         assert len(positions) == 1
         assert positions[0].shape == (3, 1, 4)
+
+
+class _HiddenStatesAdapter(_MmAdapter):
+    """Adapter whose LM can stop before the head; row ``r`` holds ``r``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_calls: list[mx.array] = []
+
+    def text_model(self) -> Any:
+        return SimpleNamespace(
+            compute_logits=lambda h: h[..., :1] * mx.ones((self.vocab_size,))
+        )
+
+    def call_lm_hidden_states(
+        self, input_ids: mx.array, *args: Any, **kwargs: Any
+    ) -> mx.array:
+        self.hidden_calls.append(input_ids)
+        seq_len = input_ids.shape[1]
+        rows = mx.arange(seq_len, dtype=mx.float32)[None, :, None]
+        return mx.broadcast_to(rows, (1, seq_len, self.hidden_size))
+
+
+class TestMmSelectiveLogits:
+    @pytest.mark.parametrize(
+        ("selective", "adapter_cls", "prompt_logprobs", "selects"),
+        [
+            (True, _HiddenStatesAdapter, False, True),
+            (False, _HiddenStatesAdapter, False, False),
+            (True, _MmAdapter, False, False),
+            (True, _HiddenStatesAdapter, True, False),
+        ],
+        ids=["selects", "head_not_reproducible", "no_hidden_states", "prompt_logprobs"],
+    )
+    def test_mm_prefill_projects_only_the_sampled_row_when_allowed(
+        self,
+        selective: bool,
+        adapter_cls: type[_MmAdapter],
+        prompt_logprobs: bool,
+        selects: bool,
+    ) -> None:
+        adapter = adapter_cls()
+        runner = _runner(adapter)
+        runner._selective_logits_supported = selective
+        if prompt_logprobs:
+            runner._prompt_logprobs_tracker.register("req-0", 1)
+        runner.encoder_cache.add_request(
+            "req-0", [_feature("img-0", offset=1, length=2)]
+        )
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill(
+                    "req-0",
+                    token_ids=[10, 99, 99, 11],
+                    prompt_len=4,
+                    full_prompt=[10, 99, 99, 11],
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        state = runner._execute_model_state
+        assert len(getattr(adapter, "hidden_calls", [])) == int(selects)
+        assert len(adapter.call_lm_calls) == int(not selects)
+        if selects:
+            assert state.logits_cu_seqlens == [0, 1]
+            assert state.logits[0, :, 0].tolist() == [3.0]
+        else:
+            assert state.logits_cu_seqlens == [0, 4]
+            assert state.logits.shape == (1, 4, adapter.vocab_size)

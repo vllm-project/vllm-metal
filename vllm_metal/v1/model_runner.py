@@ -316,8 +316,8 @@ def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> boo
     declares ``text_path_selective_logits_ok``: its text batches run the
     plain text path on the very object ``runner.model`` refers to, so the
     bit-exactness probe in ``supports_selective_logits`` applies.  The mm
-    forward never requests selected rows, so the flag affects text batches
-    only.
+    forward selects rows only when the adapter also provides
+    ``call_lm_hidden_states``.
     """
     if not is_vlm:
         return True
@@ -663,8 +663,8 @@ class MetalModelRunner:
             max_position_embeddings=max_position_embeddings,
         )
         # Probed here because it runs a cacheless one-token forward, which is
-        # only safe before a paged context is installed. PP and multimodal take
-        # other forward branches that never request selection.
+        # only safe before a paged context is installed. PP takes another
+        # forward branch that never requests selection.
         self._selective_logits_supported = (
             self.pp is None
             and text_path_selective_logits_allowed(
@@ -852,6 +852,25 @@ class MetalModelRunner:
             [*decode_bounds, *range(num_decode_rows + 1, num_selected + 1)],
         )
 
+    def _needs_prompt_logprob_rows(self, prefill_reqs: list[PrefillRequest]) -> bool:
+        """Whether a prompt-logprobs request needs every packed prompt row."""
+        needed = self._prompt_logprobs_tracker.wants_any(
+            pr.req_id for pr in prefill_reqs
+        )
+        if needed:
+            # The profiled activation allowance covers the rows the
+            # sampler reads (see _profile_logits_indices); this step
+            # projects every packed prompt position instead, so say so
+            # once rather than letting the KV budget look inclusive.
+            logger.warning_once(
+                "A step with prompt logprobs projects a logits row for every "
+                "packed prompt position — up to max_num_batched_tokens x vocab "
+                "— which the profiled activation allowance does not reserve. "
+                "Lower --gpu-memory-utilization if these requests share a "
+                "large KV cache."
+            )
+        return needed
+
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
         return self._model_adapter.target_input_embeddings(
             self._forward_model, input_ids
@@ -942,6 +961,12 @@ class MetalModelRunner:
         """
         return self._supports_mm_inputs or adapter.requires_explicit_positions
 
+    def _mm_forward_selects_rows(self, adapter: MultimodalRuntimeAdapter) -> bool:
+        """Whether the mm forward projects only the rows the sampler reads."""
+        return self._selective_logits_supported and callable(
+            getattr(adapter, "call_lm_hidden_states", None)
+        )
+
     @staticmethod
     def _mm_forward_forced(adapter: MultimodalRuntimeAdapter | None) -> bool:
         """Whether a forward-ready adapter routes text batches through the
@@ -1009,15 +1034,16 @@ class MetalModelRunner:
 
         ``None`` keeps the full-row projection whenever selection cannot apply
         (pipeline parallel, LoRA, an adapter that rejects it), whenever a
-        multimodal step can run, or when the batch is smaller than the rows a
-        step can sample. The mm forward projects every packed row, so a
+        multimodal step can run without selecting rows, or when the batch is
+        smaller than the rows a step can sample. An mm forward without
+        ``call_lm_hidden_states`` projects every packed row, so such a
         forward-ready adapter keeps the full reserve when vLLM accepts
         multimodal inputs or the adapter requires explicit positions.
 
         This is the *sampler's* worst case. A step whose batch carries a
         prompt-logprobs request projects a logits row for every packed prompt
-        position instead — ``needs_prompt_logprob_rows`` skips both pruning
-        paths — so those steps can exceed the profiled allowance by up to
+        position instead — ``needs_prompt_logprob_rows`` skips every pruning
+        path — so those steps can exceed the profiled allowance by up to
         ``max_num_batched_tokens x vocab x dtype size`` (the whole-batch logits
         tensor). That path is opt-in per request and cannot be disabled by
         configuration: vLLM caps ``prompt_logprobs`` at ``max_logprobs``, but
@@ -1029,6 +1055,7 @@ class MetalModelRunner:
             adapter is not None
             and adapter.forward_ready
             and self._mm_step_can_run(adapter)
+            and not self._mm_forward_selects_rows(adapter)
         ):
             return None
         rows = int(input_ids.shape[-1])
@@ -1393,13 +1420,28 @@ class MetalModelRunner:
                     offset_caches,
                 )
             elif use_mm_forward:
+                assert adapter is not None
+                selects = self._mm_forward_selects_rows(adapter)
+                if selects and not self._needs_prompt_logprob_rows(prefill_reqs):
+                    logits_layout = self._paged_logits_layout(
+                        cu_seqlens,
+                        num_decode_segments=len(decode_segments),
+                    )
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
                     prefill_reqs,
                     decode_segments,
+                    hidden_states_only=logits_layout.indices is not None,
                 )
-                logits = self._extract_logits(model_output)
+                if logits_layout.indices is None:
+                    logits = self._extract_logits(model_output)
+                else:
+                    logits = self._model_adapter.project_logits(
+                        self._forward_model,
+                        model_output,
+                        logits_indices=logits_layout.indices,
+                    )
                 target_hidden_states = None
                 del model_output
             elif self.pp is not None and self.pp.size > 1:
@@ -1436,21 +1478,9 @@ class MetalModelRunner:
                 # position, so their steps skip both head-pruning paths: the
                 # projection-free intermediate forward (no logits at all) and
                 # the selective layout (last prefill row only).
-                needs_prompt_logprob_rows = self._prompt_logprobs_tracker.wants_any(
-                    pr.req_id for pr in prefill_reqs
+                needs_prompt_logprob_rows = self._needs_prompt_logprob_rows(
+                    prefill_reqs
                 )
-                if needs_prompt_logprob_rows:
-                    # The profiled activation allowance covers the rows the
-                    # sampler reads (see _profile_logits_indices); this step
-                    # projects every packed prompt position instead, so say so
-                    # once rather than letting the KV budget look inclusive.
-                    logger.warning_once(
-                        "A step with prompt logprobs projects a logits row for every "
-                        "packed prompt position — up to max_num_batched_tokens x vocab "
-                        "— which the profiled activation allowance does not reserve. "
-                        "Lower --gpu-memory-utilization if these requests share a "
-                        "large KV cache."
-                    )
                 if (
                     intermediate_only
                     and self._intermediate_forward_supported
@@ -2109,8 +2139,13 @@ class MetalModelRunner:
         offset_caches: list[OffsetCache],
         prefill_reqs: list[PrefillRequest],
         decode_segments: tuple[PagedDecodeSegment, ...],
+        *,
+        hidden_states_only: bool = False,
     ) -> tuple[Any, dict[str, int]]:
         """Run paged forward through ``adapter.call_lm`` with packed splice.
+
+        ``hidden_states_only`` calls ``adapter.call_lm_hidden_states`` instead
+        and returns the final hidden states, for the caller's selective head.
 
         Builds per-segment M-RoPE positions (sliced out of the full-prompt
         positions for mm prefill chunks, computed as ``cache_start_pos +
@@ -2350,7 +2385,12 @@ class MetalModelRunner:
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
         }
 
-        model_output = adapter.call_lm(
+        call_lm = (
+            cast(Any, adapter).call_lm_hidden_states
+            if hidden_states_only
+            else adapter.call_lm
+        )
+        model_output = call_lm(
             input_ids,
             inputs_embeds,
             offset_caches,

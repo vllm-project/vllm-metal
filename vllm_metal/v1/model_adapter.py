@@ -171,6 +171,11 @@ class MultimodalRuntimeAdapter(Protocol):
       text-only batches may use selective logits (``logits_indices``).  Only
       adapters whose ``text_model()`` is the same object the runner profiles
       with ``supports_selective_logits`` may set it.
+    - ``call_lm_hidden_states(...)`` (default absent): :meth:`call_lm` with the
+      same arguments but without the output head, returning the final hidden
+      states ``text_model()``'s head projects.  With it, the multimodal forward
+      projects only the rows the sampler reads, under the same gate as the
+      text path.
     - ``profile_features() -> list[MultiModalFeatureSpec]`` (default: no
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
@@ -322,6 +327,15 @@ class ModelAdapter(Protocol):
 
     def supports_selective_logits(self, model: Any) -> bool:
         """Whether ``target_forward`` may honour ``logits_indices`` for ``model``."""
+
+    def project_logits(
+        self,
+        model: Any,
+        hidden_states: mx.array,
+        *,
+        logits_indices: mx.array | None = None,
+    ) -> mx.array:
+        """Apply ``model``'s output head; needs ``supports_selective_logits``."""
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -719,21 +733,30 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             cache=cache,
         )
         flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
-        if logits_indices is None:
-            logits = self._compute_target_logits(model, hidden_states)
-            return TargetModelForwardOutput(
-                logits=logits,
-                hidden_states=flat_hidden_states if collect_hidden_states else None,
-            )
-
-        # `[None]` restores the leading batch axis the callers' `logits[0, row]`
-        # indexing expects. The hidden states stay row-major over ALL input rows,
-        # so the drafter's `target_hidden_row` keeps indexing the packed layout.
-        selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
+        # The hidden states stay row-major over ALL input rows, so the drafter's
+        # `target_hidden_row` keeps indexing the packed layout.
         return TargetModelForwardOutput(
-            logits=self._compute_target_logits(model, selected_hidden_states[None]),
+            logits=self.project_logits(
+                model, hidden_states, logits_indices=logits_indices
+            ),
             hidden_states=flat_hidden_states if collect_hidden_states else None,
         )
+
+    def project_logits(
+        self,
+        model: Any,
+        hidden_states: mx.array,
+        *,
+        logits_indices: mx.array | None = None,
+    ) -> mx.array:
+        """Apply *model*'s output head to final hidden states, or to selected rows."""
+        if logits_indices is None:
+            return self._compute_target_logits(model, hidden_states)
+        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
+        selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
+        # `[None]` restores the leading batch axis the callers' `logits[0, row]`
+        # indexing expects.
+        return self._compute_target_logits(model, selected_hidden_states[None])
 
     def supports_selective_logits(self, model: Any) -> bool:
         """Whether the split backbone/head path reproduces this model's head.

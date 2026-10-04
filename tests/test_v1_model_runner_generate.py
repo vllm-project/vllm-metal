@@ -2694,10 +2694,21 @@ class TestProfileLogitsIndices:
         assert runner._profile_logits_indices(self._ids(64)) is None
 
     def test_forward_ready_multimodal_adapter_keeps_every_row(self) -> None:
-        # The mm forward projects logits for every packed row, so a step with
-        # an image needs the full-row reserve even when the text path selects.
+        # An mm forward without call_lm_hidden_states projects logits for every
+        # packed row, so a step with an image needs the full-row reserve even
+        # when the text path selects.
         runner = self._runner(multimodal_adapter=SimpleNamespace(forward_ready=True))
         assert runner._profile_logits_indices(self._ids(64)) is None
+
+    def test_mm_adapter_with_hidden_states_selects_like_the_text_path(self) -> None:
+        runner = self._runner(
+            multimodal_adapter=SimpleNamespace(
+                forward_ready=True, call_lm_hidden_states=lambda *a, **k: None
+            )
+        )
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.tolist() == [*range(64 - 8, 64)]
 
     def test_adapter_that_cannot_run_the_mm_forward_still_selects(self) -> None:
         runner = self._runner(multimodal_adapter=SimpleNamespace(forward_ready=False))

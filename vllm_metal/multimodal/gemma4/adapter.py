@@ -213,16 +213,44 @@ class Gemma4MultimodalAdapter:
 
         ``position_ids`` is unused: RoPE comes from the paged context.
         """
+        del position_ids
+        input_ids = self._lm_input_ids(
+            input_ids, visual_pos_masks, deepstack_visual_embeds
+        )
+        return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
+
+    def call_lm_hidden_states(
+        self,
+        input_ids: mx.array,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> mx.array:
+        """:meth:`call_lm` without the output head: the backbone's final hidden states."""
+        del position_ids
+        input_ids = self._lm_input_ids(
+            input_ids, visual_pos_masks, deepstack_visual_embeds
+        )
+        return self._backbone(input_ids, cache=cache, input_embeddings=inputs_embeds)
+
+    def _lm_input_ids(
+        self,
+        input_ids: mx.array,
+        visual_pos_masks: Any | None,
+        deepstack_visual_embeds: Any | None,
+    ) -> mx.array:
         if deepstack_visual_embeds is not None:
             raise RuntimeError(
                 "Gemma 4 has no deepstack residuals; refusing to drop "
                 "deepstack_visual_embeds silently."
             )
-        del position_ids
-        if visual_pos_masks is not None:
-            # HF looks up per-layer inputs (E2B/E4B) with pad ids at image positions.
-            input_ids = mx.where(visual_pos_masks, self._pad_token_id, input_ids)
-        return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
+        if visual_pos_masks is None:
+            return input_ids
+        # HF looks up per-layer inputs (E2B/E4B) with pad ids at image positions.
+        return mx.where(visual_pos_masks, self._pad_token_id, input_ids)
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:
         """One maximal image feature for ``profile_run``, sized from the loaded tower.
