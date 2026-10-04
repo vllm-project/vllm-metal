@@ -55,16 +55,17 @@ before model load.
 ## Current scope
 
 - Supported model families: Qwen2, Qwen3, Llama, and Mistral.
-- Supported qtypes: Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, and Q6_K, plus plain
-  F32/F16/BF16 tensors, mixed freely within one file, so llama.cpp's Q4_K_M
-  and Q5_K_M exports and bartowski's Q4_K_L load. Remote reference tags accept
-  Q8_0, Q4_0, Q4_1, and the plain types; K-quant files load from a local path.
+- Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, and Q6_K, plus
+  plain F32/F16/BF16 tensors, mixed freely within one file, so llama.cpp's
+  Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L load. Remote reference tags
+  accept Q8_0, Q4_0, Q4_1, and the plain types; other quants load from a local
+  path.
+- llama.cpp falls back from Q4_K/Q5_K to Q5_0/Q5_1 on rows that are not a
+  multiple of 256 wide, as in Qwen2.5-0.5B's Q4_K_M and Q5_K_M files.
 - Q6_K weights stay in their GGUF blocks and run on custom Metal kernels.
   Small batches use a fused kernel on the packed blocks, and larger ones, such
   as a prefill, dequantize a transient dense copy of the weight for one GEMM
   and free it afterwards.
 - A tied model's unused `output.weight` is skipped whatever its qtype.
-- Unsupported: Q5_0/Q5_1 (llama.cpp falls back to them when a row width is not
-  a multiple of 256, as in Qwen2.5-0.5B's Q4_K_M), Q2_K/Q3_K and IQ quants,
-  MoE, SSM or hybrid models, vision models, fused-QKV GGUFs, and sharded GGUF
-  files.
+- Unsupported: Q2_K/Q3_K and IQ quants, MoE, SSM or hybrid models, vision
+  models, fused-QKV GGUFs, and sharded GGUF files.

@@ -9,14 +9,14 @@ that triple in an explicit, validated contract and exposes
 :meth:`~GGUFMLXQuantizedTensor.embedding`, which run on the packed weights so
 supported weights never get expanded into a dense copy.
 
-Q8_0, Q4_0, and Q4_1 blocks carry one fp16 scale (and Q4_1 one fp16 min) per
-32 weights, so their triple stores ``float16`` scales/biases and is byte for
-byte what MLX's own GGUF repack in ``mx.load`` produces. Q4_K and Q5_K
-sub-blocks are also 32 wide, but their scales are the fp32 products
-``d*sc`` / ``-dmin*m``, so those triples store ``float32`` to reproduce
-``gguf.quants.dequantize`` bit for bit (#761). K-quants with 16-element
-sub-groups (Q6_K/Q3_K/Q2_K) cannot repack, since MLX has no group_size=16
-kernels, and stay out of scope for this path.
+Q8_0, Q4_0/Q4_1, and Q5_0/Q5_1 blocks carry one fp16 scale (and Q4_1/Q5_1 one
+fp16 min) per 32 weights, so their triple stores ``float16`` scales/biases.
+Q8_0/Q4_0/Q4_1 triples are byte for byte what MLX's own GGUF repack in
+``mx.load`` produces (it cannot read Q5_0/Q5_1). Q4_K and Q5_K sub-blocks are
+also 32 wide, but their scales are the fp32 products ``d*sc`` / ``-dmin*m``, so
+those triples store ``float32`` to reproduce ``gguf.quants.dequantize`` bit for
+bit (#761). K-quants with 16-element sub-groups (Q6_K/Q3_K/Q2_K) cannot repack,
+since MLX has no group_size=16 kernels, and stay out of scope for this path.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ _BITS: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.Q8_0: 8,
     GGMLQuantizationType.Q4_0: 4,
     GGMLQuantizationType.Q4_1: 4,
+    GGMLQuantizationType.Q5_0: 5,
+    GGMLQuantizationType.Q5_1: 5,
     GGMLQuantizationType.Q4_K: 4,
     GGMLQuantizationType.Q5_K: 5,
 }
@@ -65,11 +67,11 @@ class GGUFMLXQuantizedTensor:
     * ``qweight`` — ``uint32`` packed weights, 2-D, shape :attr:`packed_shape`.
     * ``scales`` / ``biases`` — shape ``(out_features, in_features //
       group_size)``; ``float32`` for Q4_K/Q5_K (required for a bit-exact
-      K-quant repack, #761) and ``float16`` for Q8_0/Q4_0/Q4_1.
+      K-quant repack, #761) and ``float16`` for Q8_0/Q4_0/Q4_1/Q5_0/Q5_1.
     * ``qweight_type`` — a ``gguf.GGMLQuantizationType`` in
       :data:`AFFINE_GGUF_TYPES`.
     * logical weight is ``(out_features, in_features)``; :attr:`group_size` is 32;
-      :attr:`bits` is 8 for Q8_0, 5 for Q5_K, 4 for Q4_0/Q4_1/Q4_K.
+      :attr:`bits` is 8 for Q8_0, 5 for Q5_0/Q5_1/Q5_K, 4 for Q4_0/Q4_1/Q4_K.
     * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
       returns ``x``'s dtype; :meth:`embedding` returns an explicit ``output_dtype``.
 
@@ -200,6 +202,8 @@ class GGUFMLXQuantizedTensor:
             GGMLQuantizationType.Q8_0: cls._parse_q8_0,
             GGMLQuantizationType.Q4_0: cls._parse_q4_0,
             GGMLQuantizationType.Q4_1: cls._parse_q4_1,
+            GGMLQuantizationType.Q5_0: cls._parse_q5_0,
+            GGMLQuantizationType.Q5_1: cls._parse_q5_1,
             GGMLQuantizationType.Q4_K: cls._parse_q4_k,
             GGMLQuantizationType.Q5_K: cls._parse_q5_k,
         }[qweight_type]
@@ -265,6 +269,41 @@ class GGUFMLXQuantizedTensor:
         nibbles = blocks[:, 4:20]
         codes = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
         return codes, d, m
+
+    @staticmethod
+    def _parse_q5_0(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 22-byte Q5_0 blocks (fp16 ``d``, 4 ``qh`` bytes, 16 nibble bytes).
+
+        ``w = d*(q-16)`` for the 5-bit code ``q``, so ``scale = d`` and
+        ``bias = -16*d``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        codes = GGUFMLXQuantizedTensor._join_fifth_bits(blocks[:, 6:22], blocks[:, 2:6])
+        return codes, d, d * -16
+
+    @staticmethod
+    def _parse_q5_1(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Split 24-byte Q5_1 blocks (fp16 ``d``/``m``, 4 ``qh``, 16 nibble bytes).
+
+        The codes match Q5_0 and ``w = d*q + m``, so ``scale = d`` and
+        ``bias = m``.
+        """
+        d = blocks[:, 0:2].view(mx.float16)
+        m = blocks[:, 2:4].view(mx.float16)
+        codes = GGUFMLXQuantizedTensor._join_fifth_bits(blocks[:, 8:24], blocks[:, 4:8])
+        return codes, d, m
+
+    @staticmethod
+    def _join_fifth_bits(nibbles: mx.array, qh: mx.array) -> mx.array:
+        """Combine Q4_0-ordered nibbles with the fifth bits packed in ``qh``.
+
+        ``qh`` holds the 4 bytes of a little-endian ``uint32`` whose bit ``i``
+        is element ``i``'s fifth bit, i.e. bit ``i % 8`` of byte ``i // 8``.
+        """
+        low = mx.concatenate([nibbles & 0x0F, nibbles >> 4], axis=1)
+        byte_bits = mx.arange(8, dtype=mx.uint8)
+        high = ((qh[:, :, None] >> byte_bits) & 1).reshape(qh.shape[0], 32)
+        return low | (high << 4)
 
     @staticmethod
     def _parse_q4_k(blocks: mx.array) -> tuple[mx.array, mx.array, mx.array]:

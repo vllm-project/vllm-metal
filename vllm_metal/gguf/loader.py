@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Local GGUF loader for dense Q8_0/Q4_0/Q4_1 and Q4_K/Q5_K/Q6_K checkpoints."""
+"""Local GGUF loader for dense checkpoints."""
 
 from __future__ import annotations
 
@@ -75,8 +75,7 @@ class GGUFModelLoader:
     """Load a dense GGUF checkpoint into its mlx-lm model.
 
     Args:
-        gguf_path: Path to a local ``.gguf`` file (dense; Q8_0/Q4_0/Q4_1 or
-            K-quant Q4_K/Q5_K/Q6_K).
+        gguf_path: Path to a local dense ``.gguf`` file.
         config_dir: Companion HF config source that defines the mlx-lm skeleton.
         tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.

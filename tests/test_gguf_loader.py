@@ -223,7 +223,7 @@ def _assert_forward_vocab_shape(model: nn.Module) -> None:
     assert out.shape == (1, 3, 256)
 
 
-@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1])
+@pytest.mark.parametrize("quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1, QT.Q5_0, QT.Q5_1])
 @pytest.mark.parametrize(
     ("model_type", "has_qk_norm", "needs_tokenizer"),
     [("qwen3", True, False), ("llama", False, True)],
@@ -435,7 +435,8 @@ def _write_minimal_tokenizer(config_dir: str, vocab_size: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "quant_type", [QT.Q8_0, QT.Q4_0, QT.Q4_1, QT.Q4_K, QT.Q5_K, QT.Q6_K]
+    "quant_type",
+    [QT.Q8_0, QT.Q4_0, QT.Q4_1, QT.Q5_0, QT.Q5_1, QT.Q4_K, QT.Q5_K, QT.Q6_K],
 )
 def test_quantized_llama_qk_are_row_unpermuted(tmp_path, quant_type):
     # The main quantized-path behavior: installed q/k GGUFLinear tensors carry the
@@ -825,8 +826,9 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
+        config_overrides=_KQUANT_CONFIG,
         has_qk_norm=True,
-        quant_overrides={"blk.0.ffn_up.weight": QT.Q5_0},
+        inject={"blk.0.ffn_up.weight": ("q3_k", (256, 256))},
     )
 
     def fail_load_model(*args, **kwargs):
@@ -835,7 +837,7 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
     monkeypatch.setattr(gguf_loader, "load_model", fail_load_model)
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype Q5_0 on mapped weight 'blk.0.ffn_up.weight'",
+        match="Unsupported qtype Q3_K on mapped weight 'blk.0.ffn_up.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -916,14 +918,14 @@ def test_rejects_unsupported_untied_output(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
-        config_overrides={"tie_word_embeddings": False},
+        config_overrides={**_KQUANT_CONFIG, "tie_word_embeddings": False},
         has_qk_norm=True,
-        quant_overrides={"output.weight": QT.Q5_0},
+        inject={"output.weight": ("q3_k", (256, 256))},
     )
 
     with pytest.raises(
         GGUFLoadError,
-        match="Unsupported qtype Q5_0 on mapped weight 'output.weight'",
+        match="Unsupported qtype Q3_K on mapped weight 'output.weight'",
     ):
         GGUFModelLoader(
             gguf_path,
@@ -1069,8 +1071,8 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
 
     assert str(excinfo.value) == (
         "Unsupported qtype Q3_K on mapped weight 'blk.0.ffn_gate.weight'; "
-        "only Q4_0/Q4_1/Q8_0/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) are "
-        "supported."
+        "only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K (and plain F32/F16/BF16) "
+        "are supported."
     )
 
 
@@ -1081,11 +1083,13 @@ def test_rejects_unsupported_kquant_weight_at_preflight(tmp_path):
         pytest.param(QT.Q5_K, QT.Q6_K, id="q5_k_m"),
         pytest.param(QT.Q4_K, QT.Q8_0, id="q4_k_l"),
         pytest.param(QT.Q4_0, QT.Q6_K, id="q4_0-q6_k-embd"),
+        pytest.param(QT.Q4_K, QT.Q5_0, id="q4_k-q5_0-embd"),
+        pytest.param(QT.Q5_K, QT.Q5_1, id="q5_k-q5_1-embd"),
     ],
 )
 def test_loads_llama_cpp_qtype_mixes(tmp_path, body_type, embd_type):
-    # llama.cpp mixes qtypes inside one file: Q6_K or Q8_0 embeddings next to a
-    # K-quant or Q4_0 body.
+    # llama.cpp mixes qtypes inside one file: Q6_K, Q8_0 or Q5_0/Q5_1 fallback
+    # embeddings next to a K-quant or Q4_0 body.
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,
         "qwen3",
