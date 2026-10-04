@@ -10,6 +10,8 @@ benchmark, excluding tokenization, HTTP and concurrent serving queues.
     PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model
     PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model \
         --quality-text /path/to/wikitext-test.txt --output quality.json
+    PYTHONPATH=. python tools/benchmark/tq_e2e_arm.py --model /path/to/model \
+        --prefix-probe --prefix-tokens 8192 --query-tokens 32 64 96 128
 """
 
 import argparse
@@ -31,6 +33,34 @@ PARA = (
 )
 
 
+def prefix_probe_layout(prefix_tokens, query_tokens, block_size, max_prompt):
+    """Keep an exact, block-aligned cached prefix and leave query rows uncached."""
+    cached = 2 * block_size if prefix_tokens is None else prefix_tokens
+    if cached <= 0 or cached % block_size:
+        raise ValueError(f"--prefix-tokens must be a positive multiple of {block_size}")
+    required = cached + max(query_tokens)
+    if required > max_prompt:
+        raise ValueError(f"Prefix probe needs --prompt-tokens >= {required}")
+    return cached, required
+
+
+def validate_prefix_reuse(seed, row, cached_tokens, query_tokens):
+    """Reject a cache miss or a different query count instead of mislabelling it."""
+    if seed["num_cached_tokens"] != 0 or row["num_cached_tokens"] != cached_tokens:
+        raise RuntimeError("Prefix probe did not reuse the exact requested prefix")
+    if row["prompt_tokens"] - row["num_cached_tokens"] != query_tokens:
+        raise RuntimeError("Prefix probe executed a different query length")
+    if row["arm"] == "tq":
+        dispatch = row["dispatch"]
+        eligible = dispatch["threshold_eligible_layer_calls"]
+        selected = dispatch["lane_layer_calls"]
+        if selected > eligible or (eligible and not selected):
+            raise RuntimeError(
+                "Prefix probe dispatch disagrees with the query threshold; "
+                "check hardware opt-in and workspace budget"
+            )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
@@ -46,11 +76,26 @@ def main():
     ap.add_argument("--v-quant", default="q3_0")
     ap.add_argument("--quality-text", type=Path)
     ap.add_argument("--prefix-probe", action="store_true")
+    ap.add_argument(
+        "--prefix-tokens",
+        type=int,
+        help="Exact cached prefix length, block-aligned; default: two cache blocks",
+    )
+    ap.add_argument(
+        "--query-tokens",
+        type=int,
+        nargs="+",
+        help="Uncached query lengths for the prefix probe; default: 1 9 257",
+    )
     ap.add_argument("--quality-windows", type=int, default=16)
     ap.add_argument("--quality-window", type=int, default=1024)
     ap.add_argument("--progress-interval", type=float, default=0)
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
+    if args.query_tokens is not None and not args.prefix_probe:
+        ap.error("--query-tokens requires --prefix-probe")
+    if args.query_tokens is None:
+        args.query_tokens = [1, 9, 257]
     if (
         min(
             *args.prompt_tokens,
@@ -59,6 +104,7 @@ def main():
             args.reps,
             args.quality_windows,
             args.quality_window,
+            *args.query_tokens,
         )
         < 1
         or args.warmup < 0
@@ -69,6 +115,14 @@ def main():
         ap.error("quality scoring requires window >= 256")
     if args.prefix_probe and (args.arm != "paired" or args.quality_text):
         ap.error("prefix probe requires --arm paired without --quality-text")
+    if args.prefix_tokens is not None and (
+        not args.prefix_probe or args.prefix_tokens <= 0
+    ):
+        ap.error("--prefix-tokens requires --prefix-probe and a positive length")
+    if args.prefix_probe and args.max_tokens != 1:
+        ap.error("prefix probe requires --max-tokens 1 to preserve the seeded prefix")
+    if args.prefix_probe and max(args.query_tokens) > args.batch_tokens:
+        ap.error("prefix probe query lengths must fit in one --batch-tokens step")
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
@@ -79,6 +133,7 @@ def main():
     from tools.attention_bench_utils import package_versions
     from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
     from vllm_metal.attention.impls import sdpa
+    from vllm_metal.attention.impls import turboquant_prefill as tq_prefill
     from vllm_metal.metal import get_ops
 
     original_planner = sdpa._turboquant_prefill_plan
@@ -90,6 +145,13 @@ def main():
         nonlocal last_progress
         dispatch["prefill_layer_calls"] += 1
         dispatch["workspace_limit_bytes"] = planner_args[1].tq_prefill_workspace_bytes
+        threshold = tq_prefill.min_prefill_tokens(*planner_args[4:7])
+        cu = planner_args[0].cu_seqlens
+        dispatch["threshold_eligible_layer_calls"] += int(
+            any(b - a >= threshold for a, b in zip(cu[:-1], cu[1:], strict=True))
+        )
+        if threshold not in dispatch["query_thresholds"]:
+            dispatch["query_thresholds"].append(threshold)
         plan = (
             None
             if active_arm == "tq-reference"
@@ -130,6 +192,8 @@ def main():
     def reset_dispatch():
         dispatch.update(
             prefill_layer_calls=0,
+            threshold_eligible_layer_calls=0,
+            query_thresholds=[],
             lane_layer_calls=0,
             lane_segments=0,
             max_gathered_tokens=0,
@@ -147,6 +211,8 @@ def main():
             "v_quant": args.v_quant,
         }
     max_prompt = args.quality_window if args.quality_text else max(args.prompt_tokens)
+    if args.prefix_probe and args.prefix_tokens is not None:
+        max_prompt = args.prefix_tokens + max(args.query_tokens)
     t0 = time.perf_counter()
     llm = LLM(
         model=os.path.expanduser(args.model),
@@ -249,50 +315,79 @@ def main():
     try:
         if args.prefix_probe:
             block_size = llm.llm_engine.vllm_config.cache_config.block_size
-            prefix_length = 2 * block_size + 1
-            if prefix_length + 256 > max_prompt:
-                raise ValueError(
-                    f"Prefix probe needs --prompt-tokens >= {prefix_length + 256}"
-                )
+            cached_tokens, required = prefix_probe_layout(
+                args.prefix_tokens, args.query_tokens, block_size, max_prompt
+            )
             all_ids = tokenizer.encode(
-                PARA * ((prefix_length + 256) // 32 + 2), add_special_tokens=False
-            )[: prefix_length + 256]
-            for suffix in (0, 8, 256):
-                for arm in arms:
-                    if not llm.reset_prefix_cache():
-                        raise RuntimeError("Unable to reset the prefix cache")
-                    seed = run(all_ids[:prefix_length], arm, "prefix-seed", suffix)
-                    row = run(
-                        all_ids[: prefix_length + suffix],
-                        arm,
-                        "prefix-reuse",
-                        suffix,
-                        allow_no_lane=True,
-                    )
-                    if seed["num_cached_tokens"] != 0 or row["num_cached_tokens"] <= 0:
-                        raise RuntimeError("Prefix probe did not exercise a fresh hit")
-                    remaining = (
-                        len(all_ids[: prefix_length + suffix])
-                        - row["num_cached_tokens"]
-                    )
-                    # This probe uses the default GQA crossover. The final
-                    # dispatch record is authoritative for other geometries.
-                    if arm == "tq" and remaining < 128:
-                        assert row["dispatch"]["lane_layer_calls"] == 0
-                    if arm == "tq" and suffix == 256:
-                        assert row["dispatch"]["lane_layer_calls"] > 0
-                    summaries.append(
-                        {
-                            "kind": "prefix-reuse",
-                            "arm": arm,
-                            "block_size": block_size,
-                            "suffix_tokens": suffix,
-                            "remaining_query_tokens": remaining,
-                            "num_cached_tokens": row["num_cached_tokens"],
-                            "lane_layer_calls": row["dispatch"]["lane_layer_calls"],
-                            "ttft_s": row["ttft_s"],
-                        }
-                    )
+                PARA * (required // 32 + 2), add_special_tokens=False
+            )[:required]
+            if len(all_ids) != required:
+                raise RuntimeError(
+                    "Prefix probe did not construct enough prompt tokens"
+                )
+            for query_tokens in args.query_tokens:
+                measured = []
+                for trial in range(-args.warmup, args.reps):
+                    for arm in arms if trial % 2 == 0 else arms[::-1]:
+                        if not llm.reset_prefix_cache():
+                            raise RuntimeError("Unable to reset the prefix cache")
+                        # The extra token lets vLLM cache every requested prefix
+                        # block while retaining a query row to compute logits.
+                        # Seed both arms with the same production path so their
+                        # cached hidden states do not depend on the measured arm.
+                        seed = run(
+                            all_ids[: cached_tokens + 1],
+                            "tq",
+                            "prefix-seed",
+                            trial,
+                            allow_no_lane=True,
+                        )
+                        row = run(
+                            all_ids[: cached_tokens + query_tokens],
+                            arm,
+                            "prefix-warmup" if trial < 0 else "prefix-reuse",
+                            trial,
+                            allow_no_lane=True,
+                        )
+                        validate_prefix_reuse(seed, row, cached_tokens, query_tokens)
+                        if trial >= 0:
+                            measured.append(row)
+                summary = {
+                    "kind": "prefix-reuse",
+                    "comparison": "compressed_vs_production_policy",
+                    "block_size": block_size,
+                    "num_cached_tokens": cached_tokens,
+                    "remaining_query_tokens": query_tokens,
+                    "median_ttft_s": {
+                        arm: statistics.median(
+                            row["ttft_s"] for row in measured if row["arm"] == arm
+                        )
+                        for arm in arms
+                    },
+                    "lane_layer_calls": {
+                        arm: sorted(
+                            {
+                                row["dispatch"]["lane_layer_calls"]
+                                for row in measured
+                                if row["arm"] == arm
+                            }
+                        )
+                        for arm in arms
+                    },
+                    "greedy_tokens_match": all(
+                        len(
+                            {
+                                tuple(row["tokens"])
+                                for row in measured
+                                if row["trial"] == trial
+                            }
+                        )
+                        == 1
+                        for trial in range(args.reps)
+                    ),
+                }
+                summaries.append(summary)
+                print(json.dumps(summary), flush=True)
         elif args.quality_text:
             text = args.quality_text.read_text()
             token_ids = tokenizer.encode(text, add_special_tokens=False)

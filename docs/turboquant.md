@@ -207,19 +207,20 @@ materialized time; values below 1 mean materialization is slower. These are
 warmed single-layer production-wrapper timings, including projection, cache
 writes, planning, materialization and synchronization, not model TTFT.
 
-| Backend | Q/KV heads | 16 new tokens | 32 | 64 | 128 | 256 |
-|---|---|---:|---:|---:|---:|---:|
-| NAX | GQA 8/2 | 0.65–0.68× | 1.04–1.12× | 2.27–2.93× | 4.26–5.60× | 7.74–10.82× |
-| NAX | MHA 8/8 | 0.55–0.59× | 0.89–0.97× | 1.89–2.52× | 3.54–4.74× | 6.34–9.12× |
-| Tiled | GQA 8/2 | 0.52–0.60× | 0.90–0.94× | 1.60–1.72× | 2.92–3.54× | 4.35–5.35× |
-| Tiled | MHA 8/8 | 0.47–0.51× | 0.78–0.81× | 1.37–1.60× | 2.52–3.07× | 3.95–4.66× |
+| Backend | Q/KV heads | 16 new tokens | 32 | 64 | 96 | 128 | 256 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| NAX | GQA 8/2 | 0.65–0.69× | 1.06–1.11× | 2.35–2.69× | 2.70–3.10× | 4.22–5.23× | 7.38–9.97× |
+| NAX | MHA 8/8 | 0.56–0.60× | 0.90–0.95× | 1.95–2.28× | 2.32–2.61× | 3.56–4.31× | 6.00–8.07× |
+| Tiled | GQA 8/2 | 0.52–0.61× | 0.90–0.95× | 1.67–1.72× | 2.37–2.51× | 3.07–3.25× | 4.24–4.96× |
+| Tiled | MHA 8/8 | 0.47–0.51× | 0.77–0.80× | 1.35–1.51× | 1.89–2.18× | 2.50–2.91× | 3.89–4.37× |
 
 On this device, the observed NAX GQA crossover is between 16 and 32 new tokens;
-the 8K advantage at 32 tokens is only 4–6%. NAX MHA and both tiled shapes
+the advantage at 32 tokens remains small. NAX MHA and both tiled shapes
 cross between 32 and 64 tokens. The production policy remains conservative:
 128 new tokens for this GQA shape and 256 for MHA. These measurements do not
 establish thresholds for other GPUs or model shapes. Some configurations
-still show timing variation of several percent.
+still show timing variation of several percent; the shortest cases can vary
+by about 10–13%, so small gains near the crossover need confirmation.
 
 The `crossover-hd128` suite forces only the query-count threshold in the
 benchmark to compare both algorithms below the production cutoff. It retains
@@ -269,8 +270,46 @@ JSON records vLLM's `first_token_latency`, wall time, actual layer dispatch,
 workspace, MLX memory and runtime versions. TTFT summaries are medians of the
 measured repetitions, excluding warmup. Missing TTFT or an inactive requested
 TQ lane fails explicitly. This offline tool excludes HTTP and concurrent serving
-queues. `--prefix-probe --prompt-tokens 8192` instead seeds and reuses real cached
-prefixes with short/long suffixes, recording cache hits and dispatch.
+queues.
+
+For threshold calibration, the prefix probe accepts an exact cached history and
+the number of query tokens that must remain uncached. The history must be a
+multiple of the scheduler block size. The probe seeds one extra token so the
+entire requested history can be cached, then verifies both the cache-hit count
+and the remaining query count on every reuse. A partial hit fails the probe.
+
+```bash
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  VLLM_METAL_TQ_PREFILL=1 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/hd128-model --prefix-probe --prefix-tokens 8192 \
+  --query-tokens 32 63 64 65 96 127 128 129 256 \
+  --max-tokens 1 --reps 3 --warmup 1 --output prefix-8k.json
+```
+
+Use `--prefix-tokens 32768` for a longer history when the model and device can
+hold it. These explicit prefix/query lengths determine the required model
+context limit; `--prompt-tokens` is for the ordinary prompt-length sweep.
+Without `--prefix-tokens`, the prefix probe retains its two-block history;
+default query lengths are 1, 9 and 257. Query lengths are not appended-suffix
+lengths: vLLM must retain at least one query to compute logits. Query lengths
+must fit within `--batch-tokens` so the measured reuse occupies one scheduler step.
+
+Each arm gets a fresh prefix seeded through the same production path, keeping
+cached hidden states independent of the measured arm. Warmup and measured pairs
+alternate arm order, and summaries report median reuse TTFT, actual lane calls
+and greedy token agreement. Dispatch checks use the loaded model's production threshold,
+so short seeds and MHA thresholds do not inherit a hard-coded GQA cutoff.
+An eligible probe with no materialized layers fails rather than reporting a
+fallback as a materialized result.
+
+The hd128 microbenchmark can run on M3 with `--tiled`, and on M5 with both
+backends. Use the same source and dependency versions for calibration. The
+microbenchmark measures the two algorithms below the policy cutoff; the prefix
+probe measures compressed attention against the current production policy.
+To claim a threshold-change benefit, compare the old and new production
+policies separately. Non-M5 calibration and that policy comparison are required
+before retuning the threshold; enabling non-M5 devices by default is a separate
+rollout decision.
 
 For HTTP latency and throughput, start the same model with prefix caching off:
 
