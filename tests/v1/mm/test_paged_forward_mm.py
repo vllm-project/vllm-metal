@@ -1099,7 +1099,7 @@ class TestMmSelectiveLogits:
             (True, _MmAdapter, False, False),
             (True, _HiddenStatesAdapter, True, False),
         ],
-        ids=["selects", "head_not_reproducible", "no_hidden_states", "prompt_logprobs"],
+        ids=["selects", "selection_unsupported", "no_hidden_states", "prompt_logprobs"],
     )
     def test_mm_prefill_projects_only_the_sampled_row_when_allowed(
         self,

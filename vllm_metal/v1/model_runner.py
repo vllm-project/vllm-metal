@@ -1042,13 +1042,13 @@ class MetalModelRunner:
 
         This is the *sampler's* worst case. A step whose batch carries a
         prompt-logprobs request projects a logits row for every packed prompt
-        position instead — ``needs_prompt_logprob_rows`` skips every pruning
-        path — so those steps can exceed the profiled allowance by up to
-        ``max_num_batched_tokens x vocab x dtype size`` (the whole-batch logits
-        tensor). That path is opt-in per request and cannot be disabled by
-        configuration: vLLM caps ``prompt_logprobs`` at ``max_logprobs``, but
-        ``prompt_logprobs=0`` is still accepted. ``_start_paged_forward``
-        warns once when a step first takes it.
+        position instead — steps where :meth:`_needs_prompt_logprob_rows` holds
+        skip every pruning path — so those steps can exceed the profiled
+        allowance by up to ``max_num_batched_tokens x vocab x dtype size`` (the
+        whole-batch logits tensor). That path is opt-in per request and cannot
+        be disabled by configuration: vLLM caps ``prompt_logprobs`` at
+        ``max_logprobs``, but ``prompt_logprobs=0`` is still accepted.
+        :meth:`_needs_prompt_logprob_rows` warns once when a step first takes it.
         """
         adapter = self._multimodal_adapter
         if not self._selective_logits_supported or (
