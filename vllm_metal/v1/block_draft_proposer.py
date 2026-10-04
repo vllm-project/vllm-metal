@@ -48,11 +48,7 @@ class BlockDraftProposer(ABC):
         num_draft_tokens: int,
         controller: SpeculativeDecodeController,
     ) -> None:
-        if (
-            type(num_draft_tokens) is not int
-            or not 1 <= num_draft_tokens <= model.config.block_size - self.extra_slots
-        ):
-            raise ValueError(f"{self.name} draft width must fit the trained block_size")
+        model._validate_num_draft_tokens(num_draft_tokens, extra_slots=self.extra_slots)
         if model.fc.weight.dtype not in (mx.float16, mx.bfloat16):
             raise ValueError(f"{self.name} serving requires an FP16 or BF16 checkpoint")
         self.model = model

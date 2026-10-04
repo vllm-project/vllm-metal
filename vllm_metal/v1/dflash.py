@@ -447,12 +447,14 @@ class DFlashModel(nn.Module):
         self.validate_embeddings(embeddings, 1)
         return embeddings
 
-    def _validate_num_draft_tokens(self, num_draft_tokens: int) -> None:
+    def _validate_num_draft_tokens(
+        self, num_draft_tokens: int, extra_slots: int = 1
+    ) -> None:
         if (
             type(num_draft_tokens) is not int
-            or not 1 <= num_draft_tokens < self.config.block_size
+            or not 1 <= num_draft_tokens <= self.config.block_size - extra_slots
         ):
-            raise ValueError("DFlash requires 1 <= num_draft_tokens < block_size")
+            raise ValueError("num_draft_tokens must fit the trained block_size")
 
     def _project_logits(
         self,
