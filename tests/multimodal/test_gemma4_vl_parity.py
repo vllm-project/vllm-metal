@@ -39,10 +39,10 @@ Two levels:
       hf download mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4
 
   ``GEMMA4_PARITY_MODEL`` overrides it with another repo id or with the path to
-  a local checkout.  Pick a checkpoint the sidecar actually accepts: the 26B-A4B
-  repos are the ones without per-layer inputs, and of those only this one ships
-  the ``video_processor`` block in ``processor_config.json`` that
-  ``Gemma4Processor`` needs.
+  a local checkout.  Pick a checkpoint the sidecar actually accepts: of the
+  26B-A4B repos only this one ships the ``video_processor`` block in
+  ``processor_config.json`` that ``Gemma4Processor`` needs, and the
+  ``mlx-community/gemma-4-e2b-it-4bit`` / ``gemma-4-e4b-it-4bit`` repos ship it too.
 """
 
 from __future__ import annotations
@@ -262,11 +262,12 @@ def _adapter_side(
     )
 
     input_ids = mx.array(inputs["input_ids"])
+    image_mask = mx.array(ids == image_token_id)
     encoded = adapter.encode_multimodal([feature])[0]
     spliced = merge_multimodal_embeddings(
         adapter.embed_tokens(input_ids),
         [encoded.hidden_states],
-        mx.array(ids == image_token_id),
+        image_mask,
     )
     positions, _delta = adapter.get_mrope_input_positions(ids.tolist(), [feature])
     num_layers = len(text_model.language_model.model.layers)
@@ -275,6 +276,7 @@ def _adapter_side(
         inputs_embeds=spliced,
         cache=[None] * num_layers,
         position_ids=positions,
+        visual_pos_masks=image_mask[None, :],
     )
     logits = getattr(logits, "logits", logits)
     mx.eval(spliced, logits)

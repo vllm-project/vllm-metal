@@ -83,6 +83,9 @@ class Gemma4MultimodalAdapter:
         self._embed_scale_rounded = float(
             mx.array(float(backbone.embed_scale), dtype=embed_dtype).item()
         )
+        self._pad_token_id = int(
+            getattr(getattr(backbone, "config", None), "pad_token_id", 0) or 0
+        )
 
     @classmethod
     def from_loaded(
@@ -208,15 +211,17 @@ class Gemma4MultimodalAdapter:
     ) -> Any:
         """Run the mlx_lm model on runner-built embeddings.
 
-        ``position_ids`` and ``visual_pos_masks`` are unused: RoPE comes from
-        the paged context and Gemma 4 has no deepstack residuals.
+        ``position_ids`` is unused: RoPE comes from the paged context.
         """
         if deepstack_visual_embeds is not None:
             raise RuntimeError(
                 "Gemma 4 has no deepstack residuals; refusing to drop "
                 "deepstack_visual_embeds silently."
             )
-        del position_ids, visual_pos_masks
+        del position_ids
+        if visual_pos_masks is not None:
+            # HF looks up per-layer inputs (E2B/E4B) with pad ids at image positions.
+            input_ids = mx.where(visual_pos_masks, self._pad_token_id, input_ids)
         return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:

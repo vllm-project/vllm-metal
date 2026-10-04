@@ -338,7 +338,7 @@ class TestCallLm:
         )
 
         call = text_model.calls[0]
-        assert call["inputs"] is ids
+        assert call["inputs"].tolist() == [[1, 0]]
         assert call["input_embeddings"] is embeds
         assert call["cache"] is cache
         assert out.logits.shape == (1, 2, 16)

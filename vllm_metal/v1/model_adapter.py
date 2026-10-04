@@ -108,13 +108,6 @@ def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str 
     )
     if quant_method == "awq":
         return "vision needs a safetensors checkpoint (AWQ)"
-    text_config = getattr(hf_config, "text_config", hf_config)
-    per_layer_inputs = int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0)
-    if per_layer_inputs > 0:
-        return (
-            "per-layer inputs are unsupported on the sidecar path "
-            f"(hidden_size_per_layer_input={per_layer_inputs})"
-        )
     checkpoint = _local_checkpoint_dir(model_config)
     if checkpoint is None:
         return (

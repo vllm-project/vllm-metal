@@ -1292,11 +1292,12 @@ def _sidecar_ready(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestMultimodalBackboneMode:
+    @pytest.mark.parametrize("per_layer_inputs", [0, 256])
     @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
     def test_gemma4_with_everything_present_is_text_sidecar(
-        self, tmp_path: Path, _sidecar_ready, model_type: str
+        self, tmp_path: Path, _sidecar_ready, model_type: str, per_layer_inputs: int
     ) -> None:
-        config = _gemma4_model_config(tmp_path)
+        config = _gemma4_model_config(tmp_path, per_layer_inputs=per_layer_inputs)
         config.hf_config.model_type = model_type
         mode = DefaultModelAdapter().multimodal_backbone_mode(config)
         assert mode == "text_sidecar"
@@ -1369,11 +1370,6 @@ class TestMultimodalBackboneMode:
             ({"quantization": "gguf"}, None, "safetensors"),
             ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
             ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
-            (
-                {"per_layer_inputs": 256, "model": "mlx-community/not-local"},
-                None,
-                "hidden_size_per_layer_input=256",
-            ),
         ],
     )
     def test_fallback_reasons(
