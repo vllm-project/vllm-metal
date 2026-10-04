@@ -33,6 +33,7 @@ from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.distributed.pipeline import PipelineGroup
+from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 from vllm_metal.v1.sampling_batch import _SamplingResult
@@ -136,6 +137,45 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     runner.install_drafter(num_blocks=1, block_size=16)
 
     assert isinstance(runner._drafter, Gemma4MTPProposer)
+
+
+def test_draft_model_loads_before_cache_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = Mock(spec=DraftModelProposer)
+    build = Mock(return_value=proposer)
+    monkeypatch.setattr(
+        "vllm_metal.v1.draft_model_proposer.DraftModelProposer.build", build
+    )
+    spec = SimpleNamespace(
+        method="draft_model",
+        uses_draft_model=lambda: True,
+        draft_model_config=SimpleNamespace(max_model_len=128),
+    )
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=8),
+        _model_lifecycle=SimpleNamespace(
+            load=Mock(),
+            install_decode_dispatch=Mock(),
+        ),
+    )
+    runner.vllm_config.speculative_config = spec
+    runner.kv_cache_dtype = mx.float16
+
+    runner.load_model()
+
+    assert runner._drafter is proposer
+    build.assert_called_once()
+    proposer.bind_paged_cache.assert_not_called()
+
+    runner.install_drafter(num_blocks=9, block_size=32)
+
+    proposer.bind_paged_cache.assert_called_once_with(
+        num_blocks=9,
+        block_size=32,
+        dtype=mx.float16,
+    )
 
 
 class TestDrafterReleaseOnLifecycle:

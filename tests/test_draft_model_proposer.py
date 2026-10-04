@@ -24,7 +24,7 @@ from vllm.utils.math_utils import cdiv
 from tests.stub_draft_model import VOCAB_SIZE, StubDraftModel
 from vllm_metal.attention.context import OffsetCache, get_context
 from vllm_metal.v1 import draft_model_proposer
-from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+from vllm_metal.v1.draft_model_proposer import DraftDims, DraftModelProposer
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -32,6 +32,59 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 BLOCK_SIZE = 16
 SCHEDULER_GROUP_INDEX = 0
 PROMPT_LEN = 20
+
+
+class _CachelessDraftModel:
+    """Draft stub that accepts a cacheless warmup forward."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[int, ...], object]] = []
+
+    def __call__(self, input_ids: mx.array, cache=None) -> mx.array:
+        self.calls.append((tuple(int(d) for d in input_ids.shape), cache))
+        return mx.zeros((1, int(input_ids.shape[1]), VOCAB_SIZE), dtype=mx.float32)
+
+
+def test_bind_paged_cache_initializes_backend(monkeypatch):
+    model = _CachelessDraftModel()
+    backend = Mock()
+    backend.patch_model.return_value = 1
+    runtime_cls = Mock(return_value=backend)
+    monkeypatch.setattr(
+        draft_model_proposer,
+        "_load_draft_model",
+        lambda *_: (model, DraftDims(1, 2, 64)),
+    )
+    monkeypatch.setattr(draft_model_proposer, "SDPAPagedAttentionRuntime", runtime_cls)
+
+    proposer = DraftModelProposer.build(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(model="draft"),
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=None,
+        ),
+        parallel_config=None,
+        controller=SpeculativeDecodeController(),
+        model_adapter=SimpleNamespace(
+            supports_selective_logits=lambda _: False,
+            extract_logits=lambda value: value,
+        ),
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=BLOCK_SIZE,
+        allow_deferred_zero_k_ingest=False,
+    )
+    proposer.bind_paged_cache(num_blocks=7, block_size=32, dtype=mx.float16)
+
+    runtime_cls.assert_called_once_with(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        block_size=32,
+        dtype=mx.float16,
+    )
+    backend.initialize.assert_called_once_with(7)
+    backend.patch_model.assert_called_once_with(model)
 
 
 @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])

@@ -196,6 +196,10 @@ class DraftModelProposer(NoOwnKVProposer):
         # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
         # later via adopt_scheduler_group().
         self._scheduler_group_index: int | None = None
+        # Draft dimensions are resolved by ``build`` and used once cache
+        # capacity is known.
+        self._dims: DraftDims | None = None
+        self._draft_model_name: str | None = None
 
     # -- construction --------------------------------------------------------
 
@@ -207,39 +211,17 @@ class DraftModelProposer(NoOwnKVProposer):
         parallel_config: ParallelConfig,
         controller: SpeculativeDecodeController,
         model_adapter: ModelAdapter,
-        num_blocks: int,
         max_model_len: int,
         max_num_seqs: int,
         block_size: int,
-        dtype: mx.Dtype,
         allow_deferred_zero_k_ingest: bool,
     ) -> DraftModelProposer:
+        """Load draft weights without binding the paged cache."""
         model, dims = _load_draft_model(speculative_config, parallel_config)
         # The capability probe uses a cacheless forward and must run before
         # patch_model() installs attention wrappers that require a paged
         # context. Unsupported model heads retain the full-logits fallback.
         selective_logits_supported = model_adapter.supports_selective_logits(model)
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=dims.num_layers,
-            num_kv_heads=dims.num_kv_heads,
-            head_dim=dims.head_dim,
-            block_size=block_size,
-            dtype=dtype,
-        )
-        backend.initialize(num_blocks)
-        n_patched = backend.patch_model(model)
-        logger.info(
-            "Draft model loaded for speculative decoding: %s "
-            "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "num_blocks=%d, selective_logits=%s)",
-            speculative_config.draft_model_config.model,
-            dims.num_layers,
-            dims.num_kv_heads,
-            dims.head_dim,
-            n_patched,
-            num_blocks,
-            selective_logits_supported,
-        )
         min_speculative_tokens = speculative_config.num_speculative_tokens
         schedule = speculative_config.num_speculative_tokens_per_batch_size
         if schedule:
@@ -266,6 +248,17 @@ class DraftModelProposer(NoOwnKVProposer):
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
             allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
         )
+        proposer._dims = dims
+        proposer._draft_model_name = speculative_config.draft_model_config.model
+        logger.info(
+            "Draft model weights loaded for speculative decoding: %s "
+            "(layers=%d, kv_heads=%d, head_dim=%d, selective_logits=%s)",
+            proposer._draft_model_name,
+            dims.num_layers,
+            dims.num_kv_heads,
+            dims.head_dim,
+            selective_logits_supported,
+        )
         mismatch = proposer._ingest_window_mismatch()
         if mismatch is None:
             logger.info(
@@ -278,6 +271,42 @@ class DraftModelProposer(NoOwnKVProposer):
                 mismatch,
             )
         return proposer
+
+    def bind_paged_cache(
+        self,
+        *,
+        num_blocks: int,
+        block_size: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        """Allocate the draft KV pool and patch attention. Weights stay put."""
+        dims = self._dims
+        if dims is None:
+            raise RuntimeError(
+                "DraftModelProposer.bind_paged_cache() requires build() first"
+            )
+        self._block_size = block_size
+        backend = SDPAPagedAttentionRuntime(
+            num_layers=dims.num_layers,
+            num_kv_heads=dims.num_kv_heads,
+            head_dim=dims.head_dim,
+            block_size=block_size,
+            dtype=dtype,
+        )
+        backend.initialize(num_blocks)
+        n_patched = backend.patch_model(self._model)
+        logger.info(
+            "Draft model paged cache bound: %s "
+            "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
+            "num_blocks=%d, selective_logits=%s)",
+            self._draft_model_name,
+            dims.num_layers,
+            dims.num_kv_heads,
+            dims.head_dim,
+            n_patched,
+            num_blocks,
+            self._selective_logits_supported,
+        )
 
     def _ingest_window_mismatch(self) -> str | None:
         """Why committed-token ingest stays expanded, or ``None`` when it merges.
@@ -297,9 +326,8 @@ class DraftModelProposer(NoOwnKVProposer):
         """Adopt the scheduler cache group and final target context limit.
 
         Called from ``ModelCachePolicy._adopt_draft_scheduler_group`` once
-        ``kv_cache_config`` exists -- after this proposer is built, since the
-        physical backend above is sized before the scheduler has decided
-        groups.
+        ``kv_cache_config`` exists -- after ``bind_paged_cache``, since the
+        physical backend is sized before the scheduler has decided groups.
         """
         self._scheduler_group_index = group_index
         # The engine may auto-fit the target limit after memory profiling.
@@ -829,7 +857,7 @@ def resolve_draft_dims(
     Config-only and weight-free, so this can run early in the runner
     lifecycle (before ``determine_available_memory()``/``get_kv_cache_spec()``)
     to size a scheduler-visible KV-cache group for the draft model, well
-    before its MLX weights are actually loaded in ``_load_draft_model``.
+    before its MLX weights are actually loaded in ``DraftModelProposer.build``.
 
     Delegates to ``ModelConfig``'s own accessors rather than re-deriving GQA
     head-count and head-size fallbacks from raw ``hf_config`` fields --

@@ -240,13 +240,12 @@ def test_build_uses_reachable_scheduler_widths(
             supports_selective_logits=lambda model: False,
             extract_logits=lambda value: value,
         ),
-        num_blocks=3,
         max_model_len=4096,
         max_num_seqs=max_num_seqs,
         block_size=16,
-        dtype=mx.float32,
         allow_deferred_zero_k_ingest=False,
     )
+    proposer.bind_paged_cache(num_blocks=3, block_size=16, dtype=mx.float32)
     proposer.adopt_scheduler_group(0, 32)
     info.reset_mock()  # Ignore the separate model-load message.
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))

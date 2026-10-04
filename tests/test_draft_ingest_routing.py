@@ -208,7 +208,6 @@ def test_build_logs_the_ingest_layout(
         "_load_draft_model",
         lambda *_: (StubDraftModel(), dmp.DraftDims(1, 1, head_dim)),
     )
-    monkeypatch.setattr(dmp, "SDPAPagedAttentionRuntime", Mock())
     info = Mock()
     monkeypatch.setattr(dmp.logger, "info", info)
 
@@ -224,11 +223,9 @@ def test_build_logs_the_ingest_layout(
             supports_selective_logits=lambda model: False,
             extract_logits=lambda value: value,
         ),
-        num_blocks=3,
         max_model_len=4096,
         max_num_seqs=4,
         block_size=16,
-        dtype=mx.float32,
         allow_deferred_zero_k_ingest=False,
     )
 
