@@ -77,3 +77,4 @@ nav:
     - Distributed (Ray): distributed.md
   - Tools: tools.md
   - Contributing: CONTRIBUTING.md
+  - PyTorch MPS decisions: pytorch-mps.md

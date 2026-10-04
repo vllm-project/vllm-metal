@@ -7,6 +7,7 @@ import psutil
 import torch
 from vllm.utils.torch_utils import set_random_seed
 
+from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
 from vllm_metal.pytorch_backend.runner import MPSModelRunner
 from vllm_metal.v1.worker import MetalWorker, init_worker_distributed_environment
 
@@ -47,7 +48,7 @@ def configure_mps(config):
     hf = model.hf_text_config
     if (
         hf.model_type != "qwen3"
-        or hf.head_dim != 128
+        or model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
         or model.quantization is not None
         or model.runner_type != "generate"
         or model.dtype not in (torch.float16, torch.bfloat16)
@@ -62,8 +63,10 @@ def configure_mps(config):
             "Experimental MPS requires unquantized Qwen3, fp16/bf16, "
             "one GPU, and no LoRA/speculative decoding/KV transfer."
         )
-    if config.cache_config.block_size not in (None, 16):
-        raise ValueError("Experimental MPS requires --block-size 16")
+    if config.cache_config.block_size is None:
+        config.cache_config.block_size = 16
+    if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):
+        raise ValueError("MPS requires a cache block size divisible by 8")
     unsupported = [
         name
         for name in ("use_fp64_gumbel", "enable_trace_replay", "return_sampling_mask")
@@ -74,8 +77,8 @@ def configure_mps(config):
             f"Experimental MPS does not support {', '.join(unsupported)}"
         )
     _patch_mps_mrv2_validation()
-    config.cache_config.block_size = 16
-    config.scheduler_config.async_scheduling = False
+    if config.scheduler_config.async_scheduling is None:
+        config.scheduler_config.async_scheduling = False
     config.compilation_config.mode = CompilationMode.NONE
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     model.enforce_eager = True

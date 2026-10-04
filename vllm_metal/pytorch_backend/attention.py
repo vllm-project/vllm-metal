@@ -31,11 +31,15 @@ class MPSAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]
+        return [8, 16, 32]
 
     @staticmethod
     def get_supported_head_sizes():
-        return [128]
+        return [64, 96, 128, 256, 512]
+
+    @classmethod
+    def supports_sliding_window(cls):
+        return True
 
     @staticmethod
     def get_impl_cls():
@@ -77,20 +81,21 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
         **kwargs,
     ):
         if (
-            head_size != 128
+            head_size not in MPSAttentionBackend.get_supported_head_sizes()
             or alibi_slopes is not None
-            or sliding_window is not None
-            or logits_soft_cap is not None
             or attn_type != AttentionType.DECODER
             or kv_sharing_target_layer_name is not None
         ):
             raise NotImplementedError(
-                "Experimental MPS attention supports dense Qwen3 only"
+                "MPS requires causal attention with a supported head size, "
+                "without ALiBi or cross-layer KV sharing"
             )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads or num_heads
         self.scale = scale
+        self.sliding_window = sliding_window if sliding_window is not None else -1
+        self.logits_soft_cap = logits_soft_cap or 0.0
         self.kv_cache_dtype = kv_cache_dtype
         self.ops = get_mps_ops()
 
@@ -117,8 +122,8 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             query.contiguous(),
             key,
             value,
-            kv_cache[..., :128],
-            kv_cache[..., 128:],
+            kv_cache[..., : self.head_size],
+            kv_cache[..., self.head_size :],
             m.slot_mapping,
             m.block_tables,
             m.seq_lens,
@@ -126,5 +131,7 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             output,
             m.max_seq_len,
             self.scale,
+            self.sliding_window,
+            self.logits_soft_cap,
         )
         return output
