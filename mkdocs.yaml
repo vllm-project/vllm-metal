@@ -79,3 +79,4 @@ nav:
   - Tools: tools.md
   - Benchmarking on macOS: benchmarking-macos.md
   - Contributing: CONTRIBUTING.md
+  - PyTorch MPS decisions: pytorch-mps.md

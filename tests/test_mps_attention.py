@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch.nn import functional
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="Requires Apple Silicon MPS"
@@ -13,48 +12,91 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("force_tiled", [False, True])
-def test_mps_paged_attention(dtype, force_tiled):
+@pytest.mark.parametrize(
+    "head_size,block_size,window,softcap",
+    [
+        (64, 8, None, None),
+        (96, 16, 33, 2.0),
+        (128, 32, None, 0.0),
+        (256, 16, 33, None),
+        (512, 8, None, 2.0),
+    ],
+)
+@pytest.mark.parametrize(
+    "force_tiled,counts,starts",
+    [
+        (False, [39, 1], [17, 700]),
+        (True, [39, 1], [17, 700]),
+        (False, [1, 1], [17, 700]),
+        (False, [1, 1], [17, 40]),
+    ],
+)
+def test_mps_paged_attention(
+    dtype, head_size, block_size, window, softcap, force_tiled, counts, starts
+):
     from vllm_metal.pytorch_backend.attention import (
         MPSAttentionImpl,
         MPSAttentionMetadata,
     )
 
     torch.manual_seed(8)
-    # One batch exercises cached prefill and decode spanning two partitions.
-    counts, starts = [39, 1], [17, 700]
     total = sum(counts)
     # Deliberately strided K/V inputs like vLLM's packed QKV projection.
-    qkv = torch.randn(total, 32, 128, dtype=dtype) * 0.25
+    qkv = torch.randn(total, 32, head_size, dtype=dtype) * 0.25
     q, k, v = qkv.split([16, 8, 8], dim=1)
-    table = [list(range(1 + i * 50, 1 + (i + 1) * 50)) for i in range(len(counts))]
-    cache = torch.randn(1 + 50 * len(counts), 16, 8, 256, dtype=dtype) * 0.25
+    blocks_per_seq = (max(starts) + max(counts) + block_size - 1) // block_size
+    table = [
+        list(range(1 + i * blocks_per_seq, 1 + (i + 1) * blocks_per_seq))
+        for i in range(len(counts))
+    ]
+    cache = (
+        torch.randn(
+            1 + blocks_per_seq * len(counts), block_size, 8, 2 * head_size, dtype=dtype
+        )
+        * 0.25
+    )
     expected_cache = cache.clone()
     reference = []
     offset = 0
     for blocks, start, count in zip(table, starts, counts, strict=True):
         for j in range(count):
             p = start + j
-            expected_cache[blocks[p // 16], p % 16, :, :128] = k[offset + j]
-            expected_cache[blocks[p // 16], p % 16, :, 128:] = v[offset + j]
+            expected_cache[blocks[p // block_size], p % block_size, :, :head_size] = k[
+                offset + j
+            ]
+            expected_cache[blocks[p // block_size], p % block_size, :, head_size:] = v[
+                offset + j
+            ]
         history = expected_cache[blocks].flatten(0, 1)[: start + count]
         mask = (
             torch.arange(start + count)[None, :]
             <= torch.arange(start, start + count)[:, None]
         )
-        ref = functional.scaled_dot_product_attention(
-            q[offset : offset + count].transpose(0, 1).float(),
-            history[..., :128].repeat_interleave(2, dim=1).transpose(0, 1).float(),
-            history[..., 128:].repeat_interleave(2, dim=1).transpose(0, 1).float(),
-            attn_mask=mask,
+        if window is not None:
+            mask &= torch.arange(start + count)[None, :] >= (
+                torch.arange(start, start + count)[:, None] + 1 - window
+            )
+        q_ref = q[offset : offset + count].transpose(0, 1).float()
+        k_ref = (
+            history[..., :head_size].repeat_interleave(2, dim=1).transpose(0, 1).float()
         )
+        v_ref = (
+            history[..., head_size:].repeat_interleave(2, dim=1).transpose(0, 1).float()
+        )
+        scores = (q_ref @ k_ref.transpose(-1, -2)) * head_size**-0.5
+        if softcap:
+            scores = softcap * (scores / softcap).tanh()
+        ref = scores.masked_fill(~mask, -torch.inf).softmax(-1) @ v_ref
         reference.append(ref.transpose(0, 1))
         offset += count
     cu = [0]
     slots = []
     for blocks, start, count in zip(table, starts, counts, strict=True):
         cu.append(cu[-1] + count)
-        slots.extend(blocks[p // 16] * 16 + p % 16 for p in range(start, start + count))
+        slots.extend(
+            blocks[p // block_size] * block_size + p % block_size
+            for p in range(start, start + count)
+        )
     metadata = MPSAttentionMetadata(
         cu_seqlens=torch.tensor(cu, dtype=torch.int32, device="mps"),
         seq_lens=torch.tensor(
@@ -70,7 +112,14 @@ def test_mps_paged_attention(dtype, force_tiled):
     gpu_q, gpu_k, gpu_v = gpu_qkv.split([16, 8, 8], dim=1)
     gpu_cache = cache.to("mps")
     out = torch.empty_like(gpu_q, memory_format=torch.contiguous_format)
-    impl = MPSAttentionImpl(16, 128, 128**-0.5, num_kv_heads=8)
+    impl = MPSAttentionImpl(
+        16,
+        head_size,
+        head_size**-0.5,
+        num_kv_heads=8,
+        sliding_window=window,
+        logits_soft_cap=softcap,
+    )
     if force_tiled:
         metal = Path(__file__).resolve().parents[1] / "vllm_metal" / "metal"
         impl.ops = type(impl.ops)(
