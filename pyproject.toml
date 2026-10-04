@@ -66,6 +66,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mps = [
+    # Experimental host launcher for PyTorch's Metal command stream.
+    "ninja>=1.11",
+]
 gguf = [
     # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
     # unless a Metal-specific path needs a newer API.

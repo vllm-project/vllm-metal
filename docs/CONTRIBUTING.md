@@ -3,6 +3,8 @@
 To run a released build, use the [installation guide](installation.md).
 The setup below is for editing vllm-metal itself.
 
+For the experimental backend, follow the [PyTorch MPS decision contract](pytorch-mps.md).
+
 ## Development setup
 
 On an Apple Silicon Mac, install full

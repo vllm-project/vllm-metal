@@ -111,6 +111,7 @@ def _auto_or_nonnegative_int(name: str, *, unit: str) -> Callable[[], int | str]
 
 
 if TYPE_CHECKING:
+    VLLM_METAL_BACKEND: str = "mlx"
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MM_PREFIX_PATH: str | None = None
@@ -131,6 +132,8 @@ if TYPE_CHECKING:
     VLLM_METAL_RING_BASE_PORT: int = 32323
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in proof of concept: vLLM Qwen3 model running on PyTorch MPS.
+    "VLLM_METAL_BACKEND": lambda: os.getenv("VLLM_METAL_BACKEND", "mlx"),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),
     # Multimodal serving mode:
