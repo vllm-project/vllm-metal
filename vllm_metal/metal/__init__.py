@@ -46,14 +46,14 @@ def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
     artifacts that predate it still load, so a missing binding raises a
     rebuild error rather than a bare AttributeError.
     """
-    try:
-        values = ops.paged_attention_capabilities()
-    except AttributeError as exc:
+    query = getattr(ops, "paged_attention_capabilities", None)
+    if query is None:
         raise RuntimeError(
             "The loaded native extension does not export "
             "paged_attention_capabilities; rebuild the vllm-metal native "
             "extension."
-        ) from exc
+        )
+    values = query()
     return {
         key: bool(values.get(key, False))
         for key in ("gqa_decode", "gqa_disable", "decode_routing_metadata")

@@ -33,6 +33,15 @@ def test_missing_binding_directs_to_a_rebuild():
         paged_attention_capabilities(SimpleNamespace())
 
 
+def test_binding_errors_are_not_reported_as_missing():
+    query = MagicMock(side_effect=AttributeError("binding failed"))
+
+    with pytest.raises(AttributeError, match="binding failed"):
+        paged_attention_capabilities(
+            SimpleNamespace(paged_attention_capabilities=query)
+        )
+
+
 def test_missing_capabilities_fail_closed():
     ops = SimpleNamespace(paged_attention_capabilities=lambda: {})
     assert not any(paged_attention_capabilities(ops).values())
