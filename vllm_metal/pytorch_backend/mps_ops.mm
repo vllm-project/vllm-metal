@@ -7,7 +7,10 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <unordered_map>
 
+#include "../metal/paged_attention_kernels.h"
+
 using at::Tensor;
+namespace kernels = vllm_metal::kernels;
 
 class PagedAttention {
   id<MTLLibrary> library_;
@@ -124,17 +127,11 @@ class PagedAttention {
     const bool nax = prefill && nax_library_ != nil;
     const bool split = !prefill && heads * tokens < min_decode_grid_ && parts >= 2;
     const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
-    const std::string hs = "_hs" + std::to_string(head_size);
-    const std::string bs = "_bs" + std::to_string(block_size);
-    // Match the shared tiled shader's instantiations and MLX launch geometry.
-    const int tile = head_size <= 128 ? 32 : head_size == 256 ? 16 : 8;
-    const std::string tile_name = "_bq" + std::to_string(tile) +
-        "_tk" + std::to_string(tile) + "_nt" + std::to_string(tile * 4);
-    auto scatter = pipeline("reshape_and_cache_kv_" + dt + "_cache_" + dt);
-    auto name = nax ? "paged_attention_nax_" + dt + hs + bs :
-        prefill ? "paged_attention_tiled_" + dt + hs + bs + tile_name :
-        "paged_attention_" + dt + "_cache_" + dt + "_" + dt +
-            hs + bs + "_nt256_nsl32_ps" + (split ? "512" : "0");
+    const auto cfg = kernels::select_tile_config(head_size).value();
+    auto scatter = pipeline(kernels::reshape_and_cache_name(dt, dt));
+    auto name = nax ? kernels::nax_name(dt, head_size, block_size) :
+        prefill ? kernels::tiled_name(dt, head_size, block_size, cfg) :
+        kernels::paged_name(dt, dt, dt, head_size, block_size, split ? 512 : 0);
     auto attn = pipeline(name, split, window_q);
     id<MTLComputePipelineState> reduce = nil;
     Tensor tmp, sums, maxes;
@@ -142,7 +139,7 @@ class PagedAttention {
       tmp = at::empty({tokens, heads, parts, head_size}, q.options());
       sums = at::empty({tokens, heads, parts}, q.options().dtype(at::kFloat));
       maxes = at::empty_like(sums);
-      reduce = pipeline("paged_attention_v2_reduce_" + dt + hs + "_nt256_nsl32_ps512");
+      reduce = pipeline(kernels::paged_reduce_kernel_name(dt, head_size, 512));
     }
     auto stream = at::mps::getCurrentMPSStream();
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
@@ -173,9 +170,10 @@ class PagedAttention {
         scalar<int>(enc, 21, sliding_window);
         int grid_y = window ? seqs * window_q : tokens, threads = 256;
         if (prefill) {
-          grid_y = tokens / (nax ? 64 : tile) + seqs;
-          threads = nax ? 128 : tile * 4;
-          if (!nax) [enc setThreadgroupMemoryLength:3 * tile * (head_size + 8) * 2 atIndex:0];
+          grid_y = tokens / (nax ? kernels::kNaxBQ : cfg.BQ) + seqs;
+          threads = nax ? kernels::kNaxThreads : cfg.NUM_THREADS;
+          if (!nax) [enc setThreadgroupMemoryLength:
+              kernels::tiled_shared_bytes(cfg, head_size, q.element_size()) atIndex:0];
         } else {
           const int rows = window ? VLLM_METAL_PA_WINDOW_ROWS : 1;
           const int scores = 8 * rows * block_size * 4 +
@@ -189,7 +187,8 @@ class PagedAttention {
         if (split) {
           [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
           [enc setComputePipelineState:reduce];
-          [enc setThreadgroupMemoryLength:((2 * parts * 4 + 15) & ~15) atIndex:0];
+          [enc setThreadgroupMemoryLength:
+              kernels::paged_reduce_threadgroup_bytes(parts) atIndex:0];
           buffer(enc, 0, out); buffer(enc, 1, sums); buffer(enc, 2, maxes);
           buffer(enc, 3, tmp); buffer(enc, 4, lens); scalar<int>(enc, 5, parts);
           buffer(enc, 7, cu); scalar<int>(enc, 8, seqs);

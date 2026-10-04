@@ -26,11 +26,14 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "paged_attention_kernels.h"
+
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 
 namespace nb = nanobind;
+namespace kernels = vllm_metal::kernels;
 using namespace mlx::core;
 
 void register_mlx_patch(nb::module_& m);
@@ -223,18 +226,6 @@ static std::string gqa_decode_kernel_name(
       + "_bs" + std::to_string(block_size) + "_ps" + std::to_string(partition_size);
 }
 
-static std::string paged_reduce_kernel_name(
-    const std::string& dtype, int head_size, int partition_size) {
-  return "paged_attention_v2_reduce_" + dtype + "_hs" + std::to_string(head_size)
-      + "_nt256_nsl32_ps" + std::to_string(partition_size);
-}
-
-static size_t paged_reduce_threadgroup_bytes(int64_t num_partitions) {
-  // Two FP32 statistics per partition; Metal requires 16-byte alignment.
-  return (static_cast<size_t>(num_partitions) * 2 * sizeof(float) + 15) &
-      ~size_t(15);
-}
-
 static bool paged_reduce_memory_fits(
     size_t dynamic_bytes, size_t static_bytes, size_t capacity) {
   return dynamic_bytes <= capacity && static_bytes <= capacity - dynamic_bytes;
@@ -315,7 +306,7 @@ static int gqa_decode_partition_for_lengths(
   // Include a caller's larger allocation bound in the reducer resource check.
   const int64_t allocation_length = std::max(max_seq_len, plan.max_length);
   const int64_t partitions256 = (allocation_length + 255) / 256;
-  if (!paged_reduce_memory_fits(paged_reduce_threadgroup_bytes(partitions256),
+  if (!paged_reduce_memory_fits(kernels::paged_reduce_threadgroup_bytes(partitions256),
                                kGqaReduceStaticMemoryBytes,
                                kM3GqaReducerMemoryBytes)) return partition;
   return 256;
@@ -548,48 +539,6 @@ static void bind_paged_attn_buffers(
   enc.set_bytes(sliding_window_i, 21);
 }
 
-// Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
-// One TileConfig per supported HEAD_SIZE. NUM_THREADS = NUM_SG * 32.
-struct TileConfig {
-  int BQ;
-  int TILE_KV;
-  int NUM_THREADS;
-};
-
-// ─ How to add a new HEAD_SIZE ────────────────────────────────────────────
-// Budget: smem <= 32 KB (Apple Silicon per-threadgroup memory limit, M1-M4).
-// Formula:
-//   smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + 8) * 2 bytes
-//   where  BQ+2*TILE_KV = Q-rows + K-rows + V-rows
-//          HEAD_SIZE+8  = row stride (+8 = SMEM_PAD for bank-conflict
-//                                     avoidance; see pagedattention_tiled.metal)
-//          *2           = sizeof(bf16/half); fp8 KV would change this
-//
-// Constraints on (BQ, TILE_KV):
-//   BQ <= 2*TILE_KV       (O_smem fp32 reuses Q+K+V region at kernel exit)
-//   BQ / NUM_SG == 8      (each simdgroup owns 8 Q rows; 8x8 MMA fragment)
-//   HEAD_SIZE, TILE_KV multiples of 8
-// NUM_THREADS = NUM_SG * 32 (one Apple simdgroup = 32 lanes).
-//
-// HEAD_SIZE -> (BQ, TILE_KV, NUM_THREADS, NUM_SG, smem):
-//   64, 96, 128 -> (32, 32, 128, 4, 24-26 KB)
-//   256         -> (16, 16,  64, 2,   25.3 KB)
-//   512         -> ( 8,  8,  32, 1,   24.9 KB)  // no in-threadgroup SG parallelism
-// 80, 112 excluded by HD_TILES % NUM_SG(4) == 0.
-// ─────────────────────────────────────────────────────────────────────────
-static std::optional<TileConfig> select_tile_config(int head_size) {
-  switch (head_size) {
-    case 64: case 96: case 128:
-      return TileConfig{32, 32, 128};
-    case 256:
-      return TileConfig{16, 16, 64};
-    case 512:
-      return TileConfig{8, 8, 32};
-    default:
-      return std::nullopt;
-  }
-}
-
 // Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
 static void dispatch_paged_attention_nax(
     array& out, const array& query,
@@ -601,8 +550,8 @@ static void dispatch_paged_attention_nax(
     Stream s, const array* sinks) {
   auto& d = metal::device(s.device);
 
-  constexpr int kNaxBQ = 64;
-  constexpr int kNaxThreads = 128;
+  using kernels::kNaxBQ;
+  using kernels::kNaxThreads;
 
   int total_q_tokens = static_cast<int>(query.shape(0));
   int head_size  = static_cast<int>(query.shape(2));
@@ -611,9 +560,7 @@ static void dispatch_paged_attention_nax(
   bool use_sinks = sinks != nullptr;
 
   std::string base_kname =
-      "paged_attention_nax_" + dtype_to_metal(query.dtype()) +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size);
+      kernels::nax_name(dtype_to_metal(query.dtype()), head_size, block_size);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_nax_kern");
@@ -645,7 +592,7 @@ static void dispatch_paged_attention_tiled(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
-    TileConfig cfg, Stream s, const array* sinks,
+    kernels::TileConfig cfg, Stream s, const array* sinks,
     const array* mm_prefix_ranges) {
   auto& d = metal::device(s.device);
 
@@ -664,13 +611,7 @@ static void dispatch_paged_attention_tiled(
   bool use_mm_prefix = mm_prefix_ranges != nullptr;
 
   auto dt = dtype_to_metal(query.dtype());
-  std::string base_kname =
-      "paged_attention_tiled_" + dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_bq" + std::to_string(cfg.BQ) +
-      "_tk" + std::to_string(cfg.TILE_KV) +
-      "_nt" + std::to_string(cfg.NUM_THREADS);
+  std::string base_kname = kernels::tiled_name(dt, head_size, block_size, cfg);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_mp" + (use_mm_prefix ? "1" : "0");
 
@@ -684,15 +625,7 @@ static void dispatch_paged_attention_tiled(
        {&use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
 
   const int t_size = static_cast<int>(query.itemsize());
-  // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
-  // Output staging reuses Q_smem as fp32 O_smem at exit; fits because
-  // BQ*LD*4 <= (BQ+2*TILE_KV)*LD*2  <=>  BQ <= 2*TILE_KV.
-  // A1: leading dim padded by 16 B for bank-conflict avoidance —
-  // smem_pad/ld MUST match SMEM_PAD/LD in pagedattention_tiled.metal.
-  const int smem_pad = 16 / t_size;
-  const int ld       = head_size + smem_pad;
-  size_t shmem = static_cast<size_t>(
-      (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
+  size_t shmem = kernels::tiled_shared_bytes(cfg, head_size, t_size);
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -726,7 +659,7 @@ static void dispatch_paged_attention_tiled(
 static MTL::ComputePipelineState* paged_attention_v2_reduce_kernel(
     metal::Device& d, const std::string& dt, int head_size,
     int partition_size, bool use_sinks, bool use_tq_fc) {
-  const auto rname = paged_reduce_kernel_name(dt, head_size, partition_size);
+  const auto rname = kernels::paged_reduce_kernel_name(dt, head_size, partition_size);
   // The reduce kernel reads only use_sinks (40) and use_turboquant (50); the
   // other function constants are inert for it.  TurboQuant batches take this
   // path (use_tq_fc varies: the TQ reduce applies the deferred inverse FWHT),
@@ -757,7 +690,7 @@ static void dispatch_paged_attention_v2_reduce(
     rkernel = paged_attention_v2_reduce_kernel(
         d, dt, head_size, partition_size, use_sinks, use_tq_fc);
   }
-  const size_t reduce_shmem = paged_reduce_threadgroup_bytes(max_num_partitions);
+  const size_t reduce_shmem = kernels::paged_reduce_threadgroup_bytes(max_num_partitions);
   const size_t capacity = d.mtl_device()->maxThreadgroupMemoryLength();
   if (!paged_reduce_memory_fits(
           reduce_shmem, rkernel->staticThreadgroupMemoryLength(), capacity)) {
@@ -840,7 +773,7 @@ static void dispatch_paged_attention_v2_online(
       && dtype_ok && mm_prefix_ranges == nullptr
       && nax_eligible(query.dtype(), head_size, block_size);
   const auto tile_config = has_prefill && !window_batch && !use_turboquant
-      && dtype_ok ? select_tile_config(head_size) : std::nullopt;
+      && dtype_ok ? kernels::select_tile_config(head_size) : std::nullopt;
 
   // Split long ordinary decode rows from tiled prefill. Keep spec and NAX on
   // their established whole-batch routes.
@@ -1004,7 +937,7 @@ static void dispatch_paged_attention_v2_online(
       : nullptr;
   const bool gqa_decode = scratch_fits
       && paged_reduce_memory_fits(
-          paged_reduce_threadgroup_bytes(gqa_partitions),
+          kernels::paged_reduce_threadgroup_bytes(gqa_partitions),
           gqa_rkernel->staticThreadgroupMemoryLength(),
           d.mtl_device()->maxThreadgroupMemoryLength());
   if (gqa_decode) {
@@ -1056,11 +989,9 @@ static void dispatch_paged_attention_v2_online(
     return;
   }
 
-  std::string kname =
-      "paged_attention_" + dt + "_cache_" + k_cache_dt + "_" + v_cache_dt +
-      "_hs" + std::to_string(head_size) +
-      "_bs" + std::to_string(block_size) +
-      "_nt256_nsl32_ps" + std::to_string(partition ? kPartitionSize : 0);
+  std::string kname = kernels::paged_name(
+      dt, k_cache_dt, v_cache_dt, head_size, block_size,
+      partition ? kPartitionSize : 0);
 
   bool use_partitioning  = partition;
   bool use_alibi         = false;
@@ -1385,7 +1316,7 @@ static array paged_attention_primitive_fn(
     const int head_size_q = static_cast<int>(query.shape(2));
     if (query.dtype() == float32 || query.dtype() != key_cache.dtype()
         || window_seqlen_q > 1 || total_q <= num_segments
-        || !select_tile_config(head_size_q)) {
+        || !kernels::select_tile_config(head_size_q)) {
       throw std::invalid_argument(
           "mm_prefix ranges need the tiled prefill kernel: a non-float32 "
           "query matching the KV cache dtype, at least one multi-token "
@@ -1712,7 +1643,7 @@ class ReshapeAndCachePrimitive : public Primitive {
 
     auto kv_dt    = dtype_to_metal(key.dtype());
     auto cache_dt = dtype_to_metal(inputs[2].dtype());
-    std::string kname = "reshape_and_cache_kv_" + kv_dt + "_cache_" + cache_dt;
+    std::string kname = kernels::reshape_and_cache_name(kv_dt, cache_dt);
 
     // rac_use_fp8_scales (fc 100) = false: non-quantized cache, so the
     // k_scale/v_scale buffers (5,6) are absent from the signature.
@@ -2370,7 +2301,7 @@ NB_MODULE(_paged_ops, m) {
           for (const char* dtype : {"half", "bfloat16_t"}) {
             for (int part : kGqaPartitionSizes) {
               for (const auto& layout : kGqaDecodeGeometries) {
-                const auto reducer = paged_reduce_kernel_name(
+                const auto reducer = kernels::paged_reduce_kernel_name(
                     dtype, layout.head_size, part);
                 bool no = false;
                 if (d.get_kernel(reducer, lib, reducer + "_gqa_check",
@@ -2403,7 +2334,7 @@ NB_MODULE(_paged_ops, m) {
 
   m.def("tile_config",
         [](int head_size) -> nb::object {
-          auto cfg = select_tile_config(head_size);
+          auto cfg = kernels::select_tile_config(head_size);
           if (!cfg) return nb::none();
           return nb::make_tuple(cfg->BQ, cfg->TILE_KV);
         },
@@ -2616,7 +2547,7 @@ NB_MODULE(_paged_ops, m) {
           const int64_t num_partitions =
               (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
               partition_size;
-          if (paged_reduce_threadgroup_bytes(num_partitions) >
+          if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
               metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
             throw std::invalid_argument(
                 "GQA test partition exceeds the device threadgroup memory limit");

@@ -21,6 +21,7 @@ setup(
             "_paged_ops.mlx-version",
             "*.metallib",
             "*.cpp",
+            "*.h",
             "kernels_v2/*.metal",
         ],
     },

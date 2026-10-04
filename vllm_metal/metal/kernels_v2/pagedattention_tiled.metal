@@ -621,7 +621,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       uint lane [[thread_index_in_simdgroup]]);
 
 // Each entry must match a (head_size -> TileConfig) row in select_tile_config
-// in vllm_metal/metal/paged_ops.cpp.
+// in vllm_metal/metal/paged_attention_kernels.h.
 #define instantiate_paged_attention_tiled_heads(type, block_size)              \
   instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128); \
   instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128); \
