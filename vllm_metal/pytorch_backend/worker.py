@@ -45,10 +45,14 @@ def configure_mps(config):
             raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
     model = config.model_config
-    hf = model.hf_text_config
     if (
-        hf.model_type != "qwen3"
-        or model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
+        model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
+        or model.is_encoder_decoder
+        or model.is_diffusion
+        or model.is_multimodal_model
+        or model.is_moe
+        or model.has_inner_state
+        or model.use_mla
         or model.quantization is not None
         or model.runner_type != "generate"
         or model.dtype not in (torch.float16, torch.bfloat16)
@@ -60,7 +64,8 @@ def configure_mps(config):
         or config.additional_config.get("turboquant", False)
     ):
         raise NotImplementedError(
-            "Experimental MPS requires unquantized Qwen3, fp16/bf16, "
+            "Experimental MPS requires an unquantized dense autoregressive "
+            "text decoder with a supported attention head size, fp16/bf16, "
             "one GPU, and no LoRA/speculative decoding/KV transfer."
         )
     if config.cache_config.block_size is None:
