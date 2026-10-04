@@ -10,7 +10,11 @@ import pytest
 import tools.dflash_parity as dflash_parity
 import tools.dspark_paged_parity as dspark_paged_parity
 import tools.dspark_parity as dspark_parity
-from tools.attention_bench_utils import compare, native_source_hashes
+from tools.attention_bench_utils import (
+    compare,
+    native_source_hashes,
+    source_file_hashes,
+)
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
 
 
@@ -57,3 +61,13 @@ def test_reports_hash_the_module_that_admits_the_weights(sources) -> None:
     hashes = native_source_hashes(*sources)
 
     assert hashes[rules.name] == hashlib.sha256(rules.read_bytes()).hexdigest()
+
+
+def test_source_file_hashes_use_relative_paths(tmp_path: Path) -> None:
+    source = tmp_path / "nested" / "source.py"
+    source.parent.mkdir()
+    source.write_text("source")
+
+    assert source_file_hashes(tmp_path, [source]) == {
+        "nested/source.py": hashlib.sha256(b"source").hexdigest()
+    }

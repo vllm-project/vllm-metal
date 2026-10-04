@@ -61,7 +61,14 @@ def test_reference_device_tensors_compare_and_report_mismatches(device):
 
 
 @pytest.mark.parametrize("value", [None, "1"])
-@pytest.mark.parametrize("module", ["tools.dspark_parity", "tools.dspark_paged_parity"])
+@pytest.mark.parametrize(
+    "module",
+    [
+        "tools.dflash_serving_parity",
+        "tools.dspark_parity",
+        "tools.dspark_paged_parity",
+    ],
+)
 def test_import_does_not_override_caller_tf32_setting(monkeypatch, value, module):
     import importlib
     import os

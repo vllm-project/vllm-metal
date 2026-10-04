@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+from collections.abc import Iterable
 from pathlib import Path
 from types import FunctionType
 
@@ -44,6 +45,14 @@ def native_source_hashes(*functions: FunctionType) -> dict[str, str]:
         path = Path(function.__code__.co_filename)
         hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     return hashes
+
+
+def source_file_hashes(root: Path, files: Iterable[Path]) -> dict[str, str]:
+    """Hash source files using paths relative to the recorded source root."""
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in files
+    }
 
 
 def compare(

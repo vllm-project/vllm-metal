@@ -10,7 +10,6 @@ Each engine runs in a separate process to release Metal allocations.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -18,6 +17,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __name__ == "__main__":
+    os.environ["MLX_ENABLE_TF32"] = "0"
+
+from tools.attention_bench_utils import source_file_hashes
 from tools.check_parity import compare_results, mlx_generate
 from tools.parity_prompts import PROMPTS
 
@@ -182,7 +185,6 @@ def main():
         or not 1 <= args.max_tokens <= 512
     ):
         parser.error("batch sizes must be positive and max-tokens must be 1–512")
-    os.environ["MLX_ENABLE_TF32"] = "0"
     from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 
     try:
@@ -213,10 +215,7 @@ def main():
     (args.output_dir / "metadata.json").write_text(
         json.dumps(
             {
-                "source_sha256": {
-                    str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in sources
-                },
+                "source_sha256": source_file_hashes(root, sources),
                 "target": args.target,
                 "draft": args.draft,
                 "method": args.method,

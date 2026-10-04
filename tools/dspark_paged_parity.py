@@ -8,7 +8,6 @@ precision or generated-sequence/serving equivalence.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,7 +25,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 
-from tools.attention_bench_utils import native_source_hashes, package_versions
+from tools.attention_bench_utils import (
+    native_source_hashes,
+    package_versions,
+    source_file_hashes,
+)
 from tools.dspark_parity import capture_samples, check_tokens
 from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
@@ -188,11 +191,14 @@ def qualify(args):
         "atol": atol,
         "rtol": rtol,
         "native_source_sha256": native_source_hashes(*NATIVE_SOURCES, qualify),
-        "metal_source_sha256": {
-            str(p.relative_to(metal)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(metal.rglob("*"))
-            if p.suffix in (".metal", ".cpp", ".h")
-        },
+        "metal_source_sha256": source_file_hashes(
+            metal,
+            (
+                p
+                for p in sorted(metal.rglob("*"))
+                if p.suffix in (".metal", ".cpp", ".h")
+            ),
+        ),
         "versions": package_versions("mlx", "mlx-lm", "vllm"),
         "cases": rows,
     }
