@@ -143,7 +143,7 @@ def _pick_kernel_block_size(cache_block_size: int) -> int:
     )
 
 
-def _build_block_tables(
+def build_block_tables(
     raw_block_tables: list[list[int]],
     cache_block_size: int,
 ) -> tuple[mx.array, int]:
@@ -223,7 +223,7 @@ def _kernel_metadata(
     key = (group_index, cache_block_size)
     meta = ctx.kernel_metadata_cache.get(key)
     if meta is None:
-        block_tables, kernel_block_size = _build_block_tables(
+        block_tables, kernel_block_size = build_block_tables(
             raw_block_tables, cache_block_size
         )
         meta = _KernelMetadata(
@@ -700,7 +700,7 @@ def sdpa_forward(
     # _kernel_metadata).  Includes the hybrid block-size translation:
     # vLLM may inflate block_size (e.g. 544) to align attention pages with
     # mamba pages in hybrid models, while the Metal kernel only supports
-    # small block sizes (8, 16, 32); _build_block_tables expands each vLLM
+    # small block sizes (8, 16, 32); build_block_tables expands each vLLM
     # block into multiple kernel blocks and returns the kernel-compatible
     # block_size.
     meta = _kernel_metadata(

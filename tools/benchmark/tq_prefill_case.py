@@ -56,7 +56,7 @@ class AttentionCase:
             self.inner, self.x, self.ctx, self.inner.n_heads, self.inner.n_kv_heads
         )
         q = mx.contiguous(q[0].transpose(1, 0, 2).astype(c.dtype))
-        table, kb = sdpa._build_block_tables(self.ctx.block_tables, c.block_size)
+        table, kb = sdpa.build_block_tables(self.ctx.block_tables, c.block_size)
 
         def kernel_view(array):
             return array.reshape(-1, kb, c.num_kv_heads, array.shape[-1])
