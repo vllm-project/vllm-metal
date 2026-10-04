@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PyTorch implementations of MRV2's input/state kernels for MPS."""
+"""Temporary Torch replacements for vLLM 0.30 MRv2 input/state kernels on MPS.
+
+Upstream launches Triton kernels without a Torch fallback at these entry points.
+These implementations cover the supported non-speculative path. Replace the
+private bindings in install() as upstream kernel/component hooks become usable
+(vllm-project/vllm#43048 and #51212). Registration alone does not remove these
+implementations; prefer shared device-neutral fallbacks when they are available.
+"""
 
 import torch
 
