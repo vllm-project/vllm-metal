@@ -33,6 +33,7 @@ def test_native_reports_public_routing_capabilities():
         "gqa_decode": True,
         "gqa_disable": True,
         "decode_routing_metadata": True,
+        "gqa_batch_context_lens": True,
     }
 
 
@@ -104,6 +105,7 @@ def _run_primitive(
     turboquant: bool = False,
     native_reference: bool = False,
     test_partition: int | None = None,
+    gqa_context_lens: list[int] | None = None,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -144,6 +146,8 @@ def _run_primitive(
 
     key_ref, value_ref = key_cache, value_cache
     quant_kwargs = {}
+    if gqa_context_lens is not None:
+        quant_kwargs["gqa_context_lens"] = gqa_context_lens
     if turboquant:
         from vllm_metal.attention.caches.turboquant import (
             get_v_centroids,
@@ -160,15 +164,17 @@ def _run_primitive(
             output_dtype=dtype,
             key_quant_type="q8_0",
         )
-        quant_kwargs = {
-            "key_scale_cache": k_scale,
-            "value_scale_cache": v_scale,
-            "key_zero_cache": k_zero,
-            "v_centroids": get_v_centroids(3),
-            "use_turboquant": True,
-            "quant_type": "q8_0",
-            "v_bits": 3,
-        }
+        quant_kwargs.update(
+            {
+                "key_scale_cache": k_scale,
+                "value_scale_cache": v_scale,
+                "key_zero_cache": k_zero,
+                "v_centroids": get_v_centroids(3),
+                "use_turboquant": True,
+                "quant_type": "q8_0",
+                "v_bits": 3,
+            }
+        )
         mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
 
     out = mx.array(0)

@@ -993,7 +993,7 @@ def sdpa_forward(
     else:
         # Whole-batch decode routing belongs to the ordinary cache path. TQ
         # uses its own sub-batch metadata and stays outside native decode split.
-        paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
+        paged_kwargs: dict[str, int | mx.array | list[int]] = dict(mm_kwargs)
         if ctx.paged_native_capabilities is None:
             ctx.paged_native_capabilities = paged_attention_capabilities(ops)
         capabilities = ctx.paged_native_capabilities
@@ -1014,6 +1014,19 @@ def sdpa_forward(
                 num_decode_tokens=ctx.num_decode_tokens,
                 max_decode_context_len=ctx.max_decode_context_len,
             )
+        if (
+            capabilities["gqa_batch_context_lens"]
+            and not ctx.gqa_disabled
+            and ctx.num_decode_requests > 1
+            and ctx.num_decode_requests
+            == ctx.num_decode_tokens
+            == q_3d.shape[0]
+            == len(ctx.context_lens)
+            and ctx.verify_window_q == 1
+        ):
+            # The scheduler already has these lengths on the CPU. Native
+            # admission/planning stays authoritative, without a GPU readback.
+            paged_kwargs["gqa_context_lens"] = ctx.context_lens
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

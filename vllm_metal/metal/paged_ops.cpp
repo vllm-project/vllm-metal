@@ -16,12 +16,14 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
@@ -50,11 +52,14 @@ enum class PagedDispatch {
 };
 static std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
 static std::atomic<int> g_last_gqa_partition{0};
+static std::atomic<int> g_last_gqa_requests{0};
 static std::atomic<bool> g_dispatch_diagnostics_enabled{false};
-inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0) {
+inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
+                                  int gqa_requests = 0) {
   if (!g_dispatch_diagnostics_enabled.load(std::memory_order_relaxed)) return;
   g_last_dispatch.store(family, std::memory_order_relaxed);
   g_last_gqa_partition.store(gqa_partition, std::memory_order_relaxed);
+  g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
 }
 
 static bool set_paged_dispatch_diagnostics(bool enabled) {
@@ -64,6 +69,7 @@ static bool set_paged_dispatch_diagnostics(bool enabled) {
       g_dispatch_diagnostics_enabled.exchange(enabled, std::memory_order_relaxed);
   g_last_dispatch.store(PagedDispatch::None, std::memory_order_relaxed);
   g_last_gqa_partition.store(0, std::memory_order_relaxed);
+  g_last_gqa_requests.store(0, std::memory_order_relaxed);
   return previous;
 }
 // Split only after eight KV partitions amortize the extra dispatch.
@@ -193,6 +199,7 @@ static_assert(kPartitionSize == 512,
               "GQA partition list assumes the established 512-token split");
 constexpr std::array<int, 2> kGqaPartitionSizes = {512, 256};
 constexpr int64_t kGqaSimdGroupsPerCore = 33;
+constexpr int64_t kDecodeThreadgroupsPerCore = 8;
 
 static std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size) {
@@ -245,6 +252,36 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
                                    max_seq_len, gpu_cores, block_size) > 0;
 }
 
+// The scheduler already owns these lengths on the CPU. Do not read back the
+// GPU seq_lens array or add an evaluation boundary to plan each layer.
+static int gqa_decode_batch_partition_size(
+    int num_heads, const std::vector<int>& context_lens, int gpu_cores) {
+  if (num_heads <= 0 || gpu_cores <= 0 || context_lens.empty() ||
+      std::any_of(context_lens.begin(), context_lens.end(),
+                  [](int length) { return length <= 0; })) return 0;
+  if (context_lens.size() == 1)
+    return gqa_decode_partition_size(num_heads, context_lens[0], gpu_cores);
+
+  // Keep the established path once the unsplit batch already supplies the
+  // split-KV occupancy budget. More concurrency need not benefit from splitting.
+  const int64_t base_grid = static_cast<int64_t>(num_heads) * context_lens.size();
+  if (base_grid >= kDecodeThreadgroupsPerCore * gpu_cores) return 0;
+  for (int p : kGqaPartitionSizes) {
+    int64_t full_partitions = 0;
+    for (int length : context_lens) full_partitions += length / p;
+    if (full_partitions * num_heads >= kGqaSimdGroupsPerCore * gpu_cores) return p;
+  }
+  return 0;
+}
+
+static int gqa_decode_batch_plan_for_shape(
+    int num_heads, int num_kv_heads, int head_size,
+    const std::vector<int>& context_lens, int gpu_cores, int block_size) {
+  if (!gqa_decode_geometry_supported(
+          num_heads, num_kv_heads, head_size, block_size)) return 0;
+  return gqa_decode_batch_partition_size(num_heads, context_lens, gpu_cores);
+}
+
 // Engage the split while the base decode grid (num_q_heads * num_seqs) stays
 // below ~8 threadgroups per GPU core.  On a 14-core M1 Pro that is 112.  At 8K
 // context with the fixed 512-token (16-way) split, this regime measured:
@@ -256,7 +293,7 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
 // partitions are the sweet spot, so a fixed size + a wider gate is simpler and
 // just as fast.)
 static int min_decode_grid() {
-  static const int v = gpu_core_count() * 8;
+  static const int v = gpu_core_count() * kDecodeThreadgroupsPerCore;
   return v;
 }
 
@@ -688,7 +725,8 @@ static void dispatch_paged_attention_v2_online(
     int num_decode_tokens = 0,
     int max_decode_context_len = 0,
     int decode_only_rows = 0, bool gqa_disabled = false,
-    int gqa_test_partition = 0) {
+    int gqa_test_partition = 0,
+    const std::vector<int>& gqa_context_lens = {}) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -837,16 +875,20 @@ static void dispatch_paged_attention_v2_online(
     return a;
   };
 
-  // Only measured single-request shapes use the new pass. Keep policy below
-  // the Python boundary so direct primitive callers obey the same scope.
-  const bool gqa_single_request =
-      decode_only_rows == 0 && num_seqs == 1 &&
-      (num_decode_requests == -1 || num_decode_requests == 1);
+  // Ordinary decode has exactly one query row per request. Scheduler counts
+  // distinguish it from expanded verification and one-token prefill segments.
+  // Mixed decode prefixes remain on their established route.
+  const bool gqa_decode_rows =
+      decode_only_rows == 0 && total_q_tokens == num_seqs &&
+      ((num_seqs == 1 &&
+        (num_decode_requests == -1 || num_decode_requests == 1)) ||
+       (num_seqs > 1 && num_decode_requests == num_seqs &&
+        num_decode_tokens == num_seqs));
   // Enforce geometry at the actual dispatch boundary, including the private
   // forced-partition entry. That entry bypasses only occupancy selection.
   const bool gqa_supported =
       !gqa_disabled
-      && pure_decode && window_seqlen_q <= 1 && gqa_single_request
+      && pure_decode && window_seqlen_q <= 1 && gqa_decode_rows
       && (query.dtype() == float16 || query.dtype() == bfloat16)
       && query.dtype() == key_cache.dtype()
       && query.dtype() == value_cache.dtype()
@@ -856,7 +898,10 @@ static void dispatch_paged_attention_v2_online(
           num_heads, num_kv_heads, head_size, block_size);
   const int gqa_partition_size = !gqa_supported ? 0
       : gqa_test_partition > 0 ? gqa_test_partition
-      : gqa_decode_partition_size(num_heads, max_seq_len, detected_gpu_core_count());
+      : num_seqs == 1
+          ? gqa_decode_partition_size(num_heads, max_seq_len, detected_gpu_core_count())
+          : gqa_decode_batch_partition_size(
+                num_heads, gqa_context_lens, detected_gpu_core_count());
   const int64_t gqa_partitions = gqa_partition_size > 0
       ? (static_cast<int64_t>(max_seq_len) + gqa_partition_size - 1) /
             gqa_partition_size : 0;
@@ -866,7 +911,7 @@ static void dispatch_paged_attention_v2_online(
   if (gqa_decode) {
     const int gqa_num_partitions = static_cast<int>(gqa_partitions);
     const int gqa_group = num_heads / num_kv_heads;
-    record_paged_dispatch(PagedDispatch::GqaDecode, gqa_partition_size);
+    record_paged_dispatch(PagedDispatch::GqaDecode, gqa_partition_size, num_seqs);
     const auto gname = gqa_decode_kernel_name(
         dt, head_size, block_size, gqa_partition_size);
     // Instantiated in pagedattention.metal and shipped in the v2 metallib.
@@ -1060,7 +1105,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int window_seqlen_q = 1, bool use_sinks = false,
       bool use_mm_prefix = false, int num_decode_requests = -1,
       int num_decode_tokens = 0, int max_decode_context_len = 0,
-      bool gqa_disabled = false, int gqa_test_partition = 0)
+      bool gqa_disabled = false, int gqa_test_partition = 0,
+      const std::vector<int>& gqa_context_lens = {})
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1071,7 +1117,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         num_decode_requests_(num_decode_requests),
         num_decode_tokens_(num_decode_tokens),
         max_decode_context_len_(max_decode_context_len),
-        gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition) {}
+        gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition),
+        gqa_context_lens_(gqa_context_lens) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1104,7 +1151,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         stream(),
         ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp,
         num_decode_requests_, num_decode_tokens_, max_decode_context_len_,
-        0, gqa_disabled_, gqa_test_partition_);
+        0, gqa_disabled_, gqa_test_partition_, gqa_context_lens_);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -1126,7 +1173,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->num_decode_tokens_ == num_decode_tokens_
         && rhs->max_decode_context_len_ == max_decode_context_len_
         && rhs->gqa_disabled_ == gqa_disabled_
-        && rhs->gqa_test_partition_ == gqa_test_partition_;
+        && rhs->gqa_test_partition_ == gqa_test_partition_
+        && rhs->gqa_context_lens_ == gqa_context_lens_;
   }
 
  private:
@@ -1147,6 +1195,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int max_decode_context_len_;
   bool gqa_disabled_;
   int gqa_test_partition_;
+  std::vector<int> gqa_context_lens_;
 };
 
 static array paged_attention_primitive_fn(
@@ -1167,7 +1216,19 @@ static array paged_attention_primitive_fn(
     int num_decode_requests = -1,
     int num_decode_tokens = 0,
     int max_decode_context_len = 0, bool gqa_disabled = false,
-    int gqa_test_partition = 0) {
+    int gqa_test_partition = 0,
+    const std::vector<int>& gqa_context_lens = {}) {
+  if (!gqa_context_lens.empty() &&
+      (query.ndim() != 3 || seq_lens.ndim() != 1 || cu_seqlens_q.ndim() != 1 ||
+       gqa_context_lens.size() != static_cast<size_t>(query.shape(0)) ||
+       gqa_context_lens.size() != static_cast<size_t>(seq_lens.shape(0)) ||
+       gqa_context_lens.size() + 1 != static_cast<size_t>(cu_seqlens_q.shape(0)) ||
+       std::any_of(gqa_context_lens.begin(), gqa_context_lens.end(),
+           [=](int length) { return length <= 0 || length > max_seq_len; }))) {
+    throw std::invalid_argument(
+        "gqa_context_lens requires one positive length per decode row, "
+        "bounded by max_seq_len");
+  }
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -1295,7 +1356,7 @@ static array paged_attention_primitive_fn(
       block_size, max_seq_len, sliding_window,
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
-      max_decode_context_len, gqa_disabled, gqa_test_partition);
+      max_decode_context_len, gqa_disabled, gqa_test_partition, gqa_context_lens);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
@@ -2123,11 +2184,20 @@ NB_MODULE(_paged_ops, m) {
         "Default GQA partition for a supported decode geometry, or zero. "
         "Geometry and occupancy planning only; dtype, feature and resource "
         "eligibility are enforced separately by gqa_decode dispatch.");
+  m.def("gqa_decode_batch_partition_size", &gqa_decode_batch_plan_for_shape,
+        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("context_lens"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
+        "GQA partition from per-request KV lengths, or zero. Geometry and "
+        "occupancy planning only; dispatch separately checks features and resources.");
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
   }, "Partition selected by the most recent recorded paged eval, or zero "
      "when disabled, cleared or on a fallback. "
      "Process-wide diagnostic; not a request trace or routing input.");
+  m.def("last_gqa_num_requests", []() {
+    return g_last_gqa_requests.load(std::memory_order_relaxed);
+  }, "Number of requests in the most recent recorded GQA dispatch, or zero "
+     "when disabled, cleared or on a fallback. Not per-request telemetry.");
   m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
@@ -2188,6 +2258,7 @@ NB_MODULE(_paged_ops, m) {
     caps["gqa_decode"] = true;
     caps["gqa_disable"] = true;
     caps["decode_routing_metadata"] = true;
+    caps["gqa_batch_context_lens"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -2393,7 +2464,7 @@ NB_MODULE(_paged_ops, m) {
                         partition_size) == kGqaPartitionSizes.end()) {
             throw std::invalid_argument("GQA test partition must be 256/512");
           }
-          if (q.ndim() != 3 || q.shape(0) != 1 || k.ndim() != 4 ||
+          if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 ||
               k.shape() != v.shape() || k.strides() != v.strides() ||
               (q.dtype() != float16 && q.dtype() != bfloat16) ||
               k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
@@ -2401,12 +2472,12 @@ NB_MODULE(_paged_ops, m) {
               !gqa_decode_geometry_supported(q.shape(1), k.shape(2),
                                              q.shape(2), block_size) ||
               k.shape(1) % block_size != 0 ||
-              tables.ndim() != 2 || tables.shape(0) != 1 ||
+              tables.ndim() != 2 || tables.shape(0) != q.shape(0) ||
               tables.dtype() != int32 || lengths.ndim() != 1 ||
-              lengths.shape(0) != 1 || lengths.dtype() != int32 ||
+              lengths.shape(0) != q.shape(0) || lengths.dtype() != int32 ||
               max_seq_len <= 0 ||
               max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
-            throw std::invalid_argument("GQA test entry requires one supported decode row");
+            throw std::invalid_argument("GQA test entry requires supported one-token decode rows");
           }
           const int64_t num_partitions =
               (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
@@ -2416,18 +2487,19 @@ NB_MODULE(_paged_ops, m) {
             throw std::invalid_argument(
                 "GQA test partition exceeds the device threadgroup memory limit");
           }
-          auto cu = array({0, 1}, int32);
+          auto cu = arange(q.shape(0) + 1, int32);
           auto result = paged_attention_primitive_fn(
               q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
               block_size, max_seq_len, -1, false, "", nullptr, nullptr,
-              nullptr, nullptr, 3, 1, nullptr, nullptr, 1, 0, 0, false,
+              nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
+              max_seq_len, false,
               partition_size);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
         nb::arg("out"),
-        "Private test-only single-request GQA dispatch with an explicit partition. "
+        "Private test-only one-token-per-request GQA dispatch with an explicit partition. "
         "Page IDs and sequence lengths must describe valid cache contents. "
         "Does not change the default selector or require GPU core detection.");
 
@@ -2454,7 +2526,8 @@ NB_MODULE(_paged_ops, m) {
            nb::object mm_prefix_ranges_h,
            int num_decode_requests,
            int num_decode_tokens,
-           int max_decode_context_len, bool gqa_disabled) {
+           int max_decode_context_len, bool gqa_disabled,
+           const std::vector<int>& gqa_context_lens) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
           const array* mp = mm_prefix_ranges_h.is_none()
@@ -2478,7 +2551,8 @@ NB_MODULE(_paged_ops, m) {
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
               window_seqlen_q, sk, mp, num_decode_requests,
-              num_decode_tokens, max_decode_context_len, gqa_disabled);
+              num_decode_tokens, max_decode_context_len, gqa_disabled,
+              0, gqa_context_lens);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -2503,6 +2577,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("num_decode_tokens") = 0,
         nb::arg("max_decode_context_len") = 0,
         nb::arg("gqa_disabled") = false,
+        nb::arg("gqa_context_lens") = std::vector<int>{},
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
@@ -2518,7 +2593,10 @@ NB_MODULE(_paged_ops, m) {
         "rejected with TurboQuant, float32 queries, verification windows and "
         "pure-decode batches.  "
         "gqa_disabled mirrors VLLM_METAL_DISABLE_GQA_DECODE and keeps "
-        "eligible batches off the GQA-shared decode kernel.");
+        "eligible batches off the GQA-shared decode kernel. "
+        "gqa_context_lens is the CPU copy of seq_lens for a whole ordinary "
+        "decode batch, used for planning without a GPU readback; the caller "
+        "must keep both consistent. Omit it to retain legacy batch routing.");
 
   m.def(
       "last_paged_dispatch",

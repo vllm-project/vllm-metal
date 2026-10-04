@@ -395,7 +395,7 @@ def test_private_gqa_entry_rejects_mismatched_cache_dtype(
     else:
         value = value.astype(cache_dtype)
     # Rejection must happen before a lazy kernel can reinterpret either cache.
-    with pytest.raises(ValueError, match="requires one supported decode row"):
+    with pytest.raises(ValueError, match="requires supported one-token decode rows"):
         get_ops()._gqa_paged_attention_for_test(
             query,
             key,

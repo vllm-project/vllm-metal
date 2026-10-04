@@ -664,6 +664,7 @@ class _PagedRoutingOpsSpy:
             "gqa_decode": True,
             "gqa_disable": True,
             "decode_routing_metadata": True,
+            "gqa_batch_context_lens": True,
         }
 
     def reshape_and_cache(
@@ -704,6 +705,7 @@ class _PagedRoutingOpsSpy:
         num_decode_tokens: int = 0,
         max_decode_context_len: int = 0,
         gqa_disabled: bool = False,
+        gqa_context_lens: list[int] | None = None,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
@@ -713,6 +715,7 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
+        self.calls[-1].gqa_context_lens = gqa_context_lens
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -863,6 +866,56 @@ class TestSDPAForward:
         assert capability_query.call_count == 2
         assert spy.calls[-1].gqa_disabled is not disabled
         assert spy.calls[-1].num_decode_requests == 1
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("batch_capability", [False, True])
+    @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
+    def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
+        self, monkeypatch, disabled, batch_capability, kind
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        if kind == "decode":
+            decode, prefill = [([[0]], 1), ([[1]], 3)], []
+        elif kind == "mixed":
+            decode, prefill = [([[0]], 1)], [([[1]], 1, 0)]
+        else:
+            decode, prefill = [([[0]], 1, 2)], []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        assert ctx is not None
+        spy = _PagedRoutingOpsSpy()
+        query = MagicMock(
+            return_value={
+                "gqa_decode": True,
+                "gqa_disable": True,
+                "decode_routing_metadata": True,
+                "gqa_batch_context_lens": batch_capability,
+            }
+        )
+        monkeypatch.setattr(spy, "paged_attention_capabilities", query)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=2,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        x = mx.ones((1, 2, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, 2, _N_HEADS * _HEAD_DIM), mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        expected = (
+            [2, 4] if kind == "decode" and batch_capability and not disabled else None
+        )
+        assert spy.calls[-1].gqa_context_lens == expected
+        query.assert_called_once_with()
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
