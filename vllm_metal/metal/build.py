@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""JIT build script for the native paged-attention Metal extension.
+"""Build shared Metal shader artifacts and the MLX native extension.
 
 Compiles ``paged_ops.cpp``, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
 Metal shaders through MLX's own command encoder.
@@ -27,6 +27,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _KERNELS = _THIS_DIR / "paged_attention_kernels.h"
+_DEVICE = _THIS_DIR / "metal_device.h"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -186,6 +187,26 @@ def _compile_metallib(name: str, source: str) -> Path:
     return out
 
 
+def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
+    """Resolve one shader artifact without loading either framework's extension."""
+    if build_from_source:
+        return _compile_metallib(name, _metallib_source(name))
+    path = metallib_path(name)
+    if not path.exists():
+        raise RuntimeError(
+            f"Prebuilt Metal library missing: {path}. Install a vllm-metal release "
+            "wheel, or set VLLM_METAL_BUILD_FROM_SOURCE=1 to compile shaders."
+        )
+    if _stamp_path(path).exists() and is_stale(
+        path, _metallib_digest(name, _metallib_source(name))
+    ):
+        raise RuntimeError(
+            f"Prebuilt Metal library is stale: {path}. Set "
+            "VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild it."
+        )
+    return path
+
+
 def build_metallibs() -> list[Path]:
     """Precompile the required libraries and optional NAX library.
 
@@ -271,7 +292,7 @@ def _build_spec() -> _BuildSpec:
         "Metal",
         "-framework",
         "Foundation",
-        # IOKit + CoreFoundation: gpu_core_count() in paged_ops.cpp queries the
+        # IOKit + CoreFoundation: shared GPU detection in metal_device.h queries the
         # IORegistry. Explicit -framework is load-bearing — "-undefined
         # dynamic_lookup" below resolves only against already-loaded images,
         # and nothing else loads IOKit.
@@ -324,7 +345,7 @@ def _input_hash(spec: _BuildSpec) -> str:
     # so editing a flag still busts the hash.
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
-    for p in (_SRC, _MLX_PATCH, _KERNELS, _BUILD, _CONSTANTS, spec.nb_src):
+    for p in (_SRC, _MLX_PATCH, _KERNELS, _DEVICE, _BUILD, _CONSTANTS, spec.nb_src):
         h.update(p.name.encode())
         h.update(b"\0")
         h.update(p.read_bytes())

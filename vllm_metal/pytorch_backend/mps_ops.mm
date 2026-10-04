@@ -7,10 +7,18 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <unordered_map>
 
+#include "../metal/metal_device.h"
 #include "../metal/paged_attention_kernels.h"
 
 using at::Tensor;
 namespace kernels = vllm_metal::kernels;
+namespace hardware = vllm_metal::hardware;
+
+static bool nax_supported() {
+  auto device = at::mps::getCurrentMPSStream()->device();
+  return hardware::nax_supported(
+      [device supportsFamily:static_cast<MTLGPUFamily>(hardware::kApple10)]);
+}
 
 class PagedAttention {
   id<MTLLibrary> library_;
@@ -69,8 +77,9 @@ class PagedAttention {
       if (!nax_path.empty()) {
         nax_library_ = [device newLibraryWithURL:[NSURL fileURLWithPath:
             [NSString stringWithUTF8String:nax_path.c_str()]] error:&error];
-        TORCH_CHECK(nax_library_, "Cannot load NAX metallib: ",
-                    error.localizedDescription.UTF8String);
+        if (!nax_library_)
+          TORCH_WARN("Cannot load NAX metallib; using the non-NAX fallback: ",
+                     error.localizedDescription.UTF8String);
       }
     }
   }
@@ -201,6 +210,10 @@ class PagedAttention {
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("detected_gpu_core_count", &hardware::detected_gpu_core_count);
+  m.def("_override_detected_gpu_core_count_for_test",
+        &hardware::override_detected_gpu_core_count_for_test);
+  m.def("nax_supported", &nax_supported);
   pybind11::class_<PagedAttention>(m, "PagedAttention")
       .def(pybind11::init<const std::string&, const std::string&, int>())
       .def("forward", &PagedAttention::forward);

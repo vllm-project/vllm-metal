@@ -14,6 +14,42 @@ import torch
 os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _kernel_test_gpu_core_count():
+    """Use an explicit topology for kernel/routing tests, including hosted VMs.
+
+    Load lazily so CPU-only tests do not need the native extension. Real-engine
+    subprocesses do not inherit this injection and still use hardware detection.
+    """
+    import vllm_metal.metal as metal
+    from vllm_metal.pytorch_backend import mps_ops
+
+    initialized = []
+
+    def with_test_topology(load):
+        def wrapped():
+            mod = load()
+            if mod not in initialized:
+                mod._override_detected_gpu_core_count_for_test(20)
+                initialized.append(mod)
+            return mod
+
+        return wrapped
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            metal, "_load_native_module", with_test_topology(metal._load_native_module)
+        )
+        patch.setattr(
+            mps_ops, "_load_mps_module", with_test_topology(mps_ops._load_mps_module)
+        )
+        try:
+            yield
+        finally:
+            for mod in initialized:
+                mod._override_detected_gpu_core_count_for_test(-1)
+
+
 @pytest.fixture
 def run_in_spawn_process(request):
     """Isolate a real engine: MLX is not fork-safe, and engines retain state.

@@ -1,23 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental PyTorch-stream launcher; no new attention shaders."""
 
-import re
-import subprocess
+import logging
 from functools import cache
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 
 @cache
-def get_mps_ops():
+def _load_mps_module():
     from torch.utils.cpp_extension import load
 
-    from vllm_metal.metal import get_ops
     from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE, PA_WINDOW_ROWS
 
-    # Reuse the existing artifact validation/build policy and hardware gate.
-    metal_ops = get_ops()
     root = Path(__file__).resolve().parent
-    module = load(
+    return load(
         name="vllm_metal_mps_ops",
         sources=[str(root / "mps_ops.mm")],
         extra_cflags=[
@@ -25,17 +23,37 @@ def get_mps_ops():
             f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
             f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
         ],
-        extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
+        extra_ldflags=[
+            "-framework",
+            "Metal",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "IOKit",
+            "-framework",
+            "CoreFoundation",
+        ],
     )
-    registry = subprocess.check_output(
-        ["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"], text=True
+
+
+@cache
+def get_mps_ops():
+    from vllm_metal import envs
+    from vllm_metal.metal.build import NAX_METALLIB_NAME, prepare_metallib
+
+    module = _load_mps_module()
+    # The shared detector is compiled into each launcher; MPS never loads MLX.
+    gpu_cores = module.detected_gpu_core_count()
+    build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
+    path = prepare_metallib(
+        "paged_attention_v2_kern", build_from_source=build_from_source
     )
-    cores = re.search(r'"gpu-core-count"\s*=\s*(\d+)', registry)
-    metal_dir = root.parent / "metal"
-    return module.PagedAttention(
-        str(metal_dir / "paged_attention_v2_kern.metallib"),
-        str(metal_dir / "paged_attention_nax_kern.metallib")
-        if metal_ops.nax_ready()
-        else "",
-        int(cores[1]) if cores else 14,
-    )
+    nax_path = ""
+    if not envs.VLLM_METAL_DISABLE_NAX and module.nax_supported():
+        try:
+            nax_path = str(
+                prepare_metallib(NAX_METALLIB_NAME, build_from_source=build_from_source)
+            )
+        except (OSError, RuntimeError) as exc:
+            logger.warning("NAX unavailable; using the non-NAX fallback: %s", exc)
+    return module.PagedAttention(str(path), nax_path, gpu_cores)

@@ -18,14 +18,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <IOKit/IOKitLib.h>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "metal_device.h"
 #include "paged_attention_kernels.h"
 
 #include "mlx/mlx.h"
@@ -34,6 +32,7 @@
 
 namespace nb = nanobind;
 namespace kernels = vllm_metal::kernels;
+namespace hardware = vllm_metal::hardware;
 using namespace mlx::core;
 
 void register_mlx_patch(nb::module_& m);
@@ -112,63 +111,8 @@ constexpr int kWindowMaxHeadSize = VLLM_METAL_PA_WINDOW_MAX_HEAD;
 // when the base grid underfills the GPU, so saturated high-concurrency serving
 // is untouched.
 
-// GPU core count via IORegistry.  Metal/MLX expose no core-count API, but the
-// split-KV gate needs to scale per machine — a small laptop GPU and a large
-// desktop one saturate at very different grid sizes. Read once; zero means
-// unknown so the new GQA performance gate can fail closed.
-// Tests may inject a non-negative count through
-// `_override_detected_gpu_core_count_for_test` so CI hosts without
-// IORegistry still exercise default routing. Production must not call it.
-static std::atomic<int> g_test_gpu_core_count{-1};
-
-static int hardware_gpu_core_count() {
-  static const int v = []() {
-    int cores = 0;
-    io_iterator_t it;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                                     IOServiceMatching("AGXAccelerator"),
-                                     &it) == KERN_SUCCESS) {
-      io_object_t obj;
-      while ((obj = IOIteratorNext(it))) {
-        CFTypeRef p = IORegistryEntrySearchCFProperty(
-            obj, kIOServicePlane, CFSTR("gpu-core-count"),
-            kCFAllocatorDefault, kIORegistryIterateRecursively);
-        if (p) {
-          if (CFGetTypeID(p) == CFNumberGetTypeID())
-            CFNumberGetValue((CFNumberRef)p, kCFNumberIntType, &cores);
-          CFRelease(p);
-        }
-        IOObjectRelease(obj);
-        if (cores > 0) break;
-      }
-      IOObjectRelease(it);
-    }
-    return cores;
-  }();
-  return v;
-}
-
-static int detected_gpu_core_count() {
-  const int override =
-      g_test_gpu_core_count.load(std::memory_order_relaxed);
-  if (override >= 0)
-    return override;
-  return hardware_gpu_core_count();
-}
-
-static void override_detected_gpu_core_count_for_test(int cores) {
-  if (cores < -1)
-    throw std::invalid_argument(
-        "test GPU core override must be >= -1 (got " +
-        std::to_string(cores) + ")");
-  g_test_gpu_core_count.store(cores, std::memory_order_relaxed);
-}
-
-// Preserve the established split-KV fallback when detection is unavailable.
-static int gpu_core_count() {
-  const int cores = detected_gpu_core_count();
-  return cores > 0 ? cores : 14;
-}
+using hardware::detected_gpu_core_count;
+using hardware::override_detected_gpu_core_count_for_test;
 
 // One measured dispatch table, also exposed read-only to numerical/routing
 // tests. Include the kernel page view so geometry and page admission cannot
@@ -360,8 +304,7 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
 // partitions are the sweet spot, so a fixed size + a wider gate is simpler and
 // just as fast.)
 static int min_decode_grid() {
-  static const int v = gpu_core_count() * 8;
-  return v;
+  return detected_gpu_core_count() * 8;
 }
 
 void init_v2_library(const std::string& v2_src) {
@@ -390,21 +333,10 @@ static std::string nax_source_;
 static bool nax_lib_ready_ = false;   // a NAX library was registered
 static bool nax_enabled_ = true;      // test / A-B switch
 
-// Match MLX's hardware gate, but ignore MLX_METAL_NO_NAX because this library
-// is compiled separately. The 'p' family requires generation 18 rather than 17.
 static bool nax_hardware_supported() {
-  static const bool v = []() {
-    bool ok = false;
-    if (__builtin_available(macOS 26.2, *)) {
-      ok = true;
-    }
-    auto& d = metal::device(Device::gpu);
-    const auto& arch = d.get_architecture();
-    if (arch.empty()) return false;
-    ok &= d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
-    return ok;
-  }();
-  return v;
+  auto* device = metal::device(Device::gpu).mtl_device();
+  return hardware::nax_supported(
+      device->supportsFamily(static_cast<MTL::GPUFamily>(hardware::kApple10)));
 }
 
 void init_nax_library(const std::string& nax_src) {
@@ -2211,11 +2143,11 @@ NB_MODULE(_paged_ops, m) {
   register_mlx_patch(m);
   m.attr("PARTITION_SIZE") = nb::int_(kPartitionSize);
   m.def("detected_gpu_core_count", &detected_gpu_core_count,
-        "Detected GPU core count, or zero when detection is unavailable.");
+        "Positive GPU core count; raises if detection is unavailable or invalid.");
   m.def("_override_detected_gpu_core_count_for_test",
         &override_detected_gpu_core_count_for_test, nb::arg("cores"),
-        "Test-only. A non-negative count replaces IORegistry detection; "
-        "-1 restores hardware detection. Production routing must not call this.");
+        "Test-only. A positive count replaces hardware detection; zero simulates "
+        "failure and -1 restores detection. Production must not call this.");
   m.def("_set_paged_dispatch_diagnostics", &set_paged_dispatch_diagnostics,
         nb::arg("enabled"),
         "Private process-wide diagnostic opt-in; disabled by default. "

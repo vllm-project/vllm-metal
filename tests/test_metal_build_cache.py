@@ -18,6 +18,7 @@ class _Paths:
     src: Path
     patch: Path
     kernels: Path
+    device: Path
     bld: Path
     consts: Path
     nb_src: Path
@@ -32,6 +33,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     src = tmp_path / "paged_ops.cpp"
     patch = tmp_path / "mlx_patch.cpp"
     kernels = tmp_path / "paged_attention_kernels.h"
+    device = tmp_path / "metal_device.h"
     bld = tmp_path / "build.py"
     consts = tmp_path / "constants.py"
     nb_src = tmp_path / "nb_combined.cpp"
@@ -42,6 +44,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     src.write_bytes(b"// source v1")
     patch.write_bytes(b"// patch v1")
     kernels.write_bytes(b"// kernel descriptions v1")
+    device.write_bytes(b"// hardware detection v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
@@ -50,6 +53,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     monkeypatch.setattr(build, "_SRC", src)
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
     monkeypatch.setattr(build, "_KERNELS", kernels)
+    monkeypatch.setattr(build, "_DEVICE", device)
     monkeypatch.setattr(build, "_BUILD", bld)
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
@@ -67,7 +71,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, patch, kernels, bld, consts, nb_src, out, hsh, ver, spec)
+    return _Paths(src, patch, kernels, device, bld, consts, nb_src, out, hsh, ver, spec)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -110,7 +114,7 @@ def test_old_content_with_newer_so_mtime_still_rebuilds(patched):
     assert build.needs_rebuild() is True
 
 
-@pytest.mark.parametrize("source_name", ["src", "patch", "kernels"])
+@pytest.mark.parametrize("source_name", ["src", "patch", "kernels", "device"])
 def test_hash_changes_with_source_bytes(patched, source_name):
     h1 = build._input_hash(patched.spec)
     getattr(patched, source_name).write_bytes(b"// source v2")
@@ -283,6 +287,20 @@ def test_stale_artifacts_empty_when_all_fresh(stale_env):
     assert build.stale_artifacts() == []
 
 
+def test_prepare_metallib_is_independent_of_mlx(stale_env, monkeypatch):
+    _seed_fresh()
+    monkeypatch.setattr(build, "_build_spec", _raise(AssertionError("touched MLX")))
+    name = build.METALLIB_NAMES[0]
+    lib = build.metallib_path(name)
+    assert build.prepare_metallib(name) == lib
+    build._stamp_path(lib).write_text("STALE")
+    with pytest.raises(RuntimeError, match="stale"):
+        build.prepare_metallib(name)
+    lib.unlink()
+    with pytest.raises(RuntimeError, match="missing"):
+        build.prepare_metallib(name)
+
+
 def test_stale_artifacts_empty_without_stamps_skips_build_deps(stale_env, monkeypatch):
     # Wheel install: artifacts present, no stamps. Must short-circuit to [] BEFORE
     # importing build deps -> _input_hash (which would raise here) is never hit.
@@ -381,6 +399,7 @@ def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkey
     so.write_bytes(b"")
     monkeypatch.delenv("VLLM_METAL_BUILD_FROM_SOURCE", raising=False)
     monkeypatch.setattr(metal, "_ops_module", None)
+    monkeypatch.setattr(metal, "_native_module", None)
     monkeypatch.setattr(build, "output_path", lambda: so)
     monkeypatch.setattr(build, "stale_artifacts", lambda: [])
     monkeypatch.setattr(build, "mlx_version_mismatch", lambda: ("0.32.1", "0.32.3"))

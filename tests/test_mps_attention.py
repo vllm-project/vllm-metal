@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MPS-stream dispatch parity, including KV layout, split decode and verification."""
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,28 @@ import torch
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="Requires Apple Silicon MPS"
 )
+
+
+def test_mps_shader_loading_without_mlx():
+    # A fresh process ensures the MLX extension is not already resident. Inject
+    # topology only for this test; hosted VMs may omit the IORegistry property.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+sys.modules["mlx"] = None
+sys.modules["_paged_ops"] = None
+from vllm_metal.pytorch_backend.mps_ops import _load_mps_module, get_mps_ops
+_load_mps_module()._override_detected_gpu_core_count_for_test(20)
+get_mps_ops()
+assert sys.modules["mlx"] is None
+assert sys.modules["_paged_ops"] is None
+""",
+        ],
+        check=True,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
