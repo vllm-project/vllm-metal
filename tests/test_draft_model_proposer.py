@@ -87,6 +87,43 @@ def test_bind_paged_cache_initializes_backend(monkeypatch):
     backend.patch_model.assert_called_once_with(model)
 
 
+def test_profile_warmup_clips_to_draft_context_limit() -> None:
+    model = _CachelessDraftModel()
+    proposer = DraftModelProposer(
+        model=model,
+        block_size=BLOCK_SIZE,
+        max_model_len=2,
+        num_layers=1,
+        controller=SpeculativeDecodeController(),
+        extract_logits=lambda output: output,
+    )
+
+    proposer.profile_warmup(SimpleNamespace(), mx.zeros((1, 8), dtype=mx.int32))
+
+    assert model.calls == [((1, 2), None)]
+
+
+def test_profile_warmup_selects_max_sequence_rows():
+    model = _CachelessDraftModel()
+    adapter = _SelectiveLogitsAdapter()
+    proposer = DraftModelProposer(
+        model=model,
+        block_size=BLOCK_SIZE,
+        max_model_len=4096,
+        num_layers=1,
+        controller=SpeculativeDecodeController(),
+        extract_logits=lambda output: output,
+        model_adapter=adapter,
+        selective_logits_supported=True,
+    )
+    runner = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3))
+
+    proposer.profile_warmup(runner, mx.zeros((1, 32), dtype=mx.int32))
+
+    assert model.calls == [((1, 32), None)]
+    assert adapter.logits_indices == [[29, 30, 31]]
+
+
 @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
 def test_draft_load_preserves_revision(monkeypatch, revision):
     dims, model = object(), object()

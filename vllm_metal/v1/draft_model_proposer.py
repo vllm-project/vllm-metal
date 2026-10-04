@@ -85,7 +85,11 @@ if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
     from vllm_metal.v1.model_adapter import ModelAdapter
-    from vllm_metal.v1.model_runner import PrefillRequest, RequestState
+    from vllm_metal.v1.model_runner import (
+        MetalModelRunner,
+        PrefillRequest,
+        RequestState,
+    )
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
@@ -354,6 +358,40 @@ class DraftModelProposer(NoOwnKVProposer):
         # A standalone draft model consumes only token ids; it never reads the
         # target's hidden states (mirrors upstream pass_hidden_states_to_model=False).
         return False
+
+    def profile_warmup(self, runner: MetalModelRunner, tokens: mx.array) -> None:
+        """Include a cacheless draft forward in the measured peak.
+
+        Must run before ``bind_paged_cache``: patched attention wrappers
+        require a paged context that does not exist at profile time.
+        """
+        warmup = tokens
+        if tokens.shape[1] > self._max_model_len:
+            warmup = tokens[:, : self._max_model_len]
+        num_tokens = int(warmup.shape[1])
+        indices = None
+        if (
+            self._selective_logits_supported
+            and num_tokens >= _SELECTIVE_LOGITS_MIN_ROWS
+        ):
+            num_logits = min(num_tokens, runner.scheduler_config.max_num_seqs)
+            if num_logits < num_tokens:
+                indices = mx.arange(
+                    num_tokens - num_logits,
+                    num_tokens,
+                    dtype=mx.int32,
+                )
+        if indices is not None:
+            assert self._model_adapter is not None
+            logits = self._model_adapter.target_forward(
+                self._model,
+                warmup,
+                cache=None,
+                logits_indices=indices,
+            ).logits
+        else:
+            logits = self._extract_logits(self._model(warmup, cache=None))
+        mx.eval(logits)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens

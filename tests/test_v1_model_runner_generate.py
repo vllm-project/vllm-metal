@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import mlx.core as mx
 import numpy as np
@@ -2866,18 +2867,39 @@ class TestDummyForwardOutputsPPRouting:
 class TestProfileRunDrafterWarmup:
     """``profile_run`` must warm the drafter's buffers in the measured peak."""
 
-    def test_profile_run_calls_drafter_profile_warmup(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("captures_target", "expected_retained"),
+        [(False, True), (True, False)],
+    )
+    def test_profile_run_uses_drafter_target_output_lifetime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        captures_target: bool,
+        expected_retained: bool,
     ) -> None:
+        class _Output:
+            pass
+
+        output_refs = []
+
+        def target_outputs(_tokens):
+            output = _Output()
+            output_refs.append(ref(output))
+            return [output]
+
+        warmups = []
+
+        def profile_warmup(warmed_runner, tokens) -> None:
+            warmups.append((warmed_runner, tokens, output_refs[0]() is not None))
+
         runner = make_stub_runner(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
         )
-        runner._dummy_forward_outputs = Mock(return_value=[])
-        warmups: list[tuple[object, mx.array]] = []
-        runner._drafter = SimpleNamespace(
-            profile_warmup=lambda r, tokens: warmups.append((r, tokens))
-        )
+        runner._dummy_forward_outputs = target_outputs
+        runner._drafter = SimpleNamespace(profile_warmup=profile_warmup)
+        runner._aux_capture = object() if captures_target else None
         cache_readings = iter([100, 180])
+        monkeypatch.setattr(mr.mx, "eval", lambda *_: None)
         monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
         monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
         monkeypatch.setattr(mr.mx, "set_cache_limit", lambda _n: None)
@@ -2885,11 +2907,12 @@ class TestProfileRunDrafterWarmup:
         runner.profile_run()
 
         assert len(warmups) == 1
-        warmed_runner, tokens = warmups[0]
+        warmed_runner, tokens, target_retained = warmups[0]
         assert warmed_runner is runner
-        # The drafter profiles the same max-batched-tokens warmup shape.
         assert tokens.shape == (1, 4)
         assert tokens.dtype == mx.int32
+        assert target_retained is expected_retained
+        assert output_refs[0]() is None
 
     def test_skips_encoder_profiling_when_multimodal_cannot_run(self) -> None:
         # No mm inputs and no explicit-positions requirement: an mm step can

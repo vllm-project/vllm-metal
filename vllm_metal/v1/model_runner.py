@@ -921,9 +921,16 @@ class MetalModelRunner:
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
-        mx.eval(*self._dummy_forward_outputs(dummy_tokens))
+        target_outputs = self._dummy_forward_outputs(dummy_tokens)
+        mx.eval(*target_outputs)
+        retain_target_outputs = self._aux_capture is None
+        if not retain_target_outputs:
+            # DFlash profiles its captured target forward below.
+            del target_outputs
         if self._drafter is not None:
             self._drafter.profile_warmup(self, dummy_tokens)
+        if retain_target_outputs:
+            del target_outputs
         # The vision encoder runs outside the text forward; profile it too so
         # the buffer-cache cap covers one encoder pass (the runner encodes
         # features one adapter call per step, so one maximal feature is the
