@@ -124,6 +124,12 @@ def gather_block_tables(self, mapping, num_reqs_padded, out=None, out_ptrs=None)
     return tuple(t[:padded] for t in out)
 
 
+def apply_block_table_writes(self):
+    for table in self.block_tables:
+        table.apply_write()
+    self.num_blocks.copy_to_uva()
+
+
 def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=None):
     padded = num_tokens_padded
     out = self.slot_mappings if out is None else out
@@ -161,5 +167,6 @@ def install():
     input_batch.get_num_sampled_and_rejected = get_num_sampled_and_rejected
     sampler.get_num_sampled_and_rejected = get_num_sampled_and_rejected
     block_table.BlockTables.gather_block_tables = gather_block_tables
+    block_table.BlockTables.apply_staged_writes = apply_block_table_writes
     block_table.BlockTables.compute_slot_mappings = compute_slot_mappings
     block_table.BlockTables._make_ptr_tensor = make_block_pointer_tensor

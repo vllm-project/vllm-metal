@@ -22,21 +22,37 @@ def state():
     return RequestState(4, 64, 16, 0, 64, torch.device("mps"))
 
 
-def test_request_slots_and_removed_request_writeback(state):
-    tables = BlockTables([16], 4, 16, [4], torch.device("mps"), [16])
-    tables.append_block_ids(3, ([8, 9],), True)
-    tables.append_block_ids(0, ([2, 4],), True)
+@pytest.mark.parametrize("num_groups", [1, 2])
+def test_request_slots_and_removed_request_writeback(state, num_groups):
+    tables = BlockTables(
+        [16] * num_groups,
+        4,
+        16,
+        [4] * num_groups,
+        torch.device("mps"),
+        [16] * num_groups,
+    )
+    tables.append_block_ids(3, ([8, 9], [12, 13])[:num_groups], True)
+    tables.append_block_ids(0, ([2, 4], [6, 7])[:num_groups], True)
     tables.apply_staged_writes()
+    assert tables.num_blocks.gpu.tolist() == [[2, 0, 0, 2]] * num_groups
     mapping = torch.tensor([0, 3], dtype=torch.int32, device="mps")
-    (gathered,) = tables.gather_block_tables(mapping, num_reqs_padded=3)
-    assert gathered[:, :2].tolist() == [[2, 4], [8, 9], [0, 0]]
+    gathered = tables.gather_block_tables(mapping, num_reqs_padded=3)
+    assert [table[:, :2].tolist() for table in gathered] == [
+        [[2, 4], [8, 9], [0, 0]],
+        [[6, 7], [12, 13], [0, 0]],
+    ][:num_groups]
     slots = tables.compute_slot_mappings(
         mapping,
         torch.tensor([0, 1, 4], dtype=torch.int32, device="mps"),
         torch.tensor([17, 14, 15, 16], dtype=torch.int64, device="mps"),
         num_tokens_padded=8,
     )
-    assert slots.tolist() == [[65, 142, 143, 144, -1, -1, -1, -1]]
+    expected_slots = [
+        [65, 142, 143, 144, -1, -1, -1, -1],
+        [113, 206, 207, 208, -1, -1, -1, -1],
+    ]
+    assert slots.tolist() == expected_slots[:num_groups]
     # The second request disappears before writeback. Its -1 slot must not
     # alias slot zero and overwrite the surviving request's sampled token.
     state.num_computed_tokens.gpu[0] = 17
