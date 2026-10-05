@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -62,14 +63,19 @@ def test_raises_when_trace_dir_missing(
         MetalProfilerWrapper(cfg, trace_name="run")
 
 
+@pytest.mark.parametrize("backend", ["mlx", "mps"])
 @pytest.mark.parametrize("new_wrapper", [False, True])
 def test_captures_use_distinct_trace_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     new_wrapper: bool,
+    backend: str,
 ) -> None:
     monkeypatch.setenv("MTL_CAPTURE_ENABLED", "1")
+    monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+    monkeypatch.chdir(tmp_path)
     captures: list[Path] = []
+    stopped = MagicMock()
 
     def start_capture(path: str) -> None:
         trace_path = Path(path)
@@ -77,8 +83,26 @@ def test_captures_use_distinct_trace_paths(
         trace_path.mkdir()
         captures.append(trace_path)
 
-    monkeypatch.setattr("mlx.core.metal.start_capture", start_capture)
-    monkeypatch.setattr("mlx.core.metal.stop_capture", MagicMock())
+    if backend == "mlx":
+        monkeypatch.setattr("mlx.core.metal.start_capture", start_capture)
+        monkeypatch.setattr("mlx.core.metal.stop_capture", stopped)
+    else:
+
+        @contextmanager
+        def capture(name):
+            start_capture(str(tmp_path / f"0000-{name}.gputrace"))
+            try:
+                yield
+            finally:
+                stopped()
+
+        monkeypatch.setattr("torch.mps.profiler.metal_capture", capture)
+        monkeypatch.setattr(
+            "mlx.core.metal.start_capture", lambda *_: pytest.fail("MPS called MLX")
+        )
+        monkeypatch.setattr(
+            "mlx.core.metal.stop_capture", lambda: pytest.fail("MPS called MLX")
+        )
 
     cfg = ProfilerConfig(
         profiler="torch",
@@ -93,30 +117,15 @@ def test_captures_use_distinct_trace_paths(
         wrapper = MetalProfilerWrapper(cfg, trace_name="run42")
     wrapper.start()
     assert wrapper.is_running
-    wrapper.stop()
+    wrapper.shutdown()
+    wrapper.shutdown()
 
     assert len(captures) == 2
-    for path in captures:
+    assert stopped.call_count == 2
+    traces = list(tmp_path.glob("run42_*.gputrace"))
+    assert len(traces) == 2
+    assert not list(tmp_path.glob("0000-*.gputrace"))
+    for path in traces:
         assert path.parent == Path(cfg.torch_profiler_dir)
         assert path.name.startswith("run42_")
         assert path.suffix == ".gputrace"
-
-
-def test_stop_calls_mlx_stop_capture(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setenv("MTL_CAPTURE_ENABLED", "1")
-    monkeypatch.setattr("mlx.core.metal.start_capture", MagicMock())
-    mock_stop = MagicMock()
-    monkeypatch.setattr("mlx.core.metal.stop_capture", mock_stop)
-
-    cfg = ProfilerConfig(
-        profiler="torch",
-        torch_profiler_dir=str(tmp_path),
-    )
-    wrapper = MetalProfilerWrapper(cfg, trace_name="run")
-    wrapper.start()
-    wrapper.stop()
-
-    mock_stop.assert_called_once_with()
