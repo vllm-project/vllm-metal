@@ -24,8 +24,25 @@ _QUANT_TAG_RE = re.compile(
 _REMOTE_PREFIXES = ("*.", "*-")
 _REMOTE_SUFFIXES = ("-*", "")
 _SHARD_NAME_RE = re.compile(r"-\d+-of-(\d+)\.gguf$")
-_SUPPORTED_REMOTE_QTYPES = frozenset(
-    {"Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "F16", "F32", "BF16"}
+_SUPPORTED_REMOTE_TAGS = frozenset(
+    {
+        "Q8_0",
+        "Q4_0",
+        "Q4_1",
+        "Q5_0",
+        "Q5_1",
+        "Q4_K_S",
+        "Q4_K_M",
+        "Q4_K_L",
+        "Q5_K_S",
+        "Q5_K_M",
+        "Q5_K_L",
+        "Q6_K",
+        "Q6_K_L",
+        "F16",
+        "F32",
+        "BF16",
+    }
 )
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
 _TOKENIZER_ALLOW_PATTERNS = (
@@ -76,11 +93,11 @@ class RemoteGGUFReference:
         ignore_patterns: list[str] | str | None,
         token: bool | str | None,
     ) -> str:
-        if self.quant_type.upper() not in _SUPPORTED_REMOTE_QTYPES:
-            supported = ", ".join(sorted(_SUPPORTED_REMOTE_QTYPES))
+        if self.quant_type.upper() not in _SUPPORTED_REMOTE_TAGS:
+            supported = ", ".join(sorted(_SUPPORTED_REMOTE_TAGS))
             raise ValueError(
-                f"Remote GGUF qtype {self.quant_type!r} is not supported by "
-                f"vllm-metal; supported qtypes: {supported}."
+                f"Remote GGUF tag {self.quant_type!r} is not supported by "
+                f"vllm-metal; supported tags: {supported}."
             )
         snapshot_dir = None
         if hf_constants.HF_HUB_OFFLINE:

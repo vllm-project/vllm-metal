@@ -535,14 +535,14 @@ def test_remote_load_source_rejects_unsupported_remote_matches(
     assert str(excinfo.value) == error
 
 
-def test_remote_load_source_rejects_unsupported_qtype_before_download(
+def test_remote_load_source_rejects_unsupported_tag_before_download(
     monkeypatch,
 ) -> None:
     def fail_list_repo_files(**_: object) -> list[str]:
-        raise AssertionError("unsupported remote qtype must not list files")
+        raise AssertionError("unsupported remote tag must not list files")
 
     def fail_snapshot_download(**_: object) -> str:
-        raise AssertionError("unsupported remote qtype must not download")
+        raise AssertionError("unsupported remote tag must not download")
 
     monkeypatch.setattr(
         gguf_source,
@@ -554,13 +554,14 @@ def test_remote_load_source_rejects_unsupported_qtype_before_download(
     with pytest.raises(ValueError) as excinfo:
         gguf_source.GGUFLoadSource.from_model_config(
             _remote_gguf_model_config(
-                model_weights="Qwen/Qwen3-0.6B-GGUF:Q4_K_M",
+                model_weights="Qwen/Qwen3-0.6B-GGUF:UD-Q4_K_XL",
             )
         )
 
     assert str(excinfo.value) == (
-        "Remote GGUF qtype 'Q4_K_M' is not supported by vllm-metal; "
-        "supported qtypes: BF16, F16, F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0."
+        "Remote GGUF tag 'UD-Q4_K_XL' is not supported by vllm-metal; "
+        "supported tags: BF16, F16, F32, Q4_0, Q4_1, Q4_K_L, Q4_K_M, Q4_K_S, "
+        "Q5_0, Q5_1, Q5_K_L, Q5_K_M, Q5_K_S, Q6_K, Q6_K_L, Q8_0."
     )
 
 
@@ -586,3 +587,23 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
     )
 
     assert resolved == str(snapshot / gguf_name)
+
+
+@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L"])
+def test_remote_sibling_tags_resolve_separately(tmp_path, monkeypatch, tag) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
+    snapshot = tmp_path / "weights"
+    repo_files = ["README.md", "model-Q6_K.gguf", "model-Q6_K_L.gguf"]
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(list_repo_files=lambda **_: repo_files),
+    )
+    monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
+    reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type=tag)
+
+    resolved = reference.resolve(
+        cache_dir=None, revision=None, ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / f"model-{tag}.gguf")
