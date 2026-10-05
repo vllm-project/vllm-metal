@@ -123,8 +123,10 @@ class MPSWorker(MetalWorker):
                 "Cannot estimate MPS activation memory from this model config; "
                 "set --kv-cache-memory-bytes explicitly."
             )
-        # PoC estimate only, not a measured peak. See the MPS roadmap for
-        # profiling and unified-memory budgeting before broadening this path.
+        # PoC estimate only; --kv-cache-memory-bytes bypasses this heuristic.
+        # TODO: budget against torch.mps.recommended_max_memory() and measure
+        # execution overhead at the configured prefill/concurrency limits
+        # instead of estimating it from model dimensions.
         reserve = self.scheduler_config.max_num_batched_tokens * (
             intermediate_size * 2 + hidden_size * 8
         ) * 4 + (512 << 20)
