@@ -11,7 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoTokenizer
 
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
     encoder_model_path,
     load_encoder_weights,

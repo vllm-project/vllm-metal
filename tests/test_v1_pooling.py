@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig  # noqa: E402
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime  # noqa: E402
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange  # noqa: E402
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch  # noqa: E402
+from vllm_metal.tensor_bridge import mlx_to_torch  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.model_lifecycle import (  # noqa: E402
     LoadedGenerationModel,

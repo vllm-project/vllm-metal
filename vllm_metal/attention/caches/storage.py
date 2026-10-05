@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
-from vllm_metal.pytorch_backend.tensor_bridge import (
+from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
     torch_to_mlx,
 )

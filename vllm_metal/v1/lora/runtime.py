@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from vllm.lora.layers import LoRAMapping
 
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 from .worker_manager import MetalWorkerLoRAManager
 

@@ -14,5 +14,5 @@ def __getattr__(name):
     if name in __all__:
         from importlib import import_module
 
-        return getattr(import_module(f"{__name__}.tensor_bridge"), name)
+        return getattr(import_module("vllm_metal.tensor_bridge"), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

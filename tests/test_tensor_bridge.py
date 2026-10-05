@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_metal.pytorch_backend.tensor_bridge import (
+from vllm_metal.tensor_bridge import (
     MLX_TO_TORCH_DTYPE,
     TORCH_TO_MLX_DTYPE,
     get_torch_device,

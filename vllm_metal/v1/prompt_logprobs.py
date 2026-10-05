@@ -11,7 +11,7 @@ import torch
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch
 
 _LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
 

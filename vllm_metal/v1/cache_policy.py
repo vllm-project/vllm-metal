@@ -45,8 +45,8 @@ from vllm_metal.config import (
     MetalConfig,
     get_config,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
+from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.utils import CommitProbe, probe_commit
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY

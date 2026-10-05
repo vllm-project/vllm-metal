@@ -53,7 +53,7 @@ def initialize_hybrid_runtime(
     )
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
-    from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+    from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 
     plan = runtime._hybrid_plan
     attention_cls = MLAAttentionSpec if mla else FullAttentionSpec

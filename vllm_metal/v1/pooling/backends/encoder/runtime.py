@@ -15,7 +15,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.pooling.contract import (
     EMBED_TASK,
     EncoderPooler,

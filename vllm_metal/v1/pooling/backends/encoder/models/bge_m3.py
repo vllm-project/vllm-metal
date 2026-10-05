@@ -12,7 +12,7 @@ import torch
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 
-from vllm_metal.pytorch_backend.tensor_bridge import (
+from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
     mlx_to_torch,
 )

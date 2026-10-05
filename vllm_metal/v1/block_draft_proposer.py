@@ -15,7 +15,7 @@ from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
-from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.block_draft_paged import BlockDraftPagedCache
 from vllm_metal.v1.dflash import DFlashModel, DFlashTargetCapture

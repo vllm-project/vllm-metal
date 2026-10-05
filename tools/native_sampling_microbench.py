@@ -19,7 +19,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.tensor_bridge import mlx_to_torch
 from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 from vllm_metal.v1.sampling_batch import SamplingBatch
 
