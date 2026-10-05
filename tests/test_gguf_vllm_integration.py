@@ -517,6 +517,8 @@ def test_remote_load_source_downloads_one_matching_gguf(
 def test_remote_load_source_rejects_unsupported_remote_matches(
     monkeypatch, filenames, error
 ) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
+
     def fail_snapshot_download(**_: object) -> str:
         raise AssertionError("rejected remote GGUF reference must not download")
 
