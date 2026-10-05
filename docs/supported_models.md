@@ -155,7 +155,7 @@ block-FP8 checkpoint is not supported.
 | Granite 3.3 | 🔵 | | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
 | EXAONE 4.0 | 🔵 | | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
 | Laguna | ✅  | | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
-| Hunyuan (dense) | ✅ | 🔵 | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |
+| Hunyuan (dense) | ✅ | 🔵 | GQA + QK norm (paged) | ✅ | `tencent/Hunyuan-1.8B-Instruct` |
 | MiniMax M2 | 🟡 | | GQA + full-projection QK norm (paged) | Not verified | — |
 | OLMo 2 | ✅ | 🔵 | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
 | OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
