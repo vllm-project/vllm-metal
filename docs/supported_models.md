@@ -22,7 +22,7 @@ does not work, please open an issue rather than adding more rows or example
 checkpoints.
 
 The **PyTorch MPS** column covers the opt-in `VLLM_METAL_BACKEND=mps` path;
-blank cells are unverified.
+blank MPS cells are unverified.
 
 <!-- Keep this a high-level support matrix. Add a feature column only once at
 least one shipped model uses it (e.g. speculative decoding, tensor parallel) —
