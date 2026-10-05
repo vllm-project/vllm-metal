@@ -557,8 +557,6 @@ class MetalPlatform(Platform):
 
         # Set worker class for Metal
         backend = envs.VLLM_METAL_BACKEND
-        if backend not in ("mlx", "mps"):
-            raise ValueError("VLLM_METAL_BACKEND must be 'mlx' or 'mps'")
         if backend == "mps":
             from vllm_metal.pytorch_backend.worker import configure_mps
 

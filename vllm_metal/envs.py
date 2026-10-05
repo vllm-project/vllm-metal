@@ -134,7 +134,7 @@ if TYPE_CHECKING:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in proof of concept: vLLM Qwen3 model running on PyTorch MPS.
-    "VLLM_METAL_BACKEND": lambda: os.getenv("VLLM_METAL_BACKEND", "mlx"),
+    "VLLM_METAL_BACKEND": _choice("VLLM_METAL_BACKEND", "mlx", ("mlx", "mps")),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),
     # Multimodal serving mode:
