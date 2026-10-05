@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MPS request mapping and removed-request writeback."""
+"""MPS request mapping, cache sizing and normalization parity."""
 
 from types import SimpleNamespace
 
@@ -99,3 +99,35 @@ def test_cache_budget_handles_model_dimensions(monkeypatch, config_name, fields,
     worker.cache_config.kv_cache_memory_bytes = 1234
     worker.model_config = None
     assert MPSWorker.determine_available_memory(worker) == 1234
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("fused", [False, True], ids=["plain", "residual"])
+def test_rms_norm_parity(dtype, fused):
+    from vllm import ir
+
+    import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    op = ir.ops.fused_add_rms_norm if fused else ir.ops.rms_norm
+    args = op.generate_inputs(num_tokens=4, hidden_size=128, dtype=dtype, device="cpu")
+    args[-2].copy_(torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(32))
+    if fused:
+        # This row distinguishes FP32 accumulation and cast-before-weight from
+        # rounding the sum early or applying the learned weight before casting.
+        args[0][0].fill_(1)
+        args[1][0] = (
+            torch.tensor([0.125, 0.375, 0.625, 0.875], dtype=dtype).repeat(32)
+            * torch.finfo(dtype).eps
+        )
+    with op.set_priority(["native"]):
+        expected = op(*args)
+    gpu_args = tuple(x.to("mps") if isinstance(x, torch.Tensor) else x for x in args)
+    with op.set_priority(["torch_mps", "native"]):
+        assert op.dispatch(*gpu_args).provider == "torch_mps"
+        actual = op(*gpu_args)
+    if fused:
+        actual, residual = actual
+        expected, expected_residual = expected
+        torch.testing.assert_close(residual.cpu(), expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(actual[0].cpu(), expected[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual.cpu(), expected, **op.get_tolerance(dtype))
