@@ -133,7 +133,7 @@ if TYPE_CHECKING:
     VLLM_METAL_KV_COMMIT_PROBE: bool = True
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Opt-in proof of concept: vLLM Qwen3 model running on PyTorch MPS.
+    # Opt-in PyTorch MPS backend; model capabilities are checked by the worker.
     "VLLM_METAL_BACKEND": _choice("VLLM_METAL_BACKEND", "mlx", ("mlx", "mps")),
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),

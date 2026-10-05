@@ -5,6 +5,7 @@ from functools import wraps
 
 import psutil
 import torch
+from vllm.config.utils import getattr_iter
 from vllm.utils.torch_utils import set_random_seed
 
 from vllm_metal.pytorch_backend.attention import MPSAttentionBackend
@@ -45,10 +46,14 @@ def configure_mps(config):
             raise ValueError("Experimental MPS requires VLLM_USE_V2_MODEL_RUNNER=1")
 
     model = config.model_config
-    hf = model.hf_text_config
     if (
-        hf.model_type != "qwen3"
-        or model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
+        model.get_head_size() not in MPSAttentionBackend.get_supported_head_sizes()
+        or model.is_encoder_decoder
+        or model.is_diffusion
+        or model.is_multimodal_model
+        or model.is_moe
+        or model.has_inner_state
+        or model.use_mla
         or model.quantization is not None
         or model.runner_type != "generate"
         or model.dtype not in (torch.float16, torch.bfloat16)
@@ -60,7 +65,8 @@ def configure_mps(config):
         or config.additional_config.get("turboquant", False)
     ):
         raise NotImplementedError(
-            "Experimental MPS requires unquantized Qwen3, fp16/bf16, "
+            "Experimental MPS requires an unquantized dense autoregressive "
+            "text decoder with a supported attention head size, fp16/bf16, "
             "one GPU, and no LoRA/speculative decoding/KV transfer."
         )
     if config.cache_config.block_size is None:
@@ -105,10 +111,22 @@ class MPSWorker(MetalWorker):
         if self.cache_config.kv_cache_memory_bytes is not None:
             return self.cache_config.kv_cache_memory_bytes
         hf = self.model_config.hf_text_config
+        hidden_size = self.model_config.get_hidden_size()
+        intermediate_size = getattr_iter(
+            hf, ("intermediate_size", "ffn_dim", "n_inner")
+        )
+        if intermediate_size is None and hasattr(hf, "n_inner"):
+            # Upstream GPT-2/GPT-J use 4 * hidden_size when n_inner is None.
+            intermediate_size = 4 * hidden_size
+        if intermediate_size is None:
+            raise ValueError(
+                "Cannot estimate MPS activation memory from this model config; "
+                "set --kv-cache-memory-bytes explicitly."
+            )
         # PoC estimate only, not a measured peak. See the MPS roadmap for
         # profiling and unified-memory budgeting before broadening this path.
         reserve = self.scheduler_config.max_num_batched_tokens * (
-            hf.intermediate_size * 2 + hf.hidden_size * 8
+            intermediate_size * 2 + hidden_size * 8
         ) * 4 + (512 << 20)
         budget = int(
             psutil.virtual_memory().total * self.cache_config.gpu_memory_utilization
