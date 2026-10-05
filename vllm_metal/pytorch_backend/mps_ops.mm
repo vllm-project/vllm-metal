@@ -14,6 +14,8 @@ using at::Tensor;
 namespace kernels = vllm_metal::kernels;
 namespace hardware = vllm_metal::hardware;
 
+constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
+
 static bool nax_supported() {
   auto device = at::mps::getCurrentMPSStream()->device();
   return hardware::nax_supported(
@@ -118,7 +120,8 @@ class PagedAttention {
                 lens.is_contiguous() && cu.is_contiguous(),
                 "Attention metadata must be contiguous");
     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
-    const int seqs = lens.numel(), parts = (max_seq_len + 511) / 512;
+    const int seqs = lens.numel();
+    const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
     TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 && k.size(0) == tokens &&
                 k.size(1) == kv_heads && k.size(2) == head_size &&
                 k.stride(2) == 1 && k.stride(1) == head_size &&
@@ -141,7 +144,8 @@ class PagedAttention {
     auto scatter = pipeline(kernels::reshape_and_cache_name(dt, dt));
     auto name = nax ? kernels::nax_name(dt, head_size, block_size) :
         prefill ? kernels::tiled_name(dt, head_size, block_size, cfg) :
-        kernels::paged_name(dt, dt, dt, head_size, block_size, split ? 512 : 0);
+        kernels::paged_name(
+            dt, dt, dt, head_size, block_size, split ? kPartitionSize : 0);
     auto attn = pipeline(name, split, window_q);
     id<MTLComputePipelineState> reduce = nil;
     Tensor tmp, sums, maxes;
@@ -149,7 +153,8 @@ class PagedAttention {
       tmp = at::empty({tokens, heads, parts, head_size}, q.options());
       sums = at::empty({tokens, heads, parts}, q.options().dtype(at::kFloat));
       maxes = at::empty_like(sums);
-      reduce = pipeline(kernels::paged_reduce_kernel_name(dt, head_size, 512));
+      reduce = pipeline(
+          kernels::paged_reduce_kernel_name(dt, head_size, kPartitionSize));
     }
     auto stream = at::mps::getCurrentMPSStream();
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{

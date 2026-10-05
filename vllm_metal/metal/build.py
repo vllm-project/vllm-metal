@@ -511,6 +511,7 @@ def build_mps() -> Path:
         extra_compile_args=[
             "-O3",
             f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+            f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
             f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
             f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
         ],
