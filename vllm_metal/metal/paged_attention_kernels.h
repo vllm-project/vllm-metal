@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 
 // Host-side descriptions of the shared shaders. Stream ownership, feature
-// selection and pipeline-cache keys remain in each framework's launcher.
+// eligibility and pipeline-cache keys remain in each framework's launcher.
 namespace vllm_metal::kernels {
 
 // Tiled kernel: Flash-Attention-style with simdgroup 8×8 MMA.
@@ -83,6 +84,47 @@ inline std::string nax_name(
   return "paged_attention_nax_" + dtype +
       "_hs" + std::to_string(head_size) +
       "_bs" + std::to_string(block_size);
+}
+
+// Engage the split while the base decode grid (num_q_heads * num_seqs) stays
+// below ~8 threadgroups per GPU core.  On a 14-core M1 Pro that is 112.  At 8K
+// context with the fixed 512-token (16-way) split, this regime measured:
+// conc=1 -33%, conc=2 -6.7%, conc=4 -5.3%, fading to ~-1.6% (noise) by conc=8 —
+// so the split stays on through ~conc 6 and disengages beyond, where it stops
+// paying.  Scales with core count.
+// (An adaptive runtime split count was tried and reverted: this kernel is
+// memory-bound, so it likes oversubscription — fewer splits hurt, and ~512-token
+// partitions are the sweet spot, so a fixed size + a wider gate is simpler and
+// just as fast.)
+inline constexpr int kDecodeGroupsPerCore = 8;
+
+inline bool should_split_decode(
+    int heads, int query_tokens, int partitions, int gpu_cores) {
+  return heads * query_tokens < gpu_cores * kDecodeGroupsPerCore
+      && partitions >= 2;
+}
+
+inline size_t paged_threadgroup_bytes(
+    int head_size, int block_size, int element_bytes,
+    bool window, int window_rows) {
+  constexpr int NUM_THREADS = 256;
+  constexpr int NUM_SIMD_LANES = 32;
+  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
+  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
+  // per row and stages the sub-window's query rows after them; the layout
+  // must mirror the kernel's shared_mem carve exactly.
+  const int rows_per_tg = window ? window_rows : 1;
+  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
+                          * static_cast<int>(sizeof(float));
+  int q_window_bytes = window
+      ? window_rows * head_size * element_bytes
+      : 0;
+  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
+                    * static_cast<int>(sizeof(float));
+  size_t shmem = static_cast<size_t>(
+      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
+  shmem = (shmem + 15) & ~size_t(15);
+  return shmem;
 }
 
 inline std::string paged_name(

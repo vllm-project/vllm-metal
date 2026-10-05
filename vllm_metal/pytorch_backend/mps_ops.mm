@@ -24,7 +24,7 @@ class PagedAttention {
   id<MTLLibrary> library_;
   id<MTLLibrary> nax_library_ = nil;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines_;
-  int min_decode_grid_;
+  int gpu_cores_;
 
   id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
                                       int window_q = 0) {
@@ -66,7 +66,7 @@ class PagedAttention {
 
  public:
   PagedAttention(const std::string& path, const std::string& nax_path, int gpu_cores)
-      : min_decode_grid_(gpu_cores * 8) {
+      : gpu_cores_(gpu_cores) {
     @autoreleasepool {
       auto device = at::mps::getCurrentMPSStream()->device();
       NSError* error = nil;
@@ -134,7 +134,8 @@ class PagedAttention {
         (window_seqlen_q + VLLM_METAL_PA_WINDOW_ROWS - 1) / VLLM_METAL_PA_WINDOW_ROWS : 0;
     const bool prefill = tokens > seqs && !window;
     const bool nax = prefill && nax_library_ != nil;
-    const bool split = !prefill && heads * tokens < min_decode_grid_ && parts >= 2;
+    const bool split = !prefill
+        && kernels::should_split_decode(heads, tokens, parts, gpu_cores_);
     const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
     const auto cfg = kernels::select_tile_config(head_size).value();
     auto scatter = pipeline(kernels::reshape_and_cache_name(dt, dt));
@@ -184,11 +185,9 @@ class PagedAttention {
           if (!nax) [enc setThreadgroupMemoryLength:
               kernels::tiled_shared_bytes(cfg, head_size, q.element_size()) atIndex:0];
         } else {
-          const int rows = window ? VLLM_METAL_PA_WINDOW_ROWS : 1;
-          const int scores = 8 * rows * block_size * 4 +
-              (window ? rows * head_size * q.element_size() : 0);
-          const int merge = (16 + 8 * head_size) * 4;
-          [enc setThreadgroupMemoryLength:((std::max(scores, merge) + 15) & ~15) atIndex:0];
+          [enc setThreadgroupMemoryLength:kernels::paged_threadgroup_bytes(
+              head_size, block_size, static_cast<int>(q.element_size()),
+              window, VLLM_METAL_PA_WINDOW_ROWS) atIndex:0];
         }
         if (split) { buffer(enc, 0, sums); buffer(enc, 1, maxes); }
         [enc dispatchThreadgroups:MTLSizeMake(heads, grid_y, split ? parts : 1)

@@ -293,18 +293,8 @@ static bool gqa_decode_shape_eligible(int num_heads, int num_kv_heads,
                                    max_seq_len, gpu_cores, block_size) > 0;
 }
 
-// Engage the split while the base decode grid (num_q_heads * num_seqs) stays
-// below ~8 threadgroups per GPU core.  On a 14-core M1 Pro that is 112.  At 8K
-// context with the fixed 512-token (16-way) split, this regime measured:
-// conc=1 -33%, conc=2 -6.7%, conc=4 -5.3%, fading to ~-1.6% (noise) by conc=8 —
-// so the split stays on through ~conc 6 and disengages beyond, where it stops
-// paying.  Scales with core count.
-// (An adaptive runtime split count was tried and reverted: this kernel is
-// memory-bound, so it likes oversubscription — fewer splits hurt, and ~512-token
-// partitions are the sweet spot, so a fixed size + a wider gate is simpler and
-// just as fast.)
 static int min_decode_grid() {
-  return detected_gpu_core_count() * 8;
+  return detected_gpu_core_count() * kernels::kDecodeGroupsPerCore;
 }
 
 void init_v2_library(const std::string& v2_src) {
@@ -806,9 +796,9 @@ static void dispatch_paged_attention_v2_online(
   // invisible on 10-core M4 / M2 Ultra whose thresholds land elsewhere.
   // (For non-window batches grid_y == total_q_tokens, so this is the
   // same value the gate always used.)
-  const int gate_grid = num_heads * total_q_tokens;  // grid.z = 1 occupancy
   const bool partition = (pure_decode || window_batch)
-      && gate_grid < min_decode_grid() && max_num_partitions >= 2;
+      && kernels::should_split_decode(
+          num_heads, total_q_tokens, max_num_partitions, detected_gpu_core_count());
 
   auto* lib = d.get_library("paged_attention_v2_kern");
   auto& enc = metal::get_command_encoder(s);
@@ -955,22 +945,9 @@ static void dispatch_paged_attention_v2_online(
        {&window_q_fc,      MTL::DataType::DataTypeInt,  NS::UInteger(110)}});
 
   constexpr int NUM_THREADS    = 256;
-  constexpr int NUM_SIMD_LANES = 32;
-  constexpr int NUM_WARPS      = NUM_THREADS / NUM_SIMD_LANES;
-  // Window mode widens the per-warp score slices to one BLOCK_SIZE slice
-  // per row and stages the sub-window's query rows after them; the layout
-  // must mirror the kernel's shared_mem carve exactly.
-  const int rows_per_tg = window_batch ? kWindowRows : 1;
-  int warp_scores_bytes = NUM_WARPS * rows_per_tg * block_size
-                          * static_cast<int>(sizeof(float));
-  int q_window_bytes = window_batch
-      ? kWindowRows * head_size * static_cast<int>(query.itemsize())
-      : 0;
-  int merge_bytes = (2 * NUM_WARPS + NUM_WARPS * head_size)
-                    * static_cast<int>(sizeof(float));
-  size_t shmem = static_cast<size_t>(
-      std::max(warp_scores_bytes + q_window_bytes, merge_bytes));
-  shmem = (shmem + 15) & ~size_t(15);
+  const size_t shmem = kernels::paged_threadgroup_bytes(
+      head_size, block_size, static_cast<int>(query.itemsize()),
+      window_batch, kWindowRows);
 
   // TurboQuant scale/zero/centroid buffers (slots 22-27); shared by both paths.
   auto bind_turboquant = [&]() {
