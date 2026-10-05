@@ -1,39 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental PyTorch-stream launcher; no new attention shaders."""
 
+import importlib
 import logging
 from functools import cache
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 @cache
 def _load_mps_module():
-    from torch.utils.cpp_extension import load
+    import torch  # Load libtorch before importing the linked extension.
 
-    from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE, PA_WINDOW_ROWS
-
-    root = Path(__file__).resolve().parent
-    return load(
-        name="vllm_metal_mps_ops",
-        sources=[str(root / "mps_ops.mm")],
-        extra_cflags=[
-            "-O3",
-            f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
-            f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
-        ],
-        extra_ldflags=[
-            "-framework",
-            "Metal",
-            "-framework",
-            "Foundation",
-            "-framework",
-            "IOKit",
-            "-framework",
-            "CoreFoundation",
-        ],
+    from vllm_metal import envs
+    from vllm_metal.metal.build import (
+        build_mps,
+        mps_artifact_is_stale,
+        mps_output_path,
+        mps_version_path,
     )
+
+    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+        build_mps()
+    if not mps_output_path().exists() or not mps_version_path().exists():
+        raise RuntimeError(
+            "Prebuilt MPS extension is missing. Reinstall a vllm-metal wheel, "
+            "or set VLLM_METAL_BUILD_FROM_SOURCE=1 to build from source."
+        )
+    built = mps_version_path().read_text().strip()
+    if built != str(torch.__version__):
+        raise RuntimeError(
+            f"The MPS extension was built against PyTorch {built}, but "
+            f"{torch.__version__} is installed. Reinstall a matching wheel, "
+            "or set VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild it."
+        )
+    if mps_artifact_is_stale():
+        raise RuntimeError(
+            "Prebuilt MPS extension is stale. Run python -m vllm_metal.metal.build "
+            "or set VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild it."
+        )
+    return importlib.import_module("vllm_metal.pytorch_backend._mps_ops")
 
 
 @cache

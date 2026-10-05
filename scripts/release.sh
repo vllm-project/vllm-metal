@@ -89,9 +89,8 @@ main() {
 
   setup_dev_env
 
-  # Package all native artifacts before building the wheel.
-  ensure_metal_toolchain
-  build_native_artifacts
+  # Use the same pinned vLLM/PyTorch and native build as source installs and CI.
+  ./install.sh
 
   local version prerelease=0
   if [ "$channel" = "dev" ]; then

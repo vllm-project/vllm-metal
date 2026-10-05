@@ -139,12 +139,10 @@ ensure_metal_toolchain() {
   rm -rf "${tmpdir}"
 }
 
-# Build the in-package native artifacts (the _paged_ops*.so and the required
-# precompiled .metallib shader libraries, including NAX) into vllm_metal/metal/
-# so `uv build` can bundle them as package data.
+# Build both native launchers and the shared .metallib libraries, including
+# NAX, into the package so `uv build` can bundle them.
 #
-# `python` here is the venv interpreter activated by setup_dev_env, so mlx and
-# nanobind are importable.
+# `python` is the venv interpreter with the installer's pinned vLLM/PyTorch.
 build_native_artifacts() {
   section "Building native Metal artifacts"
   # Official wheels require NAX, so reject an older SDK before compiling.
@@ -156,7 +154,7 @@ build_native_artifacts() {
 }
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
-# artifacts: the _paged_ops*.so extension, its MLX version record, three
+# artifacts: both native launchers, their framework-version records, the
 # required metallibs, and NAX.
 # setup.py's package data is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
@@ -170,9 +168,11 @@ verify_wheel_artifacts() {
 
   local expected
   if ! expected=$(python -c "
-from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, mlx_version_path, output_path
+from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, mlx_version_path, output_path, mps_output_path, mps_version_path
 print(output_path().name)
 print(mlx_version_path().name)
+print(mps_output_path().name)
+print(mps_version_path().name)
 for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     print(metallib_path(_name).name)
 "); then
@@ -193,16 +193,17 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     fi
   done <<< "$expected"
 
-  local expected_minos paged_ops_name unpack_dir native_so native_name actual_minos native_count
+  local expected_minos paged_ops_name mps_ops_name unpack_dir native_so native_name actual_minos native_count
   expected_minos=$(python -c "from vllm_metal.metal.build import MIN_MACOS_VERSION; print(MIN_MACOS_VERSION)")
   paged_ops_name=$(python -c "from vllm_metal.metal.build import output_path; print(output_path().name)")
+  mps_ops_name=$(python -c "from vllm_metal.metal.build import mps_output_path; print(mps_output_path().name)")
   unpack_dir=$(mktemp -d)
-  unzip -qq "${wheel}" '*.so' -d "${unpack_dir}"
+  unzip -qq "${wheel}" -d "${unpack_dir}"
   native_count=0
   while IFS= read -r native_so; do
     native_name=$(basename "${native_so}")
     case "${native_name}" in
-      "${paged_ops_name}") ;;
+      "${paged_ops_name}"|"${mps_ops_name}") ;;
       *) continue ;;
     esac
     native_count=$((native_count + 1))
@@ -214,8 +215,25 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     fi
     success "${native_name}: macOS ${actual_minos}"
   done < <(find "${unpack_dir}" -type f -name '*.so')
+  # Import from the wheel copy, with compiler tooling unavailable.
+  if ! VLLM_METAL_BUILD_FROM_SOURCE=0 python - "${unpack_dir}" <<'PYTHON'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+sys.modules["torch.utils.cpp_extension"] = None
+from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
+
+module = _load_mps_module()
+assert Path(module.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
+PYTHON
+  then
+    error "The wheel's prebuilt MPS launcher could not be imported."
+    rm -rf "${unpack_dir}"
+    return 1
+  fi
   rm -rf "${unpack_dir}"
-  if [ "${native_count}" -lt 1 ]; then
+  if [ "${native_count}" -ne 2 ]; then
     error "Wheel ${wheel} is missing a required native extension."
     return 1
   fi

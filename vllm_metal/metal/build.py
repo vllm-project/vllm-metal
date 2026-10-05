@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build shared Metal shader artifacts and the MLX native extension.
+"""Build shared Metal shader artifacts and both native launchers.
 
 Compiles ``paged_ops.cpp``, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
 Metal shaders through MLX's own command encoder.
@@ -34,6 +34,9 @@ _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
 # The built extension lives inside the package so the wheel can include it.
 # Runtime loads the prebuilt artifact without invoking clang++ on the user's Mac.
 _OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
+_MPS_DIR = _THIS_DIR.parent / "pytorch_backend"
+_MPS_OUT = _MPS_DIR / f"_mps_ops{_EXT_SUFFIX}"
+_MPS_VERSION = _MPS_DIR / "_mps_ops.torch-version"
 
 
 def _stamp_path(artifact: Path) -> Path:
@@ -64,6 +67,14 @@ def output_path() -> Path:
 
 def mlx_version_path() -> Path:
     return _MLX_VERSION
+
+
+def mps_output_path() -> Path:
+    return _MPS_OUT
+
+
+def mps_version_path() -> Path:
+    return _MPS_VERSION
 
 
 def metallib_path(name: str) -> Path:
@@ -469,9 +480,70 @@ def build() -> Path:
     return _OUT
 
 
+def _mps_input_hash() -> str:
+    import torch
+
+    h = hashlib.sha256(str(torch.__version__).encode())
+    for path in (_MPS_DIR / "mps_ops.mm", _KERNELS, _DEVICE, _BUILD, _CONSTANTS):
+        h.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def mps_artifact_is_stale() -> bool:
+    # Wheels have no stamps; source checkouts verify the shared headers too.
+    return _stamp_path(_MPS_OUT).exists() and is_stale(_MPS_OUT, _mps_input_hash())
+
+
+def build_mps() -> Path:
+    """Build the MPS launcher into the package using PyTorch's extension builder."""
+    import torch
+    from setuptools import Distribution
+    from torch.utils.cpp_extension import BuildExtension, CppExtension
+
+    digest = _mps_input_hash()
+    if all(
+        p.exists() for p in (_MPS_OUT, _MPS_VERSION, _stamp_path(_MPS_OUT))
+    ) and not is_stale(_MPS_OUT, digest):
+        return _MPS_OUT
+    extension = CppExtension(
+        "_mps_ops",
+        sources=[str(_MPS_DIR / "mps_ops.mm")],
+        extra_compile_args=[
+            "-O3",
+            f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+            f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
+            f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
+        ],
+        extra_link_args=[
+            f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+            "-framework",
+            "Metal",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "IOKit",
+            "-framework",
+            "CoreFoundation",
+        ],
+    )
+    command = BuildExtension(Distribution({"ext_modules": [extension]}))
+    # A single host source needs no Ninja dependency.
+    command.use_ninja = False
+    command.ensure_finalized()
+    command.build_lib = str(_MPS_DIR)
+    command.force = True
+    with tempfile.TemporaryDirectory(prefix="vllm-metal-mps-build-") as tmp:
+        command.build_temp = tmp
+        command.run()
+    _MPS_VERSION.write_text(str(torch.__version__) + "\n")
+    _stamp_path(_MPS_OUT).write_text(digest)
+    return _MPS_OUT
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     so = build()
     print(so)
     for lib in build_metallibs():
         print(lib)
+    print(build_mps())

@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_mps_shader_loading_without_mlx():
+def test_mps_prebuilt_loading_without_mlx_or_compiler():
     # A fresh process ensures the MLX extension is not already resident. Inject
     # topology only for this test; hosted VMs may omit the IORegistry property.
     subprocess.run(
@@ -24,6 +24,7 @@ def test_mps_shader_loading_without_mlx():
 import sys
 sys.modules["mlx"] = None
 sys.modules["_paged_ops"] = None
+sys.modules["torch.utils.cpp_extension"] = None
 from vllm_metal.pytorch_backend.mps_ops import _load_mps_module, get_mps_ops
 _load_mps_module()._override_detected_gpu_core_count_for_test(20)
 get_mps_ops()

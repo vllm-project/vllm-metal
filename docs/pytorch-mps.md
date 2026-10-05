@@ -3,6 +3,19 @@
 The opt-in MPS path should reuse upstream model and serving logic. Local code
 should provide device integration and measured kernel improvements.
 
+## Try the backend
+
+Use the [normal installation](installation.md), then select MPS:
+
+```bash
+VLLM_METAL_BACKEND=mps vllm serve Qwen/Qwen3-0.6B --dtype bfloat16
+```
+
+Release wheels include both native launchers and the shared Metal shaders;
+no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
+Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
+requests (`temperature=0`, without logprobs).
+
 ## Models
 
 - Use `model_impl="auto"` and vLLM's resolver. Keep model definitions and weight
