@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import vllm.engine.arg_utils as arg_utils_module
+from huggingface_hub import HfApi
 from huggingface_hub import constants as hf_constants
 from vllm.engine.arg_utils import EngineArgs
 
@@ -75,6 +76,10 @@ def gguf_file(tmp_path: Path) -> str:
 
 def _engine_args(**kwargs):
     return EngineArgs(**kwargs)
+
+
+def _echo_revision(repo_id: str, *, revision: str | None, **_: object) -> str | None:
+    return revision
 
 
 def _remote_gguf_model_config(**overrides: object) -> SimpleNamespace:
@@ -408,8 +413,13 @@ def test_remote_load_source_downloads_one_matching_gguf(
         directory.mkdir()
     gguf_path = weight_snapshot / f"Qwen3-0.6B-{quant}.gguf"
     gguf_path.write_text("dummy")
+    resolve_calls: list[tuple[str, dict[str, object]]] = []
     list_calls: list[dict[str, object]] = []
     calls: list[dict[str, object]] = []
+
+    def fake_resolve_revision(repo_id: str, **kwargs: object) -> str:
+        resolve_calls.append((repo_id, kwargs))
+        return "weights-rev"
 
     def fake_list_repo_files(**kwargs: object) -> list[str]:
         list_calls.append(kwargs)
@@ -428,7 +438,10 @@ def test_remote_load_source_downloads_one_matching_gguf(
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
-        lambda: SimpleNamespace(list_repo_files=fake_list_repo_files),
+        lambda: SimpleNamespace(
+            resolve_revision=fake_resolve_revision,
+            list_repo_files=fake_list_repo_files,
+        ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", fake_snapshot_download)
     load_config = SimpleNamespace(
@@ -448,10 +461,22 @@ def test_remote_load_source_downloads_one_matching_gguf(
     assert source.weights_path == str(gguf_path)
     assert source.config_dir == str(config_snapshot)
     assert source.tokenizer_dir == str(tokenizer_snapshot)
+    # The weights repo gets its own revision; the companion repos keep theirs.
+    assert resolve_calls == [
+        (
+            "Qwen/Qwen3-0.6B-GGUF",
+            {
+                "revision": "rev-a",
+                "cache_dir": str(tmp_path / "cache"),
+                "local_files_only": False,
+                "token": "hf-token",
+            },
+        )
+    ]
     assert list_calls == [
         {
             "repo_id": "Qwen/Qwen3-0.6B-GGUF",
-            "revision": "rev-a",
+            "revision": "weights-rev",
             "token": "hf-token",
         }
     ]
@@ -460,7 +485,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "repo_id": "Qwen/Qwen3-0.6B-GGUF",
         "cache_dir": str(tmp_path / "cache"),
         "allow_patterns": [gguf_path.name],
-        "revision": "rev-a",
+        "revision": "weights-rev",
         "token": "hf-token",
     }
     assert config_call == {
@@ -486,6 +511,39 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "revision": "tok-rev",
         "token": "hf-token",
     }
+
+
+def _cache_hub_repo(cache_dir: Path, repo_id: str, commit: str, filename: str) -> Path:
+    repo_dir = cache_dir / ("models--" + repo_id.replace("/", "--"))
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(commit)
+    path = repo_dir / "snapshots" / commit / filename
+    path.parent.mkdir(parents=True)
+    path.write_text("dummy")
+    return path
+
+
+def test_remote_load_source_repins_the_config_repo_revision_offline(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
+    cache_dir = tmp_path / "hub"
+    _cache_hub_repo(cache_dir, "org/model", "a" * 40, "config.json")
+    gguf_path = _cache_hub_repo(cache_dir, "org/model-GGUF", "b" * 40, "m-Q8_0.gguf")
+    # ModelConfig.revision as vLLM 0.31 stores it: pinned to the config repo.
+    config_revision = HfApi().resolve_revision(
+        "org/model", cache_dir=cache_dir, local_files_only=True
+    )
+    reference = gguf_source.RemoteGGUFReference("org/model-GGUF", "Q8_0")
+
+    resolved = reference.resolve(
+        cache_dir=str(cache_dir),
+        revision=config_revision,
+        ignore_patterns=None,
+        token=None,
+    )
+
+    assert resolved == str(gguf_path)
 
 
 @pytest.mark.parametrize(
@@ -525,7 +583,10 @@ def test_remote_load_source_rejects_unsupported_remote_matches(
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
-        lambda: SimpleNamespace(list_repo_files=lambda **_: filenames),
+        lambda: SimpleNamespace(
+            resolve_revision=_echo_revision,
+            list_repo_files=lambda **_: filenames,
+        ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", fail_snapshot_download)
 
@@ -538,6 +599,9 @@ def test_remote_load_source_rejects_unsupported_remote_matches(
 def test_remote_load_source_rejects_unsupported_tag_before_download(
     monkeypatch,
 ) -> None:
+    def fail_resolve_revision(*_: object, **__: object) -> str:
+        raise AssertionError("unsupported remote tag must not resolve a revision")
+
     def fail_list_repo_files(**_: object) -> list[str]:
         raise AssertionError("unsupported remote tag must not list files")
 
@@ -547,7 +611,10 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
-        lambda: SimpleNamespace(list_repo_files=fail_list_repo_files),
+        lambda: SimpleNamespace(
+            resolve_revision=fail_resolve_revision,
+            list_repo_files=fail_list_repo_files,
+        ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", fail_snapshot_download)
 
@@ -576,7 +643,10 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
-        lambda: SimpleNamespace(list_repo_files=lambda **_: ["README.md", gguf_name]),
+        lambda: SimpleNamespace(
+            resolve_revision=_echo_revision,
+            list_repo_files=lambda **_: ["README.md", gguf_name],
+        ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
     reference = gguf_source.RemoteGGUFReference.parse(f"org/model:{tag}")
@@ -597,7 +667,10 @@ def test_remote_sibling_tags_resolve_separately(tmp_path, monkeypatch, tag) -> N
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
-        lambda: SimpleNamespace(list_repo_files=lambda **_: repo_files),
+        lambda: SimpleNamespace(
+            resolve_revision=_echo_revision,
+            list_repo_files=lambda **_: repo_files,
+        ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
     reference = gguf_source.RemoteGGUFReference(repo_id="org/model", quant_type=tag)

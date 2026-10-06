@@ -119,10 +119,14 @@ def _fallback_warnings(caplog, calls) -> int:
     metal_logger = logging.getLogger("vllm_metal")
     mm_prefix_module._warn_kernel_path_unavailable.cache_clear()
     metal_logger.addHandler(caplog.handler)
+    propagate = metal_logger.propagate
+    # Count each record once, whether or not vLLM has configured logging.
+    metal_logger.propagate = False
     try:
         for value, supported in calls:
             resolve_mm_prefix_path(value, supported)
     finally:
+        metal_logger.propagate = propagate
         metal_logger.removeHandler(caplog.handler)
     return caplog.text.count("predate mm_prefix")
 

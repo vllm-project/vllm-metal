@@ -28,7 +28,6 @@ from vllm.distributed.kv_transfer import (
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -416,9 +415,7 @@ class MetalModelRunner:
         )
         self._pooling_backend: ExecutablePoolingBackend | None = None
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
-        self._supports_mm_inputs: bool = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
-            self.model_config
-        )
+        self._supports_mm_inputs: bool = self.model_config.supports_multimodal_inputs
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
         # Block-diffusion LMs run their own step protocol (v1/diffusion.py).

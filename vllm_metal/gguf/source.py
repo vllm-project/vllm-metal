@@ -99,6 +99,15 @@ class RemoteGGUFReference:
                 f"Remote GGUF tag {self.quant_type!r} is not supported by "
                 f"vllm-metal; supported tags: {supported}."
             )
+        # vLLM pins the engine revision to the config repo's commit; resolving
+        # it here re-resolves the requested revision for this weights repo.
+        revision = HfApi().resolve_revision(
+            self.repo_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=hf_constants.HF_HUB_OFFLINE,
+            token=token,
+        )
         snapshot_dir = None
         if hf_constants.HF_HUB_OFFLINE:
             snapshot_dir = Path(

@@ -276,6 +276,7 @@ def make_gemma4_mixed_attention_runner(
     )
     vllm_config = SimpleNamespace(
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         attention_config=AttentionConfig(),
         max_in_flight_tokens=max_in_flight_tokens,
         model_config=SimpleNamespace(
@@ -283,6 +284,7 @@ def make_gemma4_mixed_attention_runner(
             original_max_model_len=original_max_model_len,
         ),
         parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),

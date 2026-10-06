@@ -11,6 +11,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import AuxOutputConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
@@ -65,6 +66,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             max_num_scheduled_tokens=None,
         ),
         lora_config=None,
+        aux_output_config=AuxOutputConfig(),
         kv_transfer_config=None,
         # Real VllmConfig always carries this; the events path reads it.
         kv_events_config=None,

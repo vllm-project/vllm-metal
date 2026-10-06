@@ -237,14 +237,16 @@ def test_config_bridge_preserves_other_runner_rejections(monkeypatch, method, wo
         parallel_config=SimpleNamespace(
             worker_cls=worker,
             prefill_context_parallel_size=2,
+            pipeline_parallel_size=2,
             enable_batch_sharded_sampling=True,
         ),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=None
         if method is None
         else SimpleNamespace(method=method, enable_adaptive_verification=True),
         model_config=SimpleNamespace(is_diffusion=True),
         _dflash_needs_multi_kv_group=lambda: True,
-        _is_dflash2_draft=lambda: True,
+        _is_dflash_candidate_draft=lambda: True,
     )
     before = original(config)
     after = first(config)

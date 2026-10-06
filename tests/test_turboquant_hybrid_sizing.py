@@ -8,7 +8,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 import torch
-from vllm.config import AttentionConfig, CacheConfig
+from vllm.config import AttentionConfig, CacheConfig, CompilationConfig
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
@@ -299,6 +299,26 @@ class TestTurboQuantHybridAlignment:
         )
 
         assert vllm_config.cache_config.block_size == 16
+
+    def test_update_block_size_aligns_hybrid_without_turboquant(
+        self, monkeypatch
+    ) -> None:
+        cache_config = CacheConfig(enable_prefix_caching=False)
+        cache_config.mamba_cache_mode = "none"
+        vllm_config = self._vllm_config_with_cache(cache_config)
+        # An MLX model registers no attention layers for vLLM's backend lookup.
+        vllm_config.compilation_config = CompilationConfig()
+        monkeypatch.setattr(
+            "vllm_metal.platform.get_config", lambda: MetalConfig(mlx_device="gpu")
+        )
+        self._patch_model_cls(monkeypatch)
+        attn_page_1_token = 2 * KV_HEADS * HEAD_DIM * torch.float16.itemsize
+        expected_block = 16 * -(-self._MAMBA_PAGE // (16 * attn_page_1_token))
+
+        MetalPlatform.update_block_size_for_backend(vllm_config)
+
+        assert cache_config.block_size == expected_block
+        assert cache_config.mamba_page_size_padded == expected_block * attn_page_1_token
 
     @pytest.mark.parametrize(
         "cache_kwargs,hash_consumer",

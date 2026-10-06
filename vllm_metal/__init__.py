@@ -17,19 +17,29 @@ except PackageNotFoundError:  # running from a source tree without an install
 
 logger = logging.getLogger(__name__)
 
+# The vllm handlers this plugin copied onto vllm_metal; distinguishes our
+# mirror, which a vLLM reconfigure refreshes, from handlers a user configured.
+_mirrored_handlers: list[logging.Handler] = []
+
 
 def _configure_logging() -> None:
-    """Configure vllm_metal logging to mirror vLLM settings."""
-    from vllm.envs import VLLM_LOGGING_LEVEL
+    """Configure vllm_metal logging to mirror vLLM settings.
 
+    vLLM configures its logger per process after plugin registration and can
+    configure it again, so ``MetalPlatform.log_warnings`` reruns this each time.
+    """
     vllm_logger = logging.getLogger("vllm")
     metal_logger = logging.getLogger("vllm_metal")
-    metal_logger.setLevel(logging.getLevelName(VLLM_LOGGING_LEVEL))
-
-    if vllm_logger.handlers and not metal_logger.handlers:
-        for handler in vllm_logger.handlers:
-            metal_logger.addHandler(handler)
-        metal_logger.propagate = False
+    # The level always follows vLLM; handlers a user attached are left alone.
+    metal_logger.setLevel(vllm_logger.level)
+    if metal_logger.handlers != _mirrored_handlers:
+        return
+    for handler in _mirrored_handlers:
+        metal_logger.removeHandler(handler)
+    _mirrored_handlers[:] = vllm_logger.handlers
+    for handler in _mirrored_handlers:
+        metal_logger.addHandler(handler)
+    metal_logger.propagate = not _mirrored_handlers
 
 
 def _apply_macos_defaults() -> None:

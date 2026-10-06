@@ -197,6 +197,13 @@ class MetalPlatform(Platform):
             return False
 
     @classmethod
+    def log_warnings(cls) -> None:
+        """Mirror vLLM's logging onto vllm_metal once vLLM has configured it."""
+        from vllm_metal import _configure_logging
+
+        _configure_logging()
+
+    @classmethod
     def get_device_count(cls) -> int:
         """Get number of available devices.
 
@@ -443,6 +450,14 @@ class MetalPlatform(Platform):
                 "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
                 "MetalWorker implements the V1 model runner contract. Unset it "
                 "(vllm-metal defaults it to 0)."
+            )
+
+        # vLLM leaves AuxOutput validation to out-of-tree platforms, and
+        # MetalModelRunner produces no auxiliary outputs.
+        if vllm_config.aux_output_config.enabled:
+            raise NotImplementedError(
+                "--enable-return-routed-experts is not supported on Metal: "
+                "MetalModelRunner does not return routed experts."
             )
 
         config = get_config()
@@ -1064,20 +1079,20 @@ class MetalPlatform(Platform):
         return True
 
     @classmethod
-    def _find_non_ssm_backend(
+    def _find_non_ssm_backends(
         cls, vllm_config: "VllmConfig"
-    ) -> "type[AttentionBackend] | None":
-        """Return a Metal-specific backend for block_size calculation.
+    ) -> "list[type[AttentionBackend]]":
+        """Return the Metal-specific backend for block_size calculation.
 
         Since MLX models don't populate static_forward_context, the default
-        Platform._find_non_ssm_backend (which walks attention layers via
+        Platform._find_non_ssm_backends (which walks attention layers via
         get_layers_from_vllm_config) returns nothing. We override to return
         the synthetic MetalBackend, which advertises Metal's MultipleOf(16)
         kernel alignment to the framework's hybrid-block-size math.
         """
         from vllm_metal.attention.synthetic_backend import MetalBackend
 
-        return MetalBackend
+        return [MetalBackend]
 
     @classmethod
     def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
@@ -1119,7 +1134,7 @@ class MetalPlatform(Platform):
         """Update block_size for Metal platform.
 
         Delegates to vLLM's base implementation, which reads the Metal kernel
-        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backend`
+        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backends`
         override. Adds a one-time warning when paged attention is enabled for
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
@@ -1161,8 +1176,8 @@ class MetalPlatform(Platform):
                 "  This is a logical transformation — physical memory is unchanged."
             )
 
-        # Delegate the rest to upstream. With our ``_find_non_ssm_backend``
-        # returning :class:`MetalBackend` (which advertises ``MultipleOf(16)``),
+        # Delegate the rest to upstream. With our ``_find_non_ssm_backends``
+        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)``),
         # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
         # models (matching the kernel sweet spot), and Phase 2
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
@@ -1230,8 +1245,7 @@ class MetalPlatform(Platform):
             v_quant=v_quant,
         )
 
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
-        assert backend_cls is not None
+        backend_cls = cls._find_non_ssm_backends(vllm_config)[0]
         backend_block_alignment_size = min(
             s.base if isinstance(s, MultipleOf) else s
             for s in backend_cls.get_supported_kernel_block_sizes()

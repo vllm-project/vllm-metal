@@ -339,7 +339,10 @@ def test_peft_loader_materializes_weights_before_return(tmp_path: Path) -> None:
     [
         ({"r": 1024}, "is greater than max_lora_rank"),
         ({"use_dora": True}, "does not yet support DoRA"),
-        ({"modules_to_save": ["lm_head"]}, "modules_to_save being None"),
+        (
+            {"modules_to_save": ["lm_head"]},
+            r"Unsupported modules_to_save: \['lm_head'\]",
+        ),
     ],
 )
 def test_peft_loader_rejects_unsupported_configs(

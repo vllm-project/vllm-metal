@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for MetalPlatform.update_block_size_for_backend() and _find_non_ssm_backend().
+"""Unit tests for MetalPlatform.update_block_size_for_backend() and _find_non_ssm_backends().
 
 Tests cover:
-1. _find_non_ssm_backend returns MetalBackend with correct kernel block alignment
+1. _find_non_ssm_backends returns MetalBackend with correct kernel block alignment
 2. update_block_size_for_backend preserves vLLM base block-size behavior
 3. Metal-specific adjustments (block_size multiple of 16 for paged attention)
 """
@@ -15,14 +15,14 @@ from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm_metal.platform import MetalPlatform
 
 
-class TestFindNonSsmBackend:
-    """Test suite for _find_non_ssm_backend() method."""
+class TestFindNonSsmBackends:
+    """Test suite for _find_non_ssm_backends() method."""
 
     def test_returns_metal_backend_class(self):
-        """Test: _find_non_ssm_backend returns a MetalBackend class."""
-        backend_cls = MetalPlatform._find_non_ssm_backend(None)  # type: ignore
+        """Test: _find_non_ssm_backends returns only the MetalBackend class."""
+        backends = MetalPlatform._find_non_ssm_backends(None)  # type: ignore
 
-        assert backend_cls.get_name() == "METAL_ATTN"
+        assert [backend.get_name() for backend in backends] == ["METAL_ATTN"]
 
     def test_metal_backend_kernel_block_sizes(self):
         """Test: MetalBackend returns MultipleOf(16) for kernel block sizes.
@@ -34,8 +34,8 @@ class TestFindNonSsmBackend:
         """
         from vllm.v1.attention.backend import MultipleOf
 
-        backend_cls = MetalPlatform._find_non_ssm_backend(None)  # type: ignore
-        sizes = backend_cls.get_supported_kernel_block_sizes()  # type: ignore
+        backend_cls = MetalPlatform._find_non_ssm_backends(None)[0]  # type: ignore
+        sizes = backend_cls.get_supported_kernel_block_sizes()
 
         assert len(sizes) == 1
         assert isinstance(sizes[0], MultipleOf)

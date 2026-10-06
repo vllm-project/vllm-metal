@@ -10,7 +10,13 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    AuxOutputConfig,
+    CacheConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -98,6 +104,7 @@ class TestMetalPlatform:
         config.scheduler_config = scheduler
         config.speculative_config = speculative_config  # type: ignore[assignment]
         config.lora_config = lora_config  # type: ignore[assignment]
+        config.aux_output_config = AuxOutputConfig()
         config.additional_config = {}
         return config
 
@@ -488,6 +495,22 @@ class TestMetalPlatform:
             ),
         ):
             MetalPlatform.check_and_update_config(self._platform_config())
+
+    def test_check_and_update_config_rejects_routed_experts(self) -> None:
+        """vLLM leaves AuxOutput validation to out-of-tree platforms."""
+        vllm_config = self._platform_config()
+        vllm_config.aux_output_config = AuxOutputConfig(
+            enable_return_routed_experts=True
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match=re.escape(
+                "--enable-return-routed-experts is not supported on Metal: "
+                "MetalModelRunner does not return routed experts."
+            ),
+        ):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
