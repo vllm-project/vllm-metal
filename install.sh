@@ -174,23 +174,37 @@ main() {
   # Override the default dev channel with --stable or VLLM_METAL_CHANNEL.
   local channel="${VLLM_METAL_CHANNEL:-dev}"
 
-  for arg in "$@"; do
-    case "$arg" in
+  local venv_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
       --dev)
         channel="dev"
         ;;
       --stable)
         channel="stable"
         ;;
+      --venv)
+        if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+          echo "--venv requires a directory." >&2
+          exit 1
+        fi
+        # Resolve before source installs change the working directory.
+        case "$2" in
+          /*) venv_override="$2" ;;
+          *) venv_override="$PWD/$2" ;;
+        esac
+        shift
+        ;;
       -h|--help)
         cat <<'EOF'
-Usage: install.sh [--dev | --stable]
+Usage: install.sh [--dev | --stable] [--venv PATH]
 
 Options:
       --dev         Install the latest development build cut from main.
                     This is the default and the currently recommended channel.
       --stable      Install the latest tagged stable release. Stable releases
                     are cut by hand and may lag behind the dev channel.
+      --venv PATH   Use this Python environment directory instead of the default.
   -h, --help        Show this help.
 
 The channel can also be set with VLLM_METAL_CHANNEL=dev|stable.
@@ -198,11 +212,12 @@ EOF
         exit 0
         ;;
       *)
-        echo "Unknown argument: $arg" >&2
+        echo "Unknown argument: $1" >&2
         echo "Run with --help for usage." >&2
         exit 1
         ;;
     esac
+    shift
   done
 
   case "$channel" in
@@ -258,6 +273,7 @@ EOF
     venv="$script_dir/.venv-vllm-metal"
   fi
 
+  venv="${venv_override:-$venv}"
   ensure_venv "$venv"
   if ! require_arm64_python python; then
     exit 1
@@ -301,10 +317,11 @@ EOF
   success "Installation complete!"
   echo ""
   echo "To use vllm, activate the virtual environment:"
-  echo "  source $venv/bin/activate"
+  printf '  source %q\n' "$venv/bin/activate"
   echo ""
   echo "Or add the venv to your PATH:"
-  echo "  export PATH=\"$venv/bin:\$PATH\""
+  # shellcheck disable=SC2016 # Print a command for the user's next shell.
+  printf '  export PATH=%q:"$PATH"\n' "$venv/bin"
 }
 
 main "$@"
