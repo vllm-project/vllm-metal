@@ -1,6 +1,9 @@
-<h1 align="center">vLLM Metal Plugin</h1>
-
-<h3 align="center">High-performance LLM inference on Apple Silicon using MLX and vLLM</h3>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vllm-metal-dark.svg">
+    <img src="docs/assets/vllm-metal-light.svg" alt="vLLM Metal — Run vLLM on your Apple Silicon GPU" width="900">
+  </picture>
+</p>
 
 <p align="center">
 | <a href="https://docs.vllm.ai/projects/vllm-metal/en/latest/"><b>Documentation</b></a> | <a href="https://vllm.ai/blog/2026-09-22-vllm-metal-v0-28-0"><b>Blog</b></a> | <a href="https://slack.vllm.ai/"><b>Developer Slack</b></a> (#hw-metal) |
