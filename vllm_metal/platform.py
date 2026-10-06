@@ -346,7 +346,6 @@ class MetalPlatform(Platform):
             unsupported_controls += [
                 name
                 for name in (
-                    "logprobs",
                     "logprob_token_ids",
                     "prompt_logprobs",
                     "structured_outputs",

@@ -14,7 +14,8 @@ VLLM_METAL_BACKEND=mps vllm serve Qwen/Qwen3-0.6B --dtype bfloat16
 Release wheels include both native launchers and the shared Metal shaders;
 no compiler is needed. Source checkouts use the [development setup](CONTRIBUTING.md#development-setup).
 Selecting MPS defaults to MRv2. Use unquantized FP16/BF16 checkpoints and greedy
-requests (`temperature=0`, without logprobs).
+requests (`temperature=0`). Output-token logprobs are supported; prompt logprobs
+and explicit token-ID scoring are not yet supported.
 
 ## Models
 

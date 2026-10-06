@@ -136,7 +136,14 @@ class TestParityTool:
         with pytest.raises(ValueError, match="input token IDs"):
             http_generate("http://localhost/v1", "model", [{"input_ids": [1]}], 1)
 
-    def test_canonical_flow_reuses_reference_and_server(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    def test_canonical_flow_reuses_reference_and_server(
+        self, monkeypatch, tmp_path, backend
+    ):
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        monkeypatch.setattr(
+            "tools.check_parity.checkpoint", lambda model: (model, "bfloat16")
+        )
         events = []
         row = {**self._result([2], []), "input_ids": [1]}
 
@@ -148,8 +155,17 @@ class TestParityTool:
 
         @contextmanager
         def server(
-            model, max_model_len, max_num_seqs, gpu_memory_utilization, log_path, env
+            model,
+            max_model_len,
+            max_num_seqs,
+            gpu_memory_utilization,
+            log_path,
+            env,
+            extra_args=(),
         ):
+            assert extra_args == (("--dtype", "bfloat16") if backend == "mps" else ())
+            if backend == "mps":
+                assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
             events.append("server started")

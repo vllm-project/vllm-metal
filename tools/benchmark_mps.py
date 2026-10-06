@@ -22,28 +22,11 @@ import urllib.request
 from pathlib import Path
 
 if __package__:
-    from .check_parity import serving
+    from .check_parity import checkpoint, serving
 else:
-    from check_parity import serving
+    from check_parity import checkpoint, serving
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def checkpoint(model: str) -> tuple[str, str]:
-    from huggingface_hub import snapshot_download
-    from safetensors import safe_open
-
-    path = Path(model) if Path(model).is_dir() else Path(snapshot_download(model))
-    # MLX preserves checkpoint weights; --dtype alone does not cast them.
-    dtypes = set()
-    for shard in path.glob("*.safetensors"):
-        with safe_open(shard, framework="np") as tensors:
-            dtypes.update(tensors.get_slice(key).get_dtype() for key in tensors.keys())
-    if dtypes not in ({"F16"}, {"BF16"}):
-        raise ValueError(
-            f"Use a uniform FP16/BF16 checkpoint for a fair comparison: {dtypes}"
-        )
-    return str(path.resolve()), "float16" if dtypes == {"F16"} else "bfloat16"
 
 
 def main() -> None:

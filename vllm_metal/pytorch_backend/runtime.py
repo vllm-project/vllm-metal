@@ -75,6 +75,29 @@ def staged_write(self):
     self.clear_staged_writes()
 
 
+def compute_topk_scores(
+    logits,
+    num_logprobs,
+    sampled_token_ids,
+    cu_num_logits=None,
+    logprob_token_ids_state=None,
+    expanded_idx_mapping=None,
+    max_per_req_token_ids=0,
+    logits_mode=False,
+):
+    from vllm.v1.sample.sampler import Sampler
+
+    # Explicit-token and prompt logprobs remain rejected by validate_request.
+    assert max_per_req_token_ids == 0
+    scores = logits.float() if logits_mode else Sampler.compute_logprobs(logits)
+    # Keep upstream's compiled rank helper eager on MPS.
+    with torch.compiler.set_stance("force_eager"):
+        result = Sampler.gather_logprobs(scores, num_logprobs, sampled_token_ids.long())
+    if isinstance(cu_num_logits, torch.Tensor):
+        return result._replace(cu_num_generated_tokens_tensor=cu_num_logits)
+    return result._replace(cu_num_generated_tokens=cu_num_logits)
+
+
 def install():
     from vllm.model_executor.layers.mamba.short_conv import ShortConv
     from vllm.v1.worker.gpu import buffer_utils, model_runner
@@ -103,6 +126,7 @@ def install():
     buffer_utils.UvaBackedTensor.copy_to_uva = copy_changed_state
 
     input_ops.install()
-    # validate_request limits this baseline to plain greedy generation.
+    # validate_request limits sampling to greedy; scoring uses upstream Torch ops.
     sampler.gumbel_sample = lambda logits, *args, **kwargs: logits.argmax(dim=-1)
+    sampler.compute_topk_scores = compute_topk_scores
     buffer_utils._metal_installed = True
