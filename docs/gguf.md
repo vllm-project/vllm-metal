@@ -58,10 +58,14 @@ before model load.
 - Supported qtypes: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, and
   Q6_K, plus plain F32/F16/BF16 tensors, mixed freely within one file, so
   llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L load. Remote
-  reference tags accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K_S/M/L, Q5_K_S/M/L,
-  Q6_K, Q6_K_L, and the plain types; Q2_K/Q3_K files load from a local path.
+  reference tags accept Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q2_K_L, Q3_K_S/M/L,
+  Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, and the plain types.
 - llama.cpp falls back from Q4_K/Q5_K to Q5_0/Q5_1 on rows that are not a
   multiple of 256 wide, as in Qwen2.5-0.5B's Q4_K_M and Q5_K_M files.
+- On those same rows llama.cpp falls back from Q2_K/Q3_K to IQ4_NL, which the
+  loader rejects. Qwen2.5-0.5B's Q2_K file holds 121 IQ4_NL tensors, the
+  embedding among them, so it fails with a clear error from a tag or a path
+  alike. Q2_K/Q3_K files of models whose rows are a multiple of 256 wide load.
 - Q2_K/Q3_K/Q6_K weights stay in their GGUF blocks and run on custom Metal
   kernels. Small batches use a fused kernel on the packed blocks, and larger
   ones, such as a prefill, dequantize a transient dense copy of the weight

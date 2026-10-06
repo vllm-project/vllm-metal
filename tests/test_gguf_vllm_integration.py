@@ -558,10 +558,10 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
             )
         )
 
+    supported = ", ".join(sorted(gguf_source._SUPPORTED_REMOTE_TAGS))
     assert str(excinfo.value) == (
         "Remote GGUF tag 'UD-Q4_K_XL' is not supported by vllm-metal; "
-        "supported tags: BF16, F16, F32, Q4_0, Q4_1, Q4_K_L, Q4_K_M, Q4_K_S, "
-        "Q5_0, Q5_1, Q5_K_L, Q5_K_M, Q5_K_S, Q6_K, Q6_K_L, Q8_0."
+        f"supported tags: {supported}."
     )
 
 
@@ -569,6 +569,29 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
 def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
+    snapshot = tmp_path / "weights"
+    snapshot.mkdir()
+    gguf_name = f"model-{tag}.gguf"
+    (snapshot / gguf_name).write_text("dummy")
+    monkeypatch.setattr(
+        gguf_source,
+        "HfApi",
+        lambda: SimpleNamespace(list_repo_files=lambda **_: ["README.md", gguf_name]),
+    )
+    monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
+    reference = gguf_source.RemoteGGUFReference.parse(f"org/model:{tag}")
+    assert reference is not None
+
+    resolved = reference.resolve(
+        cache_dir=None, revision=None, ignore_patterns=None, token=None
+    )
+
+    assert resolved == str(snapshot / gguf_name)
+
+
+@pytest.mark.parametrize("tag", ["Q2_K", "Q2_K_L", "Q3_K_S", "Q3_K_M", "Q3_K_L"])
+def test_remote_k_quant_tags_resolve(tmp_path, monkeypatch, tag) -> None:
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
     gguf_name = f"model-{tag}.gguf"
