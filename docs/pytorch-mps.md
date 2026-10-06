@@ -50,9 +50,3 @@ reuses a PyTorch fused operation through a vLLM IR registration.
 - Reject configurations for concrete missing behavior or incompatible kernel
   contracts. Keep unverified models blank in the support matrix, not in a runtime
   model allowlist. Preserve upstream numerical, cache-lifetime and mutation semantics.
-
-## Performance
-
-Shared and custom Metal kernels should bring MPS performance close to or above
-MLX. Prove improvements with the [matched serving comparison](tools.md#mlx-versus-pytorch-mps-performance),
-and retain the corresponding operator or model correctness checks.

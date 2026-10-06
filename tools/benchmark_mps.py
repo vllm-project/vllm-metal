@@ -2,17 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare MLX and MPS serving with vLLM's benchmark client.
 
-Fresh servers run in MLX/MPS/MPS/MLX order. See docs/tools.md for the contract.
+Fresh servers run in MLX/MPS/MPS/MLX order.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import importlib.metadata
 import json
 import os
-import platform
 import signal
 import statistics
 import subprocess
@@ -54,7 +51,6 @@ def main() -> None:
     ):
         parser.error("Workload sizes, request rate and cache blocks must be positive")
     dataset = args.dataset_path.resolve()
-    dataset_hash = hashlib.sha256(dataset.read_bytes()).hexdigest()
     model, dtype = checkpoint(args.model)
     output = args.output_dir or Path(tempfile.mkdtemp(prefix="metal-backend-bench-"))
     output.mkdir(parents=True, exist_ok=True)
@@ -84,44 +80,18 @@ def main() -> None:
         filter(None, [str(ROOT), env.get("PYTHONPATH")])
     )
     env["VLLM_METAL_MEMORY_FRACTION"] = "0.3"
-    manifest = {
-        "model": model,
-        "dtype": dtype,
-        "workload": vars(args),
-        "dataset_sha256": dataset_hash,
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip(),
-        "hardware": subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
-        ).strip(),
-        "memory_bytes": int(
-            subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
-        ),
-        "platform": platform.platform(),
-        "versions": {
-            p: importlib.metadata.version(p) for p in ("vllm", "torch", "mlx", "mlx-lm")
-        },
-        "server_args": server_args,
-        "max_model_len": max_len,
-        "prefix_caching": False,
-        "gpu_memory_utilization": 0.3,
-        "env": {
-            k: v
-            for k, v in env.items()
-            if k.startswith(
-                (
-                    "VLLM_METAL_",
-                    "VLLM_MLX_",
-                    "VLLM_USE_",
-                    "VLLM_ENABLE_V1_",
-                    "MLX_",
-                    "PYTORCH_MPS_",
-                )
-            )
-        },
-        "runs": [],
-    }
+    (output / "config.json").write_text(
+        json.dumps(
+            {
+                "model": model,
+                "dtype": dtype,
+                "workload": vars(args),
+                "server_args": server_args,
+            },
+            indent=2,
+            default=str,
+        )
+    )
     results = {"mlx": [], "mps": []}
     for index, backend in enumerate(("mlx", "mps", "mps", "mlx"), 1):
         label = f"{index}-{backend}"
@@ -179,12 +149,6 @@ def main() -> None:
                 "--result-filename",
                 f"{label}.json",
             ]
-            manifest["runs"].append(
-                {"label": label, "env": overrides, "client": command}
-            )
-            (output / "config.json").write_text(
-                json.dumps(manifest, indent=2, default=str)
-            )
             print(f"Running {label}...", flush=True)
             with (output / f"{label}-client.log").open("w") as log:
                 subprocess.run(
