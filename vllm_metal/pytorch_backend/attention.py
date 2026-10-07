@@ -31,7 +31,7 @@ class MPSAttentionBackend(AttentionBackend):
         return "CUSTOM"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [8, 16, 32]
 
     @staticmethod

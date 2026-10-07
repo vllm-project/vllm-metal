@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Temporary Torch replacements for vLLM 0.30 MRv2 input/state kernels on MPS.
+"""Temporary Torch replacements for vLLM 0.31 MRv2 input/state kernels on MPS.
 
 Upstream launches Triton kernels without a Torch fallback at these entry points.
 These implementations cover the supported non-speculative path. Replace the
