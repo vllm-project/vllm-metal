@@ -14,12 +14,13 @@ M3_ARCH = "applegpu_g15g"
 def _native_diagnostics():
     ops = get_ops()
     previous = ops._set_paged_dispatch_diagnostics(True)
+    previous_cores = ops.detected_gpu_core_count()
     ops._override_detected_gpu_core_count_for_test(10)
     try:
         yield
     finally:
         mx.synchronize()
-        ops._override_detected_gpu_core_count_for_test(-1)
+        ops._override_detected_gpu_core_count_for_test(previous_cores)
         ops._set_paged_dispatch_diagnostics(previous)
 
 
