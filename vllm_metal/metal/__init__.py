@@ -122,6 +122,10 @@ def _build_mla_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
+def _build_rope_source() -> str:
+    return _read_v2_metal_source("rope.metal")
+
+
 def _build_nax_source() -> str:
     """Read the self-contained NAX prefill attention source."""
     return _read_metal_source(_KERNELS_V2_DIR / "pagedattention_nax.metal")
