@@ -167,16 +167,20 @@ class RemoteGGUFReference:
                 f"No {self.quant_type!r} GGUF file found in remote repository "
                 f"{self.repo_id!r}."
             )
-        if any(_SHARD_NAME_RE.search(filename) for filename in filenames):
+        # A shard set next to its merged <stem>.gguf counts as that one file.
+        merged_names = sorted(
+            {_SHARD_NAME_RE.sub(_GGUF_SUFFIX, filename) for filename in filenames}
+        )
+        if any(name not in filenames for name in merged_names):
             raise ValueError(
                 f"Remote sharded GGUF files are not supported yet: {self.value!r}."
             )
-        if len(filenames) != 1:
-            names = ", ".join(filenames)
+        if len(merged_names) != 1:
+            names = ", ".join(merged_names)
             raise ValueError(
                 f"Remote GGUF reference {self.value!r} matched multiple files: {names}."
             )
-        return filenames[0]
+        return merged_names[0]
 
 
 @dataclass(frozen=True, slots=True)

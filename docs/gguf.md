@@ -45,12 +45,14 @@ The source priority is:
 ```
 
 vllm-metal downloads exactly one matching `.gguf` file from the remote
-repository. Missing, ambiguous, or sharded matches fail before model load.
+repository. A quant published both as one file and as that file's shards
+resolves to the single file. Missing or ambiguous matches, and quants published
+only as shards, fail before model load.
 
 With `HF_HUB_OFFLINE=1`, remote references select from the requested revision
 in the local Hugging Face cache. Cache the matching GGUF file and companion
-config/tokenizer first; missing, ambiguous, or sharded cached matches also fail
-before model load.
+config/tokenizer first; missing, ambiguous, or shard-only cached matches also
+fail before model load.
 
 ## Current scope
 

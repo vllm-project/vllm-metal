@@ -577,6 +577,27 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
             "Remote sharded GGUF files are not supported yet: "
             "'Qwen/Qwen3-0.6B-GGUF:Q8_0'.",
         ),
+        # Only a file's own shard set drops out; another file's shards reject.
+        (
+            [
+                "model-a-Q8_0.gguf",
+                "model-b-Q8_0-00001-of-00002.gguf",
+                "model-b-Q8_0-00002-of-00002.gguf",
+            ],
+            "Remote sharded GGUF files are not supported yet: "
+            "'Qwen/Qwen3-0.6B-GGUF:Q8_0'.",
+        ),
+        # Dropping a shard set still leaves its single file as a candidate.
+        (
+            [
+                "mmproj-model-Q8_0.gguf",
+                "model-Q8_0-00001-of-00002.gguf",
+                "model-Q8_0-00002-of-00002.gguf",
+                "model-Q8_0.gguf",
+            ],
+            "Remote GGUF reference 'Qwen/Qwen3-0.6B-GGUF:Q8_0' matched "
+            "multiple files: mmproj-model-Q8_0.gguf, model-Q8_0.gguf.",
+        ),
     ],
 )
 def test_remote_load_source_rejects_unsupported_remote_matches(
@@ -665,10 +686,17 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
     assert resolved == str(snapshot / gguf_name)
 
 
-@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L"])
-def test_remote_sibling_tags_resolve_separately(tmp_path, monkeypatch, tag) -> None:
+@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L", "Q8_0"])
+def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     snapshot = tmp_path / "weights"
-    repo_files = ["README.md", "model-Q6_K.gguf", "model-Q6_K_L.gguf"]
+    repo_files = [
+        "README.md",
+        "model-Q6_K.gguf",
+        "model-Q6_K_L.gguf",
+        "model-Q8_0-00001-of-00002.gguf",
+        "model-Q8_0-00002-of-00002.gguf",
+        "model-Q8_0.gguf",
+    ]
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
